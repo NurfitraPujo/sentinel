@@ -1,0 +1,163 @@
+{
+  "schema_version": "1.0",
+  "extensions": {
+    "git": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:9731aa8143a72fbebfdb440f155038ab42642517c2b2bdbbf67c8fdbe076ed79",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.git.feature",
+          "speckit.git.validate",
+          "speckit.git.remote",
+          "speckit.git.initialize",
+          "speckit.git.commit"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T09:35:07.429823+00:00"
+    },
+    "blueprint": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:c0c5bf7b0ac6236d660693ff792a3658f5cc0b1742a7cf3cb69e1675e1811ada",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.blueprint.generate",
+          "speckit.blueprint.validate"
+        ],
+        "kilocode": [
+          "speckit.blueprint.generate",
+          "speckit.blueprint.validate"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T10:58:35.387583+00:00"
+    },
+    "architecture-guard": {
+      "version": "1.8.0",
+      "source": "local",
+      "manifest_hash": "sha256:2ebeac88a78e7483dd60660fd7f150ccf7e794f80b696442976e6663bb519c9f",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.architecture-guard.governed-plan",
+          "speckit.architecture-guard.governed-tasks",
+          "speckit.architecture-guard.governed-implement",
+          "speckit.architecture-guard.architecture-workflow",
+          "speckit.architecture-guard.architecture-review",
+          "speckit.architecture-guard.violation-detection",
+          "speckit.architecture-guard.refactor-generator",
+          "speckit.architecture-guard.architecture-apply",
+          "speckit.architecture-guard.init"
+        ],
+        "kilocode": [
+          "speckit.architecture-guard.governed-plan",
+          "speckit.architecture-guard.governed-tasks",
+          "speckit.architecture-guard.governed-implement",
+          "speckit.architecture-guard.architecture-workflow",
+          "speckit.architecture-guard.architecture-review",
+          "speckit.architecture-guard.violation-detection",
+          "speckit.architecture-guard.refactor-generator",
+          "speckit.architecture-guard.architecture-apply",
+          "speckit.architecture-guard.init"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T10:59:58.119408+00:00"
+    },
+    "conduct": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:04cd27f87ea721fa9b53310a6ef241428a3c5095086770c2e352cfed6cba461a",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.conduct.run"
+        ],
+        "kilocode": [
+          "speckit.conduct.run"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T12:05:34.392274+00:00"
+    },
+    "cost": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:366789e598074aac218bc4a1aecc910049bef03d2e06bdf0bbb0a74d3a2bdffd",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.cost.track",
+          "speckit.cost.report",
+          "speckit.cost.budget",
+          "speckit.cost.compare",
+          "speckit.cost.export"
+        ],
+        "kilocode": [
+          "speckit.cost.track",
+          "speckit.cost.report",
+          "speckit.cost.budget",
+          "speckit.cost.compare",
+          "speckit.cost.export"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T12:07:23.108779+00:00"
+    },
+    "speckit-utils": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:e4970a3d868ad26c27c2b7b57cec58a017b0f6d31e1186dd64ca30c8e8da7721",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.speckit-utils.resume",
+          "speckit.resume",
+          "speckit.speckit-utils.doctor",
+          "speckit.doctor",
+          "speckit.speckit-utils.validate",
+          "speckit.validate"
+        ],
+        "kilocode": [
+          "speckit.speckit-utils.resume",
+          "speckit.resume",
+          "speckit.speckit-utils.doctor",
+          "speckit.doctor",
+          "speckit.speckit-utils.validate",
+          "speckit.validate"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T12:08:02.685204+00:00"
+    },
+    "status": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:25d080d9f1a0ea2fc62de2464479143c7c008b9131d32755f351413605d7946f",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.status.show",
+          "speckit.status"
+        ],
+        "kilocode": [
+          "speckit.status.show",
+          "speckit.status"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T12:08:18.626353+00:00"
+    }
+  }
+}
