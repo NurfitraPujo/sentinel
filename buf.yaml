@@ -1,0 +1,22 @@
+# For details on buf.yaml configuration, visit https://buf.build/docs/configuration/v2/buf-yaml
+version: v2
+lint:
+    use:
+        - STANDARD
+breaking:
+    use:
+        - FILE
+plugins:
+    # Generate Go code for the backend
+    - remote: buf.build/protocolbuffers/go:v1.36.0
+      out: gen
+      opt: paths=source_relative
+
+    # Generate ConnectRPC Go handlers
+    - remote: buf.build/connectrpc/go:v1.16.0
+      out: gen
+      opt: paths=source_relative
+
+    # Generate TypeScript for the Svelte Dashboard
+    - remote: buf.build/connectrpc/es:v1.4.0
+      out: apps/dashboard/src/lib/gen

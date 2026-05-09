@@ -158,6 +158,35 @@
       },
       "registered_skills": [],
       "installed_at": "2026-05-09T12:08:18.626353+00:00"
+    },
+    "security-review": {
+      "version": "1.4.5",
+      "source": "local",
+      "manifest_hash": "sha256:f0c3a5faaada6628d9903d038c36ac6d39efe1c0d4499c4bec5357691c8e53c1",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.security-review.audit",
+          "speckit.security-review.staged",
+          "speckit.security-review.branch",
+          "speckit.security-review.plan",
+          "speckit.security-review.tasks",
+          "speckit.security-review.followup",
+          "speckit.security-review.apply"
+        ],
+        "kilocode": [
+          "speckit.security-review.audit",
+          "speckit.security-review.staged",
+          "speckit.security-review.branch",
+          "speckit.security-review.plan",
+          "speckit.security-review.tasks",
+          "speckit.security-review.followup",
+          "speckit.security-review.apply"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-09T12:53:53.617461+00:00"
     }
   }
 }
