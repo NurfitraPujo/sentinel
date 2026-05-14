@@ -10,12 +10,31 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Store struct {
+// QueryStore defines the "Read" side of the Issue store.
+type QueryStore interface {
+	GetProjectByKey(ctx context.Context, projectKey string) (string, error)
+	GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error)
+}
+
+// CommandStore defines the "Write" side of the Issue store.
+type CommandStore interface {
+	UpsertIssue(ctx context.Context, issue *Issue) error
+	InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error
+}
+
+// IssueStore combines both Read and Write operations for the Processor.
+type IssueStore interface {
+	QueryStore
+	CommandStore
+}
+
+type pgStore struct {
 	db *pgxpool.Pool
 }
 
-func NewStore(db *pgxpool.Pool) *Store {
-	return &Store{db: db}
+// NewStore returns a concrete implementation of IssueStore using PostgreSQL.
+func NewStore(db *pgxpool.Pool) IssueStore {
+	return &pgStore{db: db}
 }
 
 type Issue struct {
@@ -42,7 +61,7 @@ type ErrorOccurrence struct {
 	CreatedAt   time.Time
 }
 
-func (s *Store) UpsertIssue(ctx context.Context, issue *Issue) error {
+func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue) error {
 	query := `
 		INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
@@ -67,7 +86,7 @@ func (s *Store) UpsertIssue(ctx context.Context, issue *Issue) error {
 	return err
 }
 
-func (s *Store) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error {
+func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error {
 	query := `
 		INSERT INTO error_occurrences (id, issue_id, environment, platform, stacktrace, metadata, trace_id, span_id, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -88,7 +107,7 @@ func (s *Store) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) erro
 	return err
 }
 
-func (s *Store) GetProjectByKey(ctx context.Context, projectKey string) (string, error) {
+func (s *pgStore) GetProjectByKey(ctx context.Context, projectKey string) (string, error) {
 	var projectID string
 	err := s.db.QueryRow(ctx,
 		"SELECT id FROM projects WHERE name = $1",
@@ -99,4 +118,13 @@ func (s *Store) GetProjectByKey(ctx context.Context, projectKey string) (string,
 		return "", fmt.Errorf("project not found: %s", projectKey)
 	}
 	return projectID, err
+}
+
+func (s *pgStore) GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error) {
+	var issueID string
+	err := s.db.QueryRow(ctx,
+		"SELECT id FROM issues WHERE project_id = $1 AND fingerprint = $2",
+		projectID, fingerprint,
+	).Scan(&issueID)
+	return issueID, err
 }

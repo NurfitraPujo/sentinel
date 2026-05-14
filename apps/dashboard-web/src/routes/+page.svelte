@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { PageData } from './$types';
 
-	export let data: PageData;
+	let { data } = $props();
 
 	function formatDate(date: string | Date | null): string {
 		if (!date) return 'Never';
@@ -14,7 +14,8 @@
 		});
 	}
 
-	function isNew(lastSeen: string | Date): boolean {
+	function isNew(lastSeen: string | Date | null): boolean {
+		if (!lastSeen) return false;
 		const diff = Date.now() - new Date(lastSeen).getTime();
 		return diff < 24 * 60 * 60 * 1000;
 	}

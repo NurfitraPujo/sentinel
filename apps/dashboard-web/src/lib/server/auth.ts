@@ -4,7 +4,7 @@ import type { RequestEvent } from '@sveltejs/kit';
 export interface AuthUser {
 	id: string;
 	email: string;
-	name: string;
+	name?: string;
 }
 
 export async function getUser(event: RequestEvent): Promise<AuthUser | null> {
@@ -12,11 +12,10 @@ export async function getUser(event: RequestEvent): Promise<AuthUser | null> {
 	if (!session?.user?.email) {
 		return null;
 	}
-
 	return {
-		id: session.user.email,
+		id: (session.user as any).id || session.user.email,
 		email: session.user.email,
-		name: session.user.name ?? session.user.email,
+		name: session.user.name || undefined,
 	};
 }
 

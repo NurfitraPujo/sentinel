@@ -1,24 +1,28 @@
 import type { PageServerLoad } from './$types';
-import { db } from '$lib/server/db';
-import { issues, errorOccurrences, projects } from '$lib/db/schema';
-import { eq, desc } from 'drizzle-orm';
 import { error } from '@sveltejs/kit';
+import { checkProjectAccess } from '$lib/server/projects';
+import { issueQueries } from '$lib/server/queries/issue-queries';
 
-export const load: PageServerLoad = async ({ params }) => {
+export const load: PageServerLoad = async ({ params, locals }) => {
+	const session = await locals.getSession();
+	if (!session?.user?.id) {
+		throw error(401, 'Unauthorized');
+	}
+
 	const issueId = params.id;
-
-	const [issue] = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
+	const issue = await issueQueries.getIssueById(issueId);
 
 	if (!issue) {
 		throw error(404, 'Issue not found');
 	}
 
-	const [project] = await db.select().from(projects).where(eq(projects.id, issue.projectId)).limit(1);
+	const isAuthorized = await checkProjectAccess(session.user.id, issue.projectId, 'viewer');
+	if (!isAuthorized) {
+		throw error(403, 'Forbidden');
+	}
 
-	const occurrences = await db.select().from(errorOccurrences)
-		.where(eq(errorOccurrences.issueId, issueId))
-		.orderBy(desc(errorOccurrences.createdAt))
-		.limit(100);
+	const project = await issueQueries.getProjectById(issue.projectId);
+	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
 
 	return {
 		issue,

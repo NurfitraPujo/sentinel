@@ -1,23 +1,25 @@
 import { db } from './db';
-import { projects, project_members } from '$lib/db/schema';
-import type { RequestEvent } from '@sveltejs/kit';
+import { projects, projectMembers } from '$lib/db/schema';
 import type { Role, ProjectAccess } from '$lib/rbac';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 
 export async function getUserProjectAccess(
 	userId: string,
 	projectId?: string
 ): Promise<ProjectAccess[]> {
-	let query = db.select({
-		projectId: project_members.projectId,
-		role: project_members.role,
-	}).from(project_members).where(eq(project_members.userId, userId));
-
+	const conditions = [eq(projectMembers.userId, userId)];
+	
 	if (projectId) {
-		query = query.where(eq(project_members.projectId, projectId)) as any;
+		conditions.push(eq(projectMembers.projectId, projectId));
 	}
 
-	const results = await query;
+	const results = await db.select({
+		projectId: projectMembers.projectId,
+		role: projectMembers.role,
+	})
+	.from(projectMembers)
+	.where(conditions.length > 1 ? and(...conditions) : conditions[0]);
+
 	return results.map(r => ({
 		projectId: r.projectId,
 		role: r.role as Role,

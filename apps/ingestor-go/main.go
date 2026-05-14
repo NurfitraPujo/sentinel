@@ -12,14 +12,11 @@ import (
 
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
-	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
-	"github.com/golang/protobuf/proto"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"google.golang.org/protobuf/types/known/structpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func main() {
@@ -56,10 +53,11 @@ func main() {
 	}
 	defer publisher.Close()
 
+	ingestService := service.NewIngestService(publisher)
 	rateLimiter := middleware.NewRateLimiter(5000, time.Minute)
 	ingestHandler := auth.NewAPIKeyAuthenticator(db).Middleware(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handleIngest(db, publisher).ServeHTTP(w, r)
+			handleIngest(ingestService).ServeHTTP(w, r)
 		}),
 	)
 	http.Handle("/ingest", rateLimiter.Middleware(ingestHandler))
@@ -90,7 +88,7 @@ func main() {
 	}
 }
 
-func handleIngest(db *pgxpool.Pool, publisher *nats.Publisher) http.HandlerFunc {
+func handleIngest(svc *service.IngestService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -108,43 +106,9 @@ func handleIngest(db *pgxpool.Pool, publisher *nats.Publisher) http.HandlerFunc 
 			return
 		}
 
-		var stacktrace []*sentinelv1.StackFrame
-		for _, frame := range payload.Stacktrace {
-			stacktrace = append(stacktrace, &sentinelv1.StackFrame{
-				File:     frame.File,
-				Line:     frame.Line,
-				Function: frame.Function,
-				InApp:    frame.InApp,
-			})
-		}
-
-		var metadata *structpb.Struct
-		if payload.Metadata != nil {
-			metadata, _ = structpb.NewStruct(payload.Metadata)
-		}
-
-		event := &sentinelv1.ErrorEvent{
-			ProjectKey:  payload.ProjectKey,
-			Platform:    payload.Platform,
-			Environment: payload.Environment,
-			Message:     payload.Message,
-			ErrorClass:  payload.ErrorClass,
-			TraceId:     payload.TraceID,
-			SpanId:      payload.SpanID,
-			Stacktrace:  stacktrace,
-			Metadata:    metadata,
-			Timestamp:   timestamppb.New(payload.Timestamp),
-			TraceFlags:  payload.TraceFlags,
-		}
-
-		data, err := proto.Marshal(event)
-		if err != nil {
-			http.Error(w, "Failed to encode payload", http.StatusInternalServerError)
-			return
-		}
-
-		if err := publisher.Publish(r.Context(), data); err != nil {
-			http.Error(w, "Failed to publish event", http.StatusInternalServerError)
+		if err := svc.Ingest(r.Context(), &payload); err != nil {
+			log.Printf("Failed to ingest error: %v", err)
+			http.Error(w, "Failed to ingest error", http.StatusInternalServerError)
 			return
 		}
 

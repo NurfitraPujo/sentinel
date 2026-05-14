@@ -13,11 +13,10 @@ export interface RetentionResult {
 export async function cleanupRetainedData(retentionDays: number = 30): Promise<RetentionResult> {
 	const cutoffDate = new Date();
 	cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
-	const cutoffTimestamp = cutoffDate.toISOString();
 
 	const deletedOccurrencesResult = await db
 		.delete(errorOccurrences)
-		.where(lt(errorOccurrences.createdAt, cutoffTimestamp))
+		.where(lt(errorOccurrences.createdAt, cutoffDate))
 		.returning({ id: errorOccurrences.id });
 
 	const deletedOccurrences = deletedOccurrencesResult.length;

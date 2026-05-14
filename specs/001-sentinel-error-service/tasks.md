@@ -124,6 +124,30 @@
 
 ---
 
+## Phase 7: Architectural Refactor
+
+**Purpose**: Remediate architecture violations and improve code quality/maintainability
+
+- [x] T048 [P] [US1] Fix fingerprinting algorithm: use `file:function` instead of `file:line` in `apps/processor-go/fingerprint/fingerprint.go`
+- [x] T049 [P] [US1] Ensure custom fingerprints are SHA256 hashed in `apps/processor-go/fingerprint/fingerprint.go`
+- [x] T050 [US1] Move direct database queries in `apps/processor-go/processor.go` to the store abstraction in `apps/processor-go/store/store.go`
+- [x] T051 [P] [US1] Update `packages/proto/error_event.proto` to include the 64KB metadata size limit using Protobuf validation
+- [x] T052 [US1] Refactor `apps/ingestor-go` to use a service layer in `apps/ingestor-go/service/` for orchestration logic
+- [x] T053 [US1] TASK-REF-001: Implement `IssueStore` interface to decouple Command/Query paths in `processor-go`
+- [x] T054 [US1] TASK-REF-002: Create `QueryService` in `dashboard-web` to encapsulate Drizzle ORM queries
+- [x] T055 [US1] TASK-REF-003: Refactor global dashboard loaders to utilize the new `QueryService`
+
+---
+
+## Phase 8: Security Remediation
+
+**Purpose**: Address critical security vulnerabilities and harden data protection logic
+
+- [x] TASK-SEC-001 [US3] Fix IDOR in Issue Detail view: verify project ownership before returning issue data in `apps/dashboard-web/src/routes/issues/[id]/+page.server.ts`
+- [x] TASK-SEC-002 [US1] Refine PII masking logic: replace broad `strings.Contains` with precise key matching in `apps/processor-go/masker/masker.go` to prevent over-redaction
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
@@ -134,6 +158,7 @@
   - User stories can then proceed in parallel (if staffed)
   - Or sequentially in priority order (P1 → P2 → P3)
 - **Polish (Phase 6)**: Depends on all desired user stories being complete
+- **Refactor (Phase 7)**: Depends on Phase 3 and Phase 1 completion (Proto/Ingestor/Processor foundations)
 
 ### User Story Dependencies
 
@@ -220,15 +245,15 @@ With multiple developers:
 
 | Requirement | Task(s) |
 |-------------|---------|
-| FR-001: REST ingestion endpoint | T015, T016, T018, T019 |
-| FR-002: De-duplication into Issues | T020, T024 |
+| FR-001: REST ingestion endpoint | T015, T016, T018, T019, T051, T052 |
+| FR-002: De-duplication into Issues | T020, T024, T048, T049, T050 |
 | FR-003: Full stack trace and context | T035, T036, T037 |
 | FR-004: Dashboard with filtering/search | T026, T027, T038, T039 |
 | FR-005: Email/Telegram notifications | T029, T030, T031, T033, T034 |
 | FR-006: Google Workspace auth + RBAC | T012, T013, T028 |
 | FR-007: Go/Rails SDK support | T005 (proto contract) |
 | FR-008: NATS JetStream messaging | T004, T010, T011, T023 |
-| FR-009: Custom fingerprints | T020 |
+| FR-009: Custom fingerprints | T020, T049 |
 | FR-010: Message/stacktrace normalization | T021 |
 | FR-011: PII/secret masking | T022 |
 

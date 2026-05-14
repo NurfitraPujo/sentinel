@@ -1,9 +1,9 @@
 <script lang="ts">
 	import type { PageData } from './$types';
 
-	export let data: PageData;
+	let { data } = $props();
 
-	let expandedMetadata = new Set<string>();
+	let expandedMetadata = $state(new Set<string>());
 
 	function formatDate(date: string | Date | null): string {
 		if (!date) return 'Unknown';
@@ -23,7 +23,6 @@
 		} else {
 			expandedMetadata.add(id);
 		}
-		expandedMetadata = expandedMetadata;
 	}
 
 	function formatStackFrame(frame: { file: string; line: number; function: string }): string {
@@ -36,7 +35,8 @@
 		return `at ${frame.function} (${file}:${frame.line})`;
 	}
 
-	function getDateGroup(dateStr: string): string {
+	function getDateGroup(dateStr: string | Date | null): string {
+		if (!dateStr) return 'Unknown';
 		const date = new Date(dateStr);
 		const today = new Date();
 		const yesterday = new Date(today);
@@ -47,13 +47,31 @@
 		return date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
 	}
 
-	interface OccurrenceGroup {
-		date: string;
-		occurrences: typeof data.occurrences;
+	interface StackFrame {
+		file: string;
+		line: number;
+		function: string;
 	}
 
-	$: occurrenceGroups = data.occurrences.reduce((groups: OccurrenceGroup[], occ) => {
-		const groupLabel = getDateGroup(occ.createdAt);
+	interface Occurrence {
+		id: string;
+		issueId: string;
+		environment: string;
+		platform: string;
+		stacktrace: StackFrame[];
+		metadata: Record<string, unknown>;
+		traceId: string | null;
+		spanId: string | null;
+		createdAt: string | Date | null;
+	}
+
+	interface OccurrenceGroup {
+		date: string;
+		occurrences: Occurrence[];
+	}
+
+	let occurrenceGroups = $derived((data.occurrences as Occurrence[]).reduce((groups: OccurrenceGroup[], occ) => {
+		const groupLabel = getDateGroup(occ.createdAt as string | Date | null);
 		const existing = groups.find(g => g.date === groupLabel);
 		if (existing) {
 			existing.occurrences.push(occ);
@@ -61,7 +79,7 @@
 			groups.push({ date: groupLabel, occurrences: [occ] });
 		}
 		return groups;
-	}, []);
+	}, []));
 </script>
 
 <div class="issue-detail">
@@ -115,7 +133,7 @@
 							</div>
 						{/if}
 
-						<button class="metadata-toggle" on:click={() => toggleMetadata(occurrence.id)}>
+						<button class="metadata-toggle" onclick={() => toggleMetadata(occurrence.id)}>
 							{expandedMetadata.has(occurrence.id) ? 'Hide' : 'Show'} Metadata
 						</button>
 

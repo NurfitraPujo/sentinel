@@ -10,16 +10,18 @@
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.0.1",
-    "@sveltejs/kit": "^2.5.7",
-    "@sveltejs/vite-plugin-svelte": "^3.1.0",
-    "svelte": "^4.2.15",
-    "svelte-check": "^3.7.1",
+    "@sveltejs/kit": "^2.59.1",
+    "@sveltejs/vite-plugin-svelte": "^4.0.4",
+    "@types/node": "^25.7.0",
+    "svelte": "^5.55.5",
+    "svelte-check": "^4.4.8",
     "typescript": "^5.4.5",
     "vite": "^5.2.11"
   },
   "dependencies": {
+    "@auth/core": "^0.34.3",
+    "@auth/sveltekit": "^1.11.2",
     "drizzle-orm": "^0.30.10",
-    "@auth/core": "^0.31.0",
     "postgres": "^3.4.4",
     "zod": "^3.23.6"
   },

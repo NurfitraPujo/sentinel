@@ -1,12 +1,13 @@
 import { SvelteKitAuth } from '@auth/sveltekit';
 import Google from '@auth/core/providers/google';
-import type { RequestEvent } from '@sveltejs/kit';
+import { env } from '$env/dynamic/private';
 
-const GOOGLE_WORKSPACE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_WORKSPACE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_WORKSPACE_CLIENT_ID = env.GOOGLE_CLIENT_ID;
+const GOOGLE_WORKSPACE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET;
 const ALLOWED_EMAIL_DOMAIN = 'company.com';
 
-export const { handle, signIn, signOut } = SvelteKitAuth({
+// @ts-ignore - version mismatch between @auth/core and @auth/sveltekit nested @auth/core
+export const { handle } = SvelteKitAuth({
 	providers: [
 		Google({
 			clientId: GOOGLE_WORKSPACE_CLIENT_ID,
@@ -26,6 +27,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 			return true;
 		},
 	},
+	trustHost: true,
 	pages: {
 		signIn: '/auth/signin',
 	},

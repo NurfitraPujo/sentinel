@@ -1,8 +1,8 @@
 ---
 description: "Show project status and SDD workflow progress — active feature, artifacts, task completion, phase, and extensions."
 scripts:
-  sh: scripts/bash/status.sh
-  ps: scripts/powershell/status.ps1
+  sh: ../scripts/bash/status.sh
+  ps: ../scripts/powershell/status.ps1
 ---
 
 # Project Status

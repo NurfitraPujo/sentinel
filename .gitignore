@@ -30,3 +30,11 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+docs/superpowers
+.kilo/plans
+
+apps/dashboard-web/build
+apps/dashboard-web/.svelte-kit
+
+node_modules

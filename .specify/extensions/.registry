@@ -187,6 +187,27 @@
       },
       "registered_skills": [],
       "installed_at": "2026-05-09T12:53:53.617461+00:00"
+    },
+    "ripple": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:bc161d2c68a251113c7664ac606ef943891330dfce97d52a32fb87e1cd87db2d",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "gemini": [
+          "speckit.ripple.scan",
+          "speckit.ripple.resolve",
+          "speckit.ripple.check"
+        ],
+        "kilocode": [
+          "speckit.ripple.scan",
+          "speckit.ripple.resolve",
+          "speckit.ripple.check"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-05-10T08:59:02.366635+00:00"
     }
   }
 }

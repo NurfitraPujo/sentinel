@@ -1,9 +1,8 @@
 <script lang="ts">
 	import '../app.css';
-	import { session } from '$app/stores';
 	import type { LayoutData } from './$types';
 
-	export let data: LayoutData;
+	let { data, children } = $props();
 </script>
 
 <div class="app">
@@ -20,7 +19,7 @@
 	</header>
 
 	<main>
-		<slot />
+		{@render children()}
 	</main>
 </div>
 

@@ -14,10 +14,21 @@ var (
 	credentialRegex = regexp.MustCompile(`(?i)(credential|client[_-]?secret|private[_-]?key)\s*[=:]\s*["']?([a-zA-Z0-9_\-\+\=/]{20,})["']?`)
 	bearerRegex     = regexp.MustCompile(`(?i)bearer\s+([a-zA-Z0-9_\-\.]+)`)
 
-	sensitiveKeys = []string{
-		"password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
-		"api_key", "apiKey", "auth", "credential", "credentials", "private_key",
-		"client_secret", "access_token", "refresh_token",
+	sensitiveKeys = map[string]struct{}{
+		"password":      {},
+		"passwd":        {},
+		"pwd":           {},
+		"secret":        {},
+		"token":         {},
+		"api_key":       {},
+		"apikey":        {},
+		"auth":          {},
+		"credential":    {},
+		"credentials":   {},
+		"private_key":   {},
+		"client_secret": {},
+		"access_token":  {},
+		"refresh_token": {},
 	}
 )
 
@@ -77,10 +88,6 @@ func (m *Masker) MaskSlice(s []interface{}) []interface{} {
 
 func (m *Masker) isSensitiveKey(key string) bool {
 	lowerKey := strings.ToLower(key)
-	for _, sensitive := range sensitiveKeys {
-		if strings.Contains(lowerKey, sensitive) {
-			return true
-		}
-	}
-	return false
+	_, found := sensitiveKeys[lowerKey]
+	return found
 }

@@ -15,7 +15,7 @@ import (
 
 type Processor struct {
 	db          *pgxpool.Pool
-	store       *store.Store
+	store       store.IssueStore
 	indexer     *indexer.Indexer
 	degradation *degradation.GracefulDegradation
 }
@@ -72,11 +72,7 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 		return err
 	}
 
-	var issueID string
-	err = p.db.QueryRow(ctx,
-		"SELECT id FROM issues WHERE project_id = $1 AND fingerprint = $2",
-		projectID, evt.Fingerprint,
-	).Scan(&issueID)
+	issueID, err := p.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
 	if err != nil {
 		log.Printf("Failed to get issue ID: %v", err)
 		return err

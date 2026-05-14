@@ -188,6 +188,13 @@ hooks:
     prompt: Would you like to scan the new implementation for security vulnerabilities?
     description: ''
     condition: null
+  - extension: ripple
+    command: speckit.ripple.scan
+    enabled: true
+    optional: true
+    prompt: Scan for untested side effects?
+    description: Auto-scan for ripple effects after implementation
+    condition: null
   after_checklist:
   - extension: git
     command: speckit.git.commit

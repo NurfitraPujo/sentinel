@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { PageData } from './$types';
 
-	export let data: PageData;
+	let { data } = $props();
 
 	function formatDate(date: string | Date | null): string {
 		if (!date) return 'Never';

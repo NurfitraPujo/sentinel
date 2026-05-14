@@ -31,6 +31,29 @@ Implement a high-performance error tracking system consisting of a Go-based inge
 | Google Workspace Auth | PASS | Planned for Dashboard authentication. |
 | Domain-Driven Design | PASS | Logic for fingerprinting and masking resides in domain layer. |
 
+## Architecture
+
+### CQRS Lite Enforcement
+The **Processor** layer is strictly forbidden from performing direct database queries. All data access must go through the `Store` abstraction, which must explicitly separate Command (write) and Query (read) interfaces. This ensures that processing logic remains decoupled from persistence and maintains the integrity of the "write" side of the system.
+
+The **Dashboard** (UI layer) is strictly forbidden from direct database knowledge. All data retrieval must be encapsulated within a dedicated `QueryService`. SvelteKit loaders and actions must only interact with this service, ensuring that the "read" side of the system is isolated from the underlying schema and Drizzle ORM implementation.
+
+## Architectural Standards
+
+### Fingerprinting
+Error fingerprinting must use the `file:function` format for stack trace analysis. Custom fingerprints provided by clients must be mandatory hashed before storage to ensure consistent indexing and prevent collision with system-generated keys.
+
+### Contract Layer
+Protobuf definitions in `packages/proto` must enforce validation of metadata size. The aggregate size of the `metadata` field in error events must not exceed 64KB to ensure performance and prevent resource exhaustion during ingestion and processing.
+
+## Security Standards
+
+### Authorization & Multi-tenancy
+All dashboard data access must strictly enforce project ownership. Every server-side load function and action (SvelteKit) that takes a resource ID (Issue, Occurrence, Project) must verify that the authenticated user's organization has a valid role for that specific project.
+
+### Data Protection (PII Masking)
+The PII masking engine in the processing layer must use high-precision matching. Sensitive keys (e.g., `password`, `token`) must be matched exactly or via scoped regex to prevent the "over-redaction" of non-sensitive metadata that happens with broad substring matching.
+
 ## Project Structure
 
 ### Documentation (this feature)
@@ -51,6 +74,7 @@ specs/001-sentinel-error-service/
 ```text
 apps/
 ├── ingestor-go/         # HTTP API for error ingestion
+│   └── service/         # Ingestion orchestration logic (prevents handler leakage)
 ├── processor-go/        # NATS consumer for grouping/masking
 └── dashboard-web/       # SvelteKit interface
 

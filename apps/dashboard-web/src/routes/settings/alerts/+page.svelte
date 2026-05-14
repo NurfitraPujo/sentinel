@@ -2,7 +2,7 @@
 	import { enhance } from '$app/forms';
 	import type { PageData } from './$types';
 
-	export let data: PageData;
+	let { data } = $props();
 
 	interface AlertConfig {
 		id: string;
@@ -12,20 +12,20 @@
 		frequencyThreshold: number;
 		windowSeconds: number;
 		enabled: boolean;
-		createdAt: Date;
+		createdAt: Date | null;
 	}
 
-	let selectedProjectId = '';
-	let channel = 'email';
-	let channelTarget = '';
-	let frequencyThreshold = 50;
-	let windowSeconds = 60;
-	let enabled = true;
-	let isSubmitting = false;
-	let editMode = false;
-	let editingConfig: AlertConfig | null = null;
+	let selectedProjectId = $state('');
+	let channel = $state('email');
+	let channelTarget = $state('');
+	let frequencyThreshold = $state(50);
+	let windowSeconds = $state(60);
+	let enabled = $state(true);
+	let isSubmitting = $state(false);
+	let editMode = $state(false);
+	let editingConfig = $state<AlertConfig | null>(null);
 
-	$: editableAlertConfigIds = new Set(data.editableAlertConfigs.map((c: AlertConfig) => c.id));
+	let editableAlertConfigIds = $derived(new Set(data.editableAlertConfigs.map((c: AlertConfig) => c.id)));
 
 	function getProjectName(projectId: string): string {
 		const project = data.projects.find((p: { id: string; name: string }) => p.id === projectId);
@@ -169,7 +169,7 @@
 
 				<div class="form-actions">
 					{#if editMode}
-						<button type="button" on:click={cancelEdit}>Cancel</button>
+						<button type="button" onclick={cancelEdit}>Cancel</button>
 					{/if}
 					<button type="submit" disabled={isSubmitting}>
 						{editMode ? 'Update Alert' : 'Create Alert'}
@@ -208,7 +208,7 @@
 								</td>
 								<td>
 									{#if hasWritePermission(config.projectId)}
-										<button type="button" on:click={() => startEdit(config)}>Edit</button>
+										<button type="button" onclick={() => startEdit(config)}>Edit</button>
 									{:else}
 										<span class="no-permission">View only</span>
 									{/if}

@@ -23,8 +23,8 @@ export interface SearchResult {
 	errorClass: string;
 	status: string;
 	count: number;
-	firstSeen: Date;
-	lastSeen: Date;
+	firstSeen: Date | null;
+	lastSeen: Date | null;
 	projectName: string;
 	matchingOccurrence: {
 		id: string;
@@ -35,7 +35,7 @@ export interface SearchResult {
 		requestId: string | null;
 		userId: string | null;
 		tenantId: string | null;
-		createdAt: Date;
+		createdAt: Date | null;
 	};
 }
 
@@ -163,7 +163,7 @@ export async function searchErrors(
 		.offset(offset);
 
 	let countQuery = db
-		.select({ count: sql<number>`count(DISTINCT ${issues.id})` })
+		.select({ count: sql<number>`cast(count(DISTINCT ${issues.id}) as integer)` })
 		.from(issues)
 		.innerJoin(errorOccurrences, eq(errorOccurrences.issueId, issues.id))
 		.innerJoin(errorSearchIndex, eq(errorSearchIndex.occurrenceId, errorOccurrences.id));
@@ -179,9 +179,11 @@ export async function searchErrors(
 		countConditions.push(or(...searchConditions));
 	}
 
-	const [{ count: total }] = countConditions.length > 0
+	const countResult = countConditions.length > 0
 		? await countQuery.where(and(...countConditions))
 		: await countQuery;
+	
+	const total = countResult[0]?.count ?? 0;
 
 	const searchResults: SearchResult[] = results.map(row => ({
 		issueId: row.issueId,
