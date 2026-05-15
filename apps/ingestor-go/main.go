@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,7 +26,7 @@ func main() {
 
 	dbCfg := database.Config{
 		Host:            getEnv("POSTGRES_HOST", "localhost"),
-		Port:            5432,
+		Port:            getEnvInt("POSTGRES_PORT", 5432),
 		User:            getEnv("POSTGRES_USER", "sentinel"),
 		Password:        getEnv("POSTGRES_PASSWORD", "changeme"),
 		Database:        getEnv("POSTGRES_DB", "sentinel"),
@@ -35,9 +36,23 @@ func main() {
 		MaxConnIdleTime: 10 * time.Minute,
 	}
 
-	db, err := database.NewConnection(ctx, dbCfg)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+	// Retry database connection with timeout
+	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer connCancel()
+
+	var db *pgxpool.Pool
+	var err error
+	for {
+		db, err = database.NewConnection(connCtx, dbCfg)
+		if err == nil {
+			break
+		}
+		select {
+		case <-connCtx.Done():
+			log.Fatalf("Failed to connect to database after 30s timeout: %v", err)
+		case <-time.After(500 * time.Millisecond):
+			log.Printf("Retrying database connection: %v", err)
+		}
 	}
 	defer db.Close()
 
@@ -112,6 +127,7 @@ func handleIngest(svc *service.IngestService) http.HandlerFunc {
 			return
 		}
 
+		log.Printf("Successfully ingested error: project=%s, class=%s", payload.ProjectKey, payload.ErrorClass)
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 	}
@@ -131,6 +147,15 @@ func handleHealth(db *pgxpool.Pool) http.HandlerFunc {
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if s := os.Getenv(key); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			return v
+		}
 	}
 	return defaultValue
 }

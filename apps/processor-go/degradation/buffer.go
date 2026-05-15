@@ -103,7 +103,7 @@ func (g *GracefulDegradation) CheckAndBuffer(ctx context.Context, event []byte) 
 }
 
 func (g *GracefulDegradation) Flush(ctx context.Context, processor func([]byte) error) int {
-	if g.IsAvailable() {
+	if !g.IsAvailable() {
 		return 0
 	}
 

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
@@ -28,37 +28,14 @@ type TestConfig struct {
 	IngesterURL      string
 }
 
-func getTestConfig() TestConfig {
-	return TestConfig{
-		PostgresHost:     getEnv("POSTGRES_HOST", "localhost"),
-		PostgresUser:     getEnv("POSTGRES_USER", "sentinel"),
-		PostgresPassword: getEnv("POSTGRES_PASSWORD", "changeme"),
-		PostgresDB:       getEnv("POSTGRES_DB", "sentinel"),
-		NATSURL:          getEnv("NATS_URL", "nats://localhost:4222"),
-		IngesterURL:      getEnv("INGESTOR_URL", "http://localhost:8080"),
-	}
-}
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func skipIfNoInfrastructure(t *testing.T) {
-	if os.Getenv("TEST_SKIP_INTEGRATION") == "true" {
-		t.Skip("Skipping integration test: TEST_SKIP_INTEGRATION is set")
-	}
-}
-
 func newPostgresPool(t *testing.T, cfg TestConfig) *pgxpool.Pool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.New(ctx, fmt.Sprintf(
-		"postgres://%s:%s@%s:5432/%s?sslmode=disable",
-		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost, cfg.PostgresDB,
+		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost,
+		os.Getenv("POSTGRES_PORT"), cfg.PostgresDB,
 	))
 	if err != nil {
 		t.Skipf("Skipping: cannot connect to postgres: %v", err)
@@ -75,10 +52,10 @@ func newPostgresPool(t *testing.T, cfg TestConfig) *pgxpool.Pool {
 func createTestProject(t *testing.T, pool *pgxpool.Pool, projectName, apiKey string) string {
 	var projectID string
 	err := pool.QueryRow(context.Background(),
-		`INSERT INTO projects (name, api_key, api_key_hash) 
-		 VALUES ($1, $2, encode(sha256($2::bytea), 'hex')) 
+		`INSERT INTO projects (name, api_key, api_key_hash)
+		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'))
 		 RETURNING id::text`,
-		projectName, apiKey,
+		projectName, apiKey, apiKey,
 	).Scan(&projectID)
 	if err != nil {
 		t.Fatalf("Failed to create test project: %v", err)
@@ -117,10 +94,10 @@ func sendErrorEvent(t *testing.T, ingesterURL, apiKey string, payload map[string
 func getIssueCount(t *testing.T, pool *pgxpool.Pool, projectID, fingerprint string) int64 {
 	var count int64
 	err := pool.QueryRow(context.Background(),
-		`SELECT count FROM issues WHERE project_id = $1 AND fingerprint = $2`,
+		`SELECT i.count FROM issues i WHERE i.project_id = $1 AND i.fingerprint = $2`,
 		projectID, fingerprint,
 	).Scan(&count)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return 0
 	}
 	if err != nil {
@@ -136,7 +113,7 @@ func getIssueByFingerprint(t *testing.T, pool *pgxpool.Pool, projectID, fingerpr
 		`SELECT id::text, count FROM issues WHERE project_id = $1 AND fingerprint = $2`,
 		projectID, fingerprint,
 	).Scan(&id, &count)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return "", 0
 	}
 	if err != nil {
@@ -151,8 +128,8 @@ func computeFingerprint(errorClass string, stacktrace []map[string]interface{}) 
 	for _, frame := range stacktrace {
 		if inApp, ok := frame["in_app"].(bool); ok && inApp {
 			file := frame["file"].(string)
-			line := int(frame["line"].(float64))
-			appFrames = append(appFrames, fmt.Sprintf("%s:%d", file, line))
+			function := frame["function"].(string)
+			appFrames = append(appFrames, fmt.Sprintf("%s:%s", file, function))
 			if len(appFrames) >= maxAppFrames {
 				break
 			}
@@ -169,8 +146,14 @@ func computeFingerprint(errorClass string, stacktrace []map[string]interface{}) 
 }
 
 func TestIngestAndProcess(t *testing.T) {
-	skipIfNoInfrastructure(t)
-	cfg := getTestConfig()
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+		NATSURL:          os.Getenv("NATS_URL"),
+		IngesterURL:      os.Getenv("INGESTOR_URL"),
+	}
 	pool := newPostgresPool(t, cfg)
 	defer pool.Close()
 
@@ -179,6 +162,19 @@ func TestIngestAndProcess(t *testing.T) {
 
 	projectID := createTestProject(t, pool, projectName, apiKey)
 	defer cleanupProject(t, pool, projectID)
+
+	// Debug: verify project was created and show count
+	var projCount int64
+	pool.QueryRow(context.Background(), "SELECT count(*) FROM projects").Scan(&projCount)
+	t.Logf("Created project: name=%s, id=%s, api_key=%s, total projects in DB=%d", projectName, projectID, apiKey, projCount)
+
+	// Debug: verify project exists by fetching it back
+	var verifyName string
+	err := pool.QueryRow(context.Background(), "SELECT name FROM projects WHERE id = $1", projectID).Scan(&verifyName)
+	if err != nil {
+		t.Fatalf("Failed to verify project exists after creation: %v", err)
+	}
+	t.Logf("Verified project exists: id=%s, name=%s", projectID, verifyName)
 
 	payload := map[string]interface{}{
 		"project_key": projectName,
@@ -207,6 +203,12 @@ func TestIngestAndProcess(t *testing.T) {
 
 	fingerprint := computeFingerprint("TestError", payload["stacktrace"].([]map[string]interface{}))
 	count := getIssueCount(t, pool, projectID, fingerprint)
+
+	// Debug: log issue count
+	var dbCount int64
+	pool.QueryRow(context.Background(), "SELECT count(*) FROM issues WHERE project_id = $1", projectID).Scan(&dbCount)
+	t.Logf("Issue count check: fingerprint=%s, countFromFn=%d, countDirect=%d", fingerprint, count, dbCount)
+
 	assert.Equal(t, int64(1), count, "Expected issue count to be 1 after first event")
 
 	for i := 0; i < 9; i++ {
@@ -221,8 +223,14 @@ func TestIngestAndProcess(t *testing.T) {
 }
 
 func TestSearchIndexing(t *testing.T) {
-	skipIfNoInfrastructure(t)
-	cfg := getTestConfig()
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+		NATSURL:          os.Getenv("NATS_URL"),
+		IngesterURL:      os.Getenv("INGESTOR_URL"),
+	}
 	pool := newPostgresPool(t, cfg)
 	defer pool.Close()
 
@@ -281,8 +289,14 @@ func TestSearchIndexing(t *testing.T) {
 }
 
 func TestFingerprinting(t *testing.T) {
-	skipIfNoInfrastructure(t)
-	cfg := getTestConfig()
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+		NATSURL:          os.Getenv("NATS_URL"),
+		IngesterURL:      os.Getenv("INGESTOR_URL"),
+	}
 	pool := newPostgresPool(t, cfg)
 	defer pool.Close()
 

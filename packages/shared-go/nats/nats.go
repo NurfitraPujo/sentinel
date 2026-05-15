@@ -67,7 +67,7 @@ func NewPublisher(ctx context.Context, cfg PublisherConfig) (*Publisher, error) 
 }
 
 func (p *Publisher) Publish(ctx context.Context, data []byte) error {
-	_, err := p.js.PublishAsync(p.subject, data)
+	_, err := p.js.Publish(p.subject, data, nats.Context(ctx))
 	if err != nil {
 		return fmt.Errorf("failed to publish message: %w", err)
 	}

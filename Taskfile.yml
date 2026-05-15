@@ -1,0 +1,171 @@
+version: "3"
+
+dotenv: [".env"]
+
+env:
+    BASH_ENV: ~/.bashrc
+    TESTCONTAINERS_PROVIDER: '{{.TESTCONTAINERS_PROVIDER | default "docker"}}'
+
+tasks:
+    # ============ Database ============
+
+    db-migrate:
+        desc: Run database migrations
+        cmds:
+            - docker compose exec -T postgres psql -U sentinel -d sentinel -f /docker-entrypoint-initdb.d/init.sql
+
+    db-reset:
+        desc: Reset database (drop and recreate)
+        cmds:
+            - docker compose down -v
+            - docker compose up -d postgres
+            - sleep 3
+            - task: db-migrate
+
+    db-rollback:
+        desc: Rollback last migration
+        cmds:
+            - echo "Manual rollback required - implement based on migration tool"
+
+    db-shell:
+        desc: Open PostgreSQL shell
+        cmds:
+            - docker compose exec postgres psql -U sentinel -d sentinel
+
+    # ============ NATS ============
+
+    nats-init:
+        desc: Initialize NATS JetStream
+        cmds:
+            - ./scripts/nats-init.sh
+
+    nats-shell:
+        desc: Open NATS CLI shell
+        cmds:
+            - docker compose exec nats nats-server -c /etc/nats/nats-server.conf
+
+    # ============ Infrastructure ============
+
+    infra-up:
+        desc: Start all infrastructure services
+        cmds:
+            - docker compose up -d
+
+    infra-down:
+        desc: Stop all infrastructure services
+        cmds:
+            - docker compose down
+
+    infra-logs:
+        desc: Tail infrastructure logs
+        cmds:
+            - docker compose logs -f
+
+    # ============ Build ============
+
+    build:
+        desc: Build all applications
+        cmds:
+            - task: build-ingestor
+            - task: build-processor
+            - task: build-dashboard
+
+    build-ingestor:
+        desc: Build ingestor-go
+        dir: apps/ingestor-go
+        cmds:
+            - go build -o bin/ingestor .
+
+    build-processor:
+        desc: Build processor-go
+        dir: apps/processor-go
+        cmds:
+            - go build -o bin/processor .
+
+    build-dashboard:
+        desc: Build dashboard-web
+        dir: apps/dashboard-web
+        cmds:
+            - pnpm install
+            - pnpm build
+
+    # ============ Development ============
+
+    dev-ingestor:
+        desc: Run ingestor in development
+        dir: apps/ingestor-go
+        cmds:
+            - go run .
+
+    dev-processor:
+        desc: Run processor in development
+        dir: apps/processor-go
+        cmds:
+            - go run .
+
+    dev-dashboard:
+        desc: Run dashboard in development
+        dir: apps/dashboard-web
+        cmds:
+            - pnpm dev
+
+    # ============ Testing ============
+
+    test-unit:
+        desc: Run unit tests
+        cmds:
+            - go test ./tests/unit/... -v
+
+    test-integration:
+        desc: Run integration tests with testcontainers
+        env:
+            TESTCONTAINERS_PROVIDER: '{{.TESTCONTAINERS_PROVIDER | default "docker"}}'
+        cmds:
+            - go test ./tests/integration/... -v -count=1
+
+    test-load:
+        desc: Run load tests
+        cmds:
+            - go test ./tests/load/... -v -count=1
+
+    test-all:
+        desc: Run all tests
+        cmds:
+            - task: test-unit
+            - task: test-integration
+
+    test-e2e:
+        desc: Full E2E test with infrastructure
+        cmds:
+            - task: infra-up
+            - sleep 5
+            - task: db-migrate
+            - task: nats-init
+            - task: test-integration
+            - task: infra-down
+
+    # ============ Docker ============
+
+    docker-build:
+        desc: Build all Docker images
+        cmds:
+            - docker compose build
+
+    docker-push:
+        desc: Push Docker images to registry
+        cmds:
+            - docker compose push
+
+    # ============ Cleanup ============
+
+    clean:
+        desc: Clean up containers and build artifacts
+        cmds:
+            - docker compose down -v --rmi local
+            - rm -rf apps/*/bin apps/dashboard-web/build
+
+    clean-all:
+        desc: Full cleanup including node_modules
+        cmds:
+            - task: clean
+            - rm -rf apps/dashboard-web/node_modules

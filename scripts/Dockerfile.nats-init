@@ -1,0 +1,4 @@
+FROM natsio/nats-box:latest
+COPY nats-init.sh /scripts/nats-init.sh
+RUN chmod +x /scripts/nats-init.sh
+ENTRYPOINT ["/bin/sh", "/scripts/nats-init.sh"]

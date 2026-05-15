@@ -1,6 +1,9 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- Enable pgcrypto for digest() function
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 -- Projects table
 CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -23,7 +26,8 @@ CREATE TABLE IF NOT EXISTS issues (
     status VARCHAR(20) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved', 'ignored')),
     first_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    count BIGINT NOT NULL DEFAULT 1
+    count BIGINT NOT NULL DEFAULT 1,
+    UNIQUE (project_id, fingerprint)
 );
 
 CREATE INDEX idx_issues_project_id ON issues(project_id);

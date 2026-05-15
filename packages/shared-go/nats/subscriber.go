@@ -11,6 +11,7 @@ import (
 type SubscriberConfig struct {
 	URL         string
 	Stream      string
+	Subject     string
 	Consumer    string
 	BatchSize   int
 	BatchWait   time.Duration
@@ -68,7 +69,7 @@ func NewSubscriber(ctx context.Context, cfg SubscriberConfig) (*Subscriber, erro
 }
 
 func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) error {
-	sub, err := s.js.PullSubscribe(s.cfg.Consumer, s.cfg.Stream)
+	sub, err := s.js.PullSubscribe(s.cfg.Subject, s.cfg.Consumer, nats.BindStream(s.cfg.Stream))
 	if err != nil {
 		return fmt.Errorf("failed to create pull subscription: %w", err)
 	}
@@ -86,7 +87,9 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) 
 					if ctx.Err() != nil {
 						return
 					}
-					s.errors <- err
+					if err != nats.ErrTimeout {
+						s.errors <- err
+					}
 					continue
 				}
 

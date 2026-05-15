@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 NATS_URL="${NATS_URL:-nats://localhost:4222}"
@@ -7,7 +7,7 @@ SUBJECT="error_events"
 CONSUMER_NAME="processor-consumer"
 
 echo "Waiting for NATS to be ready..."
-until nats server check --server "$NATS_URL" 2>/dev/null; do
+until nats server check connection --server "$NATS_URL" 2>/dev/null; do
   sleep 1
 done
 
@@ -20,13 +20,15 @@ nats stream add "$STREAM_NAME" \
   --max-bytes=-1 \
   --storage=file \
   --replicas=1 \
-  --discard=new
+  --discard=new \
+  --defaults
 
 echo "Creating consumer $CONSUMER_NAME..."
-nats consumer add "$STREAM_NAME" \
+nats consumer add "$STREAM_NAME" "$CONSUMER_NAME" \
   --server "$NATS_URL" \
-  --consumer="$CONSUMER_NAME" \
+  --pull \
   --deliver=all \
-  --ack=none
+  --ack=explicit \
+  --defaults
 
 echo "NATS JetStream initialization complete."

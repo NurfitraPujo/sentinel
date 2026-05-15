@@ -100,6 +100,12 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
+	if searchEntry.TraceID == "" {
+		searchEntry.TraceID = evt.TraceID
+	}
+	if searchEntry.SpanID == "" {
+		searchEntry.SpanID = evt.SpanID
+	}
 
 	if err := p.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
 		log.Printf("Failed to index occurrence: %v", err)

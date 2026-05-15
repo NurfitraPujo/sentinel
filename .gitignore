@@ -38,3 +38,6 @@ apps/dashboard-web/build
 apps/dashboard-web/.svelte-kit
 
 node_modules
+
+.worktrees
+worktrees
