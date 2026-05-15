@@ -5,6 +5,7 @@ import { eq, desc, sql, and, type SQL } from "drizzle-orm";
 export interface IssueFilters {
     status?: string;
     projectId?: string;
+    projectIds?: string[];
 }
 
 export const issueQueries = {
@@ -38,6 +39,10 @@ export const issueQueries = {
             conditions.push(eq(issues.projectId, filters.projectId));
         }
 
+        if (filters.projectIds && filters.projectIds.length > 0) {
+            conditions.push(eq(issues.projectId, filters.projectIds[0]));
+        }
+
         const results = await db
             .select({
                 id: issues.id,
@@ -68,6 +73,10 @@ export const issueQueries = {
 
         if (filters.projectId && filters.projectId !== "all") {
             conditions.push(eq(issues.projectId, filters.projectId));
+        }
+
+        if (filters.projectIds && filters.projectIds.length > 0) {
+            conditions.push(eq(issues.projectId, filters.projectIds[0]));
         }
 
         const totalResult = await db

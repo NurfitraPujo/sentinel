@@ -2,6 +2,7 @@ import type { PageServerLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getUser } from '$lib/server/auth';
+import { getUserProjectAccess } from '$lib/server/projects';
 
 export const load: PageServerLoad = async ({ url, locals }) => {
 	const user = await getUser({ locals } as any);
@@ -9,6 +10,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	if (!user) {
 		redirect(303, '/auth/signin');
 	}
+	
+	const userAccess = await getUserProjectAccess(user.id);
+	const authorizedProjectIds = userAccess.map(a => a.projectId);
 	
 	const statusFilter = url.searchParams.get('status') ?? 'all';
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
@@ -18,6 +22,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const filters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
+		projectIds: authorizedProjectIds,
 	};
 
 	const [results, userProjects, total] = await Promise.all([

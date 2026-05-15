@@ -34,6 +34,13 @@ hooks:
     prompt: Commit outstanding changes before planning?
     description: Auto-commit before implementation planning
     condition: null
+  - extension: memory-md
+    command: speckit.memory-md.plan-with-memory
+    enabled: true
+    optional: true
+    prompt: Would you like to synthesize project memory before planning?
+    description: ''
+    condition: null
   before_tasks:
   - extension: git
     command: speckit.git.commit
@@ -194,6 +201,14 @@ hooks:
     optional: true
     prompt: Scan for untested side effects?
     description: Auto-scan for ripple effects after implementation
+    condition: null
+  - extension: memory-md
+    command: speckit.memory-md.capture-from-diff
+    enabled: true
+    optional: true
+    prompt: Would you like to capture durable lessons from this implementation to
+      project memory?
+    description: ''
     condition: null
   after_checklist:
   - extension: git
