@@ -1,21 +1,22 @@
-# Implementation Plan: Sentinel Error Service
+# Implementation Plan: Sentinel Error Service - Magic Link Auth
 
-**Branch**: `001-sentinel-error-service` | **Date**: 2026-05-09 | **Spec**: [spec.md](spec.md)
-**Input**: Feature specification from `/specs/001-sentinel-error-service/spec.md`
+**Branch**: `001-sentinel-error-service` | **Date**: 2026-05-15 | **Spec**: [spec.md](spec.md)
+**Input**: Feature specification from `/specs/001-sentinel-error-service/spec.md` + user requirement for magic link authentication
 
 ## Summary
-Implement a high-performance error tracking system consisting of a Go-based ingestion and processing pipeline, NATS JetStream for async messaging, and a SvelteKit dashboard. The system will de-duplicate errors into issues, perform server-side PII masking, and provide a searchable interface for root-cause analysis.
+
+Add magic link authentication as a fallback for local development environments where Google Workspace OIDC is unavailable. Uses Auth.js built-in Email provider for magic link support rather than custom implementation.
 
 ## Technical Context
 
 **Language/Version**: Go 1.22+, TypeScript 5.0+, Node.js 20+  
-**Primary Dependencies**: NATS JetStream, PostgreSQL 15+, SvelteKit, Google Auth Library  
-**Storage**: PostgreSQL (Occurrences, Issues, Projects)  
+**Primary Dependencies**: SvelteKit, Drizzle ORM, pgx/v5, NATS JetStream, Auth.js (SvelteKit), Google Auth Library  
+**Storage**: PostgreSQL 15+  
 **Testing**: Go `testing` package (Workers), Vitest/Playwright (Dashboard)  
-**Target Platform**: Kubernetes / Dockerized Environment  
+**Target Platform**: Kubernetes / Dockerized Environment + Local Development  
 **Project Type**: Web Service + Background Workers  
 **Performance Goals**: Ingestion < 50ms, Processing < 200ms, Search < 1s  
-**Constraints**: < 1% error drop rate during ingestion, PII masking mandatory  
+**Constraints**: Magic link tokens must expire within 15 minutes; tokens are single-use; local auth must not bypass project RBAC  
 **Scale/Scope**: 1k+ events per second (throttled via NATS)
 
 ## Constitution Check
@@ -28,31 +29,32 @@ Implement a high-performance error tracking system consisting of a Go-based inge
 | Explicit Contracts (Protos) | PASS | Defining error event schema in `packages/proto`. |
 | CQRS Lite Pattern | PASS | Separating ingestion (write) from dashboard (read). |
 | Async Processing (NATS) | PASS | Using NATS JetStream between Ingestor and Processor. |
-| Google Workspace Auth | PASS | Planned for Dashboard authentication. |
-| Domain-Driven Design | PASS | Logic for fingerprinting and masking resides in domain layer. |
-
-## Architecture
-
-### CQRS Lite Enforcement
-The **Processor** layer is strictly forbidden from performing direct database queries. All data access must go through the `Store` abstraction, which must explicitly separate Command (write) and Query (read) interfaces. This ensures that processing logic remains decoupled from persistence and maintains the integrity of the "write" side of the system.
-
-The **Dashboard** (UI layer) is strictly forbidden from direct database knowledge. All data retrieval must be encapsulated within a dedicated `QueryService`. SvelteKit loaders and actions must only interact with this service, ensuring that the "read" side of the system is isolated from the underlying schema and Drizzle ORM implementation.
-
-## Architectural Standards
-
-### Fingerprinting
-Error fingerprinting must use the `file:function` format for stack trace analysis. Custom fingerprints provided by clients must be mandatory hashed before storage to ensure consistent indexing and prevent collision with system-generated keys.
-
-### Contract Layer
-Protobuf definitions in `packages/proto` must enforce validation of metadata size. The aggregate size of the `metadata` field in error events must not exceed 64KB to ensure performance and prevent resource exhaustion during ingestion and processing.
+| Google Workspace Auth | PASS | Planned for production dashboard authentication. |
+| Domain-Driven Design | PASS | Logic for authentication resides in domain layer. |
+| Auth.js Provider Pattern | PASS | Using Auth.js Email provider instead of custom auth abstraction |
 
 ## Security Standards
 
 ### Authorization & Multi-tenancy
 All dashboard data access must strictly enforce project ownership. Every server-side load function and action (SvelteKit) that takes a resource ID (Issue, Occurrence, Project) must verify that the authenticated user's organization has a valid role for that specific project.
 
-### Data Protection (PII Masking)
-The PII masking engine in the processing layer must use high-precision matching. Sensitive keys (e.g., `password`, `token`) must be matched exactly or via scoped regex to prevent the "over-redaction" of non-sensitive metadata that happens with broad substring matching.
+### Magic Link Authentication (via Auth.js Email Provider)
+- Tokens are managed by Auth.js (not stored in our database directly)
+- Tokens are cryptographically random (min 32 bytes) - handled by Auth.js
+- Tokens expire within 15 minutes of generation - configurable in Auth.js
+- Tokens are single-use - handled by Auth.js token invalidation
+- Magic link auth MUST NOT bypass RBAC - authenticated user still requires project membership
+- Email sender MUST be configurable (SMTP)
+
+## Architectural Standards
+
+### Auth.js Integration
+The dashboard uses Auth.js for authentication. Adding magic link support means:
+- Adding Auth.js Email provider to existing providers array
+- Configuring SMTP adapter for email delivery
+- Using existing session storage and RBAC integration
+
+No custom `AuthProvider` interface needed - Auth.js handles provider abstraction internally.
 
 ## Project Structure
 
@@ -65,8 +67,7 @@ specs/001-sentinel-error-service/
 ├── data-model.md        # Phase 1 output
 ├── quickstart.md        # Phase 1 output
 ├── contracts/           # Proto definitions
-└── checklists/
-    └── requirements.md  # Spec quality checklist
+└── tasks.md             # Phase 2 output
 ```
 
 ### Source Code (repository root)
@@ -74,9 +75,13 @@ specs/001-sentinel-error-service/
 ```text
 apps/
 ├── ingestor-go/         # HTTP API for error ingestion
-│   └── service/         # Ingestion orchestration logic (prevents handler leakage)
+│   └── service/         # Ingestion orchestration logic
 ├── processor-go/        # NATS consumer for grouping/masking
 └── dashboard-web/       # SvelteKit interface
+    └── src/lib/
+        ├── auth.ts     # Auth.js config (Google + Email providers)
+        ├── email/      # Email/SMTP utilities
+        └── server/     # Server-side logic (RBAC, audit)
 
 packages/
 ├── proto/               # Shared protobuf definitions
@@ -84,8 +89,14 @@ packages/
 └── tailwind-config/     # Shared styles
 ```
 
-**Structure Decision**: Adhering to the Modular Monolith pattern defined in the Architecture Constitution.
+**Structure Decision**: Adhering to the Modular Monolith pattern. Magic link auth is implemented within existing Auth.js framework, adding only SMTP configuration and email templates.
 
 ## Complexity Tracking
 
-*No violations detected. Plan strictly follows the Constitution.*
+*No violations detected. Plan uses Auth.js built-in Email provider for magic link, avoiding custom implementation.*
+
+---
+
+**Generated Artifacts**:
+- Plan: `/home/fitrapujo/oss/sentinel/specs/001-sentinel-error-service/plan.md`
+- Branch: `001-sentinel-error-service`
