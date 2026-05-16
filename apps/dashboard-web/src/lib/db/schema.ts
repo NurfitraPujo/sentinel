@@ -58,4 +58,21 @@ export const alertConfigs = pgTable('alert_configs', {
 	windowSeconds: integer('window_seconds').notNull().default(60),
 	enabled: boolean('enabled').notNull().default(true),
 	createdAt: timestamp('created_at').defaultNow(),
-});
+	});
+
+	export const auditLogs = pgTable('audit_logs', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	action: varchar('action', { length: 100 }).notNull(),
+	resourceType: varchar('resource_type', { length: 50 }),
+	resourceId: uuid('resource_id'),
+	actorId: varchar('actor_id', { length: 255 }).notNull(),
+	metadata: jsonb('metadata').notNull().default({}),
+	createdAt: timestamp('created_at').defaultNow(),
+	});
+
+	export const settings = pgTable('settings', {
+	key: varchar('key', { length: 255 }).primaryKey(),
+	value: text('value').notNull(),
+	createdAt: timestamp('created_at').defaultNow(),
+	updatedAt: timestamp('updated_at').defaultNow(),
+	});

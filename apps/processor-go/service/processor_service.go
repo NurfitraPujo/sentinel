@@ -1,8 +1,9 @@
-package main
+package service
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/degradation"
@@ -13,15 +14,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Processor struct {
+type ProcessorService struct {
 	db          *pgxpool.Pool
 	store       store.IssueStore
 	indexer     *indexer.Indexer
 	degradation *degradation.GracefulDegradation
 }
 
-func NewProcessor(db *pgxpool.Pool) *Processor {
-	return &Processor{
+func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
+	return &ProcessorService{
 		db:      db,
 		store:   store.NewStore(db),
 		indexer: indexer.NewIndexer(db),
@@ -31,16 +32,16 @@ func NewProcessor(db *pgxpool.Pool) *Processor {
 	}
 }
 
-func (p *Processor) ProcessEvent(ctx context.Context, data []byte) error {
-	if !p.degradation.CheckAndBuffer(ctx, data) {
+func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) error {
+	if !s.degradation.CheckAndBuffer(ctx, data) {
 		log.Printf("Event buffered due to database unavailability")
 		return nil
 	}
 
-	return p.processEventInternal(ctx, data)
+	return s.processEventInternal(ctx, data)
 }
 
-func (p *Processor) processEventInternal(ctx context.Context, data []byte) error {
+func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {
 	evt, err := event.Deserialize(data)
 	if err != nil {
 		log.Printf("Failed to deserialize event: %v", err)
@@ -50,7 +51,7 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 	log.Printf("Processing event: project=%s, error_class=%s, fingerprint=%s",
 		evt.ProjectKey, evt.ErrorClass, evt.Fingerprint)
 
-	projectID, err := p.store.GetProjectByKey(ctx, evt.ProjectKey)
+	projectID, err := s.store.GetProjectByKey(ctx, evt.ProjectKey)
 	if err != nil {
 		log.Printf("Failed to get project: %v", err)
 		return err
@@ -67,12 +68,21 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 		LastSeen:    evt.Timestamp,
 	}
 
-	if err := p.store.UpsertIssue(ctx, issue); err != nil {
+	if err := s.store.UpsertIssue(ctx, issue); err != nil {
 		log.Printf("Failed to upsert issue: %v", err)
 		return err
 	}
 
-	issueID, err := p.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "issue_upserted",
+		ResourceType: "issue",
+		ResourceID:   &issue.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
+	})
+
+	issueID, err := s.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
 	if err != nil {
 		log.Printf("Failed to get issue ID: %v", err)
 		return err
@@ -93,10 +103,19 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 		CreatedAt:   evt.Timestamp,
 	}
 
-	if err := p.store.InsertOccurrence(ctx, occ); err != nil {
+	if err := s.store.InsertOccurrence(ctx, occ); err != nil {
 		log.Printf("Failed to insert occurrence: %v", err)
 		return err
 	}
+
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "occurrence_created",
+		ResourceType: "error_occurrence",
+		ResourceID:   &occ.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
+	})
 
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
@@ -107,12 +126,12 @@ func (p *Processor) processEventInternal(ctx context.Context, data []byte) error
 		searchEntry.SpanID = evt.SpanID
 	}
 
-	if err := p.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
+	if err := s.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
 		log.Printf("Failed to index occurrence: %v", err)
 	}
 
-	p.degradation.Flush(ctx, func(eventData []byte) error {
-		return p.processEventInternal(ctx, eventData)
+	s.degradation.Flush(ctx, func(eventData []byte) error {
+		return s.processEventInternal(ctx, eventData)
 	})
 
 	return nil

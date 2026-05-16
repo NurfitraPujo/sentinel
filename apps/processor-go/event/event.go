@@ -36,6 +36,7 @@ type StackFrame struct {
 
 func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker.Masker) {
 	e.Message = normalizer.NormalizeString(e.Message)
+	e.Message = masker.MaskString(e.Message) // R002: Mask message
 	e.ErrorClass = normalizer.NormalizeString(e.ErrorClass)
 	e.TraceID = normalizer.NormalizeString(e.TraceID)
 	e.SpanID = normalizer.NormalizeString(e.SpanID)
@@ -63,6 +64,7 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		TraceID:     protoEvent.TraceId,
 		SpanID:      protoEvent.SpanId,
 		TraceFlags:  protoEvent.TraceFlags,
+		Fingerprint: protoEvent.Fingerprint,
 	}
 
 	if protoEvent.Timestamp != nil {
@@ -82,7 +84,12 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		})
 	}
 
-	if event.Fingerprint == "" {
+	// R005: Normalize/Mask BEFORE fingerprinting
+	norm := normalizer.NewNormalizer()
+	mask := masker.NewMasker()
+	event.Normalize(norm, mask)
+
+	if event.Fingerprint == "" || protoEvent.FingerprintOverride {
 		frames := make([]fingerprint.StackFrame, len(event.Stacktrace))
 		for i, f := range event.Stacktrace {
 			frames[i] = fingerprint.StackFrame{
@@ -97,10 +104,6 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 			Stacktrace: frames,
 		})
 	}
-
-	norm := normalizer.NewNormalizer()
-	mask := masker.NewMasker()
-	event.Normalize(norm, mask)
 
 	return event, nil
 }

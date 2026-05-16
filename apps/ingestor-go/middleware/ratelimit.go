@@ -1,68 +1,45 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
-	"sync"
 	"time"
+
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
+	libredis "github.com/redis/go-redis/v9"
 )
 
 type RateLimiter struct {
-	mu      sync.RWMutex
-	buckets map[string]*bucket
-	rate    int
-	window  time.Duration
+	client *libredis.Client
+	rate   int
+	window time.Duration
 }
 
-type bucket struct {
-	tokens    int
-	lastReset time.Time
+func NewRateLimiter(client *libredis.Client, rate int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		client: client,
+		rate:   rate,
+		window: window,
+	}
 }
 
-func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
-	rl := &RateLimiter{
-		buckets: make(map[string]*bucket),
-		rate:    rate,
-		window:  window,
-	}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *RateLimiter) Allow(key string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	b, exists := rl.buckets[key]
-
-	if !exists || now.Sub(b.lastReset) >= rl.window {
-		rl.buckets[key] = &bucket{
-			tokens:    rl.rate - 1,
-			lastReset: now,
-		}
-		return true
+func (rl *RateLimiter) Allow(ctx context.Context, key string) bool {
+	if rl.client == nil {
+		return true // Fallback if Redis is not configured
 	}
 
-	if b.tokens <= 0 {
-		return false
+	redisKey := redis.GetWindowKey("ratelimit", key, rl.window)
+
+	count, err := rl.client.Incr(ctx, redisKey).Result()
+	if err != nil {
+		return true // Fail open
 	}
 
-	b.tokens--
-	return true
-}
-
-func (rl *RateLimiter) cleanup() {
-	ticker := time.NewTicker(time.Minute)
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for key, b := range rl.buckets {
-			if now.Sub(b.lastReset) >= rl.window {
-				delete(rl.buckets, key)
-			}
-		}
-		rl.mu.Unlock()
+	if count == 1 {
+		rl.client.Expire(ctx, redisKey, rl.window*2) // Keep key longer than window to be safe
 	}
+
+	return count <= int64(rl.rate)
 }
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
@@ -73,7 +50,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if !rl.Allow(apiKey) {
+		if !rl.Allow(r.Context(), apiKey) {
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 			return

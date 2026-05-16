@@ -20,6 +20,7 @@ type QueryStore interface {
 type CommandStore interface {
 	UpsertIssue(ctx context.Context, issue *Issue) error
 	InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error
+	PersistAuditLog(ctx context.Context, log *AuditLog) error
 }
 
 // IssueStore combines both Read and Write operations for the Processor.

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 )
@@ -50,7 +51,7 @@ func main() {
 	}
 	defer subscriber.Close()
 
-	proc := NewProcessor(db)
+	proc := service.NewProcessorService(db)
 
 	err = subscriber.Subscribe(ctx, func(data []byte) error {
 		return proc.ProcessEvent(ctx, data)

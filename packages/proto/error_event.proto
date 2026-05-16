@@ -45,6 +45,8 @@ message ErrorEvent {
   google.protobuf.Struct metadata = 9;
   google.protobuf.Timestamp timestamp = 10;
   uint32 trace_flags = 11;
+  string fingerprint = 12;
+  bool fingerprint_override = 13;
 }
 
 message StackFrame {

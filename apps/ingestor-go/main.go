@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -68,8 +70,19 @@ func main() {
 	}
 	defer publisher.Close()
 
-	ingestService := service.NewIngestService(publisher)
-	rateLimiter := middleware.NewRateLimiter(5000, time.Minute)
+	ingestService, err := service.NewIngestService(publisher)
+	if err != nil {
+		log.Fatalf("Failed to create ingest service: %v", err)
+	}
+
+	redisCfg := redis.Config{
+		Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		Password: getEnv("REDIS_PASSWORD", ""),
+		DB:       getEnvInt("REDIS_DB", 0),
+	}
+
+	redisClient, _ := redis.NewClient(ctx, redisCfg)
+	rateLimiter := middleware.NewRateLimiter(redisClient, 5000, time.Minute)
 	ingestHandler := auth.NewAPIKeyAuthenticator(db).Middleware(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handleIngest(ingestService).ServeHTTP(w, r)
@@ -116,13 +129,12 @@ func handleIngest(svc *service.IngestService) http.HandlerFunc {
 			return
 		}
 
-		if result := validation.ValidatePayload(&payload); !result.Valid {
-			validation.WriteValidationError(w, result)
-			return
-		}
-
 		if err := svc.Ingest(r.Context(), &payload); err != nil {
 			log.Printf("Failed to ingest error: %v", err)
+			if strings.Contains(err.Error(), "validation failed") {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			http.Error(w, "Failed to ingest error", http.StatusInternalServerError)
 			return
 		}
