@@ -2,6 +2,8 @@ import { SvelteKitAuth } from '@auth/sveltekit';
 import Google from '@auth/core/providers/google';
 import Email from '@auth/core/providers/email';
 import { env } from '$env/dynamic/private';
+import { CQRSAdapter } from './auth-adapter';
+import { getUserProjectRoles } from './queries/project-members';
 
 const GOOGLE_WORKSPACE_CLIENT_ID = env.GOOGLE_CLIENT_ID;
 const GOOGLE_WORKSPACE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET;
@@ -48,6 +50,7 @@ if (EMAIL_SERVER) {
 
 // @ts-ignore - version mismatch between @auth/core and @auth/sveltekit nested @auth/core
 export const { handle, signIn, signOut } = SvelteKitAuth({
+	adapter: CQRSAdapter(),
 	providers,
 	callbacks: {
 		async signIn({ user, account }) {
@@ -65,6 +68,19 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				return true;
 			}
 			return true;
+		},
+		async jwt({ token, account, user }) {
+			if (account?.provider === 'email' && user?.email) {
+				const roles = await getUserProjectRoles(user.email);
+				token.projectRoles = roles;
+			}
+			return token;
+		},
+		async session({ session, token }) {
+			if (token.projectRoles) {
+				(session as any).projectRoles = token.projectRoles;
+			}
+			return session;
 		},
 	},
 	trustHost: true,

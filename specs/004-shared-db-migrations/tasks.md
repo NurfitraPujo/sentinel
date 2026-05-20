@@ -16,9 +16,9 @@
 
 **Purpose**: Project initialization and basic structure
 
-- [ ] T001 Create project structure for `packages/db-migrations/` per implementation plan
-- [ ] T002 Initialize Go module in `packages/db-migrations/` and add dependencies (`goose/v3`, `pgx/v5`)
-- [ ] T003 Create single unified directory structure: `packages/db-migrations/migrations/` (Do not partition by target)
+- [x] T001 Create project structure for `packages/db-migrations/` per implementation plan
+- [x] T002 Initialize Go module in `packages/db-migrations/` and add dependencies (`goose/v3`, `pgx/v5`)
+- [x] T003 Create single unified directory structure: `packages/db-migrations/migrations/` (Do not partition by target)
 
 ---
 
@@ -43,9 +43,9 @@
 
 **Independent Test**: Successfully run `task db:processor:status` on a fresh database.
 
-- [ ] T010 [P] [US1] Create integration test in `tests/integration/db_migrations_test.go` using Testcontainers to verify `status` command
+- [x] T010 [P] [US1] Create integration test in `tests/integration/db_migrations_test.go` using Testcontainers to verify `status` command
 - [x] T011 [US1] Implement target-specific connection string retrieval (env vars) in `packages/db-migrations/cmd/migrate/main.go`
-- [x] T012 [US1] Define initial "001_init" SQL migration for Processor target in `packages/db-migrations/migrations/processor/001_init.sql`
+- [x] T012 [US1] Define initial SQL migrations in the unified directory using Unix timestamp versioning
 
 **Checkpoint**: User Story 1 functional - basic status and initialization tracking working.
 
@@ -57,9 +57,9 @@
 
 **Independent Test**: Apply two migrations in sequence and verify schema state.
 
-- [ ] T013 [P] [US2] Add integration test case for applying multiple migrations sequentially and handling failures
-- [ ] T014 [US2] Implement sequential execution logic in `packages/db-migrations/goose.go` ensuring "loud failure" on error
-- [ ] T015 [US2] Add second migration for Processor target and verify `up` command updates schema version
+- [x] T013 [P] [US2] Add integration test case for applying multiple migrations sequentially and handling failures
+- [x] T014 [US2] Implement sequential execution logic in `packages/db-migrations/goose.go` ensuring "loud failure" on error
+- [x] T015 [US2] Add migrations using Unix timestamp versioning and verify `up` command updates schema version
 
 ---
 
@@ -69,9 +69,9 @@
 
 **Independent Test**: Run migrations for two different targets and verify they are independent.
 
-- [ ] T016 [P] [US4] Add integration test verifying isolation between `processor` and `dashboard` migration targets
-- [ ] T017 [US4] Implement logic in CLI tool to use the unified `packages/db-migrations/migrations/` directory regardless of the command flag
-- [ ] T018 [US4] Add `db:ingestor:*` and `db:dashboard:*` tasks to `Taskfile.yml`
+- [x] T016 [P] [US4] Add integration test verifying isolation between `processor` and `dashboard` migration targets
+- [x] T017 [US4] Implement logic in CLI tool to use the unified `packages/db-migrations/migrations/` directory regardless of the command flag
+- [x] T018 [US4] Add `db:ingestor:*` and `db:dashboard:*` tasks to `Taskfile.yml`
 
 ---
 
@@ -81,8 +81,8 @@
 
 **Independent Test**: Use the `baseline` command on a DB with existing schema and verify subsequent migrations work.
 
-- [ ] T019 [P] [US3] Add integration test case for the `baseline` / `version` command on an existing schema
-- [ ] T020 [US3] Implement `baseline` (version forcing) command in the CLI tool and Goose wrapper
+- [x] T019 [P] [US3] Add integration test case for the `baseline` / `version` command on an existing schema
+- [x] T020 [US3] Implement `baseline` (version forcing) command in the CLI tool and Goose wrapper
 
 ---
 
@@ -90,14 +90,14 @@
 
 **Purpose**: Documentation, synchronization, and final hardening.
 
-- [ ] T021 [P] Update `packages/proto` with any core schema changes identified during migration implementation (Architecture Alignment)
-- [ ] T022 Document manual recovery procedures for "Partial Failure" scenarios in `packages/db-migrations/README.md`
-- [ ] T023 Final validation run of `Taskfile.yml` commands against a local dev environment
-- [ ] T024 [REFACTOR] Fix `migrate down` command logic in `packages/db-migrations/goose.go` to correctly call `goose.RunContext` with "down" instead of hardcoded "up" (P0)
-- [ ] T025 [REFACTOR] Unify directory structure by moving all existing migrations into the root `packages/db-migrations/migrations/` and updating the CLI to point there (P1)
-- [ ] T026 [REFACTOR] Normalize incremental migrations: Fix `002_add_trace.sql` by removing duplicate `CREATE TABLE` logic and adhering to standard `goose Up/Down` blocks (P1)
-- [ ] T027 [REFACTOR] Synchronize Proto Contracts: Add `source` field to `ErrorEvent` in `packages/proto/error_event.proto` (P1)
-- [ ] T028 [REFACTOR] Prune dead code (`getEnv`, `getDSNForTarget`) in `main.go` and unused `pgxpool` abstraction in `driver.go` (P2)
+- [x] T021 [P] Update `packages/proto` with core schema changes (source field) (Architecture Alignment)
+- [x] T022 [P] Document manual recovery procedures for "Partial Failure" scenarios in `packages/db-migrations/README.md`
+- [x] T023 [P] Final validation run of `Taskfile.yml` commands against a local dev environment
+- [x] T024 [REFACTOR] Fix `migrate down` command logic in `packages/db-migrations/goose.go` to correctly call `goose.RunContext` with "down" instead of hardcoded "up" (P0)
+- [x] T025 [REFACTOR] Unify directory structure by moving all existing migrations into the root `packages/db-migrations/migrations/` and updating the CLI to point there (P1)
+- [x] T026 [REFACTOR] Normalize incremental migrations and adopt Unix timestamp versioning (P1)
+- [x] T027 [REFACTOR] Synchronize Proto Contracts: Add `source` field to `ErrorEvent` in `packages/proto/error_event.proto` (P1)
+- [x] T028 [REFACTOR] Prune dead code (`getEnv`, `getDSNForTarget`) in `main.go` and unused `pgxpool` abstraction in `driver.go` (P2)
 
 ---
 

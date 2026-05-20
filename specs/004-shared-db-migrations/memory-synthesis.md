@@ -1,22 +1,42 @@
-# Memory Synthesis: Shared Database Migrations
+# Memory Synthesis
 
-**Created**: 2024-05-24
-**Feature**: 004-shared-db-migrations
+## Current Scope
+- Feature: 004-shared-db-migrations
+- Spec: Feature Specification: Shared Database Migrations
+- Feature folder: specs/004-shared-db-migrations
+- Spec context: # Feature Specification : Shared Database Migrations **Feature Branch **: `004-shared-db-migrations` **Created**: 2024-05-24 **Status**: Draft **Input**: User description : "create database migrations that supports incremental migration setup . The database migrations is...
 
-## Clear Decisions
-- **PostgreSQL Focus**: All migrations must be optimized for PostgreSQL features. (From `DECISIONS.md` and `ARCHITECTURE.md`)
-- **Shared Packages Pattern**: Following the monorepo structure, migrations should live in a shared package (e.g., `packages/db-migrations`) to be accessible by all Go apps (`apps/processor-go`, `apps/ingestor-go`). (From `architecture_constitution.md`)
-- **Versioned Migrations**: Use a versioned migration pattern (timestamped) to support parallel development and avoid collisions. (Aligned with `DECISIONS.md` recency and user requirement).
-- **Unified Schema Structure**: Migrations are unified into a single root directory (`packages/db-migrations/migrations/`) rather than partitioned by app target. The schema serves all apps cohesively, preventing duplicate table definitions and versioning fragmentation.
+## Relevant Project Context
+- [C1] Low Latency : Ingestion must be fast to handle high volumes of incoming events. Scalability : The system uses NATS as a message broker to decouple ingestion from processing, allowing independent scaling of workers. Data Integrity : Protobuf is used for strict schema enforcement across all components. (Source: `docs/memory/PROJECT_CONTEXT.md`)
 
-## Conflicts
-- **App Isolation vs. Shared Migrations**: `architecture_constitution.md` mandates high isolation between modules, but migrations are a shared concern. The solution is to centralize the *source* in a shared package while allowing apps to *execute* them targeting their specific DB instances.
-- **Concurrent Execution**: Sentinel values data persistence. Concurrent migration runs must be strictly prevented to avoid corrupting the `schema_migrations` log or the schema itself.
+## Relevant Decisions
+- [D1] Status Active Why this is durable Local development environments may not have access to Google Workspace OIDC. Magic link authentication provides a fallback that doesn't bypass project RBAC. (Source: `docs/memory/DECISIONS.md`)
+- [D2] Status Active Why this is durable Sentinel is an observability platform. Losing events during a temporary database outage defeats the purpose of the platform. This decision ensures that short-term infrastructure issues don't lead to permanent data loss. (Source: `docs/memory/DECISIONS.md`)
 
-## Assumptions
-- **Taskfile Entrypoint**: `Taskfile.yml` will be the unified interface for developers, wrapping the underlying migration CLI.
-- **Protobuf/Contracts**: Schema changes that affect cross-module data flow must eventually be reflected in `packages/proto`.
-- **Testcontainers**: Integration tests for this feature will use Testcontainers to spin up ephemeral Postgres instances.
+## Active Architecture Constraints
+- [A1] Ingestor-go : Handles incoming traffic, authentication, and initial validation. Acts as a producer for NATS. Processor-go : Consumes events from NATS, performs heavy lifting (masking, normalization, fingerprinting), and stores results in the database. (Source: `docs/memory/ARCHITECTURE.md`)
+- [A2] Contract-Based : Imports between apps/ and packages/ must be restricted to shared libraries and proto definitions. No Direct Imports : Apps must not directly import internals from other apps. (Source: `.specify/memory/architecture_constitution.md`)
+- [A3] Automated tools (Architecture Guard) will scan for violations during the planning and implementation phases. PRs containing P0 violations will be blocked until remediated or the Constitution is updated. (Source: `.specify/memory/architecture_constitution.md`)
 
-## Relevant Historical Context
-- Sentinel prioritizes "Graceful Degradation". The migration system must be robust enough to handle "loud failures" without leaving the database in an inconsistent state (using transactions where possible).
+## Accepted Deviations
+- [V1] Boundary Violation : Direct cross-module imports skipping contracts or shared packages. Logic Leakage : Business logic implemented in handlers, controllers, or transport layers. Unvalidated Input : Missing or bypassed input validation (Proto/Zod). (Source: `.specify/memory/architecture_constitution.md`)
+
+## Relevant Security Constraints
+- [S1] Data Integrity : Ensure that ingested error data is sanitized and stored securely. Least Privilege : Workers and apps should only have access to the resources they strictly need. Contract Enforcement : Use Protos to ensure that data entering and moving through the system is valid and safe. (Source: `.specify/memory/constitution.md`)
+
+## Related Historical Lessons
+- [B1] Status Active Symptoms Events are lost or dropped when the Processor cannot reach the PostgreSQL database. Root Cause Processor service traditionally assumed the database is always available during event processing. Future mistake prevented Failing to handle transient database connection failures in processing workers. (Source: `docs/memory/BUGS.md`)
+
+## Conflict Warnings
+- [none]
+
+## Specific Migration Decisions
+- **PostgreSQL Focus**: All migrations must be optimized for PostgreSQL features.
+- **Shared Packages Pattern**: Migrations live in `packages/db-migrations` to be accessible by all Go apps.
+- **Unified Schema Structure**: Migrations are unified into a single root directory (`packages/db-migrations/migrations/`) rather than partitioned by app target.
+- **Unix Timestamp Versioning**: Use a Unix timestamp (to the seconds) as the version prefix (e.g., `1716541200_init.sql`) to support parallel development and ensure global uniqueness.
+
+## Retrieval Notes
+- Index entries considered: 10
+- Source sections read: 10
+- Budget status: within limit

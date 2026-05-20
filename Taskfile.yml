@@ -12,13 +12,57 @@ tasks:
     db-migrate:
         desc: Run database migrations
         cmds:
-            - docker compose exec -T postgres psql -U sentinel -d sentinel -f /docker-entrypoint-initdb.d/init.sql
+            - docker compose exec -T sentinel-postgres psql -U sentinel -d sentinel -f /docker-entrypoint-initdb.d/init.sql
+
+    db:{{.TARGET}}-status:
+        desc: Check migration status for target database
+        env:
+            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
+        dir: packages/db-migrations
+        cmds:
+            - go run cmd/migrate/main.go status -target {{.TARGET}}
+
+    db:{{.TARGET}}-up:
+        desc: Apply pending migrations for target database
+        env:
+            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
+        dir: packages/db-migrations
+        cmds:
+            - go run cmd/migrate/main.go up -target {{.TARGET}}
+
+    db:{{.TARGET}}-down:
+        desc: Rollback last migration for target database
+        env:
+            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
+        dir: packages/db-migrations
+        cmds:
+            - go run cmd/migrate/main.go down -target {{.TARGET}}
+
+    db:{{.TARGET}}-baseline:
+        desc: Baseline target database at specified version
+        env:
+            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
+        dir: packages/db-migrations
+        cmds:
+            - go run cmd/migrate/main.go baseline -target {{.TARGET}} -version {{.VERSION}}
+
+    db:{{.TARGET}}-reset:
+        desc: Reset target database (DANGEROUS)
+        interactive: true
+        preconditions:
+            - sh: test "{{.ENVIRONMENT}}" != "prod"
+              msg: "Cannot reset production database"
+        vars:
+            TARGET: "{{.TARGET}}"
+        cmds:
+            - echo "Resetting {{.TARGET}} database - this will destroy all data!"
+            - docker compose exec -T sentinel-postgres psql -U sentinel -d sentinel -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 
     db-reset:
         desc: Reset database (drop and recreate)
         cmds:
             - docker compose down -v
-            - docker compose up -d postgres
+            - docker compose up -d sentinel-postgres
             - sleep 3
             - task: db-migrate
 

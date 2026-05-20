@@ -13,6 +13,7 @@
     "@sveltejs/kit": "^2.59.1",
     "@sveltejs/vite-plugin-svelte": "^4.0.4",
     "@types/node": "^25.7.0",
+    "@types/nodemailer": "^6.4.17",
     "svelte": "^5.55.5",
     "svelte-check": "^4.4.8",
     "typescript": "^5.4.5",
@@ -22,6 +23,7 @@
     "@auth/core": "^0.34.3",
     "@auth/sveltekit": "^1.11.2",
     "drizzle-orm": "^0.30.10",
+    "nodemailer": "^7.0.13",
     "postgres": "^3.4.4",
     "zod": "^3.23.6"
   },

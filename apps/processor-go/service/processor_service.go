@@ -41,6 +41,12 @@ func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) error 
 	return s.processEventInternal(ctx, data)
 }
 
+func (s *ProcessorService) VerifyAuditLogTable(ctx context.Context) error {
+	query := `INSERT INTO audit_logs (id, action, resource_type, actor_id, metadata) VALUES ('00000000-0000-0000-0000-000000000000', 'verification_test', 'test', 'processor-go', '{}') ON CONFLICT DO NOTHING`
+	_, err := s.db.Exec(ctx, query)
+	return err
+}
+
 func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {
 	evt, err := event.Deserialize(data)
 	if err != nil {

@@ -3,11 +3,14 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
 	libredis "github.com/redis/go-redis/v9"
 )
+
+var strictMode = os.Getenv("RATELIMIT_STRICT_MODE") == "true"
 
 type RateLimiter struct {
 	client *libredis.Client
@@ -25,18 +28,24 @@ func NewRateLimiter(client *libredis.Client, rate int, window time.Duration) *Ra
 
 func (rl *RateLimiter) Allow(ctx context.Context, key string) bool {
 	if rl.client == nil {
-		return true // Fallback if Redis is not configured
+		if strictMode {
+			return false
+		}
+		return true
 	}
 
 	redisKey := redis.GetWindowKey("ratelimit", key, rl.window)
 
 	count, err := rl.client.Incr(ctx, redisKey).Result()
 	if err != nil {
-		return true // Fail open
+		if strictMode {
+			return false
+		}
+		return true
 	}
 
 	if count == 1 {
-		rl.client.Expire(ctx, redisKey, rl.window*2) // Keep key longer than window to be safe
+		rl.client.Expire(ctx, redisKey, rl.window*2)
 	}
 
 	return count <= int64(rl.rate)

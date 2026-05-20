@@ -1,10 +1,8 @@
--- Enable UUID extension
+-- +goose Up
+-- +goose StatementBegin
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Enable pgcrypto for digest() function
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- Projects table
 CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
@@ -12,11 +10,9 @@ CREATE TABLE IF NOT EXISTS projects (
     api_key_hash VARCHAR(128) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
 CREATE INDEX idx_projects_api_key ON projects(api_key);
 CREATE INDEX idx_projects_api_key_hash ON projects(api_key_hash);
 
--- Issues table
 CREATE TABLE IF NOT EXISTS issues (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -29,13 +25,11 @@ CREATE TABLE IF NOT EXISTS issues (
     count BIGINT NOT NULL DEFAULT 1,
     UNIQUE (project_id, fingerprint)
 );
-
 CREATE INDEX idx_issues_project_id ON issues(project_id);
 CREATE INDEX idx_issues_fingerprint ON issues(fingerprint);
 CREATE INDEX idx_issues_status ON issues(status);
 CREATE INDEX idx_issues_last_seen ON issues(last_seen DESC);
 
--- Error occurrences table
 CREATE TABLE IF NOT EXISTS error_occurrences (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     issue_id UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
@@ -47,12 +41,10 @@ CREATE TABLE IF NOT EXISTS error_occurrences (
     span_id VARCHAR(64),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
 CREATE INDEX idx_error_occurrences_issue_id ON error_occurrences(issue_id);
 CREATE INDEX idx_error_occurrences_created_at ON error_occurrences(created_at DESC);
 CREATE INDEX idx_error_occurrences_trace_id ON error_occurrences(trace_id);
 
--- Error search index table
 CREATE TABLE IF NOT EXISTS error_search_index (
     occurrence_id UUID PRIMARY KEY REFERENCES error_occurrences(id) ON DELETE CASCADE,
     user_id VARCHAR(255),
@@ -61,16 +53,13 @@ CREATE TABLE IF NOT EXISTS error_search_index (
     span_id VARCHAR(64),
     request_id VARCHAR(255)
 );
-
 CREATE INDEX idx_error_search_user_id ON error_search_index(user_id);
 CREATE INDEX idx_error_search_tenant_id ON error_search_index(tenant_id);
 CREATE INDEX idx_error_search_trace_id ON error_search_index(trace_id);
 CREATE INDEX idx_error_search_request_id ON error_search_index(request_id);
 
--- Full-text search index on issues
 CREATE INDEX idx_issues_message_fts ON issues USING gin(to_tsvector('english', message));
 
--- Alert configurations table
 CREATE TABLE IF NOT EXISTS alert_configs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -81,10 +70,8 @@ CREATE TABLE IF NOT EXISTS alert_configs (
     enabled BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
 CREATE INDEX idx_alert_configs_project_id ON alert_configs(project_id);
 
--- Audit logs table
 CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     action VARCHAR(100) NOT NULL,
@@ -94,11 +81,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     metadata JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
-
 CREATE INDEX idx_audit_logs_action ON audit_logs(action);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at DESC);
 
--- Settings table
 CREATE TABLE IF NOT EXISTS settings (
     key VARCHAR(255) PRIMARY KEY,
     value TEXT NOT NULL,
@@ -106,7 +91,6 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Auth.js Tables
 CREATE TABLE IF NOT EXISTS "user" (
     id TEXT PRIMARY KEY,
     name TEXT,
@@ -129,7 +113,6 @@ CREATE TABLE IF NOT EXISTS account (
     session_state TEXT,
     PRIMARY KEY (provider, provider_account_id)
 );
-
 CREATE INDEX idx_account_user_id ON account(user_id);
 
 CREATE TABLE IF NOT EXISTS session (
@@ -137,7 +120,6 @@ CREATE TABLE IF NOT EXISTS session (
     user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
     expires TIMESTAMP WITH TIME ZONE NOT NULL
 );
-
 CREATE INDEX idx_session_user_id ON session(user_id);
 
 CREATE TABLE IF NOT EXISTS "verification_token" (
@@ -146,5 +128,22 @@ CREATE TABLE IF NOT EXISTS "verification_token" (
     expires TIMESTAMP WITH TIME ZONE NOT NULL,
     PRIMARY KEY (identifier, token)
 );
-
 CREATE INDEX idx_verification_token_identifier ON "verification_token"(identifier);
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+DROP TABLE IF EXISTS "verification_token";
+DROP TABLE IF EXISTS session;
+DROP TABLE IF EXISTS account;
+DROP TABLE IF EXISTS "user";
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS alert_configs;
+DROP TABLE IF EXISTS error_search_index;
+DROP TABLE IF EXISTS error_occurrences;
+DROP TABLE IF EXISTS issues;
+DROP TABLE IF EXISTS projects;
+DROP EXTENSION IF EXISTS "pgcrypto";
+DROP EXTENSION IF EXISTS "uuid-ossp";
+-- +goose StatementEnd

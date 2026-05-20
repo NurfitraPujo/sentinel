@@ -3,7 +3,7 @@ import { fail } from '@sveltejs/kit';
 import { z } from 'zod';
 import { checkRateLimit } from '$lib/rate-limit';
 import { logAuditEvent } from '$lib/server/audit';
-import { signIn } from '$lib/auth';
+import { signIn } from '$lib/server/auth-config';
 import type { PageServerLoad, Actions } from './$types';
 
 const emailSchema = z.object({

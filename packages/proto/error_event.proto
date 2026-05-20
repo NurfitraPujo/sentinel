@@ -47,6 +47,7 @@ message ErrorEvent {
   uint32 trace_flags = 11;
   string fingerprint = 12;
   bool fingerprint_override = 13;
+  string source = 14;
 }
 
 message StackFrame {

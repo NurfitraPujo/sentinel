@@ -85,8 +85,8 @@
 
 **Purpose**: Address architecture review findings
 
-- [ ] T027 [P] Persist audit events to database (in-memory log lost on restart)
-- [ ] T028 [P] Use Redis or shared store for rate limiter (in-memory Map won't work across instances)
+- [x] T027 [P] Persist audit events to database (in-memory log lost on restart) - VERIFIED: audit_store.go persists to DB, main.go verifies table on startup
+- [x] T028 [P] Use Redis or shared store for rate limiter (in-memory Map won't work across instances) - VERIFIED: ratelimit.go uses Redis, RATELIMIT_STRICT_MODE flag added
 
 ---
 

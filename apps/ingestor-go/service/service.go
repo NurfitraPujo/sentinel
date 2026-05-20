@@ -13,7 +13,7 @@ import (
 
 type IngestService struct {
 	publisher *nats.Publisher
-	validator *protovalidate.Validator
+	validator protovalidate.Validator
 }
 
 func NewIngestService(publisher *nats.Publisher) (*IngestService, error) {

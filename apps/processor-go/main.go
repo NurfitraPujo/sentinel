@@ -53,6 +53,11 @@ func main() {
 
 	proc := service.NewProcessorService(db)
 
+	if err := proc.VerifyAuditLogTable(ctx); err != nil {
+		log.Fatalf("AUDIT_VERIFICATION_FAILED: audit_logs table is not writable: %v", err)
+	}
+	log.Println("Audit log table verification passed")
+
 	err = subscriber.Subscribe(ctx, func(data []byte) error {
 		return proc.ProcessEvent(ctx, data)
 	})

@@ -1,1 +1,3 @@
-{"feature_directory": "specs/001-sentinel-error-service"}
+{
+  "feature_directory": "specs/004-shared-db-migrations"
+}
