@@ -1,0 +1,106 @@
+version: "3.8"
+
+services:
+    postgres:
+        image: postgres:15-alpine
+        container_name: sentinel-postgres
+        environment:
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+        ports:
+            - "5432:5432"
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U sentinel"]
+            interval: 5s
+            timeout: 5s
+            retries: 5
+
+    nats:
+        image: nats:2.10-alpine
+        container_name: sentinel-nats
+        ports:
+            - "4222:4222"
+            - "4223:4222"
+            - "8222:8222"
+        volumes:
+            - nats_data:/data
+        command: ["-js", "--server_name", "sentinel-nats", "--sd", "/data/jetstream"]
+        healthcheck:
+            test: ["CMD", "nc", "-z", "localhost", "4222"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    nats-init:
+        build:
+            context: ./scripts
+            dockerfile: Dockerfile.nats-init
+        depends_on:
+            nats:
+                condition: service_healthy
+        environment:
+            NATS_URL: nats://nats:4222
+        restart: "no"
+
+    ingestor:
+        build:
+            context: .
+            dockerfile: apps/ingestor-go/Dockerfile
+        container_name: sentinel-ingestor
+        ports:
+            - "8080:8080"
+        depends_on:
+            postgres:
+                condition: service_healthy
+            nats:
+                condition: service_healthy
+        environment:
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+            NATS_URL: nats://nats:4222
+
+    processor:
+        build:
+            context: .
+            dockerfile: apps/processor-go/Dockerfile
+        container_name: sentinel-processor
+        depends_on:
+            postgres:
+                condition: service_healthy
+            nats:
+                condition: service_healthy
+        environment:
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+            NATS_URL: nats://nats:4222
+
+    dashboard:
+        build:
+            context: .
+            dockerfile: apps/dashboard-web/Dockerfile
+        container_name: sentinel-dashboard
+        ports:
+            - "3000:3000"
+        depends_on:
+            postgres:
+                condition: service_healthy
+        environment:
+            DATABASE_URL: postgres://sentinel:changeme@postgres:5432/sentinel
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+
+volumes:
+    postgres_data:
+    nats_data:

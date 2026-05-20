@@ -1,0 +1,31 @@
+{
+  "name": "@sentinel/dashboard-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-node": "^5.0.1",
+    "@sveltejs/kit": "^2.59.1",
+    "@sveltejs/vite-plugin-svelte": "^4.0.4",
+    "@types/node": "^25.7.0",
+    "@types/nodemailer": "^6.4.17",
+    "svelte": "^5.55.5",
+    "svelte-check": "^4.4.8",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11"
+  },
+  "dependencies": {
+    "@auth/core": "^0.34.3",
+    "@auth/sveltekit": "^1.11.2",
+    "drizzle-orm": "^0.30.10",
+    "nodemailer": "^7.0.13",
+    "postgres": "^3.4.4",
+    "zod": "^3.23.6"
+  },
+  "type": "module"
+}

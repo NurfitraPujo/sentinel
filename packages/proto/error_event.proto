@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package sentinel.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "buf/validate/validate.proto";
+
+option go_package = "github.com/NurfitraPujo/sentinel/gen/sentinel/v1;sentinelv1";
+
+message ErrorEvent {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "error_event.project_key"
+        message: "project_key is required and must not exceed 64 characters"
+        expression: "this.project_key.size() > 0 && this.project_key.size() <= 64"
+      },
+      {
+        id: "error_event.platform"
+        message: "platform is required and must be lowercase alphanumeric"
+        expression: "this.platform.matches('^[a-z0-9]+$')"
+      },
+      {
+        id: "error_event.environment"
+        message: "environment is required and must be lowercase alphanumeric"
+        expression: "this.environment.matches('^[a-z0-9]+$')"
+      },
+      {
+        id: "error_event.message"
+        message: "message must not exceed 10000 characters"
+        expression: "this.message.size() <= 10000"
+      }
+    ]
+  };
+
+  string project_key = 1 [(buf.validate.field).required = true];
+  string platform = 2 [(buf.validate.field).required = true];
+  string environment = 3 [(buf.validate.field).required = true];
+  string message = 4 [(buf.validate.field).string.len = 10000];
+  string error_class = 5 [(buf.validate.field).required = true];
+  string trace_id = 6;
+  string span_id = 7;
+  repeated StackFrame stacktrace = 8 [(buf.validate.field).repeated.max_items = 100];
+  google.protobuf.Struct metadata = 9;
+  google.protobuf.Timestamp timestamp = 10;
+  uint32 trace_flags = 11;
+  string fingerprint = 12;
+  bool fingerprint_override = 13;
+  string source = 14;
+}
+
+message StackFrame {
+    option (buf.validate.message) = {
+        cel: [
+          {
+            id: "stack_frame.file_required"
+            message: "file is required for app frames"
+            expression: "!this.in_app || this.file.size() > 0"
+          }
+        ]
+    };
+
+    string file = 1;
+    int32 line = 2;
+    string function = 3;
+    bool in_app = 4;
+}
