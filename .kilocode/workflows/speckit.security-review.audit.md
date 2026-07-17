@@ -29,7 +29,7 @@ Perform a comprehensive security audit. Analyze the identified `changed_files` a
 
 Before reviewing the code, check the Spec-Kit memory hub context when it exists:
 
-- `docs/memory/` for durable repository memory
+- `.specify/extensions/security-review/docs/memory/` for durable repository memory
 - `specs/<feature>/memory.md` for active feature memory
 - `specs/<feature>/memory-synthesis.md` for the concise working summary
 - `.github/copilot-instructions.md` for repo-scoped Copilot guidance

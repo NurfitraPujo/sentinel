@@ -51,11 +51,11 @@ If an agent is configured (e.g., `"ai_assistant": "claude"`):
 
 ### Step 4: Check scripts
 
-Scan `.specify/scripts/bash/` and `.specify/scripts/powershell/` for script files.
+Scan `.specify/extensions/speckit-utils/scripts/bash/` and `.specify/extensions/speckit-utils/scripts/powershell/` for script files.
 
 - No scripts directory: WARN ("no scripts directory found")
 - Scripts exist and are executable: PASS
-- Scripts exist but not executable (missing +x on .sh files): WARN ("scripts not executable - run `chmod +x .specify/scripts/bash/*.sh`")
+- Scripts exist but not executable (missing +x on .sh files): WARN ("scripts not executable - run `chmod +x .specify/extensions/speckit-utils/scripts/bash/*.sh`")
 
 ### Step 5: Check constitution
 

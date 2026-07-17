@@ -14,6 +14,20 @@
           "speckit.git.remote",
           "speckit.git.initialize",
           "speckit.git.commit"
+        ],
+        "kilocode": [
+          "speckit.git.feature",
+          "speckit.git.validate",
+          "speckit.git.remote",
+          "speckit.git.initialize",
+          "speckit.git.commit"
+        ],
+        "zed": [
+          "speckit.git.feature",
+          "speckit.git.validate",
+          "speckit.git.remote",
+          "speckit.git.initialize",
+          "speckit.git.commit"
         ]
       },
       "registered_skills": [],
@@ -31,6 +45,10 @@
           "speckit.blueprint.validate"
         ],
         "kilocode": [
+          "speckit.blueprint.generate",
+          "speckit.blueprint.validate"
+        ],
+        "zed": [
           "speckit.blueprint.generate",
           "speckit.blueprint.validate"
         ]
@@ -66,6 +84,17 @@
           "speckit.architecture-guard.refactor-generator",
           "speckit.architecture-guard.architecture-apply",
           "speckit.architecture-guard.init"
+        ],
+        "zed": [
+          "speckit.architecture-guard.governed-plan",
+          "speckit.architecture-guard.governed-tasks",
+          "speckit.architecture-guard.governed-implement",
+          "speckit.architecture-guard.architecture-workflow",
+          "speckit.architecture-guard.architecture-review",
+          "speckit.architecture-guard.violation-detection",
+          "speckit.architecture-guard.refactor-generator",
+          "speckit.architecture-guard.architecture-apply",
+          "speckit.architecture-guard.init"
         ]
       },
       "registered_skills": [],
@@ -82,6 +111,9 @@
           "speckit.conduct.run"
         ],
         "kilocode": [
+          "speckit.conduct.run"
+        ],
+        "zed": [
           "speckit.conduct.run"
         ]
       },
@@ -103,6 +135,13 @@
           "speckit.cost.export"
         ],
         "kilocode": [
+          "speckit.cost.track",
+          "speckit.cost.report",
+          "speckit.cost.budget",
+          "speckit.cost.compare",
+          "speckit.cost.export"
+        ],
+        "zed": [
           "speckit.cost.track",
           "speckit.cost.report",
           "speckit.cost.budget",
@@ -135,6 +174,14 @@
           "speckit.doctor",
           "speckit.speckit-utils.validate",
           "speckit.validate"
+        ],
+        "zed": [
+          "speckit.speckit-utils.resume",
+          "speckit.resume",
+          "speckit.speckit-utils.doctor",
+          "speckit.doctor",
+          "speckit.speckit-utils.validate",
+          "speckit.validate"
         ]
       },
       "registered_skills": [],
@@ -152,6 +199,10 @@
           "speckit.status"
         ],
         "kilocode": [
+          "speckit.status.show",
+          "speckit.status"
+        ],
+        "zed": [
           "speckit.status.show",
           "speckit.status"
         ]
@@ -183,6 +234,15 @@
           "speckit.security-review.tasks",
           "speckit.security-review.followup",
           "speckit.security-review.apply"
+        ],
+        "zed": [
+          "speckit.security-review.audit",
+          "speckit.security-review.staged",
+          "speckit.security-review.branch",
+          "speckit.security-review.plan",
+          "speckit.security-review.tasks",
+          "speckit.security-review.followup",
+          "speckit.security-review.apply"
         ]
       },
       "registered_skills": [],
@@ -201,6 +261,11 @@
           "speckit.ripple.check"
         ],
         "kilocode": [
+          "speckit.ripple.scan",
+          "speckit.ripple.resolve",
+          "speckit.ripple.check"
+        ],
+        "zed": [
           "speckit.ripple.scan",
           "speckit.ripple.resolve",
           "speckit.ripple.check"
@@ -226,6 +291,15 @@
           "speckit.memory-md.token-report"
         ],
         "kilocode": [
+          "speckit.memory-md.init",
+          "speckit.memory-md.plan-with-memory",
+          "speckit.memory-md.capture",
+          "speckit.memory-md.capture-from-diff",
+          "speckit.memory-md.audit",
+          "speckit.memory-md.log-finding",
+          "speckit.memory-md.token-report"
+        ],
+        "zed": [
           "speckit.memory-md.init",
           "speckit.memory-md.plan-with-memory",
           "speckit.memory-md.capture",

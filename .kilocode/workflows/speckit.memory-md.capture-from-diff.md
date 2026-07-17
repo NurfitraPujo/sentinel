@@ -13,7 +13,7 @@ scripts:
 
 You are capturing durable knowledge for `memory-hub` by analyzing code changes.
 
-Resolve configuration first. Use `.specify/extensions/memory-md/config.yml` when present; otherwise default to `memory_root: docs/memory` and `specs_root: specs`.
+Resolve configuration first. Use `.specify/extensions/memory-md/config.yml` when present; otherwise default to `memory_root: .specify/extensions/memory-md/docs/memory` and `specs_root: specs`.
 
 Capture is manual and human-approved. Do not write durable memory unless the user explicitly ran this command and approves the proposed updates.
 

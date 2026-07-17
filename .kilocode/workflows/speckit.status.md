@@ -2,8 +2,8 @@
 description: Show project status and SDD workflow progress — active feature, artifacts,
   task completion, phase, and extensions.
 scripts:
-  sh: .specify/scripts/bash/status.sh
-  ps: .specify/scripts/powershell/status.ps1
+  sh: ../scripts/bash/status.sh
+  ps: ../scripts/powershell/status.ps1
 ---
 
 
@@ -23,7 +23,7 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 ## Outline
 
-1. **Run status script**: Execute `.specify/scripts/bash/status.sh` from the project root and parse the JSON output.
+1. **Run status script**: Execute `../scripts/bash/status.sh` from the project root and parse the JSON output.
 
 2. **Present project information**:
    - **Project name** — current directory name

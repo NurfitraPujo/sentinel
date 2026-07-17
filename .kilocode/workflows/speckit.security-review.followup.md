@@ -40,7 +40,7 @@ Review the following artifacts when present:
 - `data-model.md`
 - `contracts/`
 - `quickstart.md`
-- `docs/memory/`
+- `.specify/extensions/security-review/docs/memory/`
 - `specs/<feature>/memory.md`
 - `specs/<feature>/memory-synthesis.md`
 - `.github/copilot-instructions.md`

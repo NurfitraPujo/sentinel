@@ -1,9 +1,10 @@
 {
-  "ai": "kilocode",
+  "ai": "zed",
+  "ai_skills": true,
   "branch_numbering": "sequential",
   "context_file": ".kilocode/rules/specify-rules.md",
   "here": true,
-  "integration": "kilocode",
+  "integration": "zed",
   "script": "sh",
-  "speckit_version": "0.8.7"
+  "speckit_version": "0.12.15"
 }

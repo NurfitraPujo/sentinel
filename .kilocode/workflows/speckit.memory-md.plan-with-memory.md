@@ -9,7 +9,7 @@ description: Use index-first retrieval to synthesize constraints and gate planni
 # Plan With Memory
 
 Before planning the feature, resolve configuration. If `.specify/extensions/memory-md/config.yml` exists, read it for `memory_root`, `specs_root`, `feature_memory_filename`, `memory_synthesis_filename`, `require_memory_synthesis_before_plan`, `optimizer`, and `retrieval`.
-Otherwise use defaults: `memory_root: docs/memory`, `specs_root: specs`, `feature_memory_filename: memory.md`, `memory_synthesis_filename: memory-synthesis.md`, `require_memory_synthesis_before_plan: true`, and the retrieval defaults below.
+Otherwise use defaults: `memory_root: .specify/extensions/memory-md/docs/memory`, `specs_root: specs`, `feature_memory_filename: memory.md`, `memory_synthesis_filename: memory-synthesis.md`, `require_memory_synthesis_before_plan: true`, and the retrieval defaults below.
 If `require_memory_synthesis_before_plan` is `false`, skip the synthesis gate but still produce a synthesis when possible.
 
 ### Optimizer-Aware Flow

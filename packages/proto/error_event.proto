@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package sentinel.v1;
 
-import "google/protobuf/timestamp.proto";
-import "google/protobuf/struct.proto";
 import "buf/validate/validate.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/NurfitraPujo/sentinel/gen/sentinel/v1;sentinelv1";
 
@@ -51,18 +51,18 @@ message ErrorEvent {
 }
 
 message StackFrame {
-    option (buf.validate.message) = {
-        cel: [
-          {
-            id: "stack_frame.file_required"
-            message: "file is required for app frames"
-            expression: "!this.in_app || this.file.size() > 0"
-          }
-        ]
-    };
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "stack_frame.file_required"
+        message: "file is required for app frames"
+        expression: "!this.in_app || this.file.size() > 0"
+      }
+    ]
+  };
 
-    string file = 1;
-    int32 line = 2;
-    string function = 3;
-    bool in_app = 4;
+  string file = 1;
+  int32 line = 2;
+  string function = 3;
+  bool in_app = 4;
 }
