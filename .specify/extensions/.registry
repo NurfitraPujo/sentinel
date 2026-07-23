@@ -22,7 +22,7 @@
           "speckit.git.initialize",
           "speckit.git.commit"
         ],
-        "zed": [
+        "droid": [
           "speckit.git.feature",
           "speckit.git.validate",
           "speckit.git.remote",
@@ -48,7 +48,7 @@
           "speckit.blueprint.generate",
           "speckit.blueprint.validate"
         ],
-        "zed": [
+        "droid": [
           "speckit.blueprint.generate",
           "speckit.blueprint.validate"
         ]
@@ -85,7 +85,7 @@
           "speckit.architecture-guard.architecture-apply",
           "speckit.architecture-guard.init"
         ],
-        "zed": [
+        "droid": [
           "speckit.architecture-guard.governed-plan",
           "speckit.architecture-guard.governed-tasks",
           "speckit.architecture-guard.governed-implement",
@@ -113,7 +113,7 @@
         "kilocode": [
           "speckit.conduct.run"
         ],
-        "zed": [
+        "droid": [
           "speckit.conduct.run"
         ]
       },
@@ -141,7 +141,7 @@
           "speckit.cost.compare",
           "speckit.cost.export"
         ],
-        "zed": [
+        "droid": [
           "speckit.cost.track",
           "speckit.cost.report",
           "speckit.cost.budget",
@@ -175,7 +175,7 @@
           "speckit.speckit-utils.validate",
           "speckit.validate"
         ],
-        "zed": [
+        "droid": [
           "speckit.speckit-utils.resume",
           "speckit.resume",
           "speckit.speckit-utils.doctor",
@@ -202,7 +202,7 @@
           "speckit.status.show",
           "speckit.status"
         ],
-        "zed": [
+        "droid": [
           "speckit.status.show",
           "speckit.status"
         ]
@@ -235,7 +235,7 @@
           "speckit.security-review.followup",
           "speckit.security-review.apply"
         ],
-        "zed": [
+        "droid": [
           "speckit.security-review.audit",
           "speckit.security-review.staged",
           "speckit.security-review.branch",
@@ -265,7 +265,7 @@
           "speckit.ripple.resolve",
           "speckit.ripple.check"
         ],
-        "zed": [
+        "droid": [
           "speckit.ripple.scan",
           "speckit.ripple.resolve",
           "speckit.ripple.check"
@@ -299,7 +299,7 @@
           "speckit.memory-md.log-finding",
           "speckit.memory-md.token-report"
         ],
-        "zed": [
+        "droid": [
           "speckit.memory-md.init",
           "speckit.memory-md.plan-with-memory",
           "speckit.memory-md.capture",

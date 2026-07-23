@@ -1,95 +1,58 @@
-# Technical Decisions (`docs/memory/`)
+#!/usr/bin/env bash
+set -euo pipefail
 
-This file stores durable technical and implementation decisions. For governance-level decisions or project standards, see `.specify/memory/DECISIONS.md`.
+cd "$(dirname "$0")/../.specify/extensions/memory-md"
 
-## Entry Lifecycle
-
-Each decision follows this lifecycle:
-
-```
-Active → Needs Review → Superseded → (pruned)
-```
-
-- **Active**: The decision is current and must be honored by all features and AI agents.
-- **Needs Review**: Implementation reality or new context suggests this decision may be outdated. It should still be honored until reviewed and explicitly changed.
-- **Superseded**: A newer decision has replaced this one. Keep it for historical context until the next audit, then consider pruning.
-- **Pruned**: During an audit, remove superseded entries that no longer provide historical value. This keeps the file focused.
-
-### When to change status
-
-| Current Status | Change To    | When                                                                                                       |
-| -------------- | ------------ | ---------------------------------------------------------------------------------------------------------- |
-| Active         | Needs Review | Verified implementation or tests contradict the decision, or recurring features follow a different pattern |
-| Active         | Superseded   | A newer decision explicitly replaces this one                                                              |
-| Needs Review   | Active       | Team confirms the decision still holds after review                                                        |
-| Needs Review   | Superseded   | Team confirms a replacement decision                                                                       |
-| Superseded     | _(remove)_   | Audit finds no remaining historical value                                                                  |
-
-### Rules
-
-- Never delete an Active decision without replacing or superseding it.
-- Never silently ignore a decision. If it feels wrong, mark it Needs Review and resolve it.
-- Keep at most 3–5 Superseded entries for context. Prune older ones during audits.
-
----
-
-### 2024-05-20 - Graceful Degradation via In-Memory Buffering
+# ---------- A1 ----------
+npx --no-install speckit-memory register-memory \
+  --id A1 \
+  --title "Unified Migration Directory Boundary" \
+  --tags "migrations,architecture,monorepo,postgres" \
+  --file ARCHITECTURE.md \
+  --status active \
+  --content "$(cat <<'A1_EOF'
+### 2026-07-17 - Unified Migration Directory Boundary
 
 **Status**
 Active
 
 **Why this is durable**
-Sentinel is an observability platform. Losing events during a temporary database outage defeats the purpose of the platform. This decision ensures that short-term infrastructure issues don't lead to permanent data loss.
+Database schema is cross-cutting infrastructure used by every Go service in the monorepo. The location and ownership of migration files is an architectural boundary, not an implementation detail — once split per app, duplicate tables and version drift become inevitable.
 
 **Decision**
-When the PostgreSQL database is unavailable, the Processor service MUST buffer incoming events in memory up to a limit (MaxBufferSize = 10,000 events). These events MUST be flushed to the database automatically once connection is restored.
+All PostgreSQL schema definitions live in a single flat directory at `packages/db-migrations/migrations/`. The `packages/db-migrations/cmd/migrate` CLI always reads from this root regardless of target database; multi-database support is achieved exclusively via per-target connection strings (e.g. `DB_URL_PROCESSOR`, `DB_URL_INGESTOR`), never via per-target migration subdirectories.
+
+This boundary prevents:
+- Duplicate table creation across apps (e.g. the `events` table).
+- Versioning fragmentation where each target owns its own sequence.
+- Drift between apps' schema views of the same domain.
 
 **Tradeoffs**
-- **Gained**: High availability and data persistence during temporary outages.
-- **Made harder**: Memory management in the Processor service. A long-term outage could lead to OOM if the buffer is too large or if backpressure is not applied.
-- **Reconsider**: If Sentinel moves to a multi-tenant model where memory limits must be strictly partitioned, or if the buffer size needs to be dynamic.
+- **Gained**: Single source of truth, deterministic versioning, simpler CLI surface.
+- **Made harder**: Schema changes affect every target — requires extra review discipline.
+- **Reconsider**: If a target legitimately needs a private schema extension, it must be justified against this boundary.
 
 **Future mistake prevented**
-Directly failing or dropping events when the database is down.
+Adding per-app migration subdirectories, dual-versioning tracks, or splitting schema into package-private files.
 
 **Evidence**
-Implementation in `apps/processor-go/degradation/buffer.go`.
+- `specs/004-shared-db-migrations/architecture-migration-plan.md`
+- `specs/004-shared-db-migrations/plan.md` → Structure Decision
+- `specs/004-shared-db-migrations/spec.md` → Clarifications Q2
 
 **Where to look next**
-`apps/processor-go/processor.go` and `apps/processor-go/degradation/buffer.go`.
+`packages/db-migrations/migrations/` and `packages/db-migrations/cmd/migrate/`.
+A1_EOF
+)"
 
----
-
-### 2026-05-15 - Magic Link Authentication via Auth.js Email Provider
-
-**Status**
-Active
-
-**Why this is durable**
-Local development environments may not have access to Google Workspace OIDC. Magic link authentication provides a fallback that doesn't bypass project RBAC.
-
-**Decision**
-- Use Auth.js built-in Email provider for magic link support
-- Tokens are cryptographically random, expire in 15 minutes, and are single-use (handled by Auth.js)
-- Magic link authentication does NOT bypass project RBAC - user must still have project membership
-- For local dev, use `smtp://debug` to output email JSON to stdout instead of sending
-
-**Tradeoffs**
-- **Gained**: Simple local auth without Google OAuth setup
-- **Made harder**: Requires SMTP configuration for production
-- **Reconsider**: If magic link deliverability issues arise in production
-
-**Future mistake prevented**
-Custom auth implementation that bypasses RBAC or uses insecure token handling.
-
-**Evidence**
-Implementation in `apps/dashboard-web/src/lib/auth.ts` and `apps/dashboard-web/src/routes/auth/signin/+page.svelte`.
-
-**Where to look next**
-`specs/001-sentinel-error-service/tasks.md` (Phase 5: Local Development Support)
-
----
-
+# ---------- D3 ----------
+npx --no-install speckit-memory register-memory \
+  --id D3 \
+  --title "Adopt Goose for All Database Migrations" \
+  --tags "migrations,tooling,goose,go" \
+  --file DECISIONS.md \
+  --status active \
+  --content "$(cat <<'D3_EOF'
 ### 2026-07-17 - Adopt Goose for All Database Migrations
 
 **Status**
@@ -117,9 +80,17 @@ Re-evaluating migration tools per app, introducing dynamic SQL through CLI flags
 
 **Where to look next**
 `packages/db-migrations/` and `Taskfile.yml` `db:*` task namespace.
+D3_EOF
+)"
 
----
-
+# ---------- D4 ----------
+npx --no-install speckit-memory register-memory \
+  --id D4 \
+  --title "Strict Loud-Failure Migration Policy" \
+  --tags "migrations,errors,concurrency,policy" \
+  --file DECISIONS.md \
+  --status active \
+  --content "$(cat <<'D4_EOF'
 ### 2026-07-17 - Strict Loud-Failure Migration Policy
 
 **Status**
@@ -150,9 +121,17 @@ Wrapping migrations in retry loops, swallowing partial-failure errors, or introd
 
 **Where to look next**
 `packages/db-migrations/goose.go` and the `db:*` Taskfile targets.
+D4_EOF
+)"
 
----
-
+# ---------- D5 ----------
+npx --no-install speckit-memory register-memory \
+  --id D5 \
+  --title "Production Safety Guardrails for Destructive Migration Tasks" \
+  --tags "migrations,security,ci,operations" \
+  --file DECISIONS.md \
+  --status active \
+  --content "$(cat <<'D5_EOF'
 ### 2026-07-17 - Production Safety Guardrails for Destructive Migration Tasks
 
 **Status**
@@ -181,3 +160,25 @@ Running `task db:reset` in prod, leaking DSNs in CI logs, granting the migration
 
 **Where to look next**
 `Taskfile.yml`, `packages/db-migrations/cmd/migrate/main.go`.
+D5_EOF
+)"
+
+# ---------- W2 (prepend) ----------
+npx --no-install speckit-memory register-memory \
+  --id W2 \
+  --title "Shared DB Migrations Foundation Shipped" \
+  --tags "milestone,migrations,architecture" \
+  --file WORKLOG.md \
+  --status active \
+  --prepend \
+  --content "$(cat <<'W2_EOF'
+### 2026-07-17 - Shared DB Migrations Foundation Shipped
+
+- **Why durable**: Sentinel now has a single, enforced boundary for schema evolution across all apps. The architectural invariant (unified migrations directory, loud-failure policy, prod-safety guardrails) will outlive the feature that introduced it.
+- **Future mistake prevented**: A future contributor adding per-app migration subdirectories, bypassing `goose` for ad-hoc SQL, or removing the `ENVIRONMENT=prod` guard from destructive Taskfile targets.
+- **Evidence**: `a1255dc feat(db-migrations): complete 004-shared-db-migrations feature`. 28/28 tasks complete. Integration tests in `tests/integration/db_migrations_test.go` cover all targets.
+- **Where to look**: `packages/db-migrations/`, `Taskfile.yml`, `specs/004-shared-db-migrations/architecture-migration-plan.md`, `docs/memory/ARCHITECTURE.md` → Database Schema Management.
+W2_EOF
+)"
+
+echo "OK: 5 register-memory calls completed"

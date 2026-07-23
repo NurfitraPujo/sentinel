@@ -1,20 +1,20 @@
 {
-  "version": "0.12.15",
+  "version": "0.13.4",
   "integration_state_schema": 1,
   "installed_integrations": [
     "kilocode",
-    "zed"
+    "droid"
   ],
   "integration_settings": {
     "kilocode": {
       "script": "sh",
       "invoke_separator": "."
     },
-    "zed": {
+    "droid": {
       "script": "sh",
       "invoke_separator": "-"
     }
   },
-  "integration": "zed",
-  "default_integration": "zed"
+  "integration": "droid",
+  "default_integration": "droid"
 }

@@ -1,0 +1,17 @@
+{
+  "integration": "droid",
+  "version": "0.13.4",
+  "installed_at": "2026-07-23T07:08:49.298842+00:00",
+  "files": {
+    ".factory/skills/speckit-analyze/SKILL.md": "dc2acdfcc7ede081607a37e4323ac6689b43b540f39d4cad040d95a28366f2ac",
+    ".factory/skills/speckit-clarify/SKILL.md": "2cd4a77b571d9855cbe53d620eeb74924ef76657c9660b005dd8eb0c7a7ef111",
+    ".factory/skills/speckit-constitution/SKILL.md": "b6e46e821261a16feb21875535a4bdcfca6bbb9537b68c51c9306d7a60e328eb",
+    ".factory/skills/speckit-implement/SKILL.md": "3202f28534fdf46411d1db0ed3a64fb7415d5351b8e7c68ae8468a19b104f342",
+    ".factory/skills/speckit-converge/SKILL.md": "04226b8443797337624983111546d5e5a48d9993a176c4e6d72a4099a0af50d4",
+    ".factory/skills/speckit-plan/SKILL.md": "6e9455dafd97a16f631ce74b485e49876ec6e511572f70e447d005c2447d11a4",
+    ".factory/skills/speckit-checklist/SKILL.md": "545946e53178ca4a42e29a05e7d9342c1787610ad7485ce110b1e7d289706cde",
+    ".factory/skills/speckit-specify/SKILL.md": "1e2e857fdfa9e7435cc88af20b5e3fa26598808cf3df8ed7fa79e11c99fe665f",
+    ".factory/skills/speckit-tasks/SKILL.md": "9225a308b52d1adfe94f8478fec495106a79587f6d9ea1da65a4bd5d2a070f41",
+    ".factory/skills/speckit-taskstoissues/SKILL.md": "604475a2c61fcf810628a1cba26264667574e186f15ba89f4dc070b05744efd7"
+  }
+}

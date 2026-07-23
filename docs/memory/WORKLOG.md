@@ -3,6 +3,15 @@
 Use concise high-value entries only.
 This is not a changelog. Do not record routine releases, version bumps, or implementation summaries.
 
+---
+
+### 2026-07-17 - Shared DB Migrations Foundation Shipped
+
+- **Why durable**: Sentinel now has a single, enforced boundary for schema evolution across all apps. The architectural invariant (unified migrations directory, loud-failure policy, prod-safety guardrails) will outlive the feature that introduced it.
+- **Future mistake prevented**: A future contributor adding per-app migration subdirectories, bypassing `goose` for ad-hoc SQL, or removing the `ENVIRONMENT=prod` guard from destructive Taskfile targets.
+- **Evidence**: `a1255dc feat(db-migrations): complete 004-shared-db-migrations feature`. 28/28 tasks complete. Integration tests in `tests/integration/db_migrations_test.go` cover all targets.
+- **Where to look**: `packages/db-migrations/`, `Taskfile.yml`, `specs/004-shared-db-migrations/architecture-migration-plan.md`, `docs/memory/ARCHITECTURE.md` → Database Schema Management.
+
 ### 2024-05-20 - Adopted CEL for Protobuf Validation
 
 - **Why durable**: Validation logic traditionally drifted between the Go Ingestor and any potential future clients. CEL allows embedding validation rules directly in the schema.

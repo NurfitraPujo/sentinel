@@ -5,6 +5,8 @@ compatibility: "Requires spec-kit project structure with .specify/ directory"
 metadata:
   author: "github-spec-kit"
   source: "templates/commands/clarify.md"
+user-invocable: true
+disable-model-invocation: false
 ---
 
 
