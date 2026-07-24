@@ -7,7 +7,10 @@ import (
 )
 
 func DetectProvider() testcontainers.ProviderType {
-	provider := os.Getenv("TESTCONTAINERS_PROVIDER")
+	provider := os.Getenv("TESTCONTAINER_PROVIDER")
+	if provider == "" {
+		provider = os.Getenv("TESTCONTAINERS_PROVIDER")
+	}
 	switch provider {
 	case "podman":
 		return testcontainers.ProviderPodman

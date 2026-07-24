@@ -76,7 +76,7 @@ func BaselineVersion(ctx context.Context, db *sql.DB, version int64, opts Migrat
 
 	goose.SetTableName(opts.TableName)
 
-	if err := goose.RunContext(ctx, "baseline", db, opts.Directory, strconv.FormatInt(version, 10)); err != nil {
+	if err := goose.UpToContext(ctx, db, opts.Directory, version); err != nil {
 		return fmt.Errorf("baseline failed: %w", err)
 	}
 

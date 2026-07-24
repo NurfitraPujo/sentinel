@@ -10,7 +10,7 @@ var (
 	hexAddressRegex = regexp.MustCompile(`\b0x[0-9a-fA-F]{6,}\b`)
 	emailRegex      = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
 	versionRegex    = regexp.MustCompile(`\bv?\d+\.\d+\.\d+(-[a-zA-Z0-9]+)?\b`)
-	userPathRegex   = regexp.MustCompile(`/(?:home|Users|U/users)[^/\s]+`)
+	userPathRegex   = regexp.MustCompile(`(?i)/(?:home|Users|u/users)/[^/\s]+`)
 )
 
 type Normalizer struct{}

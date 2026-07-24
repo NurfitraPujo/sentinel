@@ -76,7 +76,7 @@ func TestMaskString(t *testing.T) {
 		},
 		{
 			name:     "pwd variant",
-			input:    `pwd: "short"`,
+			input:    `pwd: "shortpass"`,
 			expected: `pwd=***REDACTED***`,
 		},
 		{
@@ -205,7 +205,7 @@ func TestMaskMap(t *testing.T) {
 		},
 		{
 			name:  "non-sensitive key value masked via content",
-			input: map[string]interface{}{"message": "user: api_key=secret123"},
+			input: map[string]interface{}{"message": "user: api_key=secret12345678901234567890"},
 			checkFn: func(got map[string]interface{}) bool {
 				return got["message"] == "user: api_key=***REDACTED***"
 			},

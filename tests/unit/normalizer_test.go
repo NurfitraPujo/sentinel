@@ -62,7 +62,7 @@ func TestNormalizeString(t *testing.T) {
 		{
 			name:     "email replacement with subdomain",
 			input:    "admin@mail.company.co.uk",
-			expected: "admin@<EMAIL>",
+			expected: "<EMAIL>",
 		},
 		{
 			name:     "version string removal",
@@ -92,7 +92,7 @@ func TestNormalizeString(t *testing.T) {
 		{
 			name:     "user path replacement - /u/users",
 			input:    "path: /u/users/admin",
-			expected: "path: /<USER_PATH>/admin",
+			expected: "path: /<USER_PATH>",
 		},
 		{
 			name:     "combined normalizations",

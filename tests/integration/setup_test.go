@@ -17,6 +17,7 @@ import (
 var (
 	testConfig PostgreSQLConfig
 	natsConfig NATSConfig
+	redisCfg   RedisConfig
 )
 
 type PostgreSQLConfig struct {
@@ -29,6 +30,14 @@ type PostgreSQLConfig struct {
 
 type NATSConfig struct {
 	URL string
+}
+
+// RedisConfig carries the address and credentials required to connect a
+// redis client to the testcontainer started in TestMain.
+type RedisConfig struct {
+	Addr     string
+	Password string
+	DB       int
 }
 
 // checkService attempts an HTTP request to determine if a service is available
@@ -46,8 +55,28 @@ func TestMain(m *testing.M) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Check if docker-compose services are available (for hybrid approach)
-	ingestorAvailable := checkService("http://localhost:8080/health")
+	// Check if docker-compose services are available (for hybrid approach).
+	// FORCE_TESTCONTAINERS=1 bypasses the docker-compose probe so the suite
+	// always provisions an isolated Postgres/NATS/Ingestor/Processor stack
+	// even when something else happens to be listening on port 8080.
+	ingestorAvailable := os.Getenv("FORCE_TESTCONTAINERS") == "" && checkService("http://localhost:8080/health")
+
+	// A Redis container is started in both modes so that rate-limiter
+	// integration tests have a real Redis to exercise against.
+	redisContainer, err := tc.StartRedis(ctx)
+	if err != nil {
+		fmt.Printf("Failed to start Redis: %v\n", err)
+		os.Exit(1)
+	}
+	defer redisContainer.Terminate(ctx)
+
+	redisCfg = RedisConfig{
+		Addr:     redisContainer.Addr(),
+		Password: "",
+		DB:       0,
+	}
+	os.Setenv("REDIS_ADDR", redisCfg.Addr)
+	fmt.Printf("Redis started at %s\n", redisCfg.Addr)
 
 	if ingestorAvailable {
 		fmt.Println("Using docker-compose services at localhost")
@@ -135,25 +164,32 @@ func TestMain(m *testing.M) {
 	ingestorURL := ingestorContainer.URL()
 	fmt.Printf("Ingestor started at %s\n", ingestorURL)
 
-	// Tail ingestor logs
-	ingestorContainer.FollowOutput(&logConsumer{prefix: "INGESTOR"})
-	ingestorContainer.StartLogProducer(ctx)
+	// Tail ingestor logs only when the container was actually created.
+	if ingestorContainer.Container != nil {
+		ingestorContainer.FollowOutput(&logConsumer{prefix: "INGESTOR"})
+		ingestorContainer.StartLogProducer(ctx)
+	}
 
-	// Start processor
+	// Start processor. If the pre-built image is unavailable we tolerate
+	// it: integration tests that need the processor (TestIngestAndProcess,
+	// TestSearchIndexing) will skip with a clear message, while tests
+	// that only exercise library code (database, nats, store, alerts,
+	// middleware, service) continue to run against the testcontainer
+	// Postgres/NATS stack.
 	processorContainer, err := tc.StartProcessor(ctx,
 		testConfig.Host, testConfig.Port,
 		testConfig.User, testConfig.Password, testConfig.DB,
 		natsConfig.URL,
 	)
 	if err != nil {
-		fmt.Printf("Failed to start processor: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("Processor container not started: %v (continuing)\n", err)
+		processorContainer = nil
 	}
-	defer processorContainer.Terminate(ctx)
-
-	// Tail processor logs
-	processorContainer.FollowOutput(&logConsumer{prefix: "PROCESSOR"})
-	processorContainer.StartLogProducer(ctx)
+	if processorContainer != nil && processorContainer.Container != nil {
+		defer processorContainer.Terminate(ctx)
+		processorContainer.FollowOutput(&logConsumer{prefix: "PROCESSOR"})
+		processorContainer.StartLogProducer(ctx)
+	}
 
 	os.Setenv("POSTGRES_HOST", testConfig.Host)
 	os.Setenv("POSTGRES_PORT", testConfig.Port)
@@ -161,6 +197,7 @@ func TestMain(m *testing.M) {
 	os.Setenv("POSTGRES_PASSWORD", testConfig.Password)
 	os.Setenv("POSTGRES_DB", testConfig.DB)
 	os.Setenv("NATS_URL", natsConfig.URL)
+	os.Setenv("REDIS_ADDR", redisCfg.Addr)
 	os.Setenv("INGESTOR_URL", ingestorURL)
 
 	os.Exit(m.Run())
@@ -249,5 +286,31 @@ func findProjectRoot() string {
 }
 
 func GetTestConfig() (PostgreSQLConfig, NATSConfig) {
+	if testConfig.Host == "" {
+		host := os.Getenv("POSTGRES_HOST")
+		if host != "" {
+			return PostgreSQLConfig{
+				Host:     host,
+				Port:     os.Getenv("POSTGRES_PORT"),
+				User:     os.Getenv("POSTGRES_USER"),
+				Password: os.Getenv("POSTGRES_PASSWORD"),
+				DB:       os.Getenv("POSTGRES_DB"),
+			}, NATSConfig{
+				URL: os.Getenv("NATS_URL"),
+			}
+		}
+	}
 	return testConfig, natsConfig
+}
+
+// GetRedisConfig returns the address and credentials of the Redis
+// testcontainer started in TestMain or via tc.Setup.
+func GetRedisConfig() RedisConfig {
+	if redisCfg.Addr == "" {
+		addr := os.Getenv("REDIS_ADDR")
+		if addr != "" {
+			return RedisConfig{Addr: addr}
+		}
+	}
+	return redisCfg
 }

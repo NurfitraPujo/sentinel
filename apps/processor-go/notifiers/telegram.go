@@ -29,9 +29,11 @@ type TelegramWorker struct {
 
 func NewTelegramWorker(cfg TelegramConfig) *TelegramWorker {
 	w := &TelegramWorker{
-		config: cfg,
-		client: &http.Client{Timeout: 10 * time.Second},
-		queue:  make(chan *TelegramNotification, 1000),
+		config:     cfg,
+		client:     &http.Client{Timeout: 10 * time.Second},
+		queue:      make(chan *TelegramNotification, 1000),
+		maxRetries: 3,
+		backoffs:   []time.Duration{1 * time.Second, 5 * time.Second, 30 * time.Second},
 	}
 	go w.processQueue()
 	return w
@@ -110,4 +112,11 @@ func (w *TelegramWorker) sendTelegram(notification *TelegramNotification) error 
 
 func (w *TelegramWorker) Close() {
 	close(w.queue)
+}
+
+// QueueLen returns the current number of buffered notifications awaiting
+// delivery. Intended for tests and operational diagnostics; not part of the
+// public notifier contract.
+func (w *TelegramWorker) QueueLen() int {
+	return len(w.queue)
 }

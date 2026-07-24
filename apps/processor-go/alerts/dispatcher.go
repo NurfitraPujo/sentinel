@@ -33,6 +33,10 @@ type Dispatcher struct {
 	mu       sync.RWMutex
 	configs  map[string]*AlertConfig
 	configMu sync.RWMutex
+	// senderForTest is a non-exported test seam. When set, sendAlert calls
+	// this function instead of logging. It is left nil in production; tests
+	// can install a fake via the setter exposed in export_test.go.
+	senderForTest func(ctx context.Context, cfg *AlertConfig, alert *Alert)
 }
 
 type alertCounter struct {
@@ -50,6 +54,42 @@ func NewDispatcher(db *pgxpool.Pool) *Dispatcher {
 	}
 	go d.loadConfigs(context.Background())
 	return d
+}
+
+// NewDispatcherForTest builds a Dispatcher without spawning the loadConfigs
+// background goroutine. It is intended for tests that populate the configs
+// map directly via SetConfigsForTest and therefore do not need the periodic
+// refresh ticker. The returned Dispatcher otherwise behaves like one built
+// by NewDispatcher.
+func NewDispatcherForTest(db *pgxpool.Pool) *Dispatcher {
+	return &Dispatcher{
+		db:       db,
+		counters: make(map[string]*alertCounter),
+		configs:  make(map[string]*AlertConfig),
+	}
+}
+
+// SetConfigsForTest replaces the dispatcher's loaded configurations. It is
+// intended for tests that populate the configs map directly without going
+// through the loadConfigs background goroutine.
+func (d *Dispatcher) SetConfigsForTest(configs map[string]*AlertConfig) {
+	d.configMu.Lock()
+	defer d.configMu.Unlock()
+	d.configs = configs
+}
+
+// RefreshConfigsForTest exposes the package-private refreshConfigs query so
+// tests can drive the loader synchronously without relying on the periodic
+// ticker started by NewDispatcher.
+func (d *Dispatcher) RefreshConfigsForTest(ctx context.Context) {
+	d.refreshConfigs(ctx)
+}
+
+// LoadConfigsForTest exposes the package-private loadConfigs loop so tests
+// can drive the ticker behavior synchronously with a caller-supplied
+// context. The loop returns when the context is cancelled.
+func (d *Dispatcher) LoadConfigsForTest(ctx context.Context) {
+	d.loadConfigs(ctx)
 }
 
 func (d *Dispatcher) loadConfigs(ctx context.Context) {
@@ -141,7 +181,19 @@ func (d *Dispatcher) Dispatch(ctx context.Context, issueID, projectID, errorClas
 }
 
 func (d *Dispatcher) sendAlert(ctx context.Context, cfg *AlertConfig, alert *Alert) {
+	if d.senderForTest != nil {
+		d.senderForTest(ctx, cfg, alert)
+		return
+	}
 	log.Printf("ALERT: %s via %s - %s", alert.IssueID, cfg.Channel, alert.Message)
+}
+
+// SetSenderForTest replaces the default sendAlert implementation with a
+// caller-supplied function. It is intended for tests that need to observe
+// the alerts the dispatcher produces. When s is nil, the default logging
+// behavior is restored. Production code should not call this method.
+func (d *Dispatcher) SetSenderForTest(s func(ctx context.Context, cfg *AlertConfig, alert *Alert)) {
+	d.senderForTest = s
 }
 
 func formatAlertMessage(errorClass, message string, count int) string {

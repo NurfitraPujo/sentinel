@@ -8,7 +8,7 @@ You MUST follow the memory-first workflow defined in [.specify/memory/workflow.m
 
 ## Memory Source of Truth
 - **Governance**: `.specify/memory/` (Constitution, Architecture, Workflow)
-- **Durable**: `docs/memory/` (History, Decisions, Patterns)
+- **Durable**: `docs/memory/` and `docs/solutions/` (History, Decisions, Patterns, Solutions)
 - **Active**: `specs/<feature>/` (Local context and synthesis)
 
 A task is not fully complete until memory has been reviewed and systemic lessons are captured.
