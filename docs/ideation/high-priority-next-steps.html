@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentinel Ideation: High-Priority Next Steps</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --accent: #38bdf8;
+            --accent-green: #4ade80;
+            --accent-amber: #fbbf24;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 2rem;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        header {
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        h1 {
+            color: var(--accent);
+            margin-top: 0;
+        }
+        .meta-tag {
+            display: inline-block;
+            background: var(--border);
+            color: var(--accent);
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .card h2 {
+            margin-top: 0;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+        .badge-p1 { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+        .badge-p2 { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
+        .badge-p3 { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; }
+        ul {
+            padding-left: 1.25rem;
+        }
+        li {
+            margin-bottom: 0.5rem;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 0.2rem 0.4rem;
+            border-radius: 0.25rem;
+            color: var(--accent-green);
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <span class="meta-tag">CE-IDEATION ARTIFACT</span>
+            <h1>Sentinel: Next High-Priority Technical & Product Directions</h1>
+            <p style="color: var(--text-muted);">Grounding scan executed on <code>/home/fitrapujo/oss/sentinel</code>. Ranked candidate directions for immediate roadmap consideration.</p>
+        </header>
+
+        <section class="card">
+            <h2>1. End-to-End E2E & Browser Test Pipeline Automation <span class="badge badge-p1">Rank 1 · Top Priority</span></h2>
+            <p><strong>Context & Rationale:</strong> We recently established comprehensive package unit test coverage and fixed setup containers. However, E2E processing tests (`TestIngestAndProcess`, `TestSearchIndexing`, `TestFingerprinting`) still require running Processor containers asynchronously. Adding automated Playwright/Browser E2E tests for <code>apps/dashboard-web</code> and a single Taskfile command (<code>task test:e2e</code>) will complete the integration testing matrix.</p>
+            <h3>Key Capabilities:</h3>
+            <ul>
+                <li>Add a unified Taskfile target <code>task test:e2e</code> that builds local containers, provisions Postgres/NATS, and runs full E2E flow.</li>
+                <li>Add Playwright browser tests in <code>apps/dashboard-web</code> to verify event search, filter, and issue details UI navigation.</li>
+                <li>Integrate non-blocking mock stream generators for local development.</li>
+            </ul>
+        </section>
+
+        <section class="card">
+            <h2>2. NATS JetStream Consumer Backpressure & Worker Pool Autoscaling <span class="badge badge-p1">Rank 2 · Architecture</span></h2>
+            <p><strong>Context & Rationale:</strong> In <code>docs/memory/ARCHITECTURE.md</code>, NATS Backpressure and Worker lag are identified as primary risk hotspots. While the Processor now has in-memory fallback buffering for DB outages, high-throughput spikes on NATSJetStream stream consumers need worker pool dynamic scaling and explicit backpressure metrics.</p>
+            <h3>Key Capabilities:</h3>
+            <ul>
+                <li>Implement a dynamic worker pool in <code>apps/processor-go</code> adjusting concurrency based on NATS JetStream pending message count.</li>
+                <li>Expose Prometheus/OpenTelemetry metrics for NATS lag and processing throughput.</li>
+                <li>Add rate-limiting and client-key quota enforcement in <code>apps/ingestor-go/middleware</code>.</li>
+            </ul>
+        </section>
+
+        <section class="card">
+            <h2>3. Real-Time WebSocket / Server-Sent Events (SSE) Live Feed in Dashboard <span class="badge badge-p2">Rank 3 · Feature</span></h2>
+            <p><strong>Context & Rationale:</strong> The current <code>apps/dashboard-web</code> relies on periodic polling or page refreshes to query issues. Adding SSE or WebSocket streaming from Processor/Postgres notify streams will allow real-time live event streaming directly in the frontend.</p>
+            <h3>Key Capabilities:</h3>
+            <ul>
+                <li>Add a Lightweight SSE endpoint in <code>apps/dashboard-web</code> listening to PostgreSQL <code>LISTEN/NOTIFY</code> or NATS event streams.</li>
+                <li>Implement live issue stream UI components with auto-scroll and instant error counter updates.</li>
+                <li>Add user notification toasts for critical severity spikes.</li>
+            </ul>
+        </section>
+
+        <section class="card">
+            <h2>4. Multi-Tenant Auth & Role-Based Access Control (RBAC) <span class="badge badge-p3">Rank 4 · DX / Security</span></h2>
+            <p><strong>Context & Rationale:</strong> As team usage grows, scoping project keys, issue resolution privileges, and dashboard management per-organization will be essential. <code>packages/db-migrations/migrations/1716550000_add_project_members.sql</code> initiated team member tables, but enforcement in the web UI and Ingestor API requires completion.</p>
+            <h3>Key Capabilities:</h3>
+            <ul>
+                <li>Complete RBAC middleware in <code>apps/dashboard-web</code> (Owner, Admin, Member roles).</li>
+                <li>Add API Key scoped permissions (ingest-only vs read/query keys).</li>
+                <li>Provide project-level audit logs visualization in Dashboard settings.</li>
+            </ul>
+        </section>
+    </div>
+</body>
+</html>
