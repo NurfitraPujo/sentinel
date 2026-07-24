@@ -1,7 +1,44 @@
 import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean } from 'drizzle-orm/pg-core';
 
+export const organizations = pgTable('organizations', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	name: varchar('name', { length: 255 }).notNull(),
+	slug: varchar('slug', { length: 255 }).notNull().unique(),
+	avatarUrl: text('avatar_url'),
+	createdAt: timestamp('created_at').defaultNow(),
+	updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+export const organizationMembers = pgTable('organization_members', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	userId: varchar('user_id', { length: 255 }).notNull(),
+	role: varchar('role', { length: 20 }).notNull().default('viewer'),
+	joinedAt: timestamp('joined_at').defaultNow(),
+}, (table) => ({
+	uniqueUserOrg: index('organization_members_user_org_unique').on(table.userId, table.organizationId),
+}));
+
+export const organizationInvitations = pgTable('organization_invitations', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	email: varchar('email', { length: 255 }).notNull(),
+	role: varchar('role', { length: 20 }).notNull().default('viewer'),
+	token: varchar('token', { length: 128 }).notNull().unique(),
+	status: varchar('status', { length: 20 }).notNull().default('pending'),
+	expiresAt: timestamp('expires_at').notNull(),
+	createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const userSessionPreferences = pgTable('user_session_preferences', {
+	userId: varchar('user_id', { length: 255 }).primaryKey(),
+	lastActiveOrganizationId: uuid('last_active_organization_id').references(() => organizations.id, { onDelete: 'set null' }),
+	updatedAt: timestamp('updated_at').defaultNow(),
+});
+
 export const projects = pgTable('projects', {
 	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
 	name: varchar('name', { length: 255 }).notNull(),
 	apiKey: varchar('api_key', { length: 64 }).notNull(),
 	apiKeyHash: varchar('api_key_hash', { length: 128 }).notNull(),

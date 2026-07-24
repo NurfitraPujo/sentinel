@@ -45,3 +45,10 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 > - Deployed to staging
 
 This is a changelog entry, not a durable lesson. It records what happened, not what was learned.
+
+### 2026-07-24 - Shipped Organization Layer & Multi-Tenancy Support
+
+- **Why durable**: Sentinel now supports multi-tenant organization hierarchy, server-side context routing, RBAC role inheritance (`owner`, `admin`, `engineer`, `support`, `viewer`), header org switcher, and project navigation components under `005-organization-layer`.
+- **Future mistake prevented**: Building features without explicit multi-tenant organization boundaries or context scoping.
+- **Evidence**: `specs/005-organization-layer/tasks.md` (9/9 tasks completed) and `specs/005-organization-layer/ripple-fixes.md`.
+- **Where to look**: `apps/dashboard-web/src/lib/db/queries/organizations.ts`, `apps/dashboard-web/src/hooks.server.ts`, `packages/db-migrations/migrations/1721800000_add_organization_layer.sql`.

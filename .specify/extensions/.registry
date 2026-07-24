@@ -28,6 +28,13 @@
           "speckit.git.remote",
           "speckit.git.initialize",
           "speckit.git.commit"
+        ],
+        "agy": [
+          "speckit.git.feature",
+          "speckit.git.validate",
+          "speckit.git.remote",
+          "speckit.git.initialize",
+          "speckit.git.commit"
         ]
       },
       "registered_skills": [],
@@ -49,6 +56,10 @@
           "speckit.blueprint.validate"
         ],
         "droid": [
+          "speckit.blueprint.generate",
+          "speckit.blueprint.validate"
+        ],
+        "agy": [
           "speckit.blueprint.generate",
           "speckit.blueprint.validate"
         ]
@@ -95,6 +106,17 @@
           "speckit.architecture-guard.refactor-generator",
           "speckit.architecture-guard.architecture-apply",
           "speckit.architecture-guard.init"
+        ],
+        "agy": [
+          "speckit.architecture-guard.governed-plan",
+          "speckit.architecture-guard.governed-tasks",
+          "speckit.architecture-guard.governed-implement",
+          "speckit.architecture-guard.architecture-workflow",
+          "speckit.architecture-guard.architecture-review",
+          "speckit.architecture-guard.violation-detection",
+          "speckit.architecture-guard.refactor-generator",
+          "speckit.architecture-guard.architecture-apply",
+          "speckit.architecture-guard.init"
         ]
       },
       "registered_skills": [],
@@ -114,6 +136,9 @@
           "speckit.conduct.run"
         ],
         "droid": [
+          "speckit.conduct.run"
+        ],
+        "agy": [
           "speckit.conduct.run"
         ]
       },
@@ -142,6 +167,13 @@
           "speckit.cost.export"
         ],
         "droid": [
+          "speckit.cost.track",
+          "speckit.cost.report",
+          "speckit.cost.budget",
+          "speckit.cost.compare",
+          "speckit.cost.export"
+        ],
+        "agy": [
           "speckit.cost.track",
           "speckit.cost.report",
           "speckit.cost.budget",
@@ -182,6 +214,14 @@
           "speckit.doctor",
           "speckit.speckit-utils.validate",
           "speckit.validate"
+        ],
+        "agy": [
+          "speckit.speckit-utils.resume",
+          "speckit.resume",
+          "speckit.speckit-utils.doctor",
+          "speckit.doctor",
+          "speckit.speckit-utils.validate",
+          "speckit.validate"
         ]
       },
       "registered_skills": [],
@@ -203,6 +243,10 @@
           "speckit.status"
         ],
         "droid": [
+          "speckit.status.show",
+          "speckit.status"
+        ],
+        "agy": [
           "speckit.status.show",
           "speckit.status"
         ]
@@ -243,6 +287,15 @@
           "speckit.security-review.tasks",
           "speckit.security-review.followup",
           "speckit.security-review.apply"
+        ],
+        "agy": [
+          "speckit.security-review.audit",
+          "speckit.security-review.staged",
+          "speckit.security-review.branch",
+          "speckit.security-review.plan",
+          "speckit.security-review.tasks",
+          "speckit.security-review.followup",
+          "speckit.security-review.apply"
         ]
       },
       "registered_skills": [],
@@ -266,6 +319,11 @@
           "speckit.ripple.check"
         ],
         "droid": [
+          "speckit.ripple.scan",
+          "speckit.ripple.resolve",
+          "speckit.ripple.check"
+        ],
+        "agy": [
           "speckit.ripple.scan",
           "speckit.ripple.resolve",
           "speckit.ripple.check"
@@ -300,6 +358,15 @@
           "speckit.memory-md.token-report"
         ],
         "droid": [
+          "speckit.memory-md.init",
+          "speckit.memory-md.plan-with-memory",
+          "speckit.memory-md.capture",
+          "speckit.memory-md.capture-from-diff",
+          "speckit.memory-md.audit",
+          "speckit.memory-md.log-finding",
+          "speckit.memory-md.token-report"
+        ],
+        "agy": [
           "speckit.memory-md.init",
           "speckit.memory-md.plan-with-memory",
           "speckit.memory-md.capture",

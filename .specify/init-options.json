@@ -1,10 +1,10 @@
 {
-  "ai": "droid",
+  "ai": "agy",
   "ai_skills": true,
   "branch_numbering": "sequential",
   "context_file": ".kilocode/rules/specify-rules.md",
   "here": true,
-  "integration": "droid",
+  "integration": "agy",
   "script": "sh",
   "speckit_version": "0.13.4"
 }

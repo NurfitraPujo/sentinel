@@ -20,6 +20,6 @@
       "invoke_separator": "-"
     }
   },
-  "integration": "droid",
-  "default_integration": "droid"
+  "integration": "agy",
+  "default_integration": "agy"
 }

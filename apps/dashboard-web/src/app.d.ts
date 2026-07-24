@@ -6,6 +6,8 @@ declare global {
 		interface Locals {
 			auth(): Promise<Session | null>;
 			getSession(): Promise<Session | null>;
+			currentOrg?: { id: string; name: string; slug: string };
+			orgRole?: string;
 		}
 		interface PageData {
 			session: Session | null;

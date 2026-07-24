@@ -181,3 +181,31 @@ Running `task db:reset` in prod, leaking DSNs in CI logs, granting the migration
 
 **Where to look next**
 `Taskfile.yml`, `packages/db-migrations/cmd/migrate/main.go`.
+
+---
+
+### 2026-07-24 - Organization-First Multi-Tenancy & Role Inheritance
+
+**Status**
+Active
+
+**Why this is durable**
+Defines the multi-tenant resource hierarchy and authorization precedence for Sentinel across all current and future features.
+
+**Decision**
+Projects must belong to exactly one Organization. User authorization is resolved by inheriting the user's `organization_members.role` (`owner`, `admin`, `engineer`, `support`, `viewer`) across all org projects by default, unless a specific project override exists in `project_members`. Session context resolution prioritizes the URL slug `/[orgSlug]/...` as the primary source of truth, with `user_session_preferences` used solely for root landing.
+
+**Tradeoffs**
+- **Gained**: Clean multi-tenant data isolation and low operational friction for org admins.
+- **Made harder**: Single project access grants require explicit `project_members` override configuration.
+- **Reconsider**: If standalone non-organizational project monitoring is required.
+
+**Future mistake prevented**
+Implementing fragmented per-project access checks or allowing data leakage across organization boundaries.
+
+**Evidence**
+- Implementation: `apps/dashboard-web/src/lib/db/queries/organizations.ts`, `apps/dashboard-web/src/hooks.server.ts`
+- Spec & Plan: `specs/005-organization-layer/spec.md`, `specs/005-organization-layer/data-model.md`
+
+**Where to look next**
+`apps/dashboard-web/src/lib/db/queries/organizations.ts` and `apps/dashboard-web/src/hooks.server.ts`.
