@@ -1,5 +1,4 @@
 {
-  "active_feature": "006-issue-lifecycle-management",
-  "status": "completed",
-  "completed_at": "2026-07-25T12:20:30Z"
+  "active_feature": "007-go-client-sdk",
+  "feature_directory": "specs/007-go-client-sdk"
 }

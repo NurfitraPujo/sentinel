@@ -65,3 +65,12 @@ Marks the completion of the active triage platform milestone (006-issue-lifecycl
 
 **Decision**
 Shipped issue status triage, polymorphic AI/human assignees, bulk triage API, real-time Go regression detection, and Many-to-Many issue relations.
+
+---
+
+### 2026-07-25 - Shipped Official Go Client SDK (`packages/sdk-go`) and High-Throughput Ingestor Batch API
+
+- **Why durable**: Sentinel now has an official Go Client SDK (`packages/sdk-go`) adhering to the Sentinel SDK Protocol Specification (`docs/sdk-specification.md`), with batch HTTP ingestion support (`POST /ingest/batch`) in `ingestor-go`.
+- **Future mistake prevented**: Creating ad-hoc unstandardized error reporting clients or making blocking HTTP calls on caller threads during error capture.
+- **Evidence**: `specs/007-go-client-sdk/tasks.md` (6/6 tasks completed) and `specs/007-go-client-sdk/ripple-report.md`.
+- **Where to look**: `packages/sdk-go/`, `apps/ingestor-go/main.go`, `docs/sdk-specification.md`.

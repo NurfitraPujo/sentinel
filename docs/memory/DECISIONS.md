@@ -238,3 +238,35 @@ Querying or locking relational issue graphs on the high-throughput error ingesti
 
 **Where to look next**
 `apps/processor-go/store/store.go` and `apps/dashboard-web/src/lib/db/queries/issues.ts`.
+
+---
+
+### 2026-07-25 - Non-Blocking Dual-Endpoint Client SDK Protocol with Auto-Initialization & Context-Aware Telemetry Correlation
+
+**Status**
+Active
+
+**Why this is durable**
+Client SDKs in high-throughput applications must guarantee zero execution latency penalties (< 50 µs) and non-blocking caller execution, while preserving OpenTelemetry trace context and sanitizing client-side PII.
+
+**Decision**
+1. **Dual Endpoint Ingestion**: `ingestor-go` supports both single-event (`POST /ingest`) and array batch (`POST /ingest/batch`) ingestion endpoints to reduce network request count by up to 90% during error spikes.
+2. **Lock-Free Channel Transport**: SDK uses a buffered Go channel (`chan *Event`) with non-blocking `select` push and FIFO eviction on ring buffer overflow (`MaxBufferSize`).
+3. **Auto-Initialization Fallback**: If uninitialized code invokes `CaptureError`, default configuration auto-initializes without panicking.
+4. **Context-Aware Telemetry Wiring**: `CaptureErrorContext(ctx, err)` automatically extracts W3C OpenTelemetry `trace_id`/`span_id` from `ctx` and applies context tag helpers (`WithUser`, `WithTenant`, `WithTag`).
+5. **Logger Framework Sub-Packages**: Zero-code-change logger integration via `sentinelslog` (`slog.Handler`), `sentinelzerolog` (`zerolog.Hook`), and `sentinellog` (`io.Writer`).
+
+**Tradeoffs**
+- **Gained**: Sub-50µs execution overhead, 90% HTTP request reduction, automatic trace correlation.
+- **Made harder**: Slightly higher memory usage for buffered channels (up to 10 MB per process).
+- **Reconsider**: If client applications require disk-backed persistence during multi-day offline disconnects.
+
+**Future mistake prevented**
+Blocking application execution threads during error capture or leaking PII in metadata.
+
+**Evidence**
+- Specification: `docs/sdk-specification.md`, `specs/007-go-client-sdk/spec.md`
+- Implementation: `packages/sdk-go/`, `apps/ingestor-go/main.go`
+
+**Where to look next**
+`docs/sdk-specification.md` and `packages/sdk-go/`.

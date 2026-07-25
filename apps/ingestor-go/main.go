@@ -88,7 +88,13 @@ func main() {
 			handleIngest(ingestService).ServeHTTP(w, r)
 		}),
 	)
+	batchIngestHandler := auth.NewAPIKeyAuthenticator(db).Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handleBatchIngest(ingestService).ServeHTTP(w, r)
+		}),
+	)
 	http.Handle("/ingest", rateLimiter.Middleware(ingestHandler))
+	http.Handle("/ingest/batch", rateLimiter.Middleware(batchIngestHandler))
 	http.HandleFunc("/health", handleHealth(db))
 
 	srv := &http.Server{
@@ -142,6 +148,41 @@ func handleIngest(svc *service.IngestService) http.HandlerFunc {
 		log.Printf("Successfully ingested error: project=%s, class=%s", payload.ProjectKey, payload.ErrorClass)
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	}
+}
+
+func handleBatchIngest(svc *service.IngestService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payloads []validation.ErrorPayload
+		if err := json.NewDecoder(r.Body).Decode(&payloads); err != nil {
+			http.Error(w, "Invalid JSON payload array", http.StatusBadRequest)
+			return
+		}
+
+		if len(payloads) == 0 {
+			http.Error(w, "Empty payload batch", http.StatusBadRequest)
+			return
+		}
+
+		ingestedCount := 0
+		for i := range payloads {
+			if err := svc.Ingest(r.Context(), &payloads[i]); err != nil {
+				log.Printf("Failed to ingest batch item %d: %v", i, err)
+			} else {
+				ingestedCount++
+			}
+		}
+
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "accepted",
+			"ingested": ingestedCount,
+		})
 	}
 }
 
