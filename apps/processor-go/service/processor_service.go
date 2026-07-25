@@ -54,8 +54,8 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		return err
 	}
 
-	log.Printf("Processing event: project=%s, error_class=%s, fingerprint=%s",
-		evt.ProjectKey, evt.ErrorClass, evt.Fingerprint)
+	log.Printf("Processing event: project=%s, error_class=%s, fingerprint=%s, release_version=%s",
+		evt.ProjectKey, evt.ErrorClass, evt.Fingerprint, evt.ReleaseVersion)
 
 	projectID, err := s.store.GetProjectByKey(ctx, evt.ProjectKey)
 	if err != nil {
@@ -69,12 +69,12 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		Fingerprint: evt.Fingerprint,
 		Message:     evt.Message,
 		ErrorClass:  evt.ErrorClass,
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   evt.Timestamp,
 		LastSeen:    evt.Timestamp,
 	}
 
-	if err := s.store.UpsertIssue(ctx, issue); err != nil {
+	if err := s.store.UpsertIssue(ctx, issue, evt.ReleaseVersion); err != nil {
 		log.Printf("Failed to upsert issue: %v", err)
 		return err
 	}
@@ -98,15 +98,16 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	metadataJSON, _ := json.Marshal(evt.Metadata)
 
 	occ := &store.ErrorOccurrence{
-		ID:          uuid.New().String(),
-		IssueID:     issueID,
-		Environment: evt.Environment,
-		Platform:    evt.Platform,
-		Stacktrace:  stacktraceJSON,
-		Metadata:    metadataJSON,
-		TraceID:     evt.TraceID,
-		SpanID:      evt.SpanID,
-		CreatedAt:   evt.Timestamp,
+		ID:             uuid.New().String(),
+		IssueID:        issueID,
+		Environment:    evt.Environment,
+		Platform:       evt.Platform,
+		ReleaseVersion: evt.ReleaseVersion,
+		Stacktrace:     stacktraceJSON,
+		Metadata:       metadataJSON,
+		TraceID:        evt.TraceID,
+		SpanID:         evt.SpanID,
+		CreatedAt:      evt.Timestamp,
 	}
 
 	if err := s.store.InsertOccurrence(ctx, occ); err != nil {

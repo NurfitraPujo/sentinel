@@ -52,3 +52,16 @@ This is a changelog entry, not a durable lesson. It records what happened, not w
 - **Future mistake prevented**: Building features without explicit multi-tenant organization boundaries or context scoping.
 - **Evidence**: `specs/005-organization-layer/tasks.md` (9/9 tasks completed) and `specs/005-organization-layer/ripple-fixes.md`.
 - **Where to look**: `apps/dashboard-web/src/lib/db/queries/organizations.ts`, `apps/dashboard-web/src/hooks.server.ts`, `packages/db-migrations/migrations/1721800000_add_organization_layer.sql`.
+
+---
+
+### 2026-07-25 - Shipped Issue Lifecycle Management & Regression Tracking
+
+**Status**
+Active
+
+**Why this is durable**
+Marks the completion of the active triage platform milestone (006-issue-lifecycle-management).
+
+**Decision**
+Shipped issue status triage, polymorphic AI/human assignees, bulk triage API, real-time Go regression detection, and Many-to-Many issue relations.

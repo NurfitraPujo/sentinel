@@ -13,18 +13,19 @@ import (
 )
 
 type ErrorEvent struct {
-	Fingerprint string                 `json:"fingerprint"`
-	ProjectKey  string                 `json:"project_key"`
-	Platform    string                 `json:"platform"`
-	Environment string                 `json:"environment"`
-	Message     string                 `json:"message"`
-	ErrorClass  string                 `json:"error_class"`
-	TraceID     string                 `json:"trace_id"`
-	SpanID      string                 `json:"span_id"`
-	Stacktrace  []StackFrame           `json:"stacktrace"`
-	Metadata    map[string]interface{} `json:"metadata"`
-	Timestamp   time.Time              `json:"timestamp"`
-	TraceFlags  uint32                 `json:"trace_flags"`
+	Fingerprint    string                 `json:"fingerprint"`
+	ProjectKey     string                 `json:"project_key"`
+	Platform       string                 `json:"platform"`
+	Environment    string                 `json:"environment"`
+	ReleaseVersion string                 `json:"release_version"`
+	Message        string                 `json:"message"`
+	ErrorClass     string                 `json:"error_class"`
+	TraceID        string                 `json:"trace_id"`
+	SpanID         string                 `json:"span_id"`
+	Stacktrace     []StackFrame           `json:"stacktrace"`
+	Metadata       map[string]interface{} `json:"metadata"`
+	Timestamp      time.Time              `json:"timestamp"`
+	TraceFlags     uint32                 `json:"trace_flags"`
 }
 
 type StackFrame struct {
@@ -36,12 +37,15 @@ type StackFrame struct {
 
 func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker.Masker) {
 	e.Message = normalizer.NormalizeString(e.Message)
-	e.Message = masker.MaskString(e.Message) // R002: Mask message
+	e.Message = masker.MaskString(e.Message)
 	e.ErrorClass = normalizer.NormalizeString(e.ErrorClass)
 	e.TraceID = normalizer.NormalizeString(e.TraceID)
 	e.SpanID = normalizer.NormalizeString(e.SpanID)
 	if e.Metadata != nil {
 		e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))
+		if rv, ok := e.Metadata["release_version"].(string); ok && e.ReleaseVersion == "" {
+			e.ReleaseVersion = rv
+		}
 	}
 }
 
@@ -84,7 +88,6 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		})
 	}
 
-	// R005: Normalize/Mask BEFORE fingerprinting
 	norm := normalizer.NewNormalizer()
 	mask := masker.NewMasker()
 	event.Normalize(norm, mask)

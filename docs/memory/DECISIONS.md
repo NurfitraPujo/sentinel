@@ -209,3 +209,32 @@ Implementing fragmented per-project access checks or allowing data leakage acros
 
 **Where to look next**
 `apps/dashboard-web/src/lib/db/queries/organizations.ts` and `apps/dashboard-web/src/hooks.server.ts`.
+
+---
+
+### 2026-07-25 - Real-time Ingestion Regression Detection with Polymorphic Assignees & Async Relations
+
+**Status**
+Active
+
+**Why this is durable**
+Establishes the real-time regression reopening architecture inside the high-throughput Go ingestion worker while decoupling asynchronous issue linkage to protect ingestion throughput.
+
+**Decision**
+- Perform automated version-aware regression reopening (`detectAndHandleRegression`) directly inside `apps/processor-go/store/store.go` during event ingestion.
+- Maintain 0% read/lock overhead on `issue_relations` on the high-throughput ingestion path.
+- Support polymorphic issue assignment and timeline activity actors (`assignee_type: "user" | "agent"`).
+
+**Tradeoffs**
+- Gained: Sub-second regression reopening upon recurrence in newer release versions, zero ingestion throughput degradation.
+- Made harder: Must maintain regression version comparison logic in both Go (`processor-go`) and TypeScript query helpers.
+- Reconsider: If complex issue linkage graph traversals need to be evaluated during real-time event filtering.
+
+**Future mistake prevented**
+Querying or locking relational issue graphs on the high-throughput error ingestion hot path.
+
+**Evidence**
+- Implementation: `apps/processor-go/store/store.go`, `apps/dashboard-web/src/lib/db/queries/issues.ts`, `packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql`
+
+**Where to look next**
+`apps/processor-go/store/store.go` and `apps/dashboard-web/src/lib/db/queries/issues.ts`.
