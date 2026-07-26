@@ -82,19 +82,35 @@ func main() {
 	}
 
 	redisClient, _ := redis.NewClient(ctx, redisCfg)
-	rateLimiter := middleware.NewRateLimiter(redisClient, 5000, time.Minute)
-	ingestHandler := auth.NewAPIKeyAuthenticator(db).Middleware(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handleIngest(ingestService).ServeHTTP(w, r)
-		}),
+	
+	subCfg := nats.SubscriberConfig{
+		URL:       getEnv("NATS_URL", "nats://localhost:4222"),
+		Subject:   "api_key.invalidated",
+		Consumer:  "ingestor_apikey_invalidated",
+		Stream:    "API_KEYS", // Assuming there's a stream for it
+		BatchSize: 10,
+	}
+	subscriber, _ := nats.NewSubscriber(ctx, subCfg)
+
+	rateLimiter := middleware.NewRateLimiter(redisClient)
+	authenticator := auth.NewAPIKeyAuthenticator(db, redisClient, subscriber)
+
+	ingestHandler := authenticator.Middleware(
+		rateLimiter.Middleware(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handleIngest(ingestService).ServeHTTP(w, r)
+			}),
+		),
 	)
-	batchIngestHandler := auth.NewAPIKeyAuthenticator(db).Middleware(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handleBatchIngest(ingestService).ServeHTTP(w, r)
-		}),
+	batchIngestHandler := authenticator.Middleware(
+		rateLimiter.Middleware(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handleBatchIngest(ingestService).ServeHTTP(w, r)
+			}),
+		),
 	)
-	http.Handle("/ingest", rateLimiter.Middleware(ingestHandler))
-	http.Handle("/ingest/batch", rateLimiter.Middleware(batchIngestHandler))
+	http.Handle("/ingest", ingestHandler)
+	http.Handle("/ingest/batch", batchIngestHandler)
 	http.HandleFunc("/health", handleHealth(db))
 
 	srv := &http.Server{

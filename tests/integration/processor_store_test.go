@@ -112,7 +112,7 @@ func TestStorePackage_UpsertIssue_InsertsNewIssue(t *testing.T) {
 		LastSeen:    time.Now().UTC(),
 	}
 
-	require.NoError(t, s.UpsertIssue(ctx, issue))
+	require.NoError(t, s.UpsertIssue(ctx, issue, ""))
 
 	// Verify the row was inserted with count = 1.
 	var (
@@ -149,7 +149,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 		FirstSeen:   time.Now().UTC().Add(-1 * time.Hour),
 		LastSeen:    time.Now().UTC().Add(-1 * time.Hour),
 	}
-	require.NoError(t, s.UpsertIssue(ctx, first))
+	require.NoError(t, s.UpsertIssue(ctx, first, ""))
 
 	var (
 		firstID    string
@@ -174,7 +174,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
-	require.NoError(t, s.UpsertIssue(ctx, second))
+	require.NoError(t, s.UpsertIssue(ctx, second, ""))
 
 	var (
 		secondID    string
@@ -213,7 +213,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 		FirstSeen:   now,
 		LastSeen:    now,
 	}
-	require.NoError(t, s.UpsertIssue(ctx, first))
+	require.NoError(t, s.UpsertIssue(ctx, first, ""))
 
 	// A duplicate call with an older last_seen must NOT regress last_seen.
 	older := &store.Issue{
@@ -226,7 +226,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 		FirstSeen:   now.Add(-2 * time.Hour),
 		LastSeen:    now.Add(-2 * time.Hour),
 	}
-	require.NoError(t, s.UpsertIssue(ctx, older))
+	require.NoError(t, s.UpsertIssue(ctx, older, ""))
 
 	var lastSeen time.Time
 	require.NoError(t, pool.QueryRow(ctx,
@@ -258,7 +258,7 @@ func TestStorePackage_InsertOccurrence_InsertsRow(t *testing.T) {
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
-	require.NoError(t, s.UpsertIssue(ctx, issue))
+	require.NoError(t, s.UpsertIssue(ctx, issue, ""))
 
 	stacktrace := json.RawMessage(`[{"file":"main.go","line":1,"function":"main"}]`)
 	metadata := json.RawMessage(`{"k":"v"}`)
@@ -339,7 +339,7 @@ func TestStorePackage_GetIssueIDByFingerprint_ReturnsID(t *testing.T) {
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
-	require.NoError(t, s.UpsertIssue(ctx, issue))
+	require.NoError(t, s.UpsertIssue(ctx, issue, ""))
 
 	got, err := s.GetIssueIDByFingerprint(ctx, projectID, fingerprint)
 	require.NoError(t, err)

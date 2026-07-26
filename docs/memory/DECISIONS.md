@@ -270,3 +270,32 @@ Blocking application execution threads during error capture or leaking PII in me
 
 **Where to look next**
 `docs/sdk-specification.md` and `packages/sdk-go/`.
+
+---
+
+### 2026-07-26 - Dual-Layer Multi-Tenant API Key Authentication with NATS Invalidation & Hierarchical Sliding-Window Rate Limiting
+
+**Status**
+Active
+
+**Why this is durable**
+Protects Sentinel ingestion hot path (< 1ms overhead) from authentication latency and denial-of-service memory amplification while maintaining immediate (< 100ms) cache invalidation upon key revocation across distributed ingestor nodes.
+
+**Decision**
+Store only SHA256 hashed API key digests (`key_hash`) in `project_api_keys` with raw secret tokens (`sent_live_...` or `sent_org_...`) displayed ONCE upon creation. Support both Project-scoped and Organization-wide API keys (`organization_id` bound, nullable `project_id`). Cache valid keys in Redis/in-memory LRU with a 60-second TTL, listening to NATS JetStream `api_key.invalidated` events for instant revocation cache purging. Enforce hierarchical rate limits (per-key quota overrides project default 5,000 RPM) via Redis sliding window counters wrapped inside authentication middleware.
+
+**Tradeoffs**
+- **Gained**: Sub-millisecond error ingestion auth, zero plaintext secret storage, instant cross-node revocation, and granular per-key rate limit overrides.
+- **Made harder**: Standalone single-node deployments without Redis/NATS rely on a 60-second in-memory LRU TTL window for key revocation propagation.
+- **Reconsider**: If standalone non-Redis deployments require instant revocation without NATS broker overhead.
+
+**Future mistake prevented**
+Nesting rate-limiting middleware outside authentication middleware (exposing rate limit caches to unauthenticated DoS amplification) or storing plaintext API key tokens in database tables.
+
+**Evidence**
+- Implementation: `apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`, `packages/db-migrations/migrations/1722000000_add_api_key_management.sql`
+- Specification & Plan: `specs/008-api-key-management/spec.md`, `specs/008-api-key-management/plan.md`
+
+**Where to look next**
+`apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
+

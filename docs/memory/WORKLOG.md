@@ -74,3 +74,13 @@ Shipped issue status triage, polymorphic AI/human assignees, bulk triage API, re
 - **Future mistake prevented**: Creating ad-hoc unstandardized error reporting clients or making blocking HTTP calls on caller threads during error capture.
 - **Evidence**: `specs/007-go-client-sdk/tasks.md` (6/6 tasks completed) and `specs/007-go-client-sdk/ripple-report.md`.
 - **Where to look**: `packages/sdk-go/`, `apps/ingestor-go/main.go`, `docs/sdk-specification.md`.
+
+---
+
+### 2026-07-26 - Shipped Multi-Tenant Auth & API Key Management
+
+- **Why durable**: Sentinel now features full multi-tenant organization API key management, dual context creation UI (Org Settings vs. Project Settings), instant NATS JetStream key revocation, and hierarchical sliding-window rate limiting.
+- **Future mistake prevented**: Nesting rate-limiting middleware outside authentication middleware (exposing rate limit caches to unauthenticated DoS amplification) or storing plaintext API key tokens in database tables.
+- **Evidence**: `specs/008-api-key-management/tasks.md` (8/8 tasks completed) and `specs/008-api-key-management/ripple-report.md`.
+- **Where to look**: `apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`, `packages/db-migrations/migrations/1722000000_add_api_key_management.sql`.
+

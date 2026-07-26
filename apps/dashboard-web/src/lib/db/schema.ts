@@ -234,3 +234,22 @@ export const verificationTokens = pgTable(
 		compoundKey: index('verification_token_identifier_token_index').on(vt.identifier, vt.token),
 	})
 );
+
+export const projectApiKeys = pgTable('project_api_keys', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+	name: varchar('name', { length: 255 }).notNull(),
+	keyPrefix: varchar('key_prefix', { length: 16 }).notNull(),
+	keyHash: varchar('key_hash', { length: 128 }).notNull().unique(),
+	scope: varchar('scope', { length: 20 }).notNull().default('ingest'),
+	status: varchar('status', { length: 20 }).notNull().default('active'),
+	rateLimitRpm: integer('rate_limit_rpm').notNull().default(5000),
+	expiresAt: timestamp('expires_at', { withTimezone: true }),
+	revokedAt: timestamp('revoked_at', { withTimezone: true }),
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+}, (table) => ({
+	idxApiKeysHashStatus: index('idx_api_keys_hash_status').on(table.keyHash, table.status),
+	idxApiKeysOrgProject: index('idx_api_keys_org_project').on(table.organizationId, table.projectId),
+}));

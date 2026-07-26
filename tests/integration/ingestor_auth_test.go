@@ -69,7 +69,7 @@ func seedAuthProject(t *testing.T, pool *pgxpool.Pool, name, apiKey string) stri
 // downstream handler is not called.
 func TestAPIKeyAuthenticator_MissingKey(t *testing.T) {
 	pool := newAuthTestPool(t)
-	authn := auth.NewAPIKeyAuthenticator(pool)
+	authn := auth.NewAPIKeyAuthenticator(pool, nil, nil)
 
 	called := false
 	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +99,7 @@ func TestAPIKeyAuthenticator_InvalidKey(t *testing.T) {
 	seedName := fmt.Sprintf("test-project-invalid-%d", time.Now().UnixNano())
 	seedAuthProject(t, pool, seedName, "the-correct-api-key")
 
-	authn := auth.NewAPIKeyAuthenticator(pool)
+	authn := auth.NewAPIKeyAuthenticator(pool, nil, nil)
 
 	called := false
 	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +128,7 @@ func TestAPIKeyAuthenticator_ValidKey(t *testing.T) {
 	apiKey := fmt.Sprintf("valid-api-key-%d", time.Now().UnixNano())
 	seedAuthProject(t, pool, projectName, apiKey)
 
-	authn := auth.NewAPIKeyAuthenticator(pool)
+	authn := auth.NewAPIKeyAuthenticator(pool, nil, nil)
 
 	var (
 		observedKey any

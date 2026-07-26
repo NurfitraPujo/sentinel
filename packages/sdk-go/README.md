@@ -62,6 +62,18 @@ func main() {
 
 ---
 
+## API Keys & Authentication
+
+Sentinel supports two types of API keys for authentication (`X-API-Key`):
+
+1. **Project API Keys** (`sent_live_...`): Bound to a single project. The SDK sends `ProjectKey` in the `X-API-Key` header.
+2. **Organization-Wide API Keys** (`sent_org_...`): Bound to an organization. When ingesting with an Org-Wide key, specify the target project via the `X-Project-Key` HTTP header (or set `ProjectKey` to your target project's key).
+
+> [!NOTE]
+> **API Key Revocation**: When an API key is revoked via the Sentinel Dashboard, active cluster nodes purge key caches in **< 100ms** via NATS JetStream. In standalone single-instance deployments without Redis/NATS, cache eviction completes within a **60-second TTL** window.
+
+---
+
 ## Context Wiring & OpenTelemetry Tracing
 
 Pass request `context.Context` to capture OpenTelemetry `trace_id` / `span_id` and attach service tags:

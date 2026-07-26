@@ -1,4 +1,1 @@
-{
-  "active_feature": "007-go-client-sdk",
-  "feature_directory": "specs/007-go-client-sdk"
-}
+{"feature_directory":"specs/008-api-key-management"}

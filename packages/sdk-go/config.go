@@ -3,6 +3,9 @@ package sentinel
 import "time"
 
 type Config struct {
+	// ProjectKey is the API Key used for authentication (`X-API-Key`).
+	// Supports Project API keys (`sent_live_...`) or Organization-Wide API keys (`sent_org_...`).
+	// When using Org-Wide keys, specify target project key or header.
 	ProjectKey     string        `json:"project_key"`
 	Endpoint       string        `json:"endpoint"`
 	Environment    string        `json:"environment"`
