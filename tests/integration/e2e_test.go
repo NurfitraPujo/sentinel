@@ -37,14 +37,13 @@ func newPostgresPool(t *testing.T, cfg TestConfig) *pgxpool.Pool {
 		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost,
 		os.Getenv("POSTGRES_PORT"), cfg.PostgresDB,
 	))
-	if err != nil {
-		t.Skipf("Skipping: cannot connect to postgres: %v", err)
-	}
+	requireInfra(t, err, "postgres connection")
 
-	if err := pool.Ping(ctx); err != nil {
+	pingErr := pool.Ping(ctx)
+	if pingErr != nil {
 		pool.Close()
-		t.Skipf("Skipping: cannot ping postgres: %v", err)
 	}
+	requireInfra(t, pingErr, "postgres ping")
 
 	return pool
 }
@@ -85,10 +84,7 @@ func sendErrorEvent(t *testing.T, ingesterURL, apiKey string, payload map[string
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		t.Skipf("Skipping test: ingester HTTP service unavailable at %s: %v", ingesterURL, err)
-		return nil
-	}
+	requireInfra(t, err, fmt.Sprintf("ingester HTTP service at %s", ingesterURL))
 	return resp
 }
 

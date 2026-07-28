@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean, unique } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean } from 'drizzle-orm/pg-core';
 
 export const organizations = pgTable('organizations', {
 	id: uuid('id').primaryKey().defaultRandom(),
@@ -76,11 +76,6 @@ export const issues = pgTable('issues', {
 	firstSeen: timestamp('first_seen').defaultNow(),
 	lastSeen: timestamp('last_seen').defaultNow(),
 	count: bigint('count', { mode: 'number' }).notNull().default(1),
-	resolvedAt: timestamp('resolved_at'),
-	resolvedByType: varchar('resolved_by_type', { length: 20 }), // 'user' | 'agent'
-	resolvedBy: varchar('resolved_by', { length: 255 }),
-	regressionCount: integer('regression_count').notNull().default(0),
-	lastRegressedAt: timestamp('last_regressed_at'),
 });
 
 export const issueActivity = pgTable('issue_activity', {
@@ -124,33 +119,6 @@ export const errorSearchIndex = pgTable('error_search_index', {
 	spanId: varchar('span_id', { length: 64 }),
 	requestId: varchar('request_id', { length: 255 }),
 });
-
-export const issueRelations = pgTable('issue_relations', {
-	id: uuid('id').primaryKey().defaultRandom(),
-	sourceIssueId: uuid('source_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	targetIssueId: uuid('target_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	relationType: varchar('relation_type', { length: 50 }).notNull(),
-	createdByType: varchar('created_by_type', { length: 20 }).notNull(),
-	createdBy: varchar('created_by', { length: 255 }).notNull(),
-	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-}, (table) => ({
-	issueRelationsUnique: unique('issue_relations_unique').on(table.sourceIssueId, table.targetIssueId, table.relationType),
-	idxIssueRelationsSource: index('idx_issue_relations_source').on(table.sourceIssueId),
-	idxIssueRelationsTarget: index('idx_issue_relations_target').on(table.targetIssueId),
-}));
-
-export const issueActivity = pgTable('issue_activity', {
-	id: uuid('id').primaryKey().defaultRandom(),
-	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	actorType: varchar('actor_type', { length: 20 }).notNull(),
-	actorId: varchar('actor_id', { length: 255 }).notNull(),
-	eventType: varchar('event_type', { length: 50 }).notNull(),
-	oldValue: jsonb('old_value'),
-	newValue: jsonb('new_value'),
-	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-}, (table) => ({
-	idxIssueActivityIssueCreated: index('idx_issue_activity_issue_created').on(table.issueId, table.createdAt),
-}));
 
 export const alertConfigs = pgTable('alert_configs', {
 	id: uuid('id').primaryKey().defaultRandom(),

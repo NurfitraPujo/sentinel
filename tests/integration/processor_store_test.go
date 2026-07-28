@@ -64,9 +64,11 @@ func seedProjectU13(t *testing.T, pool *pgxpool.Pool) (projectID string, project
 func postgresConfigFromTest(t *testing.T) (host, port, user, password, db string) {
 	t.Helper()
 	env := tc.Setup(t, tc.WithResources(tc.PostgresResource), tc.WithMigrations(true))
+	var hostErr error
 	if env.PGConfig.Host == "" {
-		t.Skip("PostgreSQL not available")
+		hostErr = fmt.Errorf("postgres host unavailable")
 	}
+	requireInfra(t, hostErr, "postgres host")
 	return env.PGConfig.Host, env.PGConfig.Port, env.PGConfig.User, env.PGConfig.Password, env.PGConfig.DB
 }
 

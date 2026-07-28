@@ -5,12 +5,27 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 > [!NOTE]
 > High-level project governance, constitution, and standards are stored in the **Governance Layer** at `.specify/memory/` and should be reviewed before technical planning.
 
+## State (read first)
+- S0 | Verified State of the Codebase — what actually runs, verified by execution on 2026-07-26 | audit,build,tests,reality-check | [VERIFIED_STATE.md](VERIFIED_STATE.md) | active
+- P0 | E2E Recovery Plan — phased plan to make every feature work end-to-end, keyed to S0's findings | plan,recovery,ci,e2e | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active
+
+> [!WARNING]
+> `specs/*/spec.md` "Completed" and `WORKLOG.md` milestones record *merge events*, not verified behavior.
+> Several features marked Completed are unreachable at runtime. Check [VERIFIED_STATE.md](VERIFIED_STATE.md)
+> before building on any of them.
+
 ## Architecture
 - A1 | Unified Migration Directory Boundary | migrations,architecture,monorepo,postgres | [ARCHITECTURE.md](ARCHITECTURE.md) | active
+- A2 | Three-Module Go Layout, Workspace Mode for Local/Contract Tests Only (GOWORK=off in CI's go-root) | go,modules,sdk,testing,gowork | [ARCHITECTURE.md](ARCHITECTURE.md) | active
 
 ## Bugs
-- B1 | Data Loss on Database Outage | db,reliability,processor | [BUGS.md](BUGS.md) | active
+- B1 | Data Loss on Database Outage | db,reliability,processor | [BUGS.md](BUGS.md) | superseded-by-B7
 - B2 | Reserved Path Collision Guard for Dynamic Slug Routing | routing,sveltekit,slug,guard | [BUGS.md](BUGS.md) | active
+- B3 | "Shipped" Features That Are Never Invoked From main() | wiring,dead-code,process | [BUGS.md](BUGS.md) | active
+- B4 | One Broken Test File Silently Disables an Entire Go Test Package | go,testing,coverage | [BUGS.md](BUGS.md) | active
+- B5 | Cross-Boundary Payload Contracts Drift With No Test Spanning the Boundary | contracts,sdk,nats,json | [BUGS.md](BUGS.md) | active
+- B6 | Normalization Destroys the Fields Read After It | processor,normalizer,regression | [BUGS.md](BUGS.md) | active
+- B7 | Authenticated Identity Computed, Then Discarded | security,multitenancy,ingestor | [BUGS.md](BUGS.md) | active
 
 ## Decisions
 - D1 | Graceful Degradation via In-Memory Buffering | resilience,buffer,processor | [DECISIONS.md](DECISIONS.md) | active

@@ -1,4 +1,4 @@
-import { db } from '$lib/db';
+import { db } from '$lib/server/db';
 import { issues, issueActivity, issueRelations } from '$lib/db/schema';
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
@@ -199,7 +199,7 @@ export async function detectAndHandleRegression(issueId: string, releaseVersion:
 					.set({
 						status: 'unresolved',
 						regressionStatus: 'regressed',
-						regressionCount: sql\`\${issues.regressionCount} + 1\`,
+						regressionCount: sql`${issues.regressionCount} + 1`,
 						lastRegressedAt: new Date(),
 						resolvedInVersion: null,
 						resolvedAt: null,

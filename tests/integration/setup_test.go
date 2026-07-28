@@ -170,12 +170,15 @@ func TestMain(m *testing.M) {
 		ingestorContainer.StartLogProducer(ctx)
 	}
 
-	// Start processor. If the pre-built image is unavailable we tolerate
-	// it: integration tests that need the processor (TestIngestAndProcess,
-	// TestSearchIndexing) will skip with a clear message, while tests
-	// that only exercise library code (database, nats, store, alerts,
-	// middleware, service) continue to run against the testcontainer
-	// Postgres/NATS stack.
+	// Start processor. If the pre-built image is unavailable we tolerate it
+	// here: tests that need the processor (TestIngestAndProcess,
+	// TestSearchIndexing) don't skip unconditionally — they call requireInfra
+	// when they subsequently hit a dependent infra failure (e.g. no ingester
+	// reachable), which skips locally but hard-fails when SENTINEL_E2E=1 (see
+	// setup_helper_test.go, P0-4). Tests that only exercise library code
+	// (database, nats, store, alerts, middleware, service) continue to run
+	// against the testcontainer Postgres/NATS stack regardless of processor
+	// availability.
 	processorContainer, err := tc.StartProcessor(ctx,
 		testConfig.Host, testConfig.Port,
 		testConfig.User, testConfig.Password, testConfig.DB,

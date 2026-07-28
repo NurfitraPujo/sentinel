@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -22,9 +23,11 @@ func getDSN() string {
 
 func TestMigrationStatus(t *testing.T) {
 	dsn := getDSN()
+	var dsnErr error
 	if dsn == "" {
-		t.Skip("PostgreSQL not available")
+		dsnErr = fmt.Errorf("POSTGRES_HOST not configured")
 	}
+	requireInfra(t, dsnErr, "postgres DSN")
 
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
@@ -50,9 +53,11 @@ func TestMigrationStatus(t *testing.T) {
 
 func TestSequentialMigrations(t *testing.T) {
 	dsn := getDSN()
+	var dsnErr error
 	if dsn == "" {
-		t.Skip("PostgreSQL not available")
+		dsnErr = fmt.Errorf("POSTGRES_HOST not configured")
 	}
+	requireInfra(t, dsnErr, "postgres DSN")
 
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
@@ -83,9 +88,11 @@ func TestSequentialMigrations(t *testing.T) {
 
 func TestTargetIsolation(t *testing.T) {
 	dsn := getDSN()
+	var dsnErr error
 	if dsn == "" {
-		t.Skip("PostgreSQL not available")
+		dsnErr = fmt.Errorf("POSTGRES_HOST not configured")
 	}
+	requireInfra(t, dsnErr, "postgres DSN")
 
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
@@ -126,9 +133,11 @@ func TestTargetIsolation(t *testing.T) {
 
 func TestBaselineCommand(t *testing.T) {
 	dsn := getDSN()
+	var dsnErr error
 	if dsn == "" {
-		t.Skip("PostgreSQL not available")
+		dsnErr = fmt.Errorf("POSTGRES_HOST not configured")
 	}
+	requireInfra(t, dsnErr, "postgres DSN")
 
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)

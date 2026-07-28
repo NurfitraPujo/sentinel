@@ -48,7 +48,14 @@ export const actions: Actions = {
 		});
 
 		try {
-			await signIn('email', { email, callbackUrl: '/' });
+			// signIn's declared type is SvelteKit's form-action `Action` (single
+			// RequestEvent arg), but @auth/sveltekit's runtime signIn accepts
+			// (provider, options) for programmatic sign-in. Cast to bridge the
+			// version-mismatch between @auth/core and @auth/sveltekit types.
+			await (signIn as unknown as (provider: string, options: Record<string, unknown>) => Promise<unknown>)(
+				'email',
+				{ email, callbackUrl: '/' }
+			);
 			return { success: true, email };
 		} catch (err) {
 			logAuditEvent({

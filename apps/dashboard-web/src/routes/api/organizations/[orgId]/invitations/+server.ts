@@ -1,13 +1,13 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { createOrganizationInvitation } from '$lib/db/queries/organizations';
-import { db } from '$lib/db';
+import { db } from '$lib/server/db';
 import { organizationMembers } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 import crypto from 'crypto';
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
-  const session = await locals.getSession();
+  const session = await locals.auth();
   if (!session?.user?.id) {
     throw error(401, 'Unauthorized');
   }

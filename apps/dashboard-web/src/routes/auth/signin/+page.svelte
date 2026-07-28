@@ -62,7 +62,7 @@
 						class="flex flex-col gap-2"
 					>
 						{#if form?.error}
-							<p class="text-red-500 text-sm">{form.error}{#if form.retryAfter} Retry after {form.retryAfter}s.{/if}</p>
+							<p class="text-red-500 text-sm">{form.error}{#if 'retryAfter' in form && form.retryAfter} Retry after {form.retryAfter}s.{/if}</p>
 						{/if}
 						<input
 							type="email"

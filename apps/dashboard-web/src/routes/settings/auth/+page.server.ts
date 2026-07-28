@@ -4,7 +4,7 @@ import type { PageServerLoad, Actions } from './$types';
 
 export const load: PageServerLoad = async ({ locals }) => {
     // Check if user is admin
-    const session = await locals.getSession();
+    const session = await locals.auth();
     if (!session) throw error(401, 'Unauthorized');
     
     // In a real app, check user role. Assuming admin for now for simplicity.
@@ -20,7 +20,7 @@ export const load: PageServerLoad = async ({ locals }) => {
 
 export const actions: Actions = {
     save: async ({ request, locals }) => {
-        const session = await locals.getSession();
+        const session = await locals.auth();
         if (!session) return fail(401);
         
         const data = await request.formData();
