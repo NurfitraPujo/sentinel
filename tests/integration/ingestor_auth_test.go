@@ -45,19 +45,41 @@ func seedAuthProject(t *testing.T, pool *pgxpool.Pool, name, apiKey string) stri
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var id string
+	// Feature 008 moved authentication off projects.api_key_hash and onto the project_api_keys
+	// table (apps/ingestor-go/auth/apikey.go getAPIKeyData joins pak -> projects on pak.key_hash).
+	// Seeding only projects.api_key_hash — as this helper used to — means the key is never found and
+	// every request 401s regardless of what the middleware does. projects.api_key/api_key_hash are
+	// vestigial columns from feature 001 that nothing authenticates against any more.
+	var orgID string
 	err := pool.QueryRow(ctx,
-		`INSERT INTO projects (name, api_key, api_key_hash)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id::text`,
+		name+"-org",
+	).Scan(&orgID)
+	require.NoError(t, err)
+
+	var id string
+	err = pool.QueryRow(ctx,
+		`INSERT INTO projects (name, api_key, api_key_hash, organization_id)
+		 VALUES ($1, $2, $3, $4)
 		 RETURNING id::text`,
-		name, apiKey, hash,
+		name, apiKey, hash, orgID,
 	).Scan(&id)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO project_api_keys
+		   (project_id, organization_id, key_hash, key_prefix, name, scope, status, rate_limit_rpm, created_by)
+		 VALUES ($1, $2, $3, $4, $5, 'ingest', 'active', 100000, gen_random_uuid())`,
+		id, orgID, hash, "test", name+"-key",
+	)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM project_api_keys WHERE project_id = $1`, id)
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM projects WHERE id = $1`, id)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM organizations WHERE id = $1`, orgID)
 	})
 
 	return id
@@ -118,7 +140,7 @@ func TestAPIKeyAuthenticator_InvalidKey(t *testing.T) {
 }
 
 // TestAPIKeyAuthenticator_ValidKey covers the happy path: when the supplied
-// X-API-Key hashes to a row in projects, the middleware sets the project_key
+// X-API-Key hashes to a row in project_api_keys, the middleware sets the project_key
 // context value to the seeded name and forwards the request to the downstream
 // handler which then writes 200.
 func TestAPIKeyAuthenticator_ValidKey(t *testing.T) {
@@ -135,7 +157,13 @@ func TestAPIKeyAuthenticator_ValidKey(t *testing.T) {
 		wasCalled   bool
 	)
 	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		observedKey = r.Context().Value("project_key")
+		// Read via the typed accessor, never a string literal. auth switched to a private ctxKey
+		// type; context.Value compares the dynamic type too, so Value("project_key") silently
+		// returns nil forever. That exact mismatch disabled rate limiting on 100% of requests
+		// (VERIFIED_STATE.md R1) — a test that reaches into the context by string cannot catch it.
+		if v, ok := auth.ProjectKeyFromContext(r.Context()); ok {
+			observedKey = v
+		}
 		wasCalled = true
 		w.WriteHeader(http.StatusOK)
 	}))

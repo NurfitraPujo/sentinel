@@ -3,10 +3,10 @@
 # This is the P0-1 deliverable of docs/plans/E2E_RECOVERY_PLAN.md: until this file existed, nothing in the
 # repo was checked on push, which is the documented root cause of every defect in docs/memory/VERIFIED_STATE.md.
 #
-# Status 2026-07-28: all 7 jobs are green on this tree. Exactly ONE `continue-on-error` remains — job-level on
-# `integration`, whose ~15 failures are real and owned by P2/P3/P4 (ingest returns 401 not 202,
-# stale test fixtures using the pre-S12 status vocabulary, migrations not re-runnable). Do not remove that marker, or any TODO marker,
-# without first re-running the job and confirming it is green — see docs/memory/VERIFIED_STATE.md for evidence.
+# Status 2026-07-29: all 7 jobs are green and NONE is lenient — the last `continue-on-error` (job-level on
+# `integration`) was removed once its failures were fixed. The suite had 4 real failures, not the ~15 once
+# recorded: that number was measured against a corrupted shared dev database. Do not add a leniency marker
+# back without first re-running the job and recording why in docs/memory/VERIFIED_STATE.md.
 #
 # `task` (go-task) is intentionally never invoked here (see CLAUDE.md / constraint C6): it is not installed on
 # contributor machines in this repo, so CI calls the underlying go/pnpm/buf/docker commands directly.
@@ -209,7 +209,6 @@ jobs:
     # not CI-harness problems, and flipping this to a hard-gate before they're fixed would just make every push
     # red for reasons unrelated to whoever is pushing. Do not remove this leniency until P2/P3/P4 land and the
     # suite is re-verified green.
-    continue-on-error: true # TODO(P2/P3/P4): flip to hard-fail once the ~15 real integration failures (ingest 401 vs 202, stale test fixtures using the pre-S12 status vocabulary, migration re-run) are fixed
     steps:
       - uses: actions/checkout@v4
 

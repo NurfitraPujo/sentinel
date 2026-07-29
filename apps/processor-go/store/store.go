@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -121,6 +122,16 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND fingerprint = $2",
 		issue.ProjectID, issue.Fingerprint,
 	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
+
+	// Only "no such issue yet" is expected here. Any other error means the statement genuinely
+	// failed, and once a statement fails inside a transaction Postgres aborts it — every subsequent
+	// statement returns 25P02 "current transaction is aborted". Falling through on a real error
+	// therefore REPLACED the actual cause (e.g. `relation "issues" does not exist`) with a generic
+	// abort message, which is worse than useless when diagnosing a live pipeline.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
+			issue.ProjectID, issue.Fingerprint, err)
+	}
 
 	isRegressed := false
 	if err == nil {

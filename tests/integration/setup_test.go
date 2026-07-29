@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,21 +255,67 @@ func runMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 	}
 	defer pool.Close()
 
-	// Find project root by looking for go.mod marker
+	// Apply the REAL migrations, not scripts/db/init.sql. init.sql is a third hand-maintained schema
+	// frozen at the 1716508800 baseline — no organizations, no project_api_keys, and the pre-S12
+	// status CHECK — so bootstrapping from it silently gave every test a schema that predates
+	// features 005 and 008. This mirrors testcontainers/setup.go's runPostgresMigrations; both had
+	// to change, which is itself the argument for there being one migration entrypoint.
 	projectRoot := findProjectRoot()
-	initSQLPath := projectRoot + "/scripts/db/init.sql"
+	migDir := projectRoot + "/packages/db-migrations/migrations"
 
-	sqlBytes, err := os.ReadFile(initSQLPath)
+	entries, err := os.ReadDir(migDir)
 	if err != nil {
-		return fmt.Errorf("failed to read init.sql: %w", err)
+		return fmt.Errorf("failed to read migrations dir %s: %w", migDir, err)
 	}
 
-	_, err = pool.Exec(ctx, string(sqlBytes))
-	if err != nil {
-		return fmt.Errorf("failed to execute migrations: %w", err)
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+
+	for _, name := range files {
+		raw, rErr := os.ReadFile(filepath.Join(migDir, name))
+		if rErr != nil {
+			return fmt.Errorf("failed to read migration %s: %w", name, rErr)
+		}
+		up := extractGooseUpSection(string(raw))
+		if strings.TrimSpace(up) == "" {
+			continue
+		}
+		if _, eErr := pool.Exec(ctx, up); eErr != nil {
+			return fmt.Errorf("failed to apply migration %s: %w", name, eErr)
+		}
 	}
 
 	return nil
+}
+
+// extractGooseUpSection returns only the `-- +goose Up` portion of a migration file, dropping the
+// Down section and goose's StatementBegin/StatementEnd parser directives.
+func extractGooseUpSection(content string) string {
+	var out []string
+	inUp := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "-- +goose Up"):
+			inUp = true
+			continue
+		case strings.HasPrefix(trimmed, "-- +goose Down"):
+			inUp = false
+			continue
+		case strings.HasPrefix(trimmed, "-- +goose StatementBegin"),
+			strings.HasPrefix(trimmed, "-- +goose StatementEnd"):
+			continue
+		}
+		if inUp {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func findProjectRoot() string {
@@ -293,14 +342,14 @@ func GetTestConfig() (PostgreSQLConfig, NATSConfig) {
 		host := os.Getenv("POSTGRES_HOST")
 		if host != "" {
 			return PostgreSQLConfig{
-				Host:     host,
-				Port:     os.Getenv("POSTGRES_PORT"),
-				User:     os.Getenv("POSTGRES_USER"),
-				Password: os.Getenv("POSTGRES_PASSWORD"),
-				DB:       os.Getenv("POSTGRES_DB"),
-			}, NATSConfig{
-				URL: os.Getenv("NATS_URL"),
-			}
+					Host:     host,
+					Port:     os.Getenv("POSTGRES_PORT"),
+					User:     os.Getenv("POSTGRES_USER"),
+					Password: os.Getenv("POSTGRES_PASSWORD"),
+					DB:       os.Getenv("POSTGRES_DB"),
+				}, NATSConfig{
+					URL: os.Getenv("NATS_URL"),
+				}
 		}
 	}
 	return testConfig, natsConfig
