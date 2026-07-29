@@ -3,8 +3,12 @@ lint:
     use:
         - STANDARD
 breaking:
+    # PACKAGE, not FILE: FILE treats an intra-package file relocation as breaking even when the
+    # descriptor, proto package and go_package are byte-identical. P0-3's move of error_event.proto
+    # into packages/proto/sentinel/v1/ (required by lint's PACKAGE_DIRECTORY_MATCH) tripped exactly
+    # that. Wire compatibility is a property of the package, not the file path.
     use:
-        - FILE
+        - PACKAGE
 
 modules:
     - path: packages/proto

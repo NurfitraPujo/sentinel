@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean, unique } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean } from 'drizzle-orm/pg-core';
 
 export const organizations = pgTable('organizations', {
 	id: uuid('id').primaryKey().defaultRandom(),
@@ -76,28 +76,34 @@ export const issues = pgTable('issues', {
 	firstSeen: timestamp('first_seen').defaultNow(),
 	lastSeen: timestamp('last_seen').defaultNow(),
 	count: bigint('count', { mode: 'number' }).notNull().default(1),
-	resolvedAt: timestamp('resolved_at'),
-	resolvedByType: varchar('resolved_by_type', { length: 20 }), // 'user' | 'agent'
-	resolvedBy: varchar('resolved_by', { length: 255 }),
-	regressionCount: integer('regression_count').notNull().default(0),
-	lastRegressedAt: timestamp('last_regressed_at'),
 });
 
+// Matches packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql — the table
+// has old_value/new_value JSONB columns, NOT a single `metadata` column. actor_type/actor_id are NOT NULL
+// with a CHECK on actor_type ('user'|'agent'|'system'). event_type CHECK allows
+// 'status_changed'|'assigned'|'unassigned'|'regressed'|'ai_analysis'|'linked' (note: 'status_changed', not
+// 'status_change' — see queries/issues.ts).
 export const issueActivity = pgTable('issue_activity', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	eventType: varchar('event_type', { length: 50 }).notNull(), // 'status_change' | 'assigned' | 'unassigned' | 'linked' | 'regressed'
-	actorType: varchar('actor_type', { length: 20 }), // 'user' | 'agent' | 'system'
-	actorId: varchar('actor_id', { length: 255 }),
-	metadata: jsonb('metadata').notNull().default({}),
+	eventType: varchar('event_type', { length: 50 }).notNull(), // 'status_changed' | 'assigned' | 'unassigned' | 'linked' | 'regressed' | 'ai_analysis'
+	actorType: varchar('actor_type', { length: 20 }).notNull(), // 'user' | 'agent' | 'system'
+	actorId: varchar('actor_id', { length: 255 }).notNull(),
+	oldValue: jsonb('old_value'),
+	newValue: jsonb('new_value'),
 	createdAt: timestamp('created_at').defaultNow(),
 });
 
+// Matches the same migration: relation_type has no default and its CHECK only allows
+// 'linked_to'|'caused_by'|'duplicate_of' (never 'related'/'duplicate' — a default of 'related' violates
+// the constraint on every insert that omits it). created_by_type/created_by are NOT NULL.
 export const issueRelations = pgTable('issue_relations', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	sourceIssueId: uuid('source_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
 	targetIssueId: uuid('target_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	relationType: varchar('relation_type', { length: 20 }).notNull().default('related'), // 'related', 'duplicate'
+	relationType: varchar('relation_type', { length: 50 }).notNull(), // 'linked_to' | 'caused_by' | 'duplicate_of'
+	createdByType: varchar('created_by_type', { length: 20 }).notNull(), // 'user' | 'agent' | 'system'
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
 	createdAt: timestamp('created_at').defaultNow(),
 });
 
@@ -125,42 +131,19 @@ export const errorSearchIndex = pgTable('error_search_index', {
 	requestId: varchar('request_id', { length: 255 }),
 });
 
-export const issueRelations = pgTable('issue_relations', {
-	id: uuid('id').primaryKey().defaultRandom(),
-	sourceIssueId: uuid('source_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	targetIssueId: uuid('target_issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	relationType: varchar('relation_type', { length: 50 }).notNull(),
-	createdByType: varchar('created_by_type', { length: 20 }).notNull(),
-	createdBy: varchar('created_by', { length: 255 }).notNull(),
-	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-}, (table) => ({
-	issueRelationsUnique: unique('issue_relations_unique').on(table.sourceIssueId, table.targetIssueId, table.relationType),
-	idxIssueRelationsSource: index('idx_issue_relations_source').on(table.sourceIssueId),
-	idxIssueRelationsTarget: index('idx_issue_relations_target').on(table.targetIssueId),
-}));
-
-export const issueActivity = pgTable('issue_activity', {
-	id: uuid('id').primaryKey().defaultRandom(),
-	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
-	actorType: varchar('actor_type', { length: 20 }).notNull(),
-	actorId: varchar('actor_id', { length: 255 }).notNull(),
-	eventType: varchar('event_type', { length: 50 }).notNull(),
-	oldValue: jsonb('old_value'),
-	newValue: jsonb('new_value'),
-	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-}, (table) => ({
-	idxIssueActivityIssueCreated: index('idx_issue_activity_issue_created').on(table.issueId, table.createdAt),
-}));
-
+// Matches 1716508800_init.sql: the real columns are channel_config (JSONB) and
+// frequency_window_seconds (integer) — NOT channel_target (varchar) / window_seconds. This drift made
+// every GET/POST/PUT/DELETE on /api/alerts 500 (42703) in the same way as the issue_activity/issue_relations
+// drift this file was already carrying; found and fixed alongside it (P6-3).
 export const alertConfigs = pgTable('alert_configs', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	projectId: uuid('project_id').notNull().references(() => projects.id),
 	channel: varchar('channel', { length: 20 }).notNull(),
-	channelTarget: varchar('channel_target', { length: 255 }).notNull(),
+	channelConfig: jsonb('channel_config').notNull().default({}),
 	frequencyThreshold: integer('frequency_threshold').notNull().default(50),
-	windowSeconds: integer('window_seconds').notNull().default(60),
+	frequencyWindowSeconds: integer('frequency_window_seconds').notNull().default(60),
 	enabled: boolean('enabled').notNull().default(true),
-	createdAt: timestamp('created_at').defaultNow(),
+	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 
 export const auditLogs = pgTable('audit_logs', {

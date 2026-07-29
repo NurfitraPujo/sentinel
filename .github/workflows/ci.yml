@@ -1,0 +1,411 @@
+# Sentinel CI
+#
+# This is the P0-1 deliverable of docs/plans/E2E_RECOVERY_PLAN.md: until this file existed, nothing in the
+# repo was checked on push, which is the documented root cause of every defect in docs/memory/VERIFIED_STATE.md.
+#
+# Status 2026-07-29: all 7 jobs are green and NONE is lenient — the last `continue-on-error` (job-level on
+# `integration`) was removed once its failures were fixed. The suite had 4 real failures, not the ~15 once
+# recorded: that number was measured against a corrupted shared dev database. Do not add a leniency marker
+# back without first re-running the job and recording why in docs/memory/VERIFIED_STATE.md.
+#
+# `task` (go-task) is intentionally never invoked here (see CLAUDE.md / constraint C6): it is not installed on
+# contributor machines in this repo, so CI calls the underlying go/pnpm/buf/docker commands directly.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION_FILE: go.mod
+
+jobs:
+  # ---------------------------------------------------------------------------------------------------------
+  # go-root: the root module. Run with GOWORK=off (constraint C2 / plan P0-3) so this job keeps exercising the
+  # *published pseudo-version* of packages/db-migrations that a real `go get` would resolve, rather than the
+  # local workspace copy. This is deliberate: go.work (P0-3) makes local cross-module dev/testing possible, but
+  # it must not silently mask a real version-skew bug between what's on disk and what's actually published.
+  #
+  # IMPORTANT — why tests/contract/ must stay out of this job's build: `go vet ./...` and `go test ./...` both
+  # load `_test.go` files for every package under the root module, including tests/contract once P2-4 lands.
+  # `GOWORK=off go list github.com/NurfitraPujo/sentinel/packages/sdk-go` fails with "no required module
+  # provides package" — go.work is the *only* thing that lets the root module import packages/sdk-go, and this
+  # job deliberately turns it off. Without a guard, the moment tests/contract/sdk_ingestor_test.go imports
+  # packages/sdk-go, this job breaks — not because anything regressed, but because two intentional constraints
+  # (C2's GOWORK=off here vs. P2-4's need for the workspace) collide. The fix is that every file under
+  # tests/contract/ MUST carry a `//go:build contract` build tag (see the `contract` job below): the tag keeps
+  # those files invisible to an untagged `go vet ./...`/`go test ./...` here, while the `contract` job builds
+  # with `-tags=contract` and workspace mode (GOWORK unset) so the files still run for real.
+  # ---------------------------------------------------------------------------------------------------------
+  go-root:
+    name: go-root
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Verified green on 2026-07-28 (`rtk go build ./...` with GOWORK=off). Hard-gate.
+      - name: go build
+        run: go build ./...
+
+      # Verified green on 2026-07-28 (`GOWORK=off go vet ./...`, exit 0). S1 (tests/unit/ingestor_middleware_test.go
+      # calling the deleted token-bucket middleware.NewRateLimiter signature) is resolved. Hard-gate.
+      - name: go vet
+        run: go vet ./...
+
+      # Verified green on 2026-07-29 (`GOWORK=off go test ./tests/unit/... -count=1`: 241 assertions pass).
+      # Because tests/unit is one flat Go package (C3), a single stale file can still disable all 11 files
+      # (~2,800 lines) in the suite — this hard-gate is what makes that regression visible again. Hard-gate.
+      - name: go test ./tests/unit/...
+        run: go test ./tests/unit/... -count=1
+
+  # ---------------------------------------------------------------------------------------------------------
+  # go-sdk: independent module (packages/sdk-go). Run with GOWORK=off so this job sees exactly what a real
+  # consumer's `go get` sees. Without it, Go's workspace auto-discovery walks UP from packages/sdk-go and finds
+  # the repo-root go.work (P0-3), which pulls all three modules into one build: the module graph goes from ~19
+  # modules to ~169, and every matrix leg gets forced onto go.work's `go 1.25.8` directive — the go-1.21 leg
+  # would either hard-fail (GOTOOLCHAIN=local) or silently run under 1.25.8 instead (GOTOOLCHAIN=auto). Either
+  # way, the SDK's minimum-version guarantee would not actually be under test. Matrix over its declared minimum
+  # (go.mod: `go 1.21`) and the latest stable toolchain, since this is the public client other people's code
+  # depends on.
+  # ---------------------------------------------------------------------------------------------------------
+  go-sdk:
+    name: go-sdk (go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    defaults:
+      run:
+        working-directory: packages/sdk-go
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.21", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache-dependency-path: packages/sdk-go/go.sum
+
+      # Verified green on 2026-07-28 (`GOWORK=off go build ./... && GOWORK=off go vet ./... && GOWORK=off go
+      # test ./... -count=1`, run from packages/sdk-go under go1.26). The 1.21 leg of the matrix has not been
+      # separately verified locally (no 1.21 toolchain available in the sandbox this workflow was authored in);
+      # it is not marked continue-on-error because there is no known reason to expect it fails — the go.mod
+      # directive is exactly `go 1.21`. Watch its first real run.
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  # ---------------------------------------------------------------------------------------------------------
+  # go-migrations: independent module (packages/db-migrations). This is what the root module currently
+  # consumes at a published pseudo-version (see go-root's GOWORK=off note and ARCHITECTURE.md A2) — local edits
+  # here are invisible to go-root until committed and the pseudo-version is bumped. Run with GOWORK=off for the
+  # same reason as go-sdk: without it, the repo-root go.work (found by walking up) pulls this module into the
+  # workspace build instead of testing it standalone as its own published module.
+  # ---------------------------------------------------------------------------------------------------------
+  go-migrations:
+    name: go-migrations
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    defaults:
+      run:
+        working-directory: packages/db-migrations
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/db-migrations/go.mod
+          cache-dependency-path: packages/db-migrations/go.sum
+
+      # Verified green on 2026-07-28 (`GOWORK=off go build ./... && GOWORK=off go test ./... -count=1`, run
+      # from packages/db-migrations). Hard-gate.
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  # ---------------------------------------------------------------------------------------------------------
+  # dashboard: apps/dashboard-web (SvelteKit + Auth.js + Drizzle). All three steps below are hard-gates: `pnpm
+  # check` exits non-zero on type errors (error-gating by construction), and `pnpm build` / `pnpm test` are
+  # ordinary build/test commands. S2 in VERIFIED_STATE.md (the outage that made this job red) is resolved.
+  # ---------------------------------------------------------------------------------------------------------
+  # dashboard's `pnpm test` includes apps/dashboard-web/tests/schema-drift.test.ts, the guard that introspects
+  # a REAL migrated Postgres (information_schema + pg_constraint) and compares it against src/lib/db/schema.ts
+  # — this is what catches the class of bug where schema.ts and the migrated database disagree (issueRelations
+  # missing NOT NULL created_by_type/created_by, issueActivity declaring a nonexistent `metadata` column,
+  # alertConfigs declaring channel_target/window_seconds instead of the real channel_config/
+  # frequency_window_seconds — see the test file's header comment). Without a real database, that test SKIPS
+  # per table and `pnpm test` still reports overall success — a guard that silently no-ops is worse than no
+  # guard, so this job (a) stands up a real `postgres` service, (b) runs the actual migrations against it via
+  # the project's real migration tool (packages/db-migrations/cmd/migrate, target=dashboard — see D1 in
+  # docs/memory/DECISIONS.md: goose via that CLI is the only sanctioned migration path, so this does not
+  # reimplement migration logic — it invokes the real thing exactly as the test file's own header comment
+  # documents), and (c) sets SCHEMA_DRIFT_REQUIRED=1 so an unreachable database turns into a hard CI failure
+  # instead of a quiet skip, mirroring SENTINEL_E2E's role in the `integration` job below.
+  # ---------------------------------------------------------------------------------------------------------
+  dashboard:
+    name: dashboard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/dashboard-web
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: sentinel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sentinel -d sentinel"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      # Read by apps/dashboard-web/tests/schema-drift.test.ts (SCHEMA_DRIFT_DATABASE_URL, falling back to
+      # DATABASE_URL — set the specific one so this doesn't depend on that fallback order). Deliberately NOT
+      # named DATABASE_URL: that name is also src/lib/server/db.ts's runtime default (which itself falls back
+      # to localhost:5432 with the same credentials if unset), and this guard is meant to bind to an
+      # explicitly-freshly-migrated database, never to "whatever happens to be on 5432" (see the test file's
+      # own header comment on this exact hazard).
+      SCHEMA_DRIFT_DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable
+      # Turns "no reachable database" from a silent per-table skip into a hard test failure. Without this, a
+      # broken postgres service (or a step reordering that runs `pnpm test` before migrations) would still
+      # report "39 tests passed" while 20 of them silently did nothing — exactly the failure mode this job was
+      # changed to close. Mirrors SENTINEL_E2E's role in the `integration` job below.
+      SCHEMA_DRIFT_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/dashboard-web/pnpm-lock.yaml
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/db-migrations/go.mod
+          cache-dependency-path: packages/db-migrations/go.sum
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # Runs the REAL migrations (packages/db-migrations/migrations/*.sql, goose's own filename-ordered Up
+      # runner) against the postgres service above via the project's real migration CLI — not a hand-rolled
+      # SQL-file-concatenation shim. GOWORK=off for the same reason as the go-migrations job: this is an
+      # independent module and must build against its own go.mod, not get pulled into the repo-root workspace.
+      - name: Apply real database migrations (target=dashboard)
+        working-directory: packages/db-migrations
+        env:
+          GOWORK: "off"
+          DB_URL_DASHBOARD: postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable
+        run: go run ./cmd/migrate up -target dashboard
+
+      # Verified green on 2026-07-28 (`pnpm build`, exit 0 — vite SSR + client bundles both build clean). S2's
+      # blast radius (unresolved "semver" import via src/lib/db/queries/issues.ts) is resolved. Hard-gate.
+      - name: pnpm build
+        run: pnpm build
+
+      # Verified green on 2026-07-28 (`pnpm check` → svelte-check: 707 files, 0 errors, 2 pre-existing
+      # warnings). This step is error-gating by construction (svelte-check's own exit code). Hard-gate.
+      - name: pnpm check
+        run: pnpm check
+
+      # Runs against the freshly-migrated postgres service above (SCHEMA_DRIFT_DATABASE_URL,
+      # SCHEMA_DRIFT_REQUIRED=1 set at job level) — schema-drift.test.ts's 20 per-table cases now actually
+      # execute instead of silently skipping. Hard-gate.
+      - name: pnpm test
+        run: pnpm test
+
+  # ---------------------------------------------------------------------------------------------------------
+  # integration: boots the real compose stack and runs the integration suite with SENTINEL_E2E=1, which is
+  # P0-4's mechanism for turning "infra unreachable" from a silent skip into a hard failure (C5) — this is the
+  # direct reason S3 (100% of /ingest rejected) survived to main undetected. Written against the POST-fix
+  # docker-compose.yml described in the plan (services: postgres, redis, nats, nats-init, migrate, ingestor,
+  # processor, dashboard) — another workstream is landing that shape of the compose file; this job is designed
+  # to pass once it does, not before.
+  # ---------------------------------------------------------------------------------------------------------
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    # P0-5 has landed: docker-compose.yml now has a `redis` service with a healthcheck and a one-shot `migrate`
+    # step, and `docker compose up -d` reaches an all-healthy state. The leniency below is NOT about P0-5
+    # anymore — it stays because the suite itself still has ~15 real, unowned failures once the stack is up:
+    # /ingest returning 401 instead of the expected 202 for valid requests, `issues_status_check` constraint
+    # violations, and a migration re-run failure. Those are P2/P3/P4 product bugs (processor/ingestor/schema),
+    # not CI-harness problems, and flipping this to a hard-gate before they're fixed would just make every push
+    # red for reasons unrelated to whoever is pushing. Do not remove this leniency until P2/P3/P4 land and the
+    # suite is re-verified green.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Boot the compose stack
+        run: docker compose up -d --build
+
+      - name: Wait for the stack to become healthy
+        run: |
+          if [ -x ./scripts/wait-healthy.sh ]; then
+            ./scripts/wait-healthy.sh
+          else
+            echo "::warning::scripts/wait-healthy.sh not present yet (P0-5 deliverable) — using an inline fallback poll"
+            ready=""
+            for i in $(seq 1 60); do
+              if curl -sf http://localhost:8080/health > /dev/null; then
+                ready=1
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$ready" ]; then
+              echo "ingestor never became healthy" >&2
+              docker compose ps
+              docker compose logs --tail=200
+              exit 1
+            fi
+          fi
+
+      - name: go test ./tests/integration/... (SENTINEL_E2E=1 — skips are failures)
+        env:
+          SENTINEL_E2E: "1"
+        run: go test ./tests/integration/... -count=1 -timeout 10m
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --tail=500
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------------------------------------------------
+  # proto: lints and validates packages/proto/sentinel/v1/error_event.proto, and enforces that gen/ is regenerated and
+  # committed for every proto change. The `buf generate` + `git diff --exit-code gen/` pairing is the gate
+  # that stops a hand-edited or unregenerated gen/ from drifting from the .proto source of truth.
+  #
+  # NOTE on S3 (`string.len = 10000` vs the intended `max_len = 10000`, which makes /ingest reject 100% of real
+  # events): neither `buf lint` (style/naming rules only) nor `buf breaking` (structural compatibility only)
+  # inspects the *semantics* of a protovalidate constraint, and `buf generate` + diff only proves gen/ matches
+  # whatever the .proto currently says — a confidently-wrong constraint regenerates cleanly. This job does NOT
+  # actually catch S3's class of bug by itself. The gate that does is P2-4's contract test
+  # (tests/contract/sdk_ingestor_test.go, which runs the real protovalidate validator against a real payload
+  # and would fail the moment a legitimate message got rejected) together with U4 in the P7 e2e harness. See
+  # this file's `contract` job below, which is currently a guarded no-op until P2-4 lands.
+  # ---------------------------------------------------------------------------------------------------------
+  proto:
+    name: proto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # buf's `.git#branch=main` ref resolution needs a local branch named `main`, which a checkout of a PR's
+      # merge commit does not otherwise provide.
+      - name: Ensure a local main ref exists for buf breaking
+        run: git fetch origin main:main || true
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.47.2"
+
+      # Not independently verified locally: this sandbox has no network-installed `buf` CLI, so these four
+      # steps are written to the plan's spec and are believed correct but unconfirmed by an actual run. Left as
+      # hard-gates (no continue-on-error) because there is no known repo defect that would make them fail —
+      # unlike the other TODOs in this file, this is a "please watch the first real run" note, not a known-red
+      # marker.
+      - name: buf lint
+        run: buf lint
+
+      - name: buf breaking (against main)
+        run: buf breaking --against '.git#branch=main'
+
+      - name: buf generate
+        run: buf generate
+
+      - name: Fail if gen/ is out of sync with packages/proto
+        run: git diff --exit-code -- gen/
+
+  # ---------------------------------------------------------------------------------------------------------
+  # contract: tests/contract/ is P2-4's deliverable and does not exist yet. This job intentionally does not
+  # fail the build while the directory is absent — it prints a notice and exits 0 — but the moment a
+  # tests/contract/*_test.go file appears, it runs for real with no leniency. This will be the durable fix for
+  # B5 (cross-boundary payload renames with no compiler between SDK JSON, ingestor validation, and the proto
+  # message) once P2-4 lands, and per its acceptance criteria it is what actually reproduces/prevents S3 and S4.
+  # Requires the go.work committed in P0-3 (already present) so this root-module package can
+  # `import ".../packages/sdk-go"`.
+  #
+  # REQUIRED CONVENTION FOR WHOEVER WRITES P2-4: every file under tests/contract/ MUST start with a
+  # `//go:build contract` tag. This job deliberately runs in workspace mode (no GOWORK env set here, so Go
+  # auto-discovers the repo-root go.work) with `-tags=contract`, which is what lets tests/contract/ import
+  # packages/sdk-go at all. The go-root job, by contrast, runs `go vet`/`go test` with GOWORK=off and no
+  # `-tags=contract`, so an untagged tests/contract/*.go file would (a) fail to compile there — GOWORK=off
+  # can't resolve the packages/sdk-go import — and (b) be invisible to *this* job's -tags filter too, silently
+  # skipping the very tests this job exists to run. The tag is what keeps those two jobs from colliding; see
+  # the note in go-root above for the full failure mode this prevents.
+  # ---------------------------------------------------------------------------------------------------------
+  contract:
+    name: contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check whether tests/contract/ exists yet
+        id: check
+        run: |
+          if [ -d tests/contract ] && [ -n "$(find tests/contract -name '*_test.go' -print -quit 2>/dev/null)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Workspace mode (GOWORK unset — do NOT set GOWORK=off here, unlike go-root) + -tags=contract: this is
+      # what lets these tests import packages/sdk-go while staying invisible to go-root's untagged, GOWORK=off
+      # `go vet`/`go test ./...`. See the REQUIRED CONVENTION note above.
+      - name: go test ./tests/contract/... -tags=contract
+        if: steps.check.outputs.present == 'true'
+        run: go test -tags=contract ./tests/contract/... -count=1
+
+      - name: tests/contract/ not present yet
+        if: steps.check.outputs.present != 'true'
+        run: echo "::notice::tests/contract/ does not exist yet (P2-4 in docs/plans/E2E_RECOVERY_PLAN.md). Not failing the build for its absence, but this job will hard-fail on any future test failure once it lands."

@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package sentinel.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/NurfitraPujo/sentinel/gen/sentinel/v1;sentinelv1";
+
+message ErrorEvent {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "error_event.project_key"
+        message: "project_key is required and must not exceed 64 characters"
+        expression: "this.project_key.size() > 0 && this.project_key.size() <= 64"
+      },
+      {
+        id: "error_event.platform"
+        message: "platform is required, must be lowercase alphanumeric, and must not exceed 50 characters"
+        expression: "this.platform.matches('^[a-z0-9]+$') && this.platform.size() <= 50"
+      },
+      {
+        id: "error_event.environment"
+        message: "environment is required, must be lowercase alphanumeric, and must not exceed 50 characters"
+        expression: "this.environment.matches('^[a-z0-9]+$') && this.environment.size() <= 50"
+      },
+      {
+        id: "error_event.message"
+        message: "message must not exceed 10000 characters"
+        expression: "this.message.size() <= 10000"
+      },
+      {
+        id: "error_event.error_class"
+        message: "error_class must not exceed 255 characters"
+        expression: "this.error_class.size() <= 255"
+      },
+      {
+        id: "error_event.trace_id"
+        message: "trace_id must not exceed 64 characters"
+        expression: "this.trace_id.size() <= 64"
+      },
+      {
+        id: "error_event.span_id"
+        message: "span_id must not exceed 64 characters"
+        expression: "this.span_id.size() <= 64"
+      },
+      {
+        id: "error_event.release_version"
+        message: "release_version must not exceed 100 characters"
+        expression: "this.release_version.size() <= 100"
+      },
+      {
+        id: "error_event.fingerprint"
+        message: "fingerprint must not exceed 64 characters"
+        expression: "this.fingerprint.size() <= 64"
+      }
+    ]
+  };
+
+  // Upper bound (64 chars) is enforced by the "error_event.project_key" CEL
+  // rule above, matching projects.api_key VARCHAR(64) — see 1716508800_init.sql.
+  string project_key = 1 [(buf.validate.field).required = true];
+  // Upper bound (50 chars) is enforced by the "error_event.platform" CEL rule
+  // above, matching error_occurrences.platform VARCHAR(50).
+  string platform = 2 [(buf.validate.field).required = true];
+  // Upper bound (50 chars) is enforced by the "error_event.environment" CEL
+  // rule above, matching error_occurrences.environment VARCHAR(50).
+  string environment = 3 [(buf.validate.field).required = true];
+  // Upper bound is enforced by the "error_event.message" CEL rule above
+  // (this.message.size() <= 10000). Do not add a `string.len` / `max_len`
+  // field rule here as well: `string.len` means EXACTLY that many bytes,
+  // which previously rejected every real (i.e. non-10000-byte) event with
+  // an HTTP 400. Two overlapping validators with different semantics is
+  // exactly how that bug hid — keep this field rule-free and let the CEL
+  // expression stay the single source of truth for this constraint.
+  // issues.message is TEXT (unbounded), so this rule is a product limit,
+  // not a storage-width constraint.
+  string message = 4;
+  // Upper bound (255 chars) is enforced by the "error_event.error_class" CEL
+  // rule above, matching issues.error_class VARCHAR(255).
+  string error_class = 5 [(buf.validate.field).required = true];
+  // Upper bound (64 chars) is enforced by the "error_event.trace_id" CEL rule
+  // above, matching error_occurrences.trace_id VARCHAR(64).
+  string trace_id = 6;
+  // Upper bound (64 chars) is enforced by the "error_event.span_id" CEL rule
+  // above, matching error_occurrences.span_id VARCHAR(64).
+  string span_id = 7;
+  repeated StackFrame stacktrace = 8 [(buf.validate.field).repeated.max_items = 100];
+  google.protobuf.Struct metadata = 9;
+  google.protobuf.Timestamp timestamp = 10;
+  uint32 trace_flags = 11;
+  // Client-supplied custom fingerprint. When set (with fingerprint_override,
+  // or whenever the processor takes it as-is instead of computing a hash —
+  // see apps/processor-go/event/event.go Deserialize / fingerprint.Compute),
+  // this value is written verbatim into issues.fingerprint VARCHAR(64) with
+  // no server-side hashing. Upper bound (64 chars) is enforced by the
+  // "error_event.fingerprint" CEL rule above, matching that column — see
+  // VERIFIED_STATE.md S14.
+  string fingerprint = 12;
+  bool fingerprint_override = 13;
+  // Free-form event source label. Not currently persisted to any column by
+  // apps/processor-go (verified: no store/indexer write path reads this
+  // field), so it carries no storage-width constraint today.
+  string source = 14;
+  // Application release/version string (e.g. semver, git SHA). First-class
+  // field so it survives Normalize()'s metadata rewriting untouched — see
+  // VERIFIED_STATE.md S5. Previously smuggled through `metadata`, where the
+  // normalizer's version regex rewrote it to the literal "<VERSION>" before
+  // it was ever read, permanently disabling regression detection.
+  // Upper bound (100 chars) is enforced by the "error_event.release_version"
+  // CEL rule above, matching error_occurrences.release_version VARCHAR(100)
+  // — see VERIFIED_STATE.md S14.
+  string release_version = 15;
+  // Tenant-scoping project identifier (UUID string). MUST be populated
+  // server-side by the ingestor from the authenticated API key's resolved
+  // project — never from client input. If a client sends this field, the
+  // ingestor MUST ignore/overwrite it rather than trust it. This closes the
+  // cross-tenant write path described in VERIFIED_STATE.md S6, where any
+  // valid key could write into any project by naming it in the request
+  // body, and replaces the processor's `SELECT id FROM projects WHERE name
+  // = $1` lookup by name.
+  string project_id = 16;
+}
+
+message StackFrame {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "stack_frame.file_required"
+        message: "file is required for app frames"
+        expression: "!this.in_app || this.file.size() > 0"
+      }
+    ]
+  };
+
+  string file = 1;
+  int32 line = 2;
+  string function = 3;
+  bool in_app = 4;
+}

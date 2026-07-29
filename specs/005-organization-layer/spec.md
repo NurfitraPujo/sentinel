@@ -2,7 +2,18 @@
 
 **Feature Branch**: `feature/organization-layer`  
 **Created**: 2026-07-24  
-**Status**: Draft  
+**Status**: Draft — `tasks.md` for this feature is marked "Completed"; the schema and dashboard code
+merged. The dashboard-side isolation claims (FR-006, SC-003) were not part of the 2026-07-28/29 fix
+pass and remain **unverified by this pass** — the entries below cover only the ingest-side tenancy hole
+(S6) that this layer's `organization_id`/`projects.name` design made possible.  
+**Verified**: 2026-07-29 (partial — ingest path only) — `docs/memory/VERIFIED_STATE.md` **S6** (any
+valid ingest key could write into any organization's project) RESOLVED for `apps/ingestor-go`; see
+`specs/008-api-key-management/spec.md` "Verified Implementation Status" for the resolution order. A
+new `CREATE UNIQUE INDEX idx_projects_org_name ON projects (organization_id, name)` was added — same
+project name is still permitted across *different* organizations (by design; `name` is scoped to the
+organization, matching FR-001's "each Project MUST belong to exactly one Organization"), but is now
+rejected as a duplicate *within* one organization. **Dashboard-side org isolation (SC-003) was not
+re-verified in this pass** — do not treat it as confirmed.  
 **Input**: User description: "we need to add another layer on top of projects named organization because an organization naturally have multiple projects and we must make it smooth for organization members to navigate between their projects, we also need to make sure a user may have access to multiple organizations to make it flexible"
 
 ## Clarifications

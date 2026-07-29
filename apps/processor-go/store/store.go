@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,15 +16,41 @@ import (
 // QueryStore defines the "Read" side of the Issue store.
 type QueryStore interface {
 	GetProjectByKey(ctx context.Context, projectKey string) (string, error)
+	// ResolveProjectID resolves the tenant project for an incoming event.
+	// See the method doc on pgStore.ResolveProjectID for the full rationale.
+	ResolveProjectID(ctx context.Context, projectID, projectKey string) (string, error)
 	GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error)
 }
 
 // CommandStore defines the "Write" side of the Issue store.
 type CommandStore interface {
 	UpsertIssue(ctx context.Context, issue *Issue, releaseVersion string) error
+	// UpsertIssueWithOutcome behaves exactly like UpsertIssue but additionally
+	// reports whether the issue was newly created, was a regression, or
+	// already existed unchanged. This is the signal the alert dispatcher
+	// needs (docs/plans/E2E_RECOVERY_PLAN.md P5-1 / VERIFIED_STATE.md S8):
+	// alerts must fire for new issues and regressions, not every occurrence.
+	// UpsertIssue itself keeps its original single-error signature (it is
+	// exercised directly by tests/integration/processor_store_test.go) and
+	// is now a thin wrapper around this method.
+	UpsertIssueWithOutcome(ctx context.Context, issue *Issue, releaseVersion string) (IssueOutcome, error)
 	InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error
 	PersistAuditLog(ctx context.Context, log *AuditLog) error
 }
+
+// IssueOutcome reports what UpsertIssueWithOutcome actually did.
+type IssueOutcome int
+
+const (
+	// IssueOutcomeExisting means a non-resolved issue already existed for
+	// this fingerprint; this occurrence is just another duplicate.
+	IssueOutcomeExisting IssueOutcome = iota
+	// IssueOutcomeNew means no issue existed for this fingerprint before
+	// this call.
+	IssueOutcomeNew
+	// IssueOutcomeRegressed means a previously resolved issue reappeared.
+	IssueOutcomeRegressed
+)
 
 // IssueStore combines both Read and Write operations for the Processor.
 type IssueStore interface {
@@ -103,10 +130,18 @@ func isRegressionVersion(releaseVersion, resolvedInVersion string) bool {
 	return true
 }
 
+// UpsertIssue is a backward-compatible wrapper around UpsertIssueWithOutcome
+// that discards the outcome. Kept because tests/integration/processor_store_test.go
+// calls it directly with the single-error signature.
 func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion string) error {
+	_, err := s.UpsertIssueWithOutcome(ctx, issue, releaseVersion)
+	return err
+}
+
+func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, releaseVersion string) (IssueOutcome, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return err
+		return IssueOutcomeExisting, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -119,6 +154,17 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 		issue.ProjectID, issue.Fingerprint,
 	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
 
+	// Only "no such issue yet" is expected here. Any other error means the statement genuinely
+	// failed, and once a statement fails inside a transaction Postgres aborts it — every subsequent
+	// statement returns 25P02 "current transaction is aborted". Falling through on a real error
+	// therefore REPLACED the actual cause (e.g. `relation "issues" does not exist`) with a generic
+	// abort message, which is worse than useless when diagnosing a live pipeline.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return IssueOutcomeExisting, fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
+			issue.ProjectID, issue.Fingerprint, err)
+	}
+
+	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
 	isRegressed := false
 	if err == nil {
 		issue.ID = existingID
@@ -145,7 +191,7 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			WHERE id = $2
 		`
 		if _, err := tx.Exec(ctx, query, issue.LastSeen, issue.ID); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 
 		activityMeta, _ := json.Marshal(map[string]string{
@@ -153,19 +199,24 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			"previousResolvedVersion": existingResolvedInVersion,
 		})
 
+		// issue_activity has no `metadata` column — the schema
+		// (1721900000_add_issue_lifecycle_and_relations.sql:83-92) defines old_value/new_value. Inserting
+		// `metadata` raised 42703 inside this transaction, so EVERY regression event lost both the issue
+		// update and its occurrence, and errors.go classifies 42703 as retryable so it burned the full
+		// delivery budget before dead-lettering. U11 failed 100%.
 		activityQuery := `
-			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, metadata, created_at)
+			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, new_value, created_at)
 			VALUES (gen_random_uuid(), $1, 'system', 'sentinel-regression-detector', 'regressed', $2, NOW())
 		`
 		if _, err := tx.Exec(ctx, activityQuery, issue.ID, activityMeta); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 	} else {
 		query := `
 			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
-			ON CONFLICT (project_id, fingerprint) 
-			DO UPDATE SET 
+			ON CONFLICT (project_id, fingerprint)
+			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
 			WHERE issues.fingerprint = EXCLUDED.fingerprint
@@ -180,11 +231,22 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			issue.FirstSeen,
 			issue.LastSeen,
 		); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return IssueOutcomeExisting, err
+	}
+
+	switch {
+	case isRegressed:
+		return IssueOutcomeRegressed, nil
+	case wasNewIssue:
+		return IssueOutcomeNew, nil
+	default:
+		return IssueOutcomeExisting, nil
+	}
 }
 
 func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error {
@@ -207,6 +269,40 @@ func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) er
 	)
 
 	return err
+}
+
+// ResolveProjectID resolves the tenant project for an incoming event.
+//
+// It prefers projectID — ErrorEvent.project_id, proto field 16 — when it is
+// non-empty, resolving it directly against projects.id. Only when it is
+// empty does it fall back to the legacy GetProjectByKey name lookup.
+//
+// This matters because for the Go SDK (and any client following
+// docs/sdk-specification.md as originally written), ProjectKey/project_key
+// carries the API key string used for authentication, not a projects.name
+// value — GetProjectByKey's "SELECT id FROM projects WHERE name = $1" was
+// therefore guaranteed to fail for real SDK traffic with
+// "project not found: <api-key>" (VERIFIED_STATE.md S6). Once a caller
+// populates project_id (the ingestor's job, from the authenticated API key
+// context — see docs/plans/E2E_RECOVERY_PLAN.md P3-1, which is NOT done by
+// this change), this resolves correctly without going through the name
+// lookup at all. Until then, this is a no-op for callers that still leave
+// project_id empty: they keep getting exactly today's fallback behavior.
+func (s *pgStore) ResolveProjectID(ctx context.Context, projectID, projectKey string) (string, error) {
+	if projectID == "" {
+		return s.GetProjectByKey(ctx, projectKey)
+	}
+
+	var id string
+	err := s.db.QueryRow(ctx,
+		"SELECT id FROM projects WHERE id = $1",
+		projectID,
+	).Scan(&id)
+
+	if err == pgx.ErrNoRows {
+		return "", fmt.Errorf("project not found: %s", projectID)
+	}
+	return id, err
 }
 
 func (s *pgStore) GetProjectByKey(ctx context.Context, projectKey string) (string, error) {

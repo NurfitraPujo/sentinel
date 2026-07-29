@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -298,18 +301,73 @@ func runInitSQLMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 	defer pool.Close()
 
 	projectRoot := findProjectRoot()
-	initSQLPath := projectRoot + "/scripts/db/init.sql"
 
-	sqlBytes, err := os.ReadFile(initSQLPath)
+	// Apply the REAL migration files, in order, rather than scripts/db/init.sql.
+	//
+	// init.sql is a third, hand-maintained copy of the schema frozen at the 1716508800 baseline: it
+	// has no organizations, no organization_members, no project_api_keys, and still carries the
+	// pre-S12 `CHECK (status IN ('open','resolved','ignored'))` on issues. Bootstrapping test
+	// containers from it meant integration tests ran against a schema that had never seen features
+	// 005 or 008 — so every test touching organizations or API-key auth failed with
+	// `relation "organizations" does not exist` or an unexplained 401, and the S12 constraint fix
+	// was invisible to them. See ARCHITECTURE.md A1's 2026-07-29 note, which recommends exactly this.
+	//
+	// goose directives are stripped rather than interpreted: this is a one-shot bootstrap of a
+	// disposable container, so only the Up sections are needed and no version ledger is required.
+	migDir := projectRoot + "/packages/db-migrations/migrations"
+	entries, err := os.ReadDir(migDir)
 	if err != nil {
-		return fmt.Errorf("failed to read init.sql: %w", err)
+		return fmt.Errorf("failed to read migrations dir %s: %w", migDir, err)
 	}
 
-	_, err = pool.Exec(ctx, string(sqlBytes))
-	if err != nil {
-		return fmt.Errorf("failed to execute init.sql: %w", err)
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files) // filenames are timestamp-prefixed, so lexical order is apply order
+
+	for _, name := range files {
+		raw, err := os.ReadFile(filepath.Join(migDir, name))
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", name, err)
+		}
+		up := extractGooseUp(string(raw))
+		if strings.TrimSpace(up) == "" {
+			continue
+		}
+		if _, err := pool.Exec(ctx, up); err != nil {
+			return fmt.Errorf("failed to apply migration %s: %w", name, err)
+		}
 	}
 	return nil
+}
+
+// extractGooseUp returns only the `-- +goose Up` portion of a goose migration, stopping at
+// `-- +goose Down`, and drops the StatementBegin/StatementEnd markers (which are goose parser
+// directives, not SQL).
+func extractGooseUp(content string) string {
+	var out []string
+	inUp := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "-- +goose Up"):
+			inUp = true
+			continue
+		case strings.HasPrefix(trimmed, "-- +goose Down"):
+			inUp = false
+			continue
+		case strings.HasPrefix(trimmed, "-- +goose StatementBegin"),
+			strings.HasPrefix(trimmed, "-- +goose StatementEnd"):
+			continue
+		}
+		if inUp {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func findProjectRoot() string {

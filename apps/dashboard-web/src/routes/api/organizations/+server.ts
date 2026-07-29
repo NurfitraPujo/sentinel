@@ -3,7 +3,7 @@ import type { RequestHandler } from './$types';
 import { getUserOrganizations, createOrganization, getUserLastActiveOrg } from '$lib/db/queries/organizations';
 
 export const GET: RequestHandler = async ({ locals }) => {
-  const session = await locals.getSession();
+  const session = await locals.auth();
   if (!session?.user?.id) {
     throw error(401, 'Unauthorized');
   }
@@ -19,7 +19,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 };
 
 export const POST: RequestHandler = async ({ request, locals }) => {
-  const session = await locals.getSession();
+  const session = await locals.auth();
   if (!session?.user?.id) {
     throw error(401, 'Unauthorized');
   }

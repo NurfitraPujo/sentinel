@@ -65,9 +65,11 @@ func poolFromTest(t *testing.T) *pgxpool.Pool {
 		password = os.Getenv("POSTGRES_PASSWORD")
 		db = os.Getenv("POSTGRES_DB")
 	}
+	var hostErr error
 	if host == "" {
-		t.Skip("PostgreSQL not available")
+		hostErr = fmt.Errorf("POSTGRES_HOST not configured")
 	}
+	requireInfra(t, hostErr, "postgres host")
 
 	dsn := fmt.Sprintf(
 		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
@@ -84,9 +86,11 @@ func poolFromTest(t *testing.T) *pgxpool.Pool {
 
 func TestDatabasePackage_NewConnection_Success(t *testing.T) {
 	cfg := configFromTest(t)
+	var cfgErr error
 	if cfg == nil {
-		t.Skip("PostgreSQL not available")
+		cfgErr = fmt.Errorf("postgres config unavailable")
 	}
+	requireInfra(t, cfgErr, "postgres config")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

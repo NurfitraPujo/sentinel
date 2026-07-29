@@ -37,33 +37,61 @@ func newPostgresPool(t *testing.T, cfg TestConfig) *pgxpool.Pool {
 		cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresHost,
 		os.Getenv("POSTGRES_PORT"), cfg.PostgresDB,
 	))
-	if err != nil {
-		t.Skipf("Skipping: cannot connect to postgres: %v", err)
-	}
+	requireInfra(t, err, "postgres connection")
 
-	if err := pool.Ping(ctx); err != nil {
+	pingErr := pool.Ping(ctx)
+	if pingErr != nil {
 		pool.Close()
-		t.Skipf("Skipping: cannot ping postgres: %v", err)
 	}
+	requireInfra(t, pingErr, "postgres ping")
 
 	return pool
 }
 
+// createTestProject seeds a project AND the project_api_keys row the ingestor actually
+// authenticates against.
+//
+// Feature 008 moved authentication onto project_api_keys; apps/ingestor-go/auth/apikey.go
+// getAPIKeyData looks the presented key up by pak.key_hash. Seeding only projects.api_key_hash — as
+// this helper used to — makes every request 401 no matter what the rest of the pipeline does, which
+// is exactly how TestIngestAndProcess and TestSearchIndexing failed while asserting 202.
 func createTestProject(t *testing.T, pool *pgxpool.Pool, projectName, apiKey string) string {
+	ctx := context.Background()
+
+	var orgID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id::text`,
+		projectName+"-org",
+	).Scan(&orgID); err != nil {
+		t.Fatalf("Failed to create test organization: %v", err)
+	}
+
 	var projectID string
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO projects (name, api_key, api_key_hash)
-		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'))
+	err := pool.QueryRow(ctx,
+		`INSERT INTO projects (name, api_key, api_key_hash, organization_id)
+		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'), $4)
 		 RETURNING id::text`,
-		projectName, apiKey, apiKey,
+		projectName, apiKey, apiKey, orgID,
 	).Scan(&projectID)
 	if err != nil {
 		t.Fatalf("Failed to create test project: %v", err)
 	}
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO project_api_keys
+		   (project_id, organization_id, key_hash, key_prefix, name, scope, status, rate_limit_rpm, created_by)
+		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'), 'test', $4, 'ingest', 'active', 100000, gen_random_uuid())`,
+		projectID, orgID, apiKey, projectName+"-key",
+	); err != nil {
+		t.Fatalf("Failed to create test API key: %v", err)
+	}
+
 	return projectID
 }
 
 func cleanupProject(t *testing.T, pool *pgxpool.Pool, projectID string) {
+	// project_api_keys FKs to projects, so it must go first.
+	_, _ = pool.Exec(context.Background(), `DELETE FROM project_api_keys WHERE project_id = $1`, projectID)
 	_, err := pool.Exec(context.Background(), `DELETE FROM projects WHERE id = $1`, projectID)
 	if err != nil {
 		t.Logf("Failed to cleanup project %s: %v", projectID, err)
@@ -85,10 +113,7 @@ func sendErrorEvent(t *testing.T, ingesterURL, apiKey string, payload map[string
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		t.Skipf("Skipping test: ingester HTTP service unavailable at %s: %v", ingesterURL, err)
-		return nil
-	}
+	requireInfra(t, err, fmt.Sprintf("ingester HTTP service at %s", ingesterURL))
 	return resp
 }
 

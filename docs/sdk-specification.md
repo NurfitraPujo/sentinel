@@ -26,7 +26,8 @@ Every Sentinel SDK MUST accept a configuration object or builder pattern with th
 
 | Parameter | Type | Required | Default | Description |
 |:---|:---|:---|:---|:---|
-| `project_key` | `string` | **Yes** | — | Unique project API key issued by Sentinel. |
+| `api_key` | `string` | **Yes** | — | The SECRET credential (`sent_live_...` or `sent_org_...`). Sent as the `X-API-Key` header ONLY — never in the body. In the Go SDK this is `Config.APIKey`. |
+| `project_key` | `string` | Conditional | — | Target project's **unique name** (`projects.name`) — an identifier, NOT a secret. Optional for a project-scoped key (the credential already fixes the project; a mismatch is rejected with 403). **Required** for an organization-wide key, unless supplied as the `X-Project-Key` header, which takes precedence. |
 | `endpoint` | `string` | **Yes** | — | Ingestor URL (e.g., `https://sentinel.internal/ingest`). |
 | `environment` | `string` | **Yes** | `"production"` | Lowercase alphanumeric environment tag (`production`, `staging`, `development`). |
 | `release_version` | `string` | No | `""` | Application version tag (`v1.2.0`) used for automated regression detection. |
@@ -71,7 +72,7 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
 
 ### Protocol Validation Constraints
 
-- **`project_key`**: 1–64 characters.
+- **`project_key`**: 1–64 characters. Resolved against `projects.name` **within the authenticated key's organization only** — a name belonging to another organization is 403, never a cross-tenant write.
 - **`platform`**: Matches `^[a-z0-9]+$` (lowercase alphanumeric).
 - **`environment`**: Matches `^[a-z0-9]+$` (lowercase alphanumeric).
 - **`message`**: Truncated to maximum 10,000 characters.
@@ -86,7 +87,8 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
 - **Path**: `/ingest`
 - **Headers**:
   - `Content-Type: application/json`
-  - `X-API-Key: <project_key>` (or `Authorization: Bearer <project_key>`)
+  - `X-API-Key: <api_key>` — the SECRET (`sent_live_...` project-scoped, or `sent_org_...` organization-wide). Never place it in the body.
+  - `X-Project-Key: <project_name>` — optional; for organization-wide keys, selects the target project. **Takes precedence over the body's `project_key`**, so the server resolves tenancy without reading the body.
 - **Expected Status**: `HTTP 202 Accepted` (`{"status": "accepted"}`)
 
 ---

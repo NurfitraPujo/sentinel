@@ -6,6 +6,35 @@ import { requireAuth } from '$lib/server/auth';
 import { eq, and, inArray } from 'drizzle-orm';
 import { hasPermission, type Role } from '$lib/rbac';
 
+// alert_configs.channel_config is a JSONB blob (1716508800_init.sql), not the flat
+// channel_target/window_seconds columns this route used to reference — see schema.ts for the full note.
+// This API's external shape (channelTarget as a plain string, windowSeconds as a number) is preserved here
+// so callers (src/routes/settings/alerts) don't need to change; only the DB-facing mapping does.
+type AlertConfigRow = {
+	id: string;
+	projectId: string;
+	channel: string;
+	channelConfig: unknown;
+	frequencyThreshold: number;
+	frequencyWindowSeconds: number;
+	enabled: boolean;
+	createdAt: Date | null;
+};
+
+function toApiShape(row: AlertConfigRow) {
+	const channelConfig = (row.channelConfig ?? {}) as Record<string, unknown>;
+	return {
+		id: row.id,
+		projectId: row.projectId,
+		channel: row.channel,
+		channelTarget: typeof channelConfig.target === 'string' ? channelConfig.target : '',
+		frequencyThreshold: row.frequencyThreshold,
+		windowSeconds: row.frequencyWindowSeconds,
+		enabled: row.enabled,
+		createdAt: row.createdAt,
+	};
+}
+
 export const GET: RequestHandler = async ({ locals }) => {
 	try {
 		const user = await requireAuth({ locals } as any);
@@ -27,9 +56,9 @@ export const GET: RequestHandler = async ({ locals }) => {
 				id: alertConfigs.id,
 				projectId: alertConfigs.projectId,
 				channel: alertConfigs.channel,
-				channelTarget: alertConfigs.channelTarget,
+				channelConfig: alertConfigs.channelConfig,
 				frequencyThreshold: alertConfigs.frequencyThreshold,
-				windowSeconds: alertConfigs.windowSeconds,
+				frequencyWindowSeconds: alertConfigs.frequencyWindowSeconds,
 				enabled: alertConfigs.enabled,
 				createdAt: alertConfigs.createdAt,
 			})
@@ -41,7 +70,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 				)
 			);
 
-		return json(configs, { status: 200 });
+		return json(configs.map(toApiShape), { status: 200 });
 	} catch (error) {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
@@ -90,14 +119,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			.values({
 				projectId: body.projectId,
 				channel: body.channel,
-				channelTarget: body.channelTarget,
+				channelConfig: { target: body.channelTarget },
 				frequencyThreshold: body.frequencyThreshold ?? 50,
-				windowSeconds: body.windowSeconds ?? 60,
+				frequencyWindowSeconds: body.windowSeconds ?? 60,
 				enabled: body.enabled ?? true,
 			})
 			.returning();
 
-		return json(newConfig[0], { status: 201 });
+		return json(toApiShape(newConfig[0]), { status: 201 });
 	} catch (error) {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
@@ -148,19 +177,21 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 			return json({ error: 'Insufficient permissions to update alert configs' }, { status: 403 });
 		}
 
+		const existingChannelConfig = (existingConfig[0].channelConfig ?? {}) as Record<string, unknown>;
 		const updatedConfig = await db
 			.update(alertConfigs)
 			.set({
 				channel: body.channel ?? existingConfig[0].channel,
-				channelTarget: body.channelTarget ?? existingConfig[0].channelTarget,
+				channelConfig:
+					body.channelTarget !== undefined ? { target: body.channelTarget } : existingChannelConfig,
 				frequencyThreshold: body.frequencyThreshold ?? existingConfig[0].frequencyThreshold,
-				windowSeconds: body.windowSeconds ?? existingConfig[0].windowSeconds,
+				frequencyWindowSeconds: body.windowSeconds ?? existingConfig[0].frequencyWindowSeconds,
 				enabled: body.enabled ?? existingConfig[0].enabled,
 			})
 			.where(eq(alertConfigs.id, body.id))
 			.returning();
 
-		return json(updatedConfig[0], { status: 200 });
+		return json(toApiShape(updatedConfig[0]), { status: 200 });
 	} catch (error) {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });

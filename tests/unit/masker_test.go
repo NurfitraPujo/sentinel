@@ -219,11 +219,30 @@ func TestMaskMap(t *testing.T) {
 			},
 		},
 		{
-			name:  "slice masked",
-			input: map[string]interface{}{"tokens": []interface{}{"abc123", "def456"}},
+			// Uses a NON-sensitive key: this case exists to prove slices are traversed and
+			// preserved, not to assert anything about masking. It previously used "tokens",
+			// which substring-matches "token" and is now (correctly) redacted wholesale.
+			name:  "slice preserved for non-sensitive key",
+			input: map[string]interface{}{"items": []interface{}{"abc123", "def456"}},
 			checkFn: func(got map[string]interface{}) bool {
-				slice, ok := got["tokens"].([]interface{})
+				slice, ok := got["items"].([]interface{})
 				return ok && len(slice) == 2
+			},
+		},
+		{
+			// Substring match: a plural/prefixed sensitive key must not slip through. Exact-match
+			// key comparison let "tokens", "user_password" and "x-api-key" pass untouched.
+			name:  "sensitive key matched as substring",
+			input: map[string]interface{}{"tokens": []interface{}{"abc123"}},
+			checkFn: func(got map[string]interface{}) bool {
+				return got["tokens"] == "***REDACTED***"
+			},
+		},
+		{
+			name:  "sensitive key with prefix masked",
+			input: map[string]interface{}{"user_password": "hunter2"},
+			checkFn: func(got map[string]interface{}) bool {
+				return got["user_password"] == "***REDACTED***"
 			},
 		},
 		{

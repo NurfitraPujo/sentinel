@@ -4,7 +4,8 @@
   "installed_integrations": [
     "kilocode",
     "droid",
-    "agy"
+    "agy",
+    "claude"
   ],
   "integration_settings": {
     "kilocode": {
@@ -16,6 +17,10 @@
       "invoke_separator": "-"
     },
     "agy": {
+      "script": "sh",
+      "invoke_separator": "-"
+    },
+    "claude": {
       "script": "sh",
       "invoke_separator": "-"
     }

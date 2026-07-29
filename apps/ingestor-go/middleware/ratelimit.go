@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	libredis "github.com/redis/go-redis/v9"
 )
 
@@ -24,13 +25,18 @@ func NewRateLimiter(client *libredis.Client) *RateLimiter {
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		apiKeyHash, ok := r.Context().Value("api_key_hash").(string)
+		// Read via auth's typed accessors. These used to be bare string keys
+		// (r.Context().Value("api_key_hash")); when auth switched to a private ctxKey type, the
+		// string assertions here silently stopped matching — context.Value compares the dynamic
+		// type too — so this middleware passed EVERY request through and rate limiting was
+		// entirely bypassed. Never read this context by string literal again.
+		apiKeyHash, ok := auth.APIKeyHashFromContext(r.Context())
 		if !ok || apiKeyHash == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		rateLimitRPM, ok := r.Context().Value("rate_limit_rpm").(int)
+		rateLimitRPM, ok := auth.RateLimitRPMFromContext(r.Context())
 		if !ok || rateLimitRPM <= 0 {
 			rateLimitRPM = 5000 // default
 		}

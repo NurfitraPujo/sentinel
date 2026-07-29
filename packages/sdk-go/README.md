@@ -5,6 +5,12 @@
 
 The official **Go Client SDK** for [Sentinel](https://github.com/NurfitraPujo/sentinel) — a high-performance, real-time error monitoring platform. `packages/sdk-go` provides non-blocking asynchronous error capture (< 50 µs latency), high-throughput batching, automatic OpenTelemetry trace extraction, PII scrubbing, panic recovery middleware, and logging adapters for `slog`, `zerolog`, and `log.Logger`.
 
+> [!WARNING]
+> **v0.2.0 is a breaking wire-format change.** Every prior version had its payload rejected by the ingestor
+> on **every single event**, silently (no version before this one ever successfully delivered an event — see
+> [`CHANGELOG.md`](CHANGELOG.md) and `docs/memory/VERIFIED_STATE.md` S4/S11). Upgrade to `v0.2.0` or later;
+> there is no working payload format on any earlier release.
+
 ---
 
 ## Features
@@ -14,7 +20,9 @@ The official **Go Client SDK** for [Sentinel](https://github.com/NurfitraPujo/se
 - **Telemetry & Tracing Correlation**: Automatically extracts W3C `trace_id` and `span_id` from OpenTelemetry active spans (`context.Context`).
 - **Context Wiring Helpers**: Set `user_id`, `tenant_id`, and custom service tags effortlessly with `sentinel.WithUser()`, `sentinel.WithTenant()`, `sentinel.WithTag()`.
 - **Client-Side PII Scrubbing**: Filters sensitive keys (`password`, `authorization`, `token`, `secret`, `credit_card`, `ssn`, `api_key`) automatically.
+- **In-App Frame Detection**: Stack frames are automatically classified as in-app (your code) vs. not (standard library, module cache, `vendor/`), which the server uses to fingerprint and group issues correctly.
 - **Logging Adapters**: Plug into existing logging setups with zero code refactoring via `sentinelslog` (`slog.Handler`), `sentinelzerolog` (`zerolog.Hook`), and `sentinellog` (`io.Writer`).
+- **Retry with Backoff + Failure Visibility**: Ingest failures are no longer silent. 4xx responses are dropped immediately (not retried); 5xx/network errors are retried with capped exponential backoff before being dropped. Set `Config.OnError func(error)` to be notified whenever a batch is ultimately dropped, and `Config.Debug: true` to log the status/response body.
 
 ---
 

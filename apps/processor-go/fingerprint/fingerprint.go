@@ -40,6 +40,20 @@ func Compute(cfg FingerprintConfig) string {
 		}
 	}
 
+	// P4-3 / VERIFIED_STATE.md S11: when a client marks no frames in_app, the hash input used to
+	// degenerate to ErrorClass alone, collapsing every error of a class in a project into ONE issue.
+	// Clients that do not set in_app (anything other than the Go SDK today) still deserve grouping, so
+	// fall back to the top frames regardless of the flag. Frames are still capped at MaxAppFrames, so
+	// the fingerprint stays stable as deeper stack detail changes.
+	if len(appFrames) == 0 {
+		for _, frame := range cfg.Stacktrace {
+			appFrames = append(appFrames, fmt.Sprintf("%s:%s", frame.File, frame.Function))
+			if len(appFrames) >= MaxAppFrames {
+				break
+			}
+		}
+	}
+
 	input = cfg.ErrorClass
 	if len(appFrames) > 0 {
 		input += "|" + strings.Join(appFrames, "|")

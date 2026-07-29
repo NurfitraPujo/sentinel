@@ -1,11 +1,11 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { db } from '$lib/db';
-import { issues, projects, organizationMembers } from '$lib/db/schema';
-import { eq, and } from 'drizzle-orm';
+import { db } from '$lib/server/db';
+import { issues, projects, organizationMembers, errorOccurrences } from '$lib/db/schema';
+import { eq, and, inArray } from 'drizzle-orm';
 
 export const GET: RequestHandler = async ({ params, url, locals }) => {
-	const session = await locals.getSession();
+	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
 	}
@@ -40,7 +40,15 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 
 	if (status) conditions.push(eq(issues.status, status));
 	if (regressionStatus) conditions.push(eq(issues.regressionStatus, regressionStatus));
-	if (releaseVersion) conditions.push(eq(issues.releaseVersion, releaseVersion));
+	if (releaseVersion) {
+		// release_version lives on error_occurrences, not issues — match issues that have
+		// at least one occurrence tagged with the requested release.
+		const occurrenceIssueIds = db
+			.select({ issueId: errorOccurrences.issueId })
+			.from(errorOccurrences)
+			.where(eq(errorOccurrences.releaseVersion, releaseVersion));
+		conditions.push(inArray(issues.id, occurrenceIssueIds));
+	}
 	if (assigneeType) conditions.push(eq(issues.assigneeType, assigneeType));
 	if (assignedTo) conditions.push(eq(issues.assignedTo, assignedTo));
 	if (issueType) conditions.push(eq(issues.issueType, issueType));

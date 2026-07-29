@@ -1,6 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
-CREATE TABLE project_api_keys (
+-- IF NOT EXISTS / IF NOT EXISTS throughout: same re-runnability rationale as
+-- 1721900000_add_issue_lifecycle_and_relations.sql (U30) — this table and
+-- its indexes were previously created unconditionally, which would fail a
+-- second `up` run against an already-migrated schema (a different goose
+-- version-tracking table pointed at the same physical database).
+CREATE TABLE IF NOT EXISTS project_api_keys (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
@@ -16,11 +21,11 @@ CREATE TABLE project_api_keys (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_api_keys_hash_status ON project_api_keys (key_hash, status);
-CREATE INDEX idx_api_keys_org_project ON project_api_keys (organization_id, project_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash_status ON project_api_keys (key_hash, status);
+CREATE INDEX IF NOT EXISTS idx_api_keys_org_project ON project_api_keys (organization_id, project_id);
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-DROP TABLE project_api_keys;
+DROP TABLE IF EXISTS project_api_keys;
 -- +goose StatementEnd

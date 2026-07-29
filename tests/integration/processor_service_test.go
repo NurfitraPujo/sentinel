@@ -253,13 +253,24 @@ func TestProcessorService_ProcessEvent_UnknownProjectReturnsErrorAndNoRows(t *te
 		"unknown project must not produce any issues")
 }
 
+// TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent's name is
+// historical (kept so `-run` filters used elsewhere in docs/scripts keep
+// matching): there is no in-process buffer anymore. See
+// apps/processor-go/degradation/buffer.go's package doc comment — the
+// buffer was removed, deliberately, in favor of D10's NATS bounded-retry/DLQ
+// durability (docs/memory/DECISIONS.md D10). Re-verified 2026-07-29 against
+// a full SENTINEL_E2E run: this test previously asserted the OLD behavior
+// (CheckAndBuffer returns true even when down, so processEventInternal ran
+// anyway and surfaced a raw "connect" error) and failed once that code path
+// was removed — degradation.Evaluate now short-circuits before any DB call
+// is attempted at all, so no connection error is ever produced here.
 func TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent(t *testing.T) {
 	_, _, _ = newServiceAndPoolFromEnv(t)
 
 	// Build a separate pool that points at an unreachable TCP endpoint.
 	// pgxpool is lazy, so construction does not fail even with a bad host,
-	// but any subsequent Ping returns a connection error and triggers
-	// degradation buffering.
+	// but any subsequent Ping (via degradation.Evaluate's dbChecker) reports
+	// the database as unavailable.
 	badCfg, err := pgxpool.ParseConfig(
 		"postgres://sentinel:changeme@127.0.0.1:1/sentinel?sslmode=disable&connect_timeout=2",
 	)
@@ -278,18 +289,18 @@ func TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// The actual production behavior with a degraded pool:
-	//   1. ProcessEvent -> CheckAndBuffer
-	//   2. dbChecker (db.Ping) fails, so the buffer Push is attempted and
-	//      succeeds (the buffer is empty). CheckAndBuffer returns true.
-	//   3. ProcessEvent then calls processEventInternal, which fails with
-	//      a connection error because GetProjectByKey cannot reach the DB.
-	// We assert that the underlying connection error surfaces so callers
-	// can observe degraded-DB behaviour. The buffer-already-pushed
-	// invariant is exercised by the unit suite for the GracefulDegradation.
+	// Current production behavior with an unreachable pool:
+	//   1. ProcessEvent -> degradation.Evaluate
+	//   2. dbChecker (db.Ping) fails -> Evaluate returns StatusUnavailable
+	//      without ever attempting processEventInternal.
+	//   3. ProcessEvent returns the fixed sentinel error below so the caller
+	//      (the NATS subscriber, in production) lets D10 redeliver it.
+	// This is a deliberate behavior change from the prior "buffer, then try
+	// anyway" design: the DB is never touched for an event evaluated while
+	// unavailable, so no raw connection error is produced or expected here.
 	err = svc.ProcessEvent(ctx, data)
-	require.Error(t, err, "ProcessEvent should surface the connection error from the unreachable pool")
-	assert.ErrorContains(t, err, "connect")
+	require.Error(t, err, "ProcessEvent must return an error so the caller (NATS) retries instead of acking")
+	assert.ErrorContains(t, err, "database unavailable")
 }
 
 func TestProcessorService_VerifyAuditLogTable_Succeeds(t *testing.T) {
@@ -488,18 +499,24 @@ func TestProcessorService_ProcessEvent_IndexOccurrenceFailsWhenSearchIndexMissin
 	assert.Equal(t, 1, occCount, "occurrence row should have been written")
 }
 
-// TestProcessorService_ProcessEvent_BufferFullReturnsNil covers the branch
-// in ProcessEvent where the degradation buffer is at capacity and the DB
-// is down: CheckAndBuffer returns false, the service logs "Event buffered
-// due to database unavailability" and returns nil without surfacing the
-// connection error.
+// TestProcessorService_ProcessEvent_NeverSilentlyDropsWhenDBUnavailable
+// replaces the former TestProcessorService_ProcessEvent_BufferFullReturnsNil.
 //
-// We drive the buffer to capacity by issuing repeated ProcessEvent calls
-// against an unreachable pool. Each call successfully pushes to the buffer
-// (when the buffer is not full) and then attempts to run
-// processEventInternal which fails with a connection error. Once the
-// buffer hits degradation.MaxBufferSize (10000) the next call returns nil.
-func TestProcessorService_ProcessEvent_BufferFullReturnsNil(t *testing.T) {
+// That test drove ProcessEvent to buffer capacity (degradation.MaxBufferSize
+// = 10000) expecting the buffer-full branch to return nil — a silent drop
+// the DECISIONS.md graceful-degradation entry and BUGS.md both documented as
+// "real, silent data loss reported as success" (S9). Re-verified 2026-07-29
+// against a full SENTINEL_E2E run: the in-process buffer this test exercised
+// no longer exists at all (apps/processor-go/degradation/buffer.go's package
+// doc comment), so there is no "full" state to reach and the test's premise
+// is gone, not merely renamed.
+//
+// What replaces it: the actual current invariant is that ProcessEvent must
+// NEVER return nil while the database is unavailable, no matter how many
+// events are evaluated — an "Ack" with nothing stored is exactly the S9
+// failure mode. This asserts that invariant holds across many repeated
+// calls (previously it only held up to the buffer's capacity, then flipped).
+func TestProcessorService_ProcessEvent_NeverSilentlyDropsWhenDBUnavailable(t *testing.T) {
 	badCfg, err := pgxpool.ParseConfig(
 		"postgres://sentinel:changeme@127.0.0.1:1/sentinel?sslmode=disable&connect_timeout=2",
 	)
@@ -510,23 +527,20 @@ func TestProcessorService_ProcessEvent_BufferFullReturnsNil(t *testing.T) {
 
 	svc := service.NewProcessorService(badPool)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Issue calls until the buffer is full. We expect every call to
-	// return a connection error until the buffer overflows, at which
-	// point CheckAndBuffer returns false and ProcessEvent returns nil.
-	const bufferCap = 10000
-	sawNil := false
-	for i := 0; i < bufferCap+10; i++ {
-		ev, mErr := proto.Marshal(buildValidProtoEvent(uniqueProjectName("u15-buf-full")))
+	// Comfortably more than the old MaxBufferSize's failure point would have
+	// needed (10000) is not required anymore since there is no capacity to
+	// exhaust; a few hundred calls is enough to prove "never nil" as a
+	// standing invariant rather than a coincidence of the first call.
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		ev, mErr := proto.Marshal(buildValidProtoEvent(uniqueProjectName("u15-never-drop")))
 		require.NoError(t, mErr)
 		callErr := svc.ProcessEvent(ctx, ev)
-		if callErr == nil {
-			sawNil = true
-			break
-		}
+		require.Error(t, callErr,
+			"call %d: ProcessEvent must never return nil while the database is unavailable — a nil return acks the NATS message with nothing stored (S9)", i)
+		assert.ErrorContains(t, callErr, "database unavailable")
 	}
-	assert.True(t, sawNil,
-		"ProcessEvent must transition to nil when the degradation buffer fills up")
 }

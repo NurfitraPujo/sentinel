@@ -76,9 +76,27 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 			}
 			return token;
 		},
-		async session({ session, token }) {
-			if (token.projectRoles) {
-				(session as any).projectRoles = token.projectRoles;
+		// NOTE ON STRATEGY. `adapter: CQRSAdapter()` is configured above and no
+		// `session.strategy` override is set, so Auth.js uses the DATABASE strategy. That means
+		// this callback is invoked with `{ session, user }` — `token` is undefined, and the `jwt`
+		// callback above never runs at all.
+		//
+		// Reading `token.projectRoles` here therefore threw a TypeError on every request. Auth.js
+		// swallows it as SessionTokenError and `locals.auth()` returns null, so `hooks.server.ts`
+		// treated even an organization OWNER as unauthenticated and every protected route 401'd.
+		//
+		// Both shapes are handled so this keeps working if the strategy is ever switched to jwt.
+		async session({ session, user, token }) {
+			const fromToken = (token as any)?.projectRoles;
+			if (fromToken) {
+				(session as any).projectRoles = fromToken;
+				return session;
+			}
+
+			// Database strategy: the roles are not carried on a token, so resolve them here.
+			const email = user?.email ?? session.user?.email;
+			if (email) {
+				(session as any).projectRoles = await getUserProjectRoles(email);
 			}
 			return session;
 		},

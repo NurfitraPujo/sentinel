@@ -2,8 +2,36 @@
 
 **Feature Branch**: `004-shared-db-migrations`  
 **Created**: 2024-05-24  
-**Status**: Draft  
-**Input**: User description: "create database migrations that supports incremental migration setup. The database migrations is used across apps in ./apps"
+**Status**: Draft — the underlying tooling merged and is in daily use (see `packages/db-migrations/`),
+but this spec document was never closed out. Separately from anything in this spec, the migration
+*content* itself shipped a defect (S12, see Verified line) that FR-012 ("fail loudly on any migration
+error") did not catch, because the defect was a pair of contradictory `CHECK` constraints that both
+applied cleanly — no migration ever failed to run, the resulting schema was simply uninsertable.  
+**Verified**: 2026-07-29 — `docs/memory/VERIFIED_STATE.md` **S12** (RESOLVED): two overlapping,
+contradictory `issues.status` CHECK constraints — `1716508800_init.sql:22`'s auto-named
+`issues_status_check` (`'open','resolved','ignored'`) was never dropped when
+`1721900000_..._issue_lifecycle...sql:23` added `check_status` (`'unresolved','resolved','ignored'`).
+Their intersection was `{resolved, ignored}`; the processor always writes `'unresolved'`. **Every
+`issues` insert failed for the entire life of the project — literally zero rows, ever** — until this
+fix. Fixed by leaving exactly one status constraint. Separately verified: **U30**, a migrations
+round-trip (`up` → `down`×5 → `up`) on a throwaway database completed cleanly. Two gaps remain open,
+not covered by this fix — see note below.
+
+> [!NOTE]
+> **Known gaps, not resolved by the S12 fix, do not mark these done:**
+> - **`scripts/db/init.sql` is a third, hand-maintained schema** frozen at the `1716508800` migration
+>   and still carries the *pre-S12* `CHECK (status IN ('open','resolved','ignored'))`.
+>   `tests/integration/setup_test.go` applies this file directly, so the integration suite can run
+>   against a schema that no longer matches what `goose` produces.
+> - **D4 tension**: migrations were made idempotent (`IF EXISTS`/`IF NOT EXISTS`/`DO $$` guards) as part
+>   of unrelated fixes, which arguably conflicts with the "Strict Loud-Failure Migration Policy" this
+>   spec's FR-012 and `docs/memory/DECISIONS.md`'s 2026-07-17 decision both describe. Needs an explicit
+>   resolution, not assumed compatible.
+> - **Migrations `1721800000`/`1721900000`/`1722000000` were edited in place** after being applied
+>   against the shared dev database. `goose` stores no checksums, so an already-migrated database
+>   silently misses those edits — a direct violation of this spec's own "deterministic, sequential"
+>   framing (FR-004) in practice, even though no tooling bug caused it. Repo owner has confirmed nothing
+>   is deployed and explicitly accepted this for now.
 
 ## Clarifications
 

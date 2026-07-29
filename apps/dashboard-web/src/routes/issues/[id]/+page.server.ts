@@ -4,7 +4,7 @@ import { checkProjectAccess } from '$lib/server/projects';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
-	const session = await locals.getSession();
+	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
 	}

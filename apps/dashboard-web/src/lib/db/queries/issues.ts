@@ -1,4 +1,4 @@
-import { db } from '$lib/db';
+import { db } from '$lib/server/db';
 import { issues, issueActivity, issueRelations } from '$lib/db/schema';
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
@@ -34,8 +34,10 @@ export async function updateIssueStatus(
 	actorId?: string
 ) {
 	return await db.transaction(async (tx) => {
+		const [existing] = await tx.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+
 		const updateData: any = { status };
-		
+
 		if (status === 'resolved') {
 			updateData.resolvedInVersion = resolvedInVersion || null;
 			updateData.resolvedAt = new Date();
@@ -52,12 +54,14 @@ export async function updateIssueStatus(
 			.set(updateData)
 			.where(eq(issues.id, issueId));
 
+		// event_type CHECK on issue_activity requires 'status_changed', not 'status_change'.
 		await tx.insert(issueActivity).values({
 			issueId,
-			eventType: 'status_change',
+			eventType: 'status_changed',
 			actorType: actorType || 'system',
 			actorId: actorId || 'system',
-			metadata: { status, resolvedInVersion },
+			oldValue: existing ? { status: existing.status } : null,
+			newValue: { status, resolvedInVersion },
 		});
 	});
 }
@@ -76,7 +80,8 @@ export async function batchUpdateIssues(
 ) {
 	return await db.transaction(async (tx) => {
 		const updateData: any = {};
-		let eventType = 'status_change';
+		// event_type CHECK on issue_activity requires 'status_changed', not 'status_change'.
+		let eventType = 'status_changed';
 
 		switch (action) {
 			case 'resolve':
@@ -113,7 +118,7 @@ export async function batchUpdateIssues(
 			eventType,
 			actorType: options.actorType || 'system',
 			actorId: options.actorId || 'system',
-			metadata: { action, ...options },
+			newValue: { action, ...options },
 		}));
 
 		if (activityRows.length > 0) {
@@ -137,13 +142,13 @@ export async function assignIssue(
 			.where(eq(issues.id, issueId));
 
 		const eventType = assignedTo ? 'assigned' : 'unassigned';
-		
+
 		await tx.insert(issueActivity).values({
 			issueId,
 			eventType,
 			actorType,
 			actorId,
-			metadata: { assigneeType, assignedTo },
+			newValue: { assigneeType, assignedTo },
 		});
 	});
 }
@@ -156,19 +161,23 @@ export async function createIssueRelation(
 	createdBy: string
 ) {
 	return await db.transaction(async (tx) => {
-		await tx.insert(issueRelations).values({
+		const [relation] = await tx.insert(issueRelations).values({
 			sourceIssueId,
 			targetIssueId,
 			relationType,
-		});
+			createdByType,
+			createdBy,
+		}).returning();
 
 		await tx.insert(issueActivity).values({
 			issueId: sourceIssueId,
 			eventType: 'linked',
 			actorType: createdByType,
 			actorId: createdBy,
-			metadata: { targetIssueId, relationType },
+			newValue: { targetIssueId, relationType },
 		});
+
+		return relation;
 	});
 }
 
@@ -199,7 +208,7 @@ export async function detectAndHandleRegression(issueId: string, releaseVersion:
 					.set({
 						status: 'unresolved',
 						regressionStatus: 'regressed',
-						regressionCount: sql\`\${issues.regressionCount} + 1\`,
+						regressionCount: sql`${issues.regressionCount} + 1`,
 						lastRegressedAt: new Date(),
 						resolvedInVersion: null,
 						resolvedAt: null,
@@ -213,7 +222,8 @@ export async function detectAndHandleRegression(issueId: string, releaseVersion:
 					eventType: 'regressed',
 					actorType: 'system',
 					actorId: 'system',
-					metadata: { releaseVersion, previousResolvedVersion: issue.resolvedInVersion },
+					oldValue: { status: issue.status, resolvedInVersion: issue.resolvedInVersion },
+					newValue: { releaseVersion, status: 'unresolved' },
 				});
 			}
 		}

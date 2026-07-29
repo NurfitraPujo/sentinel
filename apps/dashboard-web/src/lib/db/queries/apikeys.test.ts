@@ -59,8 +59,8 @@ describe('apikeys queries', () => {
 		const result = await getOrganizationApiKeys('org-1');
 		expect(result).toEqual(mockKeys);
 		expect(db.select).toHaveBeenCalled();
-		expect(db.from).toHaveBeenCalled();
-		expect(db.where).toHaveBeenCalled();
+		expect((db as any).from).toHaveBeenCalled();
+		expect((db as any).where).toHaveBeenCalled();
 	});
 
 	it('createApiKey should insert key and audit log, then return raw token', async () => {

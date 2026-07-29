@@ -9,67 +9,88 @@ env:
 tasks:
     # ============ Database ============
 
+    # db-migrate is the single entrypoint for every goose migration operation. It replaces the
+    # five previously "templated" tasks below (db:{{.TARGET}}-status/-up/-down/-baseline/-reset),
+    # which go-task never actually registered under their intended names — go-task does not
+    # template task NAMES (only values inside a task body), so those five map keys were literally
+    # parsed as the task named `db:{{.TARGET}}-status` etc. (verified with `task --list-all` on
+    # go-task v3.52.0: they show up unexpanded and are only invocable by typing that literal
+    # string). TARGET is now a var, not a name fragment, so it is actually settable at call time.
+    #
+    # Usage:
+    #   task db-migrate                                   # TARGET=processor CMD=up (defaults)
+    #   task db-migrate TARGET=ingestor CMD=status
+    #   task db-migrate TARGET=dashboard CMD=down
+    #   task db-migrate TARGET=processor CMD=baseline VERSION=1716508800
+    #   task db-migrate TARGET=processor CMD=reset CONFIRM=yes   # DANGEROUS: drops the schema
+    #
+    # DB_URL_<TARGET> (upper-cased) must be set, either via .env or -v on the command line; it
+    # defaults to the docker-compose local postgres so `task db-migrate` works out of the box
+    # against `task infra-up`. Note: go-task does not template map KEYS at all (only values) —
+    # not for task names, and not for `env:` keys either (verified empirically: a task with
+    # `env: {DB_URL_{{.TARGET | upper}}: ...}` sets a literally-named env var
+    # `DB_URL_{{.TARGET | upper}}`, never `DB_URL_PROCESSOR`). So the DB_URL_<TARGET> lookup is
+    # computed here in the shell instead, where `{{.TARGET}}` is a value substitution and works
+    # correctly. This invokes the goose-based CLI at packages/db-migrations/cmd/migrate directly
+    # (per decision D3 in docs/memory/DECISIONS.md, "Adopt Goose for All Database Migrations")
+    # instead of `docker compose exec sentinel-postgres psql -f init.sql`, which was doubly
+    # broken: `sentinel-postgres` is the container_name, not the compose service name
+    # (`postgres`), and no init.sql was ever mounted into any container.
     db-migrate:
-        desc: Run database migrations
-        cmds:
-            - docker compose exec -T sentinel-postgres psql -U sentinel -d sentinel -f /docker-entrypoint-initdb.d/init.sql
-
-    db:{{.TARGET}}-status:
-        desc: Check migration status for target database
-        env:
-            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
+        desc: "Run goose migrations (CMD=up|down|status|baseline|reset) for TARGET=processor|ingestor|dashboard"
         dir: packages/db-migrations
-        cmds:
-            - go run cmd/migrate/main.go status -target {{.TARGET}}
-
-    db:{{.TARGET}}-up:
-        desc: Apply pending migrations for target database
-        env:
-            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
-        dir: packages/db-migrations
-        cmds:
-            - go run cmd/migrate/main.go up -target {{.TARGET}}
-
-    db:{{.TARGET}}-down:
-        desc: Rollback last migration for target database
-        env:
-            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
-        dir: packages/db-migrations
-        cmds:
-            - go run cmd/migrate/main.go down -target {{.TARGET}}
-
-    db:{{.TARGET}}-baseline:
-        desc: Baseline target database at specified version
-        env:
-            DB_URL_{{.TARGET | upper}}: '{{.DB_URL | default (print "postgres://sentinel:sentinel@localhost:5432/sentinel_" .Target)}}'
-        dir: packages/db-migrations
-        cmds:
-            - go run cmd/migrate/main.go baseline -target {{.TARGET}} -version {{.VERSION}}
-
-    db:{{.TARGET}}-reset:
-        desc: Reset target database (DANGEROUS)
-        interactive: true
-        preconditions:
-            - sh: test "{{.ENVIRONMENT}}" != "prod"
-              msg: "Cannot reset production database"
         vars:
-            TARGET: "{{.TARGET}}"
+            TARGET: '{{.TARGET | default "processor"}}'
+            CMD: '{{.CMD | default "up"}}'
+            DEFAULT_DSN: "postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable"
+        preconditions:
+            - sh: test "{{.CMD}}" != "reset" -o "{{.ENVIRONMENT}}" != "prod"
+              msg: "Cannot reset production database"
+            - sh: test "{{.CMD}}" != "reset" -o "{{.CONFIRM}}" = "yes"
+              msg: 'Resetting {{.TARGET}} destroys all data. Re-run with CONFIRM=yes to proceed.'
         cmds:
-            - echo "Resetting {{.TARGET}} database - this will destroy all data!"
-            - docker compose exec -T sentinel-postgres psql -U sentinel -d sentinel -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+            - |
+                set -eu
+                TARGET_UPPER=$(printf '%s' "{{.TARGET}}" | tr '[:lower:]' '[:upper:]')
+                ENV_VAR="DB_URL_${TARGET_UPPER}"
+                CURRENT=$(eval "printf '%s' \"\${$ENV_VAR:-}\"")
+                if [ -z "$CURRENT" ]; then
+                  export "$ENV_VAR={{.DB_URL | default .DEFAULT_DSN}}"
+                fi
+                case "{{.CMD}}" in
+                  up|down|status)
+                    go run ./cmd/migrate {{.CMD}} -target {{.TARGET}}
+                    ;;
+                  baseline)
+                    if [ -z "{{.VERSION}}" ]; then echo "VERSION is required for CMD=baseline" >&2; exit 1; fi
+                    go run ./cmd/migrate baseline -target {{.TARGET}} -version {{.VERSION}}
+                    ;;
+                  reset)
+                    echo "Resetting {{.TARGET}} schema - this destroys all data!"
+                    # This task runs with dir: packages/db-migrations, but `docker compose` needs
+                    # to find docker-compose.yml at the repo root, so cd back for this one step.
+                    (cd {{.TASKFILE_DIR}} && docker compose exec -T postgres psql -U sentinel -d sentinel -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                    ;;
+                  *)
+                    echo "Unknown CMD: {{.CMD}} (expected up|down|status|baseline|reset)" >&2
+                    exit 1
+                    ;;
+                esac
 
     db-reset:
-        desc: Reset database (drop and recreate)
+        desc: Reset database (drop volume and recreate, then reapply migrations)
         cmds:
             - docker compose down -v
-            - docker compose up -d sentinel-postgres
+            - docker compose up -d postgres
             - sleep 3
             - task: db-migrate
 
     db-rollback:
         desc: Rollback last migration
         cmds:
-            - echo "Manual rollback required - implement based on migration tool"
+            - task: db-migrate
+              vars:
+                  CMD: down
 
     db-shell:
         desc: Open PostgreSQL shell
@@ -181,10 +202,30 @@ tasks:
     test-e2e:
         desc: Full E2E test with infrastructure
         cmds:
+            # Migrations are applied by docker-compose's own one-shot `migrate` service (see P0-5
+            # in docs/plans/E2E_RECOVERY_PLAN.md): `ingestor`/`processor`/`dashboard` depend on it
+            # via `condition: service_completed_successfully`, so `infra-up` already sequences
+            # schema application before the app containers start. Do NOT call `task: db-migrate`
+            # here — it targets the host-exposed port for ad-hoc developer use and would just
+            # duplicate (and race) what compose already guarantees.
+            #
+            # Do NOT call `task: nats-init` here either, for the same reason: `infra-up` already
+            # brings up the compose `nats-init` service (a container with the `nats` CLI baked
+            # in, see scripts/Dockerfile.nats-init), and `wait-healthy.sh` blocks until that
+            # one-shot container has exited 0 before this line is reached. A second, host-side
+            # `task: nats-init` run here would redundantly re-create the same streams AND
+            # requires the `nats` CLI to be installed on the host — `scripts/nats-init.sh:14`
+            # loops forever (`until nats server check connection ...`) if that binary is
+            # missing, which silently hangs `task test-e2e` on any machine without it (fresh
+            # clones and CI runners included) instead of failing fast.
             - task: infra-up
-            - sleep 5
-            - task: db-migrate
-            - task: nats-init
+            - cmd: |
+                if [ -x ./scripts/wait-healthy.sh ]; then
+                  ./scripts/wait-healthy.sh
+                else
+                  echo "scripts/wait-healthy.sh not found (see P0-5); falling back to a fixed sleep." >&2
+                  sleep 10
+                fi
             - task: test-integration
             - task: infra-down
 

@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"context"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,7 +17,7 @@ func TestRateLimiterMiddleware(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	// Add api_key_hash to context
-	ctx := context.WithValue(req.Context(), "api_key_hash", "some-hash")
+	ctx := auth.WithIdentity(req.Context(), "test-project", "", "test-org", "some-hash", 5000, false)
 	req = req.WithContext(ctx)
 
 	rr := httptest.NewRecorder()

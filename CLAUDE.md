@@ -12,3 +12,102 @@ You MUST follow the memory-first workflow defined in [.specify/memory/workflow.m
 - **Active**: `specs/<feature>/` (Local context and synthesis)
 
 A task is not fully complete until memory has been reviewed and systemic lessons are captured.
+
+---
+
+## Ground Truth (read before planning any change)
+
+> [!IMPORTANT]
+> `specs/*/spec.md` "Status: Completed" and `docs/memory/WORKLOG.md` milestones record **merge events, not
+> verified behavior**. Several features marked Completed do not execute at runtime.
+> **[docs/memory/VERIFIED_STATE.md](docs/memory/VERIFIED_STATE.md)** records what actually runs, with the
+> command that proved it. Read it before trusting any feature-complete claim, and re-verify entries whose
+> date predates the change you are making.
+>
+> **[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** is the phased plan that fixes those
+> findings, with a 32-row use-case matrix defining "working end-to-end". Work items are ID'd `P0-1`, `P2-3`,
+> … — reference those IDs in commits.
+
+### Repository shape
+
+Go/SvelteKit monorepo for an error-tracking pipeline:
+`sdk → ingestor-go (HTTP :8080) → NATS JetStream → processor-go → PostgreSQL`, with `dashboard-web`
+(SvelteKit + Auth.js + Drizzle) reading the same database.
+
+- `apps/ingestor-go` — auth, rate limit, validate, publish. The only externally exposed service.
+- `apps/processor-go` — deserialize, normalize, mask, fingerprint, upsert issue + occurrence, index.
+- `apps/dashboard-web` — UI and JSON API.
+- `packages/shared-go` — pgx pool, NATS pub/sub, redis client.
+- `packages/proto` + `gen/` — the `ErrorEvent` contract (buf + protovalidate CEL).
+- `packages/db-migrations` — goose migrations; **one flat directory** for all targets (see A1).
+- `packages/sdk-go` — the public Go client.
+- `tests/{unit,integration,load}` — root-module tests; integration tests use testcontainers ONLY when nothing answers `localhost:8080/health`; if the compose stack is up they run against the SHARED dev Postgres and can corrupt it. Set `FORCE_TESTCONTAINERS=1` to always isolate (`tests/integration/setup_test.go:62`).
+
+**Three independent Go modules** (root, `packages/sdk-go`, `packages/db-migrations`), no `replace`
+directives. As of P0-3, a committed `go.work` (`use . ./packages/sdk-go ./packages/db-migrations`) puts them
+in workspace mode for local dev and cross-module contract tests (`tests/contract/`, tagged
+`//go:build contract`), so the root module **can now import `packages/sdk-go`** locally. CI's `go-root` job
+deliberately runs with `GOWORK=off` so it still exercises the root module exactly as a real `go get` would
+see it — against `packages/db-migrations`'s **published pseudo-version**, not the local workspace copy. Local
+edits under `packages/db-migrations/` remain invisible to that job until committed and the pseudo-version is
+bumped. See A2 in `docs/memory/ARCHITECTURE.md` for the full rationale and the GOWORK divergence; this
+constraint still invalidates test plans that assume `go-root` sees local, uncommitted `db-migrations` edits.
+
+### Commands
+
+```bash
+rtk go build ./... && rtk go vet ./...          # root module — green
+rtk go test ./tests/unit/...                    # green, 241 assertions
+cd packages/sdk-go && rtk go test ./...         # separate module — green
+cd packages/db-migrations && rtk go test ./...  # separate module — green
+docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
+./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 707 files/0 errors, 19 tests
+rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
+```
+
+Running `tests/integration` is **not** in this list on purpose — see Working conventions below before you run it.
+
+**CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs) but has not yet been proven green on a real
+push from this branch — P2/P2b's changes are staged, uncommitted. `go-root`, `go-sdk` and `go-migrations`
+pin `GOWORK=off` deliberately (see A2) — `contract` is the only workspace-mode job; `integration` is
+job-level `continue-on-error` because its failures are real (10 of 75 tests, current count — re-verify, do
+not quote this). Run the relevant command yourself before claiming anything works.
+
+### Known-broken as of 2026-07-29
+
+S1–S9 and S11–S17 are **resolved** — see `## Resolved` in `VERIFIED_STATE.md`. S7–S10 remain open, plus gaps
+found while fixing the rest. Do not treat any of these as your regression — pre-existing. Full detail and
+evidence in `docs/memory/VERIFIED_STATE.md`.
+
+| | Symptom | Cause |
+|---|---|---|
+| S10 | Rate limiting non-atomic; can still fail open | 4 unpipelined Redis calls; `redisClient, _ :=` discards the error |
+| — | DLQ has a producer, no consumer | nothing drains, replays, or alerts on `error_events.dlq` |
+| — | `scripts/db/init.sql` is a third, stale schema | still `CHECK (status IN ('open','resolved','ignored'))`; the processor writes `'unresolved'`; `tests/integration/setup_test.go` applies it ONLY in the testcontainers branch, which is unreachable while the compose stack answers on :8080 |
+| — | Two dashboard API routes 500 on every request | `schema.ts` drift vs the goose migrations: `issueActivity.metadata` has no DB column (`old_value`/`new_value` exist instead); `issueRelations` is missing the DB's NOT NULL `created_by_type`/`created_by`; `issues.ts:57` writes `'status_change'`, the DB constraint requires `'status_changed'` |
+
+### Working conventions
+
+- **Prefix shell commands with `rtk`** (see `~/.claude/CLAUDE.md`), including inside `&&` chains.
+- Before changing any exported signature under `apps/` or `packages/shared-go/`, grep `tests/unit/` — it is
+  one flat Go package, so a single stale file disables all of it (B4).
+- Before marking a feature complete, **grep a call path from the package back to `main()` or an HTTP route.**
+  Passing package tests have repeatedly coexisted with entirely unreachable code (B3).
+- Anything read out of `event.Metadata` for semantic use must be read **before** `Normalize` (B6).
+- Tenant scope must derive from the credential, never from the request body (B7).
+- Cross-boundary payloads (SDK↔ingestor JSON, NATS message bodies) have no compiler checking them. Changing a
+  field name on one side requires editing the other side in the same change (B5).
+- `docker compose up -d` does **not** rebuild images on its own — use `--build --force-recreate`, or you are
+  validating a stale image.
+- A `.proto` edit changes nothing at runtime by itself — protovalidate reads the descriptor compiled into
+  `gen/`. Always follow it with `buf generate` and commit the regenerated files.
+- **Never point `tests/integration` at the shared dev database.** Each test target's goose ledger
+  (`schema_migrations`, `processor_migrations`, `dashboard_migrations`, ...) tracks the *same* physical
+  database independently; one test's `down` can drop a table a different ledger still believes is applied,
+  corrupting the dev stack for everyone. Let `TestMain` self-provision via testcontainers, or point
+  `DB_URL_*` at a disposable Postgres you're prepared to lose.
+- Never read auth context by a bare string literal (e.g. `ctx.Value("project_key")`). Use the typed
+  accessors in `apps/ingestor-go/auth/context.go` (`auth.APIKeyHashFromContext`, `auth.WithIdentity`, ...) —
+  a bare-string assertion against a typed context key fails silently (`ok == false`, no panic) and was
+  exactly how rate limiting was disabled for 100% of requests during this work (R1 in `VERIFIED_STATE.md`).
