@@ -2,8 +2,34 @@
 
 **Feature Branch**: `feature/issue-lifecycle-management`  
 **Created**: 2026-07-25  
-**Status**: Draft  
+**Status**: Draft — `tasks.md` for this feature is marked "Completed" (tasks checked off) and the code
+merged, but the core deliverable (User Story 2, automated regression detection) was **verified
+unreachable with real data** until a 2026-07-28/29 fix. MERGED ≠ VERIFIED; see below.  
+**Verified**: 2026-07-29 — `docs/memory/VERIFIED_STATE.md` **S5** (regression detection unreachable)
+RESOLVED. Proof (evidence brief U11): an occurrence carrying `release_version: "3.0.0"` against an
+issue resolved at `"2.5.0"` produced `regression_status='regressed'`, `regression_count=1`, and an
+`issue_activity` row with `new_value = {"releaseVersion":"3.0.0","previousResolvedVersion":"2.5.0"}`.
+A residual gap remains — see note below.  
 **Input**: User description: "we need to have issue lifecycle management, read this document docs/todos/05-issue-lifecycle-management-and-regression-tracking.md and explore more on this topics ensuring we provide a robust and convenient issue trackings and lifecycles managements"
+
+> [!NOTE]
+> **History of S5** (kept per this repo's standard of not deleting defect descriptions on
+> resolution): `ErrorEvent.Normalize` (`apps/processor-go/event/event.go`) ran `NormalizeMap` over
+> `Metadata` *before* reading `release_version` out of it — `normalizer.versionRegex` rewrites any
+> semver-looking string to the literal `"<VERSION>"`, so every occurrence's `release_version` was that
+> placeholder and version comparison (`isRegressionVersion`) was meaningless for every event that relied
+> on the metadata fallback. Separately, `Deserialize` never copied the proto's first-class
+> `release_version`/`project_id` fields (added in the wire-contract fix, see spec 007) onto
+> `ErrorEvent` at all — both bugs zeroed out the same field from different directions. Fixed by (a)
+> reading the metadata fallback before `NormalizeMap` runs, and (b) having `Deserialize` copy the
+> first-class field, which now always wins when present.
+>
+> **Residual gap, still open**: `issue_activity.old_value` is left `NULL` on every regression-created
+> row (`apps/processor-go/store/store.go` `UpsertIssue`) — only `new_value` is populated
+> (`{"releaseVersion", "previousResolvedVersion"}`). The Key Entities section below documents
+> `IssueActivity` as pairing `old_value`/`new_value` to record a transition; the regression path does
+> not honor that pairing. `old_value` would need to carry the pre-transition status (`resolved`) to
+> match the documented shape.
 
 ## Clarifications
 

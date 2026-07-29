@@ -41,7 +41,7 @@ Go/SvelteKit monorepo for an error-tracking pipeline:
 - `packages/proto` + `gen/` — the `ErrorEvent` contract (buf + protovalidate CEL).
 - `packages/db-migrations` — goose migrations; **one flat directory** for all targets (see A1).
 - `packages/sdk-go` — the public Go client.
-- `tests/{unit,integration,load}` — root-module tests; integration uses testcontainers.
+- `tests/{unit,integration,load}` — root-module tests; integration tests use testcontainers ONLY when nothing answers `localhost:8080/health`; if the compose stack is up they run against the SHARED dev Postgres and can corrupt it. Set `FORCE_TESTCONTAINERS=1` to always isolate (`tests/integration/setup_test.go:62`).
 
 **Three independent Go modules** (root, `packages/sdk-go`, `packages/db-migrations`), no `replace`
 directives. As of P0-3, a committed `go.work` (`use . ./packages/sdk-go ./packages/db-migrations`) puts them
@@ -56,38 +56,39 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 ### Commands
 
 ```bash
-rtk go build ./... && rtk go vet ./...   # root module — green
-rtk go test ./tests/unit/...             # green, 251 assertions
-cd packages/sdk-go && rtk go test ./...  # separate module
-docker compose up -d && ./scripts/wait-healthy.sh   # full stack incl. redis + migrate
-task test-integration                    # testcontainers; TESTCONTAINERS_PROVIDER=podman supported
-cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green, 0 type errors
-rtk buf lint && rtk buf generate         # proto lives at packages/proto/sentinel/v1/
+rtk go build ./... && rtk go vet ./...          # root module — green
+rtk go test ./tests/unit/...                    # green, 253 assertions
+cd packages/sdk-go && rtk go test ./...         # separate module — green
+cd packages/db-migrations && rtk go test ./...  # separate module — green
+docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
+./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 707 files/0 errors, 19 tests
+rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
 ```
 
-**CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs). Before that there was none, which is why
-everything below reached `main`. Two things to know: `go-root`, `go-sdk` and `go-migrations` pin
-`GOWORK=off` deliberately (see A2) — `contract` is the only workspace-mode job; and the `integration` job
-is still job-level `continue-on-error` because its ~15 failures are real and owned by P2/P3/P4. Run the
-relevant command yourself before claiming anything works.
+Running `tests/integration` is **not** in this list on purpose — see Working conventions below before you run it.
 
-### Known-broken as of 2026-07-28
+**CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs) but has not yet been proven green on a real
+push from this branch — P2/P2b's changes are staged, uncommitted. `go-root`, `go-sdk` and `go-migrations`
+pin `GOWORK=off` deliberately (see A2) — `contract` is the only workspace-mode job; `integration` is
+job-level `continue-on-error` because its failures are real (10 of 75 tests, current count — re-verify, do
+not quote this). Run the relevant command yourself before claiming anything works.
 
-S1 and S2 are **resolved** — see the `## Resolved` section of `VERIFIED_STATE.md`. S3–S11 are all still live.
+### Known-broken as of 2026-07-29
 
-Do not treat these as your regression — they are pre-existing. Full detail and evidence in
-`docs/memory/VERIFIED_STATE.md`.
+S1–S6 and S11–S17 are **resolved** — see `## Resolved` in `VERIFIED_STATE.md`. S7–S10 remain open, plus gaps
+found while fixing the rest. Do not treat any of these as your regression — pre-existing. Full detail and
+evidence in `docs/memory/VERIFIED_STATE.md`.
 
 | | Symptom | Cause |
 |---|---|---|
-| S3 | `/ingest` returns 400 for **every** event | `string.len = 10000` in `packages/proto/sentinel/v1/error_event.proto:40` means *exactly* 10000 bytes; should be `max_len` |
-| S4 | Go SDK events are 100% rejected, silently | field names diverge (`error_message`/`context`, no `platform`); SDK ignores the HTTP status |
-| S5 | Regression tracking never fires | `Normalize` rewrites `release_version` to `<VERSION>` before it is read |
-| S6 | Any key can write to any tenant's project | handlers read `project_key` from the body, not the authenticated context |
-| S7 | Key revocation/expiry ineffective | `{keyId}` vs `key_hash` mismatch; `API_KEYS` stream never created; `expires_at` never checked |
+| S7 | Key revocation/expiry ineffective | `expires_at` never checked; `rotateApiKey` leaves `status='active'` |
 | S8 | `alerts` + `notifiers` never run | never constructed in `NewProcessorService` |
-| S9 | Degradation buffer logic inverted | `CheckAndBuffer` returns `true` both when healthy and when buffered |
-| S10 | Rate limiting non-atomic, fails open | 4 unpipelined Redis calls; `redisClient, _ :=` discards the error; no redis in compose |
+| S9 | Degradation buffer still loses/duplicates events | `CheckAndBuffer`'s single bool conflates "healthy" and "buffered" (verified unchanged 2026-07-29) |
+| S10 | Rate limiting non-atomic; can still fail open | 4 unpipelined Redis calls; `redisClient, _ :=` discards the error |
+| — | DLQ has a producer, no consumer | nothing drains, replays, or alerts on `error_events.dlq` |
+| — | `scripts/db/init.sql` is a third, stale schema | still `CHECK (status IN ('open','resolved','ignored'))`; the processor writes `'unresolved'`; `tests/integration/setup_test.go` applies it ONLY in the testcontainers branch, which is unreachable while the compose stack answers on :8080 |
+| — | Two dashboard API routes 500 on every request | `schema.ts` drift vs the goose migrations: `issueActivity.metadata` has no DB column (`old_value`/`new_value` exist instead); `issueRelations` is missing the DB's NOT NULL `created_by_type`/`created_by`; `issues.ts:57` writes `'status_change'`, the DB constraint requires `'status_changed'` |
 
 ### Working conventions
 
@@ -100,3 +101,16 @@ Do not treat these as your regression — they are pre-existing. Full detail and
 - Tenant scope must derive from the credential, never from the request body (B7).
 - Cross-boundary payloads (SDK↔ingestor JSON, NATS message bodies) have no compiler checking them. Changing a
   field name on one side requires editing the other side in the same change (B5).
+- `docker compose up -d` does **not** rebuild images on its own — use `--build --force-recreate`, or you are
+  validating a stale image.
+- A `.proto` edit changes nothing at runtime by itself — protovalidate reads the descriptor compiled into
+  `gen/`. Always follow it with `buf generate` and commit the regenerated files.
+- **Never point `tests/integration` at the shared dev database.** Each test target's goose ledger
+  (`schema_migrations`, `processor_migrations`, `dashboard_migrations`, ...) tracks the *same* physical
+  database independently; one test's `down` can drop a table a different ledger still believes is applied,
+  corrupting the dev stack for everyone. Let `TestMain` self-provision via testcontainers, or point
+  `DB_URL_*` at a disposable Postgres you're prepared to lose.
+- Never read auth context by a bare string literal (e.g. `ctx.Value("project_key")`). Use the typed
+  accessors in `apps/ingestor-go/auth/context.go` (`auth.APIKeyHashFromContext`, `auth.WithIdentity`, ...) —
+  a bare-string assertion against a typed context key fails silently (`ok == false`, no panic) and was
+  exactly how rate limiting was disabled for 100% of requests during this work (R1 in `VERIFIED_STATE.md`).

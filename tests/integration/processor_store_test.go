@@ -109,7 +109,7 @@ func TestStorePackage_UpsertIssue_InsertsNewIssue(t *testing.T) {
 		Fingerprint: fmt.Sprintf("fp-insert-%d", time.Now().UnixNano()),
 		Message:     "first occurrence",
 		ErrorClass:  "UpsertInsertError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
@@ -129,7 +129,7 @@ func TestStorePackage_UpsertIssue_InsertsNewIssue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, issue.ID, gotID, "inserted issue ID should match")
 	assert.Equal(t, int64(1), gotCount, "first insert should set count to 1")
-	assert.Equal(t, "open", gotStatus)
+	assert.Equal(t, "unresolved", gotStatus)
 }
 
 func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *testing.T) {
@@ -147,7 +147,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 		Fingerprint: fingerprint,
 		Message:     "first error",
 		ErrorClass:  "UpsertDuplicateError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   time.Now().UTC().Add(-1 * time.Hour),
 		LastSeen:    time.Now().UTC().Add(-1 * time.Hour),
 	}
@@ -172,7 +172,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 		Fingerprint: fingerprint,
 		Message:     "second error",
 		ErrorClass:  "UpsertDuplicateError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
@@ -211,7 +211,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 		Fingerprint: fingerprint,
 		Message:     "first",
 		ErrorClass:  "GreatestError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   now,
 		LastSeen:    now,
 	}
@@ -224,7 +224,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 		Fingerprint: fingerprint,
 		Message:     "stale duplicate",
 		ErrorClass:  "GreatestError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   now.Add(-2 * time.Hour),
 		LastSeen:    now.Add(-2 * time.Hour),
 	}
@@ -256,7 +256,7 @@ func TestStorePackage_InsertOccurrence_InsertsRow(t *testing.T) {
 		Fingerprint: fmt.Sprintf("fp-occ-%d", time.Now().UnixNano()),
 		Message:     "occ insert",
 		ErrorClass:  "OccurrenceInsertError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}
@@ -337,7 +337,7 @@ func TestStorePackage_GetIssueIDByFingerprint_ReturnsID(t *testing.T) {
 		Fingerprint: fingerprint,
 		Message:     "get by fingerprint",
 		ErrorClass:  "GetByFingerprintError",
-		Status:      "open",
+		Status:      "unresolved",
 		FirstSeen:   time.Now().UTC(),
 		LastSeen:    time.Now().UTC(),
 	}

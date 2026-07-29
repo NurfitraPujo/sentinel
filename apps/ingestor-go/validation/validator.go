@@ -34,6 +34,22 @@ type ErrorPayload struct {
 	Metadata    map[string]interface{} `json:"metadata"`
 	Timestamp   time.Time              `json:"timestamp"`
 	TraceFlags  uint32                 `json:"trace_flags"`
+	// ReleaseVersion is the application release/version string (e.g. semver,
+	// git SHA). First-class field mirroring ErrorEvent.release_version (proto
+	// field 15) so it survives processor-side normalization untouched — see
+	// VERIFIED_STATE.md S5.
+	ReleaseVersion string `json:"release_version"`
+	// ProjectID mirrors ErrorEvent.project_id (proto field 16). It is decoded
+	// here so the field exists on the wire type, but it MUST NOT be trusted
+	// from the request body in production: it has to be overwritten from the
+	// authenticated project resolved by auth.APIKeyAuthenticator.Middleware
+	// (see apps/ingestor-go/auth/apikey.go:83-86, which already resolves the
+	// authenticated project into the request context and today throws it
+	// away — VERIFIED_STATE.md S6/B7). See the TODO(P3-1) at the call sites
+	// in main.go for where that override belongs; full enforcement (403 on
+	// mismatch, deleting the by-name project lookup) is P3-1's job, not this
+	// change's.
+	ProjectID string `json:"project_id"`
 }
 
 type StackFrame struct {

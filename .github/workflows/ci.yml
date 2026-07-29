@@ -5,7 +5,7 @@
 #
 # Status 2026-07-28: all 7 jobs are green on this tree. Exactly ONE `continue-on-error` remains — job-level on
 # `integration`, whose ~15 failures are real and owned by P2/P3/P4 (ingest returns 401 not 202,
-# issues_status_check violations, migrations not re-runnable). Do not remove that marker, or any TODO marker,
+# stale test fixtures using the pre-S12 status vocabulary, migrations not re-runnable). Do not remove that marker, or any TODO marker,
 # without first re-running the job and confirming it is green — see docs/memory/VERIFIED_STATE.md for evidence.
 #
 # `task` (go-task) is intentionally never invoked here (see CLAUDE.md / constraint C6): it is not installed on
@@ -67,7 +67,7 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # Verified green on 2026-07-28 (`GOWORK=off go test ./tests/unit/... -count=1`: 251 assertions pass).
+      # Verified green on 2026-07-28 (`GOWORK=off go test ./tests/unit/... -count=1`: 253 assertions pass).
       # Because tests/unit is one flat Go package (C3), a single stale file can still disable all 11 files
       # (~2,800 lines) in the suite — this hard-gate is what makes that regression visible again. Hard-gate.
       - name: go test ./tests/unit/...
@@ -209,7 +209,7 @@ jobs:
     # not CI-harness problems, and flipping this to a hard-gate before they're fixed would just make every push
     # red for reasons unrelated to whoever is pushing. Do not remove this leniency until P2/P3/P4 land and the
     # suite is re-verified green.
-    continue-on-error: true # TODO(P2/P3/P4): flip to hard-fail once the ~15 real integration failures (ingest 401 vs 202, issues_status_check violations, migration re-run) are fixed
+    continue-on-error: true # TODO(P2/P3/P4): flip to hard-fail once the ~15 real integration failures (ingest 401 vs 202, stale test fixtures using the pre-S12 status vocabulary, migration re-run) are fixed
     steps:
       - uses: actions/checkout@v4
 

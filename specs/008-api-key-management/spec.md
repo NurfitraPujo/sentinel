@@ -2,8 +2,73 @@
 
 **Feature Branch**: `008-api-key-management`  
 **Created**: 2026-07-26  
-**Status**: Completed  
+**Status**: Completed (MERGED 2026-07-26) — tasks file checked off, but at merge time the ingest path
+was tenant-scope-broken (S6: any valid key could write into any project by naming it in the body) and
+the dashboard key-management API was a hardcoded-fixture mock. A follow-up fix on 2026-07-28/29 closed
+S6 for the ingest path. **Multiple FRs/SCs below remain unverified or contradicted by the code as of
+that fix** — see "Verified Implementation Status" immediately below before trusting any FR in this
+document.  
+**Verified**: 2026-07-29 — `docs/memory/VERIFIED_STATE.md` S6 (cross-tenant write) RESOLVED for
+`apps/ingestor-go`. S7 (revocation/expiry) and S10 (rate-limit atomicity/fail-open) **remain open** —
+re-verify before relying on them. See "Verified Implementation Status" below.  
 **Input**: User description: "Multi-Tenant Project Auth & API Key Management - full API key lifecycle (creation, listing, revocation, scope management, SHA256 hashed storage), Redis/In-Memory rate limiting per key/project, and Organization RBAC integration based on docs/todos/02-multi-tenant-auth-and-api-key-management.md"
+
+---
+
+## Verified Implementation Status (2026-07-29)
+
+> [!IMPORTANT]
+> The FRs and SCs below this box describe the *original design intent*. Where they conflict with this
+> section, **the code is the source of truth**.
+
+### Key resolution order (RESOLVED — S6, `apps/ingestor-go/auth/apikey.go`, `main.go`)
+
+Neither FR-004 nor the Key Entities section below describes an actual resolution order; this is what
+`applyAuthenticatedScope` + the auth middleware implement, and it is now the ground truth:
+
+1. **Project-scoped key** (`project_id` set on the key row): the project is fixed by the credential.
+   The request body's `project_key` may be absent, or may name the *same* project. Naming a
+   *different* project is rejected **403** (previously this silently let any valid key write into any
+   tenant's project — the headline defect in S6).
+2. **Organization-wide key** (`project_id` NULL): the credential fixes only the organization, not a
+   project, so the caller must select one:
+   a. `X-Project-Key` **header**, if present, resolved in the auth middleware — **takes precedence**.
+   b. Otherwise, the body's `project_key` field, resolved in the handler (`applyAuthenticatedScope`).
+   c. If neither is present: rejected — `project_key is required for an organization-wide API key`.
+3. **Both (1) and (2b) resolve the project name via `ResolveProjectInOrg`, which is scoped to the
+   authenticated key's `organization_id`.** A name belonging to a *different* organization returns the
+   same 403 as "no such project" — indistinguishable on purpose, so it cannot be used to enumerate
+   other tenants' project names. This closes the second half of S6 (global, unscoped name resolution).
+
+This contradicts the Assumptions/Clarifications text further down, which describes org-wide key
+target selection only via "payload `project_key` or `X-Project-Key` header" with no stated precedence —
+the header winning, and the body being ignored once the header resolves a target, is an
+implementation decision made during the S6 fix, not something the original spec specified.
+
+### Still NOT implemented (do not mark these resolved)
+
+- **`expires_at` is never checked** (S7, unchanged). `getAPIKeyData` filters on `status` only.
+  FR-004's "reject requests using ... expired API keys" is not honored.
+- **Key rotation leaves the old key `status = 'active'`** (S7, unchanged). `rotateApiKey` sets
+  `expires_at` on the old key but nothing reads it (previous point), so rotated keys stay valid
+  forever, not for the "configurable grace period (default 24h)" User Story 1 Acceptance Scenario 4
+  describes.
+- **Rate limiting is per-key only, not hierarchical.** FR-005 and the Clarifications session both
+  describe "per-API-key `rate_limit_rpm` applies if configured; otherwise project default quota
+  applies" (also recorded as "hierarchical" in `docs/memory/DECISIONS.md` D9). There is no project
+  tier in the code and no `projects.rate_limit_rpm` column — `apps/ingestor-go/middleware/ratelimit.go`
+  keys solely on `api_key_hash`. **D9's "hierarchical" language does not match the implementation.**
+- **Rate limiting remains non-atomic** (S10) — four unpipelined Redis round-trips
+  (`ZRemRangeByScore`→`ZCard`→decide→`ZAdd`), not a Lua script or pipeline. Concurrent requests can all
+  read the same count before any write lands, so the effective limit under concurrency is higher than
+  configured. Whether the nil-Redis-client fail-open path (`redisClient, _ := redis.NewClient(...)`,
+  silently disabling rate limiting if Redis is unreachable at boot) still exists was **not
+  re-verified** as part of this pass — check `apps/ingestor-go/main.go` before relying on either
+  direction.
+- **`apps/dashboard-web` key-management HTTP surface**: not touched by the 2026-07-28/29 fix pass.
+  `VERIFIED_STATE.md` (2026-07-26 baseline) recorded `api/organizations/[orgId]/keys/+server.ts` as a
+  mock returning hardcoded fixtures with no auth check — **unverified whether this has changed**; treat
+  User Story 1's dashboard flows as unverified until re-checked.
 
 ---
 
@@ -11,7 +76,7 @@
 
 ### Session 2026-07-26
 - Q: How should API key validity be cached in `ingestor-go` to balance instant revocation (<100ms) with sub-millisecond database protection? → A: Option A (Redis/In-Memory Cache with NATS JetStream invalidation topic to purge revoked keys instantly across all ingestor nodes).
-- Q: How should rate limit quotas be configured across projects and individual API keys? → A: Option A (Hierarchical Rate Limits: per-API-key limit overrides project default quota if explicitly specified).
+- Q: How should rate limit quotas be configured across projects and individual API keys? → A: Option A (Hierarchical Rate Limits: per-API-key limit overrides project default quota if explicitly specified). **Not what was built** — see "Verified Implementation Status" above: implementation is per-key only, no project tier exists.
 - Q: How should key rotation behave regarding grace periods for legacy keys? → A: Option A (Configurable Grace Period: old key receives an `expires_at` timestamp [default 24h] allowing dual-active operation during migration).
 - Q: How should Organization-wide API Keys work across multiple projects within an organization? → A: Option A (Support Organization-Level API Keys bound to `organization_id` with optional `project_id`. Ingestion events specify target project via payload `project_key` or `X-Project-Key` header).
 - Q: How is the frontend UI flow structured for creating Organization-wide vs. Project-specific API keys? → A: Option A (Dual Context Creation: Org Settings `/[orgSlug]/settings/keys` provides a Target Project selector including "All Projects [Org-Wide]", while Project Settings `/[orgSlug]/projects/[projectId]/settings/keys` pre-locks to the current project).

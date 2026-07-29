@@ -3,8 +3,62 @@
 **Feature ID**: `007-go-client-sdk`  
 **Feature Branch**: `feature/go-client-sdk`  
 **Created**: 2026-07-25  
-**Status**: Completed  
+**Status**: Completed (MERGED 2026-07-25) — code shipped, but the wire contract it shipped with was
+**verified broken** (0% of events accepted) until a follow-up fix on 2026-07-28/29. "Completed" here
+tracked the tasks file, not runtime behavior — see `docs/memory/VERIFIED_STATE.md`.  
+**Verified**: 2026-07-29 — `docs/memory/VERIFIED_STATE.md` findings **S4** (SDK↔ingestor field
+mismatch) and **S11** (fingerprint collapse with no in-app frames), both now RESOLVED. Proof: SDK
+payload accepted end-to-end into `error_occurrences`/`issues`; `packages/sdk-go/CHANGELOG.md` v0.2.0.
+Below is the corrected contract as of that fix — see "Wire Contract Correction (v0.2.0)".  
 **Specification Protocol**: [`docs/sdk-specification.md`](file:///home/fitrapujo/oss/sentinel/docs/sdk-specification.md)
+
+---
+
+## Wire Contract Correction (v0.2.0, 2026-07-28/29)
+
+> [!IMPORTANT]
+> Everything below this box documents the SDK **as originally specified and merged**. It is kept for
+> history. The actual wire contract changed in `packages/sdk-go` v0.2.0 (BREAKING) because the
+> originally-shipped contract was rejected by `ingestor-go` on every single event — see
+> `docs/memory/VERIFIED_STATE.md` S4. Where this spec's text below still describes the pre-v0.2.0
+> shape, **the code is the source of truth**; treat the spec text as historical intent, not current
+> behavior.
+
+Changes made (full detail: `packages/sdk-go/CHANGELOG.md`):
+
+- **`Config.ProjectKey` split into two fields.** The single field this spec's FR-001 describes as "the
+  API Key used for authentication" was both the secret AND the tenancy selector, and the ingestor
+  never resolved it as a credential — it resolved it against `projects.name`. Every SDK event was
+  `202`'d by NATS publish and then permanently dead-lettered at the processor, silently.
+  - `Config.APIKey` (new) — the SECRET (`sent_live_...` / `sent_org_...`). Sent ONLY as the
+    `X-API-Key` header, never in the body.
+  - `Config.ProjectKey` (redefined) — the target project's **unique name** (`projects.name`), an
+    identifier, not a secret. Travels in the body as `project_key`. `Config.Validate()` rejects a
+    `ProjectKey` that carries an API-key prefix, so a swapped config fails loudly at startup instead
+    of as a silent 100% rejection rate.
+- **Event field renames** (`Event` struct, `packages/sdk-go/event.go`): `error_message` → `message`;
+  `context` → `metadata`. The ingestor never read the old names (S4); every message and every user
+  tag/PII-scrubbed context value was silently dropped before this fix.
+- **`platform` added to `Event`**, always `"go"`. The ingestor requires it
+  (`^[a-z0-9]+$`) and rejected every request missing it with HTTP 400 — this alone caused the
+  100% rejection rate documented in S4.
+- **`in_app` added to `Frame`, and actually populated** by `isInAppFrame()` (true unless the frame's
+  file is under `GOROOT`, a module cache `pkg/mod/`, or `vendor/`). Fixes S11: the processor's
+  fingerprinter only hashes in-app frames, so with `in_app` always false (the field didn't exist
+  before), every error of a given class in a project collapsed into one issue. The processor also now
+  falls back to the top 3 frames when *no* frame is in-app (`apps/processor-go/fingerprint/fingerprint.go`),
+  covering any client — not just this SDK — that never sets `in_app`.
+- **`sendBatch` now inspects `resp.StatusCode`.** Previously discarded entirely, so the 100% rejection
+  rate produced zero client-side signal. Now: 2xx = success; 4xx = dropped immediately and logged under
+  `Config.Debug` (not retried — resending an unchanged payload cannot change a validation outcome);
+  5xx/network error = retried up to 4 attempts with capped exponential backoff (200ms→400ms→800ms,
+  capped 5s), then dropped. `Config.OnError func(error)` fires whenever a batch is ultimately dropped,
+  always from the SDK's internal worker goroutine, never the caller's.
+- **`Config.ReleaseVersion` → `Event.release_version` was already correct** before this release; called
+  out only because it sits in the same S4/S5 field table in `docs/plans/E2E_RECOVERY_PLAN.md` P2-3.
+
+No application code changes are required to adopt v0.2.0 unless callers constructed `sentinel.Event`
+literals directly or depended on the `error_message`/`context` JSON keys on the wire.
 
 ---
 
@@ -57,6 +111,11 @@ The **Go Client SDK** (`packages/sdk-go`) provides an official, zero-dependency 
 ## Functional Requirements
 
 - **FR-001**: **Configuration**: SDK MUST accept `ProjectKey`, `Endpoint`, `Environment`, `ReleaseVersion`, `SampleRate`, `MaxBufferSize`, `BatchSize`, `BatchWait`, `MaxBreadcrumbs`, and `Debug` options.
+  > [!NOTE]
+  > **Superseded by the v0.2.0 wire contract correction above.** As implemented, `Config` also requires
+  > a separate `APIKey` field (the secret, header-only); `ProjectKey` is redefined as the project's
+  > unique *name*, not a credential. The code (`packages/sdk-go/config.go`) is authoritative for the
+  > current field list.
 - **FR-002**: **Context-Aware Telemetry Extraction**: `sentinel.CaptureErrorContext(ctx, err)` MUST automatically extract W3C OpenTelemetry `trace_id` and `span_id` from the active OpenTelemetry span in `ctx`.
 - **FR-003**: **Developer Context Helpers**: SDK MUST provide immutable context wiring helpers:
   - `sentinel.WithUser(ctx, userID)` — Attaches `user_id` to event context.

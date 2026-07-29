@@ -53,10 +53,17 @@ BEGIN
         UPDATE projects SET organization_id = new_org_id WHERE id = rec.id;
     END LOOP;
 END $$;
+-- projects.name is the tenant routing key used by the org-wide-key path
+-- (X-Project-Key header) and by store.GetProjectByKey's `WHERE name = $1`.
+-- Without this, two organizations can own same-named projects and that lookup
+-- resolves arbitrarily across tenants — see VERIFIED_STATE.md S6.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_org_name ON projects (organization_id, name);
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
+DROP INDEX IF EXISTS idx_projects_org_name;
 ALTER TABLE projects DROP COLUMN IF EXISTS organization_id;
 DROP TABLE IF EXISTS user_session_preferences;
 DROP TABLE IF EXISTS organization_invitations;

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -70,23 +71,56 @@ func (a *APIKeyAuthenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		var projectKey string
-		if data.ProjectID == nil || data.ProjectName == "" {
-			projectKey = r.Header.Get("X-Project-Key")
-			if projectKey == "" {
-				http.Error(w, "Missing X-Project-Key header for org-wide key", http.StatusBadRequest)
-				return
-			}
-		} else {
+		var projectKey, projectID string
+		orgWide := data.ProjectID == nil || data.ProjectName == ""
+
+		if !orgWide {
+			// Project-scoped key: the project is fixed by the credential itself.
 			projectKey = data.ProjectName
+			projectID = *data.ProjectID
+		} else {
+			// Organization-wide key: the caller names the target project. Whatever it names is
+			// CLIENT-SUPPLIED and untrusted — resolving it globally would just relocate S6's
+			// cross-tenant write from the body to a header, so resolution is always scoped to the
+			// key's own organization and a name outside it is a 403.
+			//
+			// spec 008 allows an org-wide key to name its target project EITHER via this header
+			// OR via the body's project_key. The body is not decoded yet at middleware time, so
+			// an absent header is not an error here — it defers to the handler, which resolves
+			// payload.ProjectKey through ResolveProjectInOrg with the same org scoping.
+			projectKey = r.Header.Get("X-Project-Key")
+			if projectKey != "" {
+				var err error
+				projectID, err = ResolveProjectInOrg(r.Context(), a.db, projectKey, data.OrganizationID)
+				if err != nil {
+					http.Error(w, "Project not found in this organization", http.StatusForbidden)
+					return
+				}
+			}
 		}
 
-		ctx := context.WithValue(r.Context(), "project_key", projectKey)
-		ctx = context.WithValue(ctx, "rate_limit_rpm", data.RateLimitRPM)
-		ctx = context.WithValue(ctx, "api_key_hash", hashStr)
+		ctx := WithIdentity(r.Context(), projectKey, projectID, data.OrganizationID, hashStr, data.RateLimitRPM, orgWide)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// ResolveProjectInOrg maps a project's unique name to its id WITHIN one organization.
+//
+// The organization scope is the whole point: resolving a client-supplied project name globally is
+// what let any key write into any tenant's project (VERIFIED_STATE.md S6). The error is deliberately
+// indistinguishable between "no such project" and "belongs to another organization", so it cannot be
+// used to enumerate other tenants' project names.
+func ResolveProjectInOrg(ctx context.Context, db *pgxpool.Pool, projectName, organizationID string) (string, error) {
+	var projectID string
+	err := db.QueryRow(ctx,
+		`SELECT id::text FROM projects WHERE name = $1 AND organization_id = $2`,
+		projectName, organizationID,
+	).Scan(&projectID)
+	if err != nil {
+		return "", fmt.Errorf("project not found in organization")
+	}
+	return projectID, nil
 }
 
 func (a *APIKeyAuthenticator) getAPIKeyData(ctx context.Context, hashStr string) (*APIKeyData, error) {

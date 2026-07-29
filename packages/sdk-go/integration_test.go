@@ -30,7 +30,8 @@ func TestGoSDKEndToEndPipeline(t *testing.T) {
 
 	// 1. Initialize Go SDK
 	sentinel.Init(sentinel.Config{
-		ProjectKey: "proj_integration_key",
+		APIKey:     "proj_integration_key", // secret -> X-API-Key header
+		ProjectKey: "integration-project",  // project unique name -> body project_key
 		Endpoint:   server.URL,
 		BatchSize:  5,
 		BatchWait:  100 * time.Millisecond,

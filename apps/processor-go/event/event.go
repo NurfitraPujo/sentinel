@@ -13,8 +13,15 @@ import (
 )
 
 type ErrorEvent struct {
-	Fingerprint    string                 `json:"fingerprint"`
-	ProjectKey     string                 `json:"project_key"`
+	Fingerprint string `json:"fingerprint"`
+	ProjectKey  string `json:"project_key"`
+	// ProjectID is ErrorEvent.project_id (proto field 16, added alongside
+	// release_version in P2-1). When non-empty it is the authenticated
+	// project's UUID and must be preferred over any ProjectKey-based lookup
+	// — see store.ResolveProjectID and VERIFIED_STATE.md S6. It is empty
+	// for any producer that has not been updated to send it, in which case
+	// callers fall back to the legacy ProjectKey/name lookup.
+	ProjectID      string                 `json:"project_id"`
 	Platform       string                 `json:"platform"`
 	Environment    string                 `json:"environment"`
 	ReleaseVersion string                 `json:"release_version"`
@@ -42,10 +49,21 @@ func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker
 	e.TraceID = normalizer.NormalizeString(e.TraceID)
 	e.SpanID = normalizer.NormalizeString(e.SpanID)
 	if e.Metadata != nil {
-		e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))
-		if rv, ok := e.Metadata["release_version"].(string); ok && e.ReleaseVersion == "" {
-			e.ReleaseVersion = rv
+		// Read the legacy release_version-in-metadata fallback BEFORE
+		// NormalizeMap runs, not after (VERIFIED_STATE.md S5 / B6:
+		// normalizer.versionRegex rewrites any semver-looking string to the
+		// literal "<VERSION>", so reading it post-normalization always
+		// yielded that placeholder and regression detection could never
+		// fire). The first-class ErrorEvent.ReleaseVersion field (proto
+		// field 15, populated in Deserialize) always wins when present —
+		// this is purely a fallback for producers that still smuggle the
+		// version through metadata instead of sending the field directly.
+		if e.ReleaseVersion == "" {
+			if rv, ok := e.Metadata["release_version"].(string); ok {
+				e.ReleaseVersion = rv
+			}
 		}
+		e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))
 	}
 }
 
@@ -60,15 +78,25 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 	}
 
 	event := &ErrorEvent{
-		ProjectKey:  protoEvent.ProjectKey,
-		Platform:    protoEvent.Platform,
-		Environment: protoEvent.Environment,
-		Message:     protoEvent.Message,
-		ErrorClass:  protoEvent.ErrorClass,
-		TraceID:     protoEvent.TraceId,
-		SpanID:      protoEvent.SpanId,
-		TraceFlags:  protoEvent.TraceFlags,
-		Fingerprint: protoEvent.Fingerprint,
+		ProjectKey: protoEvent.ProjectKey,
+		// ProjectID/ReleaseVersion (proto fields 16/15) were added to the
+		// wire contract in P2-1 and populated by the ingestor, but this
+		// Deserialize never copied them onto ErrorEvent — so the processor
+		// silently dropped both on every event (VERIFIED_STATE.md S5, and
+		// the processor half of S6's project_id plumbing). Copying them
+		// here, before Normalize runs, is what makes the first-class
+		// ReleaseVersion field win over the metadata fallback in Normalize
+		// above.
+		ProjectID:      protoEvent.ProjectId,
+		ReleaseVersion: protoEvent.ReleaseVersion,
+		Platform:       protoEvent.Platform,
+		Environment:    protoEvent.Environment,
+		Message:        protoEvent.Message,
+		ErrorClass:     protoEvent.ErrorClass,
+		TraceID:        protoEvent.TraceId,
+		SpanID:         protoEvent.SpanId,
+		TraceFlags:     protoEvent.TraceFlags,
+		Fingerprint:    protoEvent.Fingerprint,
 	}
 
 	if protoEvent.Timestamp != nil {

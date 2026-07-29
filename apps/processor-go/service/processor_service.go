@@ -10,6 +10,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -50,17 +51,21 @@ func (s *ProcessorService) VerifyAuditLogTable(ctx context.Context) error {
 func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {
 	evt, err := event.Deserialize(data)
 	if err != nil {
+		// A deserialize failure (malformed proto, a required field missing)
+		// is a property of these exact bytes: redelivering the same message
+		// will fail identically forever, so it must not spend its whole
+		// MaxDeliver budget being retried (VERIFIED_STATE.md S13).
 		log.Printf("Failed to deserialize event: %v", err)
-		return err
+		return nats.Permanent(err)
 	}
 
-	log.Printf("Processing event: project=%s, error_class=%s, fingerprint=%s, release_version=%s",
-		evt.ProjectKey, evt.ErrorClass, evt.Fingerprint, evt.ReleaseVersion)
+	log.Printf("Processing event: project=%s, project_id=%s, error_class=%s, fingerprint=%s, release_version=%s",
+		evt.ProjectKey, evt.ProjectID, evt.ErrorClass, evt.Fingerprint, evt.ReleaseVersion)
 
-	projectID, err := s.store.GetProjectByKey(ctx, evt.ProjectKey)
+	projectID, err := s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
 	if err != nil {
-		log.Printf("Failed to get project: %v", err)
-		return err
+		log.Printf("Failed to resolve project: %v", err)
+		return classifyProjectLookupError(err)
 	}
 
 	issue := &store.Issue{
@@ -76,7 +81,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 
 	if err := s.store.UpsertIssue(ctx, issue, evt.ReleaseVersion); err != nil {
 		log.Printf("Failed to upsert issue: %v", err)
-		return err
+		return classifyStoreError(err)
 	}
 
 	s.store.PersistAuditLog(ctx, &store.AuditLog{
@@ -91,7 +96,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	issueID, err := s.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
 	if err != nil {
 		log.Printf("Failed to get issue ID: %v", err)
-		return err
+		return classifyStoreError(err)
 	}
 
 	stacktraceJSON, _ := json.Marshal(evt.Stacktrace)
@@ -112,7 +117,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 
 	if err := s.store.InsertOccurrence(ctx, occ); err != nil {
 		log.Printf("Failed to insert occurrence: %v", err)
-		return err
+		return classifyStoreError(err)
 	}
 
 	s.store.PersistAuditLog(ctx, &store.AuditLog{

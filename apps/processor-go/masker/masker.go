@@ -29,6 +29,16 @@ var (
 		"client_secret": {},
 		"access_token":  {},
 		"refresh_token": {},
+		// Named by docs/sdk-specification.md section 5 but previously absent here, so the
+		// server-side second masking layer that PROJECT_CONTEXT.md treats as a durable constraint
+		// did not actually cover them.
+		"authorization":   {},
+		"bearer":          {},
+		"credit_card":     {},
+		"card_number":     {},
+		"cvv":             {},
+		"ssn":             {},
+		"social_security": {},
 	}
 )
 
@@ -86,8 +96,18 @@ func (m *Masker) MaskSlice(s []interface{}) []interface{} {
 	return result
 }
 
+// isSensitiveKey matches on SUBSTRING, not equality. Exact matching meant "user_password",
+// "x-api-key" and "authorization_header" all sailed through untouched — the map's entries only ever
+// fired on a key that was exactly the bare word.
 func (m *Masker) isSensitiveKey(key string) bool {
 	lowerKey := strings.ToLower(key)
-	_, found := sensitiveKeys[lowerKey]
-	return found
+	if _, found := sensitiveKeys[lowerKey]; found {
+		return true
+	}
+	for candidate := range sensitiveKeys {
+		if strings.Contains(lowerKey, candidate) {
+			return true
+		}
+	}
+	return false
 }

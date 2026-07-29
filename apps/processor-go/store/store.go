@@ -15,6 +15,9 @@ import (
 // QueryStore defines the "Read" side of the Issue store.
 type QueryStore interface {
 	GetProjectByKey(ctx context.Context, projectKey string) (string, error)
+	// ResolveProjectID resolves the tenant project for an incoming event.
+	// See the method doc on pgStore.ResolveProjectID for the full rationale.
+	ResolveProjectID(ctx context.Context, projectID, projectKey string) (string, error)
 	GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error)
 }
 
@@ -153,8 +156,13 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			"previousResolvedVersion": existingResolvedInVersion,
 		})
 
+		// issue_activity has no `metadata` column — the schema
+		// (1721900000_add_issue_lifecycle_and_relations.sql:83-92) defines old_value/new_value. Inserting
+		// `metadata` raised 42703 inside this transaction, so EVERY regression event lost both the issue
+		// update and its occurrence, and errors.go classifies 42703 as retryable so it burned the full
+		// delivery budget before dead-lettering. U11 failed 100%.
 		activityQuery := `
-			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, metadata, created_at)
+			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, new_value, created_at)
 			VALUES (gen_random_uuid(), $1, 'system', 'sentinel-regression-detector', 'regressed', $2, NOW())
 		`
 		if _, err := tx.Exec(ctx, activityQuery, issue.ID, activityMeta); err != nil {
@@ -207,6 +215,40 @@ func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) er
 	)
 
 	return err
+}
+
+// ResolveProjectID resolves the tenant project for an incoming event.
+//
+// It prefers projectID — ErrorEvent.project_id, proto field 16 — when it is
+// non-empty, resolving it directly against projects.id. Only when it is
+// empty does it fall back to the legacy GetProjectByKey name lookup.
+//
+// This matters because for the Go SDK (and any client following
+// docs/sdk-specification.md as originally written), ProjectKey/project_key
+// carries the API key string used for authentication, not a projects.name
+// value — GetProjectByKey's "SELECT id FROM projects WHERE name = $1" was
+// therefore guaranteed to fail for real SDK traffic with
+// "project not found: <api-key>" (VERIFIED_STATE.md S6). Once a caller
+// populates project_id (the ingestor's job, from the authenticated API key
+// context — see docs/plans/E2E_RECOVERY_PLAN.md P3-1, which is NOT done by
+// this change), this resolves correctly without going through the name
+// lookup at all. Until then, this is a no-op for callers that still leave
+// project_id empty: they keep getting exactly today's fallback behavior.
+func (s *pgStore) ResolveProjectID(ctx context.Context, projectID, projectKey string) (string, error) {
+	if projectID == "" {
+		return s.GetProjectByKey(ctx, projectKey)
+	}
+
+	var id string
+	err := s.db.QueryRow(ctx,
+		"SELECT id FROM projects WHERE id = $1",
+		projectID,
+	).Scan(&id)
+
+	if err == pgx.ErrNoRows {
+		return "", fmt.Errorf("project not found: %s", projectID)
+	}
+	return id, err
 }
 
 func (s *pgStore) GetProjectByKey(ctx context.Context, projectKey string) (string, error) {

@@ -36,7 +36,9 @@ Active → Needs Review → Superseded → (pruned)
 ### 2024-05-20 - Graceful Degradation via In-Memory Buffering
 
 **Status**
-Active
+Needs Review — verified implementation contradicts the decision in the buffer-exhaustion case (see
+Update, 2026-07-29). Not superseded: the buffering behavior described below is real and does work for
+the common case; only the "MUST NOT lose events" guarantee is broken, and only at capacity.
 
 **Why this is durable**
 Sentinel is an observability platform. Losing events during a temporary database outage defeats the purpose of the platform. This decision ensures that short-term infrastructure issues don't lead to permanent data loss.
@@ -52,11 +54,53 @@ When the PostgreSQL database is unavailable, the Processor service MUST buffer i
 **Future mistake prevented**
 Directly failing or dropping events when the database is down.
 
+**Update (2026-07-29) — S9's inversion is still present; it was not part of this changeset**
+Verified by reading `apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`, lines 86-103) and
+`apps/processor-go/service/processor_service.go` (`ProcessEvent`, lines 36-43), and confirmed the
+control flow was untouched by the P0-P2b work: the only staged change to `processor_service.go` is
+error classification for D10 (`classifyStoreError`/`nats.Permanent`), not this logic. Also confirmed by
+running `rtk go test ./tests/unit/... -run TestCheckAndBuffer -v -count=1` (4/4 pass) and reading
+`tests/integration/processor_service_test.go`, which names and documents the exact behavior below
+(not executed here — it needs a live/unreachable Postgres target and testcontainers wiring).
+
+`CheckAndBuffer` returns `true` in two cases the caller cannot distinguish: (1) the DB is healthy, and
+(2) the DB is down but `buffer.Push` succeeded — the event WAS queued. `ProcessEvent`
+(`processor_service.go:37`) then falls through to an immediate live write, `processEventInternal`, in
+**both** cases. `tests/integration/processor_service_test.go:256-293`
+(`TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent`) documents this explicitly: the event is
+pushed to the buffer, then `ProcessEvent` still attempts and surfaces a connection error from the
+immediate write — i.e. a successfully-buffered event is also attempted against the down database right
+away rather than the call simply returning "queued".
+
+`CheckAndBuffer` returns `false` only when the DB is down **and** the buffer is full: `buffer.Push`
+drops the event (its own "dropping event" log) and returns `false`. `ProcessEvent` then logs "Event
+buffered due to database unavailability" — untrue, the event was dropped, not buffered — and returns
+`nil`, which the NATS subscriber acks as success. `tests/integration/processor_service_test.go:491-532`
+(`TestProcessorService_ProcessEvent_BufferFullReturnsNil`) drives the buffer to capacity and asserts
+exactly this: `ProcessEvent` "must transition to nil when the degradation buffer fills up". **This is
+real, silent data loss reported as success — the same inversion originally recorded as S9. It remains
+open.** `tests/unit/processor_degradation_test.go:111-118`
+(`TestCheckAndBuffer_DBDown_ReturnsTrueOnPushSuccess`) asserts the `true`-on-successful-push behavior by
+name as the expected contract, which is why the S1 unit-suite fix (253 assertions, 0 fail) does not
+catch this: the tests codify the current control flow rather than the decision's "MUST NOT lose events"
+guarantee.
+
+**Interaction with D10**: D10's bounded retry/backoff covers the immediate write attempt above when it
+fails with a retryable error (e.g. the connection error in the DBUnavailableBuffersEvent case) — NATS
+redelivers with 1s/5s/15s/30s/60s backoff up to `MaxDeliver=5` instead of hot-looping, and an event that
+exhausts that budget is dead-lettered (preserved, unprocessed) rather than lost. D10 does **not** reach
+the buffer-full path above: that path returns `nil` directly from `ProcessEvent` and never produces an
+error for NATS to retry or dead-letter in the first place. See D10, this file.
+
 **Evidence**
-Implementation in `apps/processor-go/degradation/buffer.go`.
+Implementation in `apps/processor-go/degradation/buffer.go` and
+`apps/processor-go/service/processor_service.go`. Control flow re-verified 2026-07-29 (see Update).
 
 **Where to look next**
-`apps/processor-go/processor.go` and `apps/processor-go/degradation/buffer.go`.
+`apps/processor-go/processor.go`, `apps/processor-go/degradation/buffer.go`,
+`tests/integration/processor_service_test.go:256-293,491-532` (documents current behavior),
+`tests/unit/processor_degradation_test.go:111-118` (asserts current behavior as the contract), and D10
+in this file.
 
 ---
 
@@ -109,6 +153,20 @@ Use `github.com/pressly/goose/v3` as the only migration tool across the project,
 **Future mistake prevented**
 Re-evaluating migration tools per app, introducing dynamic SQL through CLI flags, or accepting migration tooling that lacks transactional DDL.
 
+**Accepted risk (2026-07-29) — already-applied migration files were edited in place**
+`goose` stores no checksums of applied migration files (only version numbers in its tracking table), so
+it cannot detect that an already-applied file changed underneath it. During P2b, three already-applied
+migrations — `1721800000_add_organization_layer.sql`, `1721900000_add_issue_lifecycle_and_relations.sql`,
+`1722000000_add_api_key_management.sql` — were edited in place (see D4's Tension entry for the idempotency
+change specifically, and the S12 fix for the dropped `issues_status_check` constraint). Any database that
+already ran the old file content will never see these edits; its schema silently diverges from a fresh
+`up` on the same version. Normally this would be a correctness incident on its own. **The repo owner has
+confirmed nothing is deployed**, so no database exists yet where the pre-edit version was ever the final
+state of a long-lived environment — the only affected databases are local/dev/test, disposable, and were
+re-migrated as part of this same work. This is an accepted, one-time risk for this specific recovery, not
+a precedent: future migrations must not be edited in place once any database anyone cares about has
+applied them; add a new migration instead.
+
 **Evidence**
 - `specs/004-shared-db-migrations/research.md` (tool selection rationale)
 - `specs/004-shared-db-migrations/plan.md` (Primary Dependencies)
@@ -143,10 +201,53 @@ Migrations MUST follow these non-negotiable rules:
 **Future mistake prevented**
 Wrapping migrations in retry loops, swallowing partial-failure errors, or introducing a parallel migration path that bypasses the advisory lock.
 
+**Tension (2026-07-29) — migrations were made idempotent; this is not what rule 3/4 above intend, and needs an explicit carve-out**
+During the P2b recovery, `1721800000_add_organization_layer.sql`, `1721900000_add_issue_lifecycle_and_relations.sql`,
+and `1722000000_add_api_key_management.sql` — all three **already applied** to the running dev database
+— were edited to add `IF EXISTS` / `IF NOT EXISTS` guards on every `ALTER TABLE ADD COLUMN`, `CREATE
+INDEX`, `CREATE TABLE`, `DROP ...`, plus two `DO $$ ... IF NOT EXISTS (SELECT ... FROM pg_catalog) $$`
+blocks for `ADD CONSTRAINT`, which Postgres has no direct `IF NOT EXISTS` DDL for
+(`rtk git diff --cached HEAD -- packages/db-migrations/migrations/`). A second `up` of any of these
+files against an already-migrated schema now silently no-ops instead of erroring.
+
+**Why this was done**: the repo's local/test topology has **at least five independent goose
+version-tracking tables** pointed at the **same physical Postgres database**: `schema_migrations` is the
+CLI's own default ledger (`packages/db-migrations/goose.go:22,28,55,73`), and
+`tests/integration/db_migrations_test.go` defines four more distinct `MigrationOptions.TableName` values
+exercised against that same database — `seq_migrations` (line 73), `processor_migrations` (line 108),
+`dashboard_migrations` (line 121), `baseline_test_migrations` (line 153) — plus a sixth,
+`status_test_migrations` (line 43), used only for `status` command tests. Each ledger tracks its own
+idea of "applied" independently of the others, so a migration one ledger considers new can already have
+been run by a different ledger against the identical tables — and did, which is how U30 (up→down×5→up
+round-trip) and the S12 fix needed to be replay-safe to even test. This is a genuine, reproduced local
+hazard (see also VERIFIED_STATE.md's "running the integration suite corrupts the shared dev database"
+hazard note), not speculative.
+
+**Tension**: rule 3 ("stop on first failure... partial state is the user's responsibility") and rule 4
+("no silent rollback on errors") describe a tool that surfaces every anomaly loudly. An `ADD COLUMN IF
+NOT EXISTS` that silently no-ops when the column is already there is the opposite instinct: it
+absorbs an anomaly (two ledgers disagreeing about state) instead of surfacing it. A genuinely wrong
+second application — e.g., a column that should have a different type the second time, or an `ADD
+COLUMN IF NOT EXISTS` masking a real forgotten migration further up the chain — would now also silently
+no-op instead of failing loudly, which is precisely what D4 exists to prevent.
+
+**Recommendation**: idempotency guards should be a narrow, explicitly-labeled carve-out for the
+multi-ledger-single-database hazard above — not a general migration-authoring style. The comments added
+in the migration files themselves already do this (they cite U30 and the multi-ledger scenario inline),
+which is the right instinct; this entry makes it a decision instead of a comment. The durable fix is
+architectural, not idempotency: collapse to one goose version-tracking table per physical database (or
+give each target's tests their own throwaway database instead of sharing the dev one — U30's own test
+already uses "a throwaway DB", which suggests the pattern exists and the shared-database ledgers are the
+outlier). Until that lands, treat `IF EXISTS`/`IF NOT EXISTS`/guarded `DO $$` blocks in migrations that
+have already reached any shared database as an accepted, narrow exception to rule 4 — not a precedent
+for new migrations authored against a single-ledger target, which should keep failing loudly on replay
+as originally specified.
+
 **Evidence**
 - `specs/004-shared-db-migrations/spec.md` → Edge Cases
 - `specs/004-shared-db-migrations/plan.md` → Technical Context Constraints
 - `specs/004-shared-db-migrations/security-constraints.md` → Confirmed Secure Patterns (transactional DDL, concurrency locking)
+- Idempotency retrofit: `packages/db-migrations/migrations/1721800000_add_organization_layer.sql`, `1721900000_add_issue_lifecycle_and_relations.sql`, `1722000000_add_api_key_management.sql`
 
 **Where to look next**
 `packages/db-migrations/goose.go` and the `db:*` Taskfile targets.
@@ -173,6 +274,10 @@ Active
 
 **Future mistake prevented**
 Running `task db:reset` in prod, leaking DSNs in CI logs, granting the migration role data-access permissions.
+
+**Checked (2026-07-29)**: reviewed against the P2b in-place migration edits (see D3's Accepted Risk and
+D4's Tension entries). Not implicated — this decision governs destructive Taskfile targets, DSN handling,
+and least-privilege DB roles, none of which the migration-file edits touched or bypassed.
 
 **Evidence**
 - `specs/004-shared-db-migrations/plan.md` → Security & Governance Context
@@ -233,8 +338,36 @@ Establishes the real-time regression reopening architecture inside the high-thro
 **Future mistake prevented**
 Querying or locking relational issue graphs on the high-throughput error ingestion hot path.
 
+**Update (2026-07-29) — the detector was structurally incapable of firing; both root causes are now fixed**
+This decision was recorded (and left `Active`) while `detectAndHandleRegression`'s two prerequisites
+were both broken:
+1. `event.Deserialize` never copied the proto's `ReleaseVersion` field onto the internal `Event`, so
+   `UpsertIssue`'s regression comparison always ran against an empty string.
+2. The regression branch's `issue_activity` insert targeted a `metadata` column that does not exist on
+   that table (`packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql:83-92`
+   defines `old_value`/`new_value`, not `metadata`) — SQLSTATE 42703 aborted the whole transaction, so
+   every regression event lost both the issue update and its occurrence, and `errors.go` classified
+   42703 as retryable, so it burned the full NATS delivery budget before dead-lettering instead of
+   failing fast.
+
+Both are fixed: `ReleaseVersion` is proto field 15, copied by `Deserialize`
+(`apps/processor-go/event/event.go:61-91`) and read before `Normalize` runs, per B6; the
+`issue_activity` insert now writes `new_value` (`apps/processor-go/store/store.go:164-168`).
+
+**Evidence (runtime proof, 2026-07-29)**: a regression event produced `issues.regression_status =
+'regressed'`, `regression_count = 1`, and an `issue_activity` row with
+`new_value = {"releaseVersion":"3.0.0","previousResolvedVersion":"2.5.0"}` (VERIFIED_STATE.md U11).
+
+**Residual gap — not fixed**: `issue_activity.old_value` is left `NULL` on every regression insert
+(`apps/processor-go/store/store.go:164-168` inserts only `new_value`). The schema
+(migration `1721900000`, lines 83-92) pairs `old_value`/`new_value` to record a before/after transition;
+right now only the "after" half is captured, so a transition's prior state (e.g. which version it was
+last resolved in, before this regression cleared it) is reconstructable only via `previousResolvedVersion`
+inside `new_value`'s JSON, not via the column the schema provisioned for it.
+
 **Evidence**
 - Implementation: `apps/processor-go/store/store.go`, `apps/dashboard-web/src/lib/db/queries/issues.ts`, `packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql`
+- Fix: `apps/processor-go/event/event.go` (ReleaseVersion copy, read-before-Normalize), `apps/processor-go/store/store.go:159-168` (issue_activity column fix)
 
 **Where to look next**
 `apps/processor-go/store/store.go` and `apps/dashboard-web/src/lib/db/queries/issues.ts`.
@@ -282,7 +415,7 @@ Active
 Protects Sentinel ingestion hot path (< 1ms overhead) from authentication latency and denial-of-service memory amplification while maintaining immediate (< 100ms) cache invalidation upon key revocation across distributed ingestor nodes.
 
 **Decision**
-Store only SHA256 hashed API key digests (`key_hash`) in `project_api_keys` with raw secret tokens (`sent_live_...` or `sent_org_...`) displayed ONCE upon creation. Support both Project-scoped and Organization-wide API keys (`organization_id` bound, nullable `project_id`). Cache valid keys in Redis/in-memory LRU with a 60-second TTL, listening to NATS JetStream `api_key.invalidated` events for instant revocation cache purging. Enforce hierarchical rate limits (per-key quota overrides project default 5,000 RPM) via Redis sliding window counters wrapped inside authentication middleware.
+Store only SHA256 hashed API key digests (`key_hash`) in `project_api_keys` with raw secret tokens (`sent_live_...` or `sent_org_...`) displayed ONCE upon creation. Support both Project-scoped and Organization-wide API keys (`organization_id` bound, nullable `project_id`). Cache valid keys in Redis/in-memory LRU with a 60-second TTL, listening to NATS JetStream `api_key.invalidated` events for instant revocation cache purging. ~~Enforce hierarchical rate limits (per-key quota overrides project default 5,000 RPM)~~ **[false, see Correction below — rate limiting is per-key only]** via Redis sliding window counters wrapped inside authentication middleware.
 
 **Tradeoffs**
 - **Gained**: Sub-millisecond error ingestion auth, zero plaintext secret storage, instant cross-node revocation, and granular per-key rate limit overrides.
@@ -292,10 +425,188 @@ Store only SHA256 hashed API key digests (`key_hash`) in `project_api_keys` with
 **Future mistake prevented**
 Nesting rate-limiting middleware outside authentication middleware (exposing rate limit caches to unauthenticated DoS amplification) or storing plaintext API key tokens in database tables.
 
+**Correction (2026-07-29) — "hierarchical" was never true; record it as unimplemented**
+There is no project rate-limit tier and no `projects.rate_limit_rpm` column. Verified: `rtk grep -rn
+"rate_limit_rpm" apps/ingestor-go packages/db-migrations/migrations` finds exactly one column,
+`project_api_keys.rate_limit_rpm INTEGER NOT NULL DEFAULT 5000`
+(`packages/db-migrations/migrations/1722000000_add_api_key_management.sql:17`), read per-key in
+`auth/apikey.go:143-148` and carried through `auth.WithIdentity` /
+`auth.RateLimitRPMFromContext`. Rate limiting is **per-key only**; "overrides project default" describes
+a tier that was never built. If org- or project-level quotas are wanted, they are new work, not a bug
+fix.
+
+**Correction (2026-07-29) — rate limiting was silently 100% bypassed until R1 (self-inflicted, same changeset) fixed it**
+Introducing typed context keys in `auth/context.go` (replacing bare string keys, itself a good change —
+Go vet flags string-literal context keys, and they collide silently across packages) broke
+`middleware/ratelimit.go`, which still read the old bare string keys (`"api_key_hash"`,
+`"rate_limit_rpm"`). `context.Value` compares the dynamic type as well as the value, so
+`r.Context().Value("api_key_hash").(string)` always failed its type assertion and `ok` was always
+`false` — every request took the `next.ServeHTTP(w, r); return` early-out and rate limiting did not run,
+for any key, at any RPM, with no error or log. Three test files hand-injected the bare string keys
+directly into `context.Background()`, matching the (broken) production reads, so nothing caught it.
+Fixed by routing both middleware and tests through `auth.APIKeyHashFromContext` /
+`auth.RateLimitRPMFromContext` / `auth.WithIdentity` (`apps/ingestor-go/middleware/ratelimit.go:33,39`).
+**Proven**: 12 requests against a limit of 5 → `202 202 202 202 202 429 429 429 429 429 429 429`, with
+`Retry-After: 60`, `X-RateLimit-Limit: 5`, `X-RateLimit-Remaining: 0`.
+
+**Correction (2026-07-29) — org-wide key resolution order, previously undocumented**
+For an organization-wide key (`project_api_keys.project_id IS NULL`), the target project is resolved in
+this order, entirely inside the key's own organization (`apps/ingestor-go/main.go:317-376`,
+`applyAuthenticatedScope`):
+1. `X-Project-Key` header, resolved by the auth middleware. If present, it **is** the target; the
+   body's `project_key` is never consulted, even if also present.
+2. Body `project_key`, resolved via `auth.ResolveProjectInOrg`, only if the header was absent.
+3. A name that does not resolve within the key's organization is `403`, not a cross-tenant write — this
+   is what closed S6.
+
+For a project-scoped key, the project is fixed by the credential; the body may omit `project_key` or
+name the same project, but naming a **different** one is `403` (`main.go:365-368`).
+
+**Known gaps not addressed by this correction** (see VERIFIED_STATE.md for detail, out of scope here):
+S7 (`expires_at` never checked; rotation leaves `status='active'`) and S10 (rate limiting is still 4
+unpipelined Redis round-trips — `ZRemRangeByScore`/`ZCard`/`ZAdd`/`Expire` are not pipelined — and
+`middleware/ratelimit.go:44-47`'s `if rl.client == nil { next.ServeHTTP(...); return }` still fails
+open with no rate limiting applied when Redis is unset) remain open and are unrelated to the corrections
+above.
+
 **Evidence**
-- Implementation: `apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`, `packages/db-migrations/migrations/1722000000_add_api_key_management.sql`
+- Implementation: `apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/auth/context.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/ingestor-go/main.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`, `packages/db-migrations/migrations/1722000000_add_api_key_management.sql`
 - Specification & Plan: `specs/008-api-key-management/spec.md`, `specs/008-api-key-management/plan.md`
 
 **Where to look next**
-`apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
+`apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/auth/context.go`, `apps/ingestor-go/middleware/ratelimit.go`, `apps/ingestor-go/main.go` (`applyAuthenticatedScope`), `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
 
+
+---
+
+## D10 | Bounded-Retry NATS Delivery with Dead-Letter Capture
+
+**Status**: active · **Recorded**: 2026-07-29 · **Tags**: nats,jetstream,reliability,delivery,dlq
+
+**Context**
+JetStream is an at-least-once transport: it redelivers until the consumer acks or terminates. The
+processor previously did neither correctly — on any handler error it issued a bare `msg.Nak()` with no
+delivery cap and no dead-letter path, and `scripts/nats-init.sh` created the consumer with `--defaults`
+(unlimited redeliveries). A single permanently-unstorable message therefore redelivered forever and,
+being pulled back into every Fetch batch ahead of newer messages, starved the whole pipeline. Measured
+during the P2b recovery: ~510 unique events produced 5,874 processing attempts, and no newly-published
+event was ever observed reaching Postgres (VERIFIED_STATE.md S13).
+
+No decision record covered delivery semantics at all, so this behavior was invented during a bug fix.
+This entry exists so it stops being accidental.
+
+**Decision**
+The pipeline offers **at-least-once delivery into the stream, bounded retry out of it, and never a
+silent drop**. Concretely:
+
+1. **Failures are classified.** `nats.Permanent(err)` marks a content-caused failure — malformed
+   payload, check-constraint or foreign-key violation, a lookup that can never succeed. Everything else
+   (connection refused, context deadline, partition) is retryable. Handlers MUST NOT mark infrastructure
+   failures permanent: those are precisely what redelivery and the degradation buffer (D1) recover from.
+2. **Retryable failures back off**: 1s, 5s, 15s, 30s, 60s via `NakWithDelay`, bounded by
+   `MaxDeliver` (default 5). A bare Nak redelivers immediately and burns the entire budget in
+   milliseconds, which would dead-letter an event long before a restarting database came back.
+3. **Permanent failures skip the retry budget** and dead-letter on the first delivery.
+4. **`Term()` is called ONLY after the event is captured somewhere durable.** Term is the application
+   explicitly waiving JetStream's at-least-once guarantee for one message; waiving it before the event
+   is stored is unrecoverable loss. If the DLQ publish fails, the message is Nak'd and left in the
+   file-backed source stream instead. That cannot livelock: server-side `MaxDeliver` stops redelivery on
+   its own, leaving the message parked-but-preserved.
+5. **The DLQ is `<STREAM>_DLQ`, file-backed, unlimited retention**, carrying `X-Sentinel-Dlq-Reason`,
+   `-Attempts` and `-Source-Subject` headers.
+
+**Tradeoffs**
+- **Gained**: no poison-message livelock; transient database faults survive a ~51s retry window; no
+  event is dropped without being stored first.
+- **Made harder**: a dead-lettered event is *preserved but unprocessed*. Durability moved from a stream
+  with a live consumer to one with none.
+- **Reconsider**: if the DLQ needs its own retention limits, or if per-subject delivery budgets diverge.
+
+**Known gap — this decision is not fully honored yet**
+**Nothing consumes the DLQ.** There is no drain, no replay, no alerting, and no dashboard surface, so a
+dead-lettered event is invisible to the product. `Subscriber.DLQPublishFailures()` exists but is not
+exported to any metric. Until a replay path exists, "no event loss" is true in the storage sense and
+false in the useful sense — an error tracker that silently parks its own errors. Minimum work to close
+it: (a) surface DLQ depth on `/health` or a metric, (b) a replay CLI that re-publishes onto
+`error_events` once the root cause is fixed, (c) a "failed events" view in the dashboard.
+
+**Future mistake prevented**
+Reintroducing a bare `Nak()` (unbounded immediate redelivery → livelock), or terminating a message
+whose DLQ publish failed (silent event loss). Also: classifying a database outage as `Permanent`, which
+would dead-letter every in-flight event during a restart.
+
+**Evidence**
+- Implementation: `packages/shared-go/nats/subscriber.go` (`handleMessage`, `deadLetter`,
+  `retryBackoff`, `ensureConsumer`), `apps/processor-go/service/errors.go`, `apps/processor-go/main.go`
+- Runtime proof: after the fix, `ERROR_EVENTS` showed `Redelivered=0` across ~180 messages with
+  `ERROR_EVENTS_DLQ` holding the unstorable ones, and events posted behind a poison message landed
+  within ~2s (previously never).
+
+**Where to look next**
+`packages/shared-go/nats/subscriber.go`, `apps/processor-go/service/errors.go`, `scripts/nats-init.sh`
+(whose unconditional `--defaults` consumer add can still race and revert `MaxDeliver`).
+
+---
+
+## D11 | APIKey/ProjectKey Split — a Project Name Is Never a Credential
+
+**Status**: active · **Recorded**: 2026-07-29 · **Tags**: sdk,go,auth,multitenancy,contracts
+
+**Context**
+Before this fix, `packages/sdk-go`'s `Config` had a single field, `ProjectKey`, which callers were
+expected to set to their API key, and which the SDK also sent as the wire body's `project_key`. The
+ingestor resolves `project_key` against `projects.name` (`apps/ingestor-go/validation/validator.go:26`,
+`apps/processor-go/store/store.go` project lookup) — a human-chosen, non-secret, per-organization-unique
+name — never against a credential. So every event sent by every Go SDK user was accepted at the HTTP
+layer (202), then the async processor's project-name lookup failed to find a project named "the
+customer's actual API key string", and the event was permanently dead-lettered
+(`classifyProjectLookupError`, this file's D10) — with no error ever surfaced to the caller, because
+`sendBatch` did not inspect the response status at all (S4, VERIFIED_STATE.md). This is VERIFIED_STATE.md
+S16: **the official SDK's happy path silently discarded 100% of events**, and nothing in the SDK's own
+test suite caught it because no test round-tripped a real ingestor.
+
+No decision record had ever stated, in one place, that a project name and an API key are different kinds
+of value with different trust levels and different transport locations. That gap is what let one field
+do both jobs.
+
+**Decision**
+A project's identity on the wire and a project's authorization credential are two different values that
+MUST NOT share a field, in either the SDK or the server:
+1. **`project_key` (wire body field, `projects.name`)** is a human-chosen, unique-per-organization
+   *name* — an identifier, not a secret. It is safe to log, safe to put in a request body, and its only
+   job is telling an organization-wide credential which of the org's projects an event belongs to.
+2. **The API key (`sent_live_...` / `sent_org_...`)** is the secret credential. It travels ONLY in the
+   `X-API-Key` header, NEVER in a body field, and is what D9's hashing/lookup/rate-limit machinery keys
+   on.
+3. In `packages/sdk-go`, these are separate `Config` fields: `APIKey` (`json:"-"`, never serialized) and
+   `ProjectKey` (`json:"project_key"`). `Config.Validate()` additionally rejects a `ProjectKey` value that
+   *looks like* an API key (`looksLikeSecret`, matching `sent_live_`/`sent_org_`/`pk_live_`/`sk_`
+   prefixes) so a caller who swaps the two fields gets a loud config-time error instead of a silent
+   100%-drop rate identical to S16's.
+4. Server-side, tenant scope is still derived from the authenticated credential context, never trusted
+   from the body outright — `project_key` in the body only *selects* which project inside the
+   credential's own organization for an org-wide key, per D9's resolution order, and is rejected with 403
+   on any mismatch for a project-scoped key. This is what B7 requires.
+
+**Tradeoffs**
+- **Gained**: an SDK config-time error (`Validate()`) instead of a runtime, per-event, silent data-loss
+  failure mode; the field names now match what the server does with them, closing the semantic gap that
+  caused S16.
+- **Made harder**: a breaking SDK config change — any caller still setting only `ProjectKey` to their API
+  key must migrate (the CHANGELOG documents this as a v0.2.0 breaking change).
+- **Reconsider**: if a future auth scheme needs the project name to also carry authorization weight (it
+  should not — that would resurrect this exact bug class).
+
+**Future mistake prevented**
+Naming a credential and a public identifier the same thing, or trusting either an SDK field name or a
+request body field to imply where a value is safe to log or transmit.
+
+**Evidence**
+- Implementation: `packages/sdk-go/config.go` (`APIKey`, `ProjectKey`, `looksLikeSecret`, `Validate`),
+  `apps/ingestor-go/main.go` (`applyAuthenticatedScope`, this file's D9)
+- `packages/sdk-go/CHANGELOG.md` documents the breaking change
+- Cross-reference: VERIFIED_STATE.md S16, S4; this file's B7 (`docs/memory/BUGS.md`), D9, D10
+
+**Where to look next**
+`packages/sdk-go/config.go`, `apps/ingestor-go/main.go:317-376` (`applyAuthenticatedScope`),
+`apps/ingestor-go/validation/validator.go:26`.

@@ -1,14 +1,14 @@
 package unit
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 
-	"github.com/alicebob/miniredis/v2"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
+	"github.com/alicebob/miniredis/v2"
 	libredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,10 +41,14 @@ func doRequest(t *testing.T, handler http.Handler, apiKeyHash string, rateLimitR
 	req := httptest.NewRequest(http.MethodPost, "/ingest", nil)
 	ctx := req.Context()
 	if apiKeyHash != "" {
-		ctx = context.WithValue(ctx, "api_key_hash", apiKeyHash)
-	}
-	if rateLimitRPM != nil {
-		ctx = context.WithValue(ctx, "rate_limit_rpm", *rateLimitRPM)
+		// Built via the production helper, never by string literal: a hand-injected context can
+		// silently diverge from what the middleware actually reads (that is how the typed-key
+		// switch bypassed rate limiting entirely without a single test failing).
+		rpm := 0
+		if rateLimitRPM != nil {
+			rpm = *rateLimitRPM
+		}
+		ctx = auth.WithIdentity(ctx, "test-project", "", "test-org", apiKeyHash, rpm, false)
 	}
 	req = req.WithContext(ctx)
 

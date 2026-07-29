@@ -43,6 +43,14 @@ func main() {
 		Consumer:  "processor-consumer",
 		BatchSize: 10,
 		BatchWait: 1 * time.Second,
+		// MaxDeliver caps redelivery attempts so a single
+		// permanently-unprocessable message cannot redeliver forever and
+		// starve every subsequent event (VERIFIED_STATE.md S13). Exhausted
+		// or explicitly-permanent failures are dead-lettered to
+		// DLQSubject/DLQStream instead of looping.
+		MaxDeliver: getEnvInt("PROCESSOR_MAX_DELIVER", 5),
+		DLQSubject: getEnv("PROCESSOR_DLQ_SUBJECT", "error_events.dlq"),
+		DLQStream:  getEnv("PROCESSOR_DLQ_STREAM", "ERROR_EVENTS_DLQ"),
 	}
 
 	subscriber, err := nats.NewSubscriber(ctx, natsCfg)

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
 	sharedredis "github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
 	tc "github.com/NurfitraPujo/sentinel/tests/integration/testcontainers"
@@ -41,8 +42,7 @@ func TestRateLimiterMiddleware_AllowsUnderThreshold(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/ingest", nil)
-	ctx := context.WithValue(req.Context(), "api_key_hash", "hash_test_123")
-	ctx = context.WithValue(ctx, "rate_limit_rpm", 5000)
+	ctx := auth.WithIdentity(req.Context(), "test-project", "", "test-org", "hash_test_123", 5000, false)
 
 	rl.Middleware(okHandler).ServeHTTP(rec, req.WithContext(ctx))
 
@@ -61,8 +61,7 @@ func TestRateLimiterMiddleware_ReturnsTooManyRequests(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/ingest", nil)
-		ctx := context.WithValue(req.Context(), "api_key_hash", apiKeyHash)
-		ctx = context.WithValue(ctx, "rate_limit_rpm", 1)
+		ctx := auth.WithIdentity(req.Context(), "test-project", "", "test-org", apiKeyHash, 1, false)
 
 		handler.ServeHTTP(rec, req.WithContext(ctx))
 

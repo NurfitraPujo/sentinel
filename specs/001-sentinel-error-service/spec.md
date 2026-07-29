@@ -3,7 +3,18 @@
 **Feature Branch**: `001-sentinel-error-service`  
 **Created**: 2026-05-09  
 **Updated**: 2026-05-10  
-**Status**: Draft  
+**Status**: Draft — this spec was never formally closed out, but the code implementing FR-001/FR-002
+(ingest → fingerprint → store) merged long ago and was **verified completely non-functional** (zero
+rows ever written) until a 2026-07-28/29 fix pass. MERGED code existed for ~2.5 months with an
+unverified/broken core path; treat "Draft" here as "spec not maintained", not as "not built".  
+**Verified**: 2026-07-29 — `docs/memory/VERIFIED_STATE.md` **S3** (ingest rejected 100% of events),
+**S11** (fingerprint collapse with no in-app frames), and two findings not in the original doc, **S12**
+(contradictory `issues.status` CHECK constraints made every insert fail — DB had literally zero rows
+for the life of the project) and **S14** (unbounded string fields vs. `VARCHAR` column widths), are all
+RESOLVED. Proof (evidence brief): a POSTed event now produces both an `issues` row and an
+`error_occurrences` row with correct `message`/`metadata`/`platform`/`release_version`/
+`status='unresolved'` — first time ever (evidence brief "U1"). See the per-item notes below for what
+changed and what is still unverified.  
 Input: User description: "Currently, debugging errors across our Go APIs, Go Workers, and Rails applications requires manual log searching via grepping or centralized log explorers. This process is reactive, slow, and lacks context (e.g., local variables, full stack traces, and occurrence frequency). Sentinel is a proposed internal service designed to ingest, group, and alert on application errors in real-time. It provides a 'Sentry-like' experience by de-duplicating identical errors into 'Issues' and providing developers with a structured dashboard for root-cause analysis."
 
 ## Clarifications
@@ -18,6 +29,19 @@ Input: User description: "Currently, debugging errors across our Go APIs, Go Wor
 
 ### Session 2026-05-10 - Requirements Quality Review
 - **Fingerprinting Algorithm**: SHA256 hash of `error_class + "|" + joined_app_frames` where `joined_app_frames = strings.Join(top_3_frames, "|")`. Each frame format is `file + ":" + function`. If fewer than 3 app frames exist, use all available frames. Hash output truncated to first 16 hex characters.
+  > [!NOTE]
+  > **Amended 2026-07-29 (`docs/memory/VERIFIED_STATE.md` S11, RESOLVED)**: "app frames" means frames
+  > with `in_app = true`. The Go SDK originally sent no `in_app` field at all, so `top_3_frames` was
+  > always empty and every fingerprint degenerated to `error_class` alone — every error of a given class
+  > in a project collapsed into one issue. Fixed two ways, both now in `apps/processor-go/fingerprint/fingerprint.go`:
+  > (1) the Go SDK now populates `in_app` (`packages/sdk-go/event.go` `isInAppFrame`); (2) independent of
+  > any client, when a stacktrace has **zero** in-app frames, the fingerprinter now falls back to the
+  > top 3 frames of the raw stacktrace instead of the error class alone. Proven: 3 events of the same
+  > class with different stacktraces and no in-app frames now produce 3 distinct issues (previously 1
+  > issue, count=3). **This changes fingerprints for any data ingested before the fix** — the same error
+  > can now group differently than it did under the old (broken) algorithm. There was no pre-existing
+  > production data affected in practice, since S12 meant the `issues` table had never successfully
+  > accepted a single row before this fix pass.
 - **Normalization Rules**: Apply in order: (1) collapse whitespace to single space, (2) replace UUIDs `[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}` with `<uuid>`, (3) replace numeric IDs `\b\d{10,}\b` with `<id>`, (4) replace hex addresses `0x[a-fA-F0-9]+` with `<addr>`, (5) replace email patterns with `<email>`, (6) strip version strings `v4.2.1`, `v4.1.0`, etc., (7) replace user paths `/Users/\w+/` and `/home/\w+/` with placeholders.
 - **Masking Patterns** (PII/Secrets): Applied after normalization. Patterns include: (1) SSN `\b\d{3}-\d{2}-\d{4}\b`, (2)护照号 `\b[A-Z]{1,2}\d{6,8}\b`, (3) name/address JSON fields, (4) API keys `(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]\s*["'][^"']+["']`, (5) passwords, (6) bearer tokens, (7) generic tokens. Sensitive metadata keys: `password`, `token`, `secret`, `api_key`, `apikey`, `credential`, `auth` (case-insensitive match on key name).
 - **RBAC Role Hierarchy**:
@@ -87,6 +111,17 @@ Developers view the stack trace and local variables for a specific error occurre
   - Max stacktrace depth: 100 frames (excess truncated with warning logged)
   - Max metadata size: 64KB (excess dropped with warning logged)
   - Max message length: 10,000 characters (excess truncated)
+    > [!NOTE]
+    > **Code does not truncate — it rejects.** `packages/proto/sentinel/v1/error_event.proto`'s CEL
+    > rule (`this.message.size() <= 10000`) returns HTTP 400 for any message over the limit; nothing
+    > truncates it server-side. Until 2026-07-28/29 (S3) a second, redundant field-level rule
+    > (`(buf.validate.field).string.len = 10000`, which protovalidate treats as *exactly* 10000, not a
+    > maximum) rejected **every** message that wasn't precisely 10000 characters — including empty and
+    > normal-length ones — so `/ingest` returned 400 for 100% of real events. Fixed by deleting the
+    > redundant field rule so the correct CEL rule is the sole validator. The same "field length rule
+    > with no `max_len` against a bounded column" bug class recurred for `platform`/`environment`
+    > (`VARCHAR(50)`), `error_class` (`VARCHAR(255)`), `trace_id`/`span_id` (`VARCHAR(64)`), and
+    > `release_version` (`VARCHAR(100)`) — see `docs/memory/VERIFIED_STATE.md` S14.
   - Max file path length: 512 characters per frame
 - **Sensitive Data Masking**: PII and secrets are masked using regex patterns in processor-go before storage. Masking is mandatory and irreversible.
 - **Empty/Null Field Handling**:

@@ -12,9 +12,13 @@ occurrences, organizations, and alerting configuration.
 > [!IMPORTANT]
 > Several features in `specs/` are marked "Completed" but do not work at runtime. Before trusting any
 > feature-complete claim, read [docs/memory/VERIFIED_STATE.md](docs/memory/VERIFIED_STATE.md) — it records
-> what has actually been proven to run, and with which command. CI exists as of P0-1 (`.github/workflows/ci.yml`); the `integration` job is still lenient
-> ([docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md) tracks fixing that), so nothing here is
-> checked automatically on push.
+> what has actually been proven to run, and with which command. As of the P0–P2 work tracked in
+> [docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md), the pipeline above produces real
+> `issues`/`error_occurrences` rows end to end — it did not before (see VERIFIED_STATE.md's S12 entry:
+> the database had zero rows, ever, until this work). Key management, rate limiting, alerting, and the
+> degradation buffer are documented open gaps, not yet fixed — see that same plan for current status. CI
+> exists (`.github/workflows/ci.yml`) but the `integration` job is still lenient and nothing has actually
+> been checked on a push from this branch yet.
 
 ## Repository layout
 
@@ -125,7 +129,7 @@ status / roll back / re-baseline without restarting the whole stack.
 task --list                 # see every available task with its description
 task build                  # build ingestor, processor, and dashboard
 task test-unit               # go test ./tests/unit/...
-task test-integration        # go test ./tests/integration/... (testcontainers; needs Docker/Podman)
+task test-integration        # go test ./tests/integration/... (testcontainers ONLY if nothing is on :8080 — otherwise it hits your shared dev DB; use FORCE_TESTCONTAINERS=1 to isolate)
 task test-e2e                # infra-up, wait healthy, test-integration, infra-down
 task dev-ingestor             # go run apps/ingestor-go against your local .env
 task dev-processor            # go run apps/processor-go
@@ -215,6 +219,32 @@ go test ./tests/load/... -v -count=1
 # db-shell
 docker compose exec postgres psql -U sentinel -d sentinel
 ```
+
+## Using the Go SDK: `APIKey` vs `ProjectKey` (breaking change in v0.2.0)
+
+`packages/sdk-go`'s `Config` has **two separate fields** that are easy to conflate — getting this wrong is
+a silent 100% event-rejection rate (this was S16 in `docs/memory/VERIFIED_STATE.md`; it happened for real):
+
+| Field | What it is | Where it travels |
+|---|---|---|
+| `APIKey` | The **secret** credential (`sent_live_...` for a project-scoped key, `sent_org_...` for an org-wide key) | `X-API-Key` header only — never the body |
+| `ProjectKey` | The target project's **unique name** (`projects.name`) — an identifier, not a secret | Event body, `project_key` field |
+
+```go
+sentinel.Init(sentinel.Config{
+    APIKey:     "sent_live_...",        // the secret — required
+    ProjectKey: "my-project",           // required for an org-wide key; optional for a project-scoped
+                                         // key (whose project is already fixed by the credential — a
+                                         // mismatch here is rejected with 403, never silently trusted)
+    Endpoint:   "http://localhost:8080/ingest",
+})
+```
+
+Before v0.2.0, a single `ProjectKey` field held the secret **and** was sent as `project_key` in the body;
+the server resolved that value against `projects.name`, never found it, and every event was accepted
+(`202`) then silently dead-lettered. `Config.Validate()` now detects the swap (an `APIKey`-shaped value in
+`ProjectKey`, or vice versa) and returns an error instead of failing silently — if you are upgrading from a
+pre-v0.2.0 client, move your secret into `APIKey`.
 
 ## More documentation
 
