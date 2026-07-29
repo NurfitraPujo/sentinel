@@ -101,7 +101,7 @@ first time a POSTed event has been independently verified to reach Postgres as a
 here without softening that this is a recovery from a broken baseline, not a new feature.
 
 **What actually shipped (verified, not claimed)**
-- **S1** `tests/unit` (11 files, ~2,800 lines, previously 0 tests run) now builds and passes: 253 assertions.
+- **S1** `tests/unit` (11 files, ~2,800 lines, previously 0 tests run) now builds and passes: 241 assertions.
 - **S2** `apps/dashboard-web` now builds; `pnpm check` 707 files / 0 errors; `pnpm test` 5 files / 19 tests.
 - **S3** `/ingest` accepts well-formed events instead of rejecting 100% of them — fixed by *deleting* the
   redundant field-level `string.len` rule, not by switching to `max_len`; two overlapping validators with

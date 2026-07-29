@@ -2,72 +2,95 @@
 
 This file stores durable implementation bug patterns and their mitigations. For systemic, high-risk, or governance-level patterns, see `.specify/memory/BUGS.md`.
 
-### 2024-05-20 - Data Loss on Database Outage (mitigation found broken 2026-07-29, still Active)
+### 2024-05-20 - Data Loss on Database Outage (RESOLVED 2026-07-29 — mitigation deleted, not repaired)
+
 **Status**
-Active. **The mitigation this entry originally pointed to does not do what it says — verified 2026-07-29,
-unchanged by the P0/P1/P2/P2b work. Do not treat `GracefulDegradation` as a working safety net without
-first reading the Root Cause update below.**
+Resolved. The `GracefulDegradation` buffer this entry recommended as the mitigation has been **deleted**.
+The inversion previously documented here is moot rather than fixed: the ambiguous true/false,
+`MaxBufferSize`, and the buffer-full silent ACK no longer exist as code.
 
 **Symptoms**
-Events are lost or dropped when the Processor cannot reach the PostgreSQL database.
+Events lost or dropped when the processor could not reach PostgreSQL.
 
 **Root Cause**
-Processor service traditionally assumed the database is always available during event processing.
-
-**Root Cause — update 2026-07-29**
-The `GracefulDegradation` buffer this entry recommends as Prevention (`apps/processor-go/degradation/buffer.go`)
-has its own defect, unrelated to and unfixed by any of the P0–P2b work: `CheckAndBuffer` returns `true` in
-two *different* situations — DB healthy, **and** DB down but the event was successfully pushed into the
-buffer (`Push`'s return value is passed straight through). The caller,
-`ProcessorService.ProcessEvent` (`processor_service.go:36-41`), only special-cases `false`:
-
-```go
-if !s.degradation.CheckAndBuffer(ctx, data) {
-    log.Printf("Event buffered due to database unavailability")
-    return nil          // ACKs the NATS message
-}
-return s.processEventInternal(ctx, data)
-```
-
-Net effect, verified by reading the code (not yet by a live outage drill):
-- DB down, buffer has room → `CheckAndBuffer` returns `true` → **`processEventInternal` is called anyway**,
-  against a database that is down. It fails, and the resulting error is what actually gets retried — via
-  D10's NATS redelivery (added in this same round of work), not via the buffer. The in-memory buffer entry
-  is essentially inert: it is only ever drained by `Flush`, which is called at the end of a *successful*
-  `processEventInternal` run, so nothing drains it until some other event succeeds — and since the buffer is
-  in-memory and unpersisted, a process restart during the outage loses it anyway, silently.
-- DB down, buffer full → `Push` returns `false` → `CheckAndBuffer` returns `false` → the log line
-  `"Event buffered due to database unavailability"` fires and `ProcessEvent` returns `nil`, **ACKing the
-  message with no record of the event anywhere**. The log line fires exactly when the event was *not*
-  buffered — it describes a drop as a save.
-This means D10 (bounded-retry NATS delivery, `DECISIONS.md`), not this buffer, is what currently keeps an
-event alive across a *transient* outage — and this buffer's only observable effect is the buffer-full case,
-which is a silent, mislabeled data loss path strictly worse than doing nothing.
+The buffer could not deliver its guarantee. `CheckAndBuffer` returned `true` for two situations the
+caller could not distinguish, so a down database still fell through to a live write; a full buffer was
+logged as "buffered" and then ACKed and lost. Repairing the inversion made it worse — the repaired
+version ACKed events held only in process memory, so a crash mid-outage destroyed them.
 
 **Future mistake prevented**
-Failing to handle transient database connection failures in processing workers. Also, newly: a boolean
-return value that is `true` for two semantically different reasons ("all is well" vs "the fallback path
-absorbed it") will eventually be read as "all is well" by a caller that only checks for `false`.
+**Do not reintroduce in-process event buffering as a database-outage mitigation for this pipeline.** It
+cannot be simultaneously crash-safe and duplicate-free: buffer+ACK loses events on restart, and
+buffer+NAK double-processes because the flush replays and redelivery replays while `issues.count` is an
+`ON CONFLICT` increment. There is no third option without a server-side idempotency key on `event_id`,
+which has no server-side destination today (VERIFIED_STATE.md S16).
+
+Also: a boolean that is `true` for two semantically different reasons will eventually be read as the
+more optimistic one by a caller that only checks for `false`.
 
 **Evidence**
-Historical analysis of ingestion gaps during database maintenance windows (original). Code reading of
-`apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`, `Push`) and
-`apps/processor-go/service/processor_service.go:36-41`, 2026-07-29 — no live-outage test exists for this
-path; see `docs/memory/VERIFIED_STATE.md` S9 for the same finding with a table of the three cases.
+Real compose stack, real binaries, 2026-07-29: Postgres stopped mid-stream, 5 events POSTed to `/ingest`
+(all 202), Postgres restarted → 5 issues with `count=1` each, 5 occurrences, 0 loss, 0 duplicates.
+Processor log: 10 × `returning event to NATS for bounded retry (D10)` → `Database connection restored`
+→ exactly 5 `Processing event`. SIGKILL mid-outage → still 5/5 exactly once. Outage beyond the retry
+budget → 3 events dead-lettered, `dlq_depth=3` on `/health` at ~56s.
 
 **Prevention / Detection**
-Do not use `GracefulDegradation`/`CheckAndBuffer` as evidence that an outage is handled until its return
-value is split into three states (healthy / buffered / dropped) and `ProcessEvent` branches on all three —
-in particular, `processEventInternal` must never run while `CheckAndBuffer` reports the DB down. Until then,
-treat D10's bounded NATS retry as the actual (partial) mitigation, and the buffer-full case as an open,
-silent data-loss bug. Monitor `WARNING: Database unavailable` logs, but read the very next log line —
-`"Event buffered"` there currently means the opposite of what it says whenever it follows a full buffer.
+Durability belongs to NATS now (DECISIONS.md D10): bounded retry with backoff, then `ERROR_EVENTS_DLQ`.
+Watch `dlq_depth` on the processor's `/health`; replay with `go run ./tools/dlq`. Note the residual: the
+issue upsert and occurrence insert are separate transactions, so a retryable failure between them
+inflates `issues.count` once per redelivery.
 
 **Where to look next**
-`apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`, `Push`), `apps/processor-go/service/processor_service.go`
-(`ProcessEvent`), `docs/memory/DECISIONS.md` D10 (the mitigation that is actually load-bearing today).
+`apps/processor-go/degradation/buffer.go` (now a health gate only),
+`apps/processor-go/service/processor_service.go` (`ProcessEvent`), `docs/memory/DECISIONS.md` D1 and D10.
 
 ---
+
+### 2026-07-29 - A Framework Misconfiguration Can Break Every Route While All Gates Stay Green
+
+**Status**
+Active. The two instances below are fixed; the gate that would have caught them does not exist yet.
+
+**Symptoms**
+`pnpm build` succeeds, `pnpm check` reports 0 errors, `pnpm test` passes 63 tests — and every HTTP
+request to the running app returns 500. Route handlers, RBAC and query layers are all correct and none
+of them execute.
+
+**Root Cause**
+Two independent framework-integration faults in `apps/dashboard-web/src/lib/server/auth-config.ts` and
+`package.json`, both invisible to type checking and unit tests because they only manifest in the
+composed runtime:
+1. `package.json` paired `@auth/core ^0.34.3` with `@auth/sveltekit ^1.11.2`, which resolves `0.41.2`
+   internally. Two copies coexisted and `createActionURL` resolved to the older signature, whose 5th
+   parameter is a `basePath` string rather than a config object → `TypeError: basePath?.replace is not
+   a function`. Because `hooks.server.ts` calls `locals.auth()` on EVERY request, the whole app 500'd.
+2. The `session({ session, token })` callback assumed the JWT strategy, but an adapter is configured
+   with no `session.strategy` override → Auth.js uses the DATABASE strategy → `token` is `undefined`
+   and the `jwt` callback never runs. The `TypeError` was swallowed as `SessionTokenError`, so
+   `locals.auth()` returned null and an organization OWNER was treated as unauthenticated.
+
+**Future mistake prevented**
+Concluding a route is working because its handler, its tests and its type-check are correct. This is
+pattern B3 relocated to the framework-integration layer: the code is reachable in source and
+unreachable at runtime. Note it was nearly missed a second way — an agent "proved" the routes end to end
+against a stack it had hand-patched in `node_modules`, with neither patch in the repo.
+
+**Evidence**
+Against the compose-built dashboard image, 2026-07-29: `GET /`, `GET /api/organizations`, and
+`GET /api/organizations/<id>/keys` all returned 500 with `basePath?.replace is not a function` in the
+container log. After the fix: 303 to signin, 401, 401 respectively, with no `TypeError` or
+`SessionTokenError` in the log.
+
+**Prevention / Detection**
+**The missing gate is a smoke check**: boot the BUILT server (`node build/index.js`, not `vite dev`) and
+assert a non-5xx from at least one authenticated route. Every existing dashboard gate passed with the
+app fully broken. Pin `@auth/core` to the version `@auth/sveltekit` resolves, and re-check the pairing
+whenever either is bumped.
+
+**Where to look next**
+`apps/dashboard-web/src/lib/server/auth-config.ts`, `apps/dashboard-web/src/hooks.server.ts`,
+`apps/dashboard-web/package.json`, `.github/workflows/ci.yml` (dashboard job).
 
 ### 2026-07-24 - Reserved Path Collision Guard for Dynamic Slug Routing
 

@@ -36,73 +36,57 @@ Active → Needs Review → Superseded → (pruned)
 ### 2024-05-20 - Graceful Degradation via In-Memory Buffering
 
 **Status**
-Needs Review — verified implementation contradicts the decision in the buffer-exhaustion case (see
-Update, 2026-07-29). Not superseded: the buffering behavior described below is real and does work for
-the common case; only the "MUST NOT lose events" guarantee is broken, and only at capacity.
+**SUPERSEDED by D10 (2026-07-29) — the mechanism was DELETED, not repaired.**
 
-**Why this is durable**
-Sentinel is an observability platform. Losing events during a temporary database outage defeats the purpose of the platform. This decision ensures that short-term infrastructure issues don't lead to permanent data loss.
+**What this decision specified**
+It required (past tense — none of this exists in code any more) that when PostgreSQL was
+unavailable, the processor buffer incoming events in memory (MaxBufferSize =
+10,000) and flush them once the connection was restored, so a temporary outage could not lose events.
 
-**Decision**
-When the PostgreSQL database is unavailable, the Processor service MUST buffer incoming events in memory up to a limit (MaxBufferSize = 10,000 events). These events MUST be flushed to the database automatically once connection is restored.
+**Why it is gone**
+The mechanism never delivered its guarantee, and could not be made to. `CheckAndBuffer` returned `true`
+for two situations the caller could not tell apart — DB healthy, and DB down but buffered — so a down
+database still fell through to a live write, and a FULL buffer was logged as "buffered" and then ACKed
+and lost. The 2026-07-29 repair of that inversion made it worse: it ACKed events held only in process
+memory, so a crash mid-outage destroyed them (measured: 3 events buffered+ACKed, processor SIGKILLed,
+restarted → 0 rows, no redelivery, no DLQ entry).
 
-**Tradeoffs**
-- **Gained**: High availability and data persistence during temporary outages.
-- **Made harder**: Memory management in the Processor service. A long-term outage could lead to OOM if the buffer is too large or if backpressure is not applied.
-- **Reconsider**: If Sentinel moves to a multi-tenant model where memory limits must be strictly partitioned, or if the buffer size needs to be dynamic.
+**The durable lesson — this is the part worth keeping.** In-process buffering cannot be both crash-safe
+and duplicate-free for this pipeline:
+- buffer + ACK loses events on crash or redeploy, because the buffer is process memory; and
+- buffer + NAK double-processes, because the flush replays AND redelivery replays, while
+  `issues.count` is an `ON CONFLICT` increment, so the duplicate is visible in the product.
+There is no third option without a server-side idempotency key, and `event_id` has no server-side
+destination at all (VERIFIED_STATE.md S16). **Do not reintroduce in-process event buffering as a
+database-outage mitigation until that key exists.**
 
-**Future mistake prevented**
-Directly failing or dropping events when the database is down.
+**What replaced it**
+`GracefulDegradation` is now only a database-health gate: `Evaluate` returns `StatusProcessed` or
+`StatusUnavailable`, nothing else. `ProcessorService.ProcessEvent` returns a non-nil error on
+`StatusUnavailable` unconditionally, so **D10** owns recovery — bounded retry with backoff
+(1s/5s/15s/30s/60s, MaxDeliver 5) and then `ERROR_EVENTS_DLQ`. Removed from
+`apps/processor-go/degradation/buffer.go`: `EventBuffer`, `BufferedEvent`, `NewEventBuffer`, `Push`,
+`Drain`, `Size`, `MaxBufferSize`, `SetFlushHandler`, `triggerAsyncFlush`, `CheckAndBuffer`, `Flush`,
+`BufferSize`, and the `StatusBuffered`/`StatusDropped` values. A grep across `apps/ packages/ tests/
+tools/ scripts/` returns zero live Go references — only historical comments that explain the removal.
 
-**Update (2026-07-29) — S9's inversion is still present; it was not part of this changeset**
-Verified by reading `apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`, lines 86-103) and
-`apps/processor-go/service/processor_service.go` (`ProcessEvent`, lines 36-43), and confirmed the
-control flow was untouched by the P0-P2b work: the only staged change to `processor_service.go` is
-error classification for D10 (`classifyStoreError`/`nats.Permanent`), not this logic. Also confirmed by
-running `rtk go test ./tests/unit/... -run TestCheckAndBuffer -v -count=1` (4/4 pass) and reading
-`tests/integration/processor_service_test.go`, which names and documents the exact behavior below
-(not executed here — it needs a live/unreachable Postgres target and testcontainers wiring).
+**Evidence (2026-07-29)**
+Real compose stack, real `sentinel-ingestor`/`sentinel-processor` binaries: Postgres stopped
+mid-stream, 5 events POSTed to `/ingest` (all 202), Postgres restarted → **5 issues with `count=1`
+each, 5 occurrences, zero loss, zero duplicates**. Processor log shows 10 × `returning event to NATS
+for bounded retry (D10)` → `Database connection restored` → exactly 5 `Processing event` lines.
+Harder drills: SIGKILL of the processor mid-outage → still 5/5 exactly once; an outage longer than the
+retry budget → all 3 events dead-lettered, `dlq_depth=3` visible on `/health` at ~56s (the observed
+capture boundary).
 
-`CheckAndBuffer` returns `true` in two cases the caller cannot distinguish: (1) the DB is healthy, and
-(2) the DB is down but `buffer.Push` succeeded — the event WAS queued. `ProcessEvent`
-(`processor_service.go:37`) then falls through to an immediate live write, `processEventInternal`, in
-**both** cases. `tests/integration/processor_service_test.go:256-293`
-(`TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent`) documents this explicitly: the event is
-pushed to the buffer, then `ProcessEvent` still attempts and surfaces a connection error from the
-immediate write — i.e. a successfully-buffered event is also attempted against the down database right
-away rather than the call simply returning "queued".
-
-`CheckAndBuffer` returns `false` only when the DB is down **and** the buffer is full: `buffer.Push`
-drops the event (its own "dropping event" log) and returns `false`. `ProcessEvent` then logs "Event
-buffered due to database unavailability" — untrue, the event was dropped, not buffered — and returns
-`nil`, which the NATS subscriber acks as success. `tests/integration/processor_service_test.go:491-532`
-(`TestProcessorService_ProcessEvent_BufferFullReturnsNil`) drives the buffer to capacity and asserts
-exactly this: `ProcessEvent` "must transition to nil when the degradation buffer fills up". **This is
-real, silent data loss reported as success — the same inversion originally recorded as S9. It remains
-open.** `tests/unit/processor_degradation_test.go:111-118`
-(`TestCheckAndBuffer_DBDown_ReturnsTrueOnPushSuccess`) asserts the `true`-on-successful-push behavior by
-name as the expected contract, which is why the S1 unit-suite fix (253 assertions, 0 fail) does not
-catch this: the tests codify the current control flow rather than the decision's "MUST NOT lose events"
-guarantee.
-
-**Interaction with D10**: D10's bounded retry/backoff covers the immediate write attempt above when it
-fails with a retryable error (e.g. the connection error in the DBUnavailableBuffersEvent case) — NATS
-redelivers with 1s/5s/15s/30s/60s backoff up to `MaxDeliver=5` instead of hot-looping, and an event that
-exhausts that budget is dead-lettered (preserved, unprocessed) rather than lost. D10 does **not** reach
-the buffer-full path above: that path returns `nil` directly from `ProcessEvent` and never produces an
-error for NATS to retry or dead-letter in the first place. See D10, this file.
-
-**Evidence**
-Implementation in `apps/processor-go/degradation/buffer.go` and
-`apps/processor-go/service/processor_service.go`. Control flow re-verified 2026-07-29 (see Update).
-
-**Where to look next**
-`apps/processor-go/processor.go`, `apps/processor-go/degradation/buffer.go`,
-`tests/integration/processor_service_test.go:256-293,491-532` (documents current behavior),
-`tests/unit/processor_degradation_test.go:111-118` (asserts current behavior as the contract), and D10
-in this file.
-
----
+**Accepted residual risk — read this before trusting "no duplicates"**
+That result is scoped to FULL outages, where `Evaluate` short-circuits before any write. The
+issue/occurrence write pair is **not idempotent under redelivery**: `UpsertIssueWithOutcome` commits
+its own transaction before `InsertOccurrence` runs, so a retryable failure between them inflates
+`issues.count` by one per redelivery (proved: 1 event, 5 deliveries → `issues.count=5, occurrences=0`).
+Pre-existing, not introduced by the deletion — but redelivery is now the ONLY recovery path, so it
+matters more. Fix by wrapping both writes in one transaction, or by landing the `event_id` idempotency
+key. Knowingly accepted until then.
 
 ### 2026-05-15 - Magic Link Authentication via Auth.js Email Provider
 

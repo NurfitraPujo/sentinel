@@ -29,7 +29,7 @@ compose stack (`podman exec sentinel-postgres psql -U sentinel -d sentinel`, `cu
 ```bash
 rtk go build ./...                                    # root module: PASSES
 rtk go vet ./...                                      # PASSES
-rtk go test ./tests/unit/... -count=1                  # PASSES, 253 assertions (was 251 at S1's fix; masker/ratelimit tests added since)
+rtk go test ./tests/unit/... -count=1                  # PASSES, 241 assertions (was 251 at S1's fix; masker/ratelimit tests added since)
 rtk go test -tags=contract ./tests/contract/... -v -count=1   # PASSES, 4/4 (proves S3/S4/S5/S11/S16 against REAL sdk-go + REAL ingestor decode/validate path)
 cd packages/sdk-go && rtk go test ./... -count=1       # PASSES, 4 packages (SDK is an independent module — not covered by the root-module commands above)
 cd apps/dashboard-web && rtk pnpm exec vite build      # PASSES (S2)
@@ -114,7 +114,7 @@ current picture of module boundaries.
 
 ### S1 — The entire `tests/unit` package did not compile (RESOLVED 2026-07-28)
 
-**Verified**: `go test ./tests/unit/... -count=1` → `ok`, 253 assertions run. New baseline: **253**, up from
+**Verified**: `go test ./tests/unit/... -count=1` → `ok`, 241 assertions run. New baseline: **241** (253 before the degradation-buffer tests were deleted with the buffer itself; see D1), up from
 the 0 that ran while the package failed to build.
 
 **Re-verified 2026-07-29**: `go test ./tests/unit/... -v -count=1 2>&1 | grep -c "PASS:"` → **253**
@@ -652,6 +652,169 @@ pass). `go vet ./...` clean.
 
 ---
 
+### S7 — API key revocation and expiry did not take effect (RESOLVED 2026-07-29, with one bounded caveat)
+
+
+**Verified unchanged, 2026-07-29.** Confirmed by reading current code, not by assumption:
+
+1. **Subject payload mismatch, still present.** The dashboard still publishes `{ keyId }`
+   (`apps/dashboard-web/src/lib/db/queries/apikeys.ts:139`, unchanged in the P0/P1/P2 diffs); the
+   ingestor's invalidation handler still reads `data["key_hash"]`
+   (`apps/ingestor-go/auth/apikey.go:39`, unchanged). The key it needs is never in the message, so the
+   Redis cache entry is never deleted on revocation.
+2. **The stream now exists** — this part of the original finding is stale and should not be repeated.
+   `scripts/nats-init.sh` was extended (in the already-committed P0/P1 work, `cd84d17`) to also create the
+   `API_KEYS` stream and its consumer; `subscriber, _ := nats.NewSubscriber(...)` in `main.go` still
+   discards the error, but the stream it is subscribing to is provisioned now.
+3. `getAPIKeyData` (`apps/ingestor-go/auth/apikey.go:126-165`) still filters on `status` only and
+   **never checks `expires_at`** — the column is not even selected in the query. `rotateApiKey`
+   (`apps/dashboard-web/src/lib/db/queries/apikeys.ts:67-109`) still sets `expiresAt` on the old key but
+   leaves `status` untouched (stays `'active'`) — so a rotated key remains valid **forever**, not just for
+   whatever grace period `expiresAt` implies.
+
+Practical revocation latency today is still the 60-second Redis TTL, not "instant" as `WORKLOG.md` states,
+and rotation still grants no real expiry. Not re-verified live this pass (would require a working
+`project_api_keys` table — see the DB-corruption hazard above); verified by direct code reading only.
+
+**Where to look**: `apps/ingestor-go/auth/apikey.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
+
+---
+
+**Resolved 2026-07-29.** All three breaks are closed:
+- `expires_at` is enforced in the SQL itself (`auth/apikey.go` getAPIKeyData), so an expired row is
+  indistinguishable from a missing one. Seeded `expires_at = now() - 1 hour` → **401**; control key → 202.
+- `rotateApiKey` now sets `status='revoked'` + `revoked_at` on the old key immediately. Old token → **401**,
+  new token → **202**, `audit_logs` row written.
+- The invalidation payload matches byte for byte on both sides — the dashboard publishes
+  `{keyId, keyHash}` and the ingestor reads `data["keyHash"]`. Observed: cached key 202 → publish →
+  Redis TTL `-2` → next request **401**, in ~2s rather than the 60s TTL.
+- The scope check is now an allowlist matching spec 008 FR-003 (`read` → 403, `ingest`/`admin` → 202).
+- `apps/ingestor-go/main.go` no longer discards the subscriber error: a NATS hiccup at startup used to
+  leave invalidation permanently dead, silently, for the life of the process.
+
+**Bounded caveat, deliberately not closed.** The cache-hit expiry check reads `ExpiresAt` from the
+CACHED payload, so an expiry written or shortened AFTER caching is invisible for the remainder of the
+TTL. Application-driven revocation and rotation do not wait for it — they publish the invalidation. An
+out-of-band `UPDATE project_api_keys SET expires_at = ...` in psql does, and is bounded by
+`APIKEY_CACHE_TTL` (default 60s, env-tunable). That is true of any cache; it is documented rather than
+claimed closed.
+
+---
+
+### S8 — Alerting was implemented and completely unwired (RESOLVED 2026-07-29)
+
+
+**Verified unchanged, 2026-07-29.** `apps/processor-go/service/processor_service.go`'s `NewProcessorService`
+(read in full this pass) still constructs only `store`, `indexer`, and `degradation` — no `alerts.Dispatcher`
+field exists on `ProcessorService` at all, and `processEventInternal` never references `Dispatch`. None of
+the staged P2/P2b diff touches `apps/processor-go/alerts/` or `apps/processor-go/notifiers/`.
+
+- `apps/processor-go/alerts/dispatcher.go` (204 LOC) — still never constructed.
+- `apps/processor-go/notifiers/{email,telegram}.go` (221 LOC) — still zero non-test references.
+- `apps/ingestor-go/validation/validator.go` `ValidatePayload` — still only referenced by
+  `tests/unit/ingestor_validation_test.go`; the real ingest path uses `protovalidate`.
+
+`docs/todos/04-alerting-and-notification-integrations.md` is therefore still entirely open despite the
+packages existing and (per S1) their tests now actually running. Also unchanged: `Dispatcher.loadConfigs`
+still only refreshes on a 5-minute ticker with no initial load.
+
+**Where to look**: `apps/processor-go/service/processor_service.go`, `apps/processor-go/alerts/dispatcher.go`,
+`apps/processor-go/notifiers/`.
+
+---
+
+**Resolved 2026-07-29, in two stages — the second mattered more than the first.**
+
+Stage one wired it: `NewProcessorService` constructs the Dispatcher, `SetSender` connects the real
+email/telegram notifiers, and config load happens at construction rather than only on a 5-minute ticker.
+Reachability was proven by capturing the production binary making an outbound notifier call.
+
+Stage two fixed two blockers that made the wiring useless — **it was reachable and still could not
+deliver for ANY configuration**:
+- `channel_config` was scanned into a local and then DISCARDED, never unmarshaled, so `ChannelConfig`
+  was nil for every config and both permitted channels dropped every alert at the notifier.
+- The gating cancelled out the threshold: dispatch fired only on new/regressed issues, but `Dispatch`
+  sends at `count >= frequency_threshold`, which is `NOT NULL DEFAULT 50`. An issue is new exactly once.
+  Every occurrence now feeds the counter, which is what the threshold is for.
+- Latent: `&cfg.ProjectID` was passed twice in one `Scan`, working only because the second write
+  overwrote the first. Any reorder of the SELECT list would have corrupted the tenant routing key.
+
+**Lesson worth keeping**: "reachable from `main()`" is necessary and not sufficient. Alerting passed a
+reachability grep, an execution trace, and ~1,100 lines of tests while being incapable of delivering.
+
+---
+
+### S9 — The degradation buffer's control flow was inverted (RESOLVED 2026-07-29 by DELETING the buffer)
+
+
+**Verified unchanged, 2026-07-29** by reading `apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`)
+and `apps/processor-go/service/processor_service.go` (`ProcessEvent`, lines 36-43) directly — the only
+staged change to `processor_service.go` is the new error classification
+(`classifyStoreError`/`classifyProjectLookupError`, part of S13's D10 work), not this control flow.
+`rtk go test ./tests/unit/... -run TestCheckAndBuffer -v -count=1` → 4/4 pass, but the tests **assert the
+current (inverted) behavior as the contract** (`TestCheckAndBuffer_DBDown_ReturnsTrueOnPushSuccess`), so a
+green run here does not mean this is fixed — it means the tests correctly describe what the code still
+does.
+
+```go
+if !s.degradation.CheckAndBuffer(ctx, data) {
+    log.Printf("Event buffered due to database unavailability")
+    return nil          // ← ACKs the NATS message
+}
+return s.processEventInternal(ctx, data)
+```
+
+`CheckAndBuffer` still returns `true` in two situations the caller cannot distinguish — DB healthy, *and*
+DB down but the event was successfully buffered — so a successfully-buffered event still falls through to
+an immediate live write against the down database right away, rather than the call simply returning
+"queued". `CheckAndBuffer` returns `false` only when the DB is down **and** the buffer is full: the event
+is silently dropped, the misleading "Event buffered..." log line fires anyway, and `ProcessEvent` returns
+`nil` — which the NATS subscriber Acks as success. **This is still real, silent data loss reported as
+success.**
+
+**Interaction with S13/D10**: D10's bounded retry/backoff now covers the immediate-write branch above when
+it fails with a *retryable* error — redelivery with 1s/5s/15s/30s/60s backoff instead of a hot loop, and an
+event that exhausts `MaxDeliver` is dead-lettered (preserved, unprocessed) rather than lost outright. D10
+does **not** reach the buffer-full path: that path returns `nil` directly and never produces an error for
+NATS to retry or dead-letter in the first place. So S13 measurably softened this defect's worst case
+(hot-loop amplification) without fixing its core inversion.
+
+**Corroborated same-day**: `docs/memory/DECISIONS.md`'s "Update (2026-07-29)" under the graceful-degradation
+decision independently re-derives this same conclusion, citing
+`tests/integration/processor_service_test.go:256-293,491-532` by name (`TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent`,
+`TestProcessorService_ProcessEvent_BufferFullReturnsNil`) — not re-run in this pass (needs
+testcontainers/a live unreachable-Postgres target); this file's `TestCheckAndBuffer` run above is the
+unit-level corroboration.
+
+**Where to look**: `apps/processor-go/degradation/buffer.go`, `apps/processor-go/service/processor_service.go:36-43`,
+`docs/memory/DECISIONS.md` (graceful-degradation entry, "Update (2026-07-29)").
+
+---
+
+**Resolved 2026-07-29 — but not by fixing the inversion.** The first repair introduced a worse bug: it
+ACKed events held only in process memory, so a crash mid-outage destroyed them (3 events → 0 rows, no
+redelivery, no DLQ entry). It traded a duplicate-delivery bug for a permanent-loss bug.
+
+The buffer is now **deleted**. `GracefulDegradation` is a database-health gate returning
+`StatusProcessed` or `StatusUnavailable`; `ProcessEvent` returns an error on the latter, so D10's
+bounded retry and DLQ own recovery. See DECISIONS.md D1 (superseded) for why buffering could not be
+repaired, and BUGS.md B1.
+
+**Proving command** — real stack, real binaries:
+```
+docker compose up -d --build && ./scripts/wait-healthy.sh
+# stop sentinel-postgres, POST 5 events to /ingest (all 202), restart postgres
+# => 5 issues (count=1 each), 5 occurrences, 0 loss, 0 duplicates
+```
+Harder drills: SIGKILL mid-outage → still 5/5 exactly once; outage beyond the retry budget → 3 events
+dead-lettered with `dlq_depth=3` on `/health` at ~56s.
+
+**Residual, knowingly accepted**: the issue upsert and occurrence insert are separate transactions, so a
+retryable failure between them inflates `issues.count` by one per redelivery (1 event, 5 deliveries →
+`count=5, occurrences=0`). Pre-existing, but redelivery is now the only recovery path. See D1.
+
+---
+
 ### S15 — The SDK reported a partially-failed batch as complete success (NEW, RESOLVED 2026-07-29)
 
 **Original defect.** `handleBatchIngest` had no batch-size cap and no request body limit on the only
@@ -761,100 +924,6 @@ and this entry exists so the next incident report links back to a name.
 Each entry below was independently re-read against current code this pass (not assumed unchanged from
 2026-07-26). Where a same-day correction also exists in `docs/memory/DECISIONS.md`, it is cited as
 corroboration, not as a substitute for this file's own evidence.
-
-## S7 — API key revocation and expiry do not take effect
-
-**Verified unchanged, 2026-07-29.** Confirmed by reading current code, not by assumption:
-
-1. **Subject payload mismatch, still present.** The dashboard still publishes `{ keyId }`
-   (`apps/dashboard-web/src/lib/db/queries/apikeys.ts:139`, unchanged in the P0/P1/P2 diffs); the
-   ingestor's invalidation handler still reads `data["key_hash"]`
-   (`apps/ingestor-go/auth/apikey.go:39`, unchanged). The key it needs is never in the message, so the
-   Redis cache entry is never deleted on revocation.
-2. **The stream now exists** — this part of the original finding is stale and should not be repeated.
-   `scripts/nats-init.sh` was extended (in the already-committed P0/P1 work, `cd84d17`) to also create the
-   `API_KEYS` stream and its consumer; `subscriber, _ := nats.NewSubscriber(...)` in `main.go` still
-   discards the error, but the stream it is subscribing to is provisioned now.
-3. `getAPIKeyData` (`apps/ingestor-go/auth/apikey.go:126-165`) still filters on `status` only and
-   **never checks `expires_at`** — the column is not even selected in the query. `rotateApiKey`
-   (`apps/dashboard-web/src/lib/db/queries/apikeys.ts:67-109`) still sets `expiresAt` on the old key but
-   leaves `status` untouched (stays `'active'`) — so a rotated key remains valid **forever**, not just for
-   whatever grace period `expiresAt` implies.
-
-Practical revocation latency today is still the 60-second Redis TTL, not "instant" as `WORKLOG.md` states,
-and rotation still grants no real expiry. Not re-verified live this pass (would require a working
-`project_api_keys` table — see the DB-corruption hazard above); verified by direct code reading only.
-
-**Where to look**: `apps/ingestor-go/auth/apikey.go`, `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
-
----
-
-## S8 — Alerting is fully implemented and completely unwired
-
-**Verified unchanged, 2026-07-29.** `apps/processor-go/service/processor_service.go`'s `NewProcessorService`
-(read in full this pass) still constructs only `store`, `indexer`, and `degradation` — no `alerts.Dispatcher`
-field exists on `ProcessorService` at all, and `processEventInternal` never references `Dispatch`. None of
-the staged P2/P2b diff touches `apps/processor-go/alerts/` or `apps/processor-go/notifiers/`.
-
-- `apps/processor-go/alerts/dispatcher.go` (204 LOC) — still never constructed.
-- `apps/processor-go/notifiers/{email,telegram}.go` (221 LOC) — still zero non-test references.
-- `apps/ingestor-go/validation/validator.go` `ValidatePayload` — still only referenced by
-  `tests/unit/ingestor_validation_test.go`; the real ingest path uses `protovalidate`.
-
-`docs/todos/04-alerting-and-notification-integrations.md` is therefore still entirely open despite the
-packages existing and (per S1) their tests now actually running. Also unchanged: `Dispatcher.loadConfigs`
-still only refreshes on a 5-minute ticker with no initial load.
-
-**Where to look**: `apps/processor-go/service/processor_service.go`, `apps/processor-go/alerts/dispatcher.go`,
-`apps/processor-go/notifiers/`.
-
----
-
-## S9 — The degradation buffer's control flow is inverted
-
-**Verified unchanged, 2026-07-29** by reading `apps/processor-go/degradation/buffer.go` (`CheckAndBuffer`)
-and `apps/processor-go/service/processor_service.go` (`ProcessEvent`, lines 36-43) directly — the only
-staged change to `processor_service.go` is the new error classification
-(`classifyStoreError`/`classifyProjectLookupError`, part of S13's D10 work), not this control flow.
-`rtk go test ./tests/unit/... -run TestCheckAndBuffer -v -count=1` → 4/4 pass, but the tests **assert the
-current (inverted) behavior as the contract** (`TestCheckAndBuffer_DBDown_ReturnsTrueOnPushSuccess`), so a
-green run here does not mean this is fixed — it means the tests correctly describe what the code still
-does.
-
-```go
-if !s.degradation.CheckAndBuffer(ctx, data) {
-    log.Printf("Event buffered due to database unavailability")
-    return nil          // ← ACKs the NATS message
-}
-return s.processEventInternal(ctx, data)
-```
-
-`CheckAndBuffer` still returns `true` in two situations the caller cannot distinguish — DB healthy, *and*
-DB down but the event was successfully buffered — so a successfully-buffered event still falls through to
-an immediate live write against the down database right away, rather than the call simply returning
-"queued". `CheckAndBuffer` returns `false` only when the DB is down **and** the buffer is full: the event
-is silently dropped, the misleading "Event buffered..." log line fires anyway, and `ProcessEvent` returns
-`nil` — which the NATS subscriber Acks as success. **This is still real, silent data loss reported as
-success.**
-
-**Interaction with S13/D10**: D10's bounded retry/backoff now covers the immediate-write branch above when
-it fails with a *retryable* error — redelivery with 1s/5s/15s/30s/60s backoff instead of a hot loop, and an
-event that exhausts `MaxDeliver` is dead-lettered (preserved, unprocessed) rather than lost outright. D10
-does **not** reach the buffer-full path: that path returns `nil` directly and never produces an error for
-NATS to retry or dead-letter in the first place. So S13 measurably softened this defect's worst case
-(hot-loop amplification) without fixing its core inversion.
-
-**Corroborated same-day**: `docs/memory/DECISIONS.md`'s "Update (2026-07-29)" under the graceful-degradation
-decision independently re-derives this same conclusion, citing
-`tests/integration/processor_service_test.go:256-293,491-532` by name (`TestProcessorService_ProcessEvent_DBUnavailableBuffersEvent`,
-`TestProcessorService_ProcessEvent_BufferFullReturnsNil`) — not re-run in this pass (needs
-testcontainers/a live unreachable-Postgres target); this file's `TestCheckAndBuffer` run above is the
-unit-level corroboration.
-
-**Where to look**: `apps/processor-go/degradation/buffer.go`, `apps/processor-go/service/processor_service.go:36-43`,
-`docs/memory/DECISIONS.md` (graceful-degradation entry, "Update (2026-07-29)").
-
----
 
 ## S10 — Rate limiting is non-atomic and fails open
 

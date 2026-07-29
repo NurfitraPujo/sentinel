@@ -57,7 +57,7 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 
 ```bash
 rtk go build ./... && rtk go vet ./...          # root module — green
-rtk go test ./tests/unit/...                    # green, 253 assertions
+rtk go test ./tests/unit/...                    # green, 241 assertions
 cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
@@ -76,15 +76,12 @@ not quote this). Run the relevant command yourself before claiming anything work
 
 ### Known-broken as of 2026-07-29
 
-S1–S6 and S11–S17 are **resolved** — see `## Resolved` in `VERIFIED_STATE.md`. S7–S10 remain open, plus gaps
+S1–S9 and S11–S17 are **resolved** — see `## Resolved` in `VERIFIED_STATE.md`. S7–S10 remain open, plus gaps
 found while fixing the rest. Do not treat any of these as your regression — pre-existing. Full detail and
 evidence in `docs/memory/VERIFIED_STATE.md`.
 
 | | Symptom | Cause |
 |---|---|---|
-| S7 | Key revocation/expiry ineffective | `expires_at` never checked; `rotateApiKey` leaves `status='active'` |
-| S8 | `alerts` + `notifiers` never run | never constructed in `NewProcessorService` |
-| S9 | Degradation buffer still loses/duplicates events | `CheckAndBuffer`'s single bool conflates "healthy" and "buffered" (verified unchanged 2026-07-29) |
 | S10 | Rate limiting non-atomic; can still fail open | 4 unpipelined Redis calls; `redisClient, _ :=` discards the error |
 | — | DLQ has a producer, no consumer | nothing drains, replays, or alerts on `error_events.dlq` |
 | — | `scripts/db/init.sql` is a third, stale schema | still `CHECK (status IN ('open','resolved','ignored'))`; the processor writes `'unresolved'`; `tests/integration/setup_test.go` applies it ONLY in the testcontainers branch, which is unreachable while the compose stack answers on :8080 |

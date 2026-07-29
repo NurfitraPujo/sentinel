@@ -19,16 +19,17 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - A2 | Three-Module Go Layout, Workspace Mode for Local/Contract Tests Only (GOWORK=off in CI's go-root) | go,modules,sdk,testing,gowork | [ARCHITECTURE.md](ARCHITECTURE.md) | active
 
 ## Bugs
-- B1 | Data Loss on Database Outage — its stated mitigation (GracefulDegradation) is itself broken | db,reliability,processor | [BUGS.md](BUGS.md) | active
+- B1 | Data Loss on Database Outage — mitigation DELETED, replaced by D10 | db,reliability,processor | [BUGS.md](BUGS.md) | resolved-2026-07-29
 - B2 | Reserved Path Collision Guard for Dynamic Slug Routing | routing,sveltekit,slug,guard | [BUGS.md](BUGS.md) | active
 - B3 | "Shipped" Features That Are Never Invoked From main() | wiring,dead-code,process | [BUGS.md](BUGS.md) | active
 - B4 | One Broken Test File Silently Disables an Entire Go Test Package | go,testing,coverage | [BUGS.md](BUGS.md) | active
 - B5 | Cross-Boundary Payload Contracts Drift With No Test Spanning the Boundary | contracts,sdk,nats,json | [BUGS.md](BUGS.md) | partial (SDK↔ingestor covered by tests/contract; dashboard↔NATS seam still open)
 - B6 | Normalization Destroys the Fields Read After It | processor,normalizer,regression | [BUGS.md](BUGS.md) | active
+- B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active
 - B7 | Authenticated Identity Computed, Then Discarded | security,multitenancy,ingestor | [BUGS.md](BUGS.md) | resolved-2026-07-29
 
 ## Decisions
-- D1 | Graceful Degradation via In-Memory Buffering | resilience,buffer,processor | [DECISIONS.md](DECISIONS.md) | needs-review — buffer-full path still silently acks a dropped event (S9); see D10
+- D1 | Graceful Degradation via In-Memory Buffering | resilience,buffer,processor | [DECISIONS.md](DECISIONS.md) | superseded-by-D10 — the buffer was deleted, not repaired
 - D2 | Magic Link Authentication via Auth.js Email Provider | auth,magic-link,rb | [DECISIONS.md](DECISIONS.md) | active
 - D3 | Adopt Goose for All Database Migrations | migrations,tooling,goose,go | [DECISIONS.md](DECISIONS.md) | active — accepted risk: already-applied migrations edited in place, see entry
 - D4 | Strict Loud-Failure Migration Policy | migrations,errors,concurrency,policy | [DECISIONS.md](DECISIONS.md) | active — tension: idempotency retrofit for multi-ledger hazard, see entry

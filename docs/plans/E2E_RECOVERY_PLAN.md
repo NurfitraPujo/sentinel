@@ -46,7 +46,7 @@ of `cd84d17`) — see the note after the table for evidence/detail on the non-gr
 | # | Gate | Command | Status (2026-07-29) |
 |---|---|---|---|
 | G1 | Root module builds and vets clean | `rtk go build ./... && rtk go vet ./...` | ✅ PASS |
-| G2 | Unit suite runs and passes | `rtk go test ./tests/unit/...` | ✅ PASS (253 assertions) |
+| G2 | Unit suite runs and passes | `rtk go test ./tests/unit/...` | ✅ PASS (241 assertions) |
 | G3 | SDK module builds, vets, tests | `cd packages/sdk-go && rtk go test ./...` | ✅ PASS (23 tests, 4 packages) |
 | G4 | Migrations module builds and tests | `cd packages/db-migrations && rtk go test ./...` | ✅ PASS |
 | G5 | Dashboard builds | `cd apps/dashboard-web && pnpm build` | ✅ PASS |

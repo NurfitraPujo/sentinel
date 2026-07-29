@@ -67,7 +67,7 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # Verified green on 2026-07-28 (`GOWORK=off go test ./tests/unit/... -count=1`: 253 assertions pass).
+      # Verified green on 2026-07-29 (`GOWORK=off go test ./tests/unit/... -count=1`: 241 assertions pass).
       # Because tests/unit is one flat Go package (C3), a single stale file can still disable all 11 files
       # (~2,800 lines) in the suite — this hard-gate is what makes that regression visible again. Hard-gate.
       - name: go test ./tests/unit/...
