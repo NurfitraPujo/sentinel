@@ -47,12 +47,18 @@ implementation decision made during the S6 fix, not something the original spec 
 
 ### Still NOT implemented (do not mark these resolved)
 
-- **`expires_at` is never checked** (S7, unchanged). `getAPIKeyData` filters on `status` only.
-  FR-004's "reject requests using ... expired API keys" is not honored.
-- **Key rotation leaves the old key `status = 'active'`** (S7, unchanged). `rotateApiKey` sets
-  `expires_at` on the old key but nothing reads it (previous point), so rotated keys stay valid
-  forever, not for the "configurable grace period (default 24h)" User Story 1 Acceptance Scenario 4
-  describes.
+- **`expires_at` is never checked** (S7) — **UPDATE 2026-07-29 (P3-4 pass)**: resolved per code at
+  HEAD `024f8b3`. `apps/ingestor-go/auth/apikey.go`'s `getAPIKeyData` query now filters on
+  `pak.expires_at IS NULL OR pak.expires_at > now()` directly (not just `status`), and caps any
+  Redis cache entry's TTL at the key's remaining lifetime. This was verified by direct code
+  inspection during this pass, not by an isolated re-run of the ingestor's own test/curl proof
+  (that was this repo's P3-2 item) — re-verify live if you need end-to-end confirmation, but do not
+  re-flag it as unimplemented from this document alone.
+- **Key rotation leaves the old key `status = 'active'`** (S7) — **UPDATE 2026-07-29 (P3-4 pass)**:
+  also resolved. `rotateApiKey` (`apps/dashboard-web/src/lib/db/queries/apikeys.ts`) sets
+  `status='revoked'` AND `expires_at=now()` on the old key, immediately — see Acceptance Scenario 4
+  above for why this is a deliberate "no grace period" decision rather than the originally-specified
+  24h dual-active window.
 - **Rate limiting is per-key only, not hierarchical.** FR-005 and the Clarifications session both
   describe "per-API-key `rate_limit_rpm` applies if configured; otherwise project default quota
   applies" (also recorded as "hierarchical" in `docs/memory/DECISIONS.md` D9). There is no project
@@ -65,10 +71,22 @@ implementation decision made during the S6 fix, not something the original spec 
   silently disabling rate limiting if Redis is unreachable at boot) still exists was **not
   re-verified** as part of this pass — check `apps/ingestor-go/main.go` before relying on either
   direction.
-- **`apps/dashboard-web` key-management HTTP surface**: not touched by the 2026-07-28/29 fix pass.
-  `VERIFIED_STATE.md` (2026-07-26 baseline) recorded `api/organizations/[orgId]/keys/+server.ts` as a
-  mock returning hardcoded fixtures with no auth check — **unverified whether this has changed**; treat
-  User Story 1's dashboard flows as unverified until re-checked.
+- **`apps/dashboard-web` key-management HTTP surface** — **RESOLVED 2026-07-29 (P3-4)**: was a
+  hardcoded-fixture mock with no auth check on any route (GET/POST `keys/+server.ts`, DELETE
+  `keys/[keyId]/+server.ts`, POST `keys/[keyId]/rotate/+server.ts`) and revoke/rotate did not touch
+  the database at all — a revoked key stayed valid forever because nothing revoked it. All three
+  routes now: require `locals.auth()` (401 if absent), require organization membership resolved
+  from the session (never the URL or body) with a role check via `hasPermission(role,
+  'manage_keys')` — owner/admin/engineer may create/revoke/rotate, support/viewer are read-only
+  (403) — call the real query layer in `src/lib/db/queries/apikeys.ts`, and 404 when the target
+  `keyId` belongs to a different organization than the URL's `orgId` (membership-derived, not
+  URL-derived — the same class of check S6 was missing). `src/lib/rbac.ts` was reconciled against
+  both `organization_members` and `project_members`'s CHECK constraints (previously it only knew
+  `admin|developer|viewer`, so `hasPermission('owner', ...)` always returned `false` and
+  organization owners were denied every permission). See `docs/memory/VERIFIED_STATE.md` for the
+  live-HTTP proof commands. Still open: `src/routes/[orgSlug]/settings/keys/+page.svelte` and the
+  project-scoped equivalent are pure client-side mocks that never call these routes at all — the UI
+  wiring is a separate, still-unstarted piece of User Story 1.
 
 ---
 
@@ -98,7 +116,7 @@ As an Organization Admin or Engineer in the Dashboard, I want to create, inspect
 1. **Given** an Organization Admin or Engineer viewing Organization Settings (`/[orgSlug]/settings/keys`) or Project Settings (`/[orgSlug]/projects/[projectId]/settings/keys`), **When** they request a new API Key with a name, scope (`Ingest-Only`, `Read/Query`, `Admin`), and target project (including "All Projects [Org-Wide]"), **Then** the system generates a cryptographically secure random API key token, stores its SHA256 hash, displays the raw secret token to the user exactly once with a warning, and lists the key in the API keys management table.
 2. **Given** an existing active API Key, **When** an Organization Admin or Engineer clicks "Revoke", **Then** the key status immediately updates to `revoked`, its revocation timestamp is recorded, and any subsequent API request using that key is immediately rejected with HTTP 401.
 3. **Given** an `Ingest-Only` API key, **When** used to call ingestion endpoints (`POST /ingest` or `POST /ingest/batch`), **Then** access is granted; **When** used to call read/query management endpoints, **Then** access is denied with HTTP 403.
-4. **Given** an Organization Admin or Engineer, **When** they trigger key rotation for an existing key, **Then** a new API key is generated and the old key is assigned a configurable expiration timestamp (`expires_at`, defaulting to 24 hours), maintaining dual-active validity until expiration or manual revocation.
+4. **Given** an Organization Admin or Engineer, **When** they trigger key rotation for an existing key, **Then** a new API key is generated and the old key is **revoked immediately** (`status='revoked'`, `expires_at` set to the rotation time) — **not** a 24-hour dual-active grace period. **DECISION (2026-07-29, P3-4)**: the original "configurable grace period (default 24h)" design was superseded during the S7 fix pass and is deliberately not implemented. Rotation is the operator signaling "this credential may be compromised or is being retired" — most often because it leaked. A window where the flagged key still authenticates requests defeats that intent for the exact scenario rotation exists to handle, and it reopens the Redis-cache staleness gap that S7 closed for the whole window instead of just the cache TTL. A deployment that genuinely needs a soft cutover (e.g. staggered redeploy of many clients) should provision a second, independently-active key for new clients and explicitly revoke the old one once cutover is confirmed, rather than lean on a timer attached to a key already flagged for retirement. See the DECISION comment on `rotateApiKey` in `apps/dashboard-web/src/lib/db/queries/apikeys.ts`.
 
 ---
 

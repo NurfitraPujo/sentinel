@@ -2,6 +2,34 @@ import { db } from '../../server/db';
 import { projectApiKeys, auditLogs } from '../schema';
 import { eq } from 'drizzle-orm';
 import crypto from 'crypto';
+import net from 'net';
+
+// getApiKeyById fetches a single key row, including the columns callers need to enforce
+// organization scoping (organizationId) BEFORE acting on a keyId that came from the URL — the
+// same class of check VERIFIED_STATE.md S6 was missing on the ingest path. A caller MUST verify
+// `row.organizationId === <the authenticated caller's org>` itself; this function does not scope
+// by organization, so it must never be exposed to a route that skips that check.
+export async function getApiKeyById(id: string) {
+	const [row] = await db
+		.select({
+			id: projectApiKeys.id,
+			organizationId: projectApiKeys.organizationId,
+			projectId: projectApiKeys.projectId,
+			name: projectApiKeys.name,
+			keyPrefix: projectApiKeys.keyPrefix,
+			keyHash: projectApiKeys.keyHash,
+			scope: projectApiKeys.scope,
+			status: projectApiKeys.status,
+			rateLimitRpm: projectApiKeys.rateLimitRpm,
+			expiresAt: projectApiKeys.expiresAt,
+			revokedAt: projectApiKeys.revokedAt,
+			createdBy: projectApiKeys.createdBy,
+			createdAt: projectApiKeys.createdAt,
+		})
+		.from(projectApiKeys)
+		.where(eq(projectApiKeys.id, id));
+	return row;
+}
 
 export async function getOrganizationApiKeys(orgId: string) {
 	return await db
@@ -127,9 +155,15 @@ export async function rotateApiKey(
 
 	// Same invalidation path as revokeApiKey: without this, the old key's Redis cache entry
 	// (apps/ingestor-go/auth/apikey.go) survives up to its own TTL despite status now being
-	// 'revoked' in Postgres.
+	// 'revoked' in Postgres. Best-effort for the same reason as revokeApiKey: the DB update above
+	// (status='revoked', expires_at=now) already makes the old key correctly unusable; this only
+	// makes that fact propagate fast.
 	if (publisher) {
-		await publisher.publish('api_key.invalidated', { keyId: existingKey.id, keyHash: oldKeyRow?.keyHash });
+		try {
+			await publisher.publish('api_key.invalidated', { keyId: existingKey.id, keyHash: oldKeyRow?.keyHash });
+		} catch (err) {
+			console.error(`api_key.invalidated publish failed for rotated key ${existingKey.id} (revoke already committed to DB):`, err);
+		}
 	}
 
 	return { apiKey: newKey, secretToken };
@@ -140,11 +174,20 @@ export interface NatsPublisher {
 }
 
 export async function revokeApiKey(userId: string, keyId: string, publisher?: NatsPublisher) {
+	// expires_at is set to "now" alongside status, not left null. apps/ingestor-go/auth/apikey.go
+	// enforces `expires_at IS NULL OR expires_at > now()` in the query itself AND caps any Redis
+	// cache entry's TTL at the key's remaining lifetime — so setting this closes the gap for BOTH
+	// paths at once: a request that reaches Postgres directly (cache miss) is rejected by the
+	// query's own WHERE clause, and a request served from a stale cache entry cannot outlive it
+	// either. Without this, correctness rested entirely on the NATS publish below succeeding;
+	// with it, a publish failure only costs up to the cache TTL, never longer.
+	const revokedAt = new Date();
 	const [revokedKey] = await db
 		.update(projectApiKeys)
 		.set({
 			status: 'revoked',
-			revokedAt: new Date(),
+			revokedAt,
+			expiresAt: revokedAt,
 		})
 		.where(eq(projectApiKeys.id, keyId))
 		.returning();
@@ -169,8 +212,83 @@ export async function revokeApiKey(userId: string, keyId: string, publisher?: Na
 		// handler — which read `data["key_hash"]` and would still not have matched this
 		// object's camelCase key even if the field had existed — could never find anything to
 		// delete, and revocation silently waited out the cache TTL instead of being instant.
-		await publisher.publish('api_key.invalidated', { keyId, keyHash: revokedKey.keyHash });
+		//
+		// Best-effort: the DB write above (status + expires_at) is what makes the revoke
+		// correct; this publish only makes it FAST (<100ms vs. up to the cache TTL). A NATS
+		// hiccup must not turn an already-committed revoke into a 500 to the caller.
+		try {
+			await publisher.publish('api_key.invalidated', { keyId, keyHash: revokedKey.keyHash });
+		} catch (err) {
+			console.error(`api_key.invalidated publish failed for key ${keyId} (revoke already committed to DB):`, err);
+		}
 	}
 
 	return revokedKey;
+}
+
+// NatsPublisher implementation using a raw core-NATS TCP connection (no `nats` npm dependency).
+// JetStream streams capture any message published to a subject they watch regardless of whether
+// the publish went through the JetStream API or plain core NATS PUB — this sends CONNECT+PUB and
+// does not wait for a JetStream PubAck reply, which is fine for this fire-and-forget
+// invalidation signal: correctness does not depend on it (see revokeApiKey/rotateApiKey's
+// expires_at handling above), only latency does.
+export function createNatsPublisher(url: string = process.env.NATS_URL || 'nats://localhost:4222'): NatsPublisher {
+	return {
+		publish(subject: string, data: any): Promise<void> {
+			return new Promise((resolve, reject) => {
+				let host = 'localhost';
+				let port = 4222;
+				try {
+					const parsed = new URL(url);
+					host = parsed.hostname || host;
+					port = parsed.port ? Number(parsed.port) : port;
+				} catch {
+					// keep defaults
+				}
+
+				const payload = Buffer.from(JSON.stringify(data));
+				let settled = false;
+				const socket = net.createConnection({ host, port });
+
+				const timeout = setTimeout(() => {
+					if (settled) return;
+					settled = true;
+					socket.destroy();
+					reject(new Error(`NATS publish to ${host}:${port} timed out`));
+				}, 2000);
+
+				let buffered = '';
+				socket.on('data', (chunk) => {
+					if (settled) return;
+					buffered += chunk.toString('utf8');
+					// Wait for the server's initial INFO line before sending CONNECT/PUB — sending
+					// before the connection is fully established/greeted is not part of the protocol.
+					if (!buffered.includes('\r\n')) return;
+
+					const connect = `CONNECT {"verbose":false,"pedantic":false,"lang":"node"}\r\n`;
+					const pub = `PUB ${subject} ${payload.length}\r\n`;
+					socket.write(connect + pub);
+					socket.write(payload);
+					socket.write('\r\n');
+
+					// Give the write a brief moment to flush to the OS socket buffer before closing;
+					// core NATS PUB has no application-level ack, so there is nothing else to wait for.
+					setImmediate(() => {
+						if (settled) return;
+						settled = true;
+						clearTimeout(timeout);
+						socket.end();
+						resolve();
+					});
+				});
+
+				socket.on('error', (err) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timeout);
+					reject(err);
+				});
+			});
+		},
+	};
 }

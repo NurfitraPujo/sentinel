@@ -153,12 +153,53 @@ jobs:
   # check` exits non-zero on type errors (error-gating by construction), and `pnpm build` / `pnpm test` are
   # ordinary build/test commands. S2 in VERIFIED_STATE.md (the outage that made this job red) is resolved.
   # ---------------------------------------------------------------------------------------------------------
+  # dashboard's `pnpm test` includes apps/dashboard-web/tests/schema-drift.test.ts, the guard that introspects
+  # a REAL migrated Postgres (information_schema + pg_constraint) and compares it against src/lib/db/schema.ts
+  # — this is what catches the class of bug where schema.ts and the migrated database disagree (issueRelations
+  # missing NOT NULL created_by_type/created_by, issueActivity declaring a nonexistent `metadata` column,
+  # alertConfigs declaring channel_target/window_seconds instead of the real channel_config/
+  # frequency_window_seconds — see the test file's header comment). Without a real database, that test SKIPS
+  # per table and `pnpm test` still reports overall success — a guard that silently no-ops is worse than no
+  # guard, so this job (a) stands up a real `postgres` service, (b) runs the actual migrations against it via
+  # the project's real migration tool (packages/db-migrations/cmd/migrate, target=dashboard — see D1 in
+  # docs/memory/DECISIONS.md: goose via that CLI is the only sanctioned migration path, so this does not
+  # reimplement migration logic — it invokes the real thing exactly as the test file's own header comment
+  # documents), and (c) sets SCHEMA_DRIFT_REQUIRED=1 so an unreachable database turns into a hard CI failure
+  # instead of a quiet skip, mirroring SENTINEL_E2E's role in the `integration` job below.
+  # ---------------------------------------------------------------------------------------------------------
   dashboard:
     name: dashboard
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: apps/dashboard-web
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: sentinel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sentinel -d sentinel"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      # Read by apps/dashboard-web/tests/schema-drift.test.ts (SCHEMA_DRIFT_DATABASE_URL, falling back to
+      # DATABASE_URL — set the specific one so this doesn't depend on that fallback order). Deliberately NOT
+      # named DATABASE_URL: that name is also src/lib/server/db.ts's runtime default (which itself falls back
+      # to localhost:5432 with the same credentials if unset), and this guard is meant to bind to an
+      # explicitly-freshly-migrated database, never to "whatever happens to be on 5432" (see the test file's
+      # own header comment on this exact hazard).
+      SCHEMA_DRIFT_DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable
+      # Turns "no reachable database" from a silent per-table skip into a hard test failure. Without this, a
+      # broken postgres service (or a step reordering that runs `pnpm test` before migrations) would still
+      # report "39 tests passed" while 20 of them silently did nothing — exactly the failure mode this job was
+      # changed to close. Mirrors SENTINEL_E2E's role in the `integration` job below.
+      SCHEMA_DRIFT_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -172,8 +213,24 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/dashboard-web/pnpm-lock.yaml
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/db-migrations/go.mod
+          cache-dependency-path: packages/db-migrations/go.sum
+
       - name: pnpm install
         run: pnpm install --frozen-lockfile
+
+      # Runs the REAL migrations (packages/db-migrations/migrations/*.sql, goose's own filename-ordered Up
+      # runner) against the postgres service above via the project's real migration CLI — not a hand-rolled
+      # SQL-file-concatenation shim. GOWORK=off for the same reason as the go-migrations job: this is an
+      # independent module and must build against its own go.mod, not get pulled into the repo-root workspace.
+      - name: Apply real database migrations (target=dashboard)
+        working-directory: packages/db-migrations
+        env:
+          GOWORK: "off"
+          DB_URL_DASHBOARD: postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable
+        run: go run ./cmd/migrate up -target dashboard
 
       # Verified green on 2026-07-28 (`pnpm build`, exit 0 — vite SSR + client bundles both build clean). S2's
       # blast radius (unresolved "semver" import via src/lib/db/queries/issues.ts) is resolved. Hard-gate.
@@ -185,8 +242,9 @@ jobs:
       - name: pnpm check
         run: pnpm check
 
-      # Verified green on 2026-07-28 (`pnpm test` → vitest: 5 files, 19 tests, all pass). The "test" script and
-      # vitest dependency are now present in package.json. Hard-gate.
+      # Runs against the freshly-migrated postgres service above (SCHEMA_DRIFT_DATABASE_URL,
+      # SCHEMA_DRIFT_REQUIRED=1 set at job level) — schema-drift.test.ts's 20 per-table cases now actually
+      # execute instead of silently skipping. Hard-gate.
       - name: pnpm test
         run: pnpm test
 

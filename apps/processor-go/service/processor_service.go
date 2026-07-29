@@ -34,14 +34,6 @@ func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
 	svc.degradation = degradation.NewGracefulDegradation(func(ctx context.Context) bool {
 		return db.Ping(ctx) == nil
 	})
-	// Replay buffered events through the same processing path a live event
-	// takes, but never by processEventInternal calling back into the
-	// degradation package itself — see triggerAsyncFlush's doc comment
-	// (VERIFIED_STATE.md S9: the old code's Flush call at the end of
-	// processEventInternal was a re-entrant call back into itself).
-	svc.degradation.SetFlushHandler(func(data []byte) error {
-		return svc.processEventInternal(context.Background(), data)
-	})
 
 	// Dispatcher construction + wiring (VERIFIED_STATE.md S8): previously
 	// NewProcessorService never built a Dispatcher at all, so 425 LOC of
@@ -72,34 +64,24 @@ func (s *ProcessorService) Alerts() *alerts.Dispatcher {
 // the subscriber's MaxDeliver/backoff/DLQ policy — see
 // packages/shared-go/nats/subscriber.go and D10 in docs/memory/DECISIONS.md).
 //
-// It must branch on all three degradation.BufferStatus values
-// (VERIFIED_STATE.md S9): the previous single-bool CheckAndBuffer conflated
-// "database healthy" and "database down but buffered" into the same `true`,
-// so a down-but-not-full database still fell through to a live
-// processEventInternal call that was certain to fail, and a full buffer was
-// logged as "buffered" and then silently ACKed and lost.
+// There is no in-memory buffering path anymore (see the degradation package's
+// doc comment and docs/memory/BUGS.md B1): a down database always returns an
+// error here so the event stays in JetStream, where D10's bounded retry with
+// backoff (1s/5s/15s/30s/60s, MaxDeliver 5) owns recovery, and a DLQ entry
+// preserves anything that outlasts that budget. This function must never call
+// processEventInternal for an event that did not get StatusProcessed.
 func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) error {
 	switch s.degradation.Evaluate(ctx, data) {
 	case degradation.StatusProcessed:
 		return s.processEventInternal(ctx, data)
-	case degradation.StatusBuffered, degradation.StatusUnavailable:
+	case degradation.StatusUnavailable:
 		// Do NOT ACK. The database is down and this event has not been stored anywhere durable.
 		// Returning an error keeps it in JetStream, where D10's bounded retry with backoff
 		// (1s/5s/15s/30s/60s, MaxDeliver 5) owns recovery and a DLQ entry preserves anything that
-		// outlasts the budget. ACKing here — which the first version of this fix did, on the
-		// grounds that the event "was buffered" — silently destroyed events on a process restart,
-		// because the buffer is process memory. That traded a duplicate-delivery bug for a
-		// permanent-loss bug, which is strictly worse.
+		// outlasts the budget. An earlier version of this code ACKed here on the grounds that the
+		// event "was buffered" in process memory — that silently destroyed events on a process
+		// restart, trading a duplicate-delivery bug for a permanent-loss bug, which is strictly worse.
 		return fmt.Errorf("database unavailable: event returned to NATS for bounded retry")
-	case degradation.StatusDropped:
-		// The buffer is full: this event was neither stored nor buffered.
-		// The previous code ACKed here anyway (S9's core inversion) — a
-		// silent, unrecoverable data loss reported as success. Returning an
-		// error instead lets the NATS subscriber's own bounded retry with
-		// backoff (and eventual DLQ dead-letter once MaxDeliver is
-		// exhausted — D10) take over: the event is preserved, not lost,
-		// even though it could not be handled by the buffer.
-		return fmt.Errorf("event buffer full and database unavailable: event not processed")
 	default:
 		return fmt.Errorf("unknown degradation status")
 	}
@@ -223,16 +205,6 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	if err := s.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
 		log.Printf("Failed to index occurrence: %v", err)
 	}
-
-	// Flushing buffered events used to happen here, at the end of every
-	// successful event — a call from processEventInternal back into
-	// degradation.Flush, which itself calls processEventInternal again for
-	// each buffered event: a re-entrant call back into itself
-	// (VERIFIED_STATE.md S9). Flushing is now triggered exclusively by
-	// GracefulDegradation itself, on its own goroutine, the moment it
-	// observes a down->up transition — see SetFlushHandler in
-	// NewProcessorService and GracefulDegradation.triggerAsyncFlush. This
-	// call site does not participate in flushing at all anymore.
 
 	return nil
 }

@@ -11,6 +11,24 @@ package integration
 //     Postgres mid-stream, send N events, restart it, and assert exactly N
 //     occurrences land — no loss, no duplicates.
 //
+// IMPORTANT (re-verified 2026-07-29, full SENTINEL_E2E run): the second test's
+// mechanism changed underneath it since it was first written. S9's fix went
+// through two shapes: an in-process buffer-with-async-flush (what this test
+// originally drove directly via ProcessEvent, expecting a nil "buffered"
+// return while the DB was down), and — later, same body of work — the
+// buffer's removal entirely in favor of D10's NATS bounded-retry/backoff/DLQ
+// (see apps/processor-go/degradation/buffer.go's package doc comment:
+// "That mechanism is gone, deliberately, not accidentally"). Calling
+// svc.ProcessEvent directly during an outage now always returns a non-nil
+// error (there is nothing left in-process to buffer into), so the
+// no-loss-no-duplicates guarantee can only be observed the way production
+// actually delivers it: through a real NATS subscriber (D10's
+// packages/shared-go/nats.Subscriber) retrying with backoff until Postgres
+// comes back. The test below now drives a real Publisher/Subscriber pair
+// against a dedicated, uniquely-named JetStream stream (never the shared
+// ERROR_EVENTS stream the running processor container consumes in
+// docker-compose/SENTINEL_E2E mode) instead of calling ProcessEvent inline.
+//
 // Every top-level identifier in this file is prefixed with Procgo/procgo so
 // it cannot collide with identifiers other agents add to this same flat
 // `integration` package.
@@ -28,10 +46,12 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	dbmigrations "github.com/NurfitraPujo/sentinel/packages/db-migrations"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
+	sharednats "github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	tc "github.com/NurfitraPujo/sentinel/tests/integration/testcontainers"
 	"github.com/golang/protobuf/proto"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	gonats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -148,16 +168,56 @@ func procgoWaitPostgresReady(t *testing.T, pool *pgxpool.Pool, timeout time.Dura
 	}, timeout, 250*time.Millisecond, "postgres did not become ready again in time")
 }
 
+// procgoSetupDedicatedNATS provisions (or, in docker-compose/SENTINEL_E2E
+// mode, connects to) a NATS instance via tc.Setup, then creates a stream,
+// subject and durable consumer name that are unique to this test run. This
+// deliberately does NOT reuse the production ERROR_EVENTS stream/subject:
+// docker-compose mode already has a real sentinel-processor container
+// pull-consuming ERROR_EVENTS with its own durable consumer, and publishing
+// or binding a second consumer there would race the real pipeline and/or
+// double-process production traffic. tests/integration/shared_nats_test.go's
+// newNATSPackageFixture established this exact isolation pattern; this
+// mirrors it rather than reusing the shared setup_test.go stream.
+func procgoSetupDedicatedNATS(t *testing.T) (natsURL string, js gonats.JetStreamContext, stream, subject, consumer string) {
+	t.Helper()
+
+	env := tc.Setup(t, tc.WithResources(tc.NATSResource))
+	natsURL = env.NATSConfig.URL
+	require.NotEmpty(t, natsURL, "NATS URL must be configured")
+
+	nc, err := gonats.Connect(natsURL)
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	js, err = nc.JetStream()
+	require.NoError(t, err)
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	stream = "PROCGO_DEGRADE_" + id
+	subject = "procgo.degrade." + id
+	consumer = "procgo-degrade-consumer-" + id
+
+	_, err = js.AddStream(&gonats.StreamConfig{
+		Name:     stream,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = js.DeleteStream(stream) })
+
+	return natsURL, js, stream, subject, consumer
+}
+
 // TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates is the P4-2
-// (S9) execution proof. It exercises the real
-// service.ProcessorService.ProcessEvent path — not GracefulDegradation in
-// isolation, which tests/unit already covers — against a real, killable
-// testcontainers Postgres, so the tri-state fix in
-// degradation.GracefulDegradation.Evaluate and its wiring through
-// ProcessorService.ProcessEvent/processEventInternal are proven together,
-// the way the running binary actually uses them.
+// (S9) execution proof, updated for the buffer's removal (see the file-level
+// comment above). It drives events through a real
+// packages/shared-go/nats Publisher/Subscriber pair — not a direct
+// ProcessEvent call — so the thing actually being proven is what production
+// relies on for durability: D10's bounded-retry/backoff NATS redelivery
+// picking a failed event back up once Postgres is reachable again, with the
+// real service.ProcessorService.ProcessEvent as the subscriber's handler.
 func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 	pgContainer, pool := procgoSetupPostgres(t)
+	natsURL, _, stream, subject, consumer := procgoSetupDedicatedNATS(t)
 
 	projectName := fmt.Sprintf("procgo-degrade-%d", time.Now().UnixNano())
 	apiKey := projectName + "-key"
@@ -165,40 +225,60 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 
 	svc := service.NewProcessorService(pool)
 
-	const n = 5
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	publisher, err := sharednats.NewPublisher(ctx, sharednats.PublisherConfig{
+		URL:     natsURL,
+		Subject: subject,
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	subscriber, err := sharednats.NewSubscriber(ctx, sharednats.SubscriberConfig{
+		URL:       natsURL,
+		Stream:    stream,
+		Subject:   subject,
+		Consumer:  consumer,
+		BatchSize: 1,
+		BatchWait: 200 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = subscriber.Close() })
+
+	// The handler mirrors exactly what apps/processor-go/main.go wires: a
+	// non-nil, non-Permanent error from ProcessEvent (the "database
+	// unavailable" sentinel below) is retried by the Subscriber with D10's
+	// backoff (1s/5s/15s/30s/60s across MaxDeliver=5); nil Acks.
+	require.NoError(t, subscriber.Subscribe(ctx, func(data []byte) error {
+		return svc.ProcessEvent(ctx, data)
+	}))
+
+	const n = 5
 
 	// 1. Stop Postgres mid-stream.
 	require.NoError(t, pgContainer.Stop(ctx, nil))
 
-	// 2. Send N events while it is down. Each must be safely buffered (nil
-	// error, i.e. degradation.StatusBuffered) — never surfaced as a failure,
-	// and processEventInternal must never run for them (there is nothing
-	// for it to talk to; if it ran, ProcessEvent would return a connection
-	// error instead of nil here).
+	// 2. Publish N events while the database is down. Each delivery attempt
+	// will fail ("database unavailable: event returned to NATS for bounded
+	// retry") and the Subscriber NAKs it with backoff — there is no
+	// in-process buffer for ProcessEvent to succeed into anymore.
 	for i := 0; i < n; i++ {
 		evt := procgoBuildEvent(projectName, fmt.Sprintf("ProcgoDegradedError%d", i))
-		err := svc.ProcessEvent(ctx, procgoMarshal(t, evt))
-		require.NoError(t, err, "event %d should be buffered (nil error) while the database is down", i)
+		require.NoError(t, publisher.Publish(ctx, procgoMarshal(t, evt)),
+			"publish must succeed even though the database is down — NATS durability is independent of Postgres")
 	}
 
 	// 3. Restart Postgres and wait for it to accept connections again.
 	require.NoError(t, pgContainer.Start(ctx))
 	procgoWaitPostgresReady(t, pool, 90*time.Second)
 
-	// 4. Send one more "trigger" event. Its Evaluate() call is what observes
-	// the down->up transition and kicks off the async buffer flush (see
-	// degradation.GracefulDegradation.triggerAsyncFlush). Production traffic
-	// provides this naturally via the next message NATS delivers; the test
-	// provides it explicitly.
-	triggerEvt := procgoBuildEvent(projectName, "ProcgoTriggerEvent")
-	require.NoError(t, svc.ProcessEvent(ctx, procgoMarshal(t, triggerEvt)),
-		"the trigger event itself must process live now that the database is back")
-
-	// 5. Wait for the async flush to land all N buffered events, then assert
-	// EXACTLY N occurrences exist for the N distinct degraded-error issues:
-	// fewer than N would mean loss, more than N would mean duplicates.
+	// 4. Wait for D10's bounded-retry redelivery to land all N events, then
+	// assert EXACTLY N occurrences exist for the N distinct degraded-error
+	// issues: fewer than N would mean loss, more than N would mean
+	// duplicates. The backoff schedule sums to ~51s across 5 attempts, well
+	// inside this Eventually's window and Postgres's typical restart time.
 	require.Eventually(t, func() bool {
 		var count int
 		qErr := pool.QueryRow(ctx,
@@ -208,7 +288,7 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 			projectID,
 		).Scan(&count)
 		return qErr == nil && count == n
-	}, 60*time.Second, 250*time.Millisecond, "expected exactly %d occurrences to land after recovery", n)
+	}, 90*time.Second, 250*time.Millisecond, "expected exactly %d occurrences to land after recovery", n)
 
 	var finalOccCount, finalIssueCount int
 	require.NoError(t, pool.QueryRow(ctx,
@@ -217,13 +297,13 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 		  WHERE i.project_id = $1 AND i.error_class LIKE 'ProcgoDegradedError%'`,
 		projectID,
 	).Scan(&finalOccCount))
-	assert.Equal(t, n, finalOccCount, "no loss, no duplicates: exactly N buffered events must land exactly once each")
+	assert.Equal(t, n, finalOccCount, "no loss, no duplicates: exactly N redelivered events must land exactly once each")
 
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM issues WHERE project_id = $1 AND error_class LIKE 'ProcgoDegradedError%'`,
 		projectID,
 	).Scan(&finalIssueCount))
-	assert.Equal(t, n, finalIssueCount, "each buffered event should have created its own distinct issue")
+	assert.Equal(t, n, finalIssueCount, "each redelivered event should have created its own distinct issue")
 }
 
 // TestProcgoAlertingDispatchesWithinOneEvent is the P5-1 (S8) execution
