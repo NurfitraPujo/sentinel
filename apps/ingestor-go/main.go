@@ -109,7 +109,18 @@ func main() {
 		Stream:    "API_KEYS", // Assuming there's a stream for it
 		BatchSize: 10,
 	}
-	subscriber, _ := nats.NewSubscriber(ctx, subCfg)
+	// Do NOT discard this error. NewAPIKeyAuthenticator skips its invalidation goroutine when sub is
+	// nil, so a NATS hiccup at startup used to leave revocation permanently dead — with no log line,
+	// for the life of the process. Revocation would then silently degrade from "immediate" to "up to
+	// APIKEY_CACHE_TTL", which is exactly the guarantee spec 008 and WORKLOG.md advertise as instant.
+	subscriber, subErr := nats.NewSubscriber(ctx, subCfg)
+	if subErr != nil {
+		if getEnv("APIKEY_INVALIDATION_REQUIRED", "true") == "true" {
+			log.Fatalf("Failed to subscribe to API key invalidation (set APIKEY_INVALIDATION_REQUIRED=false to start anyway, accepting up to APIKEY_CACHE_TTL revocation latency): %v", subErr)
+		}
+		log.Printf("WARNING: API key invalidation subscriber unavailable (%v). Revocation will take up to %s to take effect.", subErr, auth.CacheTTLForLogging())
+		subscriber = nil
+	}
 
 	rateLimiter := middleware.NewRateLimiter(redisClient)
 	authenticator := auth.NewAPIKeyAuthenticator(db, redisClient, subscriber)

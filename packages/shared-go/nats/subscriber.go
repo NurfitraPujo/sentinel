@@ -364,6 +364,48 @@ func (s *Subscriber) dlqStreamName() string {
 	return s.cfg.Stream + "_DLQ"
 }
 
+// DLQStats summarizes the current state of the dead-letter queue: this call is what closes D10's "Known
+// gap — this decision is not fully honored yet" item (a): "surface DLQ depth on /health or a metric."
+type DLQStats struct {
+	// Stream is the DLQ stream name this reports on. Empty if it cannot be derived (no
+	// Stream/DLQStream configured on this Subscriber).
+	Stream string
+	// Depth is the number of messages currently held in the DLQ stream — i.e. events dead-lettered and
+	// waiting for an operator to look at them (see tools/dlq). Zero if the stream does not exist yet,
+	// which is the common, healthy case: ensureDLQStream only creates it lazily on the first
+	// dead-letter (deadLetter).
+	Depth uint64
+	// PublishFailures mirrors DLQPublishFailures(): events that could NOT be captured in the DLQ and
+	// were therefore left (Nak'd) in the SOURCE stream instead of being terminated — see deadLetter's
+	// comment on why Term() is never called without a successful DLQ publish first. These events are
+	// NOT reflected in Depth; they are not in the DLQ stream at all.
+	PublishFailures uint64
+}
+
+// DLQStats reports dead-letter queue depth plus DLQPublishFailures in a single call suitable for a
+// health/metrics endpoint. It is cheap to poll on every request: it reuses this Subscriber's existing
+// JetStream connection (StreamInfo is one request/reply over the connection already open for message
+// delivery) rather than opening a new connection per call. It does not create the DLQ stream as a side
+// effect — if nothing has ever been dead-lettered, the stream may not exist yet, and that is reported as
+// Depth 0, not as an error.
+func (s *Subscriber) DLQStats(ctx context.Context) (DLQStats, error) {
+	stream := s.dlqStreamName()
+	stats := DLQStats{Stream: stream, PublishFailures: s.dlqPublishFailures.Load()}
+	if stream == "" {
+		return stats, nil
+	}
+
+	info, err := s.js.StreamInfo(stream, nats.Context(ctx))
+	if err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			return stats, nil
+		}
+		return stats, fmt.Errorf("failed to get DLQ stream info for %s: %w", stream, err)
+	}
+	stats.Depth = info.State.Msgs
+	return stats, nil
+}
+
 // ensureDLQStream lazily creates the DLQ stream the first time a message is
 // actually dead-lettered, so a deployment that never dead-letters anything
 // never pays for it (and so existing tests/deployments whose NATS user

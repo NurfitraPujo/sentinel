@@ -1,8 +1,18 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
-import { issues, projects, organizationMembers, issueRelations } from '$lib/db/schema';
-import { eq, and, or } from 'drizzle-orm';
+import { issues, projects, organizationMembers } from '$lib/db/schema';
+import { createIssueRelation } from '$lib/db/queries/issues';
+import { eq, and } from 'drizzle-orm';
+
+// Must match the CHECK constraint on issue_relations.relation_type in
+// packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql.
+const VALID_RELATION_TYPES = ['linked_to', 'caused_by', 'duplicate_of'] as const;
+type RelationType = (typeof VALID_RELATION_TYPES)[number];
+
+function isValidRelationType(value: unknown): value is RelationType {
+	return typeof value === 'string' && (VALID_RELATION_TYPES as readonly string[]).includes(value);
+}
 
 export const POST: RequestHandler = async ({ request, params, locals }) => {
 	const session = await locals.auth();
@@ -14,10 +24,14 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 	const sourceIssueId = params.issueId;
 
 	const body = await request.json();
-	const { targetIssueId, relationType = 'related' } = body;
+	const { targetIssueId, relationType } = body;
 
 	if (!targetIssueId) {
 		throw error(400, 'targetIssueId is required');
+	}
+
+	if (!isValidRelationType(relationType)) {
+		throw error(400, `relationType must be one of: ${VALID_RELATION_TYPES.join(', ')}`);
 	}
 
 	// Fetch both issues and their projects to verify organization
@@ -65,15 +79,8 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 		throw error(403, 'Forbidden: You do not have access to this organization');
 	}
 
-	// Create the relation
-	const [relation] = await db
-		.insert(issueRelations)
-		.values({
-			sourceIssueId,
-			targetIssueId,
-			relationType,
-		})
-		.returning();
+	// Create the relation and its issue_activity 'linked' entry together, transactionally.
+	const relation = await createIssueRelation(sourceIssueId, targetIssueId, relationType, 'user', userId);
 
 	return json(relation, { status: 201 });
 };

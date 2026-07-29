@@ -25,9 +25,32 @@ type QueryStore interface {
 // CommandStore defines the "Write" side of the Issue store.
 type CommandStore interface {
 	UpsertIssue(ctx context.Context, issue *Issue, releaseVersion string) error
+	// UpsertIssueWithOutcome behaves exactly like UpsertIssue but additionally
+	// reports whether the issue was newly created, was a regression, or
+	// already existed unchanged. This is the signal the alert dispatcher
+	// needs (docs/plans/E2E_RECOVERY_PLAN.md P5-1 / VERIFIED_STATE.md S8):
+	// alerts must fire for new issues and regressions, not every occurrence.
+	// UpsertIssue itself keeps its original single-error signature (it is
+	// exercised directly by tests/integration/processor_store_test.go) and
+	// is now a thin wrapper around this method.
+	UpsertIssueWithOutcome(ctx context.Context, issue *Issue, releaseVersion string) (IssueOutcome, error)
 	InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error
 	PersistAuditLog(ctx context.Context, log *AuditLog) error
 }
+
+// IssueOutcome reports what UpsertIssueWithOutcome actually did.
+type IssueOutcome int
+
+const (
+	// IssueOutcomeExisting means a non-resolved issue already existed for
+	// this fingerprint; this occurrence is just another duplicate.
+	IssueOutcomeExisting IssueOutcome = iota
+	// IssueOutcomeNew means no issue existed for this fingerprint before
+	// this call.
+	IssueOutcomeNew
+	// IssueOutcomeRegressed means a previously resolved issue reappeared.
+	IssueOutcomeRegressed
+)
 
 // IssueStore combines both Read and Write operations for the Processor.
 type IssueStore interface {
@@ -107,10 +130,18 @@ func isRegressionVersion(releaseVersion, resolvedInVersion string) bool {
 	return true
 }
 
+// UpsertIssue is a backward-compatible wrapper around UpsertIssueWithOutcome
+// that discards the outcome. Kept because tests/integration/processor_store_test.go
+// calls it directly with the single-error signature.
 func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion string) error {
+	_, err := s.UpsertIssueWithOutcome(ctx, issue, releaseVersion)
+	return err
+}
+
+func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, releaseVersion string) (IssueOutcome, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return err
+		return IssueOutcomeExisting, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -129,10 +160,11 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 	// therefore REPLACED the actual cause (e.g. `relation "issues" does not exist`) with a generic
 	// abort message, which is worse than useless when diagnosing a live pipeline.
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
+		return IssueOutcomeExisting, fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
 			issue.ProjectID, issue.Fingerprint, err)
 	}
 
+	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
 	isRegressed := false
 	if err == nil {
 		issue.ID = existingID
@@ -159,7 +191,7 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			WHERE id = $2
 		`
 		if _, err := tx.Exec(ctx, query, issue.LastSeen, issue.ID); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 
 		activityMeta, _ := json.Marshal(map[string]string{
@@ -177,14 +209,14 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			VALUES (gen_random_uuid(), $1, 'system', 'sentinel-regression-detector', 'regressed', $2, NOW())
 		`
 		if _, err := tx.Exec(ctx, activityQuery, issue.ID, activityMeta); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 	} else {
 		query := `
 			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
-			ON CONFLICT (project_id, fingerprint) 
-			DO UPDATE SET 
+			ON CONFLICT (project_id, fingerprint)
+			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
 			WHERE issues.fingerprint = EXCLUDED.fingerprint
@@ -199,11 +231,22 @@ func (s *pgStore) UpsertIssue(ctx context.Context, issue *Issue, releaseVersion 
 			issue.FirstSeen,
 			issue.LastSeen,
 		); err != nil {
-			return err
+			return IssueOutcomeExisting, err
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return IssueOutcomeExisting, err
+	}
+
+	switch {
+	case isRegressed:
+		return IssueOutcomeRegressed, nil
+	case wasNewIssue:
+		return IssueOutcomeNew, nil
+	default:
+		return IssueOutcomeExisting, nil
+	}
 }
 
 func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error {

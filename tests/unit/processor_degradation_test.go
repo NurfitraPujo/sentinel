@@ -2,8 +2,6 @@ package unit
 
 import (
 	"context"
-	"errors"
-	"sync/atomic"
 	"testing"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/degradation"
@@ -108,162 +106,50 @@ func TestCheckAndBuffer_DBUp_ReturnsTrueWithoutBuffering(t *testing.T) {
 	assert.Equal(t, 0, g.BufferSize(), "event must not be buffered when DB is up")
 }
 
-func TestCheckAndBuffer_DBDown_ReturnsTrueOnPushSuccess(t *testing.T) {
+// The tests below replaced seven that asserted GracefulDegradation BUFFERS events while the database
+// is down. That behavior was removed deliberately, not accidentally.
+//
+// Buffering only looked safe: the caller ACKed the NATS message on the strength of an in-PROCESS
+// buffer, so a crash or redeploy during an outage destroyed the event outright (measured: 3 events
+// buffered+ACKed, processor killed, restarted -> 0 rows, no redelivery, no DLQ entry). Buffering AND
+// NAKing is not an alternative either: the event would be replayed once by the flush and once by
+// redelivery, and issues.count is an ON CONFLICT increment, so the duplicate is visible in the
+// product. With no idempotency key on the event (see VERIFIED_STATE.md S16 on event_id having no
+// server-side destination), there is no third option.
+//
+// So durability now belongs entirely to NATS: D10's bounded retry with backoff, then a DLQ entry for
+// anything that outlasts the budget. See docs/memory/DECISIONS.md D10 and BUGS.md B1.
+
+func TestEvaluate_DBDown_DoesNotTakeCustodyOfEvent(t *testing.T) {
 	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return false })
 
-	ok := g.CheckAndBuffer(context.Background(), []byte("event-1"))
-	assert.True(t, ok, "Push succeeded so CheckAndBuffer should return true")
-	assert.False(t, g.IsAvailable(), "should be marked unavailable")
-	assert.Equal(t, 1, g.BufferSize(), "event should be buffered")
-}
+	status := g.Evaluate(context.Background(), []byte("event-1"))
 
-func TestCheckAndBuffer_DBDown_PushReturnsFalseOnCapacity(t *testing.T) {
-	// Fill the internal buffer to capacity, then verify the next CheckAndBuffer
-	// returns the Push result (false) when DB is still down.
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return false })
-	for i := 0; i < degradation.MaxBufferSize; i++ {
-		require.True(t, g.CheckAndBuffer(context.Background(), []byte{byte(i)}))
-	}
-
-	ok := g.CheckAndBuffer(context.Background(), []byte("overflow"))
-	assert.False(t, ok, "CheckAndBuffer should return false when push fails")
+	assert.Equal(t, degradation.StatusUnavailable, status,
+		"a down database must report Unavailable so the caller errors and NATS redelivers")
 	assert.False(t, g.IsAvailable())
-	assert.Equal(t, degradation.MaxBufferSize, g.BufferSize())
+	assert.Equal(t, 0, g.BufferSize(),
+		"the event must NOT be held in process memory — ACKing on the strength of an in-memory buffer is how events were silently lost")
 }
 
-func TestCheckAndBuffer_TransitionUnavailableToAvailable(t *testing.T) {
-	var dbUp atomic.Bool
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return dbUp.Load() })
-
-	// Phase 1: DB is down; two events get buffered.
-	dbUp.Store(false)
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("a")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("b")))
-	require.False(t, g.IsAvailable())
-	require.Equal(t, 2, g.BufferSize())
-
-	// Phase 2: DB comes back. Next CheckAndBuffer should:
-	//   - flip IsAvailable back to true
-	//   - NOT buffer the new event
-	dbUp.Store(true)
-	ok := g.CheckAndBuffer(context.Background(), []byte("c"))
-	assert.True(t, ok)
-	assert.True(t, g.IsAvailable(), "IsAvailable should clear after restore")
-	assert.Equal(t, 2, g.BufferSize(), "restored event must not be buffered")
-}
-
-// ---------------------------------------------------------------------------
-// Flush tests
-// ---------------------------------------------------------------------------
-
-func TestFlush_UnavailableDoesNotDrain(t *testing.T) {
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return false })
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("a")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("b")))
-	require.False(t, g.IsAvailable())
-	require.Equal(t, 2, g.BufferSize())
-
-	var called atomic.Bool
-	processor := func(_ []byte) error {
-		called.Store(true)
-		return nil
-	}
-
-	flushed := g.Flush(context.Background(), processor)
-	assert.Equal(t, 0, flushed, "Flush should return 0 when unavailable")
-	assert.False(t, called.Load(), "processor must not be invoked when unavailable")
-	assert.Equal(t, 2, g.BufferSize(), "buffer must be untouched when unavailable")
-}
-
-func TestFlush_EmptyBufferReturnsZero(t *testing.T) {
+func TestEvaluate_DBUp_ProcessesWithoutBuffering(t *testing.T) {
 	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return true })
-	require.True(t, g.IsAvailable())
 
-	var called atomic.Bool
-	processor := func(_ []byte) error {
-		called.Store(true)
-		return nil
-	}
+	status := g.Evaluate(context.Background(), []byte("event-1"))
 
-	flushed := g.Flush(context.Background(), processor)
-	assert.Equal(t, 0, flushed)
-	assert.False(t, called.Load(), "processor must not be invoked on empty buffer")
-}
-
-func TestFlush_AllEventsSucceed(t *testing.T) {
-	var dbUp atomic.Bool
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return dbUp.Load() })
-
-	// Buffer events while DB is down so Flush has something to process.
-	dbUp.Store(false)
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("a")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("b")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("c")))
-	require.Equal(t, 3, g.BufferSize())
-	require.False(t, g.IsAvailable())
-
-	// DB is back up: one CheckAndBuffer transitions IsAvailable back to true
-	// without buffering (this is the unavailable→available transition path).
-	dbUp.Store(true)
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("ignored")))
-
-	var received []string
-	processor := func(data []byte) error {
-		received = append(received, string(data))
-		return nil
-	}
-
-	flushed := g.Flush(context.Background(), processor)
-	assert.Equal(t, 3, flushed)
-	assert.Equal(t, []string{"a", "b", "c"}, received)
-	assert.Equal(t, 0, g.BufferSize(), "buffer should be empty after successful flush")
-}
-
-func TestFlush_PartialFailureCountsFailed(t *testing.T) {
-	var dbUp atomic.Bool
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return dbUp.Load() })
-
-	dbUp.Store(false)
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("a")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("b")))
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("c")))
-	require.Equal(t, 3, g.BufferSize())
-	require.False(t, g.IsAvailable())
-
-	// Restore availability so Flush will run.
-	dbUp.Store(true)
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("ignored")))
-
-	boom := errors.New("processor boom")
-	var received []string
-	processor := func(data []byte) error {
-		received = append(received, string(data))
-		if string(data) == "b" {
-			return boom
-		}
-		return nil
-	}
-
-	flushed := g.Flush(context.Background(), processor)
-	assert.Equal(t, 2, flushed, "only successful events are counted")
-	assert.Equal(t, []string{"a", "b", "c"}, received, "all events are still processed in order")
-	assert.Equal(t, 0, g.BufferSize(), "buffer is drained even on partial failure")
-}
-
-// ---------------------------------------------------------------------------
-// BufferSize tests
-// ---------------------------------------------------------------------------
-
-func TestBufferSize_ReflectsCurrentOccupancy(t *testing.T) {
-	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return false })
+	assert.Equal(t, degradation.StatusProcessed, status)
+	assert.True(t, g.IsAvailable())
 	assert.Equal(t, 0, g.BufferSize())
+}
 
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("a")))
-	assert.Equal(t, 1, g.BufferSize())
+func TestEvaluate_TransitionUnavailableToAvailable(t *testing.T) {
+	healthy := false
+	g := degradation.NewGracefulDegradation(func(_ context.Context) bool { return healthy })
 
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("b")))
-	assert.Equal(t, 2, g.BufferSize())
+	assert.Equal(t, degradation.StatusUnavailable, g.Evaluate(context.Background(), []byte("e1")))
+	assert.False(t, g.IsAvailable())
 
-	require.True(t, g.CheckAndBuffer(context.Background(), []byte("c")))
-	assert.Equal(t, 3, g.BufferSize())
+	healthy = true
+	assert.Equal(t, degradation.StatusProcessed, g.Evaluate(context.Background(), []byte("e2")))
+	assert.True(t, g.IsAvailable(), "recovery must be observed on the next evaluation")
 }

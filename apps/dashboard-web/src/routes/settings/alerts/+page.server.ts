@@ -16,14 +16,17 @@ export const load: PageServerLoad = async ({ locals }) => {
 		.from(projectMembers)
 		.where(eq(projectMembers.userId, user.id));
 
-	const filteredAlertConfigs = await db
+	// alert_configs.channel_config is JSONB, not a flat channel_target column — see schema.ts and
+	// src/routes/api/alerts/+server.ts for the full note. Mapped to the same channelTarget/windowSeconds
+	// shape the page already renders, so +page.svelte needs no change.
+	const rawAlertConfigs = await db
 		.select({
 			id: alertConfigs.id,
 			projectId: alertConfigs.projectId,
 			channel: alertConfigs.channel,
-			channelTarget: alertConfigs.channelTarget,
+			channelConfig: alertConfigs.channelConfig,
 			frequencyThreshold: alertConfigs.frequencyThreshold,
-			windowSeconds: alertConfigs.windowSeconds,
+			frequencyWindowSeconds: alertConfigs.frequencyWindowSeconds,
 			enabled: alertConfigs.enabled,
 			createdAt: alertConfigs.createdAt,
 		})
@@ -34,6 +37,20 @@ export const load: PageServerLoad = async ({ locals }) => {
 				userProjectMemberships.map((m) => m.projectId)
 			)
 		);
+
+	const filteredAlertConfigs = rawAlertConfigs.map((row) => {
+		const channelConfig = (row.channelConfig ?? {}) as Record<string, unknown>;
+		return {
+			id: row.id,
+			projectId: row.projectId,
+			channel: row.channel,
+			channelTarget: typeof channelConfig.target === 'string' ? channelConfig.target : '',
+			frequencyThreshold: row.frequencyThreshold,
+			windowSeconds: row.frequencyWindowSeconds,
+			enabled: row.enabled,
+			createdAt: row.createdAt,
+		};
+	});
 
 	const userProjects = await db
 		.select({

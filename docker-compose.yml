@@ -106,6 +106,8 @@ services:
             RATELIMIT_STRICT_MODE: "false"
 
     processor:
+        ports:
+            - "8081:8081" # /health — includes dlq_depth (D10); see tools/dlq to replay
         build:
             context: .
             dockerfile: apps/processor-go/Dockerfile
@@ -120,6 +122,7 @@ services:
             migrate:
                 condition: service_completed_successfully
         environment:
+            PROCESSOR_HEALTH_ADDR: ":8081"
             POSTGRES_HOST: postgres
             POSTGRES_PORT: 5432
             POSTGRES_USER: sentinel
