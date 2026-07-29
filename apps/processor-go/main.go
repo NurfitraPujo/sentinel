@@ -51,7 +51,7 @@ func main() {
 		// starve every subsequent event (VERIFIED_STATE.md S13). Exhausted
 		// or explicitly-permanent failures are dead-lettered to
 		// DLQSubject/DLQStream instead of looping.
-		MaxDeliver: getEnvInt("PROCESSOR_MAX_DELIVER", 5),
+		MaxDeliver: getEnvInt("PROCESSOR_MAX_DELIVER", 7), // ~8.5min recovery window; see retryBackoff
 		DLQSubject: getEnv("PROCESSOR_DLQ_SUBJECT", "error_events.dlq"),
 		DLQStream:  getEnv("PROCESSOR_DLQ_STREAM", "ERROR_EVENTS_DLQ"),
 	}

@@ -20,7 +20,7 @@ import (
 // subsequent events (VERIFIED_STATE.md S13 / E2E_RECOVERY_PLAN.md P4-4:
 // ~510 unstorable messages produced 5,874 "Processing event" log lines and
 // no newly-published event was ever observed processed).
-const defaultMaxDeliver = 5
+const defaultMaxDeliver = 7
 
 type SubscriberConfig struct {
 	URL         string
@@ -272,8 +272,18 @@ func (s *Subscriber) handleMessage(ctx context.Context, msg *nats.Msg, handler f
 	msg.NakWithDelay(retryBackoff(numDelivered))
 }
 
-// retryBackoff returns the delay before the Nth redelivery. Bounded by design: with the default
-// MaxDeliver of 5 the total retry window is roughly 1+5+15+30 = ~51s of waiting across 5 attempts.
+// retryBackoff returns the delay before the Nth redelivery.
+//
+// The budget is sized for INFRASTRUCTURE RECOVERY, not for poison messages. A content-caused failure
+// never spends it — nats.Permanent dead-letters on the first delivery — so the only thing this window
+// governs is "how long may a database or network outage last before we give up and park the event".
+//
+// It used to be 1+5+15+30 = ~51s, which CI proved is too tight: restarting a Postgres CONTAINER on a
+// GitHub runner took longer than that, so every event was dead-lettered while the database was still
+// coming back up. Local runs never caught it because the restart was faster than the budget. With the
+// schedule below and MaxDeliver 7 the window is ~8.5 minutes, which covers a realistic restart,
+// failover or brief partition. Widening it costs nothing for permanent failures and is the difference
+// between "recovered automatically" and "an operator must run tools/dlq".
 func retryBackoff(numDelivered uint64) time.Duration {
 	schedule := []time.Duration{
 		1 * time.Second,
@@ -281,6 +291,8 @@ func retryBackoff(numDelivered uint64) time.Duration {
 		15 * time.Second,
 		30 * time.Second,
 		60 * time.Second,
+		120 * time.Second,
+		300 * time.Second,
 	}
 	if numDelivered == 0 {
 		return schedule[0]

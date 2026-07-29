@@ -44,8 +44,8 @@ import (
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
-	dbmigrations "github.com/NurfitraPujo/sentinel/packages/db-migrations"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
+	dbmigrations "github.com/NurfitraPujo/sentinel/packages/db-migrations"
 	sharednats "github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	tc "github.com/NurfitraPujo/sentinel/tests/integration/testcontainers"
 	"github.com/golang/protobuf/proto"
@@ -272,7 +272,12 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 
 	// 3. Restart Postgres and wait for it to accept connections again.
 	require.NoError(t, pgContainer.Start(ctx))
-	procgoWaitPostgresReady(t, pool, 90*time.Second)
+	// 4 minutes, not 90s. On a GitHub runner, restarting the Postgres CONTAINER took longer than the
+	// old 90s ceiling AND longer than the subscriber's whole retry budget, so this test failed in CI
+	// while passing locally — the restart was simply faster on a dev machine. The wait must comfortably
+	// exceed the slowest realistic container restart, otherwise this test measures runner speed rather
+	// than the recovery behavior it is supposed to prove.
+	procgoWaitPostgresReady(t, pool, 4*time.Minute)
 
 	// 4. Wait for D10's bounded-retry redelivery to land all N events, then
 	// assert EXACTLY N occurrences exist for the N distinct degraded-error
