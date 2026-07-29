@@ -156,6 +156,43 @@ func procgoMarshal(t *testing.T, evt *sentinelv1.ErrorEvent) []byte {
 	return data
 }
 
+// procgoAdminPool opens a pool to the maintenance database, so it stays usable while the TEST
+// database is refusing connections.
+func procgoAdminPool(ctx context.Context, c *tc.PostgreSQLContainer) (*pgxpool.Pool, error) {
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/postgres?sslmode=disable",
+		tc.DefaultUsername, tc.DefaultPassword, c.HostIP, c.HostPort)
+	return pgxpool.New(ctx, dsn)
+}
+
+// procgoSetDBReachable simulates a database outage WITHOUT touching the container.
+//
+// Neither obvious approach works here. Stopping the container makes Docker assign a new random host
+// port on restart, so every already-open DSN — this test's pool and the processor's own — keeps
+// dialing an address nothing listens on and can never recover (podman preserves the mapping, which is
+// exactly why Stop/Start passed locally and failed on every CI run). And `pg_ctl stop` inside the
+// container kills PID 1, which takes the container down with it (observed: exit 137).
+//
+// Setting CONNECTION LIMIT 0 and terminating existing backends makes new connections fail while the
+// container, the port mapping and the data all survive. That is what an application actually
+// experiences during a database outage: connections refused, then accepted again.
+func procgoSetDBReachable(ctx context.Context, admin *pgxpool.Pool, dbName string, reachable bool) error {
+	limit := "0"
+	if reachable {
+		limit = "-1"
+	}
+	if _, err := admin.Exec(ctx, fmt.Sprintf("ALTER DATABASE %q CONNECTION LIMIT %s", dbName, limit)); err != nil {
+		return err
+	}
+	if !reachable {
+		if _, err := admin.Exec(ctx,
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+			dbName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // procgoWaitPostgresReady polls pool.Ping until it succeeds or timeout
 // elapses. pgxpool reconnects lazily, so this is what actually detects that
 // a restarted Postgres container is accepting connections again.
@@ -257,27 +294,29 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 
 	const n = 5
 
-	// 1. Stop Postgres mid-stream.
-	require.NoError(t, pgContainer.Stop(ctx, nil))
+	// 1. Take the DATABASE down — not the container. See procgoSetDBReachable for why.
+	admin, adminErr := procgoAdminPool(ctx, pgContainer)
+	require.NoError(t, adminErr)
+	t.Cleanup(admin.Close)
+	require.NoError(t, procgoSetDBReachable(ctx, admin, tc.DefaultDatabaseName, false))
+	require.Eventually(t, func() bool {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return pool.Ping(pingCtx) != nil
+	}, 60*time.Second, 250*time.Millisecond, "database never became unreachable — the outage never started")
 
-	// 2. Publish N events while the database is down. Each delivery attempt
-	// will fail ("database unavailable: event returned to NATS for bounded
-	// retry") and the Subscriber NAKs it with backoff — there is no
-	// in-process buffer for ProcessEvent to succeed into anymore.
+	// 2. Publish N events while the database is down. Each delivery attempt fails with "database
+	// unavailable: event returned to NATS for bounded retry" and the Subscriber NAKs it with backoff;
+	// there is no in-process buffer for ProcessEvent to succeed into anymore.
 	for i := 0; i < n; i++ {
 		evt := procgoBuildEvent(projectName, fmt.Sprintf("ProcgoDegradedError%d", i))
 		require.NoError(t, publisher.Publish(ctx, procgoMarshal(t, evt)),
 			"publish must succeed even though the database is down — NATS durability is independent of Postgres")
 	}
 
-	// 3. Restart Postgres and wait for it to accept connections again.
-	require.NoError(t, pgContainer.Start(ctx))
-	// 4 minutes, not 90s. On a GitHub runner, restarting the Postgres CONTAINER took longer than the
-	// old 90s ceiling AND longer than the subscriber's whole retry budget, so this test failed in CI
-	// while passing locally — the restart was simply faster on a dev machine. The wait must comfortably
-	// exceed the slowest realistic container restart, otherwise this test measures runner speed rather
-	// than the recovery behavior it is supposed to prove.
-	procgoWaitPostgresReady(t, pool, 4*time.Minute)
+	// 3. Bring it back. The port never changed, so both pools reconnect on their own.
+	require.NoError(t, procgoSetDBReachable(ctx, admin, tc.DefaultDatabaseName, true))
+	procgoWaitPostgresReady(t, pool, 2*time.Minute)
 
 	// 4. Wait for D10's bounded-retry redelivery to land all N events, then
 	// assert EXACTLY N occurrences exist for the N distinct degraded-error
