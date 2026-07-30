@@ -34,9 +34,18 @@ services:
     nats:
         image: nats:2.10-alpine
         container_name: sentinel-nats
+        # Host ports are parameterized because 4222/8222 are the default NATS ports and therefore the
+        # ports another stack on the same machine is most likely to have already taken — rootless podman
+        # then fails the whole `up` with "listen tcp 0.0.0.0:4222: bind: address already in use", and
+        # every service that depends on nats (nats-init, ingestor, processor, dashboard) silently never
+        # starts. The defaults are unchanged, so CI and a clean machine behave exactly as before; set
+        # NATS_HOST_PORT / NATS_MONITOR_HOST_PORT to coexist with another NATS.
+        #
+        # Only the HOST side moves. In-cluster traffic uses nats://nats:4222 over the compose network and
+        # is unaffected. Host-side clients — tests/e2e, tests/integration, tools/dlq — read NATS_URL.
         ports:
-            - "4222:4222"
-            - "8222:8222"
+            - "${NATS_HOST_PORT:-4222}:4222"
+            - "${NATS_MONITOR_HOST_PORT:-8222}:8222"
         volumes:
             - nats_data:/data
         command: ["-js", "--server_name", "sentinel-nats", "--sd", "/data/jetstream"]

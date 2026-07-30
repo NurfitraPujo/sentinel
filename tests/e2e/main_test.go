@@ -141,9 +141,21 @@ func dialStack(ctx context.Context) error {
 		problems = append(problems, fmt.Sprintf("dashboard: %v", err))
 	}
 
+	// Connecting is not enough: 4222 is THE default NATS port, so any other stack on the machine that
+	// happens to own it will accept the connection and answer happily. A test that then publishes
+	// directly to a stream would be talking to a foreign cluster and would fail — or worse, pass — for
+	// reasons nothing in this repo explains. docker-compose.yml names this server `sentinel-nats`
+	// (`--server_name`), so check we reached ours and say what to do if not.
 	if nc, err := nats.Connect(cfg.NATSURL, nats.Timeout(5*time.Second)); err != nil {
 		problems = append(problems, fmt.Sprintf("nats at %s: %v", cfg.NATSURL, err))
 	} else {
+		if name := nc.ConnectedServerName(); name != "sentinel-nats" {
+			problems = append(problems, fmt.Sprintf(
+				"nats at %s is server %q, not \"sentinel-nats\" — something else owns that port. "+
+					"Start the stack with NATS_HOST_PORT set and point NATS_URL at it "+
+					"(e.g. NATS_HOST_PORT=14222 docker compose up -d, then NATS_URL=nats://localhost:14222)",
+				cfg.NATSURL, name))
+		}
 		nc.Close()
 	}
 
@@ -190,11 +202,18 @@ func checkSchema(ctx context.Context) error {
 	return nil
 }
 
-// waitHTTP polls until the endpoint answers with any non-5xx status. A 401/404 counts as up: this is
-// a liveness probe, not an assertion, and some of these roots legitimately redirect or reject.
+// waitHTTP polls until the endpoint answers with any non-5xx status. A 401/404/3xx counts as up: this
+// is a liveness probe, not an assertion, and some of these roots legitimately redirect or reject —
+// the dashboard root 303s to /auth/signin, which is a perfectly alive dashboard.
+//
+// Redirects are deliberately NOT followed. Following them turns a healthy 303 into whatever the
+// redirect target does, which is both slower and a different question than "is this process serving".
 func waitHTTP(ctx context.Context, url string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	var last error
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {

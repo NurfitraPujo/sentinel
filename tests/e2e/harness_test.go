@@ -720,7 +720,14 @@ func dashboardRequest(t *testing.T, method, path string, user *dashboardUser, bo
 		req.AddCookie(&http.Cookie{Name: "authjs.session-token", Value: user.SessionToken})
 	}
 
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	// Redirects are not followed: an unauthenticated call to a protected route answers with a redirect
+	// to the sign-in page, and that status IS the assertion. Following it would report whatever the
+	// sign-in page returns and quietly turn every authorization check into a pass.
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
