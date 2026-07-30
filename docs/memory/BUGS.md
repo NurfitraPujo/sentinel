@@ -484,3 +484,53 @@ hand-maintained schema copies" note under ARCHITECTURE.md A1.
 `tests/integration/setup_test.go` and neighboring `*_test.go` files (each `MigrationOptions.TableName`),
 `packages/db-migrations/cmd/migrate/`, `scripts/db/init.sql` (a third, independently hand-maintained schema
 copy — see ARCHITECTURE.md A1).
+
+## B9 — A Deployment That Never Connects Two Correct Halves
+
+**Status**: active (two instances fixed 2026-07-30, cause structural)
+
+Both sides of a feature can be complete, wired, and unit-tested, and the feature can still never run,
+because the *deployment* never joins them — and because the join's failure path logs instead of failing.
+
+Instances:
+
+1. The dashboard had no `NATS_URL`, so `createNatsPublisher` fell back to `nats://localhost:4222` —
+   nothing, inside a container. Every `api_key.invalidated` publish failed with ECONNREFUSED and API-key
+   revocation silently degraded from <100ms to the 60s cache TTL. Found by P7's U15 measuring **37.45s**
+   against a 1s bound. One line of compose config: **553µs**.
+2. `sentinel-nats` could not bind 4222 because another stack on the machine owned it, so nats-init,
+   ingestor, processor and dashboard never started — while `podman ps` showed a "running" stack with three
+   containers in `Created`.
+
+**Why it evades every gate**: `pnpm check`, `go vet`, unit tests and even integration tests all pass,
+because none of them exercises the deployed topology. Only a test that speaks to the deployed binaries can
+see it. This is B3's shape ("shipped but never invoked") relocated from code into configuration.
+
+**How to catch it**: assert the *latency* or *effect* of a cross-service signal, not just its presence in
+the code. U15 asserts revocation inside 1 second; that bound is what turned an invisible config gap into a
+measurement. A test that only asserted "revocation eventually works" would still pass today.
+
+## B10 — Tests That Assert The Defect
+
+**Status**: active (four instances fixed 2026-07-30)
+
+A test written to *document* a known bug will assert the broken behaviour, and then it fails when the bug is
+fixed — the exact inverse of what a regression test is for. Worse, it can report PASS while the defect is
+live, because the defect is what makes it pass.
+
+Instances, all in the P7 harness as first written:
+
+- `if accepted != requests` in U20's nil-Redis test: passed *because* 20/20 requests were accepted against
+  a limit of 1. It reported success while S10 was wide open and never printed its own diagnosis.
+- U24 `t.Errorf`'d after confirming the sign-in loop reproduced, and `t.Fatalf`'d if it did not — so it
+  could never pass, in either state of the world.
+- U25 `t.Skip`'d as soon as the fix appeared to have landed. Under `SENTINEL_E2E=1` a skip is a hard
+  failure (P0-4), so the row could never report success either.
+- U25's follow-up grepped the whole file for `'company.com'` and failed on a *comment* documenting the old
+  value — a comment worth keeping.
+
+**The rule**: an assertion states the REQUIRED behaviour and fails until the code meets it. Never the
+observed behaviour. And name the test for the requirement (`ConcurrentRequestsRespectLimit`), not the bug
+(`ConcurrentRequestsExceedLimit`) — a passing test named after the defect reads like the defect is still
+there.
+

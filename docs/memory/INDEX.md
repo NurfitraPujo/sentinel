@@ -7,7 +7,7 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 
 ## State (read first)
 - S0 | Verified State of the Codebase — what actually runs, verified by execution; re-verify anything dated before your current HEAD | audit,build,tests,reality-check | [VERIFIED_STATE.md](VERIFIED_STATE.md) | active
-- P0 | E2E Recovery Plan — phased plan to make every feature work end-to-end, keyed to S0's findings | plan,recovery,ci,e2e | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active
+- P0 | E2E Recovery Plan — phased plan to make every feature work end-to-end, keyed to S0's findings | plan,recovery,ci,e2e | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active — **P7 complete 2026-07-30: all 32 matrix rows green** (56 tests, 0 skips, 124.8s, CI-gated)
 
 > [!WARNING]
 > `specs/*/spec.md` "Completed" and `WORKLOG.md` milestones record *merge events*, not verified behavior.
@@ -25,7 +25,9 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - B4 | One Broken Test File Silently Disables an Entire Go Test Package | go,testing,coverage | [BUGS.md](BUGS.md) | active
 - B5 | Cross-Boundary Payload Contracts Drift With No Test Spanning the Boundary | contracts,sdk,nats,json | [BUGS.md](BUGS.md) | partial (SDK↔ingestor covered by tests/contract; dashboard↔NATS seam still open)
 - B6 | Normalization Destroys the Fields Read After It | processor,normalizer,regression | [BUGS.md](BUGS.md) | active
-- B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active
+- B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active — confirmed again 2026-07-30: /auth/signin looped forever, nobody could sign in
+- B9 | A Deployment That Never Connects Two Correct Halves | deployment,config,nats,b3 | [BUGS.md](BUGS.md) | active — two instances fixed, cause structural
+- B10 | Tests That Assert The Defect | testing,regression,process | [BUGS.md](BUGS.md) | active — four instances fixed 2026-07-30
 - B7 | Authenticated Identity Computed, Then Discarded | security,multitenancy,ingestor | [BUGS.md](BUGS.md) | resolved-2026-07-29
 
 ## Decisions

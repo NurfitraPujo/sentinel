@@ -62,7 +62,9 @@ cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
 ./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
-cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 707 files/0 errors, 19 tests
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 690 files/0 errors, 63 tests
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 56 tests, 0 skips, ~125s — NEEDS the compose stack up
+                                                                  # -tags=e2e is mandatory; without it U8-U10 are silently excluded
 rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
 ```
 
@@ -74,18 +76,20 @@ pin `GOWORK=off` deliberately (see A2) — `contract` is the only workspace-mode
 job-level `continue-on-error` because its failures are real (10 of 75 tests, current count — re-verify, do
 not quote this). Run the relevant command yourself before claiming anything works.
 
-### Known-broken as of 2026-07-29
+### Known-broken as of 2026-07-30
 
-S1–S9 and S11–S17 are **resolved** — see `## Resolved` in `VERIFIED_STATE.md`. S7–S10 remain open, plus gaps
-found while fixing the rest. Do not treat any of these as your regression — pre-existing. Full detail and
-evidence in `docs/memory/VERIFIED_STATE.md`.
+S1–S17 are **resolved**, and so is every defect P7 found — see `## Resolved` in `VERIFIED_STATE.md`.
+**All 32 rows of the use-case matrix are green** (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → 56
+passed, 0 skipped, 124.8s), gated in CI by the `e2e` job.
+
+Remaining known gaps, none of them a regression from that work:
 
 | | Symptom | Cause |
 |---|---|---|
-| S10 | Rate limiting non-atomic; can still fail open | 4 unpipelined Redis calls; `redisClient, _ :=` discards the error |
-| — | DLQ has a producer, no consumer | nothing drains, replays, or alerts on `error_events.dlq` |
-| — | `scripts/db/init.sql` is a third, stale schema | still `CHECK (status IN ('open','resolved','ignored'))`; the processor writes `'unresolved'`; `tests/integration/setup_test.go` applies it ONLY in the testcontainers branch, which is unreachable while the compose stack answers on :8080 |
-| — | Two dashboard API routes 500 on every request | `schema.ts` drift vs the goose migrations: `issueActivity.metadata` has no DB column (`old_value`/`new_value` exist instead); `issueRelations` is missing the DB's NOT NULL `created_by_type`/`created_by`; `issues.ts:57` writes `'status_change'`, the DB constraint requires `'status_changed'` |
+| — | `scripts/db/init.sql` is a **third, stale schema** | still `CHECK (status IN ('open','resolved','ignored'))`. It has now produced three separate defects (the `'stale'`/`'open'` retention bug, `'status_change'` vs `'status_changed'`, and Drizzle-vs-migrations column drift). Deleting it is the real fix and has not been done. |
+| — | The DLQ has ~6,100 dead-lettered events and no consumer | `tools/dlq` can replay them but nothing drains, replays or alerts automatically. The processor correctly reports `attention: dead-lettered events awaiting replay`. |
+| — | Invitation acceptance has no route | U22 proves the create half end to end; nothing anywhere consumes an invitation token. Asserted as a wall, not assumed. |
+| — | `issues.count` can inflate on partial-failure redelivery (S16) | the issue upsert and the occurrence insert are separate transactions with no `event_id` idempotency. U28 asserts occurrences are exactly-once and checks the counter agrees, so a regression is visible. |
 
 ### Working conventions
 

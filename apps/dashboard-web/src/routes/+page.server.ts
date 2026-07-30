@@ -8,7 +8,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const user = await getUser({ locals } as any);
 	
 	if (!user) {
-		redirect(303, '/auth/signin');
+		redirect(303, '/signin');
 	}
 	
 	const userAccess = await getUserProjectAccess(user.id);

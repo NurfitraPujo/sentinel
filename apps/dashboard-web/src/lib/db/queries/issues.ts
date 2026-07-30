@@ -181,6 +181,50 @@ export async function createIssueRelation(
 	});
 }
 
+// Unlink counterpart to createIssueRelation. Deletes the matching issue_relations row and, if one
+// was actually removed, logs an issue_activity row the same way the link path does.
+//
+// eventType is 'linked', not 'unlinked': issue_activity.event_type has a DB CHECK constraint
+// (packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql:88) that only
+// permits 'status_changed' | 'assigned' | 'unassigned' | 'regressed' | 'ai_analysis' | 'linked' — an
+// insert with any other value is rejected outright, and adding a new permitted value requires a
+// migration outside this app's scope. The unlink is distinguished in the payload itself
+// (newValue.action === 'unlink') rather than by a new event_type.
+export async function deleteIssueRelation(
+	sourceIssueId: string,
+	targetIssueId: string,
+	relationType: 'linked_to' | 'caused_by' | 'duplicate_of',
+	createdByType: 'user' | 'agent' | 'system',
+	createdBy: string
+) {
+	return await db.transaction(async (tx) => {
+		const deleted = await tx
+			.delete(issueRelations)
+			.where(
+				and(
+					eq(issueRelations.sourceIssueId, sourceIssueId),
+					eq(issueRelations.targetIssueId, targetIssueId),
+					eq(issueRelations.relationType, relationType)
+				)
+			)
+			.returning();
+
+		if (deleted.length === 0) {
+			return null;
+		}
+
+		await tx.insert(issueActivity).values({
+			issueId: sourceIssueId,
+			eventType: 'linked',
+			actorType: createdByType,
+			actorId: createdBy,
+			newValue: { targetIssueId, relationType, action: 'unlink' },
+		});
+
+		return deleted[0];
+	});
+}
+
 export async function getIssueActivity(issueId: string) {
 	return await db
 		.select()

@@ -1,10 +1,20 @@
 import { db } from '$lib/server/db';
 import { errorOccurrences, issues } from '$lib/db/schema';
-import { sql, lt, and, eq } from 'drizzle-orm';
+import { sql, lt, and } from 'drizzle-orm';
 
+// There is deliberately no "stale issue" count here any more. The stale-marking step this module used to
+// run never did anything, and could not have: it set `status: 'stale'`, which issues.check_status does not
+// permit (only 'unresolved' | 'resolved' | 'ignored'), while filtering on `status = 'open'`, which is also
+// not a permitted value — so the WHERE never matched a row and the invalid SET was never reached. Two
+// mutually-masking bugs: the unreachable filter is precisely what stopped the illegal write from ever
+// throwing, and the endpoint reported markedStaleIssues: 0 forever while appearing to work.
+//
+// Both values came from scripts/db/init.sql, a third and stale schema that still declares
+// CHECK (status IN ('open','resolved','ignored')). The concept is dropped rather than repaired: nothing
+// consumed the count, no spec asks for a 'stale' state, and adding one would mean a migration widening a
+// CHECK constraint to support a feature that has never run.
 export interface RetentionResult {
 	deletedOccurrences: number;
-	markedStaleIssues: number;
 	deletedOrphanedIssues: number;
 	retentionDays: number;
 	cutoffDate: Date;
@@ -21,29 +31,27 @@ export async function cleanupRetainedData(retentionDays: number = 30): Promise<R
 
 	const deletedOccurrences = deletedOccurrencesResult.length;
 
-	const staleIssuesResult = await db
-		.update(issues)
-		.set({ status: 'stale' })
+	// DEFECT FIX: this delete previously had no age check at all — it removed ANY zero-occurrence
+	// issue immediately, including one created moments ago whose first (and only) occurrence had
+	// just been deleted above. An issue with no occurrences yet still has to survive until it is
+	// itself old enough to be outside the retention window.
+	//
+	// `first_seen` (not `last_seen`) is the right column: per packages/db-migrations, it defaults to
+	// now() at INSERT and is never updated again (processor-go's upsert in store.go only bumps
+	// last_seen via GREATEST on conflict) — so it is exactly "when this issue was created" and keeps
+	// that meaning even after its occurrences are gone. `last_seen` would also default to the
+	// creation time for a brand-new issue, but conceptually it tracks the most recent occurrence,
+	// which is the wrong signal to gate deletion of a row precisely because it has none.
+	const orphanedIssuesResult = await db
+		.delete(issues)
 		.where(
 			and(
 				sql`${issues.id} NOT IN (
 					SELECT DISTINCT ${errorOccurrences.issueId}
 					FROM ${errorOccurrences}
 				)`,
-				eq(issues.status, 'open')
+				lt(issues.firstSeen, cutoffDate)
 			)
-		)
-		.returning({ id: issues.id });
-
-	const markedStaleIssues = staleIssuesResult.length;
-
-	const orphanedIssuesResult = await db
-		.delete(issues)
-		.where(
-			sql`${issues.id} NOT IN (
-				SELECT DISTINCT ${errorOccurrences.issueId}
-				FROM ${errorOccurrences}
-			)`
 		)
 		.returning({ id: issues.id });
 
@@ -51,7 +59,6 @@ export async function cleanupRetainedData(retentionDays: number = 30): Promise<R
 
 	return {
 		deletedOccurrences,
-		markedStaleIssues,
 		deletedOrphanedIssues,
 		retentionDays,
 		cutoffDate,

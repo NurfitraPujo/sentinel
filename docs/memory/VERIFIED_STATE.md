@@ -52,8 +52,11 @@ the commands above, and treat this list as a manual fallback.
   `packages/proto/sentinel/v1/error_event.proto` needs `buf generate` before it is live — this is exactly
   how the S3 field-rule bug shipped: the correct CEL expression was already sitting right next to the
   broken field rule in the same file, and regenerating was the step that was skipped.
-- **Running the integration suite CORRUPTS the shared dev database, and this is not hypothetical — it
-  happened again during this verification pass.** `schema_migrations` and `processor_migrations` both
+- **Running the integration suite CORRUPTS the shared dev database.** FIXED 2026-07-29: migration tests
+  now clone a throwaway database per test from a template (`tests/integration/db_migrations_test.go`), so
+  a `down` can no longer drop tables another goose ledger still believes exist. The account below is kept
+  because the *hazard* is structural — every ledger still points at one physical database — and because it
+  is what the fix has to keep preventing. Original report: `schema_migrations` and `processor_migrations` both
   report version `1722000000` (`add_api_key_management`, which `CREATE TABLE`s `project_api_keys`) as
   applied:
   ```
@@ -111,6 +114,75 @@ current picture of module boundaries.
 ---
 
 ## Resolved
+
+### P7 — the E2E proof harness now exists, and closed six defects (2026-07-30)
+
+`tests/e2e/` did not exist until 2026-07-30. All 32 rows of the use-case matrix now have named tests that
+run against the full compose stack.
+
+**Verified**:
+```
+docker compose up -d --build && ./scripts/wait-healthy.sh
+SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1
+→ 56 passed, 0 failed, 0 skipped, 124.816s
+```
+
+Runs in CI on every push (the `e2e` job). `-tags=e2e` is mandatory: `sdk_test.go` carries `//go:build e2e`
+because it imports `packages/sdk-go`, a separate module reachable only in workspace mode, and an excluded
+file leaves no trace in `go test` output — so `sdk_tag_guard_test.go` fails under `SENTINEL_E2E=1` rather
+than let U8-U10 vanish silently.
+
+Six defects were found or measured by these rows and then fixed. **Two were previously unknown**, and both
+of those are the same shape as B3/B8: complete, correct-looking code that never ran in the deployment.
+
+| # | Defect | Found by | Fix |
+|---|---|---|---|
+| 1 | **Nobody could sign in to the dashboard.** `GET /auth/signin` 302'd to itself indefinitely for every visitor. `pages.signIn` was set to the exact path Auth.js reserves for its own signin action, so `@auth/core` redirected back to it forever. Every build, typecheck and unit-test gate was green. **Previously unknown.** | U24 | custom page moved to `/signin`; `hooks.server.ts` reserved-route list updated so it is not mistaken for an org slug |
+| 2 | **Retention deleted brand-new issues.** The orphaned-issue delete had no age check at all — an issue whose first occurrence had just been removed was deleted immediately. **Previously unknown.** | U32 | gated on `first_seen` (never updated after INSERT, unlike `last_seen`) |
+| 3 | **API-key revocation took up to 60s instead of <100ms.** The dashboard service had no `NATS_URL`, so `createNatsPublisher` fell back to `nats://localhost:4222` — nothing, inside a container. Every `api_key.invalidated` publish failed with ECONNREFUSED and revocation silently degraded to cache-TTL latency. Both sides of the feature were correct; only the deployment never connected them, and the failure path logs instead of failing. | U15, U16 | `NATS_URL` + `depends_on: nats` on the dashboard service. **37.45s → 553µs**, and U16 39.3s → 1.89ms |
+| 4 | **S10 — rate limiting overshot and failed open.** 200 concurrent requests against a limit of 100 were accepted **111** times (also 101, 109): four unpipelined Redis round-trips let every request read the same count before any wrote. Separately, a nil Redis client accepted 20/20 against a limit of 1, because the nil-client branch returned before `RATELIMIT_STRICT_MODE` was consulted. | U19, U20 | one atomic Lua script; fail-open is now an explicit logged opt-out (`RATELIMIT_ALLOW_NO_REDIS`) and the default refuses to start; `PORT` override added |
+| 5 | **Alert configs took up to 5 minutes to take effect.** `loadConfigs` ran at construction and then on a hardcoded ticker with no invalidation path. | U27 | subscribe to `alert_config.changed`; backstop ticker cut to 30s and made env-tunable. Also halved the suite: **246s → 124.8s** |
+| 6 | **A relation created through the API could never be removed.** `relations/+server.ts` exported only `POST`; no delete query existed in `src/lib` either. | U13 | `DELETE` handler + `deleteIssueRelation` |
+
+Plus one cross-boundary defect found by an agent reporting across its own scope boundary, not by a row:
+**an alert config created in the UI could never deliver.** The dashboard wrote `channel_config` as
+`{target: …}` while the processor reads `["to"]` for email and `["chat_id"]` for telegram — the row looked
+perfectly well-formed in the database and no sender ever found a destination. This is B5 exactly: a
+cross-boundary payload with no compiler and no shared type. Fixed by writing the per-channel key, with a
+read-side fallback so pre-fix rows still render.
+
+**Two defects were in the tests, not the product, and both are worth remembering** because each would have
+outlived the bug it was written for:
+
+- An **inverted assertion** in U20 read `if accepted != requests`, so it *passed because* all 20 requests
+  were being silently accepted. It reported success while S10 was wide open, never printed its own
+  diagnosis, and would have turned red the moment somebody fixed the limiter. U24 and U25 had the same
+  disease in a different form — they `t.Errorf`'d when the defect reproduced and `t.Fatalf`/`t.Skip`'d when
+  it did not, so they could never pass. All were rewritten to assert the REQUIRED behaviour.
+- A **deadlock in `t.Cleanup`** receiving a second time from a size-1 channel written once. A hang in
+  Cleanup stalls the whole binary, so ten rows (U28-U30, U8-U10, U18, U21) never ran — and `go test`
+  prints nothing at all in that state. It stayed hidden because a verification run was piped through
+  `head`, which closed the pipe and killed `go test` before the hang surfaced. **Never observe a run
+  through a pipeline that can kill it.**
+
+### Dropped: the "stale issue" concept (2026-07-30)
+
+`retention.ts` set `status: 'stale'`, which `issues.check_status` does not permit, while filtering on
+`status = 'open'`, which is also not permitted — so the WHERE never matched and the illegal SET was never
+reached. Two mutually-masking bugs: the unreachable filter is exactly what stopped the invalid write from
+throwing, and the endpoint reported `markedStaleIssues: 0` forever while appearing to work.
+
+Both values came from `scripts/db/init.sql`, a **third and stale schema** that still declares
+`CHECK (status IN ('open','resolved','ignored'))`. The concept was dropped rather than repaired: nothing
+consumed the count and no spec asks for a 'stale' state, so keeping it would have meant a migration
+widening a CHECK constraint for a feature that has never once run.
+
+This is the third defect of this family. The other two: `issue_activity.event_type` written as
+`'status_change'` when the constraint requires `'status_changed'`, and the P7 harness's own readers
+selecting `issues.title` / `first_release` / `last_release` / `error_occurrences.message` / `timestamp` /
+`issue_activity.action` — none of which exist. **As long as `scripts/db/init.sql` exists as a third
+schema, this family keeps reproducing.** Deleting it is the actual fix and has not been done.
+
 
 ### S1 — The entire `tests/unit` package did not compile (RESOLVED 2026-07-28)
 

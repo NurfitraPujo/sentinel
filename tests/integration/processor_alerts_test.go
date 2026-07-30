@@ -527,8 +527,11 @@ func TestAlertsDispatcher_LoadConfigsRespectsContextCancel(t *testing.T) {
 func TestAlertsDispatcher_LoadConfigsTickerFires(t *testing.T) {
 	// The ticker's <-ticker.C branch drives refreshConfigs. Inside the
 	// synctest bubble, time.Sleep advances the synthetic clock so the
-	// 5-minute ticker fires immediately, exercising the otherwise
-	// unreachable branch.
+	// backstop ticker (alerts.ConfigRefreshInterval(); a periodic backstop
+	// now that StartInvalidationSubscriber gives config changes a
+	// sub-second path via NATS — see dispatcher.go's defaultRefreshInterval
+	// doc comment) fires immediately, exercising the otherwise unreachable
+	// branch.
 	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
 		cap := &alertCapture{}
 		ctx := context.Background()
@@ -549,12 +552,12 @@ func TestAlertsDispatcher_LoadConfigsTickerFires(t *testing.T) {
 		// Advance synthetic time past one ticker period so refreshConfigs
 		// fires and the seeded configs become visible to Dispatch.
 		synctest.Wait()
-		time.Sleep(5*time.Minute + time.Second)
+		time.Sleep(alerts.ConfigRefreshInterval() + time.Second)
 		synctest.Wait()
 
 		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
 		assert.Equal(t, 1, cap.count(),
-			"the 5-minute ticker should have fired refreshConfigs which loaded the seeded row")
+			"the backstop ticker should have fired refreshConfigs which loaded the seeded row")
 
 		cancel()
 		<-done

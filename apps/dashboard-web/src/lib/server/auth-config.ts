@@ -7,7 +7,10 @@ import { getUserProjectRoles } from './queries/project-members';
 
 const GOOGLE_WORKSPACE_CLIENT_ID = env.GOOGLE_CLIENT_ID;
 const GOOGLE_WORKSPACE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET;
-const ALLOWED_EMAIL_DOMAIN = 'company.com';
+// P3-4: env-driven, empty (unset) means allow all — a hardcoded literal made "no restriction"
+// inexpressible, permanently rejecting every Google account in any deployment that didn't happen to
+// use 'company.com'.
+const ALLOWED_EMAIL_DOMAIN = env.ALLOWED_EMAIL_DOMAIN ?? '';
 
 const EMAIL_SERVER = env.EMAIL_SERVER;
 const EMAIL_FROM = env.EMAIL_FROM ?? 'noreply@sentinel.local';
@@ -60,7 +63,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 					return false;
 				}
 				const domain = email.split('@')[1];
-				if (domain !== ALLOWED_EMAIL_DOMAIN) {
+				if (ALLOWED_EMAIL_DOMAIN && domain !== ALLOWED_EMAIL_DOMAIN) {
 					return false;
 				}
 			}
@@ -103,6 +106,12 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 	},
 	trustHost: true,
 	pages: {
-		signIn: '/auth/signin',
+		// Auth.js's own `handle` hook reserves /auth/signin for its built-in signin action —
+		// pointing a custom page at that same path makes @auth/core's page handler redirect back
+		// to pages.signIn unconditionally, forever (every visitor 6-hop loops on
+		// GET /auth/signin?callbackUrl=...). The custom page must live at a path Auth.js does not
+		// own; /signin is outside its reserved /auth/* namespace. See
+		// src/routes/signin/+page.server.ts and +page.svelte for the actual page.
+		signIn: '/signin',
 	},
 });

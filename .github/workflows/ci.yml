@@ -414,3 +414,59 @@ jobs:
       - name: tests/contract/ not present yet
         if: steps.check.outputs.present != 'true'
         run: echo "::notice::tests/contract/ does not exist yet (P2-4 in docs/plans/E2E_RECOVERY_PLAN.md). Not failing the build for its absence, but this job will hard-fail on any future test failure once it lands."
+
+  # ---------------------------------------------------------------------------------------------------------
+  # e2e: the P7 proof harness — the deliverable docs/plans/E2E_RECOVERY_PLAN.md exists to make possible. It
+  # boots the full compose stack and drives all 32 rows of the use-case matrix through the real HTTP
+  # surfaces, the real NATS hop, the real processor and the real database. No mocks, no in-process
+  # shortcuts.
+  #
+  # Why it is a separate job from `integration` rather than more cases inside it: this suite asserts
+  # end-user behaviour against deployed binaries, while tests/integration asserts package behaviour with
+  # testcontainers. They fail for different reasons and a mixed job makes triage guesswork.
+  #
+  # SENTINEL_E2E=1 is what makes this job honest. Without it a missing dependency makes every test SKIP and
+  # the job reports success having asserted nothing — the exact failure P0-4 exists to prevent. With it, a
+  # missing stack is fatal and no test may skip for any reason.
+  #
+  # -tags=e2e is REQUIRED, not optional. tests/e2e/sdk_test.go carries `//go:build e2e` because it imports
+  # packages/sdk-go, a separate module reachable only in workspace mode; without the tag that file is
+  # excluded and rows U8-U10 silently do not run. An excluded file leaves no trace in `go test` output at
+  # all, unlike a skip — so tests/e2e/sdk_tag_guard_test.go fails under SENTINEL_E2E=1 to make the omission
+  # loud. Dropping the tag here would trip that guard rather than quietly lose coverage.
+  #
+  # No GOWORK=off here, deliberately: this job runs in workspace mode so the real SDK is importable. The
+  # go-root job keeps GOWORK=off for module-graph fidelity (constraint A2 in docs/memory/ARCHITECTURE.md).
+  #
+  # No continue-on-error. Every row was green when this job was added; a failure here is a real regression
+  # in shipped behaviour, which is the whole point of the suite.
+  # ---------------------------------------------------------------------------------------------------------
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Boot the compose stack
+        run: docker compose up -d --build
+
+      - name: Wait for the stack to become healthy
+        run: ./scripts/wait-healthy.sh
+
+      - name: go test ./tests/e2e/... (SENTINEL_E2E=1 — skips are failures)
+        env:
+          SENTINEL_E2E: "1"
+        run: go test -tags=e2e ./tests/e2e/... -count=1 -timeout 20m
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --tail=500
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v

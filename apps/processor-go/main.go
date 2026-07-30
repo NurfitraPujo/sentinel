@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -62,7 +63,35 @@ func main() {
 	}
 	defer subscriber.Close()
 
+	// alert_config.changed lets alerts.Dispatcher reload alert_configs promptly after the dashboard
+	// creates/updates/deletes a config, instead of waiting up to alerts.ConfigRefreshInterval() for the
+	// backstop ticker (see alerts.Dispatcher.StartInvalidationSubscriber and E2E_RECOVERY_PLAN.md U27).
+	//
+	// Do NOT discard this error the way redisClient's is discarded elsewhere in this codebase (BUGS.md
+	// S10) — mirrors apps/ingestor-go/main.go's api_key.invalidated wiring: an unavailable subscriber
+	// must be loud, not silent. Unlike API-key invalidation, correctness here never rests on this
+	// subscriber (the ticker backstop runs regardless), so the default is non-fatal.
+	alertConfigSubCfg := nats.SubscriberConfig{
+		URL:       getEnv("NATS_URL", "nats://localhost:4222"),
+		Stream:    getEnv("ALERT_CONFIG_STREAM", "ALERT_CONFIG"),
+		Subject:   "alert_config.changed",
+		Consumer:  "processor_alert_config_changed",
+		BatchSize: 10,
+		BatchWait: 1 * time.Second,
+	}
+	alertConfigSub, alertConfigSubErr := nats.NewSubscriber(ctx, alertConfigSubCfg)
+	if alertConfigSubErr != nil {
+		if getEnv("ALERT_CONFIG_INVALIDATION_REQUIRED", "false") == "true" {
+			log.Fatalf("Failed to subscribe to alert_config.changed (set ALERT_CONFIG_INVALIDATION_REQUIRED=false to start anyway, accepting up to the periodic backstop refresh interval for new/updated alert configs): %v", alertConfigSubErr)
+		}
+		log.Printf("WARNING: alert_config.changed subscriber unavailable (%v). Alert config changes will take up to %s (the periodic backstop) to take effect.", alertConfigSubErr, alerts.ConfigRefreshInterval())
+		alertConfigSub = nil
+	} else {
+		defer alertConfigSub.Close()
+	}
+
 	proc := service.NewProcessorService(db)
+	proc.Alerts().StartInvalidationSubscriber(alertConfigSub)
 
 	if err := proc.VerifyAuditLogTable(ctx); err != nil {
 		log.Fatalf("AUDIT_VERIFICATION_FAILED: audit_logs table is not writable: %v", err)

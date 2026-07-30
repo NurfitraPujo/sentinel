@@ -1,24 +1,31 @@
 package e2e
 
 // This file drives U19-U20 of the P7 use-case matrix (docs/plans/E2E_RECOVERY_PLAN.md, "## P7 — The E2E
-// proof harness") against the real ingestor and defect S10 (docs/memory/VERIFIED_STATE.md).
+// proof harness") against the real ingestor. It is the regression test for defect S10
+// (docs/memory/VERIFIED_STATE.md), which these tests first MEASURED and which P3-3 then fixed.
 //
-// Both rows assert behaviour the product does NOT currently implement, and both tests below are
-// expected to FAIL. That failure is the deliverable: it turns "S10 is open" from a code-reading claim
-// into a measured fact. Nothing here weakens an assertion, adds a skip, or retargets an expectation so
-// the suite goes green — see the package comment in main_test.go on why a skip is treated as a lie.
+// What they measured while S10 was open, so a regression is recognizable:
 //
-// middleware/ratelimit.go does four unpipelined Redis round-trips per request — ZRemRangeByScore,
-// ZCard, decide, ZAdd/Expire — so concurrent requests can all read the same count before any of them
-// writes (U19). main.go:103 is `redisClient, _ := redis.NewClient(ctx, redisCfg)`, discarding the
-// connection error, and ratelimit.go:44 is an unconditional `if rl.client == nil { next.ServeHTTP(...);
-// return }` — a nil Redis client silently disables rate limiting for every request, regardless of
-// RATELIMIT_STRICT_MODE (U20).
+//   - 200 genuinely concurrent requests against a limit of 100 were accepted 111 times (also seen at 101
+//     and 109). middleware/ratelimit.go did four unpipelined Redis round-trips — ZRemRangeByScore, ZCard,
+//     decide, ZAdd — so concurrent requests all read the same count before any of them wrote. It is one
+//     atomic Lua script now.
+//   - A nil Redis client accepted 20/20 requests against a limit of 1. main.go discarded
+//     redis.NewClient's error, and ratelimit.go's nil-client branch returned before RATELIMIT_STRICT_MODE
+//     was ever consulted, so the fail-open was unconditional. Failing open is now an explicit, logged
+//     opt-out and the default is to refuse.
 //
-// R1 (VERIFIED_STATE.md) is worth remembering here: this exact middleware once silently bypassed rate
-// limiting for 100% of requests because of a context-key type mismatch, and its own tests passed the
-// whole time. If either test below sees ZERO limiting rather than sloppy limiting, that is the first
-// thing to rule out — not assumed away.
+// Two warnings for whoever edits these next.
+//
+// R1 (VERIFIED_STATE.md): this exact middleware once bypassed rate limiting for 100% of requests because
+// of a context-key type mismatch, and its own tests passed the whole time. If a test here ever sees ZERO
+// limiting rather than sloppy limiting, rule that out first rather than assuming away.
+//
+// And the assertions must keep describing the REQUIRED behaviour, never the observed behaviour. An
+// earlier draft of the nil-client test asserted `accepted != requests`, which passed BECAUSE all 20
+// requests were being silently accepted — it reported success while S10 was wide open and would have
+// turned red the moment the bug was fixed. A test that encodes current behaviour proves nothing and
+// obstructs the fix.
 
 import (
 	"bytes"
@@ -92,15 +99,15 @@ func TestU19_SequentialRequestsCutOverExactlyAtLimit(t *testing.T) {
 	f.waitForOccurrences(accepted)
 }
 
-// TestU19_ConcurrentRequestsExceedLimit is the row's actual assertion, and is expected to FAIL.
+// TestU19_ConcurrentRequestsRespectLimit is the row's actual assertion, and P3-3's stated acceptance
+// criterion: "an integration test firing 200 concurrent requests against a limit of 100 observes ≤100
+// accepted." It observed 111 before the fix.
 //
-// docs/plans/E2E_RECOVERY_PLAN.md P3-3's acceptance criterion is explicit: "an integration test firing
-// 200 concurrent requests against a limit of 100 observes ≤100 accepted (currently it will observe
-// ~200)." middleware/ratelimit.go's ZRemRangeByScore -> ZCard -> decide -> ZAdd sequence is four
-// separate Redis round-trips with no pipelining or Lua atomicity, so under genuine concurrency every
-// request can read the ZCard count before any request's ZAdd has landed — the effective limit collapses
-// to "however many requests the server can accept in parallel," not the configured RPM.
-func TestU19_ConcurrentRequestsExceedLimit(t *testing.T) {
+// The limiter is now a single Lua script, which Redis runs to completion before servicing any other
+// command, so there is no window in which two callers both see the pre-write count. A failure here means
+// that atomicity has been lost — most likely by someone splitting the script back into separate calls,
+// or by a pipeline that is not actually atomic.
+func TestU19_ConcurrentRequestsRespectLimit(t *testing.T) {
 	requireStack(t)
 	f := newFixture(t)
 
@@ -140,11 +147,12 @@ func TestU19_ConcurrentRequestsExceedLimit(t *testing.T) {
 	f.waitForOccurrences(accepted)
 
 	if accepted > limit {
-		t.Errorf("S10 confirmed open (U19): fired %d genuinely concurrent requests against a key with "+
+		t.Errorf("S10 REGRESSED (U19): fired %d genuinely concurrent requests against a key with "+
 			"rate_limit_rpm=%d; want at most %d accepted (202), observed %d accepted and %d rejected (429). "+
-			"middleware/ratelimit.go's ZRemRangeByScore -> ZCard -> decide -> ZAdd is four unpipelined Redis "+
-			"round-trips, so concurrent requests read the same count before any of them writes, making the "+
-			"effective limit unbounded under real concurrency.", fire, limit, limit, accepted, limited)
+			"The limiter must decide and record in ONE atomic Redis operation (a Lua script); if the trim, "+
+			"count, decide and record steps have been split back into separate round-trips, concurrent "+
+			"requests read the same count before any of them writes and the effective limit becomes "+
+			"unbounded. Pre-fix this observed 111.", fire, limit, limit, accepted, limited)
 	}
 }
 
@@ -227,7 +235,7 @@ func ratelimitFireConcurrent(t *testing.T, f *fixture, apiKey string, n int) []i
 // U20 — an unreachable Redis at boot must refuse to start or log an explicit opt-out
 // ---------------------------------------------------------------------------------------------------
 
-// TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal builds and runs the REAL ingestor binary
+// TestU20_DeadRedisAtBootIsRefusedNotIgnored builds and runs the REAL ingestor binary
 // from source (not the compose container, which has a healthy Redis) against a genuinely unreachable
 // Redis address, using the same Postgres and NATS the compose stack itself uses. It is expected to FAIL.
 //
@@ -247,9 +255,9 @@ func ratelimitFireConcurrent(t *testing.T, f *fixture, apiKey string, n int) []i
 // broken Redis with no decision ever logged about it.
 //
 // The second half of U20 — that a request against a live process is not silently accepted — is proven
-// by TestU20_NilRedisClientSilentlyBypassesRateLimit below, at the package boundary, because a live HTTP
+// by TestU20_UnavailableRedisDoesNotFailOpen below, at the package boundary, because a live HTTP
 // call to THIS standalone process is not obtainable while its port is taken.
-func TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal(t *testing.T) {
+func TestU20_DeadRedisAtBootIsRefusedNotIgnored(t *testing.T) {
 	requireStack(t)
 
 	bin := ratelimitBuildIngestor(t)
@@ -337,7 +345,7 @@ func TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal(t *testing.T) 
 			reason = "it exited non-zero for an unrelated reason — see the captured log's final lines " +
 				"(host port 8080 is already held by the compose ingestor container in this environment)"
 		}
-		t.Errorf("S10 confirmed open (U20): standalone ingestor given an unreachable Redis "+
+		t.Errorf("S10 REGRESSED (U20): standalone ingestor given an unreachable Redis "+
 			"(REDIS_ADDR=127.0.0.1:1) never logged any application-level decision about it — no refusal, "+
 			"no explicit opt-out. reachedStartLine=%v (it proceeded to \"Starting ingestor\" while Redis was "+
 			"still down); %s. main.go:103's `redisClient, _ := redis.NewClient(...)` discards the connection "+
@@ -347,17 +355,17 @@ func TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal(t *testing.T) 
 	}
 }
 
-// TestU20_NilRedisClientSilentlyBypassesRateLimit is the second half of U20's proof: given a nil Redis
+// TestU20_UnavailableRedisDoesNotFailOpen is the second half of U20's proof: given a nil Redis
 // client — the EXACT state main.go produces at apps/ingestor-go/main.go:103 when redis.NewClient's
 // connection error is discarded — does an authenticated request get silently accepted with no rate
-// limiting applied? It is expected to FAIL.
+// limiting applied? It must not.
 //
 // This exercises the real `middleware.RateLimiter` type from apps/ingestor-go/middleware, wired exactly
 // as main.go wires it (`middleware.NewRateLimiter(redisClient)` with `redisClient == nil`), and the real
 // `auth.WithIdentity` context the authentication middleware would have already populated for a valid,
 // authenticated request. Nothing here is reimplemented or mocked; it is the shipped code with the one
 // input (a nil client) that a Redis outage at boot actually produces.
-func TestU20_NilRedisClientSilentlyBypassesRateLimit(t *testing.T) {
+func TestU20_UnavailableRedisDoesNotFailOpen(t *testing.T) {
 	requireStack(t)
 
 	var nilRedisClient *libredis.Client
@@ -416,7 +424,7 @@ func TestU20_NilRedisClientSilentlyBypassesRateLimit(t *testing.T) {
 	// What U20 actually requires: Redis being unavailable must never mean "no limit". At most `rpm`
 	// requests may be accepted, whether the middleware limits them or refuses them outright.
 	if accepted > rpm {
-		t.Errorf("S10 confirmed open (U20): with rate_limit_rpm=%d and Redis unreachable (nil client — the "+
+		t.Errorf("S10 REGRESSED (U20): with rate_limit_rpm=%d and Redis unreachable (nil client — the "+
 			"exact state main.go:103 produces when redis.NewClient's error is discarded), at most %d request(s) "+
 			"may be accepted; instead %d/%d were silently accepted with no limiting applied at all "+
 			"(%d were 429, %d were 5xx). The fail-open is unconditional on RATELIMIT_STRICT_MODE: "+
