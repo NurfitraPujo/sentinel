@@ -14,6 +14,9 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 > Several features marked Completed are unreachable at runtime. Check [VERIFIED_STATE.md](VERIFIED_STATE.md)
 > before building on any of them.
 
+## Deferred work (read before assuming something is missing by accident)
+- P9 | Deferred work, with the reason and the acceptance bar for each | backlog,deferred,process | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active — 4 items consciously deferred 2026-07-30: org-wide alert UI, observability, S16 idempotency, invitation acceptance
+
 ## Architecture
 - A1 | Unified Migration Directory Boundary | migrations,architecture,monorepo,postgres | [ARCHITECTURE.md](ARCHITECTURE.md) | active
 - A2 | Three-Module Go Layout, Workspace Mode for Local/Contract Tests Only (GOWORK=off in CI's go-root) | go,modules,sdk,testing,gowork | [ARCHITECTURE.md](ARCHITECTURE.md) | active
@@ -23,7 +26,7 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - B2 | Reserved Path Collision Guard for Dynamic Slug Routing | routing,sveltekit,slug,guard | [BUGS.md](BUGS.md) | active
 - B3 | "Shipped" Features That Are Never Invoked From main() | wiring,dead-code,process | [BUGS.md](BUGS.md) | active
 - B4 | One Broken Test File Silently Disables an Entire Go Test Package | go,testing,coverage | [BUGS.md](BUGS.md) | active
-- B5 | Cross-Boundary Payload Contracts Drift With No Test Spanning the Boundary | contracts,sdk,nats,json | [BUGS.md](BUGS.md) | partial (SDK↔ingestor covered by tests/contract; dashboard↔NATS seam still open)
+- B5 | Cross-Boundary Payload Contracts Drift With No Test Spanning the Boundary | contracts,sdk,nats,json | [BUGS.md](BUGS.md) | active — recurred TWICE on 2026-07-30 (alert channel_config `{target}` vs `["to"]`; DLQ class `"unknown"` vs `"unclassified"` within an hour of the contract existing). Shared constants are the mitigation that works
 - B6 | Normalization Destroys the Fields Read After It | processor,normalizer,regression | [BUGS.md](BUGS.md) | active
 - B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active — confirmed again 2026-07-30: /auth/signin looped forever, nobody could sign in
 - B9 | A Deployment That Never Connects Two Correct Halves | deployment,config,nats,b3 | [BUGS.md](BUGS.md) | active — two instances fixed, cause structural
@@ -42,6 +45,9 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - D9 | Dual-Layer Multi-Tenant API Key Authentication with NATS Invalidation & Hierarchical Sliding-Window Rate Limiting | multitenancy,apikeys,auth,ratelimit,nats,go | [DECISIONS.md](DECISIONS.md) | active — "hierarchical" is false (per-key only, corrected); rate limiting was 100% bypassed until R1
 - D10 | Bounded-Retry NATS Delivery with Dead-Letter Capture | nats,jetstream,reliability,delivery,dlq | [DECISIONS.md](DECISIONS.md) | active
 - D11 | APIKey/ProjectKey Split — a Project Name Is Never a Credential | sdk,go,auth,multitenancy,contracts | [DECISIONS.md](DECISIONS.md) | active
+- D12 | Two-Layer Alert Configs (organization-wide + project-scoped), UNION not override | alerts,multitenancy,rbac,postgres | [DECISIONS.md](DECISIONS.md) | active — org-wide is API-only, see P9-1
+- D13 | Every JetStream Stream Is Bounded; Discard Policy Chosen Per Role | nats,jetstream,ops,outage | [DECISIONS.md](DECISIONS.md) | active
+- D14 | Dead Letters Carry a Machine-Readable Class; Permanent Failures Never Auto-Replayed | nats,dlq,ops,contracts | [DECISIONS.md](DECISIONS.md) | active
 
 ## Workflow
 - W1 | Adopted CEL for Protobuf Validation | protobuf,validation,buf | [WORKLOG.md](WORKLOG.md) | active

@@ -916,6 +916,85 @@ unreachable code across four separate features.** Add to the definition-of-done 
 
 ---
 
+## P9 — Deferred work (explicitly deferred, not forgotten)
+
+*Every item here was identified with evidence, consciously deferred, and left with the reason and the
+acceptance bar written down. This section exists because this repository's characteristic failure is work
+whose status is recorded optimistically and then believed — `specs/` was full of features marked Completed
+that did not execute. A deferral that is not written down becomes an unknown, and an unknown becomes a
+surprise.*
+
+They were deferred out of the DLQ-wiring PR deliberately: it was already 27 files and +3,202 lines, it
+carries an urgent outage fix (unbounded `ERROR_EVENTS` rejecting publishes when full), and today's defects
+came overwhelmingly from *cross-boundary* changes — bundling more unrelated boundaries multiplies exactly
+that risk, and destroys revert granularity when one piece misbehaves.
+
+### P9-1 · Organization-wide alert configs have no UI
+
+**State**: the capability is complete and tested at the schema, API, RBAC and processor-resolution layers.
+`src/routes/settings/alerts/+page.svelte` and its loader still build and list **project-scoped configs
+only**, so an org-wide config can only be created by calling the API directly.
+
+**Why deferred**: it completes the feature rather than fixing a defect, and it is the one item that is
+purely additive UI.
+
+**Acceptance**: the alerts settings page lists both layers, distinguishes them (the API already returns
+`scope: 'organization' | 'project'` — do not re-infer it from a null `projectId`), and only offers
+org-wide creation to a role holding `manage_keys`. A user who can see an org-wide config must not be able
+to edit it without that permission — the API enforces this from the stored row; the UI must not imply
+otherwise.
+
+### P9-2 · No structured logging, no metrics, no tracing
+
+**State**: every service uses stdlib `log`. There is no `slog`, no `/metrics`, no trace propagation
+anywhere. An error-tracking product with no observability of its own.
+
+**Why deferred**: it touches every service and is large enough to deserve its own review.
+
+**Why it should go FIRST of the remaining items**: it is what makes the next defect diagnosable. Several
+defects found on 2026-07-30 were only found by hand-attaching to a live stack and reading container logs —
+the API-key revocation gap surfaced only because a test measured latency, and the JetStream storage
+exhaustion surfaced as unrelated test failures. Structured logs with request IDs and a DLQ/ingest metric
+would have surfaced both directly.
+
+**Acceptance**: `slog` with request IDs across ingestor/processor/dashboard; a `/metrics` endpoint on the
+Go services exposing at least ingest rate, processing latency, DLQ depth and publish failures; and one
+e2e row asserting a request ID propagates from `/ingest` through to the processor's log line for the same
+event.
+
+### P9-3 · S16 — `issues.count` can inflate on partial-failure redelivery
+
+**State**: the issue upsert and the occurrence insert are separate transactions with no `event_id`
+idempotency key, so a redelivery that lands after the upsert but before the insert can increment the
+counter twice for one event. U28 currently asserts occurrences are exactly-once **and** that
+`issues.count` agrees, so a regression is visible — but the design has no key preventing it.
+
+**Why deferred**: it changes the processor's write path, which is the most correctness-sensitive code in
+the system, and deserves isolated testing and revert granularity.
+
+**Acceptance**: an idempotency key derived from the event (not the delivery) makes a replayed event a no-op
+at both write sites; U28 extended to force a mid-transaction redelivery and assert `issues.count` is
+exact.
+
+### P9-4 · Invitation acceptance has no route
+
+**State**: `POST /api/organizations/[orgId]/invitations` creates a real `organization_invitations` row and
+is proven end to end by U22. **Nothing anywhere consumes an invitation token** — confirmed by source grep
+and by live-probing five candidate accept URLs, all 404. U22 asserts the wall rather than assuming it.
+
+**Why deferred**: it is a missing product feature, not a defect in shipped behaviour.
+
+**Acceptance**: an accept route that consumes the token exactly once, creates the `organization_members`
+row at the invited role, rejects an expired or already-used token, and U22 extended past the wall.
+
+### Not deferred — decided against
+
+**A graceful in-flight drain on processor SIGTERM.** P8-1 listed it as a gap. It is not a correctness
+problem: unACKed messages are redelivered, which U28 verifies, so an abrupt stop costs duplicate work
+rather than data. Worth doing if someone is already in that code; not worth a dedicated change.
+
+---
+
 ## 3. Sequencing summary
 
 | Phase | Blocking? | Can parallelise? | Gate to advance |

@@ -57,12 +57,12 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 
 ```bash
 rtk go build ./... && rtk go vet ./...          # root module — green
-rtk go test ./tests/unit/...                    # green, 241 assertions
+rtk go test ./tests/unit/...                    # green, 282 assertions
 cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
 ./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
-cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 690 files/0 errors, 63 tests
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 691 files/0 errors, 79 tests
 SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 56 tests, 0 skips, ~125s — NEEDS the compose stack up
                                                                   # -tags=e2e is mandatory; without it U8-U10 are silently excluded
 rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
@@ -87,16 +87,28 @@ was **deleted** on 2026-07-30. Nothing referenced it: no container mounted it, n
 Taskfile comment already recorded that it had never been wired up. It survived only as a source of wrong
 values to copy from.
 
+**Work that is deliberately deferred is documented as P9 in
+[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI, observability,
+S16 `event_id` idempotency, and invitation acceptance, each with the reason and the acceptance bar. Read it
+before concluding something is missing by accident; this repo's characteristic failure is status recorded
+optimistically and then believed.
+
 Remaining known gaps, none of them a regression from that work:
 
 | | Symptom | Cause |
 |---|---|---|
-| — | The DLQ has no automatic drain | `tools/dlq` can now replay (`-execute`) **and discard** (`-purge`), and the 6,148 permanently-dead messages that had accumulated were purged 2026-07-30 — they had exhausted JetStream storage and were failing unrelated integration tests with "insufficient storage resources". Nothing drains it automatically yet, so it still needs an operator. |
+| — | The DLQ needs an operator to drain it | `tools/dlq` can inspect, replay (`-execute`), discard (`-purge`) and drain transient-only (`-drain`), and a `sentinel-dlq-drainer` compose service runs it on a schedule — but it ships gated OFF (`DLQ_DRAINER_ENABLED` and `DLQ_DRAINER_EXECUTE` both `false`), so nothing drains until someone flips both. Permanent-class messages are never auto-replayed by design (D14). Streams are bounded (D13), so a backlog can no longer exhaust storage. |
 | — | Invitation acceptance has no route | U22 proves the create half end to end; nothing anywhere consumes an invitation token. Asserted as a wall, not assumed. |
 | — | `issues.count` can inflate on partial-failure redelivery (S16) | the issue upsert and the occurrence insert are separate transactions with no `event_id` idempotency. U28 asserts occurrences are exactly-once and checks the counter agrees, so a regression is visible. |
 
 ### Working conventions
 
+- **On a machine where another stack owns NATS 4222**, bring sentinel up with
+  `NATS_HOST_PORT=14222 NATS_MONITOR_HOST_PORT=18222 docker compose up -d` and run host-side suites with
+  `NATS_URL=nats://localhost:14222`. `tests/e2e`'s preflight verifies it reached `sentinel-nats` and fails
+  with instructions otherwise — a foreign NATS on 4222 accepts the connection and answers happily, so this
+  is not a hypothetical. `tests/integration` honours an explicit `NATS_URL` as of 2026-07-30 (its compose
+  defaults used to override it silently).
 - **Prefix shell commands with `rtk`** (see `~/.claude/CLAUDE.md`), including inside `&&` chains.
 - Before changing any exported signature under `apps/` or `packages/shared-go/`, grep `tests/unit/` — it is
   one flat Go package, so a single stale file disables all of it (B4).

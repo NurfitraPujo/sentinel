@@ -115,6 +115,58 @@ current picture of module boundaries.
 
 ## Resolved
 
+### Ops hardening: bounded streams, DLQ alerting and draining, two-layer alert configs (2026-07-30)
+
+**Verified**:
+```
+GOWORK=off go vet ./...                                          clean
+go test ./tests/unit/... -count=1                                282 passed (was 251)
+go test ./tests/integration/... -count=1                         ok 49.854s
+SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1           61 passed, 0 failed, 0 skipped, 125.052s
+cd apps/dashboard-web && pnpm check && pnpm test                 691 files/0 errors; 79 tests (was 63)
+```
+CI green on all 9 jobs; `e2e ok 111.145s` and `integration ok 40.925s` read from the job logs, not inferred
+from the green tick.
+
+**The outage that prompted it.** The DLQ silently reached 6,148 messages, exhausted JetStream storage, and
+stream creation began failing with `nats: insufficient storage resources available` — which surfaced as
+eight *unrelated* integration tests failing, and cost real time to trace because the errors looked like
+sentinel bugs (they came from another project's NATS on the default port).
+
+**What was actually wrong was worse than the DLQ.** `ERROR_EVENTS` had `retention=Limits` with no limits and
+`discard=DiscardNew`: 18,654 fully-acked messages retained forever, and a full store REJECTS NEW PUBLISHES —
+ingestion stops at the front door. Both streams are now bounded (D13), and U33 asserts it. That guard is
+real, not fitted: the same probe measured `maxAge=0 maxBytes=-1` before the fix, exactly what it rejects.
+
+**Now true, each with the thing that proves it:**
+
+| Claim | Proof |
+|---|---|
+| Both streams bounded, discard policy per role | U33; read back from the live server after a full rebuild |
+| `nats-init.sh` is idempotent | ran twice against a live server — second run reported "No difference in configuration" for all four streams |
+| DLQ depth/age/class reported actionably | U34; `/health` carries `dlq_threshold`, `dlq_stale_after_seconds`, `dlq_oldest_age_seconds`, `dlq_oldest_class` |
+| Reported depth is live, not a constant | U34 parks a real malformed event and watches the number move |
+| Dead letters carry a machine-readable class | `X-Sentinel-Dlq-Class`, derived from the existing `PermanentError` check (D14) |
+| Permanent failures are never auto-replayed | `tools/dlq -drain` forces `class=transient`; verified live that unclassified messages are refused without an explicit override |
+| Replay caps survive a re-park | content-hash state file, because `deadLetter` rebuilds headers from scratch — proven by observing a replayed message return with none |
+| Alert configs are two-layer | D12; migration `1722100000`; cross-tenant insert rejected by the composite FK on a throwaway database |
+| Org-wide alerts need `manage_keys` | dashboard unit tests; `PUT`/`DELETE` authorize from the stored row, not the request body |
+
+**Deferred, deliberately** — see **P9** in `docs/plans/E2E_RECOVERY_PLAN.md` for the reason and acceptance
+bar of each: org-wide alert UI (P9-1), observability (P9-2, recommended first), S16 `event_id` idempotency
+(P9-3), invitation acceptance route (P9-4).
+
+**Two test seeds were broken by the migration and fixed here**, both found by an agent reporting across its
+own scope boundary rather than left to fail in CI: three raw `alert_configs` INSERTs omitted the new NOT NULL
+`organization_id`, and `tests/integration`'s `seedProject` created an **orphan project with no organization
+at all** — legal, since `projects.organization_id` is nullable, but not a state anything else in the system
+supports.
+
+**One of my own tests was wrong again** (B10): U34 accepted only `"permanent"` or `"transient"`, written
+before `"unclassified"` was added to the same contract an hour later. It now accepts the whole vocabulary and
+nothing outside it, which is what the assertion is for.
+
+
 ### P7 — the E2E proof harness now exists, and closed six defects (2026-07-30)
 
 `tests/e2e/` did not exist until 2026-07-30. All 32 rows of the use-case matrix now have named tests that

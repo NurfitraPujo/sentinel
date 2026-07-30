@@ -485,6 +485,30 @@ hand-maintained schema copies" note under ARCHITECTURE.md A1.
 `packages/db-migrations/cmd/migrate/`, `scripts/db/init.sql` (a third, independently hand-maintained schema
 copy — see ARCHITECTURE.md A1).
 
+## B5 addendum — two more recurrences, 2026-07-30
+
+B5 recurred twice in one day, which is worth recording because both instances were caught by *something
+other than a compiler* and neither would have been caught by a type checker at all.
+
+1. **`alert_configs.channel_config`**: the dashboard wrote `{target: ...}` while the processor read
+   `["to"]` (email) and `["chat_id"]` (telegram). An alert config created in the UI resolved to an empty
+   destination and could never deliver — while the row looked perfectly well-formed in the database. Two
+   agents each owned one side; neither owned the pair.
+2. **The DLQ class vocabulary**: within an hour of the `X-Sentinel-Dlq-Class` contract being written, two
+   independent readers invented different words for the same state — `"unknown"` in the processor's
+   `/health`, `"unclassified"` in `tools/dlq`. Caught only because a live `/health` body disagreed with an
+   e2e assertion.
+
+**What actually works as mitigation**: put the vocabulary in ONE place as exported constants, and have both
+sides import them. `packages/shared-go/nats` now exports `DLQReasonHeader`, `DLQAttemptsHeader`,
+`DLQSourceSubjectHeader`, `DLQClassHeader`, `DLQClassPermanent`, `DLQClassTransient` and
+`DLQClassUnclassified` for exactly this reason. A comment saying "keep these in sync" does not work; a
+constant does.
+
+**Process lesson when splitting work**: whoever owns the contract must write it down *before* the work is
+split, and must own both sides of any wire format. Handing each implementer their own guess at a shared
+vocabulary reproduces this bug every time.
+
 ## B9 — A Deployment That Never Connects Two Correct Halves
 
 **Status**: active (two instances fixed 2026-07-30, cause structural)
