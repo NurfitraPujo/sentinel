@@ -446,27 +446,37 @@ func (f *fixture) issueCount() int {
 }
 
 // issueRow is the subset of `issues` the matrix asserts on.
+//
+// These fields are the REAL columns of `public.issues`, taken from `\d issues` on a migrated database —
+// not from apps/dashboard-web/src/lib/db/schema.ts. The two have drifted before, and drift in that
+// direction is invisible until a query runs: the Drizzle definition is what the dashboard believes,
+// the migrations are what exists. There is no `title`, no `first_release` and no `last_release` column;
+// the human-readable text is `message`, and release tracking is `resolved_in_version` plus
+// error_occurrences.release_version.
+//
+// RegressionStatus and RegressionCount are NOT NULL with defaults ('none', 0), so they are values
+// rather than pointers — a nil check on them would be dead code.
 type issueRow struct {
-	ID               string
-	Fingerprint      string
-	Title            string
-	Status           string
-	Count            int
-	ErrorClass       string
-	RegressionStatus *string
-	RegressionCount  *int
-	LastRegressedAt  *time.Time
-	FirstRelease     *string
-	LastRelease      *string
+	ID                string
+	Fingerprint       string
+	Message           string
+	Status            string
+	Count             int64
+	ErrorClass        string
+	RegressionStatus  string
+	RegressionCount   int
+	LastRegressedAt   *time.Time
+	ResolvedInVersion *string
+	ResolvedAt        *time.Time
 }
 
 // issues returns every issue in this project, oldest first.
 func (f *fixture) issues() []issueRow {
 	f.t.Helper()
 	rows, err := pool.Query(context.Background(),
-		`SELECT id::text, fingerprint, title, status, count, error_class,
+		`SELECT id::text, fingerprint, message, status, count, error_class,
 		        regression_status, regression_count, last_regressed_at,
-		        first_release, last_release
+		        resolved_in_version, resolved_at
 		   FROM issues WHERE project_id = $1 ORDER BY first_seen`, f.ProjectID)
 	if err != nil {
 		f.t.Fatalf("querying issues: %v", err)
@@ -476,9 +486,9 @@ func (f *fixture) issues() []issueRow {
 	var out []issueRow
 	for rows.Next() {
 		var r issueRow
-		if err := rows.Scan(&r.ID, &r.Fingerprint, &r.Title, &r.Status, &r.Count, &r.ErrorClass,
+		if err := rows.Scan(&r.ID, &r.Fingerprint, &r.Message, &r.Status, &r.Count, &r.ErrorClass,
 			&r.RegressionStatus, &r.RegressionCount, &r.LastRegressedAt,
-			&r.FirstRelease, &r.LastRelease); err != nil {
+			&r.ResolvedInVersion, &r.ResolvedAt); err != nil {
 			f.t.Fatalf("scanning issue: %v", err)
 		}
 		out = append(out, r)
@@ -501,26 +511,33 @@ func (f *fixture) onlyIssue() issueRow {
 }
 
 // occurrenceRow is the subset of `error_occurrences` the matrix asserts on.
+//
+// Again these are the real columns: `error_occurrences` has NO `message` and NO `timestamp`. The
+// message belongs to the issue (one message per fingerprint, not per occurrence) and the time column is
+// `created_at`. IssueMessage is joined in because U8 asserts on it.
 type occurrenceRow struct {
 	ID             string
 	IssueID        string
-	Message        string
+	IssueMessage   string
 	Platform       string
 	Environment    string
 	ReleaseVersion *string
 	TraceID        *string
+	SpanID         *string
 	Metadata       []byte
+	Stacktrace     []byte
+	CreatedAt      time.Time
 }
 
 func (f *fixture) occurrences() []occurrenceRow {
 	f.t.Helper()
 	rows, err := pool.Query(context.Background(),
-		`SELECT eo.id::text, eo.issue_id::text, eo.message, eo.platform, eo.environment,
-		        eo.release_version, eo.trace_id, eo.metadata
+		`SELECT eo.id::text, eo.issue_id::text, i.message, eo.platform, eo.environment,
+		        eo.release_version, eo.trace_id, eo.span_id, eo.metadata, eo.stacktrace, eo.created_at
 		   FROM error_occurrences eo
 		   JOIN issues i ON i.id = eo.issue_id
 		  WHERE i.project_id = $1
-		  ORDER BY eo.timestamp`, f.ProjectID)
+		  ORDER BY eo.created_at`, f.ProjectID)
 	if err != nil {
 		f.t.Fatalf("querying occurrences: %v", err)
 	}
@@ -529,8 +546,8 @@ func (f *fixture) occurrences() []occurrenceRow {
 	var out []occurrenceRow
 	for rows.Next() {
 		var r occurrenceRow
-		if err := rows.Scan(&r.ID, &r.IssueID, &r.Message, &r.Platform, &r.Environment,
-			&r.ReleaseVersion, &r.TraceID, &r.Metadata); err != nil {
+		if err := rows.Scan(&r.ID, &r.IssueID, &r.IssueMessage, &r.Platform, &r.Environment,
+			&r.ReleaseVersion, &r.TraceID, &r.SpanID, &r.Metadata, &r.Stacktrace, &r.CreatedAt); err != nil {
 			f.t.Fatalf("scanning occurrence: %v", err)
 		}
 		out = append(out, r)
@@ -541,41 +558,78 @@ func (f *fixture) occurrences() []occurrenceRow {
 	return out
 }
 
-// activity returns this project's issue_activity rows for the given action, newest last.
-func (f *fixture) activity(action string) []map[string]any {
+// activityRow is one `issue_activity` row. The discriminator column is `event_type`, not `action`, and
+// its CHECK constraint permits exactly: status_changed, assigned, unassigned, regressed, ai_analysis,
+// linked. Note `status_changed` — the dashboard once wrote `status_change` and every such insert was
+// rejected by the constraint.
+//
+// OldValue and NewValue are jsonb and nullable. `old_value` is currently always NULL on rows the
+// processor writes; that is a known, recorded gap (DECISIONS.md D7), not something to assert as correct.
+type activityRow struct {
+	EventType string
+	ActorType string
+	ActorID   string
+	OldValue  *string
+	NewValue  *string
+}
+
+// activity returns this project's issue_activity rows of the given event type, oldest first.
+func (f *fixture) activity(eventType string) []activityRow {
 	f.t.Helper()
 	rows, err := pool.Query(context.Background(),
-		`SELECT ia.action, ia.old_value, ia.new_value, ia.actor_type
+		`SELECT ia.event_type, ia.actor_type, ia.actor_id, ia.old_value::text, ia.new_value::text
 		   FROM issue_activity ia
 		   JOIN issues i ON i.id = ia.issue_id
-		  WHERE i.project_id = $1 AND ia.action = $2
-		  ORDER BY ia.created_at`, f.ProjectID, action)
+		  WHERE i.project_id = $1 AND ia.event_type = $2
+		  ORDER BY ia.created_at`, f.ProjectID, eventType)
 	if err != nil {
 		f.t.Fatalf("querying issue_activity: %v", err)
 	}
 	defer rows.Close()
 
-	var out []map[string]any
+	var out []activityRow
 	for rows.Next() {
-		var act, actorType string
-		var oldVal, newVal *string
-		if err := rows.Scan(&act, &oldVal, &newVal, &actorType); err != nil {
+		var r activityRow
+		if err := rows.Scan(&r.EventType, &r.ActorType, &r.ActorID, &r.OldValue, &r.NewValue); err != nil {
 			f.t.Fatalf("scanning issue_activity: %v", err)
 		}
-		out = append(out, map[string]any{
-			"action": act, "old_value": oldVal, "new_value": newVal, "actor_type": actorType,
-		})
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatalf("iterating issue_activity: %v", err)
 	}
 	return out
 }
 
-// setIssueStatus updates an issue the way the dashboard would, so a later event can be observed as a
-// regression. It writes only within this fixture's project.
+// resolve marks an issue resolved AT a specific release, which is what the dashboard does and what
+// regression detection actually compares against.
+//
+// Setting `status='resolved'` alone is not enough and is an easy way to write a test that proves
+// nothing: the processor compares an incoming event's release against `resolved_in_version`
+// (apps/processor-go/store/store.go), and a NULL there makes every later occurrence look like a
+// regression — which would collapse U11 (newer release regresses) and U12 (older release does not)
+// into the same passing case.
+func (f *fixture) resolve(issueID, resolvedInVersion string) {
+	f.t.Helper()
+	tag, err := pool.Exec(context.Background(),
+		`UPDATE issues
+		    SET status = 'resolved', resolved_at = now(), resolved_in_version = $1,
+		        resolved_by_type = 'user', resolved_by = 'e2e-harness'
+		  WHERE id = $2 AND project_id = $3`, resolvedInVersion, issueID, f.ProjectID)
+	if err != nil {
+		f.t.Fatalf("resolving issue %s at %q: %v", issueID, resolvedInVersion, err)
+	}
+	if tag.RowsAffected() != 1 {
+		f.t.Fatalf("resolving issue %s affected %d rows, want 1", issueID, tag.RowsAffected())
+	}
+}
+
+// setIssueStatus sets only the status. `issues.check_status` permits exactly 'unresolved', 'resolved'
+// and 'ignored'. For the resolved case prefer resolve(), which also records the release.
 func (f *fixture) setIssueStatus(issueID, status string) {
 	f.t.Helper()
 	tag, err := pool.Exec(context.Background(),
-		`UPDATE issues SET status = $1, resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE resolved_at END
-		  WHERE id = $2 AND project_id = $3`, status, issueID, f.ProjectID)
+		`UPDATE issues SET status = $1 WHERE id = $2 AND project_id = $3`, status, issueID, f.ProjectID)
 	if err != nil {
 		f.t.Fatalf("setting issue %s status to %q: %v", issueID, status, err)
 	}
