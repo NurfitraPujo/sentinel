@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/dlqmonitor"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -105,12 +106,43 @@ func main() {
 		log.Fatalf("Failed to subscribe: %v", err)
 	}
 
-	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber)
+	// dlqDetailer is a second, read-only JetStream connection used only to enrich the DLQ health
+	// signal with the age/class of the oldest parked message — data DLQStats does not expose and that
+	// packages/shared-go/nats cannot be extended to provide within this change (owned by a parallel
+	// change in flight; see dlqmonitor.JetStreamDetailer's doc comment). Best-effort like
+	// alertConfigSub above: an unavailable detailer degrades /health and the DLQ monitor to
+	// depth/publish-failures-only, it does not fail startup.
+	dlqDetailer, dlqDetailerErr := dlqmonitor.NewJetStreamDetailer(natsCfg.URL)
+	if dlqDetailerErr != nil {
+		log.Printf("WARNING: DLQ detail connection unavailable (%v). /health will report dlq_depth/dlq_publish_failures only, without oldest-message age or class.", dlqDetailerErr)
+		dlqDetailer = nil
+	} else {
+		defer dlqDetailer.Close()
+	}
+
+	dlqThresholds := dlqmonitor.ThresholdsFromEnv()
+
+	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber, dlqDetailer, dlqThresholds)
 	defer func() {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
 		_ = healthSrv.Shutdown(shutdownCtx)
 	}()
+
+	// The DLQ monitor is the "nothing watches that endpoint" fix: /health carries the signal for a
+	// human or an external prober, this loop is the in-process watcher that pages through the existing
+	// alert dispatcher on a Critical-severity transition (see dlqmonitor.Monitor.CheckOnce). Wiring an
+	// AlertConfig is optional (nil when PROCESSOR_DLQ_ALERT_CHANNEL is unset) — the monitor still runs
+	// and logs transitions either way, it just does not dispatch.
+	dlqMonitor := &dlqmonitor.Monitor{
+		Stats:       subscriber,
+		Oldest:      dlqDetailer,
+		Dispatcher:  proc.Alerts(),
+		AlertConfig: alerts.OperationalAlertConfigFromEnv(),
+		Thresholds:  dlqThresholds,
+		Interval:    dlqmonitor.CheckIntervalFromEnv(),
+	}
+	go dlqMonitor.Run(ctx)
 
 	log.Println("Processor started, waiting for events...")
 
@@ -155,7 +187,20 @@ func getEnvInt(key string, defaultValue int) int {
 // dlq_depth > 0 means events are sitting unprocessed and someone must look; replay them with
 // `go run ./tools/dlq`. dlq_publish_failures > 0 is worse: those events could not even be captured
 // in the DLQ and are parked in the source stream instead.
-func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber) *http.Server {
+//
+// status now distinguishes healthy/attention/critical (dlqmonitor.Classify) instead of flipping to
+// "attention" on the first dead-lettered message: a single poison message is normal operation and stays
+// "attention", not "critical" — the same classification the in-process DLQ monitor uses to decide
+// whether to page (see main()'s dlqMonitor and dlqmonitor.Monitor.CheckOnce). dlq_threshold and
+// dlq_stale_after_seconds are the configured thresholds behind that decision, always reported so the
+// status string is never a mystery. dlq_oldest_age_seconds/dlq_oldest_class are best-effort — present
+// only when detailer is non-nil, depth > 0, and the underlying JetStream calls succeed; see
+// dlqmonitor.JetStreamDetailer for why a full permanent/transient breakdown across the whole backlog is
+// deliberately not attempted here.
+//
+// Existing field names (dlq_depth, dlq_publish_failures, dlq_stream, status, database) are unchanged —
+// tests/e2e decodes this body. Only fields are added.
+func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber, detailer dlqmonitor.OldestMessageSource, thresholds dlqmonitor.Thresholds) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		statusCode := http.StatusOK
@@ -173,17 +218,28 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 		}
 
 		if sub != nil {
-			stats, err := sub.DLQStats(reqCtx)
+			body["dlq_threshold"] = thresholds.Depth
+			body["dlq_stale_after_seconds"] = thresholds.CriticalAge.Seconds()
+
+			detail, err := dlqmonitor.GetDetail(reqCtx, sub, detailer)
 			if err != nil {
 				body["dlq_error"] = err.Error()
 			} else {
-				body["dlq_stream"] = stats.Stream
-				body["dlq_depth"] = stats.Depth
-				body["dlq_publish_failures"] = stats.PublishFailures
+				body["dlq_stream"] = detail.Stats.Stream
+				body["dlq_depth"] = detail.Stats.Depth
+				body["dlq_publish_failures"] = detail.Stats.PublishFailures
+				if detail.HasOldestAge {
+					body["dlq_oldest_age_seconds"] = detail.OldestAge.Seconds()
+				}
+				if detail.OldestClass != "" {
+					body["dlq_oldest_class"] = detail.OldestClass
+				}
+
 				// Parked events are not an outage, so this stays 200 — but it must be visible to
 				// whatever scrapes this endpoint rather than buried in a log nobody reads.
-				if stats.Depth > 0 || stats.PublishFailures > 0 {
-					body["status"] = "attention: dead-lettered events awaiting replay (see tools/dlq)"
+				_, statusMsg := dlqmonitor.Classify(detail, thresholds)
+				if statusMsg != dlqmonitor.StatusHealthy {
+					body["status"] = statusMsg
 				}
 			}
 		}

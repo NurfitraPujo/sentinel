@@ -139,6 +139,31 @@ services:
             POSTGRES_DB: sentinel
             NATS_URL: nats://nats:4222
 
+    dlq-drainer:
+        build:
+            context: .
+            dockerfile: scripts/Dockerfile.dlq-drainer
+        container_name: sentinel-dlq-drainer
+        depends_on:
+            nats:
+                condition: service_healthy
+            nats-init:
+                condition: service_completed_successfully
+        environment:
+            NATS_URL: nats://nats:4222
+            DLQ_STREAM: ERROR_EVENTS_DLQ
+            # --- schedule gates: both must be "true" for anything destructive to happen ---
+            DLQ_DRAINER_ENABLED: "false" # flip to "true" to activate the schedule
+            DLQ_DRAINER_EXECUTE: "false" # flip to "true" to let it actually replay/delete; "false" = dry-run reports only
+            # --- schedule tuning ---
+            DLQ_DRAINER_INTERVAL_SECONDS: "3600" # how often it runs (1h)
+            DLQ_DRAINER_LIMIT: "50" # cap on matched messages handled per run (tools/dlq -limit)
+            DLQ_DRAINER_MAX_REPLAYS: "3" # cap on replays per distinct message content, across runs (tools/dlq -max-replays)
+            DLQ_DRAINER_STATE_FILE: /var/lib/dlq-drainer/state.json
+        volumes:
+            - dlq_drainer_state:/var/lib/dlq-drainer
+        restart: unless-stopped
+
     dashboard:
         build:
             context: .
@@ -179,6 +204,7 @@ services:
             DATA_RETENTION_DAYS: "30"
 
 volumes:
+    dlq_drainer_state:
     postgres_data:
     nats_data:
     redis_data:

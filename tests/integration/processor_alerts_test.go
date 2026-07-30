@@ -146,14 +146,29 @@ func postgresConnectionParams() (host, port, user, password, db string) {
 func seedProject(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
 	t.Helper()
 	nonce := time.Now().UnixNano()
+
+	// The project needs an organization. projects.organization_id is nullable, so this used to omit it
+	// and produce an orphan project — which nothing else in the system expects, and which broke the
+	// moment alert_configs gained a NOT NULL organization_id derived from the project (migration
+	// 1722100000): the derivation returned NULL and the insert failed with 23502.
+	var orgID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id::text`,
+		fmt.Sprintf("u14-org-%d", nonce),
+	).Scan(&orgID))
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM organizations WHERE id = $1`, orgID)
+	})
+
 	var projectID string
 	err := pool.QueryRow(ctx,
-		`INSERT INTO projects (name, api_key, api_key_hash)
-		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'))
+		`INSERT INTO projects (name, api_key, api_key_hash, organization_id)
+		 VALUES ($1, $2, encode(digest($3::bytea, 'sha256'), 'hex'), $4)
 		 RETURNING id::text`,
 		fmt.Sprintf("u14-project-%d", nonce),
 		fmt.Sprintf("u14-api-key-%d", nonce),
 		fmt.Sprintf("u14-api-key-%d", nonce),
+		orgID,
 	).Scan(&projectID)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -168,8 +183,10 @@ func seedProject(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
 func seedAlertConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string, threshold int, windowSeconds int, enabled bool) {
 	t.Helper()
 	_, err := pool.Exec(ctx,
-		`INSERT INTO alert_configs (project_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
-		 VALUES ($1, 'email', '{}'::jsonb, $2, $3, $4)`,
+		// organization_id is NOT NULL as of migration 1722100000; derive it from the project so this seed
+		// stays correct without the caller having to know the organization.
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES ($1, (SELECT organization_id FROM projects WHERE id = $1), 'email', '{}'::jsonb, $2, $3, $4)`,
 		projectID, threshold, windowSeconds, enabled,
 	)
 	require.NoError(t, err)

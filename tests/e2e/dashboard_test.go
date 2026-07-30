@@ -163,7 +163,6 @@ func dashCronRequest(t *testing.T, secret string, present bool) dashHTTPResult {
 	return dashHTTPResult{Status: resp.StatusCode, Body: string(raw)}
 }
 
-
 // dashRandomToken returns a fresh random hex token, standing in for the raw token Auth.js would put in
 // a magic-link URL.
 func dashRandomToken(t *testing.T) string {

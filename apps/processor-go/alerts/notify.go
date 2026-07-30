@@ -120,6 +120,49 @@ func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertCo
 	}
 }
 
+// OperationalAlertConfigFromEnv builds the AlertConfig used for operational, non-project alerts — today
+// only the DLQ backlog monitor (apps/processor-go/dlqmonitor). alert_configs rows are per-project
+// (ProjectID, owned through the dashboard's alert-config API); a DLQ backlog belongs to the platform,
+// not any one project, and there is no ProjectID to key a lookup on. Rather than force this into that
+// shape — inventing a magic sentinel ProjectID, or a DB row nothing else in the schema expects — this
+// mirrors NotifierConfigFromEnv's existing split of "channel-wide, deployment-controlled setting" from
+// "per-alert routing target set through the product": PROCESSOR_DLQ_ALERT_CHANNEL/_TO/_CHAT_ID play the
+// same role for the operational alert that alert_configs.channel/channel_config play per-project.
+//
+// If a proper "operational alerts" concept is ever added to the product (e.g. a non-project-scoped
+// alert_configs row, or a dedicated table), this function should be replaced by that lookup — this is
+// documented as the interim shape, not a permanent design decision.
+//
+// Returns nil when PROCESSOR_DLQ_ALERT_CHANNEL is unset, which DispatchOperational and
+// dlqmonitor.Monitor both treat as "operational alerting is disabled" (the /health endpoint still
+// reports DLQ state regardless — this only controls the push side).
+func OperationalAlertConfigFromEnv() *AlertConfig {
+	channel := getEnv("PROCESSOR_DLQ_ALERT_CHANNEL", "")
+	if channel == "" {
+		return nil
+	}
+
+	channelConfig := map[string]interface{}{}
+	switch channel {
+	case "email":
+		if to := getEnv("PROCESSOR_DLQ_ALERT_TO", ""); to != "" {
+			channelConfig["to"] = to
+		} else {
+			log.Printf("alerts: PROCESSOR_DLQ_ALERT_CHANNEL=email but PROCESSOR_DLQ_ALERT_TO is unset; operational DLQ alerts will drop at BuildSender")
+		}
+	case "telegram":
+		// chat_id may be left unset here: BuildSender falls back to the shared
+		// ALERT_TELEGRAM_CHAT_ID default when ChannelConfig has none.
+		if chatID := getEnv("PROCESSOR_DLQ_ALERT_CHAT_ID", ""); chatID != "" {
+			channelConfig["chat_id"] = chatID
+		}
+	default:
+		log.Printf("alerts: unknown PROCESSOR_DLQ_ALERT_CHANNEL=%q (want \"email\" or \"telegram\"); operational DLQ alerts will drop at BuildSender", channel)
+	}
+
+	return &AlertConfig{Channel: channel, ChannelConfig: channelConfig, Enabled: true}
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

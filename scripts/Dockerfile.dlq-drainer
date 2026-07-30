@@ -1,0 +1,49 @@
+# Builds tools/dlq into a small standalone image that runs it on a schedule (see tools/dlq/entrypoint.sh)
+# instead of embedding drain logic as a goroutine inside the processor. Reuses the exact same tested CLI
+# an operator runs by hand — see tools/dlq/main.go's -drain flag — rather than a second, divergent
+# implementation.
+#
+# Mirrors apps/processor-go/Dockerfile's build pattern (root build context, since tools/dlq is part of
+# the root Go module and needs the whole module tree for `go build`).
+
+# Stage 1: Build
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+# Copy entire project for module resolution (tools/dlq imports packages/shared-go/nats, part of the
+# root module).
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /dlq ./tools/dlq/
+
+# Stage 2: Final
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates tzdata
+
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
+
+WORKDIR /app
+
+COPY --from=builder /dlq /usr/local/bin/dlq
+COPY tools/dlq/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    mkdir -p /var/lib/dlq-drainer && chown appuser:appgroup /var/lib/dlq-drainer
+
+USER appuser
+
+# Safe-by-default: both must be explicitly overridden to "true" for the schedule to do anything
+# destructive. See tools/dlq/entrypoint.sh for the full knob list.
+ENV DLQ_DRAINER_ENABLED=false
+ENV DLQ_DRAINER_EXECUTE=false
+ENV DLQ_DRAINER_INTERVAL_SECONDS=3600
+ENV DLQ_DRAINER_LIMIT=50
+ENV DLQ_DRAINER_MAX_REPLAYS=3
+ENV DLQ_DRAINER_STATE_FILE=/var/lib/dlq-drainer/state.json
+ENV NATS_URL=nats://localhost:4222
+ENV DLQ_STREAM=ERROR_EVENTS_DLQ
+
+ENTRYPOINT ["/app/entrypoint.sh"]

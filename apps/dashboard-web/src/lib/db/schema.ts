@@ -135,9 +135,15 @@ export const errorSearchIndex = pgTable('error_search_index', {
 // frequency_window_seconds (integer) — NOT channel_target (varchar) / window_seconds. This drift made
 // every GET/POST/PUT/DELETE on /api/alerts 500 (42703) in the same way as the issue_activity/issue_relations
 // drift this file was already carrying; found and fixed alongside it (P6-3).
+//
+// organizationId/projectId shape matches 1722100000_add_alert_config_org_layer.sql, which in turn mirrors
+// projectApiKeys above: organizationId NOT NULL, projectId nullable, NULL meaning organization-wide (applies
+// to every project in the organization). A composite FK on (projectId, organizationId) enforces at the DB
+// level that a project-scoped config's project actually belongs to the organization it names.
 export const alertConfigs = pgTable('alert_configs', {
 	id: uuid('id').primaryKey().defaultRandom(),
-	projectId: uuid('project_id').notNull().references(() => projects.id),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+	projectId: uuid('project_id').references(() => projects.id),
 	channel: varchar('channel', { length: 20 }).notNull(),
 	channelConfig: jsonb('channel_config').notNull().default({}),
 	frequencyThreshold: integer('frequency_threshold').notNull().default(50),

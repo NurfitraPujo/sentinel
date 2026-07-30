@@ -139,8 +139,12 @@ func alertsSeedConfig(t *testing.T, f *fixture, channel string, channelConfig ma
 
 	var id string
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO alert_configs (project_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
-		 VALUES ($1, $2, $3::jsonb, $4, $5, $6) RETURNING id::text`,
+		// organization_id is NOT NULL as of 1722100000 (alert configs are two-layer: project-scoped when
+		// project_id is set, organization-wide when it is NULL). Deriving it from the project rather than
+		// passing it in also documents the invariant the composite FK enforces — a config's organization
+		// must be the one that owns its project.
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES ($1, (SELECT organization_id FROM projects WHERE id = $1), $2, $3::jsonb, $4, $5, $6) RETURNING id::text`,
 		f.ProjectID, channel, raw, threshold, windowSeconds, enabled,
 	).Scan(&id); err != nil {
 		t.Fatalf("seeding alert_configs for project %s: %v", f.ProjectID, err)

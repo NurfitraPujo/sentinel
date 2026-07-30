@@ -798,7 +798,12 @@ SDK** and the **real HTTP surfaces**. No mocks, no in-process shortcuts, no skip
 
 ### Use-case coverage matrix
 
-**P7 is COMPLETE as of 2026-07-30.** `tests/e2e/` exists and every row below has a named test that runs
+**P7 is COMPLETE as of 2026-07-30**, and has since grown two operational rows (U33-U34) from a real
+incident: the DLQ silently reached 6,148 messages, exhausted JetStream storage, and began failing
+unrelated operations with "insufficient storage resources" — because neither stream was bounded and
+nothing was watching the depth.
+
+`tests/e2e/` exists and every row below has a named test that runs
 against the full compose stack — real HTTP surfaces, real NATS hop, real processor, real database, real
 published SDK. The whole suite:
 
@@ -851,6 +856,8 @@ originally promised: **a named test is green.**
 | U30 | 004 migrations | Fresh DB → `up` → `down` → `up` | schema round-trips; goose version table correct | ✅ `TestU30_LiveSchemaAgreesWithItsMigrationLedger` + `tests/integration/db_migrations_test.go` for up/down/up |
 | U31 | dashboard | Issue list / detail / search render for a seeded org | correct counts, correct tenant scoping | ✅ `TestU31_IssueListSearchAndTenantScoping` |
 | U32 | retention | Cron retention endpoint | deletes only beyond the window; **requires auth** | ✅ `TestU32_RetentionRequiresAuthAndWindow` — found orphan deletion had no age check |
+| U33 | ops | Both JetStream streams are bounded (age + size) with the right discard policy | ERROR_EVENTS discards NEW when full (backpressure, never silent loss); the DLQ discards OLD (a full DLQ must never refuse to park poison — that is the S13 livelock) | ✅ `TestU33_StreamsAreBounded` — added after both streams were found unbounded; ERROR_EVENTS held 18,654 fully-acked messages with no limits |
+| U34 | ops | The DLQ backlog is reported so somebody can act on it | `/health` carries a threshold to compare depth against, the age and class of the oldest message, and a severity that does not flip on a single poison message | ✅ `TestU34_DLQBacklogIsReportedActionably`, `TestU34_DLQDepthTracksARealDeadLetter` |
 
 **Legend**: ✅ proven by a command that was actually run · 🟡 partially verified (component-level test or
 structural check, not the full row) · ❌ blocked, with the specific blocker named · ⚪ unverified, no attempt
