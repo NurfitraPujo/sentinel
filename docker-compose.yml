@@ -151,6 +151,8 @@ services:
                 condition: service_healthy
             migrate:
                 condition: service_completed_successfully
+            nats:
+                condition: service_healthy
         environment:
             DATABASE_URL: postgres://sentinel:changeme@postgres:5432/sentinel
             POSTGRES_HOST: postgres
@@ -158,6 +160,13 @@ services:
             POSTGRES_USER: sentinel
             POSTGRES_PASSWORD: changeme
             POSTGRES_DB: sentinel
+            # Without this the dashboard cannot invalidate a revoked API key. createNatsPublisher in
+            # src/lib/db/queries/apikeys.ts defaults to nats://localhost:4222, which inside a container is
+            # nothing, so every api_key.invalidated publish failed with ECONNREFUSED and revocation
+            # silently degraded from "<100ms" to "up to APIKEY_CACHE_TTL" (60s). Both sides of the feature
+            # were correct and wired; only the deployment never connected them, and the fallback logs
+            # rather than fails — so nothing surfaced it until U15/U16 measured 37s.
+            NATS_URL: nats://nats:4222
             AUTH_SECRET: dev-only-insecure-secret-change-me-please-32chars
             AUTH_URL: http://localhost:3000
             AUTH_TRUST_HOST: "true"

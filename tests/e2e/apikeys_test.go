@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -94,24 +95,36 @@ func apikeysAssertRowMatches(t *testing.T, keyID, orgID, projectID, token string
 	}
 }
 
-// apikeysPollUntilStatus polls /ingest with secret every 20ms until the response matches want or
-// maxWait elapses, and returns the elapsed time at the moment it first matched (or timed out). This is
-// deliberately NOT waitFor: waitFor doesn't report back the elapsed duration, and U15's whole point is
-// measuring that duration, not just eventually observing the end state.
-func apikeysPollUntilStatus(t *testing.T, f *fixture, secret string, want int, maxWait time.Duration) (time.Duration, ingestResult) {
+// apikeysPollUntilStatus polls /ingest with secret every 200ms until the response matches want or
+// maxWait elapses, and returns the elapsed time at the moment it first matched (or timed out), plus how
+// many of the polls were genuinely accepted (202) before that. This is deliberately NOT waitFor:
+// waitFor doesn't report back the elapsed duration, and U15's whole point is measuring that duration,
+// not just eventually observing the end state.
+//
+// Each poll that still succeeds is a REAL /ingest call against the credential under test — not a noop
+// probe — because there is no cheaper way to observe the ingestor's actual auth decision than the
+// endpoint that decision gates. If the key is still valid (the exact condition being measured here),
+// that poll lands a genuine occurrence. The 200ms interval is a deliberate compromise: fine enough to
+// resolve the 1s bound U15 cares about, coarse enough not to flood the shared stack — at 20ms this
+// produced 1000+ extra occurrences per call while the ~60s Redis cache-TTL fallback (see U15) was still
+// active, which is exactly what a caller counting occurrences afterward must account for (acceptedCount
+// below), not ignore.
+func apikeysPollUntilStatus(t *testing.T, f *fixture, secret string, want int, maxWait time.Duration) (elapsed time.Duration, last ingestResult, acceptedCount int) {
 	t.Helper()
 	start := time.Now()
-	var last ingestResult
 	for {
 		last = f.ingest(f.newEvent(), ingestOpts{APIKey: secret})
-		elapsed := time.Since(start)
+		if last.Status == http.StatusAccepted {
+			acceptedCount++
+		}
+		elapsed = time.Since(start)
 		if last.Status == want {
-			return elapsed, last
+			return elapsed, last, acceptedCount
 		}
 		if elapsed >= maxWait {
-			return elapsed, last
+			return elapsed, last, acceptedCount
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -178,11 +191,18 @@ func TestU15_RevokedKeyFailsFastOverNATS(t *testing.T) {
 		t.Fatalf("revoke response reported success=false: %s", revokeRes.Body)
 	}
 
-	elapsed, last := apikeysPollUntilStatus(t, f, created.Token, http.StatusUnauthorized, 10*time.Second)
-	t.Logf("U15: revoked key returned status %d after %s (cache TTL is %s)", last.Status, elapsed, auth.CacheTTLForLogging())
+	// maxWait covers the full Redis cache-TTL fallback (not just the 1s bound under test): if NATS
+	// invalidation is broken, the key still becomes unusable once the cache entry ages out, and the
+	// measurement below should report that REAL number rather than an arbitrarily truncated one — the
+	// difference between "propagation is slow" and "propagation doesn't happen at all" matters for
+	// diagnosing which of the two is actually true.
+	maxWait := auth.CacheTTLForLogging() + 15*time.Second
+	elapsed, last, accepted := apikeysPollUntilStatus(t, f, created.Token, http.StatusUnauthorized, maxWait)
+	t.Logf("U15: revoked key returned status %d after %s (cache TTL is %s; %d poll(s) were still accepted before that)",
+		last.Status, elapsed, auth.CacheTTLForLogging(), accepted)
 	if last.Status != http.StatusUnauthorized {
-		t.Fatalf("revoked key never returned 401 within 10s — still returning %d after %s\n  body: %s",
-			last.Status, elapsed, last.Body)
+		t.Fatalf("revoked key never returned 401 within %s (cache TTL %s) — still returning %d after %s\n  body: %s",
+			maxWait, auth.CacheTTLForLogging(), last.Status, elapsed, last.Body)
 	}
 	if elapsed > 1*time.Second {
 		t.Fatalf("revoked key returned 401, but only after %s — exceeds the 1s bound (S7 regression). "+
@@ -230,20 +250,41 @@ func TestU16_RotatedKeyInvalidatesOldSecretImmediately(t *testing.T) {
 		t.Fatalf("rotate response did not carry a distinct new token: %+v", rotated)
 	}
 
-	elapsed, last := apikeysPollUntilStatus(t, f, oldToken, http.StatusUnauthorized, asyncTimeout)
+	// Row U16 (unlike U15) states no timing bound, only that the old secret eventually 401s — but the
+	// wait still needs to outlast the Redis cache-TTL fallback, or a broken NATS invalidation path
+	// would produce an inconclusive timeout here instead of a real measurement.
+	maxWait := auth.CacheTTLForLogging() + 15*time.Second
+	elapsed, last, accepted := apikeysPollUntilStatus(t, f, oldToken, http.StatusUnauthorized, maxWait)
 	if last.Status != http.StatusUnauthorized {
-		t.Fatalf("old (pre-rotation) key never returned 401 within %s — still returning %d\n  body: %s",
-			asyncTimeout, last.Status, last.Body)
+		t.Fatalf("old (pre-rotation) key never returned 401 within %s (cache TTL %s) — still returning %d\n  body: %s",
+			maxWait, auth.CacheTTLForLogging(), last.Status, last.Body)
 	}
-	t.Logf("U16: old key invalidated after rotate in %s", elapsed)
+	t.Logf("U16: old key invalidated after rotate in %s (%d poll(s) on the old key were still accepted before that)", elapsed, accepted)
 
-	// New secret must actually work, and land its own occurrence (project unchanged: 1 already there
-	// from warm-up, +1 from the new key).
+	// Every accepted poll above (old key, still valid during the cache-TTL fallback window) landed a
+	// real occurrence alongside the warm-up event. The exact total is therefore 1 (warm-up) + accepted,
+	// not a fixed constant — asserting a hardcoded "2" here would be correct only if invalidation were
+	// instant, which U15 already shows it currently is not. What actually matters for U16 is that the
+	// NEW key's own event lands EXACTLY ONCE on top of whatever the old key already produced.
+	beforeNewKey := f.occurrenceCount()
 	res := f.ingest(f.newEvent(), ingestOpts{APIKey: rotated.Token})
 	if res.Status != http.StatusAccepted {
 		t.Fatalf("ingest with rotated (new) key: want 202, got %d\n  body: %s", res.Status, res.Body)
 	}
-	f.waitForOccurrences(2)
+	waitFor(t, asyncTimeout, fmt.Sprintf("%d occurrences in project %s", beforeNewKey+1, f.ProjectName), func() (bool, string) {
+		got := f.occurrenceCount()
+		return got == beforeNewKey+1, fmt.Sprintf("%d occurrences", got)
+	})
+	// Hold briefly to catch a duplicate delivery of the new key's own event, the same guard
+	// waitForOccurrences applies (S16).
+	time.Sleep(1 * time.Second)
+	if got := f.occurrenceCount(); got != beforeNewKey+1 {
+		t.Fatalf("occurrence count moved after the new key's event landed: was %d, now %d — duplicate delivery", beforeNewKey+1, got)
+	}
+	if want := 1 + accepted; beforeNewKey != want {
+		t.Fatalf("occurrence count before the new key's ingest = %d, want %d (1 warm-up + %d accepted poll(s) on the old key)",
+			beforeNewKey, want, accepted)
+	}
 
 	var oldStatus string
 	queryRow(t, &oldStatus, `SELECT status FROM project_api_keys WHERE id = $1`, created.Key.ID)
