@@ -362,8 +362,9 @@ func TestProcgoAlertingDispatchesWithinOneEvent(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := pool.Exec(ctx,
-		`INSERT INTO alert_configs (project_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
-		 VALUES ($1, 'email', '{"to": "oncall@example.com"}'::jsonb, 1, 60, true)`,
+		// organization_id is NOT NULL as of migration 1722100000; derive it from the project.
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES ($1, (SELECT organization_id FROM projects WHERE id = $1), 'email', '{"to": "oncall@example.com"}'::jsonb, 1, 60, true)`,
 		projectID,
 	)
 	require.NoError(t, err)

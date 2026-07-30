@@ -149,3 +149,194 @@ func TestAlertsDispatcher_ConfigReloadRaceFree(t *testing.T) {
 	wg.Wait()
 	require.True(t, true, "reaching here under -race with no report proves the configMu guard holds")
 }
+
+// ---------------------------------------------------------------------------
+// Two-layer alert resolution (packages/db-migrations/migrations/
+// 1722100000_add_alert_config_org_layer.sql): an alert config is either
+// PROJECT-SCOPED (organization_id + project_id) or ORGANIZATION-WIDE
+// (organization_id, project_id NULL). The resolution rule for an event in
+// project P belonging to organization O is:
+//
+//	WHERE enabled AND (project_id = P OR (project_id IS NULL AND organization_id = O))
+//
+// implemented by Dispatcher.resolveConfigs over the caches SetConfigsForTest /
+// SetOrgConfigsForTest / SetProjectOrgForTest populate directly (dispatcher.go).
+// Both layers are a UNION, never one overriding the other, except that two
+// configs resolving to the identical destination (channel + "to"/"chat_id")
+// are deduplicated to a single send.
+// ---------------------------------------------------------------------------
+
+const (
+	resolutionProjectID = "resolution-project"
+	resolutionOrgID     = "resolution-org"
+)
+
+// captureDispatch wires a Dispatcher with a capturing sender and returns it
+// along with a snapshot function, so resolution tests can assert exactly
+// which configs (by ChannelConfig target) actually sent.
+func captureDispatch(t *testing.T) (*alerts.Dispatcher, func() []*alerts.AlertConfig) {
+	t.Helper()
+	d := alerts.NewDispatcherForTest(nil)
+
+	var mu sync.Mutex
+	var sent []*alerts.AlertConfig
+	d.SetSenderForTest(func(ctx context.Context, cfg *alerts.AlertConfig, alert *alerts.Alert) {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, cfg)
+	})
+
+	return d, func() []*alerts.AlertConfig {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]*alerts.AlertConfig, len(sent))
+		copy(out, sent)
+		return out
+	}
+}
+
+// projectScopedConfig and orgWideConfig build threshold=1 configs (so a single Dispatch call always
+// fires immediately) that differ only in which layer they belong to and, via chatOrEmailTo, which
+// destination they route to.
+func projectScopedConfig(id, to string) *alerts.AlertConfig {
+	return &alerts.AlertConfig{
+		ID:                 id,
+		ProjectID:          resolutionProjectID,
+		OrganizationID:     resolutionOrgID,
+		Channel:            "email",
+		ChannelConfig:      map[string]interface{}{"to": to},
+		FrequencyThreshold: 1,
+		FrequencyWindow:    time.Minute,
+		Enabled:            true,
+	}
+}
+
+func orgWideConfig(id, to string) *alerts.AlertConfig {
+	return &alerts.AlertConfig{
+		ID:                 id,
+		OrganizationID:     resolutionOrgID,
+		Channel:            "email",
+		ChannelConfig:      map[string]interface{}{"to": to},
+		FrequencyThreshold: 1,
+		FrequencyWindow:    time.Minute,
+		Enabled:            true,
+	}
+}
+
+// TestAlertsDispatcher_ResolveOrgWideOnly proves an organization-wide config (no project-scoped
+// config exists for this project at all) still fires — the whole point of the org layer being a
+// safety net that applies even to a project nobody has configured individually.
+func TestAlertsDispatcher_ResolveOrgWideOnly(t *testing.T) {
+	d, sent := captureDispatch(t)
+	d.SetConfigsForTest(map[string]*alerts.AlertConfig{})
+	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionOrgID: orgWideConfig("org-cfg", "org-oncall@example.test"),
+	})
+	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+	got := sent()
+	require.Len(t, got, 1)
+	assert.Equal(t, "org-oncall@example.test", got[0].ChannelConfig["to"])
+}
+
+// TestAlertsDispatcher_ResolveProjectScopedOnly proves a project-scoped config fires when there is no
+// organization-wide config at all (the pre-existing, single-layer behavior must still work).
+func TestAlertsDispatcher_ResolveProjectScopedOnly(t *testing.T) {
+	d, sent := captureDispatch(t)
+	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionProjectID: projectScopedConfig("proj-cfg", "project-oncall@example.test"),
+	})
+	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{})
+	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+	got := sent()
+	require.Len(t, got, 1)
+	assert.Equal(t, "project-oncall@example.test", got[0].ChannelConfig["to"])
+}
+
+// TestAlertsDispatcher_ResolveBothLayersUnion proves the contract's core rule: both layers fire. An
+// org-wide config and a project-scoped config routing to DIFFERENT destinations must both be sent —
+// this is a union, not "project overrides org".
+func TestAlertsDispatcher_ResolveBothLayersUnion(t *testing.T) {
+	d, sent := captureDispatch(t)
+	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionProjectID: projectScopedConfig("proj-cfg", "project-oncall@example.test"),
+	})
+	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionOrgID: orgWideConfig("org-cfg", "org-oncall@example.test"),
+	})
+	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+	got := sent()
+	require.Len(t, got, 2, "both an org-wide and a project-scoped config apply and must both fire")
+	targets := []string{got[0].ChannelConfig["to"].(string), got[1].ChannelConfig["to"].(string)}
+	assert.ElementsMatch(t, []string{"project-oncall@example.test", "org-oncall@example.test"}, targets)
+}
+
+// TestAlertsDispatcher_ResolveSameDestinationDeduplicated proves the other half of the contract: when
+// the org-wide config and the project-scoped config resolve to the SAME destination (same channel,
+// same "to"), the event is sent exactly once, not twice. Being paged twice for one event is how
+// alerting gets muted.
+func TestAlertsDispatcher_ResolveSameDestinationDeduplicated(t *testing.T) {
+	d, sent := captureDispatch(t)
+	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionProjectID: projectScopedConfig("proj-cfg", "shared-oncall@example.test"),
+	})
+	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
+		resolutionOrgID: orgWideConfig("org-cfg", "shared-oncall@example.test"),
+	})
+	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+	got := sent()
+	require.Len(t, got, 1, "two configs resolving to the same channel+target must be deduplicated to one send")
+	assert.Equal(t, "shared-oncall@example.test", got[0].ChannelConfig["to"])
+}
+
+// TestAlertsDispatcher_ResolveDisabledConfigIgnored proves a disabled config in either layer is
+// ignored while an enabled config in the other layer still fires. refreshConfigs' real query already
+// filters WHERE enabled = true, so this exercises Dispatch's own defensive cfg.Enabled check, reached
+// via configs injected directly (bypassing that DB-level filter), the same way a stale cache entry or
+// a test seam would.
+func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
+	t.Run("disabled org-wide config is ignored, enabled project-scoped config still fires", func(t *testing.T) {
+		d, sent := captureDispatch(t)
+		projCfg := projectScopedConfig("proj-cfg", "project-oncall@example.test")
+		orgCfg := orgWideConfig("org-cfg", "org-oncall@example.test")
+		orgCfg.Enabled = false
+
+		d.SetConfigsForTest(map[string]*alerts.AlertConfig{resolutionProjectID: projCfg})
+		d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{resolutionOrgID: orgCfg})
+		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+		d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+		got := sent()
+		require.Len(t, got, 1)
+		assert.Equal(t, "project-oncall@example.test", got[0].ChannelConfig["to"])
+	})
+
+	t.Run("disabled project-scoped config is ignored, enabled org-wide config still fires", func(t *testing.T) {
+		d, sent := captureDispatch(t)
+		projCfg := projectScopedConfig("proj-cfg", "project-oncall@example.test")
+		projCfg.Enabled = false
+		orgCfg := orgWideConfig("org-cfg", "org-oncall@example.test")
+
+		d.SetConfigsForTest(map[string]*alerts.AlertConfig{resolutionProjectID: projCfg})
+		d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{resolutionOrgID: orgCfg})
+		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+		d.Dispatch(context.Background(), "issue-2", resolutionProjectID, "TestError", "msg")
+
+		got := sent()
+		require.Len(t, got, 1)
+		assert.Equal(t, "org-oncall@example.test", got[0].ChannelConfig["to"])
+	})
+}

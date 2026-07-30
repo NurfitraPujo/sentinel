@@ -117,6 +117,52 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &permErr)
 }
 
+// Headers written onto every dead-lettered message. These are a wire contract between the Subscriber
+// (which parks messages) and anything that later inspects, replays, or discards them — tools/dlq today.
+// Changing a name here requires changing the reader in the same commit; there is no compiler between them
+// (docs/memory/BUGS.md B5).
+const (
+	// DLQReasonHeader carries cause.Error() — human-readable, free text. Do NOT branch on its contents.
+	DLQReasonHeader = "X-Sentinel-Dlq-Reason"
+	// DLQAttemptsHeader carries how many deliveries were spent before parking.
+	DLQAttemptsHeader = "X-Sentinel-Dlq-Attempts"
+	// DLQSourceSubjectHeader carries the subject the message was originally published to.
+	DLQSourceSubjectHeader = "X-Sentinel-Dlq-Source-Subject"
+	// DLQClassHeader carries DLQClassPermanent or DLQClassTransient. This is the machine-readable field
+	// to branch on.
+	DLQClassHeader = "X-Sentinel-Dlq-Class"
+)
+
+// Values for DLQClassHeader.
+const (
+	// DLQClassPermanent means the same bytes will fail identically on every redelivery — a malformed
+	// payload, a constraint violation, a lookup for something that will never exist. Replaying one is
+	// guaranteed to re-fail and re-park it.
+	DLQClassPermanent = "permanent"
+	// DLQClassTransient means the failure was environmental (database down, deadline exceeded) and the
+	// message is a genuine candidate for replay once the cause is resolved.
+	DLQClassTransient = "transient"
+	// DLQClassUnclassified is what a READER reports for a message carrying no DLQClassHeader, or one whose
+	// value it does not recognize. It is never written by deadLetter — every message parked since the
+	// header was introduced has a real class. It exists because messages parked BEFORE that change have no
+	// class at all, and because "the header said something I don't understand" must be distinguishable
+	// from "the failure was transient" rather than silently defaulting to the replayable case.
+	//
+	// This constant exists at all because two independent readers were written against this contract and
+	// invented different words for the same state ("unknown" in the processor's /health, "unclassified" in
+	// tools/dlq). That is B5 in miniature: a vocabulary with no single definition drifts immediately. One
+	// name, defined here, used by both.
+	DLQClassUnclassified = "unclassified"
+)
+
+// dlqClass reports the class to record for a failure that exhausted its retries or was marked permanent.
+func dlqClass(cause error) string {
+	if IsPermanent(cause) {
+		return DLQClassPermanent
+	}
+	return DLQClassTransient
+}
+
 func NewSubscriber(ctx context.Context, cfg SubscriberConfig) (*Subscriber, error) {
 	var opts []nats.Option
 
@@ -325,9 +371,19 @@ func (s *Subscriber) deadLetter(ctx context.Context, msg *nats.Msg, cause error,
 		}
 
 		headers := nats.Header{}
-		headers.Set("X-Sentinel-Dlq-Reason", cause.Error())
-		headers.Set("X-Sentinel-Dlq-Attempts", strconv.FormatUint(numDelivered, 10))
-		headers.Set("X-Sentinel-Dlq-Source-Subject", s.cfg.Subject)
+		headers.Set(DLQReasonHeader, cause.Error())
+		headers.Set(DLQAttemptsHeader, strconv.FormatUint(numDelivered, 10))
+		headers.Set(DLQSourceSubjectHeader, s.cfg.Subject)
+		// The CLASS is what makes a parked message safe to act on later, and it is recorded here because
+		// here is the only place that knows it authoritatively. X-Sentinel-Dlq-Reason is free text
+		// (cause.Error()), so anything downstream deciding "is this worth replaying?" from the reason
+		// alone is string-matching an error message — which silently breaks the first time someone
+		// rewords one.
+		//
+		// This matters concretely: a replay of a PERMANENT failure cannot succeed. It re-fails, re-parks,
+		// and leaves the DLQ exactly as full as before, so a drainer that replays indiscriminately is
+		// worse than one that does nothing. 6,148 messages accumulated that way before anyone noticed.
+		headers.Set(DLQClassHeader, dlqClass(cause))
 		dlqMsg := &nats.Msg{Subject: subject, Data: msg.Data, Header: headers}
 
 		if _, err := s.js.PublishMsg(dlqMsg, nats.Context(ctx)); err != nil {

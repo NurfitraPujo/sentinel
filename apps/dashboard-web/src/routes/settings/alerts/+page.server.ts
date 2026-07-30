@@ -2,7 +2,7 @@ import type { PageServerLoad, Actions } from './$types';
 import { db } from '$lib/server/db';
 import { projects, projectMembers, alertConfigs } from '$lib/db/schema';
 import { requireAuth } from '$lib/server/auth';
-import { eq, and, inArray } from 'drizzle-orm';
+import { eq, and, inArray, isNotNull } from 'drizzle-orm';
 import { hasPermission, type Role } from '$lib/rbac';
 
 export const load: PageServerLoad = async ({ locals }) => {
@@ -32,9 +32,18 @@ export const load: PageServerLoad = async ({ locals }) => {
 		})
 		.from(alertConfigs)
 		.where(
-			inArray(
-				alertConfigs.projectId,
-				userProjectMemberships.map((m) => m.projectId)
+			and(
+				// alert_configs.project_id is now nullable (1722100000_add_alert_config_org_layer.sql):
+				// NULL means an organization-wide config, which this project-scoped settings page does not
+				// yet render (see src/routes/api/alerts/+server.ts for the org-wide layer). Excluding NULL
+				// explicitly here is what lets the `row.projectId as string` cast below stay honest — the
+				// inArray predicate alone would already never match a NULL row, but wouldn't say so to the
+				// type checker.
+				isNotNull(alertConfigs.projectId),
+				inArray(
+					alertConfigs.projectId,
+					userProjectMemberships.map((m) => m.projectId)
+				)
 			)
 		);
 
@@ -42,7 +51,7 @@ export const load: PageServerLoad = async ({ locals }) => {
 		const channelConfig = (row.channelConfig ?? {}) as Record<string, unknown>;
 		return {
 			id: row.id,
-			projectId: row.projectId,
+			projectId: row.projectId as string,
 			channel: row.channel,
 			channelTarget: typeof channelConfig.target === 'string' ? channelConfig.target : '',
 			frequencyThreshold: row.frequencyThreshold,
