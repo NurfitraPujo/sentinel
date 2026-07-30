@@ -34,6 +34,31 @@ This document defines the authoritative memory-first workflow for this repositor
 - **Watchpoints**: Treat implementation and verification watchpoints in `memory-synthesis.md` as requirements, not suggestions.
 - **Isolation**: Ensure new changes do not violate trust boundaries or architectural layers defined in `ARCHITECTURE.md`.
 
+### Definition of Done (non-negotiable)
+
+A feature is **not complete** until a test exercises it through its **production entry point** — an HTTP
+route, a message consumer, or `main()` — not merely through its package API.
+
+This is not a style preference. Across four separate features in this repository, passing package tests
+coexisted with code that was never reachable at runtime: the alert dispatcher was fully implemented and
+never constructed; `/ingest` rejected 100% of well-formed events for a full release; rate limiting was
+bypassed for every request while its own tests passed; and the dashboard's sign-in page redirected to
+itself forever while every build, typecheck and unit-test gate stayed green. In each case the package tests
+were correct and the feature did not work.
+
+Two corollaries, each learned the same way:
+
+- **A cross-service signal needs its effect or latency asserted, not its presence in the code.** API-key
+  revocation was "implemented" on both sides and took 60 seconds instead of 100ms, because the deployment
+  never connected them and the failure path logged instead of failing. The test that caught it asserted a
+  1-second bound.
+- **An assertion states the required behaviour, never the observed behaviour.** A test written to document
+  a known bug asserts the broken behaviour, so it passes *because* the bug is live and fails when the bug
+  is fixed. Name tests after the requirement, not the defect.
+
+`tests/e2e/` exists to satisfy this rule for the 32 use cases in `docs/plans/E2E_RECOVERY_PLAN.md`. Adding a
+feature means adding its row.
+
 ### After Completion (Implement / Verify)
 - **Self-Learning Check**: Evaluate if any systemic architectural lessons, reusable security patterns, or technical decisions were established.
 - **Formal Capture**: You **MUST** execute `/speckit.memory-md.capture` to propose durable memory and `INDEX.md` updates.
