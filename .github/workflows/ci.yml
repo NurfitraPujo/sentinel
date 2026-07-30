@@ -340,9 +340,14 @@ jobs:
       - name: Ensure a local main ref exists for buf breaking
         run: git fetch origin main:main || true
 
+      # github_token is not optional in practice. Without it the action resolves the buf release through
+      # unauthenticated API calls, which share one rate-limit bucket per runner egress IP across all of
+      # GitHub's hosted fleet. Run 30499137744 failed here with "API rate limit exceeded for 52.173.123.145"
+      # while the push run on the identical SHA passed — nothing about this repo decides which one you get.
       - uses: bufbuild/buf-setup-action@v1
         with:
           version: "1.47.2"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       # Not independently verified locally: this sandbox has no network-installed `buf` CLI, so these four
       # steps are written to the plan's spec and are believed correct but unconfirmed by an actual run. Left as
