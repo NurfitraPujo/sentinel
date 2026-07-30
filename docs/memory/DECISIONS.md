@@ -594,3 +594,113 @@ request body field to imply where a value is safe to log or transmit.
 **Where to look next**
 `packages/sdk-go/config.go`, `apps/ingestor-go/main.go:317-376` (`applyAuthenticatedScope`),
 `apps/ingestor-go/validation/validator.go:26`.
+
+---
+
+## D12 | Two-Layer Alert Configs: Organization-Wide and Project-Scoped
+
+**Date**: 2026-07-30 · **Status**: active
+
+`alert_configs` had `project_id NOT NULL` and no `organization_id`, so there was no way to say "notify this
+address for anything in our org". Every project had to repeat the same routing, and a new project silently
+had no alerting until someone remembered to add it.
+
+**Decision**: `organization_id UUID NOT NULL`, `project_id UUID NULL`, where NULL means organization-wide
+and applies to every project in that organization. Migration `1722100000_add_alert_config_org_layer.sql`.
+
+**Why this shape**: it is the shape `project_api_keys` already uses (D9/D11) for exactly the same
+distinction. Matching an existing convention matters more than inventing a tidier one — the RBAC checks,
+the query patterns and the reviewers' mental model are already built around it.
+
+**Cross-tenant safety is enforced by the database, not by application code.** A composite FK
+`(project_id, organization_id) → projects(id, organization_id)` makes a row naming org A while pointing at
+org B's project impossible. Without it, org A's alert would fire on org B's events — a tenancy leak of the
+same family as S6. `MATCH SIMPLE` gives the right behaviour for free: with `project_id IS NULL` the
+constraint is trivially satisfied, so org-wide rows are unconstrained by `projects`. That is also *why*
+`organization_id` needs its own FK — the composite one enforces nothing in precisely the org-wide case.
+Verified on a throwaway database: the cross-tenant insert is rejected, both valid shapes succeed.
+
+**Resolution is a UNION, not an override.** For an event in project P of org O, applicable configs are
+`project_id = P OR (project_id IS NULL AND organization_id = O)`. An org-wide config is a safety net;
+suppressing it because someone added a narrow project-scoped rule would silently remove coverage at exactly
+the moment a team started paying attention to one project.
+
+**But destinations are de-duplicated on `(channel, target)`** — email `to`, telegram `chat_id`. If both
+layers resolve to the same address, one send. Being paged twice for one event is how alerting gets muted.
+On a collision the project-scoped config wins, so its threshold and window apply.
+
+**Authorization**: org-wide configs are gated on `manage_keys` — the same permission as an org-wide API key,
+which has the same blast radius. `PUT`/`DELETE` authorize against the **stored row**, never the request
+body; otherwise a project-only member could edit an org-wide config by misreporting what they are editing.
+
+**Known gap**: org-wide configs are API-only. See P9-1.
+
+**Trade-off accepted**: the processor caches `projectOrg` alongside configs so resolution needs no per-event
+organization lookup. All three maps are replaced together under one lock. The cost is that a project moved
+between organizations is not reflected until the next refresh (30s ticker, or immediately on
+`alert_config.changed`), which is acceptable for alert routing.
+
+## D13 | Every JetStream Stream Is Bounded, and Discard Policy Is Chosen Per Role
+
+**Date**: 2026-07-30 · **Status**: active
+
+Both streams ran with `retention=Limits` and **no limits** — `maxAge=0`, `maxMsgs=-1`, `maxBytes=-1`. Nothing
+was ever removed. `ERROR_EVENTS` had accumulated 18,654 messages that its single consumer had already acked.
+
+**Why this was urgent rather than untidy**: `ERROR_EVENTS` is `discard=DiscardNew`, so a full store makes
+the server **reject new publishes** — ingestion stops at the front door. This was not hypothetical: the DLQ
+filled on 2026-07-30 and stream creation began failing with `nats: insufficient storage resources
+available`, taking unrelated integration tests down with it.
+
+**Decision**: `ERROR_EVENTS` 72h / 4GiB keeping `DiscardNew`; `ERROR_EVENTS_DLQ` 30d / 1GiB keeping
+`DiscardOld`; `API_KEYS` and `ALERT_CONFIG` 64MiB.
+
+**The discard policies are opposite on purpose, and that is the substance of this decision:**
+
+- `ERROR_EVENTS` **must** reject rather than drop. Rejecting a publish is backpressure the ingestor can
+  surface to a caller; `DiscardOld` would silently destroy events nobody has processed yet.
+- The DLQ **must** drop rather than reject. If a full DLQ refused new dead letters, the subscriber could not
+  park a poison message and would NAK it forever — recreating the exact S13 livelock the DLQ exists to
+  prevent. Losing the oldest dead letter is strictly better than starving the pipeline.
+
+**Implementation note that cost real time**: `nats stream add` against an existing stream with a *different*
+config does not no-op — it errors `10058`, which under `set -e` halts the whole init script at the first
+stream. `scripts/nats-init.sh` branches on `stream info` to `stream edit -f`. Proven idempotent by running
+it twice against a live server.
+
+**Gate**: U33 (`tests/e2e/dlq_test.go`) asserts both streams are bounded and that each discard policy
+matches its role.
+
+## D14 | Dead Letters Carry a Machine-Readable Class; Permanent Failures Are Never Auto-Replayed
+
+**Date**: 2026-07-30 · **Status**: active
+
+D10 gave the DLQ a producer. Nothing drained it, and when someone finally did, the question "is this message
+worth replaying?" had no reliable answer: `X-Sentinel-Dlq-Reason` is `cause.Error()`, free text.
+
+**Decision**: `deadLetter` stamps `X-Sentinel-Dlq-Class: permanent | transient`, derived from the
+`PermanentError` check the subscriber already performed. Header names and class values are exported
+constants in `packages/shared-go/nats`.
+
+**Why a class rather than reason-matching**: branching on an error message breaks the first time somebody
+rewords one, silently. And the stakes are asymmetric — **replaying a permanent failure cannot succeed**. It
+re-fails, re-parks, and leaves the queue exactly as full. All 6,148 messages in the 2026-07-30 incident were
+permanent (`project not found`, the project having been deleted by test cleanup), so a drainer that replayed
+indiscriminately would have been *worse than one that did nothing*.
+
+**`tools/dlq -drain` therefore forces `class=transient`.** Permanent messages are structurally excluded from
+automatic action and only reported. An **unclassified** message — parked before this header existed, or
+carrying an unrecognized value — is refused for replay unless explicitly overridden: its failure mode is
+unknown, and defaulting an unknown to the replayable class is the mistake that built the pileup.
+
+**The re-park cap needs external state, and this is the non-obvious part**: `deadLetter` builds a
+**brand-new** `nats.Header` and copies only `msg.Data`, so any header a replay stamps is *lost* when the
+message is re-parked. Proven empirically — a replayed message returned to the DLQ with no headers at all.
+Replay counts are therefore keyed by SHA-256 of the body (stable across a replay → re-park round trip) in a
+state file on a named volume, because a container restart would otherwise reset every count.
+
+**`DLQClassUnclassified` exists as a constant for a reason worth remembering**: two independent readers of
+this contract were written within an hour of each other and invented *different words for the same state* —
+`"unknown"` in the processor's `/health`, `"unclassified"` in `tools/dlq`. That is B5 at the smallest
+possible scale. One name, defined once. The processor's alert text uses `"unavailable"` for a detail it could
+not fetch, which is a genuinely different state from a message having no class.
