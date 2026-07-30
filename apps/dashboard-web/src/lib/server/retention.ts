@@ -9,8 +9,9 @@ import { sql, lt, and } from 'drizzle-orm';
 // mutually-masking bugs: the unreachable filter is precisely what stopped the illegal write from ever
 // throwing, and the endpoint reported markedStaleIssues: 0 forever while appearing to work.
 //
-// Both values came from scripts/db/init.sql, a third and stale schema that still declares
-// CHECK (status IN ('open','resolved','ignored')). The concept is dropped rather than repaired: nothing
+// Both values came from scripts/db/init.sql, a third and stale schema that declared
+// CHECK (status IN ('open','resolved','ignored')). That file has since been DELETED (2026-07-30) — it was
+// unreferenced by any container or test and existed only as a source of wrong values to copy from. The concept is dropped rather than repaired: nothing
 // consumed the count, no spec asks for a 'stale' state, and adding one would mean a migration widening a
 // CHECK constraint to support a feature that has never run.
 export interface RetentionResult {
