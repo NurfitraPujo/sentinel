@@ -87,10 +87,25 @@ func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) error 
 	}
 }
 
+// VerifyAuditLogTable confirms audit_logs is present and writable-shaped at boot.
+//
+// It used to INSERT a fixed all-zero-UUID row with action 'verification_test' — a permanent piece of fake
+// audit data sitting in the audit trail, in the one table whose entire value is that everything in it
+// really happened. ON CONFLICT DO NOTHING kept it to a single row rather than one per boot, which is
+// precisely why nobody noticed it.
+//
+// A SELECT against the real column list proves the same things the INSERT did — the table exists and its
+// columns match what this service expects — without writing anything. LIMIT 0 means no rows are fetched;
+// Postgres still validates every identifier, so a renamed or dropped column fails here exactly as it
+// would have before.
 func (s *ProcessorService) VerifyAuditLogTable(ctx context.Context) error {
-	query := `INSERT INTO audit_logs (id, action, resource_type, actor_id, metadata) VALUES ('00000000-0000-0000-0000-000000000000', 'verification_test', 'test', 'processor-go', '{}') ON CONFLICT DO NOTHING`
-	_, err := s.db.Exec(ctx, query)
-	return err
+	const query = `SELECT id, action, resource_type, actor_id, metadata FROM audit_logs LIMIT 0`
+	rows, err := s.db.Query(ctx, query)
+	if err != nil {
+		return fmt.Errorf("audit_logs is not usable: %w", err)
+	}
+	rows.Close()
+	return rows.Err()
 }
 
 func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {

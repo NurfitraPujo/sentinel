@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -18,16 +19,46 @@ var (
 	version int64
 )
 
+// dsnKeywordSecret matches the keyword/value DSN form: `password=hunter2 host=...`.
+var dsnKeywordSecret = regexp.MustCompile(`(password|passphrase|secret)=[^;\s]*`)
+
+// sanitizeDSN redacts the credential from a DSN before it is logged.
+//
+// It has to handle BOTH DSN forms, because this CLI is invoked with either. The keyword form
+// (`password=hunter2 host=db`) was already covered. The URL form
+// (`postgres://user:hunter2@host:5432/db`) was NOT, and that is the form the compose stack and every
+// DB_URL_* environment variable actually use — so `migrate` printed the live database password in
+// plaintext on every invocation:
+//
+//	Connection: postgres://sentinel:changeme@postgres:5432/sentinel?sslmode=disable
+//
+// Observed in `docker compose logs migrate`, which means it also lands in CI logs and anywhere container
+// output is shipped. url.Parse handles the userinfo case; the keyword regex still covers the other, and
+// a DSN that parses as neither is redacted wholesale rather than echoed on the assumption it is safe.
 func sanitizeDSN(dsn string) string {
-	re := regexp.MustCompile(`(password|passphrase|secret)=[^;]*`)
-	return re.ReplaceAllString(dsn, "$1=***REDACTED***")
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" && u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			// Plain "REDACTED", not "***REDACTED***": url.String() percent-encodes the userinfo, so
+			// asterisks come out as %2A%2A%2A and the log line becomes unreadable.
+			u.User = url.UserPassword(u.User.Username(), "REDACTED")
+		}
+		return dsnKeywordSecret.ReplaceAllString(u.String(), "$1=***REDACTED***")
+	}
+	if dsnKeywordSecret.MatchString(dsn) {
+		return dsnKeywordSecret.ReplaceAllString(dsn, "$1=***REDACTED***")
+	}
+	// Unrecognized shape: it may still carry a credential, so do not log it verbatim.
+	if strings.Contains(dsn, "@") || strings.Contains(dsn, "=") {
+		return "***REDACTED (unrecognized DSN form)***"
+	}
+	return dsn
 }
 
 func getMigrationDir(dir string) string {
 	if dir != "" {
 		return fmt.Sprintf("%s/packages/db-migrations/migrations", strings.TrimSuffix(dir, "/"))
 	}
-	
+
 	// Fallback to finding migrations directory relative to CWD or known structure
 	cwd, _ := os.Getwd()
 	if strings.Contains(cwd, "packages/db-migrations") {
