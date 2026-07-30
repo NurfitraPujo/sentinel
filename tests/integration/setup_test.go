@@ -54,6 +54,14 @@ func checkService(url string) bool {
 	return resp.StatusCode < 500
 }
 
+// setEnvDefault sets key only when it is unset or empty, so an explicit value from the environment
+// always wins over the compose default.
+func setEnvDefault(key, value string) {
+	if os.Getenv(key) == "" {
+		os.Setenv(key, value)
+	}
+}
+
 func TestMain(m *testing.M) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -83,14 +91,29 @@ func TestMain(m *testing.M) {
 
 	if ingestorAvailable {
 		fmt.Println("Using docker-compose services at localhost")
-		// Use docker-compose services - assume standard ports and database is initialized
-		os.Setenv("INGESTOR_URL", "http://localhost:8080")
-		os.Setenv("POSTGRES_HOST", "localhost")
-		os.Setenv("POSTGRES_PORT", "5432")
-		os.Setenv("POSTGRES_USER", "sentinel")
-		os.Setenv("POSTGRES_PASSWORD", "changeme")
-		os.Setenv("POSTGRES_DB", "sentinel")
-		os.Setenv("NATS_URL", "nats://localhost:4222")
+		// Compose defaults, but NEVER overwrite a value the caller already set.
+		//
+		// These used to be unconditional os.Setenv calls, which silently discarded an explicit
+		// NATS_URL. On a machine where another project already owns the default NATS port 4222,
+		// sentinel's nats is published elsewhere (NATS_HOST_PORT), and this suite would connect to the
+		// FOREIGN server no matter what the operator passed — then fail with errors that look like
+		// sentinel bugs. It cost real time to trace: eight tests failing with
+		// "nats: insufficient storage resources available", which turned out to be the other project's
+		// server refusing new streams. Compose defaults are a fallback, not an override.
+		setEnvDefault("INGESTOR_URL", "http://localhost:8080")
+		setEnvDefault("POSTGRES_HOST", "localhost")
+		setEnvDefault("POSTGRES_PORT", "5432")
+		setEnvDefault("POSTGRES_USER", "sentinel")
+		setEnvDefault("POSTGRES_PASSWORD", "changeme")
+		setEnvDefault("POSTGRES_DB", "sentinel")
+		setEnvDefault("NATS_URL", "nats://localhost:4222")
+
+		// Populate natsConfig too. Several tests dial gonats.Connect(natsConfig.URL) directly, and in
+		// this branch natsConfig was left at its zero value — so they passed an EMPTY url, which the
+		// client silently resolves to its own default (nats://127.0.0.1:4222). On a machine where
+		// something else owns 4222 that means dialing a foreign server while every environment variable
+		// says otherwise. Only the testcontainers branch below ever set this.
+		natsConfig = NATSConfig{URL: os.Getenv("NATS_URL")}
 
 		os.Exit(m.Run())
 		return

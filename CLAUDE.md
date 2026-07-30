@@ -82,12 +82,16 @@ S1–S17 are **resolved**, and so is every defect P7 found — see `## Resolved`
 **All 32 rows of the use-case matrix are green** (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → 56
 passed, 0 skipped, 124.8s), gated in CI by the `e2e` job.
 
+`scripts/db/init.sql` — the third, stale schema that caused three separate defects of the same family —
+was **deleted** on 2026-07-30. Nothing referenced it: no container mounted it, no test applied it, and the
+Taskfile comment already recorded that it had never been wired up. It survived only as a source of wrong
+values to copy from.
+
 Remaining known gaps, none of them a regression from that work:
 
 | | Symptom | Cause |
 |---|---|---|
-| — | `scripts/db/init.sql` is a **third, stale schema** | still `CHECK (status IN ('open','resolved','ignored'))`. It has now produced three separate defects (the `'stale'`/`'open'` retention bug, `'status_change'` vs `'status_changed'`, and Drizzle-vs-migrations column drift). Deleting it is the real fix and has not been done. |
-| — | The DLQ has ~6,100 dead-lettered events and no consumer | `tools/dlq` can replay them but nothing drains, replays or alerts automatically. The processor correctly reports `attention: dead-lettered events awaiting replay`. |
+| — | The DLQ has no automatic drain | `tools/dlq` can now replay (`-execute`) **and discard** (`-purge`), and the 6,148 permanently-dead messages that had accumulated were purged 2026-07-30 — they had exhausted JetStream storage and were failing unrelated integration tests with "insufficient storage resources". Nothing drains it automatically yet, so it still needs an operator. |
 | — | Invitation acceptance has no route | U22 proves the create half end to end; nothing anywhere consumes an invitation token. Asserted as a wall, not assumed. |
 | — | `issues.count` can inflate on partial-failure redelivery (S16) | the issue upsert and the occurrence insert are separate transactions with no `event_id` idempotency. U28 asserts occurrences are exactly-once and checks the counter agrees, so a regression is visible. |
 

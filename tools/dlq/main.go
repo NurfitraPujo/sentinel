@@ -49,6 +49,7 @@ func main() {
 		deleteOnReplay = flag.Bool("delete", false, "after a message is successfully re-published, delete it from the DLQ stream. Has no effect without -execute. Off by default: a replay that fails again should not have destroyed the evidence.")
 		timeout        = flag.Duration("timeout", 30*time.Second, "overall timeout for the run")
 		previewBytes   = flag.Int("preview-bytes", 200, "how many bytes of each message body to print for context (0 to disable)")
+		purge          = flag.Bool("purge", false, "DISCARD matching messages instead of replaying them. Requires -execute. Use when the parked messages can never succeed — e.g. events whose project no longer exists — because replaying those just re-fails and re-parks them. Combine with -reason-contains to purge one bug class and keep the rest.")
 	)
 	flag.Parse()
 
@@ -67,12 +68,14 @@ func main() {
 		execute:        *execute,
 		deleteOnReplay: *deleteOnReplay,
 		previewBytes:   *previewBytes,
+		purge:          *purge,
 	}); err != nil {
 		log.Fatalf("dlq: %v", err)
 	}
 }
 
 type config struct {
+	purge          bool
 	natsURL        string
 	nkeySeed       string
 	dlqStream      string
@@ -126,6 +129,22 @@ func run(ctx context.Context, cfg config) error {
 	if info.State.Msgs == 0 {
 		fmt.Printf("DLQ stream %q is empty (0 messages). Nothing to do.\n", cfg.dlqStream)
 		return nil
+	}
+
+	if cfg.purge && !cfg.execute {
+		fmt.Printf("DLQ stream %q: %d message(s) parked, sequence range [%d, %d].\n",
+			cfg.dlqStream, info.State.Msgs, info.State.FirstSeq, info.State.LastSeq)
+		fmt.Println("Mode: DRY RUN (-purge given without -execute). Nothing was discarded.")
+		if cfg.reasonContains != "" {
+			fmt.Printf("Would discard only messages whose reason contains %q.\n", cfg.reasonContains)
+		} else {
+			fmt.Printf("Would discard ALL %d message(s). Add -reason-contains to narrow this.\n", info.State.Msgs)
+		}
+		fmt.Println("Re-run with -execute to proceed. This is not reversible.")
+		return nil
+	}
+	if cfg.purge {
+		return purgeStream(ctx, js, cfg, info)
 	}
 
 	mode := "DRY RUN (pass -execute to actually replay)"
@@ -228,6 +247,81 @@ func run(ctx context.Context, cfg config) error {
 		fmt.Println("this was a dry run — nothing was published or deleted. Re-run with -execute to replay.")
 	}
 	return nil
+}
+
+// purgeStream discards parked messages instead of replaying them.
+//
+// Replay is the right default and remains it: a dead-lettered message is evidence, and re-publishing gives
+// it another chance once the bug that parked it is fixed. But some messages can never succeed no matter how
+// many times they are replayed — an event whose project has since been deleted will fail
+// "project not found" forever, and each attempt re-parks it, so replaying is worse than doing nothing.
+// Those need discarding, and until now this tool had no way to do it, which is why 6,148 permanently-dead
+// messages accumulated until JetStream returned "insufficient storage resources" and started failing
+// unrelated integration tests.
+//
+// Unfiltered, this uses JetStream's server-side purge — one operation regardless of depth. With
+// -reason-contains it has to read each message to decide, so it deletes individually and honours -limit.
+func purgeStream(ctx context.Context, js nats.JetStreamContext, cfg config, info *nats.StreamInfo) error {
+	if cfg.reasonContains == "" {
+		before := info.State.Msgs
+		if err := js.PurgeStream(cfg.dlqStream); err != nil {
+			return fmt.Errorf("purging stream %s: %w", cfg.dlqStream, err)
+		}
+		after, err := js.StreamInfo(cfg.dlqStream)
+		if err != nil {
+			return fmt.Errorf("re-reading stream info after purge: %w", err)
+		}
+		fmt.Printf("PURGED %d message(s) from %q. %d remain.\n", before-after.State.Msgs, cfg.dlqStream, after.State.Msgs)
+		return nil
+	}
+
+	sub, err := js.PullSubscribe("", "dlq_purge_"+sanitizeDurable(cfg.reasonContains),
+		nats.BindStream(cfg.dlqStream), nats.DeliverAll(), nats.AckExplicit())
+	if err != nil {
+		return fmt.Errorf("subscribing to %s: %w", cfg.dlqStream, err)
+	}
+	defer sub.Unsubscribe()
+
+	needle := strings.ToLower(cfg.reasonContains)
+	var scanned, purged int
+	for cfg.limit == 0 || purged < cfg.limit {
+		msgs, err := sub.Fetch(1, nats.MaxWait(2*time.Second))
+		if err != nil {
+			break // no more messages within the wait: done
+		}
+		m := msgs[0]
+		scanned++
+		meta, metaErr := m.Metadata()
+		reason := headerValue(m.Header, "X-Sentinel-Dlq-Reason")
+		if strings.Contains(strings.ToLower(reason), needle) && metaErr == nil {
+			if delErr := js.DeleteMsg(cfg.dlqStream, meta.Sequence.Stream); delErr != nil {
+				return fmt.Errorf("deleting seq %d: %w", meta.Sequence.Stream, delErr)
+			}
+			purged++
+		}
+		_ = m.Ack()
+	}
+	fmt.Printf("PURGED %d of %d message(s) scanned in %q whose reason contained %q.\n",
+		purged, scanned, cfg.dlqStream, cfg.reasonContains)
+	return nil
+}
+
+// sanitizeDurable turns an arbitrary filter string into a legal NATS durable name.
+func sanitizeDurable(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if len(out) > 32 {
+		out = out[:32]
+	}
+	return out
 }
 
 func headerValue(h nats.Header, key string) string {

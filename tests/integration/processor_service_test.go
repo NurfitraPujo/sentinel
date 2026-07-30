@@ -309,38 +309,25 @@ func TestProcessorService_VerifyAuditLogTable_Succeeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	require.NoError(t, svc.VerifyAuditLogTable(ctx))
+	var before int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs`).Scan(&before))
 
-	// The verification sentinel row must exist with the canonical
-	// zero-UUID used by VerifyAuditLogTable.
-	var action, resourceType, actorID string
-	err := pool.QueryRow(ctx,
-		`SELECT action, resource_type, actor_id
-		   FROM audit_logs
-		  WHERE id = '00000000-0000-0000-0000-000000000000'::uuid`,
-	).Scan(&action, &resourceType, &actorID)
-	require.NoError(t, err, "verification sentinel row should exist")
-	assert.Equal(t, "verification_test", action)
-	assert.Equal(t, "test", resourceType)
-	assert.Equal(t, "processor-go", actorID)
-
-	// Idempotency: a second call must not duplicate the sentinel row.
 	require.NoError(t, svc.VerifyAuditLogTable(ctx))
-	var n int
+	require.NoError(t, svc.VerifyAuditLogTable(ctx), "verification must be repeatable")
+
+	// The check must WRITE NOTHING. It used to INSERT a fixed all-zero-UUID row with action
+	// 'verification_test', and this test asserted that row existed — so the test was pinning the
+	// implementation detail (a sentinel row) rather than the requirement (audit_logs is present and has
+	// the columns this service needs). Permanent fabricated rows in an audit trail are worse than no
+	// check at all: the table's entire value is that everything in it really happened.
+	var after int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs`).Scan(&after))
+	assert.Equal(t, before, after, "VerifyAuditLogTable must not write to audit_logs")
+
+	var sentinels int
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM audit_logs WHERE id = '00000000-0000-0000-0000-000000000000'::uuid`,
-	).Scan(&n))
-	assert.Equal(t, 1, n, "sentinel row must remain singleton across repeated calls")
-
-	t.Cleanup(func() {
-		// Best-effort cleanup of the sentinel row only on test pass; the
-		// global row is harmless and reused by VerifyAuditLogTable_FailsWhenTableMissing
-		// which restores the table afterwards.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = pool.Exec(cleanupCtx,
-			`DELETE FROM audit_logs WHERE id = '00000000-0000-0000-0000-000000000000'::uuid`)
-	})
+		`SELECT count(*) FROM audit_logs WHERE action = 'verification_test'`).Scan(&sentinels))
+	assert.Zero(t, sentinels, "the old 'verification_test' sentinel row must not be written any more")
 }
 
 func TestProcessorService_VerifyAuditLogTable_FailsWhenTableMissing(t *testing.T) {

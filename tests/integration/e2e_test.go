@@ -89,12 +89,43 @@ func createTestProject(t *testing.T, pool *pgxpool.Pool, projectName, apiKey str
 	return projectID
 }
 
+// cleanupProject removes the project AND the organization createTestProject made for it.
+//
+// It used to leave the organization behind. createTestProject derives the org slug from a FIXED project
+// name (no unique suffix), and organizations.slug is UNIQUE — so the leaked row made every one of these
+// tests fail on its SECOND run against the same database with
+// "duplicate key value violates unique constraint organizations_slug_key". They passed in CI only because
+// CI tears the volume down between runs; on any reused database they were single-use. Deleting the
+// organization is what makes them re-runnable.
 func cleanupProject(t *testing.T, pool *pgxpool.Pool, projectID string) {
+	ctx := context.Background()
+
+	// Capture the org before the project row disappears — it is the only link to it.
+	var orgID string
+	if err := pool.QueryRow(ctx,
+		`SELECT organization_id::text FROM projects WHERE id = $1`, projectID).Scan(&orgID); err != nil {
+		t.Logf("Could not resolve the organization for project %s (already gone?): %v", projectID, err)
+	}
+
+	// Occurrence and issue rows reference the project, and FKs are not all ON DELETE CASCADE.
+	_, _ = pool.Exec(ctx, `DELETE FROM error_search_index WHERE occurrence_id IN (
+	                         SELECT eo.id FROM error_occurrences eo
+	                         JOIN issues i ON i.id = eo.issue_id WHERE i.project_id = $1)`, projectID)
+	_, _ = pool.Exec(ctx, `DELETE FROM error_occurrences WHERE issue_id IN (
+	                         SELECT id FROM issues WHERE project_id = $1)`, projectID)
+	_, _ = pool.Exec(ctx, `DELETE FROM issues WHERE project_id = $1`, projectID)
+
 	// project_api_keys FKs to projects, so it must go first.
-	_, _ = pool.Exec(context.Background(), `DELETE FROM project_api_keys WHERE project_id = $1`, projectID)
-	_, err := pool.Exec(context.Background(), `DELETE FROM projects WHERE id = $1`, projectID)
-	if err != nil {
+	_, _ = pool.Exec(ctx, `DELETE FROM project_api_keys WHERE project_id = $1`, projectID)
+	if _, err := pool.Exec(ctx, `DELETE FROM projects WHERE id = $1`, projectID); err != nil {
 		t.Logf("Failed to cleanup project %s: %v", projectID, err)
+	}
+
+	if orgID != "" {
+		_, _ = pool.Exec(ctx, `DELETE FROM project_api_keys WHERE organization_id = $1`, orgID)
+		if _, err := pool.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, orgID); err != nil {
+			t.Logf("Failed to cleanup organization %s: %v", orgID, err)
+		}
 	}
 }
 
