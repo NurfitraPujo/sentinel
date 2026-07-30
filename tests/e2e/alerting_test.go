@@ -328,6 +328,11 @@ func TestU26_NoConfigMeansNoDispatch(t *testing.T) {
 			t.Fatalf("processor logged an alert-related line mentioning %s even though project %s has no "+
 				"alert_configs row at all — Dispatch should be a no-op here:\n%s", needle, f.ProjectID, alertsTail(logs, 40))
 		}
+		// Nothing dispatched yet and there is budget left: send another event, so whichever one first
+		// arrives after the reload completes is the one that proves the config is live.
+		if res := f.ingest(f.newEvent()); res.Status != http.StatusAccepted {
+			t.Fatalf("ingest: status %d body %s", res.Status, res.Body)
+		}
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -390,8 +395,20 @@ func TestU27_ConfigCreatedViaDashboardTakesEffectPromptly(t *testing.T) {
 	}
 
 	since := time.Now()
-	res := f.ingest(f.newEvent())
-	if res.Status != http.StatusAccepted {
+
+	// An event is sent on EVERY poll iteration below, not once before the loop.
+	//
+	// Sending a single event and then waiting is a race, and it lost in CI: the invalidation message and
+	// the event arrived in the same second, the event was dispatched-checked before the reload finished,
+	// and nothing ever re-triggered — so a correct implementation failed while its own log showed
+	// "reloaded alert configs after alert_config.changed" one line above the timeout. Same commit passed
+	// on the PR run and failed on the push run, which is the signature of a race rather than a defect.
+	//
+	// Re-sending does not weaken the row. U27 exists to catch a config that stays invisible for the
+	// length of a stale-cache window; if invalidation were broken (reload only on the periodic ticker),
+	// none of these events would dispatch inside the budget and the test still fails with the same
+	// message. What re-sending removes is only the requirement that ONE arbitrary event wins a race.
+	if res := f.ingest(f.newEvent()); res.Status != http.StatusAccepted {
 		t.Fatalf("ingest: status %d body %s", res.Status, res.Body)
 	}
 
