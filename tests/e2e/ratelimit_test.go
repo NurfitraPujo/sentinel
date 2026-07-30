@@ -275,11 +275,22 @@ func TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal(t *testing.T) 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
+	// waitObserved guards the receive in Cleanup below. `done` is written exactly ONCE, so an
+	// unconditional `<-done` here deadlocks whenever the select has already consumed that single send —
+	// which is the common case, since this process usually exits on its own.
+	//
+	// This is not a small bug: a Cleanup that never returns hangs the whole test binary, and every test
+	// that would have run AFTER this one never runs. It hid ten matrix rows (U28-U30, U8-U10, U18, U21)
+	// behind a single blocked receive, and `go test` reports nothing at all in that state — no failure,
+	// no timeout until the global one, just silence.
+	var waitObserved bool
 	t.Cleanup(func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		<-done
+		if !waitObserved {
+			<-done
+		}
 	})
 
 	var exited bool
@@ -287,6 +298,7 @@ func TestU20_IngestorProceedsPastDeadRedisWithNoAttributedRefusal(t *testing.T) 
 	select {
 	case waitErr := <-done:
 		exited = true
+		waitObserved = true
 		if waitErr == nil {
 			exitCode = 0
 		} else {
@@ -361,7 +373,7 @@ func TestU20_NilRedisClientSilentlyBypassesRateLimit(t *testing.T) {
 	const rpm = 1 // a real Redis-backed limiter would reject every request here after the first
 	const requests = 20
 
-	var accepted, limited int
+	var accepted, limited, refused int
 	for i := 0; i < requests; i++ {
 		ctx := auth.WithIdentity(context.Background(),
 			"u20-project", "u20-project-id", "u20-org-id", "u20-apikeyhash", rpm, false)
@@ -370,17 +382,18 @@ func TestU20_NilRedisClientSilentlyBypassesRateLimit(t *testing.T) {
 
 		handler.ServeHTTP(rec, req)
 
-		switch rec.Code {
-		case http.StatusOK:
+		switch {
+		case rec.Code == http.StatusOK:
 			accepted++
-		case http.StatusTooManyRequests:
+		case rec.Code == http.StatusTooManyRequests:
 			limited++
+		case rec.Code >= 500:
+			// Failing closed is a legitimate way to satisfy this row: refusing the request is not
+			// silently accepting it. Counted separately rather than treated as an error so the fixed
+			// implementation is free to choose refusal over limiting.
+			refused++
 		default:
 			t.Errorf("request %d: unexpected status %d", i, rec.Code)
-		}
-		if got := rec.Header().Get("X-RateLimit-Limit"); got != "" {
-			t.Errorf("request %d: got X-RateLimit-Limit=%q from a nil Redis client — the middleware cannot "+
-				"have computed this without ever talking to Redis", i, got)
 		}
 	}
 
@@ -389,15 +402,26 @@ func TestU20_NilRedisClientSilentlyBypassesRateLimit(t *testing.T) {
 			innerHits.Load(), accepted)
 	}
 
-	t.Logf("U20 nil-client path: rpm=%d, requests=%d, accepted=%d, 429s=%d", rpm, requests, accepted, limited)
+	t.Logf("U20 nil-client path: rpm=%d, requests=%d, accepted=%d, 429s=%d, 5xx=%d",
+		rpm, requests, accepted, limited, refused)
 
-	if accepted != requests {
+	// THE ASSERTION MUST DESCRIBE THE DESIRED BEHAVIOUR, NOT THE CURRENT ONE.
+	//
+	// This previously read `if accepted != requests`, which errors when the limiter WORKS and passes
+	// because all 20 requests were silently accepted — a characterization test asserting the defect as
+	// correct. It reported PASS while S10 was wide open, never printed the diagnosis below, and would
+	// have turned red the moment somebody fixed the bug. A test that encodes current behaviour proves
+	// nothing and actively obstructs the fix.
+	//
+	// What U20 actually requires: Redis being unavailable must never mean "no limit". At most `rpm`
+	// requests may be accepted, whether the middleware limits them or refuses them outright.
+	if accepted > rpm {
 		t.Errorf("S10 confirmed open (U20): with rate_limit_rpm=%d and Redis unreachable (nil client — the "+
-			"exact state main.go produces when redis.NewClient's error is discarded), a real Redis-backed "+
-			"limiter would reject every request but the first; instead %d/%d requests were silently accepted "+
-			"with no limiting applied at all (%d were 429). This is unconditional on RATELIMIT_STRICT_MODE: "+
-			"ratelimit.go's `if rl.client == nil { next.ServeHTTP(...); return }` returns before strictMode "+
-			"is ever consulted.", rpm, accepted, requests, limited)
+			"exact state main.go:103 produces when redis.NewClient's error is discarded), at most %d request(s) "+
+			"may be accepted; instead %d/%d were silently accepted with no limiting applied at all "+
+			"(%d were 429, %d were 5xx). The fail-open is unconditional on RATELIMIT_STRICT_MODE: "+
+			"ratelimit.go:44's `if rl.client == nil { next.ServeHTTP(...); return }` returns before "+
+			"strictMode is ever consulted.", rpm, rpm, accepted, requests, limited, refused)
 	}
 }
 
