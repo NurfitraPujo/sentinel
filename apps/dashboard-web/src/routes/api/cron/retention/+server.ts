@@ -32,7 +32,6 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		console.log('[RetentionCron] Cleanup completed:', {
 			deletedOccurrences: result.deletedOccurrences,
-			markedStaleIssues: result.markedStaleIssues,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			cutoffDate: result.cutoffDate.toISOString(),
 		});
@@ -41,8 +40,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			success: true,
 			result: {
 				deletedOccurrences: result.deletedOccurrences,
-				markedStaleIssues: result.markedStaleIssues,
-				deletedOrphanedIssues: result.deletedOrphanedIssues,
+					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				retentionDays: result.retentionDays,
 				cutoffDate: result.cutoffDate.toISOString(),
 			},

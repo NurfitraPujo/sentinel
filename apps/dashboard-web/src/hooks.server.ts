@@ -18,7 +18,9 @@ const orgHandle = async ({ event, resolve }: any) => {
 	const userId = userResult[0].id;
 
 	const pathParts = event.url.pathname.split('/').filter(Boolean);
-	const reservedRoutes = ['api', 'auth', 'issues', 'search', 'settings', 'admin', 'docs', 'billing', 'support'];
+	// 'signin' added alongside the /auth/signin -> /signin move (see auth-config.ts) so the
+	// top-level custom sign-in page is still treated as reserved, not mistaken for an org slug.
+	const reservedRoutes = ['api', 'auth', 'issues', 'search', 'settings', 'admin', 'docs', 'billing', 'support', 'signin'];
 	let orgSlugFromUrl = null;
 
 	if (pathParts.length > 0 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -60,10 +62,10 @@ func NewDispatcher(db *pgxpool.Pool) *Dispatcher {
 		configs:  make(map[string]*AlertConfig),
 	}
 
-	// loadConfigs only refreshes on a 5-minute ticker with no initial load
+	// loadConfigs only refreshes on a periodic ticker with no initial load
 	// (VERIFIED_STATE.md S8 item 4) — without this, a Dispatcher built right
-	// before an event arrives would ignore every alert config for the first
-	// five minutes after boot, which defeats the "within one event" delivery
+	// before an event arrives would ignore every alert config until the
+	// ticker's first tick, which defeats the "within one event" delivery
 	// this dispatcher exists for. Load synchronously, once, here, bounded by
 	// a short timeout so a slow/unreachable DB at startup does not hang
 	// process startup indefinitely — a failed initial load just means the
@@ -113,8 +115,40 @@ func (d *Dispatcher) LoadConfigsForTest(ctx context.Context) {
 	d.loadConfigs(ctx)
 }
 
+// defaultRefreshInterval is loadConfigs' periodic backstop tick.
+//
+// Before StartInvalidationSubscriber existed, this ticker was the ONLY path by which a config change
+// ever became visible, so it was set conservatively (5 minutes) to keep the DB query cheap. Now that a
+// config change made through the dashboard propagates via alert_config.changed in well under a second,
+// this ticker's job is narrower: catch a missed/unavailable NATS invalidation, and catch config rows
+// written by anything that does NOT go through the dashboard's publish path (a migration, a direct SQL
+// edit, an operator running psql, or tests/e2e's alertsSeedConfig helper, which INSERTs directly and
+// never publishes alert_config.changed at all). It no longer needs to be the sole correctness mechanism,
+// so it no longer needs to be as conservative — see defaultRefreshInterval's value and refreshInterval's
+// env override below.
+const defaultRefreshInterval = 30 * time.Second
+
+// refreshInterval returns the configured backstop tick period for loadConfigs: ALERT_CONFIG_REFRESH_INTERVAL
+// (a duration string, e.g. "30s") when set and parseable, otherwise defaultRefreshInterval. Mirrors the
+// pattern of apps/ingestor-go/auth/apikey.go's cacheTTL().
+func refreshInterval() time.Duration {
+	if v := os.Getenv("ALERT_CONFIG_REFRESH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		log.Printf("alerts: ignoring unparseable ALERT_CONFIG_REFRESH_INTERVAL=%q; using default %s", v, defaultRefreshInterval)
+	}
+	return defaultRefreshInterval
+}
+
+// ConfigRefreshInterval exposes the effective backstop tick period so callers (main.go's startup/warning
+// logs, tests) can report the actual worst-case staleness bound a missing or unavailable invalidation
+// subscriber falls back to.
+func ConfigRefreshInterval() time.Duration { return refreshInterval() }
+
 func (d *Dispatcher) loadConfigs(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(refreshInterval())
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -123,6 +157,64 @@ func (d *Dispatcher) loadConfigs(ctx context.Context) {
 			d.refreshConfigs(ctx)
 		}
 	}
+}
+
+// alertConfigInvalidation is the wire payload the dashboard publishes on the alert_config.changed
+// subject after a successful create, update, or delete of an alert_configs row. Both fields are used
+// for logging/correlation only: refreshConfigs always reloads the ENTIRE alert_configs table (it has no
+// per-project or per-config query path), so there is nothing to filter on here — any message on this
+// subject is treated as "reload everything now."
+type alertConfigInvalidation struct {
+	ProjectID string `json:"projectId"`
+	ConfigID  string `json:"configId"`
+}
+
+// StartInvalidationSubscriber wires sub, when non-nil, to trigger an immediate refreshConfigs on every
+// alert_config.changed message, so a config created/updated/deleted through the dashboard's real API
+// becomes visible to Dispatch in well under a second instead of waiting for loadConfigs' periodic
+// backstop tick (docs/plans/E2E_RECOVERY_PLAN.md U27; VERIFIED_STATE.md's staleness gap).
+//
+// sub may be nil, or Subscribe may fail: this mirrors apps/ingestor-go/auth's
+// NewAPIKeyAuthenticator/api_key.invalidated pattern of tolerating an unavailable subscriber rather than
+// treating it as fatal. Unlike API-key invalidation, correctness here never depended solely on this
+// subscriber — loadConfigs' ticker (started unconditionally by NewDispatcher) is the backstop whether or
+// not this call ever runs, whether or not sub is nil, and whether or not the dashboard's own publish
+// ever succeeds (the assignment is explicit that a publish failure on that side must not fail the
+// request). So an unavailable subscriber here only degrades latency — down to ConfigRefreshInterval() —
+// never correctness, and is logged loudly rather than silently swallowed.
+func (d *Dispatcher) StartInvalidationSubscriber(sub *nats.Subscriber) {
+	if sub == nil {
+		log.Printf("alerts: alert_config.changed subscriber unavailable; alert config changes will take up to %s (the periodic backstop refresh interval) to take effect", refreshInterval())
+		return
+	}
+
+	err := sub.Subscribe(context.Background(), func(data []byte) error {
+		var msg alertConfigInvalidation
+		if jsonErr := json.Unmarshal(data, &msg); jsonErr != nil {
+			log.Printf("alerts: ignoring unreadable alert_config.changed message: %v", jsonErr)
+			return nil
+		}
+
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		d.refreshConfigs(refreshCtx)
+		cancel()
+
+		log.Printf("alerts: reloaded alert configs after alert_config.changed (project=%s config=%s)", msg.ProjectID, msg.ConfigID)
+		return nil
+	})
+	if err != nil {
+		log.Printf("alerts: failed to subscribe to alert_config.changed: %v; alert config changes will take up to %s (the periodic backstop refresh interval) to take effect", err, refreshInterval())
+		return
+	}
+
+	// Errors() MUST be drained by every Subscribe caller (packages/shared-go/nats/subscriber.go's
+	// DroppedErrors doc comment) — an unread, capacity-1 channel does not deadlock the fetch loop
+	// itself, but it does silently lose error visibility for this subscriber.
+	go func() {
+		for subErr := range sub.Errors() {
+			log.Printf("alerts: alert_config.changed subscriber error: %v", subErr)
+		}
+	}()
 }
 
 func (d *Dispatcher) refreshConfigs(ctx context.Context) {

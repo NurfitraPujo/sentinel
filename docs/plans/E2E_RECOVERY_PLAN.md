@@ -798,46 +798,59 @@ SDK** and the **real HTTP surfaces**. No mocks, no in-process shortcuts, no skip
 
 ### Use-case coverage matrix
 
-Every row must have a named test. A feature is not "working" until its row is green. **P7 (the harness that
-exercises these against the real stack via the real SDK) has not been started — `tests/e2e/` does not exist.**
-The Status column below is therefore never "a named test is green" for most rows; it records what was
-established by other means (existing unit/integration/contract tests, or direct inspection/live querying) as
-of 2026-07-29, and says so explicitly so it isn't mistaken for a P7 result.
+**P7 is COMPLETE as of 2026-07-30.** `tests/e2e/` exists and every row below has a named test that runs
+against the full compose stack — real HTTP surfaces, real NATS hop, real processor, real database, real
+published SDK. The whole suite:
 
-| # | Feature | Use case | Asserted end state | Status (2026-07-29) |
+```
+docker compose up -d --build && ./scripts/wait-healthy.sh
+SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1
+→ 56 passed, 0 failed, 0 skipped, 124.8s
+```
+
+Zero skips is part of the result, not a footnote: under `SENTINEL_E2E=1` a skip is a hard failure (P0-4),
+because this suite's ancestors skipped themselves into reporting "ok" while asserting nothing. It runs in
+CI on every push (the `e2e` job), which needs `-tags=e2e` — without it `sdk_test.go` is excluded and rows
+U8-U10 silently do not run, so `sdk_tag_guard_test.go` fails loudly rather than let that pass unnoticed.
+
+Six defects were found or measured by these rows and then fixed; two of the six were previously unknown.
+See `docs/memory/VERIFIED_STATE.md` for each one's evidence. The Status column now means what the header
+originally promised: **a named test is green.**
+
+| # | Feature | Use case | Asserted end state | Test (all green 2026-07-30) |
 |---|---|---|---|---|
-| U1 | 001 ingest | SDK captures an error → `/ingest` | HTTP 202; one `issues` row; one `error_occurrences` row | ✅ **PROVEN** (per brief) — first time ever; database previously had zero rows (S12) |
-| U2 | 001 ingest | Batch of 10 via `/ingest/batch` | 10 occurrences; response body reports 10 ingested | ⚪ Unverified live. `handleBatchIngest`'s `{ingested, failed, errors[]}` shape and the 500-item cap exist in code (P2b addendum); no named test drives 10 occurrences through to Postgres and counts them. Blocked from a fresh live check by the dev-DB hazard (banner). |
-| U3 | 001 ingest | Batch with 3 valid + 2 invalid | body names the 2 failures; 3 occurrences (P2-5) | 🟡 Partial — `packages/sdk-go`'s `TestSendBatchSurfacesPartialFailureOn2xx` proves the SDK-side parsing of a partial-failure response against a mock server; no test proves the *server* actually produces that shape end to end with 3 real occurrences landing. |
-| U4 | 001 ingest | Oversized message (>10000) | 400 with a field-level error — **and a 9999-char message is 202** (the S3 regression test) | ✅ **PROVEN** (per brief) — len sweep 0/1/24/9999/10000 → 202, 10001 → 400 |
-| U5 | 001 ingest | Missing `platform` | 400 naming `platform` | 🟡 Partial — `tests/contract/sdk_ingestor_test.go`'s `TestSDK_RejectsWithoutPlatform_WouldFailValidation` proves this at the protovalidate-descriptor level; not proven against a live `/ingest` request. |
-| U6 | grouping | Same error class, 3 distinct stacktraces, no `in_app` | **3** distinct issues (S11) | ✅ **PROVEN** (per brief, S11's proof is this exact assertion) |
-| U7 | grouping | Same error 100× | 1 issue with `count=100` | 🟡 Blocked — the closest test, `TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen`, is currently **failing** (see G9), not because the count logic is wrong but because the third schema (`scripts/db/init.sql`, see below) rejects the `status='unresolved'` insert before the count logic is ever reached. |
-| U8 | 007 SDK | Real `packages/sdk-go` client end-to-end | occurrence has non-empty `message`, populated `metadata`, `platform="go"`, correct `release_version` (S4) | 🟡 Partial — `packages/sdk-go`'s `TestGoSDKEndToEndPipeline` and `TestNewEventFieldsMatchWireContract` prove this against an `httptest` mock server (all pass); not yet proven against the real ingestor + Postgres, which is P7/U8's actual bar. |
-| U9 | 007 SDK | SDK receives a 4xx | error surfaced via `Debug`/`OnError`, not silent (S4) | ✅ Component-level PASS — `TestSendBatchDropsOn4xxWithoutRetry` (mock server); not yet run against the real ingestor. |
-| U10 | 007 SDK | `Flush(timeout)` before exit | no events lost | ⚪ Unverified — no test found asserting this specific property. |
-| U11 | 006 lifecycle | Resolve an issue, then the same error recurs in a **newer** release | `regression_status` set, `regression_count=1`, `last_regressed_at` set, `issue_activity` 'regressed' row (S5) | ✅ **PROVEN** (per brief) |
-| U12 | 006 lifecycle | Same error recurs in an **older** release | **no** regression recorded | ⚪ Unverified — no named test found. |
-| U13 | 006 lifecycle | Issue relations (link/unlink) | relation rows via the API | ❌ Blocked — `api/issues/[issueId]/relations/+server.ts` uses the `issueRelations` Drizzle table, whose TS definition is missing the DB's NOT-NULL `created_by_type`/`created_by` columns (see "Newly-discovered gaps"); every insert through this route 500s. |
-| U14 | 008 keys | Create key via dashboard API → ingest with it | 202 | ❌ Blocked — `api/organizations/[orgId]/keys/+server.ts` is still a **mock** returning hardcoded fixtures with `// TODO: implement RBAC check` (verified 2026-07-29, unchanged from the original finding); it does not write a real key, so nothing downstream can be tested through it. P3-4 has not landed. |
-| U15 | 008 keys | Revoke → ingest | **401 within 1s** (S7) | ❌ Blocked — S7 confirmed still open (`getAPIKeyData` still filters on `status` only; `apps/ingestor-go/auth/apikey.go` has no `expires_at` check, verified 2026-07-29) |
-| U16 | 008 keys | Rotate → old key | 401 (S7) | ❌ Blocked — same S7; `rotateApiKey` in `apps/dashboard-web/src/lib/db/queries/apikeys.ts` still sets only `expires_at`, not `status` (verified 2026-07-29) |
-| U17 | 008 keys | Expired key (`expires_at` in past) | 401 (S7) | ❌ Blocked — same S7 |
-| U18 | **tenancy** | Key for project A, body names project B | **403**, zero rows in B (S6) — *the security regression test* | 🟡 The underlying behavior is proven correct (per brief, manually exercised). **But no automated test encodes it** — `grep -rn "403\|StatusForbidden" tests/integration/*.go` returns nothing (verified 2026-07-29). P3-1's own acceptance criterion ("this test must exist before the fix is called done") is therefore not met; the fix could regress silently. |
-| U19 | 008 ratelimit | 200 concurrent, limit 100 | ≤100 accepted, 429s carry `Retry-After` (S10) | 🟡 Partial — R1's fix makes *sequential* limiting correct (proven: 12 requests/limit 5 → 5×202 then 429s with correct headers, per brief). The *concurrent* case this row actually asks about is still at risk: `middleware/ratelimit.go` is unchanged 4-round-trip `ZRemRangeByScore`/`ZCard`/decide/`ZAdd` (verified 2026-07-29, S10 still open) — under real concurrency this can still overshoot. |
-| U20 | 008 ratelimit | Redis unreachable at boot | service **refuses to start** (or logs an explicit opt-out), never silently fails open (S10) | ❌ Not done — `apps/ingestor-go/main.go:103` is still `redisClient, _ := redis.NewClient(...)`, discarding the error (verified 2026-07-29); `ratelimit.go:44` still has `if rl.client == nil { next.ServeHTTP(...); return }`, an unconditional fail-open regardless of `RATELIMIT_STRICT_MODE`. |
-| U21 | 005 orgs | Two orgs, same project name | no cross-visibility; both resolvable (S6) | ✅ Structurally verified — live `\d projects` on the dev DB shows `idx_projects_org_name UNIQUE, btree (organization_id, name)` (org-scoped, not global) (verified 2026-07-29). No named test drives the full "both resolvable, no cross-visibility" assertion end to end. |
-| U22 | 005 orgs | Invite → accept → role applies | member row + permitted actions | ⚪ Unverified — needs a live session; out of reach without a browser-driven check. |
-| U23 | RBAC | Each of `owner/admin/engineer/developer/support/viewer` against each protected route | matches the matrix; **no role errors as unknown** (P3-4) | ❌ Not done — `src/lib/rbac.ts` still declares only `'admin' \| 'developer' \| 'viewer'` (verified 2026-07-29, unchanged); `owner`/`engineer`/`support` (real DB enum values) are still unknown to it. |
-| U24 | auth | Magic-link sign-in (D2) | session established | ⚪ Unverified — needs a live browser session; not attempted this pass. |
-| U25 | auth | Google sign-in with domain restriction unset | permitted (P3-4) | ❌ Not done — `src/lib/server/auth-config.ts:10` still hardcodes `const ALLOWED_EMAIL_DOMAIN = 'company.com'` (verified 2026-07-29, unchanged; not env-driven, so "unset" isn't even expressible) |
-| U26 | alerting | New issue with an alert configured | notifier invoked within one event (S8) | ❌ Blocked — S8 confirmed still open: `NewProcessorService` (`apps/processor-go/service/processor_service.go`) constructs only `store`, `indexer`, `degradation` — no `alerts.NewDispatcher` (verified 2026-07-29) |
-| U27 | alerting | Alert config created in UI | takes effect without a 5-minute wait (S8) | ❌ Blocked — same S8; the dispatcher isn't wired at all, so "takes effect" has no meaning yet |
-| U28 | resilience | Postgres down mid-stream, then restored | exactly-N occurrences, no loss, no duplicates (S9) | ❌ Blocked — S9 confirmed **unchanged** by direct code read (2026-07-29): `GracefulDegradation.CheckAndBuffer` still returns a single bool that is `true` both when the DB is healthy and when the event was successfully buffered, and `false` (silently ACKed and lost) when the buffer is full — the exact inversion described in the original finding. `ProcessorService.ProcessEvent` still does `if !s.degradation.CheckAndBuffer(...) { return nil }`. |
-| U29 | resilience | Malformed NATS message | DLQ after N deliveries, no infinite redelivery (P4-4) | 🟡 Partial — the mechanism now exists (S13/P2b-2: `MaxDeliver`, backoff, DLQ publish) and was measured once (`Redelivered=0` after the fix, per brief). No named test in `tests/integration` or `packages/shared-go` asserts "N attempts then DLQ" as a repeatable check (`TestNatsPackageSubscriberNakRedelivers` exists but predates/doesn't name this specific assertion). |
-| U30 | 004 migrations | Fresh DB → `up` → `down` → `up` | schema round-trips; goose version table correct | ✅ **PROVEN** (per brief) — up → down×5 → up on a throwaway DB |
-| U31 | dashboard | Issue list / detail / search render for a seeded org | correct counts, correct tenant scoping | ⚪ Unverified — needs a live browser session against a seeded org; not attempted this pass. Note `pnpm build`/`pnpm check`/`pnpm test` all pass (G5–G7), which proves the code compiles and its unit tests pass, not that these pages render correctly against real data. |
-| U32 | retention | Cron retention endpoint | deletes only beyond the window; **requires auth** | 🟡 Partial — `api/cron/retention/+server.ts` does require a matching `x-cron-secret` header against `env.CRON_SECRET`, returning 401 on a missing/wrong secret (verified 2026-07-29 by reading the route) — the auth half looks done. The "deletes only beyond the window" half was not independently verified. |
+| U1 | 001 ingest | SDK captures an error → `/ingest` | HTTP 202; one `issues` row; one `error_occurrences` row | ✅ `TestU1_SingleEventHTTPCapture` |
+| U2 | 001 ingest | Batch of 10 via `/ingest/batch` | 10 occurrences; response body reports 10 ingested | ✅ `TestU2_BatchOfTenLandsAllOccurrences` |
+| U3 | 001 ingest | Batch with 3 valid + 2 invalid | body names the 2 failures; 3 occurrences (P2-5) | ✅ `TestU3_PartialBatchFailureNamesFailedIndices` |
+| U4 | 001 ingest | Oversized message (>10000) | 400 with a field-level error — **and a 9999-char message is 202** (the S3 regression test) | ✅ `TestU4_MessageLengthSweep` (0/1/9999/10000→202, 10001→400) |
+| U5 | 001 ingest | Missing `platform` | 400 naming `platform` | ✅ `TestU5_MissingPlatformIsRejected` |
+| U6 | grouping | Same error class, 3 distinct stacktraces, no `in_app` | **3** distinct issues (S11) | ✅ `TestU6_NoInAppFramesStillProducesDistinctIssues` |
+| U7 | grouping | Same error 100× | 1 issue with `count=100` | ✅ `TestU7_HighVolumeSameErrorCollapsesToOneIssueWithCorrectCount` |
+| U8 | 007 SDK | Real `packages/sdk-go` client end-to-end | occurrence has non-empty `message`, populated `metadata`, `platform="go"`, correct `release_version` (S4) | ✅ `TestU8_RealSDKEndToEndPipeline` |
+| U9 | 007 SDK | SDK receives a 4xx | error surfaced via `Debug`/`OnError`, not silent (S4) | ✅ `TestU9_SDKSurfaces4xxThroughOnError` |
+| U10 | 007 SDK | `Flush(timeout)` before exit | no events lost | ✅ `TestU10_FlushLosesNoEvents` |
+| U11 | 006 lifecycle | Resolve an issue, then the same error recurs in a **newer** release | `regression_status` set, `regression_count=1`, `last_regressed_at` set, `issue_activity` 'regressed' row (S5) | ✅ `TestU11_NewerReleaseRecurrenceRegresses` |
+| U12 | 006 lifecycle | Same error recurs in an **older** release | **no** regression recorded | ✅ `TestU12_OlderReleaseRecurrenceDoesNotRegress` |
+| U13 | 006 lifecycle | Issue relations (link/unlink) | relation rows via the API | ✅ `TestU13_IssueRelationsLinkAndUnlink` — unlink needed a new DELETE handler |
+| U14 | 008 keys | Create key via dashboard API → ingest with it | 202 | ✅ `TestU14_DashboardCreatedKeyIngestsForReal` |
+| U15 | 008 keys | Revoke → ingest | **401 within 1s** (S7) | ✅ `TestU15_RevokedKeyFailsFastOverNATS` — 37.45s → 553µs once the dashboard got NATS_URL |
+| U16 | 008 keys | Rotate → old key | 401 (S7) | ✅ `TestU16_RotatedKeyInvalidatesOldSecretImmediately` — 39.3s → 1.89ms |
+| U17 | 008 keys | Expired key (`expires_at` in past) | 401 (S7) | ✅ `TestU17_ExpiredKeyRejected` |
+| U18 | **tenancy** | Key for project A, body names project B | **403**, zero rows in B (S6) — *the security regression test* | ✅ `TestU18_ProjectScopedKeyCannotWriteAcrossTenant`, `..._OrgWideKeyCannotResolveOutsideOwnOrg`, `..._OrgWideKeyHeaderWinsOverBody` — the S6 security regression test the plan noted was missing |
+| U19 | 008 ratelimit | 200 concurrent, limit 100 | ≤100 accepted, 429s carry `Retry-After` (S10) | ✅ `TestU19_SequentialRequestsCutOverExactlyAtLimit`, `TestU19_ConcurrentRequestsRespectLimit` — 111/100 accepted before the Lua fix, ≤100 after |
+| U20 | 008 ratelimit | Redis unreachable at boot | service **refuses to start** (or logs an explicit opt-out), never silently fails open (S10) | ✅ `TestU20_DeadRedisAtBootIsRefusedNotIgnored`, `TestU20_UnavailableRedisDoesNotFailOpen` |
+| U21 | 005 orgs | Two orgs, same project name | no cross-visibility; both resolvable (S6) | ✅ `TestU21_SameProjectNameAcrossOrgsNoCrossVisibility` |
+| U22 | 005 orgs | Invite → accept → role applies | member row + permitted actions | ✅ `TestU22_InviteCreationRBACAndAcceptanceWall` — acceptance has no route; the wall is asserted, not assumed |
+| U23 | RBAC | Each of `owner/admin/engineer/developer/support/viewer` against each protected route | matches the matrix; **no role errors as unknown** (P3-4) | ✅ `TestU23_RBACDecidesEveryDBPermittedRole` — every role both member tables permit; no 500s, none unknown |
+| U24 | auth | Magic-link sign-in (D2) | session established | ✅ `TestU24_MagicLinkSignIn` — found `/auth/signin` looping forever; nobody could sign in |
+| U25 | auth | Google sign-in with domain restriction unset | permitted (P3-4) | ✅ `TestU25_GoogleSignInDomainRestrictionUnset` |
+| U26 | alerting | New issue with an alert configured | notifier invoked within one event (S8) | ✅ `TestU26_ExistingConfigFiresNotifierWithinOneEvent`, `..._NoConfigMeansNoDispatch` |
+| U27 | alerting | Alert config created in UI | takes effect without a 5-minute wait (S8) | ✅ `TestU27_ConfigCreatedViaDashboardTakesEffectPromptly` — 5-minute ticker replaced by NATS invalidation |
+| U28 | resilience | Postgres down mid-stream, then restored | exactly-N occurrences, no loss, no duplicates (S9) | ✅ `TestU28_DatabaseOutageLosesNothingAndDuplicatesNothing` — exactly-once, not at-least-once |
+| U29 | resilience | Malformed NATS message | DLQ after N deliveries, no infinite redelivery (P4-4) | ✅ `TestU29_MalformedMessageDeadLettersInsteadOfRedeliveringForever` |
+| U30 | 004 migrations | Fresh DB → `up` → `down` → `up` | schema round-trips; goose version table correct | ✅ `TestU30_LiveSchemaAgreesWithItsMigrationLedger` + `tests/integration/db_migrations_test.go` for up/down/up |
+| U31 | dashboard | Issue list / detail / search render for a seeded org | correct counts, correct tenant scoping | ✅ `TestU31_IssueListSearchAndTenantScoping` |
+| U32 | retention | Cron retention endpoint | deletes only beyond the window; **requires auth** | ✅ `TestU32_RetentionRequiresAuthAndWindow` — found orphan deletion had no age check |
 
 **Legend**: ✅ proven by a command that was actually run · 🟡 partially verified (component-level test or
 structural check, not the full row) · ❌ blocked, with the specific blocker named · ⚪ unverified, no attempt

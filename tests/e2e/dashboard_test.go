@@ -2,13 +2,12 @@
 // "P7 — The E2E proof harness"): dashboard invitations/RBAC, magic-link and Google sign-in, issue
 // list/search tenant scoping, and the cron retention endpoint.
 //
-// Two pre-existing bugs in harness_test.go (committed foundation, not touched here) matter for every test
-// below: f.issues(), f.onlyIssue() and f.occurrences() query columns that do not exist in the migrated
-// schema — issues.title/first_release/last_release and error_occurrences.message/timestamp are all absent
-// from every migration in packages/db-migrations/migrations/ and from `\d issues` / `\d error_occurrences`
-// against the live database (confirmed directly). Calling any of the three fails with a Postgres 42703
-// error. This file therefore never calls them — every issue/occurrence read here is its own scoped SQL
-// query against the real, live column names (see dashQueryIssues, dashOccurrenceIDsForIssue, etc.).
+// Note on the read helpers used below: this file predates the fix to harness_test.go's f.issues() /
+// f.onlyIssue() / f.occurrences(), which originally selected columns that do not exist in the migrated
+// schema (issues.title/first_release/last_release, error_occurrences.message/timestamp) and failed with
+// Postgres 42703. Those helpers are correct now, but this file keeps its own scoped queries
+// (dashQueryIssues, dashOccurrenceIDsForIssue, ...) because they select exactly the fields these rows
+// assert on. New tests should prefer the shared harness readers.
 package e2e
 
 import (
@@ -164,48 +163,6 @@ func dashCronRequest(t *testing.T, secret string, present bool) dashHTTPResult {
 	return dashHTTPResult{Status: resp.StatusCode, Body: string(raw)}
 }
 
-// dashSigninPageRedirectLoops proves the /auth/signin infinite-redirect defect (see the doc comment on
-// TestU24_MagicLinkSignIn): it follows the GET /auth/signin redirect chain itself, WITHOUT the Go
-// http.Client's automatic redirect following (which would either loop until Go gives up with an error, or
-// mask the defect), and returns the sequence of Location headers observed. A real infinite loop shows the
-// same target repeating.
-func dashSigninPageRedirectLoops(t *testing.T, hops int) []string {
-	t.Helper()
-	client := &http.Client{
-		Timeout:       10 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	path := "/auth/signin"
-	var locations []string
-	for i := 0; i < hops; i++ {
-		req, err := http.NewRequest(http.MethodGet, cfg.DashboardURL+path, nil)
-		if err != nil {
-			t.Fatalf("building request for %s: %v", path, err)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("GET %s: %v", path, err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-			locations = append(locations, fmt.Sprintf("[terminal, status=%d]", resp.StatusCode))
-			break
-		}
-		loc := resp.Header.Get("Location")
-		locations = append(locations, loc)
-		// Location may be absolute or path-only; normalize to a path for the next hop.
-		if u, err := url.Parse(loc); err == nil && u.Path != "" {
-			path = u.Path
-			if u.RawQuery != "" {
-				path += "?" + u.RawQuery
-			}
-		} else {
-			break
-		}
-	}
-	return locations
-}
 
 // dashRandomToken returns a fresh random hex token, standing in for the raw token Auth.js would put in
 // a magic-link URL.
@@ -528,28 +485,37 @@ func TestU23_RBACDecidesEveryDBPermittedRole(t *testing.T) {
 func TestU24_MagicLinkSignIn(t *testing.T) {
 	requireStack(t)
 
-	// --- The defect: GET /auth/signin never terminates. ---
-	hops := dashSigninPageRedirectLoops(t, 4)
-	if len(hops) < 4 {
-		t.Fatalf("expected 4 redirect hops (a loop), got %d: %v — the loop may have been fixed; re-verify before trusting this report", len(hops), hops)
-	}
-	allSame := true
-	for _, h := range hops[1:] {
-		if h != hops[0] {
-			allSame = false
+	// --- A visitor must be able to REACH a sign-in page. ---
+	//
+	// This assertion is deliberately URL-agnostic. Its first version hardcoded /auth/signin and
+	// asserted that it LOOPED — a defect-confirmation test that reported the bug by failing and would
+	// have started failing for the opposite reason once the bug was fixed. A test that can never pass
+	// cannot be part of a green suite, and a test that asserts current behaviour obstructs the fix.
+	//
+	// What U24 actually requires is the user-visible property: an unauthenticated visitor is sent to a
+	// sign-in page, and that page RENDERS. Following the redirect chain from the app root proves it
+	// without this test needing to know whether the page lives at /auth/signin, /signin, or anywhere
+	// else — which is exactly the kind of coupling that made the first version brittle.
+	status, finalURL, body, hops := dashFollowRedirects(t, "/", 8)
+	t.Logf("U24: GET / as an anonymous visitor -> %d at %s after %d hop(s): %v", status, finalURL, len(hops), hops)
+
+	if seen := dashFirstRepeat(hops); seen != "" {
+		t.Errorf("the sign-in redirect chain from / revisits %s — it does not terminate.\n"+
+			"  chain: %v\n"+
+			"  A configured custom sign-in page at a path Auth.js reserves for its own built-in signin "+
+			"action makes @auth/core redirect back to pages.signIn forever, which makes the entire human "+
+			"sign-in surface (magic-link form and any Google button) unreachable by anyone.", seen, hops)
+	} else if status != http.StatusOK {
+		t.Errorf("the sign-in chain from / ended at %s with status %d, want 200 — an anonymous visitor "+
+			"never reaches a rendered sign-in page.\n  chain: %v", finalURL, status, hops)
+	} else if !dashLooksLikeSignInPage(body) {
+		snippet := body
+		if len(snippet) > 400 {
+			snippet = snippet[:400] + "…"
 		}
+		t.Errorf("the chain from / ended at %s with 200, but the page does not look like a sign-in page "+
+			"(no form, no email field, no sign-in text).\n  body: %s", finalURL, snippet)
 	}
-	if !allSame {
-		t.Fatalf("GET /auth/signin did NOT loop to the same target every hop (got %v) — the redirect-loop defect may no longer reproduce; re-verify", hops)
-	}
-	t.Errorf("CONFIRMED DEFECT (apps/dashboard-web/src/lib/server/auth-config.ts:106, `pages: { signIn: "+
-		"'/auth/signin' }`): GET /auth/signin is an INFINITE REDIRECT LOOP for every visitor — browser or "+
-		"not. 4 consecutive hops all redirected to the same target: %v. Root cause: Auth.js's own \"signin\" "+
-		"action (reserved under its basePath, /auth) is intercepted by the framework hook before SvelteKit's "+
-		"router ever runs, and since a custom sign-in page is configured at that exact same path, Auth.js's "+
-		"default signin renderer (@auth/core/lib/pages/index.js:53-60) redirects back to it forever. This "+
-		"means the entire human sign-in page — magic-link form AND any future Google button — is unreachable "+
-		"by anyone, not merely by this test harness. This test fails on purpose to report the defect.", hops)
 
 	// --- The mechanism, proven sound independent of the page defect above: a real callback session. ---
 	f := newFixture(t)
@@ -643,18 +609,106 @@ func TestU25_GoogleSignInDomainRestrictionUnset(t *testing.T) {
 	}
 	content := string(src)
 
-	if strings.Contains(content, "env.ALLOWED_EMAIL_DOMAIN") {
-		t.Skip("ALLOWED_EMAIL_DOMAIN now appears to be env-driven — P3-4 may have landed; re-verify the " +
-			"OAuth-domain behavior live (this static probe is no longer sufficient)")
+	// This assertion is STATIC, and that is a real limitation stated plainly rather than hidden: Google
+	// is not a registered provider in this stack, so there is no consent flow to drive and no way to
+	// observe the callback's decision over HTTP. The source is the only available evidence.
+	//
+	// What it must NOT be is a skip. The previous version skipped as soon as the fix appeared to have
+	// landed, which under SENTINEL_E2E=1 is a hard failure by design (P0-4) — and, worse, meant the row
+	// could never report success. So the checks below are written as the DESIRED end state: red while
+	// the domain is hardcoded, green once it is env-driven with empty meaning "allow all".
+	if !strings.Contains(content, "env.ALLOWED_EMAIL_DOMAIN") &&
+		!strings.Contains(content, "process.env.ALLOWED_EMAIL_DOMAIN") {
+		t.Errorf("auth-config.ts does not read ALLOWED_EMAIL_DOMAIN from the environment at all. P3-4 " +
+			"requires it env-driven with empty meaning \"allow all\", so that \"unset\" is an expressible, " +
+			"permitted configuration. While it is a literal, every Google account outside that one domain is " +
+			"permanently rejected in any real deployment.")
+	}
+	// Comments are stripped before this check. The first version grepped the whole file and failed on a
+	// comment that documented the old hardcoded value — which is exactly the sort of comment worth
+	// keeping. What must not survive is the literal in CODE, as a default or a fallback.
+	if line := dashFirstCodeLineContaining(content, "company.com"); line != "" {
+		t.Errorf("auth-config.ts still hardcodes the placeholder domain in code: %s", line)
 	}
 
-	t.Errorf("CONFIRMED DEFECT (apps/dashboard-web/src/lib/server/auth-config.ts:10): " +
-		"ALLOWED_EMAIL_DOMAIN is still the hardcoded literal 'company.com' with no environment variable read " +
-		"at all. P3-4 required making it env-driven with empty meaning 'allow all', specifically so that " +
-		"'unset' becomes an expressible, permitted configuration. Today it is not expressible: even in a real " +
-		"deployment with real Google credentials populated, every Google account outside company.com would be " +
-		"permanently rejected by this literal (auth-config.ts's signIn callback, `if (domain !== " +
-		"ALLOWED_EMAIL_DOMAIN) return false`). This test fails on purpose to report that the row is unmet.")
+	// Env-driven is not sufficient on its own: reading the variable and then comparing unconditionally
+	// would reject everything when it is unset, which is the opposite of "allow all". The comparison has
+	// to be guarded by the value being non-empty.
+	guarded := strings.Contains(content, "ALLOWED_EMAIL_DOMAIN && domain !== ALLOWED_EMAIL_DOMAIN") ||
+		strings.Contains(content, "ALLOWED_EMAIL_DOMAIN !== '' && domain !== ALLOWED_EMAIL_DOMAIN")
+	if !guarded {
+		t.Errorf("the domain comparison in auth-config.ts is not guarded by ALLOWED_EMAIL_DOMAIN being " +
+			"non-empty. Unset must permit every domain; an unguarded `domain !== ALLOWED_EMAIL_DOMAIN` " +
+			"rejects every sign-in when the variable is absent.")
+	}
+
+}
+
+// dashFollowRedirects walks a redirect chain by hand and reports every hop, so a caller can tell a
+// terminating chain from a cycle. Go's http.Client would either follow silently (hiding the shape) or
+// give up after 10 hops with an error that does not say what repeated.
+//
+// Returns the final status, the final URL, the final body, and the ordered list of locations visited.
+func dashFollowRedirects(t *testing.T, path string, maxHops int) (int, string, string, []string) {
+	t.Helper()
+
+	client := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	current := path
+	var hops []string
+	for i := 0; i < maxHops; i++ {
+		url := current
+		if strings.HasPrefix(url, "/") {
+			url = cfg.DashboardURL + url
+		}
+
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s (hop %d): %v", url, i, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			return resp.StatusCode, current, string(body), hops
+		}
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return resp.StatusCode, current, string(body), hops
+		}
+		hops = append(hops, loc)
+		current = loc
+	}
+	return 0, current, "", hops
+}
+
+// dashFirstRepeat returns the first location that appears twice in a redirect chain, or "" if every hop
+// is distinct. A repeat is the definition of a loop, and naming the repeated target is most of the
+// diagnosis.
+func dashFirstRepeat(hops []string) string {
+	seen := make(map[string]bool, len(hops))
+	for _, h := range hops {
+		if seen[h] {
+			return h
+		}
+		seen[h] = true
+	}
+	return ""
+}
+
+// dashLooksLikeSignInPage decides whether a rendered page is plausibly a sign-in page, without pinning
+// the assertion to this app's exact markup — the point is that a human arriving here could sign in, not
+// that the HTML matches a snapshot.
+func dashLooksLikeSignInPage(body string) bool {
+	lower := strings.ToLower(body)
+	hasForm := strings.Contains(lower, "<form") || strings.Contains(lower, `type="email"`) ||
+		strings.Contains(lower, "type='email'")
+	mentionsSignIn := strings.Contains(lower, "sign in") || strings.Contains(lower, "signin") ||
+		strings.Contains(lower, "sign-in") || strings.Contains(lower, "magic link")
+	return hasForm && mentionsSignIn
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -776,7 +830,7 @@ func TestU31_IssueListSearchAndTenantScoping(t *testing.T) {
 // occurrences immediately, regardless of how recently that issue (or its now-gone occurrence) was
 // created. That is demonstrated directly: a second, freshly-seeded issue whose only occurrence is deleted
 // moments before the retention call is gone after it, even though nothing about it is 30 days old. See
-// the "orphaned_issue_deletion_has_no_window_check_DEFECT" subtest, which is expected to fail.
+// the "orphaned issue deletion respects the window" subtest, which is expected to fail.
 //
 // Blast radius note: cleanupRetainedData is global — it has no project/org scoping at all, by the
 // product's own design (a retention cron is inherently cross-tenant). This test's own writes stay scoped
@@ -892,7 +946,7 @@ func TestU32_RetentionRequiresAuthAndWindow(t *testing.T) {
 		}
 	})
 
-	t.Run("orphaned_issue_deletion_has_no_window_check_DEFECT", func(t *testing.T) {
+	t.Run("orphaned issue deletion respects the window", func(t *testing.T) {
 		if dashIssueExists(t, orphanIssueID) {
 			t.Logf("issue %s survived retention — contradicts the source read of retention.ts:40-48; re-verify before trusting this defect report", orphanIssueID)
 			return
@@ -904,4 +958,22 @@ func TestU32_RetentionRequiresAuthAndWindow(t *testing.T) {
 			"removed. \"deletes only beyond the window\" does not hold for this code path — it deletes any "+
 			"zero-occurrence issue immediately, however fresh.", orphanIssueID, body.Result.RetentionDays)
 	})
+}
+
+// dashFirstCodeLineContaining returns the first non-comment line containing needle, trimmed, or "" if
+// none does. Line comments (`//`) and block-comment continuations (`*`) are ignored, so an assertion can
+// distinguish a value that is still hardcoded in code from a comment that merely mentions it — a
+// distinction a plain strings.Contains over the whole file cannot make.
+func dashFirstCodeLineContaining(content, needle string) string {
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "*") ||
+			strings.HasPrefix(line, "/*") {
+			continue
+		}
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	return ""
 }

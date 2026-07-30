@@ -100,7 +100,26 @@ func main() {
 		DB:       getEnvInt("REDIS_DB", 0),
 	}
 
-	redisClient, _ := redis.NewClient(ctx, redisCfg)
+	// Do NOT discard this error (VERIFIED_STATE.md S10 / docs/plans/E2E_RECOVERY_PLAN.md P3-3). A
+	// discarded error here leaves redisClient == nil, which the rate limiter middleware used to treat
+	// as an unconditional "let every request through" — fail-open by accident, not by decision, for the
+	// life of the process. An unreachable Redis at boot is now fatal unless an operator explicitly opts
+	// out via RATELIMIT_ALLOW_NO_REDIS=true, and that opt-out is logged loudly rather than silently
+	// taken.
+	redisClient, redisErr := redis.NewClient(ctx, redisCfg)
+	if redisErr != nil {
+		if getEnv("RATELIMIT_ALLOW_NO_REDIS", "false") == "true" {
+			log.Printf("WARNING: Redis unreachable at boot (%v); continuing with rate limiting DISABLED "+
+				"and the API-key cache DISABLED because RATELIMIT_ALLOW_NO_REDIS=true was set explicitly. "+
+				"This is a deliberate opt-out, not a default — unset RATELIMIT_ALLOW_NO_REDIS to refuse to "+
+				"start instead.", redisErr)
+			redisClient = nil
+		} else {
+			log.Fatalf("Redis unreachable at boot (%v); refusing to start with rate limiting silently "+
+				"disabled. Set RATELIMIT_ALLOW_NO_REDIS=true to start anyway with rate limiting explicitly "+
+				"disabled (an opt-out, not a default).", redisErr)
+		}
+	}
 
 	subCfg := nats.SubscriberConfig{
 		URL:       getEnv("NATS_URL", "nats://localhost:4222"),
@@ -143,13 +162,23 @@ func main() {
 	http.Handle("/ingest/batch", batchIngestHandler)
 	http.HandleFunc("/health", handleHealth(db))
 
+	addr := getEnv("INGESTOR_ADDR", "")
+	if addr == "" {
+		// PORT is the conventional single env var (Heroku-style); INGESTOR_ADDR above wins if both are
+		// set, since it can also bind a specific host. Default stays ":8080" unchanged either way, so a
+		// deployment that sets neither sees no behavior change (docs/plans/E2E_RECOVERY_PLAN.md P3-3 —
+		// this only exists so a second, standalone ingestor can be started alongside the compose one for
+		// testing without a port clash).
+		addr = ":" + getEnv("PORT", "8080")
+	}
+
 	srv := &http.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: nil,
 	}
 
 	go func() {
-		log.Println("Starting ingestor on :8080")
+		log.Printf("Starting ingestor on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}

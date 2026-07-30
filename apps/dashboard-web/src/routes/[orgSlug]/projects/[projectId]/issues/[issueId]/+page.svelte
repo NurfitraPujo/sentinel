@@ -18,9 +18,15 @@
     }
   };
 
+  // PLACEHOLDER DATA — this page does not read issue_activity yet. `type` values must use the DB
+  // vocabulary so they stay correct when it does: issue_activity.event_type is constrained to
+  // status_changed | assigned | unassigned | regressed | ai_analysis | linked. 'status_change' (no
+  // 'd') was the same typo that made every real status-change insert fail its CHECK constraint before
+  // queries/issues.ts was corrected. Note 'created' below is NOT a permitted event_type — there is no
+  // creation row in issue_activity — so the "created this issue" branch will never match real data.
   let activities = [
     { type: 'created', user: 'System', time: '2 hours ago' },
-    { type: 'status_change', user: 'Alice', time: '1 hour ago', detail: 'Changed status to Investigating' }
+    { type: 'status_changed', user: 'Alice', time: '1 hour ago', detail: 'Changed status to Investigating' }
   ];
 
   let relatedIssues = [
