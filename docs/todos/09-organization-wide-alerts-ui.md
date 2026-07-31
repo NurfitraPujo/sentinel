@@ -1,7 +1,8 @@
 # TODO 09: Organization-Wide Alert Configurations UI (P9-1)
 
 ## Priority: Medium
-## Status: Pending
+## Status: Completed
+
 
 ### Overview
 The backend capability for organization-wide alert rules (`projectId = null`) is fully implemented and tested at the schema, API (`/api/alerts`), RBAC, and processor-resolution layers. However, `src/routes/settings/alerts/+page.svelte` and its loader only list and support **project-scoped configs**. An org-wide config can currently only be created by calling the API directly.

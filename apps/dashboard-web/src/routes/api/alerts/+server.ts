@@ -7,6 +7,7 @@ import { eq, and, or, inArray, isNull } from 'drizzle-orm';
 import { hasPermission, type Role, type OrgRole } from '$lib/rbac';
 import { createNatsPublisher } from '$lib/db/queries/apikeys';
 import { log } from '$lib/server/observability/log';
+import { CHANNEL_TARGET_KEY, channelTargetOf } from '$lib/alerts';
 
 // processor-go only reloads alert_configs on a hardcoded 5-minute ticker, so a config created or
 // changed in the UI would not take effect for up to 5 minutes without this. Publishing is
@@ -47,22 +48,6 @@ type AlertConfigRow = {
 	createdAt: Date | null;
 };
 
-// channel_config is a cross-boundary payload: this route WRITES it and apps/processor-go READS it, with
-// no compiler and no shared type between them (BUGS.md B5 — changing one side requires changing the other
-// in the same edit). The processor's senders read a per-channel key, NOT a generic one:
-//
-//   apps/processor-go/alerts/notify.go:78    alertCfg.ChannelConfig["to"]        for channel 'email'
-//   apps/processor-go/alerts/notify.go:100   alertCfg.ChannelConfig["chat_id"]   for channel 'telegram'
-//
-// This route used to write `{ target: ... }` for every channel, which no sender ever looks up — so an
-// alert config created through the dashboard resolved to an empty destination and could never deliver,
-// while the row looked perfectly well-formed in the database. `alert_configs.channel` is constrained to
-// exactly 'email' | 'telegram', so these two cases are the whole space.
-const CHANNEL_TARGET_KEY: Record<string, string> = {
-	email: 'to',
-	telegram: 'chat_id',
-};
-
 // channelConfigFor builds the stored shape from this API's single external `channelTarget` string.
 function channelConfigFor(channel: string, target: string): Record<string, unknown> {
 	const key = CHANNEL_TARGET_KEY[channel];
@@ -74,18 +59,6 @@ function channelConfigFor(channel: string, target: string): Record<string, unkno
 	return { [key]: target };
 }
 
-// channelTargetOf reads the target back out, accepting the per-channel key and falling back to the legacy
-// `target` key so rows written before this fix still render in the UI instead of appearing blank.
-function channelTargetOf(channel: string, channelConfig: Record<string, unknown>): string {
-	const key = CHANNEL_TARGET_KEY[channel];
-	const candidates = [key ? channelConfig[key] : undefined, channelConfig.target];
-	for (const value of candidates) {
-		if (typeof value === 'string' && value !== '') {
-			return value;
-		}
-	}
-	return '';
-}
 
 // 'scope' is the explicit layer marker the GET response promises callers: an org-wide config's projectId
 // is NULL in the DB, but making the caller infer the layer from a null check is exactly the kind of

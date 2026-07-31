@@ -1,12 +1,14 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { invalidateAll } from '$app/navigation';
 	import type { PageData } from './$types';
 
 	let { data } = $props();
 
 	interface AlertConfig {
 		id: string;
-		projectId: string;
+		scope: 'organization' | 'project';
+		organizationId: string;
+		projectId: string | null;
 		channel: string;
 		channelTarget: string;
 		frequencyThreshold: number;
@@ -15,6 +17,7 @@
 		createdAt: Date | null;
 	}
 
+	let scope = $state<'project' | 'organization'>('project');
 	let selectedProjectId = $state('');
 	let channel = $state('email');
 	let channelTarget = $state('');
@@ -25,9 +28,27 @@
 	let editMode = $state(false);
 	let editingConfig = $state<AlertConfig | null>(null);
 
-	let editableAlertConfigIds = $derived(new Set(data.editableAlertConfigs.map((c: AlertConfig) => c.id)));
+	// Inline validation errors (HTTP 400 / 422) mapped to field names
+	let fieldErrors = $state<Record<string, string>>({});
+	// System / Permission errors (HTTP 403 / 500) shown via Toast / Banner
+	let toastMessage = $state<{ text: string; type: 'error' | 'success' } | null>(null);
 
-	function getProjectName(projectId: string): string {
+	// Inline delete confirmation tracking
+	let deletingConfigId = $state<string | null>(null);
+	let isDeleting = $state(false);
+
+	let selectedOrgId = $state('');
+
+	let editableAlertConfigIds = $derived(
+		new Set(data.editableAlertConfigs.map((c: AlertConfig) => c.id))
+	);
+
+	let activeOrgId = $derived(
+		selectedOrgId || data.projects[0]?.organizationId || data.userOrganizations[0]?.id || ''
+	);
+
+	function getProjectName(projectId: string | null): string {
+		if (!projectId) return 'Organization-Wide';
 		const project = data.projects.find((p: { id: string; name: string }) => p.id === projectId);
 		return project?.name ?? projectId;
 	}
@@ -35,12 +56,16 @@
 	function startEdit(config: AlertConfig) {
 		editMode = true;
 		editingConfig = config;
-		selectedProjectId = config.projectId;
+		scope = config.scope;
+		selectedProjectId = config.projectId ?? '';
+		selectedOrgId = config.organizationId ?? '';
 		channel = config.channel;
 		channelTarget = config.channelTarget;
 		frequencyThreshold = config.frequencyThreshold;
 		windowSeconds = config.windowSeconds;
 		enabled = config.enabled;
+		fieldErrors = {};
+		toastMessage = null;
 	}
 
 	function cancelEdit() {
@@ -50,23 +75,144 @@
 	}
 
 	function resetForm() {
+		scope = 'project';
 		selectedProjectId = '';
+		selectedOrgId = '';
 		channel = 'email';
 		channelTarget = '';
 		frequencyThreshold = 50;
 		windowSeconds = 60;
 		enabled = true;
+		fieldErrors = {};
+		toastMessage = null;
 	}
 
-	function hasWritePermission(projectId: string): boolean {
-		const role = data.projectRoles[projectId];
-		if (!role) return false;
-		const permissions: Record<string, string[]> = {
-			admin: ['read', 'write', 'delete', 'manage_members'],
-			developer: ['read', 'write'],
-			viewer: ['read'],
+	function clearToast() {
+		toastMessage = null;
+	}
+
+	async function handleSubmit(event: SubmitEvent) {
+		event.preventDefault();
+		isSubmitting = true;
+		fieldErrors = {};
+		toastMessage = null;
+
+		// Client-side validation checks
+		if (scope === 'project' && !selectedProjectId) {
+			fieldErrors.projectId = 'Please select a project';
+			isSubmitting = false;
+			return;
+		}
+		if (scope === 'organization' && data.userOrganizations.length > 1 && !activeOrgId) {
+			fieldErrors.organizationId = 'Please select an organization';
+			isSubmitting = false;
+			return;
+		}
+		if (!channelTarget.trim()) {
+			fieldErrors.channelTarget = 'Notification destination target is required';
+			isSubmitting = false;
+			return;
+		}
+
+		const payload: Record<string, unknown> = {
+			channel,
+			channelTarget,
+			frequencyThreshold,
+			windowSeconds,
+			enabled,
 		};
-		return permissions[role]?.includes('write') ?? false;
+
+		if (scope === 'project') {
+			payload.projectId = selectedProjectId;
+		} else {
+			payload.projectId = null;
+			payload.organizationId = activeOrgId;
+		}
+
+		let url = '/api/alerts';
+		let method = 'POST';
+
+		if (editMode && editingConfig) {
+			payload.id = editingConfig.id;
+			method = 'PUT';
+		}
+
+		try {
+			const response = await fetch(url, {
+				method,
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload),
+			});
+
+			const result = await response.json();
+
+			if (!response.ok) {
+				// HTTP 400 / 422: Render inline field errors if specific, else toast
+				if (response.status === 400 || response.status === 422) {
+					const errMsg = typeof result.error === 'string' ? result.error : '';
+					if (errMsg.toLowerCase().includes('project') || errMsg.toLowerCase().includes('projectid')) {
+						fieldErrors.projectId = errMsg;
+					} else if (errMsg.toLowerCase().includes('org') || errMsg.toLowerCase().includes('organizationid')) {
+						fieldErrors.organizationId = errMsg;
+					} else if (errMsg.toLowerCase().includes('target') || errMsg.toLowerCase().includes('channel')) {
+						fieldErrors.channelTarget = errMsg;
+					} else {
+						toastMessage = { text: errMsg || 'Validation error occurred', type: 'error' };
+					}
+				} else if (response.status === 403) {
+					toastMessage = {
+						text: result.error ?? 'Insufficient permissions to perform this action',
+						type: 'error',
+					};
+				} else {
+					toastMessage = {
+						text: result.error ?? 'An unexpected error occurred. Please try again.',
+						type: 'error',
+					};
+				}
+			} else {
+				toastMessage = {
+					text: editMode ? 'Alert rule updated successfully' : 'Alert rule created successfully',
+					type: 'success',
+				};
+				resetForm();
+				editMode = false;
+				editingConfig = null;
+				await invalidateAll();
+			}
+		} catch (err) {
+			toastMessage = { text: 'Network error occurred', type: 'error' };
+		} finally {
+			isSubmitting = false;
+		}
+	}
+
+	async function handleDelete(id: string) {
+		isDeleting = true;
+		try {
+			const response = await fetch('/api/alerts', {
+				method: 'DELETE',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ id }),
+			});
+
+			const result = await response.json();
+
+			if (!response.ok) {
+				toastMessage = {
+					text: result.error ?? 'Failed to delete alert rule',
+					type: 'error',
+				};
+			} else {
+				toastMessage = { text: 'Alert rule deleted', type: 'success' };
+				deletingConfigId = null;
+				await invalidateAll();
+			}
+		} catch (err) {
+			toastMessage = { text: 'Network error occurred during deletion', type: 'error' };
+		} finally {
+			isDeleting = false;
+		}
 	}
 </script>
 
@@ -76,44 +222,98 @@
 		<p class="subtitle">Set up real-time notifications for error spikes and threshold breaches</p>
 	</header>
 
-	{#if data.projects.length === 0}
-		<p class="no-projects">You don't have access to any projects yet.</p>
-	{:else}
-		<form
-			method="POST"
-			action="/api/alerts"
-			use:enhance={() => {
-				return async ({ result, update }) => {
-					isSubmitting = false;
-					if (result.type === 'success') {
-						update();
-					}
-				};
-			}}
-		>
-			<input type="hidden" name="intent" value={editMode ? 'update' : 'create'} />
-			{#if editMode && editingConfig}
-				<input type="hidden" name="id" value={editingConfig.id} />
-			{/if}
+	{#if toastMessage}
+		<div class="toast-banner" class:toast-error={toastMessage.type === 'error'} class:toast-success={toastMessage.type === 'success'}>
+			<span>{toastMessage.text}</span>
+			<button type="button" class="toast-dismiss" onclick={clearToast}>&times;</button>
+		</div>
+	{/if}
 
+	{#if data.projects.length === 0 && data.userOrganizations.length === 0}
+		<p class="no-projects">You don't have access to any projects or organizations yet.</p>
+	{:else}
+		<form onsubmit={handleSubmit}>
 			<div class="form-section">
 				<h2>{editMode ? 'Edit Alert Configuration' : 'Create New Alert'}</h2>
 
+				<!-- Form Scope Switcher -->
 				<div class="form-group">
-					<label for="projectId">Project</label>
-					<select
-						id="projectId"
-						name="projectId"
-						bind:value={selectedProjectId}
-						required
-						disabled={editMode}
-					>
-						<option value="">Select a project</option>
-						{#each data.projects as project}
-							<option value={project.id}>{project.name}</option>
-						{/each}
-					</select>
+					<label>Alert Rule Scope</label>
+					<div class="segmented-control">
+						<button
+							type="button"
+							class="segmented-btn"
+							class:active={scope === 'project'}
+							onclick={() => (scope = 'project')}
+						>
+							Project Alert
+						</button>
+						<button
+							type="button"
+							class="segmented-btn"
+							class:active={scope === 'organization'}
+							disabled={!data.canManageOrgAlerts}
+							title={!data.canManageOrgAlerts ? 'Requires manage_keys org permission' : ''}
+							onclick={() => (scope = 'organization')}
+						>
+							Organization-Wide Alert
+							{#if !data.canManageOrgAlerts}
+								<span class="lock-icon">🔒</span>
+							{/if}
+						</button>
+					</div>
+					{#if !data.canManageOrgAlerts}
+						<p class="scope-hint">Organization-wide rules require owner, admin, or engineer org role.</p>
+					{/if}
 				</div>
+
+				{#if scope === 'project'}
+					<div class="form-group">
+						<label for="projectId">Target Project</label>
+						<select
+							id="projectId"
+							name="projectId"
+							bind:value={selectedProjectId}
+							required
+							class:input-error={!!fieldErrors.projectId}
+						>
+							<option value="">Select a project</option>
+							{#each data.projects as project}
+								<option value={project.id}>{project.name}</option>
+							{/each}
+						</select>
+						{#if fieldErrors.projectId}
+							<p class="field-error-text">{fieldErrors.projectId}</p>
+						{/if}
+					</div>
+				{:else}
+					<div class="form-group">
+						<label>Target Scope</label>
+						{#if data.userOrganizations.length > 1}
+							<select
+								id="organizationId"
+								name="organizationId"
+								bind:value={selectedOrgId}
+								required
+								class:input-error={!!fieldErrors.organizationId}
+							>
+								<option value="">Select an organization</option>
+								{#each data.userOrganizations as org}
+									<option value={org.id}>{org.name}</option>
+								{/each}
+							</select>
+							{#if fieldErrors.organizationId}
+								<p class="field-error-text">{fieldErrors.organizationId}</p>
+							{/if}
+						{:else}
+							<div class="org-scope-box">
+								<span class="org-badge-large">[ORG-WIDE]</span>
+								<span class="org-scope-desc">Applies automatically to all current and future projects in your organization</span>
+							</div>
+						{/if}
+					</div>
+				{/if}
+
 
 				<div class="form-group">
 					<label for="channel">Notification Channel</label>
@@ -134,7 +334,11 @@
 						bind:value={channelTarget}
 						placeholder={channel === 'email' ? 'user@example.com' : 'bot_token:chat_id'}
 						required
+						class:input-error={!!fieldErrors.channelTarget}
 					/>
+					{#if fieldErrors.channelTarget}
+						<p class="field-error-text">{fieldErrors.channelTarget}</p>
+					{/if}
 				</div>
 
 				<div class="form-row">
@@ -187,7 +391,7 @@
 				<table class="configs-table">
 					<thead>
 						<tr>
-							<th>Project</th>
+							<th>Scope / Target</th>
 							<th>Channel</th>
 							<th>Target</th>
 							<th>Threshold</th>
@@ -199,7 +403,13 @@
 					<tbody>
 						{#each data.alertConfigs as config}
 							<tr>
-								<td class="project-cell">{getProjectName(config.projectId)}</td>
+								<td class="project-cell">
+									{#if config.scope === 'organization'}
+										<span class="org-badge">[ORG-WIDE]</span>
+									{:else}
+										<span class="project-name">{getProjectName(config.projectId)}</span>
+									{/if}
+								</td>
 								<td class="channel-cell">{config.channel}</td>
 								<td class="channel-target">{config.channelTarget}</td>
 								<td class="mono-cell">{config.frequencyThreshold} errors</td>
@@ -209,9 +419,37 @@
 										{config.enabled ? 'Enabled' : 'Disabled'}
 									</span>
 								</td>
-								<td>
-									{#if hasWritePermission(config.projectId)}
-										<button type="button" class="btn-action" onclick={() => startEdit(config)}>Edit</button>
+								<td class="actions-cell">
+									{#if editableAlertConfigIds.has(config.id)}
+										{#if deletingConfigId === config.id}
+											<div class="delete-confirm-box">
+												<span class="confirm-text">Confirm delete?</span>
+												<button
+													type="button"
+													class="btn-confirm-yes"
+													disabled={isDeleting}
+													onclick={() => handleDelete(config.id)}
+												>
+													Yes
+												</button>
+												<button
+													type="button"
+													class="btn-confirm-no"
+													onclick={() => (deletingConfigId = null)}
+												>
+													No
+												</button>
+											</div>
+										{:else}
+											<button type="button" class="btn-action" onclick={() => startEdit(config)}>Edit</button>
+											<button
+												type="button"
+												class="btn-action btn-delete"
+												onclick={() => (deletingConfigId = config.id)}
+											>
+												Delete
+											</button>
+										{/if}
 									{:else}
 										<span class="no-permission">View only</span>
 									{/if}
@@ -226,7 +464,6 @@
 		{/if}
 	{/if}
 </div>
-
 <style>
 	.alerts-page {
 		max-width: 1100px;
@@ -258,6 +495,38 @@
 		margin-bottom: 1rem;
 	}
 
+	/* Toast / Banner Messages */
+	.toast-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 0.625rem 1rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		margin-bottom: 1.25rem;
+	}
+
+	.toast-error {
+		background: rgba(239, 68, 68, 0.12);
+		border: 1px solid rgba(239, 68, 68, 0.3);
+		color: #ef4444;
+	}
+
+	.toast-success {
+		background: rgba(16, 185, 129, 0.12);
+		border: 1px solid rgba(16, 185, 129, 0.3);
+		color: #10b981;
+	}
+
+	.toast-dismiss {
+		background: transparent;
+		border: none;
+		color: inherit;
+		font-size: 1.125rem;
+		cursor: pointer;
+		padding: 0 0.25rem;
+	}
+
 	.form-section {
 		background: var(--bg-surface);
 		border: 1px solid var(--border-color);
@@ -284,6 +553,81 @@
 		font-weight: 500;
 	}
 
+	/* Segmented Scope Control */
+	.segmented-control {
+		display: flex;
+		gap: 0.25rem;
+		background: var(--bg-root);
+		padding: 0.25rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		width: fit-content;
+	}
+
+	.segmented-btn {
+		background: transparent;
+		border: none;
+		color: var(--text-muted);
+		padding: 0.375rem 0.75rem;
+		font-size: 0.8125rem;
+		font-weight: 500;
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+		transition: all 0.15s ease;
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+	}
+
+	.segmented-btn.active {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+	}
+
+	.segmented-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.scope-hint {
+		font-size: 0.75rem;
+		color: var(--text-subtle);
+		margin-top: 0.375rem;
+	}
+
+	.lock-icon {
+		font-size: 0.75rem;
+	}
+
+	.org-scope-box {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		padding: 0.5rem 0.75rem;
+		background: var(--bg-root);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+	}
+
+	.org-badge-large {
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		font-weight: 600;
+		padding: 0.2rem 0.5rem;
+		border-radius: var(--radius-sm);
+		background: rgba(59, 130, 246, 0.15);
+		color: #3b82f6;
+		border: 1px solid rgba(59, 130, 246, 0.3);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.org-scope-desc {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+
 	select,
 	input[type='text'],
 	input[type='number'] {
@@ -294,6 +638,17 @@
 		border-radius: var(--radius-sm);
 		color: var(--text-primary);
 		font-size: 0.8125rem;
+	}
+
+	select.input-error,
+	input.input-error {
+		border-color: #ef4444;
+	}
+
+	.field-error-text {
+		color: #ef4444;
+		font-size: 0.75rem;
+		margin-top: 0.25rem;
 	}
 
 	.checkbox-group label {
@@ -376,10 +731,31 @@
 		letter-spacing: 0.05em;
 	}
 
-	.channel-target, .mono-cell {
+	.project-name {
+		color: var(--text-primary);
+		font-weight: 500;
+	}
+
+	.org-badge {
+		display: inline-block;
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		font-weight: 600;
+		padding: 0.125rem 0.4rem;
+		border-radius: var(--radius-sm);
+		background: rgba(59, 130, 246, 0.15);
+		color: #3b82f6;
+		border: 1px solid rgba(59, 130, 246, 0.3);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.channel-target,
+	.mono-cell {
 		font-family: var(--font-mono);
 		font-size: 0.75rem;
 		color: var(--text-muted);
+		font-variant-numeric: tabular-nums;
 	}
 
 	.channel-target {
@@ -410,6 +786,10 @@
 		color: var(--severity-critical-text);
 	}
 
+	.actions-cell {
+		white-space: nowrap;
+	}
+
 	.btn-action {
 		background: transparent;
 		border: 1px solid var(--border-color);
@@ -418,11 +798,49 @@
 		border-radius: var(--radius-sm);
 		font-size: 0.75rem;
 		cursor: pointer;
+		margin-right: 0.25rem;
 	}
 
 	.btn-action:hover {
 		background: var(--bg-surface-hover);
 		color: var(--text-primary);
+	}
+
+	.btn-delete:hover {
+		border-color: rgba(239, 68, 68, 0.5);
+		color: #ef4444;
+	}
+
+	.delete-confirm-box {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		font-size: 0.75rem;
+	}
+
+	.confirm-text {
+		color: #ef4444;
+		font-weight: 500;
+	}
+
+	.btn-confirm-yes {
+		background: #ef4444;
+		color: white;
+		border: none;
+		padding: 0.2rem 0.4rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+
+	.btn-confirm-no {
+		background: var(--bg-root);
+		color: var(--text-muted);
+		border: 1px solid var(--border-color);
+		padding: 0.2rem 0.4rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.75rem;
+		cursor: pointer;
 	}
 
 	.no-projects,
