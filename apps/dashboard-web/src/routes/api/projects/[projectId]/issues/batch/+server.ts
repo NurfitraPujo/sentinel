@@ -2,7 +2,7 @@ import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { projects, organizationMembers } from '$lib/db/schema';
-import { batchUpdateIssues } from '$lib/db/queries/issues';
+import { batchUpdateIssues, MAX_BATCH_ISSUE_IDS } from '$lib/db/queries/issues';
 import { eq, and } from 'drizzle-orm';
 
 export const POST: RequestHandler = async ({ request, params, locals }) => {
@@ -40,6 +40,12 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 
 	if (!action || !issueIds || !Array.isArray(issueIds) || issueIds.length === 0) {
 		throw error(400, 'Invalid request body: action and non-empty issueIds array are required');
+	}
+
+	// Mirrors the ingestor's own batch cap (apps/ingestor-go/main.go:47) — reject outright rather
+	// than silently truncating; batchUpdateIssues enforces the same limit as a defensive backstop.
+	if (issueIds.length > MAX_BATCH_ISSUE_IDS) {
+		throw error(413, `Batch too large: ${issueIds.length} ids exceeds max of ${MAX_BATCH_ISSUE_IDS}`);
 	}
 
 	if (!['resolve', 'ignore', 'unresolve', 'assign'].includes(action)) {

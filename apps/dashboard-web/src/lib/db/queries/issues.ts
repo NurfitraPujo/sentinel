@@ -66,6 +66,11 @@ export async function updateIssueStatus(
 	});
 }
 
+// Same order of magnitude as the ingestor's own batch cap (apps/ingestor-go/main.go:47,
+// maxBatchSize = 500) and the same reasoning: an uncapped inArray(...) built straight from a
+// request body is both a lock-duration problem and a DoS-shaped one.
+export const MAX_BATCH_ISSUE_IDS = 500;
+
 export async function batchUpdateIssues(
 	projectId: string,
 	action: 'resolve' | 'ignore' | 'unresolve' | 'assign',
@@ -78,6 +83,31 @@ export async function batchUpdateIssues(
 		actorId?: string;
 	} = {}
 ) {
+	if (issueIds.length > MAX_BATCH_ISSUE_IDS) {
+		throw new Error(
+			`Batch too large: ${issueIds.length} ids exceeds max of ${MAX_BATCH_ISSUE_IDS}`
+		);
+	}
+
+	// NOTE for anyone arriving here to "fix the batch deadlock": there is a deadlock trace in this
+	// repo's review history attributed to this function, and sorting issueIds was proposed as the
+	// fix. It was probed against a real Postgres on 2026-07-31 and does NOT apply to this code:
+	//
+	//   - The UPDATE below plans as a Bitmap Heap Scan (verified with EXPLAIN), so Postgres locks the
+	//     matched rows in PHYSICAL order — the IN list's order is irrelevant to lock acquisition.
+	//     Two concurrent calls with reversed id lists could not be made to deadlock; neither could
+	//     two with identical lists.
+	//   - The issue_activity insert only touches rows this transaction has ALREADY locked
+	//     exclusively via the UPDATE (see the RETURNING-scoped activityRows below), so its FK checks
+	//     acquire nothing new and cannot participate in a cycle.
+	//
+	// The trace in the review history was reproduced against per-row UPDATEs in a loop — a different
+	// statement shape from the single statement here. So no sort: an inert line under a confident
+	// comment is worse than no line, because the next reader trusts it. If a real deadlock involving
+	// this function is ever OBSERVED, capture the actual `pg_locks` cycle before changing anything —
+	// the fix would likely be `SELECT ... FOR UPDATE ORDER BY id` (which does control lock order), not
+	// reordering an IN list, and it may well involve a different statement elsewhere entirely.
+
 	return await db.transaction(async (tx) => {
 		const updateData: any = {};
 		// event_type CHECK on issue_activity requires 'status_changed', not 'status_change'.
@@ -104,16 +134,27 @@ export async function batchUpdateIssues(
 				break;
 		}
 
-		await tx.update(issues)
+		const updated = await tx.update(issues)
 			.set(updateData)
 			.where(
 				and(
 					eq(issues.projectId, projectId),
 					inArray(issues.id, issueIds)
 				)
-			);
+			)
+			.returning({ id: issues.id });
 
-		const activityRows = issueIds.map((issueId) => ({
+		// Activity is written ONLY for issues the UPDATE above actually matched, which is why this
+		// reads the RETURNING ids rather than mapping over the caller's issueIds.
+		//
+		// Mapping over the caller's ids — as this did until 2026-07-31 — writes an activity row for
+		// every id the caller sent, while the UPDATE is correctly scoped by projectId. An id belonging to a
+		// DIFFERENT project therefore got audit history appended to another tenant's issue (and an FK
+		// lock taken on it) while its status was, correctly, left alone. That is a cross-tenant write
+		// driven by request-body input — B7's rule is that tenant scope comes from the credential, not
+		// the body, and it has to hold for every statement in the transaction, not just the first one.
+		const updatedIds = updated.map((row) => row.id);
+		const activityRows = updatedIds.map((issueId) => ({
 			issueId,
 			eventType,
 			actorType: options.actorType || 'system',
@@ -125,7 +166,10 @@ export async function batchUpdateIssues(
 			await tx.insert(issueActivity).values(activityRows);
 		}
 
-		return issueIds.length;
+		// The count of issues ACTUALLY updated, not the number of ids the caller sent — those differ
+		// whenever a request names an issue outside this project, and reporting the request's length
+		// would tell the caller it had changed rows it never touched.
+		return updatedIds.length;
 	});
 }
 
@@ -240,6 +284,13 @@ export async function getIssueRelations(issueId: string) {
 		.where(eq(issueRelations.sourceIssueId, issueId));
 }
 
+// No callers as of this writing (grep the repo before assuming otherwise). Left unfixed
+// deliberately: the SELECT below reads `issue` and the UPDATE further down writes it back based on
+// that read, with no `FOR UPDATE` and no retry/optimistic-lock check in between. That's a plain
+// read-then-write race — two concurrent calls for the same issueId can both read the pre-update
+// status, both decide a regression applies, and both write, silently double-incrementing
+// regressionCount / losing an interleaved status change. Add `.for('update')` on the SELECT (or a
+// WHERE that re-checks the read status atomically) before wiring this up to a real caller.
 export async function detectAndHandleRegression(issueId: string, releaseVersion: string) {
 	return await db.transaction(async (tx) => {
 		// MUST NOT query issue_relations here

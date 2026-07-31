@@ -118,7 +118,17 @@ func Setup(t *testing.T, opts ...SetupOption) *Environment {
 
 	env := &Environment{}
 
-	// If Ingestor/Processor are requested, ensure underlying PG and NATS are enabled
+	// If Ingestor/Processor are requested, ensure underlying PG and NATS are enabled.
+	// Ingestor additionally needs Redis: apps/ingestor-go/main.go defaults REDIS_ADDR to
+	// "localhost:6379" when unset, and the ingestor container runs with NetworkMode "host"
+	// (see StartIngestor), so an unset REDIS_ADDR resolves to whatever owns the HOST's port
+	// 6379 — the docker-compose redis on a machine that has the stack up, not this run's
+	// isolated one. That let a previous run's cached API-key -> project lookup
+	// (apps/ingestor-go/auth/apikey.go) leak into this run within the cache TTL, producing
+	// "project not found" failures that look unrelated to auth.
+	if cfg.resources&IngestorResource != 0 {
+		cfg.resources |= RedisResource
+	}
 	if cfg.resources&IngestorResource != 0 || cfg.resources&ProcessorResource != 0 {
 		cfg.resources |= PostgresResource | NATSResource
 	}
@@ -250,7 +260,7 @@ func Setup(t *testing.T, opts ...SetupOption) *Environment {
 		ingestorContainer, err := StartIngestor(ctx,
 			env.PGConfig.Host, env.PGConfig.Port,
 			env.PGConfig.User, env.PGConfig.Password, env.PGConfig.DB,
-			env.NATSConfig.URL,
+			env.NATSConfig.URL, env.RedisConfig.Addr,
 		)
 		if err != nil {
 			t.Fatalf("Setup: failed to start Ingestor: %v", err)
