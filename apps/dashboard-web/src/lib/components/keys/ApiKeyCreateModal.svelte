@@ -6,100 +6,125 @@
 
 	let name = '';
 	let targetProject = 'All Projects [Org-Wide]';
-	let scopes = ['Read/Query'];
-	let rateLimitOverride = '';
+	let scope = 'ingest';
+	let rateLimitRpm = '';
 	
-	let createdToken = '';
+	let isSubmitting = false;
 	
 	const dispatch = createEventDispatcher();
 	
-	const availableScopes = ['Ingest-Only', 'Read/Query', 'Admin'];
+	const availableScopes = [
+		{ id: 'ingest', label: 'Ingest (Ingest metrics & logs)', desc: 'Allows submitting telemetry events' },
+		{ id: 'read', label: 'Read (Query telemetry data)', desc: 'Allows querying dashboards & logs' },
+		{ id: 'admin', label: 'Admin (Full privileges)', desc: 'Full administrative access' }
+	];
 
 	function handleSubmit() {
-		// Emit create event
-		dispatch('create', { name, targetProject, scopes, rateLimitOverride });
+		if (!name.trim()) return;
+		isSubmitting = true;
+		dispatch('create', { 
+			name: name.trim(), 
+			targetProject, 
+			scope, 
+			rateLimitRpm: rateLimitRpm ? parseInt(rateLimitRpm, 10) : undefined 
+		});
 	}
 
 	function handleClose() {
 		isOpen = false;
-		createdToken = '';
+		name = '';
+		targetProject = 'All Projects [Org-Wide]';
+		scope = 'ingest';
+		rateLimitRpm = '';
+		isSubmitting = false;
 		dispatch('close');
-	}
-	
-	export function setCreatedToken(token: string) {
-		createdToken = token;
 	}
 </script>
 
 {#if isOpen}
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-50">
-	<div class="bg-white rounded-lg shadow-xl w-full max-w-md p-6">
-		<h2 class="text-lg font-medium text-gray-900 mb-4">Create API Key</h2>
-		
-		{#if createdToken}
-			<div class="bg-yellow-50 border-l-4 border-yellow-400 p-4 mb-4">
-				<div class="flex">
-					<div class="ml-3">
-						<p class="text-sm text-yellow-700">
-							Please copy your new API key now. You won't be able to see it again!
-						</p>
-						<div class="mt-2 text-sm font-mono bg-white p-2 border border-yellow-200 rounded">
-							{createdToken}
-						</div>
-					</div>
+<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm">
+	<div class="bg-gray-900 border border-gray-800 rounded-xl shadow-2xl w-full max-w-md p-6 text-gray-100">
+		<div class="flex justify-between items-center mb-5">
+			<h2 class="text-lg font-semibold text-gray-100">Create API Key</h2>
+			<button on:click={handleClose} class="text-gray-400 hover:text-gray-200 text-sm font-semibold">✕</button>
+		</div>
+
+		<form on:submit|preventDefault={handleSubmit} class="space-y-4">
+			<div>
+				<label for="key-name" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Key Name</label>
+				<input 
+					type="text" 
+					id="key-name" 
+					bind:value={name} 
+					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-emerald-500 transition-colors" 
+					required 
+					placeholder="e.g. Production Ingestion Service" 
+				/>
+			</div>
+
+			<div>
+				<label for="target-project" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Target Project</label>
+				<select 
+					id="target-project" 
+					bind:value={targetProject} 
+					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-emerald-500 transition-colors"
+				>
+					<option value="All Projects [Org-Wide]">All Projects [Org-Wide]</option>
+					{#each projects as project}
+						<option value={project.id}>{project.name}</option>
+					{/each}
+				</select>
+			</div>
+
+			<div>
+				<label class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Scope Scope</label>
+				<div class="space-y-2">
+					{#each availableScopes as sc}
+						<label class="flex items-start gap-2.5 p-2 rounded-lg bg-gray-950/60 border border-gray-800/80 hover:border-gray-700 cursor-pointer transition-colors">
+							<input 
+								type="radio" 
+								name="scope-group" 
+								value={sc.id} 
+								bind:group={scope} 
+								class="mt-1 accent-emerald-500 bg-gray-900" 
+							/>
+							<div>
+								<div class="text-xs font-medium text-gray-200">{sc.label}</div>
+								<div class="text-[11px] text-gray-500">{sc.desc}</div>
+							</div>
+						</label>
+					{/each}
 				</div>
 			</div>
-			<div class="mt-5 sm:mt-6">
-				<button type="button" on:click={handleClose} class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:text-sm">
-					Done
+
+			<div>
+				<label for="rate-limit" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Rate Limit Override (RPM)</label>
+				<input 
+					type="number" 
+					id="rate-limit" 
+					bind:value={rateLimitRpm} 
+					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-emerald-500 transition-colors" 
+					placeholder="Default (6000 rpm)" 
+				/>
+			</div>
+
+			<div class="pt-3 flex justify-end gap-3 border-t border-gray-800">
+				<button 
+					type="button" 
+					on:click={handleClose} 
+					class="px-4 py-2 bg-gray-800 text-gray-300 hover:bg-gray-700 rounded-lg text-xs font-medium transition-colors"
+				>
+					Cancel
+				</button>
+				<button 
+					type="submit" 
+					disabled={isSubmitting || !name.trim()}
+					class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-emerald-950/50 disabled:opacity-50"
+				>
+					{isSubmitting ? 'Creating...' : 'Create Key'}
 				</button>
 			</div>
-		{:else}
-			<form on:submit|preventDefault={handleSubmit}>
-				<div class="space-y-4">
-					<div>
-						<label for="name" class="block text-sm font-medium text-gray-700">Name</label>
-						<input type="text" id="name" bind:value={name} class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm" required placeholder="e.g. Production Backend" />
-					</div>
-					
-					<div>
-						<label for="targetProject" class="block text-sm font-medium text-gray-700">Target Project</label>
-						<select id="targetProject" bind:value={targetProject} class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
-							<option value="All Projects [Org-Wide]">All Projects [Org-Wide]</option>
-							{#each projects as project}
-								<option value={project.id}>{project.name}</option>
-							{/each}
-						</select>
-					</div>
-
-					<div>
-						<label class="block text-sm font-medium text-gray-700 mb-2">Scopes</label>
-						<div class="space-y-2">
-							{#each availableScopes as scope}
-								<div class="flex items-center">
-									<input id={`scope-${scope}`} type="checkbox" value={scope} bind:group={scopes} class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
-									<label for={`scope-${scope}`} class="ml-2 block text-sm text-gray-900">{scope}</label>
-								</div>
-							{/each}
-						</div>
-					</div>
-					
-					<div>
-						<label for="rateLimit" class="block text-sm font-medium text-gray-700">Rate Limit Override (Optional)</label>
-						<input type="number" id="rateLimit" bind:value={rateLimitOverride} class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm" placeholder="req/sec" />
-					</div>
-				</div>
-
-				<div class="mt-5 sm:mt-6 sm:flex sm:flex-row-reverse">
-					<button type="submit" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:ml-3 sm:w-auto sm:text-sm">
-						Create
-					</button>
-					<button type="button" on:click={handleClose} class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:mt-0 sm:w-auto sm:text-sm">
-						Cancel
-					</button>
-				</div>
-			</form>
-		{/if}
+		</form>
 	</div>
 </div>
 {/if}

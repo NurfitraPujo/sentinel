@@ -2,121 +2,197 @@
 	import ApiKeyTable from '$lib/components/keys/ApiKeyTable.svelte';
 	import ApiKeyCreateModal from '$lib/components/keys/ApiKeyCreateModal.svelte';
 
-	let isModalOpen = false;
-	let keys = [
-		{
-			id: '1',
-			name: 'Development Key',
-			prefix: 'sent_org_dev_',
-			scopes: ['Read/Query'],
-			targetProject: 'All Projects [Org-Wide]',
-			status: 'active',
-			createdAt: new Date().toISOString()
-		}
-	];
-	let projects = [
-		{ id: 'proj_1', name: 'Frontend App' },
-		{ id: 'proj_2', name: 'Backend API' }
-	];
+	export let data: {
+		orgId: string;
+		orgSlug: string;
+		keys: any[];
+		projects: Array<{ id: string; name: string }>;
+	};
 
-	let createModal: ApiKeyCreateModal;
+	let isModalOpen = false;
+	$: keys = data.keys || [];
+	$: projects = data.projects || [];
+
+	let newlyCreatedToken: string | null = null;
+	let copiedToken = false;
+
+	let toastMessage: string | null = null;
+	let toastType: 'error' | 'success' = 'error';
+
+	function showToast(message: string, type: 'error' | 'success' = 'error') {
+		toastMessage = message;
+		toastType = type;
+		setTimeout(() => {
+			if (toastMessage === message) toastMessage = null;
+		}, 5000);
+	}
+
+	async function copyToClipboard(text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			copiedToken = true;
+			setTimeout(() => { copiedToken = false; }, 4000);
+		} catch (e) {
+			showToast('Failed to copy to clipboard');
+		}
+	}
 
 	async function handleCreate(event: CustomEvent) {
-		const { name, targetProject, scopes, rateLimitOverride } = event.detail;
-		const newToken = 'sent_org_live_secret_token_' + Date.now();
-		keys = [...keys, {
-			id: Date.now().toString(),
-			name,
-			prefix: 'sent_org_',
-			scopes,
-			targetProject,
-			status: 'active',
-			createdAt: new Date().toISOString()
-		}];
-		createModal.setCreatedToken(newToken);
+		const { name, targetProject, scope, rateLimitRpm } = event.detail;
+
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					name,
+					scope,
+					projectId: targetProject !== 'All Projects [Org-Wide]' ? targetProject : undefined,
+					rateLimitRpm
+				})
+			});
+
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to create key' }));
+				showToast(err.message || `Error ${res.status}: Failed to create key`);
+				return;
+			}
+
+			const { key, token } = await res.json();
+			
+			// Single-exposure secret token banner
+			newlyCreatedToken = token;
+			isModalOpen = false;
+
+			// Add new key to local state
+			keys = [key, ...keys];
+			showToast('API Key created successfully', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while creating key');
+		}
 	}
 
 	async function handleRotate(event: CustomEvent) {
 		const { id } = event.detail;
-		alert(`Rotated key ${id}`);
+
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys/${id}/rotate`, {
+				method: 'POST'
+			});
+
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to rotate key' }));
+				showToast(err.message || `Error ${res.status}: Failed to rotate key`);
+				return;
+			}
+
+			const { key, token } = await res.json();
+
+			// Expose rotated raw token once in top inline tray
+			newlyCreatedToken = token;
+
+			// Replace old key in local state with rotated key
+			keys = keys.map(k => (k.id === id ? { ...key, status: 'active' } : k));
+			showToast('API Key rotated successfully. Old key invalidated.', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while rotating key');
+		}
 	}
 
 	async function handleRevoke(event: CustomEvent) {
 		const { id } = event.detail;
-		keys = keys.filter(k => k.id !== id);
+
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys/${id}`, {
+				method: 'DELETE'
+			});
+
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke key' }));
+				showToast(err.message || `Error ${res.status}: Failed to revoke key`);
+				return;
+			}
+
+			// Mark as revoked locally
+			keys = keys.map(k => (k.id === id ? { ...k, status: 'revoked', revokedAt: new Date().toISOString() } : k));
+			showToast('API Key revoked successfully', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking key');
+		}
 	}
 </script>
 
-<div class="keys-container">
-	<div class="keys-header">
-		<div>
-			<h1 class="page-title">Organization API Keys</h1>
-			<p class="subtitle">Manage secret API keys (`sent_org_...`) for org-wide event ingestion and query access</p>
+<div class="keys-container min-h-screen bg-gray-950 text-gray-100 p-6">
+	<div class="max-w-6xl mx-auto">
+		<!-- Page Header -->
+		<div class="flex justify-between items-start border-b border-gray-800 pb-4 mb-6">
+			<div>
+				<h1 class="text-xl font-bold tracking-tight text-gray-100">Organization API Keys</h1>
+				<p class="text-xs text-gray-400 mt-1">
+					Manage secret API keys (<code class="text-emerald-400 bg-gray-900 px-1.5 py-0.5 rounded border border-gray-800">sent_org_...</code>) for org-wide telemetry ingestion and API query access.
+				</p>
+			</div>
+			<button 
+				on:click={() => isModalOpen = true} 
+				class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-emerald-950/40"
+			>
+				+ Create API Key
+			</button>
 		</div>
-		<button on:click={() => isModalOpen = true} class="btn-create">
-			Create API Key
-		</button>
-	</div>
 
-	<div class="table-wrapper">
-		<ApiKeyTable {keys} on:rotate={handleRotate} on:revoke={handleRevoke} />
+		<!-- Toast Notification Banner -->
+		{#if toastMessage}
+			<div class={`mb-4 px-4 py-3 rounded-lg text-xs font-medium border flex justify-between items-center ${toastType === 'error' ? 'bg-rose-950/80 border-rose-800 text-rose-200' : 'bg-emerald-950/80 border-emerald-800 text-emerald-200'}`}>
+				<span>{toastMessage}</span>
+				<button on:click={() => toastMessage = null} class="text-xs font-bold opacity-75 hover:opacity-100">✕</button>
+			</div>
+		{/if}
+
+		<!-- Single-Exposure Raw Secret Token Alert Tray -->
+		{#if newlyCreatedToken}
+			<div class="mb-6 bg-amber-950/60 border-2 border-amber-500/80 rounded-xl p-5 shadow-2xl relative">
+				<div class="flex items-start justify-between">
+					<div class="space-y-1">
+						<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-amber-500 text-gray-950 uppercase tracking-wider">
+							Save Secret Token Now
+						</span>
+						<h3 class="text-sm font-semibold text-amber-200">Single-Exposure API Key Secret</h3>
+						<p class="text-xs text-amber-300/80">
+							This secret token will <strong>never be shown again</strong>. Store it securely in your secret manager or environment variables.
+						</p>
+					</div>
+					<button 
+						on:click={() => newlyCreatedToken = null}
+						class="text-amber-400 hover:text-amber-200 text-sm font-bold p-1"
+						title="Dismiss secret banner"
+					>
+						✕
+					</button>
+				</div>
+
+				<div class="mt-4 flex items-center gap-3">
+					<div class="flex-1 bg-gray-950 border border-amber-700/50 rounded-lg px-4 py-2.5 font-mono text-sm text-emerald-400 select-all tracking-wide break-all">
+						{newlyCreatedToken}
+					</div>
+					<button 
+						on:click={() => copyToClipboard(newlyCreatedToken!)}
+						class="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-gray-950 font-bold rounded-lg text-xs transition-colors shrink-0 flex items-center gap-1.5"
+					>
+						{copiedToken ? '✓ Copied' : 'Copy Secret'}
+					</button>
+				</div>
+			</div>
+		{/if}
+
+		<!-- Key Inventory Table -->
+		<div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
+			<ApiKeyTable {keys} on:rotate={handleRotate} on:revoke={handleRevoke} />
+		</div>
 	</div>
 </div>
 
 <ApiKeyCreateModal 
-	bind:this={createModal}
 	bind:isOpen={isModalOpen} 
 	{projects} 
 	on:create={handleCreate} 
 />
-
-<style>
-	.keys-container {
-		max-width: 1100px;
-		margin: 0 auto;
-	}
-
-	.keys-header {
-		display: flex;
-		justify-content: space-between;
-		align-items: flex-start;
-		border-bottom: 1px solid var(--border-color);
-		padding-bottom: 0.75rem;
-		margin-bottom: 1.5rem;
-	}
-
-	.page-title {
-		font-size: 1.25rem;
-		font-weight: 600;
-		color: var(--text-primary);
-		margin-bottom: 0.25rem;
-	}
-
-	.subtitle {
-		font-size: 0.8125rem;
-		color: var(--text-muted);
-	}
-
-	.btn-create {
-		background: var(--color-primary);
-		color: var(--text-primary);
-		padding: 0.45rem 1rem;
-		border-radius: var(--radius-sm);
-		font-size: 0.8125rem;
-		font-weight: 500;
-		border: none;
-		cursor: pointer;
-		transition: background 0.15s ease;
-	}
-
-	.btn-create:hover {
-		background: var(--color-primary-hover);
-	}
-
-	.table-wrapper {
-		background: var(--bg-surface);
-		border: 1px solid var(--border-color);
-		border-radius: var(--radius-md);
-		overflow: hidden;
-	}
-</style>
