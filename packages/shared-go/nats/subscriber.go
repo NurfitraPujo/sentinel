@@ -4,13 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
+
+// Header re-exports the underlying NATS client's header type so callers of Subscribe (whose handler
+// signature carries per-message headers, added for W0/OBSERVABILITY_PLAN.md so a trace context can ride
+// across the publish/consume hop) can name the parameter type via this package alone, without a direct
+// import of github.com/nats-io/nats.go. It is a type alias, not a new type: a Header here is identical
+// to, and interchangeable with, nats.Header from the underlying client — no conversion required.
+type Header = nats.Header
 
 // defaultMaxDeliver caps redelivery attempts when SubscriberConfig.MaxDeliver
 // is not set. Before this existed, the consumer had no delivery cap at all
@@ -155,6 +162,15 @@ const (
 	DLQClassUnclassified = "unclassified"
 )
 
+// Structured-log attribute keys used by this package's slog call sites below. These mirror
+// packages/shared-go/obs's naming convention (LogKeyEvent = "event", dot-separated event values like
+// "dlq.dead_lettered") but the key is spelled out here as a literal rather than imported from obs: obs
+// imports this package (NATSHeaderCarrier, see nats.go), so importing obs from here would be a cycle.
+// Keep this in sync with obs.LogKeyEvent by hand — there is no compiler check for that
+// (docs/memory/BUGS.md B5) — which is exactly why it is one constant here rather than a string literal
+// repeated at every call site below.
+const logKeyEvent = "event"
+
 // dlqClass reports the class to record for a failure that exhausted its retries or was marked permanent.
 func dlqClass(cause error) string {
 	if IsPermanent(cause) {
@@ -202,7 +218,7 @@ func NewSubscriber(ctx context.Context, cfg SubscriberConfig) (*Subscriber, erro
 	}, nil
 }
 
-func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) error {
+func (s *Subscriber) Subscribe(ctx context.Context, handler func(ctx context.Context, data []byte, headers Header) error) error {
 	// Deliberately not ctx: consumer provisioning is one-time setup, not
 	// part of the per-message fetch loop that ctx governs below. Tying it to
 	// ctx would make Subscribe fail whenever called with an
@@ -240,7 +256,12 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) 
 			return
 		}
 		if err := s.ensureConsumer(context.Background()); err != nil {
-			log.Printf("nats: post-startup consumer reconciliation failed for %s/%s: %v", s.cfg.Stream, s.cfg.Consumer, err)
+			slog.WarnContext(ctx, fmt.Sprintf("nats: post-startup consumer reconciliation failed for %s/%s: %v", s.cfg.Stream, s.cfg.Consumer, err),
+				logKeyEvent, "nats.consumer_reconcile_failed",
+				"stream", s.cfg.Stream,
+				"consumer", s.cfg.Consumer,
+				"error", err.Error(),
+			)
 		}
 	}()
 
@@ -271,7 +292,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) 
 					// An empty window is normal, not an error: nats.ErrTimeout comes from MaxWait,
 					// DeadlineExceeded from the per-fetch context above.
 					if err != nats.ErrTimeout && !errors.Is(err, context.DeadlineExceeded) {
-						s.sendError(err)
+						s.sendError(ctx, err)
 					}
 					continue
 				}
@@ -289,13 +310,13 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler func([]byte) error) 
 // handleMessage runs handler against a single delivered message and decides
 // between Ack, Nak (retry), and dead-lettering based on the handler's error
 // (and whether it is a PermanentError) and the message's delivery count.
-func (s *Subscriber) handleMessage(ctx context.Context, msg *nats.Msg, handler func([]byte) error) {
+func (s *Subscriber) handleMessage(ctx context.Context, msg *nats.Msg, handler func(ctx context.Context, data []byte, headers Header) error) {
 	numDelivered := uint64(1)
 	if meta, metaErr := msg.Metadata(); metaErr == nil && meta != nil {
 		numDelivered = meta.NumDelivered
 	}
 
-	err := handler(msg.Data)
+	err := handler(ctx, msg.Data, msg.Header)
 	if err == nil {
 		msg.Ack()
 		return
@@ -349,6 +370,24 @@ func retryBackoff(numDelivered uint64) time.Duration {
 	return schedule[numDelivered-1]
 }
 
+// copyHeader returns a deep copy of h: a new map, and a new (copied) value slice per key. nats.Header is
+// a plain map[string][]string, so a shallow "same map, new variable" copy would still alias the
+// original's value slices — a caller that then Sets a key on the "copy" would replace the slice for that
+// key in a map that is a different Go value but whose OTHER keys' slices are still shared backing arrays
+// with the original nats.Msg's headers. deadLetter below needs a copy it can freely mutate (adding the
+// DLQ bookkeeping headers) without ever risking a write that becomes visible through msg.Header too. A
+// nil h (a message published with no headers at all) returns a non-nil, empty Header, since Header.Set
+// requires a non-nil map to write into.
+func copyHeader(h nats.Header) nats.Header {
+	out := make(nats.Header, len(h))
+	for k, v := range h {
+		vv := make([]string, len(v))
+		copy(vv, v)
+		out[k] = vv
+	}
+	return out
+}
+
 // deadLetter publishes the raw message body (with failure metadata in headers) to the configured DLQ
 // subject, logs loudly, and terminates the original message so JetStream stops redelivering it.
 //
@@ -363,14 +402,38 @@ func (s *Subscriber) deadLetter(ctx context.Context, msg *nats.Msg, cause error,
 	subject := s.dlqSubject()
 
 	if subject == "" {
-		log.Printf("nats: DEAD-LETTER (no DLQ subject configured): terminating unprocessable message on subject=%s after %d deliveries, cause=%v",
-			s.cfg.Subject, numDelivered, cause)
+		slog.ErrorContext(ctx, fmt.Sprintf("nats: DEAD-LETTER (no DLQ subject configured): terminating unprocessable message on subject=%s after %d deliveries, cause=%v",
+			s.cfg.Subject, numDelivered, cause),
+			logKeyEvent, "dlq.no_subject_configured",
+			"subject", s.cfg.Subject,
+			"attempts", numDelivered,
+			"cause", cause.Error(),
+		)
 	} else {
 		if err := s.ensureDLQStream(ctx, subject); err != nil {
-			log.Printf("nats: DEAD-LETTER: failed to ensure DLQ stream for subject=%s: %v", subject, err)
+			slog.WarnContext(ctx, fmt.Sprintf("nats: DEAD-LETTER: failed to ensure DLQ stream for subject=%s: %v", subject, err),
+				logKeyEvent, "dlq.ensure_stream_failed",
+				"subject", subject,
+				"error", err.Error(),
+			)
 		}
 
-		headers := nats.Header{}
+		// Seed headers from a COPY of the inbound message's headers — not a fresh, empty map — so the W3C
+		// traceparent (and tracestate/baggage) that rode in on msg.Header survives onto the parked copy.
+		// This used to be `headers := nats.Header{}`, which silently discarded whatever the ingestor's
+		// producer span injected: msg.Header is the ONLY place that trace context lives at this point, and
+		// dropping it here severed the distributed trace at exactly the moment it becomes most valuable —
+		// "this event failed N times and got parked" is the single most useful trace in this system, and it
+		// used to end here with no link back to where the event entered the pipeline. copyHeader deep-copies
+		// (rather than aliases) msg.Header, so the Sets below can never mutate the original message's headers.
+		//
+		// The four Set calls that follow are deliberate about overwriting, not accidental: Header.Set
+		// REPLACES a key's value rather than appending to it, so if this message is itself a replay of an
+		// earlier dead-letter (msg.Header already carries X-Sentinel-Dlq-* keys — though tools/dlq's
+		// republish deliberately does NOT carry those forward, see its replayHeaders — or from some other
+		// producer that copied them), these calls overwrite them with THIS attempt's own reason/attempts/
+		// subject/class rather than leaving stale values to misdescribe what just happened.
+		headers := copyHeader(msg.Header)
 		headers.Set(DLQReasonHeader, cause.Error())
 		headers.Set(DLQAttemptsHeader, strconv.FormatUint(numDelivered, 10))
 		headers.Set(DLQSourceSubjectHeader, s.cfg.Subject)
@@ -387,19 +450,37 @@ func (s *Subscriber) deadLetter(ctx context.Context, msg *nats.Msg, cause error,
 		dlqMsg := &nats.Msg{Subject: subject, Data: msg.Data, Header: headers}
 
 		if _, err := s.js.PublishMsg(dlqMsg, nats.Context(ctx)); err != nil {
-			log.Printf("nats: DEAD-LETTER PUBLISH FAILED: subject=%s dlq_subject=%s attempts=%d cause=%v publish_err=%v — NOT terminating; leaving the message in %s so it is not lost",
-				s.cfg.Subject, subject, numDelivered, cause, err, s.cfg.Stream)
+			slog.ErrorContext(ctx, fmt.Sprintf("nats: DEAD-LETTER PUBLISH FAILED: subject=%s dlq_subject=%s attempts=%d cause=%v publish_err=%v — NOT terminating; leaving the message in %s so it is not lost",
+				s.cfg.Subject, subject, numDelivered, cause, err, s.cfg.Stream),
+				logKeyEvent, "dlq.publish_failed",
+				"subject", s.cfg.Subject,
+				"dlq_subject", subject,
+				"attempts", numDelivered,
+				"cause", cause.Error(),
+				"error", err.Error(),
+				"stream", s.cfg.Stream,
+			)
 			s.dlqPublishFailures.Add(1)
 			// Preserve the event rather than drop it. MaxDeliver bounds redelivery server-side.
 			msg.NakWithDelay(retryBackoff(numDelivered))
 			return
 		}
-		log.Printf("nats: DEAD-LETTERED message: subject=%s dlq_subject=%s attempts=%d cause=%v",
-			s.cfg.Subject, subject, numDelivered, cause)
+		slog.WarnContext(ctx, fmt.Sprintf("nats: DEAD-LETTERED message: subject=%s dlq_subject=%s attempts=%d cause=%v",
+			s.cfg.Subject, subject, numDelivered, cause),
+			logKeyEvent, "dlq.dead_lettered",
+			"subject", s.cfg.Subject,
+			"dlq_subject", subject,
+			"attempts", numDelivered,
+			"cause", cause.Error(),
+		)
 	}
 
 	if err := msg.Term(); err != nil {
-		log.Printf("nats: DEAD-LETTER: failed to terminate message on subject=%s: %v", s.cfg.Subject, err)
+		slog.ErrorContext(ctx, fmt.Sprintf("nats: DEAD-LETTER: failed to terminate message on subject=%s: %v", s.cfg.Subject, err),
+			logKeyEvent, "dlq.terminate_failed",
+			"subject", s.cfg.Subject,
+			"error", err.Error(),
+		)
 	}
 }
 
@@ -581,7 +662,7 @@ func (s *Subscriber) DLQPublishFailures() uint64 {
 // was drained (VERIFIED_STATE.md S13) — no caller could ever process
 // another message again after that point, silently. Preferring to drop and
 // count is strictly better than that: the fetch loop keeps running.
-func (s *Subscriber) sendError(err error) {
+func (s *Subscriber) sendError(ctx context.Context, err error) {
 	select {
 	case s.errors <- err:
 	default:
@@ -593,7 +674,11 @@ func (s *Subscriber) sendError(err error) {
 		if !s.shouldLogDrop() {
 			return
 		}
-		log.Printf("nats: dropping subscriber error because Errors() is not being drained (capacity=1, dropped=%d so far): %v", dropped, err)
+		slog.WarnContext(ctx, fmt.Sprintf("nats: dropping subscriber error because Errors() is not being drained (capacity=1, dropped=%d so far): %v", dropped, err),
+			logKeyEvent, "nats.subscriber_error_dropped",
+			"dropped", dropped,
+			"error", err.Error(),
+		)
 	}
 }
 

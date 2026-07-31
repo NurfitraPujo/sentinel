@@ -66,6 +66,45 @@ import (
 // header already invented different words for this state once.
 const classUnclassified = sentinelnats.DLQClassUnclassified
 
+// replayHeaderKeys are the ONLY headers a replay carries forward from the parked DLQ message onto the
+// republished one. They are the W3C distributed-trace propagation keys the OTel NATS carrier reads/writes
+// (see packages/shared-go/obs/carrier.go's NATSHeaderCarrier) — traceparent identifies the trace, tracestate
+// carries vendor-specific state, baggage carries arbitrary key/value context. Keeping these alive across a
+// replay is the whole point of this fix: "this event failed N times and got parked" is the single most
+// valuable trace in this system, and a replay that starts a disconnected root span severs it right where it
+// matters most.
+//
+// This tool cannot import packages/shared-go/obs to reuse its constants (obs has no exported names for
+// these — they are OTel's own wire vocabulary, always spelled this way by otel.GetTextMapPropagator(), see
+// carrier.go's doc comment) and, independently, this package intentionally has no dependency on obs at all,
+// so the three keys are inlined here as the literal, stable W3C header names.
+var replayHeaderKeys = []string{"traceparent", "tracestate", "baggage"}
+
+// replayHeaders builds the header set for a message being republished onto its original subject.
+//
+// The trace context survives (see replayHeaderKeys above): severing it here would just move today's bug
+// one hop further down the pipe instead of fixing it — packages/shared-go/nats/subscriber.go's deadLetter
+// now preserves it going INTO the DLQ, and dropping it here on the way back OUT would still leave the
+// replayed event starting a brand-new, disconnected trace.
+//
+// The X-Sentinel-Dlq-* bookkeeping headers (reason/attempts/source-subject/class) do NOT ride back onto
+// the source subject — this is a deliberate choice, not an oversight: those headers describe what
+// deadLetter observed about the LAST, failed attempt (why IT was parked), not anything true about this new
+// attempt. Carrying them forward would let a stale X-Sentinel-Dlq-Class (or reason, or attempt count) sit
+// on a message flowing through the primary subject, where nothing expects DLQ metadata to be present at
+// all — and if this replay fails and gets dead-lettered again, deadLetter's own headers.Set calls
+// overwrite them anyway, so keeping them here buys nothing except a message that looks, to any casual
+// inspector on the primary subject, like it is still sitting in the DLQ.
+func replayHeaders(h nats.Header) nats.Header {
+	out := nats.Header{}
+	for _, key := range replayHeaderKeys {
+		if v := headerValue(h, key); v != "" {
+			out.Set(key, v)
+		}
+	}
+	return out
+}
+
 func main() {
 	var (
 		natsURL        = flag.String("nats-url", getEnv("NATS_URL", "nats://localhost:4222"), "NATS server URL")
@@ -350,7 +389,11 @@ func run(ctx context.Context, cfg config) error {
 			continue
 		}
 
-		ack, err := js.Publish(sourceSubject, msg.Data, nats.Context(ctx))
+		// PublishMsg, not Publish: a plain Publish(subject, data) has no way to attach headers, so the
+		// replayed message would start a brand-new, disconnected trace even though the original
+		// traceparent is sitting right here in msg.Header. replayHeaders decides exactly what survives
+		// the trip back onto sourceSubject — see its doc comment for which headers and why.
+		ack, err := js.PublishMsg(&nats.Msg{Subject: sourceSubject, Data: msg.Data, Header: replayHeaders(msg.Header)}, nats.Context(ctx))
 		if err != nil {
 			fmt.Printf("  REPLAY FAILED: publish to %q failed: %v (left in DLQ, not deleted)\n", sourceSubject, err)
 			res.errored++

@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -67,7 +69,7 @@ type Dispatcher struct {
 	// SetSenderForTest below), it is no longer test-only: NewProcessorService
 	// wires it to a real sender (see alerts.BuildSender) via SetSender, which
 	// is the production, non-test entry point. It is left nil until a setter
-	// is called, in which case sendAlert falls back to log.Printf — this is
+	// is called, in which case sendAlert falls back to a slog line — this is
 	// what made alerting a no-op in production before S8 was fixed (see
 	// docs/plans/E2E_RECOVERY_PLAN.md P5-1 / VERIFIED_STATE.md S8).
 	senderMu      sync.RWMutex
@@ -185,7 +187,8 @@ func refreshInterval() time.Duration {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
-		log.Printf("alerts: ignoring unparseable ALERT_CONFIG_REFRESH_INTERVAL=%q; using default %s", v, defaultRefreshInterval)
+		slog.Warn("alerts: ignoring unparseable ALERT_CONFIG_REFRESH_INTERVAL; using default",
+			slog.String("value", v), slog.Duration("default", defaultRefreshInterval))
 	}
 	return defaultRefreshInterval
 }
@@ -233,14 +236,16 @@ type alertConfigInvalidation struct {
 // never correctness, and is logged loudly rather than silently swallowed.
 func (d *Dispatcher) StartInvalidationSubscriber(sub *nats.Subscriber) {
 	if sub == nil {
-		log.Printf("alerts: alert_config.changed subscriber unavailable; alert config changes will take up to %s (the periodic backstop refresh interval) to take effect", refreshInterval())
+		slog.Warn("alerts: alert_config.changed subscriber unavailable; alert config changes will take up to the periodic backstop refresh interval to take effect",
+			slog.Duration("backstop_interval", refreshInterval()))
 		return
 	}
 
-	err := sub.Subscribe(context.Background(), func(data []byte) error {
+	err := sub.Subscribe(context.Background(), func(ctx context.Context, data []byte, headers nats.Header) error {
 		var msg alertConfigInvalidation
 		if jsonErr := json.Unmarshal(data, &msg); jsonErr != nil {
-			log.Printf("alerts: ignoring unreadable alert_config.changed message: %v", jsonErr)
+			slog.WarnContext(ctx, "alerts: ignoring unreadable alert_config.changed message",
+				slog.String("error", jsonErr.Error()))
 			return nil
 		}
 
@@ -248,11 +253,15 @@ func (d *Dispatcher) StartInvalidationSubscriber(sub *nats.Subscriber) {
 		d.refreshConfigs(refreshCtx)
 		cancel()
 
-		log.Printf("alerts: reloaded alert configs after alert_config.changed (project=%s config=%s)", msg.ProjectID, msg.ConfigID)
+		// tests/e2e/alerting_test.go (U27) greps this exact substring — do not reword.
+		slog.InfoContext(ctx, fmt.Sprintf("alerts: reloaded alert configs after alert_config.changed (project=%s config=%s)", msg.ProjectID, msg.ConfigID),
+			slog.String("project_id", msg.ProjectID), slog.String("config_id", msg.ConfigID),
+			slog.String(obs.LogKeyEvent, "alert_config.reloaded"))
 		return nil
 	})
 	if err != nil {
-		log.Printf("alerts: failed to subscribe to alert_config.changed: %v; alert config changes will take up to %s (the periodic backstop refresh interval) to take effect", err, refreshInterval())
+		slog.Warn("alerts: failed to subscribe to alert_config.changed; alert config changes will take up to the periodic backstop refresh interval to take effect",
+			slog.String("error", err.Error()), slog.Duration("backstop_interval", refreshInterval()))
 		return
 	}
 
@@ -261,7 +270,7 @@ func (d *Dispatcher) StartInvalidationSubscriber(sub *nats.Subscriber) {
 	// itself, but it does silently lose error visibility for this subscriber.
 	go func() {
 		for subErr := range sub.Errors() {
-			log.Printf("alerts: alert_config.changed subscriber error: %v", subErr)
+			slog.Error("alerts: alert_config.changed subscriber error", slog.String("error", subErr.Error()))
 		}
 	}()
 }
@@ -279,7 +288,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 		"SELECT id, project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled FROM alert_configs WHERE enabled = true",
 	)
 	if err != nil {
-		log.Printf("Failed to load alert configs: %v", err)
+		slog.ErrorContext(ctx, "alerts: failed to load alert configs", slog.String("error", err.Error()))
 		return
 	}
 
@@ -297,7 +306,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 		// is organization-wide. organization_id is NOT NULL on every row (project-scoped rows carry
 		// it too, backfilled by that migration), so it scans directly into cfg.OrganizationID.
 		if err := rows.Scan(&configID, &projectID, &cfg.OrganizationID, &cfg.Channel, &channelConfigJSON, &cfg.FrequencyThreshold, &windowSeconds, &cfg.Enabled); err != nil {
-			log.Printf("alerts: skipping unreadable alert_configs row: %v", err)
+			slog.WarnContext(ctx, "alerts: skipping unreadable alert_configs row", slog.String("error", err.Error()))
 			continue
 		}
 		cfg.ID = configID
@@ -313,11 +322,13 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 				var nested string
 				if json.Unmarshal(channelConfigJSON, &nested) == nil {
 					if err2 := json.Unmarshal([]byte(nested), &cfg.ChannelConfig); err2 != nil {
-						log.Printf("alerts: config=%s channel_config is not a JSON object (%v); alerts for this config will drop", configID, err2)
+						slog.WarnContext(ctx, "alerts: channel_config is not a JSON object; alerts for this config will drop",
+							slog.String("config_id", configID), slog.String("error", err2.Error()))
 						continue
 					}
 				} else {
-					log.Printf("alerts: config=%s channel_config unreadable (%v); alerts for this config will drop", configID, err)
+					slog.WarnContext(ctx, "alerts: channel_config unreadable; alerts for this config will drop",
+						slog.String("config_id", configID), slog.String("error", err.Error()))
 					continue
 				}
 			}
@@ -335,7 +346,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	rowsErr := rows.Err()
 	rows.Close()
 	if rowsErr != nil {
-		log.Printf("alerts: error iterating alert_configs rows: %v", rowsErr)
+		slog.ErrorContext(ctx, "alerts: error iterating alert_configs rows", slog.String("error", rowsErr.Error()))
 		return
 	}
 
@@ -345,13 +356,13 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	projectOrg := make(map[string]string)
 	orgRows, err := d.db.Query(ctx, "SELECT id, organization_id FROM projects")
 	if err != nil {
-		log.Printf("alerts: failed to load project->organization mapping: %v", err)
+		slog.ErrorContext(ctx, "alerts: failed to load project->organization mapping", slog.String("error", err.Error()))
 		return
 	}
 	for orgRows.Next() {
 		var pid, oid string
 		if err := orgRows.Scan(&pid, &oid); err != nil {
-			log.Printf("alerts: skipping unreadable projects row: %v", err)
+			slog.WarnContext(ctx, "alerts: skipping unreadable projects row", slog.String("error", err.Error()))
 			continue
 		}
 		projectOrg[pid] = oid
@@ -359,7 +370,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	orgRowsErr := orgRows.Err()
 	orgRows.Close()
 	if orgRowsErr != nil {
-		log.Printf("alerts: error iterating projects rows: %v", orgRowsErr)
+		slog.ErrorContext(ctx, "alerts: error iterating projects rows", slog.String("error", orgRowsErr.Error()))
 		return
 	}
 
@@ -530,7 +541,13 @@ func (d *Dispatcher) sendAlert(ctx context.Context, cfg *AlertConfig, alert *Ale
 		sender(ctx, cfg, alert)
 		return
 	}
-	log.Printf("ALERT: %s via %s - %s", alert.IssueID, cfg.Channel, alert.Message)
+	// Reached only when no sender has been wired via SetSender/SetSenderForTest — production always
+	// wires one (see NewProcessorService). This is the pre-S8 no-op path, kept as a safety net rather
+	// than a panic. Recording OutcomeDispatchDropped here is what makes this path distinguishable from
+	// a healthy-but-quiet system on sentinel_alert_dispatch_total — see obs.OutcomeDispatchDropped.
+	slog.InfoContext(ctx, "ALERT (no sender configured)",
+		slog.String("issue_id", alert.IssueID), slog.String("channel", cfg.Channel), slog.String("message", alert.Message))
+	procmetrics.RecordAlertDispatch(ctx, cfg.Channel, obs.OutcomeDispatchDropped)
 }
 
 // SetSender wires the dispatcher's outbound alert channel to a real sender.

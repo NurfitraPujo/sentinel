@@ -704,3 +704,48 @@ this contract were written within an hour of each other and invented *different 
 `"unknown"` in the processor's `/health`, `"unclassified"` in `tools/dlq`. That is B5 at the smallest
 possible scale. One name, defined once. The processor's alert text uses `"unavailable"` for a detail it could
 not fetch, which is a genuinely different state from a message having no class.
+
+## D15 | Observability: OTel Everywhere, the Trace ID Is the Correlation ID, and Nothing Depends on the Collector
+
+**Date**: 2026-07-31 · **Status**: accepted · **Supersedes**: nothing · **Detail**:
+`docs/plans/OBSERVABILITY_PLAN.md` (decisions D-a…D-f), acceptance row U35.
+
+### Decision
+
+1. **One instrumentation API.** `slog` for logs, and the OTel API for both traces and metrics — metrics
+   go through the OTel meter API over a Prometheus *exporter*, not through `prometheus/client_golang`
+   directly. Two metric APIs in one process is how label conventions drift apart.
+2. **The correlation id IS the OTel trace id.** No bespoke request-id scheme. The ingestor echoes it as
+   `X-Request-Id`; every log line emitted with a context carrying a span gets `trace_id`/`span_id`
+   automatically from the shared handler.
+3. **Trace context crosses NATS in message headers** (W3C `traceparent`), so the processor's consumer
+   span is a real child of the ingestor's producer span. The DLQ preserves it in both directions.
+4. **Telemetry is never a dependency.** An absent or unreachable collector must mean "no traces", never
+   "no service". Bootstrap never blocks or fails on it, span export drops rather than blocks, and no
+   service `depends_on: jaeger`.
+
+### Why
+
+The degradation rule is the load-bearing one. This is an *error-tracking product*: a version of it that
+stops ingesting because its own telemetry backend is down is worse than one with no telemetry at all.
+That is why the batch span processor is left non-blocking, why the collector is addressed lazily, and
+why the compose file deliberately has no `depends_on` on the trace backend.
+
+The single-correlation-id rule exists because the alternative was already built once by accident and
+was silently broken: an app-generated random id looks *exactly* like a trace id in a log line, so
+nobody notices that grepping it in the trace backend returns nothing.
+
+### Consequences
+
+- Metric labels must stay low-cardinality **by construction**. `project_id`, fingerprints and messages
+  are deliberately absent, and `obs.Bootstrap` installs an SDK View denying request-derived attribute
+  keys (`server.address`, `client.address`, `url.path`, …) for *all* instruments — including
+  third-party instrumentation nobody here authored. `otelhttp` records outside the authenticator on the
+  one public port, so this is a memory-safety property, not tidiness.
+- Resource detection deliberately omits `WithProcess()`/`WithHost()`: `/metrics` is unauthenticated, and
+  `target_info` would otherwise publish hostname, OS user, pid and full argv to anyone who can reach it.
+- Anything that re-publishes a message (DLQ replay) must carry `traceparent`/`tracestate`/`baggage`
+  forward, or it starts a disconnected root trace and the failure loses its history.
+- Because OTel's missing-registration failure mode is *silence*, this decision is only meaningful with
+  the guards described in `BUGS.md` **B11** — a library guard plus a deployment guard (U35). Removing
+  either makes the decision unenforceable rather than merely untested.

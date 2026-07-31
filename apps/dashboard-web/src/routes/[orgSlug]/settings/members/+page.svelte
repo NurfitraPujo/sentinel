@@ -1,18 +1,20 @@
 <script lang="ts">
-  export let data: { 
-    members: Array<{ id: string; user: { name: string; email: string }; role: string }> 
+  import { logger } from '$lib/logger';
+
+  export let data: {
+    members: Array<{ id: string; user: { name: string; email: string }; role: string }>
   } = { members: [] };
 
   const roles = ['owner', 'admin', 'engineer', 'support', 'viewer'];
-  
+
   function handleRoleChange(memberId: string, newRole: string) {
     // TODO: implement API call to update role
-    console.log(`Update ${memberId} to ${newRole}`);
+    logger.info('members.role_change_requested', { memberId, newRole });
   }
 
   function handleRevokeAccess(memberId: string) {
     // TODO: implement API call to remove member
-    console.log(`Revoke access for ${memberId}`);
+    logger.info('members.revoke_requested', { memberId });
   }
 </script>
 

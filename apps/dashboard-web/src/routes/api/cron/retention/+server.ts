@@ -2,6 +2,7 @@ import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
 import { cleanupRetainedData } from '$lib/server/retention';
 import { env } from '$env/dynamic/private';
+import { log } from '$lib/server/observability/log';
 
 const CRON_SECRET_HEADER = 'x-cron-secret';
 
@@ -15,7 +16,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	const expectedSecret = env.CRON_SECRET;
 
 	if (!expectedSecret) {
-		console.error('[RetentionCron] CRON_SECRET environment variable is not set');
+		log.error('retention_cron.not_configured', { note: 'CRON_SECRET environment variable is not set' });
 		return json({ error: 'Cron endpoint not configured' }, { status: 500 });
 	}
 
@@ -25,12 +26,12 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	const retentionDays = parseInt(env.DATA_RETENTION_DAYS ?? '30', 10);
 
-	console.log(`[RetentionCron] Starting data retention cleanup for ${retentionDays} days`);
+	log.info('retention_cron.started', { retentionDays });
 
 	try {
 		const result = await cleanupRetainedData(retentionDays);
 
-		console.log('[RetentionCron] Cleanup completed:', {
+		log.info('retention_cron.completed', {
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			cutoffDate: result.cutoffDate.toISOString(),
@@ -46,7 +47,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			},
 		});
 	} catch (error) {
-		console.error('[RetentionCron] Cleanup failed:', error);
+		log.error('retention_cron.failed', { error });
 		return json(
 			{
 				error: 'Retention cleanup failed',

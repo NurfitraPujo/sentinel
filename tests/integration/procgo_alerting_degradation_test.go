@@ -288,7 +288,7 @@ func TestProcgoDegradationBufferSurvivesOutageNoLossNoDuplicates(t *testing.T) {
 	// non-nil, non-Permanent error from ProcessEvent (the "database
 	// unavailable" sentinel below) is retried by the Subscriber with D10's
 	// backoff (1s/5s/15s/30s/60s across MaxDeliver=5); nil Acks.
-	require.NoError(t, subscriber.Subscribe(ctx, func(data []byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		return svc.ProcessEvent(ctx, data)
 	}))
 

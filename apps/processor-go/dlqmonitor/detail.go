@@ -11,7 +11,7 @@ package dlqmonitor
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -74,7 +74,8 @@ func GetDetail(ctx context.Context, stats StatsSource, oldest OldestMessageSourc
 
 	hasAge, age, class, err := oldest.OldestMessage(ctx, s.Stream)
 	if err != nil {
-		log.Printf("dlqmonitor: oldest-message detail unavailable for stream=%s: %v", s.Stream, err)
+		slog.WarnContext(ctx, "dlqmonitor: oldest-message detail unavailable",
+			slog.String("stream", s.Stream), slog.String("error", err.Error()))
 		return detail, nil
 	}
 	detail.HasOldestAge = hasAge
@@ -135,7 +136,8 @@ func ThresholdsFromEnv() Thresholds {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			depth = uint64(n)
 		} else {
-			log.Printf("dlqmonitor: ignoring invalid PROCESSOR_DLQ_DEPTH_THRESHOLD=%q; using default %d", v, DefaultDepthThreshold)
+			slog.Warn("dlqmonitor: ignoring invalid PROCESSOR_DLQ_DEPTH_THRESHOLD; using default",
+				slog.String("value", v), slog.Int("default", DefaultDepthThreshold))
 		}
 	}
 
@@ -144,7 +146,8 @@ func ThresholdsFromEnv() Thresholds {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			age = d
 		} else {
-			log.Printf("dlqmonitor: ignoring invalid PROCESSOR_DLQ_CRITICAL_AGE=%q; using default %s", v, DefaultCriticalAge)
+			slog.Warn("dlqmonitor: ignoring invalid PROCESSOR_DLQ_CRITICAL_AGE; using default",
+				slog.String("value", v), slog.Duration("default", DefaultCriticalAge))
 		}
 	}
 

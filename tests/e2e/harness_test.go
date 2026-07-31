@@ -292,6 +292,9 @@ type ingestOpts struct {
 	NoAPIKey bool
 	// ProjectKeyHeader sets X-Project-Key, which is how an organization-wide key names its target.
 	ProjectKeyHeader string
+	// Headers sets arbitrary additional request headers, applied last so a test can override any of
+	// the above. U35 uses it to present an inbound W3C `traceparent`.
+	Headers map[string]string
 }
 
 // ingest posts one event to the real /ingest endpoint over HTTP.
@@ -334,6 +337,9 @@ func (f *fixture) post(path string, body any, opts ...ingestOpts) ingestResult {
 	}
 	if o.ProjectKeyHeader != "" {
 		req.Header.Set("X-Project-Key", o.ProjectKeyHeader)
+	}
+	for k, v := range o.Headers {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)

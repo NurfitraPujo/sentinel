@@ -1,11 +1,19 @@
 package notifiers
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/smtp"
 	"time"
+
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
+
+// channelEmail is the LabelChannel value this worker records on procmetrics.RecordAlertDispatch —
+// the same literal "email" alerts.AlertConfig.Channel and notify.go's BuildSender switch on.
+const channelEmail = "email"
 
 type EmailConfig struct {
 	SMTPHost    string
@@ -56,26 +64,42 @@ func (w *EmailWorker) processQueue() {
 }
 
 func (w *EmailWorker) sendWithRetry(notification *EmailNotification) {
+	// No request context survives the enqueue (the queue itself is the decoupling point — see
+	// EmailWorker's doc comment on NewEmailWorker), so these log with context.Background() rather than
+	// a per-request ctx: there is no span in scope here to correlate against, which is not an error,
+	// it is simply "no trace in scope right now" (see packages/shared-go/obs.Handler's doc comment).
+	ctx := context.Background()
 	var lastErr error
 
 	for attempt := 0; attempt < w.maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := w.backoffs[attempt-1]
-			log.Printf("Email retry %d/%d after %v", attempt+1, w.maxRetries, backoff)
+			// Message text unchanged (OBSERVABILITY_PLAN.md §4): structure added via attrs only.
+			slog.InfoContext(ctx, fmt.Sprintf("Email retry %d/%d after %v", attempt+1, w.maxRetries, backoff),
+				slog.Int("attempt", attempt+1), slog.Int("max_retries", w.maxRetries), slog.Duration("backoff", backoff))
 			time.Sleep(backoff)
 		}
 
 		err := w.sendEmail(notification)
 		if err == nil {
-			log.Printf("Email sent successfully to %s", notification.ToAddress)
+			// tests/e2e/alerting_test.go (U26/U27) greps this exact substring — do not reword.
+			slog.InfoContext(ctx, fmt.Sprintf("Email sent successfully to %s", notification.ToAddress),
+				slog.String(obs.LogKeyEvent, "alert.email.sent"), slog.String("to", notification.ToAddress))
+			procmetrics.RecordAlertDispatch(ctx, channelEmail, obs.OutcomeDispatchSent)
 			return
 		}
 
 		lastErr = err
-		log.Printf("Email attempt %d failed: %v", attempt+1, err)
+		// tests/e2e/alerting_test.go (U26/U27) greps this exact substring — do not reword.
+		slog.WarnContext(ctx, fmt.Sprintf("Email attempt %d failed: %v", attempt+1, err),
+			slog.Int("attempt", attempt+1), slog.String("error", err.Error()))
 	}
 
-	log.Printf("Email failed after %d attempts: %v", w.maxRetries, lastErr)
+	// tests/e2e/alerting_test.go (U26/U27) greps this exact substring — do not reword.
+	slog.ErrorContext(ctx, fmt.Sprintf("Email failed after %d attempts: %v", w.maxRetries, lastErr),
+		slog.Int("max_retries", w.maxRetries), slog.String("error", lastErr.Error()),
+		slog.String(obs.LogKeyEvent, "alert.email.failed"))
+	procmetrics.RecordAlertDispatch(ctx, channelEmail, obs.OutcomeDispatchError)
 }
 
 func (w *EmailWorker) sendEmail(notification *EmailNotification) error {

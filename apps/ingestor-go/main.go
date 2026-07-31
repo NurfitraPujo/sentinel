@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,8 +20,14 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -44,6 +50,30 @@ const (
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// obs.Setup builds the process-wide structured logger (JSON by default, LOG_FORMAT=text locally;
+	// every line carries service="ingestor-go" and trace_id/span_id once a span is in scope). Set as
+	// the slog default too, so packages that log without threading this value through (e.g. a helper
+	// deep in apps/ingestor-go/auth) still get the same formatting rather than falling back to
+	// log/slog's unconfigured default handler (docs/plans/OBSERVABILITY_PLAN.md D-a).
+	logger := obs.Setup("ingestor-go")
+	slog.SetDefault(logger)
+
+	// obs.Bootstrap wires OpenTelemetry traces+metrics (OTLP/HTTP exporter, Prometheus scrape
+	// endpoint) and registers them as the process-wide otel globals. Degradation is load-bearing here,
+	// not an afterthought: Bootstrap never blocks on, or fails because of, an unreachable collector —
+	// the only way it returns an error is a local misconfiguration (e.g. bad TLS material), which is
+	// rare and, per the plan's degradation mandate, still must not prevent the ingestor from serving
+	// traffic. So a Bootstrap error is logged and the process continues with tracing/metrics degraded
+	// to the otel package's own no-op globals (providers stays nil; every use below is nil-checked)
+	// rather than being escalated into a log.Fatalf that would turn an observability hiccup into a
+	// full outage.
+	providers, obsErr := obs.Bootstrap(ctx, logger, obs.ProvidersConfig{ServiceName: "ingestor-go"})
+	if obsErr != nil {
+		logger.Error("obs: failed to bootstrap tracing/metrics providers; continuing without them "+
+			"(a dead collector or misconfiguration must never block startup)",
+			slog.String("error", obsErr.Error()), slog.String(obs.LogKeyEvent, "obs.bootstrap_failed"))
+	}
 
 	dbCfg := database.Config{
 		Host:            getEnv("POSTGRES_HOST", "localhost"),
@@ -70,9 +100,16 @@ func main() {
 		}
 		select {
 		case <-connCtx.Done():
-			log.Fatalf("Failed to connect to database after 30s timeout: %v", err)
+			// Message text kept verbatim (fmt.Sprintf reproduces exactly what log.Fatalf would have
+			// printed); structure is added via the attr, not by rewording
+			// (docs/plans/OBSERVABILITY_PLAN.md §4). This is a boot-time fatal: nothing has served a
+			// request yet, so os.Exit(1) after logging is equivalent to log.Fatalf and is not the
+			// "dead collector must never be fatal" case obs.Bootstrap governs above.
+			logger.ErrorContext(ctx, fmt.Sprintf("Failed to connect to database after 30s timeout: %v", err),
+				slog.Any("error", err))
+			os.Exit(1)
 		case <-time.After(500 * time.Millisecond):
-			log.Printf("Retrying database connection: %v", err)
+			logger.WarnContext(ctx, fmt.Sprintf("Retrying database connection: %v", err), slog.Any("error", err))
 		}
 	}
 	defer db.Close()
@@ -85,13 +122,15 @@ func main() {
 
 	publisher, err := nats.NewPublisher(ctx, natsCfg)
 	if err != nil {
-		log.Fatalf("Failed to create NATS publisher: %v", err)
+		logger.ErrorContext(ctx, fmt.Sprintf("Failed to create NATS publisher: %v", err), slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher.Close()
 
 	ingestService, err := service.NewIngestService(publisher)
 	if err != nil {
-		log.Fatalf("Failed to create ingest service: %v", err)
+		logger.ErrorContext(ctx, fmt.Sprintf("Failed to create ingest service: %v", err), slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	redisCfg := redis.Config{
@@ -109,15 +148,24 @@ func main() {
 	redisClient, redisErr := redis.NewClient(ctx, redisCfg)
 	if redisErr != nil {
 		if getEnv("RATELIMIT_ALLOW_NO_REDIS", "false") == "true" {
-			log.Printf("WARNING: Redis unreachable at boot (%v); continuing with rate limiting DISABLED "+
+			// tests/e2e/ratelimit_test.go's U20 greps this service's stdout for the substrings
+			// "refus", "disab", "unreachable" (case-insensitively) to prove this decision was actually
+			// logged, not silently taken. The message text below is reproduced verbatim via
+			// fmt.Sprintf — do not reword it (docs/plans/OBSERVABILITY_PLAN.md §4); the slog attrs are
+			// additive structure only.
+			msg := fmt.Sprintf("WARNING: Redis unreachable at boot (%v); continuing with rate limiting DISABLED "+
 				"and the API-key cache DISABLED because RATELIMIT_ALLOW_NO_REDIS=true was set explicitly. "+
 				"This is a deliberate opt-out, not a default — unset RATELIMIT_ALLOW_NO_REDIS to refuse to "+
 				"start instead.", redisErr)
+			logger.WarnContext(ctx, msg, slog.Any("error", redisErr), slog.String(obs.LogKeyEvent, "redis.boot_optout"))
 			redisClient = nil
 		} else {
-			log.Fatalf("Redis unreachable at boot (%v); refusing to start with rate limiting silently "+
+			// Same U20 grep constraint as above applies to this line.
+			msg := fmt.Sprintf("Redis unreachable at boot (%v); refusing to start with rate limiting silently "+
 				"disabled. Set RATELIMIT_ALLOW_NO_REDIS=true to start anyway with rate limiting explicitly "+
 				"disabled (an opt-out, not a default).", redisErr)
+			logger.ErrorContext(ctx, msg, slog.Any("error", redisErr), slog.String(obs.LogKeyEvent, "redis.boot_refused"))
+			os.Exit(1)
 		}
 	}
 
@@ -135,32 +183,66 @@ func main() {
 	subscriber, subErr := nats.NewSubscriber(ctx, subCfg)
 	if subErr != nil {
 		if getEnv("APIKEY_INVALIDATION_REQUIRED", "true") == "true" {
-			log.Fatalf("Failed to subscribe to API key invalidation (set APIKEY_INVALIDATION_REQUIRED=false to start anyway, accepting up to APIKEY_CACHE_TTL revocation latency): %v", subErr)
+			msg := fmt.Sprintf("Failed to subscribe to API key invalidation (set APIKEY_INVALIDATION_REQUIRED=false "+
+				"to start anyway, accepting up to APIKEY_CACHE_TTL revocation latency): %v", subErr)
+			logger.ErrorContext(ctx, msg, slog.Any("error", subErr))
+			os.Exit(1)
 		}
-		log.Printf("WARNING: API key invalidation subscriber unavailable (%v). Revocation will take up to %s to take effect.", subErr, auth.CacheTTLForLogging())
+		msg := fmt.Sprintf("WARNING: API key invalidation subscriber unavailable (%v). Revocation will take up to %s to take effect.",
+			subErr, auth.CacheTTLForLogging())
+		logger.WarnContext(ctx, msg, slog.Any("error", subErr), slog.String(obs.LogKeyEvent, "apikey.invalidation_subscriber_unavailable"))
 		subscriber = nil
 	}
 
 	rateLimiter := middleware.NewRateLimiter(redisClient)
 	authenticator := auth.NewAPIKeyAuthenticator(db, redisClient, subscriber)
 
-	ingestHandler := authenticator.Middleware(
-		rateLimiter.Middleware(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				handleIngest(ingestService, db).ServeHTTP(w, r)
-			}),
+	// ingestRequestCounter records sentinel_ingest_requests_total{outcome}. Outcome can be decided by
+	// three different layers (auth: 401, rate limit: 429, handler: 202/4xx/5xx), so rather than each
+	// layer reporting its own metric, observeMiddleware wraps the WHOLE per-request chain and classifies
+	// the final status code once. No project_id label (docs/plans/OBSERVABILITY_PLAN.md §5 — unbounded
+	// cardinality).
+	meter := otel.Meter("ingestor-go")
+	ingestRequestCounter, err := meter.Int64Counter(
+		obs.MetricIngestRequests,
+		metric.WithDescription("Total ingest requests by outcome"),
+		metric.WithUnit("{request}"),
+	)
+	if err != nil {
+		logger.ErrorContext(ctx, "obs: failed to create ingest request counter; requests will not be recorded as a metric",
+			slog.String("error", err.Error()))
+	}
+
+	ingestChain := observeMiddleware(ingestRequestCounter,
+		authenticator.Middleware(
+			rateLimiter.Middleware(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					handleIngest(ingestService, db, logger).ServeHTTP(w, r)
+				}),
+			),
 		),
 	)
-	batchIngestHandler := authenticator.Middleware(
-		rateLimiter.Middleware(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				handleBatchIngest(ingestService, db).ServeHTTP(w, r)
-			}),
+	batchChain := observeMiddleware(ingestRequestCounter,
+		authenticator.Middleware(
+			rateLimiter.Middleware(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					handleBatchIngest(ingestService, db, logger).ServeHTTP(w, r)
+				}),
+			),
 		),
 	)
-	http.Handle("/ingest", ingestHandler)
-	http.Handle("/ingest/batch", batchIngestHandler)
+
+	// otelhttp wraps the outermost layer of each chain so every request gets a server span honouring an
+	// inbound W3C traceparent (or starting a new root trace when none is present, per D-e). That span is
+	// what observeMiddleware reads the trace id from for X-Request-Id, and what the producer span inside
+	// service.IngestService.Ingest (the NATS publish) becomes a child of.
+	http.Handle("/ingest", otelhttp.NewHandler(ingestChain, "POST /ingest"))
+	http.Handle("/ingest/batch", otelhttp.NewHandler(batchChain, "POST /ingest/batch"))
 	http.HandleFunc("/health", handleHealth(db))
+	if providers != nil {
+		// Never auth'd or rate-limited (deliverable #2) — mounted directly, outside both middlewares.
+		http.Handle("/metrics", providers.MetricsHandler)
+	}
 
 	addr := getEnv("INGESTOR_ADDR", "")
 	if addr == "" {
@@ -178,9 +260,12 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Starting ingestor on %s", addr)
+		// tests/e2e/ratelimit_test.go's U20 requires this exact, case-sensitive substring
+		// ("Starting ingestor") to prove the process reached serving state — keep it verbatim.
+		logger.InfoContext(ctx, fmt.Sprintf("Starting ingestor on %s", addr), slog.String("addr", addr))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			logger.ErrorContext(ctx, fmt.Sprintf("Server failed: %v", err), slog.Any("error", err))
+			os.Exit(1)
 		}
 	}()
 
@@ -188,13 +273,95 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down server...")
+	logger.InfoContext(ctx, "Shutting down server...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		logger.ErrorContext(ctx, fmt.Sprintf("Server forced to shutdown: %v", err), slog.Any("error", err))
 	}
+
+	// Flush the last spans/metrics before the process exits (docs/plans/OBSERVABILITY_PLAN.md finding
+	// 6a) — without this, exactly the spans covering the shutdown-triggering incident are dropped
+	// instead of exported. Bounded so a dead collector cannot hang shutdown indefinitely.
+	if providers != nil {
+		obsShutdownCtx, obsShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer obsShutdownCancel()
+		if err := providers.Shutdown(obsShutdownCtx); err != nil {
+			logger.Error("obs: error flushing/closing tracing and metrics providers on shutdown",
+				slog.String("error", err.Error()))
+		}
+	}
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code a handler chain ultimately wrote,
+// so observeMiddleware can classify the outcome after auth, rate limiting, and the handler itself have
+// all had a chance to decide it — none of those three layers needs to report the metric itself.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// Write mirrors net/http's own "implicit 200 if nobody called WriteHeader" rule, so a handler that only
+// calls Write is still recorded as a 200 rather than 0.
+func (sr *statusRecorder) Write(b []byte) (int, error) {
+	if sr.status == 0 {
+		sr.status = http.StatusOK
+	}
+	return sr.ResponseWriter.Write(b)
+}
+
+// outcomeForStatus maps an HTTP status code to one of the fixed obs.Outcome* values
+// (docs/plans/OBSERVABILITY_PLAN.md §2/obs.go) so sentinel_ingest_requests_total{outcome} never grows an
+// extra time series from a hand-typed string at a second call site.
+func outcomeForStatus(status int) string {
+	switch {
+	case status == http.StatusUnauthorized:
+		return obs.OutcomeUnauthorized
+	case status == http.StatusTooManyRequests:
+		return obs.OutcomeRateLimited
+	case status >= 200 && status < 300:
+		return obs.OutcomeAccepted
+	default:
+		return obs.OutcomeRejected
+	}
+}
+
+// observeMiddleware wraps the whole per-request middleware chain (auth, rate limiting, the handler
+// itself) to provide two cross-cutting concerns that no single inner layer owns:
+//
+//   - X-Request-Id (deliverable #4, plan D-d): the current span's trace id in hex, read from the
+//     context otelhttp already populated by the time this runs (observeMiddleware is wrapped BY
+//     otelhttp.NewHandler in main(), never the reverse) — set unconditionally so both success and error
+//     responses carry it.
+//   - sentinel_ingest_requests_total{outcome} (deliverable #5): recorded once per request from the
+//     final status code, however far the request got.
+//
+// counter may be nil (its creation logged and swallowed in main() rather than treated as fatal); Add is
+// skipped in that case rather than panicking.
+func observeMiddleware(counter metric.Int64Counter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+			w.Header().Set(obs.HTTPRequestIDHeader, sc.TraceID().String())
+		}
+
+		sr := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(sr, r)
+		if sr.status == 0 {
+			sr.status = http.StatusOK
+		}
+
+		if counter != nil {
+			counter.Add(r.Context(), 1, metric.WithAttributes(
+				attribute.String(obs.LabelOutcome, outcomeForStatus(sr.status)),
+			))
+		}
+	})
 }
 
 // batchItemError names a single failed item in a batch ingest response by its
@@ -216,7 +383,7 @@ type batchResult struct {
 	Errors   []batchItemError `json:"errors,omitempty"`
 }
 
-func handleIngest(svc *service.IngestService, db *pgxpool.Pool) http.HandlerFunc {
+func handleIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -241,7 +408,10 @@ func handleIngest(svc *service.IngestService, db *pgxpool.Pool) http.HandlerFunc
 		}
 
 		if err := svc.Ingest(r.Context(), &payload); err != nil {
-			log.Printf("Failed to ingest error: %v", err)
+			// Logged with the request's context so the handler wrapping in obs.Handler injects
+			// trace_id/span_id automatically (docs/plans/OBSERVABILITY_PLAN.md D-a) — never threaded by
+			// hand. Message text kept unchanged; the error is also attached structurally.
+			logger.ErrorContext(r.Context(), fmt.Sprintf("Failed to ingest error: %v", err), slog.Any("error", err))
 			if strings.Contains(err.Error(), "validation failed") {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -250,13 +420,14 @@ func handleIngest(svc *service.IngestService, db *pgxpool.Pool) http.HandlerFunc
 			return
 		}
 
-		log.Printf("Successfully ingested error: project=%s, class=%s", payload.ProjectKey, payload.ErrorClass)
+		logger.InfoContext(r.Context(), fmt.Sprintf("Successfully ingested error: project=%s, class=%s", payload.ProjectKey, payload.ErrorClass),
+			slog.String("project_key", payload.ProjectKey), slog.String("error_class", payload.ErrorClass))
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 	}
 }
 
-func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool) http.HandlerFunc {
+func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -293,7 +464,8 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool) http.Handle
 				continue
 			}
 			if err := svc.Ingest(r.Context(), &payloads[i]); err != nil {
-				log.Printf("Failed to ingest batch item %d: %v", i, err)
+				logger.ErrorContext(r.Context(), fmt.Sprintf("Failed to ingest batch item %d: %v", i, err),
+					slog.Int("batch_index", i), slog.Any("error", err))
 				result.Failed++
 				result.Errors = append(result.Errors, batchItemError{Index: i, Message: err.Error()})
 				continue

@@ -159,7 +159,7 @@ func TestNatsPackageRoundTrip(t *testing.T) {
 	})
 
 	received := make(chan []byte, 1)
-	require.NoError(t, subscriber.Subscribe(ctx, func(data []byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		received <- append([]byte(nil), data...)
 		return nil
 	}))
@@ -174,6 +174,51 @@ func TestNatsPackageRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for subscriber round trip")
+	}
+}
+
+// TestNatsPackagePublishWithHeadersPropagatesTraceparent proves the W3C traceparent header survives the
+// PublishWithHeaders -> JetStream -> Subscribe round trip intact. apps/processor-go/main.go:163 extracts
+// the consumer span's parent EXCLUSIVELY from the header handed to the subscriber's handler
+// (obs.NATSHeaderCarrier(headers)), so if this header were dropped, truncated, or otherwise mangled in
+// transit, every consumer span would silently start a new root trace instead of continuing the
+// producer's — with no test failure anywhere to say so. Equality (not mere presence) is asserted for
+// exactly that reason: a non-nil-but-wrong header would defeat trace propagation just as completely as a
+// missing one, and only an exact-value comparison catches it.
+func TestNatsPackagePublishWithHeadersPropagatesTraceparent(t *testing.T) {
+	fixture := newNATSPackageFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	publisher := newNATSPackagePublisher(t, ctx, fixture.url, fixture.subject, nil)
+	subscriber := newNATSPackageSubscriber(t, ctx, fixture, fixture.url, nil)
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, subscriber.Close())
+	})
+
+	// Realistic W3C traceparent: version-traceid-spanid-flags (00-<32 hex>-<16 hex>-01).
+	wantTraceparent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	received := make(chan sharednats.Header, 1)
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
+		received <- headers
+		return nil
+	}))
+
+	headers := gonats.Header{}
+	headers.Set("traceparent", wantTraceparent)
+	require.NoError(t, publisher.PublishWithHeaders(ctx, []byte("with-traceparent"), sharednats.Header(headers)))
+
+	select {
+	case gotHeaders := <-received:
+		require.NotNil(t, gotHeaders, "subscriber handler must receive the message headers")
+		assert.Equal(t, wantTraceparent, gotHeaders.Get("traceparent"),
+			"traceparent header must survive the PublishWithHeaders -> JetStream -> Subscribe round trip unchanged")
+	case err := <-subscriber.Errors():
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for subscriber to receive the published message")
 	}
 }
 
@@ -192,7 +237,7 @@ func TestNatsPackageSubscriberNakRedelivers(t *testing.T) {
 	attempts := make(chan int, 2)
 	releaseRedelivery := make(chan struct{})
 	var attemptCount atomic.Int32
-	require.NoError(t, subscriber.Subscribe(ctx, func(data []byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		assert.Equal(t, []byte("nak-and-redeliver"), data)
 		attempt := int(attemptCount.Add(1))
 		attempts <- attempt
@@ -248,7 +293,7 @@ func TestNatsPackageSubscriberAck(t *testing.T) {
 	})
 
 	handled := make(chan struct{}, 1)
-	require.NoError(t, subscriber.Subscribe(ctx, func(data []byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		assert.Equal(t, []byte("acknowledge-me"), data)
 		handled <- struct{}{}
 		return nil
@@ -278,7 +323,7 @@ func TestNatsPackageSubscriberStop(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var handled atomic.Int32
-	require.NoError(t, subscriber.Subscribe(ctx, func([]byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		handled.Add(1)
 		started <- struct{}{}
 		<-release
@@ -317,7 +362,7 @@ func TestNatsPackageSubscriberClose(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var handled atomic.Int32
-	require.NoError(t, subscriber.Subscribe(ctx, func([]byte) error {
+	require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 		handled.Add(1)
 		started <- struct{}{}
 		<-release
@@ -334,7 +379,7 @@ func TestNatsPackageSubscriberClose(t *testing.T) {
 	require.NoError(t, subscriber.Close())
 	close(release)
 
-	err := subscriber.Subscribe(ctx, func([]byte) error { return nil })
+	err := subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error { return nil })
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to create pull subscription")
 
@@ -366,7 +411,7 @@ func TestNatsPackageErrorPaths(t *testing.T) {
 		subscriber := newNATSPackageSubscriber(t, ctx, fixture, fixture.url, nil)
 		defer func() { require.NoError(t, subscriber.Close()) }()
 
-		err := subscriber.Subscribe(ctx, func([]byte) error { return nil })
+		err := subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error { return nil })
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to create pull subscription")
 	})
@@ -377,7 +422,7 @@ func TestNatsPackageErrorPaths(t *testing.T) {
 		cancel()
 		subscriber := newNATSPackageSubscriber(t, context.Background(), fixture, fixture.url, nil)
 		var handled atomic.Int32
-		require.NoError(t, subscriber.Subscribe(ctx, func([]byte) error {
+		require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 			handled.Add(1)
 			return nil
 		}))
@@ -393,7 +438,7 @@ func TestNatsPackageErrorPaths(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		subscriber := newNATSPackageSubscriber(t, ctx, fixture, fixture.url, nil)
 		var handled atomic.Int32
-		require.NoError(t, subscriber.Subscribe(ctx, func([]byte) error {
+		require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error {
 			handled.Add(1)
 			return nil
 		}))
@@ -415,7 +460,7 @@ func TestNatsPackageErrorPaths(t *testing.T) {
 		subscriber := newNATSPackageSubscriber(t, ctx, fixture, fixture.url, func(cfg *sharednats.SubscriberConfig) {
 			cfg.BatchSize = 0
 		})
-		require.NoError(t, subscriber.Subscribe(ctx, func([]byte) error { return nil }))
+		require.NoError(t, subscriber.Subscribe(ctx, func(ctx context.Context, data []byte, headers sharednats.Header) error { return nil }))
 		select {
 		case err := <-subscriber.Errors():
 			require.Error(t, err)

@@ -74,6 +74,21 @@ func (p *Publisher) Publish(ctx context.Context, data []byte) error {
 	return nil
 }
 
+// PublishWithHeaders is Publish plus NATS message headers, added so a caller (the ingestor, from W1
+// onward) can inject a W3C traceparent alongside the payload — see packages/shared-go/obs.NATSHeaderCarrier
+// and OBSERVABILITY_PLAN.md D-e. Publish is left unchanged rather than gaining a headers parameter: it
+// already has call sites in apps/ingestor-go and every test double in tests/unit and tests/integration,
+// none of which need to change shape just to add trace propagation on the one path (the ingestor) that
+// actually originates a trace.
+func (p *Publisher) PublishWithHeaders(ctx context.Context, data []byte, headers Header) error {
+	msg := &nats.Msg{Subject: p.subject, Data: data, Header: headers}
+	_, err := p.js.PublishMsg(msg, nats.Context(ctx))
+	if err != nil {
+		return fmt.Errorf("failed to publish message: %w", err)
+	}
+	return nil
+}
+
 func (p *Publisher) Close() error {
 	if p.conn != nil {
 		p.conn.Close()

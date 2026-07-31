@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync/atomic"
 )
 
@@ -43,7 +43,8 @@ func (s *pgStore) PersistAuditLog(ctx context.Context, logEntry *AuditLog) error
 
 	if err != nil {
 		RecordAuditPersistFailure()
-		log.Printf("AUDIT_PERSIST_FAILURE: failed to persist audit log %s: %v", logEntry.ID, err)
+		slog.ErrorContext(ctx, "AUDIT_PERSIST_FAILURE: failed to persist audit log",
+			slog.String("audit_log_id", logEntry.ID), slog.String("error", err.Error()))
 		return err
 	}
 

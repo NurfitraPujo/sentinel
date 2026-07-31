@@ -52,6 +52,10 @@ type stackConfig struct {
 	DatabaseURL     string
 	NATSURL         string
 	RedisAddr       string
+	// JaegerURL is the trace backend's query API. Deliberately NOT checked by dialStack: every other
+	// row of the matrix is about the pipeline, and a missing trace backend must not fail all 56 of
+	// them. U35 is the one row that needs it, and it fails on its own with a specific message.
+	JaegerURL string
 }
 
 var (
@@ -86,6 +90,7 @@ func TestMain(m *testing.M) {
 		DatabaseURL:     env("E2E_DATABASE_URL", "postgres://sentinel:changeme@localhost:5432/sentinel?sslmode=disable"),
 		NATSURL:         env("NATS_URL", "nats://localhost:4222"),
 		RedisAddr:       env("REDIS_ADDR", "localhost:6379"),
+		JaegerURL:       strings.TrimRight(env("JAEGER_URL", "http://localhost:16686"), "/"),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
