@@ -298,6 +298,14 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 // Deadlock-freedom depends on this transaction acquiring exactly ONE contended lock (the issues row,
 // via ON CONFLICT DO UPDATE / the plain UPDATE) and never waiting again — do not add audit persistence,
 // indexing, or any network I/O inside this transaction; move it after commit instead (D-d).
+//
+// The IssueOutcome return is BEST-EFFORT and currently consumed by nobody — every call site discards
+// it (verified at ship time). Its New/Existing distinction comes from a plain SELECT before the
+// upsert, so under a first-insert race two concurrent deliveries can both report IssueOutcomeNew;
+// the duplicate path always reports IssueOutcomeExisting regardless of what the original delivery
+// was. If you are about to build behavior on this value, either accept those semantics explicitly or
+// derive the distinction inside the upsert (e.g. xmax = 0 on the RETURNING row) first — do not assume
+// it is exact.
 func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurrence, releaseVersion string) (IssueOutcome, bool, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {

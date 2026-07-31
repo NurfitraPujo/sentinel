@@ -151,8 +151,12 @@ everything):
   probing a real Postgres before any code existed (F-TX-1/F-CT-1); guarded forever by the CHECK
   constraint (23514 = loud) and integration test (d).
 
-**Verified** (each test observed failing under targeted mutation before being trusted — 7-row
-mutation matrix, all at `go test` speed):
+**Verified** (each test observed failing under targeted mutation before being trusted — 8-row
+mutation matrix: 7 rows at `go test` speed, and an 8th — "the id survives the deployed wire" — proven
+by mutating the ingestor's mapper, rebuilding AND force-recreating its container, and watching U36
+time out naming the duplicate metric; the first attempt at that row also demonstrated that
+`compose up --build <svc>` without `--force-recreate` rebuilds the image while the old container keeps
+running, which would have made the row silently vacuous):
 
 ```
 tests/integration/event_idempotency_test.go — 7 tests, FORCE_TESTCONTAINERS=1, real migrations:
@@ -186,6 +190,21 @@ deliveries on a resolved issue can still double-count `regression_count` (the re
 read-then-write has no FOR UPDATE; the same-id case IS fixed); dedup horizon is
 `min(DATA_RETENTION_DAYS, DLQ MaxAge=30d)`; same-id-different-payload lands per-issue and does not
 dedup across issues.
+
+**Side findings from this work's review, REPRODUCED but deliberately not fixed here** (recorded so a
+true finding does not live only inside a work-package brief):
+
+- **`batchUpdateIssues` can deadlock against itself.** `apps/dashboard-web/src/lib/db/queries/
+  issues.ts` takes an uncapped, UNSORTED `inArray` UPDATE straight from the request body, then
+  re-locks the same rows via `issue_activity` FKs in a different order. Reproduced during the plan's
+  review with a positive control: two concurrent calls with reversed id order → `ERROR: deadlock
+  detected` (`Process 3932 waits for ShareLock on transaction 80255; blocked by process 3930 …`).
+  Fix when touched: sort the ids before the UPDATE and cap the batch. Not this change's scope —
+  `StoreEvent` was proven deadlock-free against it (it holds exactly one contended lock).
+- **`detectAndHandleRegression` (dashboard) has the same unguarded read-then-write** the processor's
+  regression arm has (`issues.ts` ~246): SELECT status, then UPDATE, no FOR UPDATE. It currently has
+  NO callers — if it ever gains one, it inherits the concurrent-distinct-deliveries double-count
+  documented above, on the dashboard side.
 
 ### Observability: structured logs, metrics, and a distributed trace that actually joins (2026-07-31)
 

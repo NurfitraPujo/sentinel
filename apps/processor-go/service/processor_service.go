@@ -261,12 +261,15 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// each one reads state this delivery did not actually write). One structured log line is
 		// D-e's whole visibility contract for this branch.
 		//
-		// The NATS delivery count is deliberately omitted here rather than threaded through
-		// (IDEMPOTENCY_PLAN.md W2 brief offers this as an explicit either/or): getting it to this
-		// call site would mean either changing nats.Subscriber's handler signature (14 call sites)
-		// or changing ProcessEvent/processEventInternal's signature to carry headers all the way
+		// The NATS delivery count is deliberately omitted here — a RECORDED DEVIATION from
+		// IDEMPOTENCY_PLAN.md D-e, which asks for it (the plan's E2E_RECOVERY_PLAN.md P9-3 entry
+		// records the deviation alongside the acceptance-text one). Getting it to this call site
+		// would mean either changing nats.Subscriber's handler signature (14 call sites) or
+		// changing ProcessEvent/processEventInternal's signature to carry headers all the way
 		// down from main.go's Subscribe closure, for a single diagnostic log field. event_id and
-		// issue_id alone are already enough to find the exact duplicate in error_occurrences.
+		// issue_id alone are already enough to find the exact duplicate in error_occurrences,
+		// and "redelivery vs client re-send" is distinguishable by whether the ingest-side POST
+		// count moved.
 		slog.InfoContext(ctx, "Duplicate event skipped: (issue_id, event_id) already stored",
 			slog.String("event_id", occ.EventID), slog.String("issue_id", issue.ID))
 		return false, nil

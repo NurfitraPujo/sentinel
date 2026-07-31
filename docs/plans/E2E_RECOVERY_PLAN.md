@@ -994,13 +994,17 @@ before implementation, and every work package was implemented and independently 
 `''`; and `store.StoreEvent` — one READ COMMITTED transaction whose duplicate path rolls back and ACKs
 as `outcome="duplicate"`, with audit/alerting/indexing gated post-commit on the event actually storing.
 
-**Acceptance, met — with the deviation recorded**: the original text asked to "force a
+**Acceptance, met — with two deviations recorded**: (1) the original text asked to "force a
 mid-transaction redelivery". Under the single-transaction design there IS no mid-transaction state to
 force — that is the fix working. What U36 and the integration suite prove instead is the pair that
 remains physically possible: same-bytes republish to the stream (a literal redelivery) and same-id
 HTTP re-POST — plus the legacy empty-id population storing exactly as before (the proto3-has-no-NULL
-trap, F-TX-1). U28 is unchanged and still guards the outage path. Every proving test was observed
-failing under a 7-row mutation matrix before being trusted.
+trap, F-TX-1). (2) The duplicate log line omits the NATS delivery count D-e asked for — threading it
+to the log site costs a shared handler-signature change at 14 call sites for one diagnostic field;
+`event_id` + `issue_id` already pinpoint the row. U28 is unchanged and still guards the outage path.
+Every proving test was observed failing under the 8-row mutation matrix (7 at go-test speed, 1 — "the
+id survives the deployed wire" — against a deliberately mutated, rebuilt, force-recreated ingestor)
+before being trusted.
 
 **Verified state entry**: S18 in `docs/memory/VERIFIED_STATE.md`. Decisions: D16.
 
