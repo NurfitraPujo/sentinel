@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.25-alpine AS builder
+FROM docker.io/library/golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -12,7 +12,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /ingestor ./apps/ingestor-go/
 
 # Stage 2: Final
-FROM alpine:3.19
+FROM docker.io/library/alpine:3.19
 
 RUN apk add --no-cache ca-certificates tzdata
 

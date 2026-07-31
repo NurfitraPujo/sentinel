@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM node:20-alpine AS builder
+FROM docker.io/library/node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ COPY apps/dashboard-web/ ./
 RUN pnpm build
 
 # Stage 2: Production
-FROM node:20-alpine
+FROM docker.io/library/node:20-alpine
 
 RUN apk add --no-cache ca-certificates tzdata
 

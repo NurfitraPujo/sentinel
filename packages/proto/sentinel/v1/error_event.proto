@@ -55,6 +55,11 @@ message ErrorEvent {
         id: "error_event.fingerprint"
         message: "fingerprint must not exceed 64 characters"
         expression: "this.fingerprint.size() <= 64"
+      },
+      {
+        id: "error_event.event_id"
+        message: "event_id must not exceed 64 characters"
+        expression: "this.event_id.size() <= 64"
       }
     ]
   };
@@ -122,6 +127,15 @@ message ErrorEvent {
   // body, and replaces the processor's `SELECT id FROM projects WHERE name
   // = $1` lookup by name.
   string project_id = 16;
+  // Client-supplied idempotency key (docs/plans/IDEMPOTENCY_PLAN.md D-a). When the client sends a
+  // usable id (1-64 chars) it is used verbatim; when absent or oversized the ingestor mints a fresh
+  // UUIDv4 and stamps it in here before publish, so every consumer of this message - first delivery,
+  // NATS redelivery, DLQ replay - sees the identical id. Upper bound (64 chars) is enforced by the
+  // "error_event.event_id" CEL rule above, matching error_occurrences.event_id VARCHAR(64) — see
+  // IDEMPOTENCY_PLAN.md D-b. Deliberately no `min_len` and no `required`: an invalid id is replaced,
+  // never rejected (D-a's invalid-id policy) - see the sibling "error_event.message" field's comment
+  // for why this file never mixes a field-level `max_len` with the CEL-only bound already covering it.
+  string event_id = 17;
 }
 
 message StackFrame {

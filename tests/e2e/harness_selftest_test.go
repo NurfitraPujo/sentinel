@@ -53,6 +53,40 @@ func TestHarnessReadersMatchSchema(t *testing.T) {
 	if got[0].Message != "harness self-test" {
 		t.Errorf("issues().Message = %q, want the inserted message", got[0].Message)
 	}
+
+	// occurrences() was already exercised above against an EMPTY project (a query that returns zero
+	// rows still proves every column NAME and type resolves, but never actually runs Scan on the new
+	// EventID column — a broken scan destination for a NULLABLE column would sail through that). Insert
+	// one occurrence with a real event_id and one with none, and confirm both round-trip through the
+	// reader (docs/plans/IDEMPOTENCY_PLAN.md W3/F-TP-2).
+	queryRow(t, new(string),
+		`INSERT INTO error_occurrences (issue_id, environment, platform, event_id)
+		 VALUES ($1, 'test', 'go', 'e2e-selftest-event-id') RETURNING id::text`, issueID)
+	queryRow(t, new(string),
+		`INSERT INTO error_occurrences (issue_id, environment, platform, event_id)
+		 VALUES ($1, 'test', 'go', NULL) RETURNING id::text`, issueID)
+
+	occs := f.occurrences()
+	if len(occs) != 2 {
+		t.Fatalf("expected the 2 occurrences just inserted, got %d", len(occs))
+	}
+	var sawWithID, sawWithoutID bool
+	for _, o := range occs {
+		switch {
+		case o.EventID != nil && *o.EventID == "e2e-selftest-event-id":
+			sawWithID = true
+		case o.EventID == nil:
+			sawWithoutID = true
+		default:
+			t.Errorf("occurrences().EventID = %v, want either nil or \"e2e-selftest-event-id\"", o.EventID)
+		}
+	}
+	if !sawWithID {
+		t.Error("occurrences() did not surface the inserted non-NULL event_id")
+	}
+	if !sawWithoutID {
+		t.Error("occurrences() did not surface the inserted NULL event_id as a nil pointer")
+	}
 }
 
 // TestHarnessDashboardSessionIsAcceptedAsSignedIn proves the seeded Auth.js session is a real one.

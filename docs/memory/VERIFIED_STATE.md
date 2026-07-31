@@ -115,6 +115,97 @@ current picture of module boundaries.
 
 ## Resolved
 
+### S18 — `issues.count` inflated on partial-failure redelivery; the write path had no idempotency key (RESOLVED 2026-07-31)
+
+*Long mislabeled "S16" in CLAUDE.md and E2E_RECOVERY_PLAN.md — S16 is the ProjectKey secret/name
+split, resolved 2026-07-28/29. This defect never had its own number; it lived as S9's "residual,
+knowingly accepted" paragraph above. Renumbered during IDEMPOTENCY_PLAN.md's adversarial review
+(F-CT-11), which caught that updating "S16 references" would have corrupted the real S16's record.*
+
+**Original defect.** The processor's write path was two disconnected transactions: the issue upsert
+(`count = issues.count + 1`, committed) and the occurrence insert (bare pool exec). A failure between
+them NAKed the message; NATS redelivered the same bytes; the upsert committed another increment.
+`regression_count`, `last_regressed_at`, and `issue_activity` sat in the same blast radius, and alert
+dispatch ran *between* the two writes — so a redelivery double-fed the alert frequency counter, and an
+event that then failed storage still counted toward an alert. `error_occurrences` had no unique
+constraint of any kind, and the idempotency key the SDK already sent (`event_id`) was silently dropped
+by the ingestor — the proto had no field for it (documented at the time in
+`degradation/buffer.go`'s header as why the buffer couldn't dedup).
+
+**The fix** (`docs/plans/IDEMPOTENCY_PLAN.md`, plan reviewed adversarially by three lenses BEFORE
+implementation; every work package implemented by one agent and validated by another that re-ran
+everything):
+
+- `event_id` travels SDK → ingestor (proto field 17) → NATS → processor. The ingestor uses a valid
+  client id (≤64 runes, no control chars) or mints a UUIDv4 — **before publish**, so every delivery
+  of one event carries the same key — and echoes the effective id in the 202/batch response.
+- `error_occurrences.event_id VARCHAR(64)` + partial unique `(issue_id, event_id) WHERE event_id IS
+  NOT NULL` + a CHECK rejecting `''` (migration 1722200000).
+- `store.StoreEvent`: ONE transaction (explicit READ COMMITTED) — issue upsert + occurrence insert
+  with `NULLIF($11,'')` and a targeted `ON CONFLICT ... DO NOTHING`; 0 rows affected → ROLLBACK →
+  the delivery ACKs as a no-op with `outcome="duplicate"`. Audit/alert/index run post-commit, gated
+  on `stored`.
+- Proto3-has-no-NULL was the load-bearing subtlety: an absent `event_id` deserializes to `""`, which
+  IS NOT NULL — without the `NULLIF` mapping, every pre-W0 in-flight message after the first per
+  issue would have been silently discarded as a "duplicate". Found by two independent reviewers
+  probing a real Postgres before any code existed (F-TX-1/F-CT-1); guarded forever by the CHECK
+  constraint (23514 = loud) and integration test (d).
+
+**Verified** (each test observed failing under targeted mutation before being trusted — 8-row
+mutation matrix: 7 rows at `go test` speed, and an 8th — "the id survives the deployed wire" — proven
+by mutating the ingestor's mapper, rebuilding AND force-recreating its container, and watching U36
+time out naming the duplicate metric; the first attempt at that row also demonstrated that
+`compose up --build <svc>` without `--force-recreate` rebuilds the image while the old container keeps
+running, which would have made the row silently vacuous):
+
+```
+tests/integration/event_idempotency_test.go — 7 tests, FORCE_TESTCONTAINERS=1, real migrations:
+  (a) same id twice sequentially     → 1 occurrence, count=1, second returns stored=false
+  (b) 8 goroutines racing one event  → exactly 1 stored, ZERO errors (no 40001, no deadlock)
+  (c) fresh id, same fingerprint     → count=2
+  (d) two EMPTY-id events            → BOTH store, rows are NULL not ''   (the legacy population)
+  (e) regression under duplicate     → regression_count=1, one activity row — interleaving forced
+                                       deterministically via a held-open connection
+  (f) duplicate feeds NO alert/index → capture-sender: 0 alerts on dup, 1 at threshold after
+  (g) stored+duplicate == deliveries → OTel ManualReader; isolation asserted read committed
+
+tests/e2e/idempotency_test.go — U36, against the deployed stack:
+  leg 1: same POST twice → both 202 echo the client literal; wait on duplicate-metric delta;
+         1 occurrence whose stored event_id == the literal; stored delta == 1
+  leg 2: same proto bytes js.Publish'd twice (ack.Stream == "ERROR_EVENTS") → 1 occurrence
+  leg 3: fresh id, same fingerprint → count 2
+  + batch echo: 3 items, 1 invalid → ingested=2, event_ids at indices {0,2} only
+
+SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1   → ok, 0 failures, 0 skips (~132s)
+```
+
+**Also fixed in passing**: the alert frequency counter no longer counts unstored or redelivered
+events; U28's failure message no longer describes this defect as open; and two more unqualified
+container-image names (`natsio/nats-box` plus all five Dockerfile bases) were qualified after the
+nats-box cache eviction reproduced the B9 jaeger failure — a stack that LOOKS healthy while running
+four-hour-old images.
+
+**Knowingly still open** (recorded in IDEMPOTENCY_PLAN.md §5, not regressions): concurrent DISTINCT
+deliveries on a resolved issue can still double-count `regression_count` (the regression arm's
+read-then-write has no FOR UPDATE; the same-id case IS fixed); dedup horizon is
+`min(DATA_RETENTION_DAYS, DLQ MaxAge=30d)`; same-id-different-payload lands per-issue and does not
+dedup across issues.
+
+**Side findings from this work's review, REPRODUCED but deliberately not fixed here** (recorded so a
+true finding does not live only inside a work-package brief):
+
+- **`batchUpdateIssues` can deadlock against itself.** `apps/dashboard-web/src/lib/db/queries/
+  issues.ts` takes an uncapped, UNSORTED `inArray` UPDATE straight from the request body, then
+  re-locks the same rows via `issue_activity` FKs in a different order. Reproduced during the plan's
+  review with a positive control: two concurrent calls with reversed id order → `ERROR: deadlock
+  detected` (`Process 3932 waits for ShareLock on transaction 80255; blocked by process 3930 …`).
+  Fix when touched: sort the ids before the UPDATE and cap the batch. Not this change's scope —
+  `StoreEvent` was proven deadlock-free against it (it holds exactly one contended lock).
+- **`detectAndHandleRegression` (dashboard) has the same unguarded read-then-write** the processor's
+  regression arm has (`issues.ts` ~246): SELECT status, then UPDATE, no FOR UPDATE. It currently has
+  NO callers — if it ever gains one, it inherits the concurrent-distinct-deliveries double-count
+  documented above, on the dashboard side.
+
 ### Observability: structured logs, metrics, and a distributed trace that actually joins (2026-07-31)
 
 Closes P9-2. `docs/plans/OBSERVABILITY_PLAN.md` holds the decisions; `E2E_RECOVERY_PLAN.md` P9-5 holds
@@ -1013,9 +1104,11 @@ docker compose up -d --build && ./scripts/wait-healthy.sh
 Harder drills: SIGKILL mid-outage → still 5/5 exactly once; outage beyond the retry budget → 3 events
 dead-lettered with `dlq_depth=3` on `/health` at ~56s.
 
-**Residual, knowingly accepted**: the issue upsert and occurrence insert are separate transactions, so a
-retryable failure between them inflates `issues.count` by one per redelivery (1 event, 5 deliveries →
-`count=5, occurrences=0`). Pre-existing, but redelivery is now the only recovery path. See D1.
+**Residual, formerly knowingly accepted — now S18, RESOLVED 2026-07-31**: the issue upsert and
+occurrence insert were separate transactions, so a retryable failure between them inflated
+`issues.count` by one per redelivery. This paragraph was the defect's only record for months (it was
+widely mislabeled "S16", which is actually the ProjectKey secret/name split); it has its own entry as
+S18 below, where the fix — `event_id` idempotency and a single-transaction write path — is verified.
 
 ---
 

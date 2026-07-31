@@ -16,6 +16,7 @@ import (
 // assert field-by-field mapping on the resulting proto.
 func fullPayload() *validation.ErrorPayload {
 	return &validation.ErrorPayload{
+		EventID:     "018f3b6a-3b8e-7c9e-8a3d-000000000001",
 		ProjectKey:  "proj-1",
 		Platform:    "go",
 		Environment: "production",
@@ -42,6 +43,7 @@ func TestMapPayloadToEvent_AllFieldsPopulated(t *testing.T) {
 	got := mapping.MapPayloadToEvent(payload)
 
 	require.NotNil(t, got)
+	assert.Equal(t, payload.EventID, got.EventId, "EventID maps to EventId (docs/plans/IDEMPOTENCY_PLAN.md D-a - the B5 hole this test guards)")
 	assert.Equal(t, payload.ProjectKey, got.ProjectKey)
 	assert.Equal(t, payload.Platform, got.Platform)
 	assert.Equal(t, payload.Environment, got.Environment)

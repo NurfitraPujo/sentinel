@@ -426,6 +426,13 @@ func TestProcessorService_ProcessEvent_UpsertIssueFailsWhenIssuesTableMissing(t 
 	assert.ErrorContains(t, err, "issues")
 }
 
+// TestProcessorService_ProcessEvent_InsertOccurrenceFailsWhenOccurrencesMissing's meaning changed under
+// D-c (docs/plans/IDEMPOTENCY_PLAN.md): store.StoreEvent folds the issue upsert and the occurrence
+// insert into ONE transaction, so an occurrence-insert failure now rolls back the issue upsert too —
+// before this change, UpsertIssueWithOutcome ran in its own transaction and committed independently,
+// so a subsequent InsertOccurrence failure left a committed issues row with count=1 and no matching
+// occurrence (the exact S18 count-inflation shape this plan closes). This test now asserts the
+// ROLLBACK: no issues row for this project, not just "ProcessEvent returned an error".
 func TestProcessorService_ProcessEvent_InsertOccurrenceFailsWhenOccurrencesMissing(t *testing.T) {
 	svc, pool, _ := newServiceAndPoolFromEnv(t)
 
@@ -444,8 +451,19 @@ func TestProcessorService_ProcessEvent_InsertOccurrenceFailsWhenOccurrencesMissi
 	require.NoError(t, err)
 
 	err = svc.ProcessEvent(ctx, data)
-	require.Error(t, err, "missing error_occurrences should fail InsertOccurrence")
+	require.Error(t, err, "missing error_occurrences should fail the occurrence insert")
 	assert.ErrorContains(t, err, "error_occurrences")
+
+	// D-c: the whole StoreEvent transaction rolled back, so the issue upsert this delivery would have
+	// performed must NOT be visible either — zero issues rows for this project, not count=1 with zero
+	// occurrences.
+	var issueCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issues WHERE project_id = $1`, projectID,
+	).Scan(&issueCount))
+	assert.Equal(t, 0, issueCount,
+		"D-c: an occurrence-insert failure must roll back the issue upsert too — a committed issue "+
+			"with no occurrence is the S18 count-inflation shape this plan closes")
 }
 
 func TestProcessorService_ProcessEvent_IndexOccurrenceFailsWhenSearchIndexMissing(t *testing.T) {

@@ -2,15 +2,24 @@ package event
 
 import (
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/fingerprint"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/normalizer"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+// maxEventIDLength mirrors error_occurrences.event_id VARCHAR(64) / apps/ingestor-go/service/
+// service.go's maxEventIDLength / the proto's "error_event.event_id" CEL rule
+// (docs/plans/IDEMPOTENCY_PLAN.md D-g).
+const maxEventIDLength = 64
 
 type ErrorEvent struct {
 	Fingerprint string `json:"fingerprint"`
@@ -33,6 +42,16 @@ type ErrorEvent struct {
 	Metadata       map[string]interface{} `json:"metadata"`
 	Timestamp      time.Time              `json:"timestamp"`
 	TraceFlags     uint32                 `json:"trace_flags"`
+	// EventID is the idempotency key (proto field 17, docs/plans/IDEMPOTENCY_PLAN.md D-a/D-h). Copied
+	// in Deserialize's struct literal alongside ProjectID/ReleaseVersion, BEFORE Normalize runs, and
+	// MUST NEVER be passed through normalizer.NormalizeString or masker.MaskString: the normalizer's
+	// regexes rewrite UUIDs to the literal "<UUID>" and >=6-digit runs to "<NUMERIC_ID>" (see
+	// TraceID/SpanID below in Normalize), which would collide every event in an issue onto one key —
+	// the identical failure mode as F-TX-1 (D-b's NULLIF gap), on the fully-upgraded path (F-CT-2, B6
+	// verbatim). If you are tempted to add a line normalizing/masking this field here, don't — that is
+	// exactly the bug this comment exists to prevent, and it is pinned by a unit test that must fail
+	// if EventID is ever added to Normalize's field list.
+	EventID string `json:"event_id"`
 }
 
 type StackFrame struct {
@@ -97,6 +116,41 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		SpanID:         protoEvent.SpanId,
 		TraceFlags:     protoEvent.TraceFlags,
 		Fingerprint:    protoEvent.Fingerprint,
+		// See the EventID field comment on ErrorEvent: copied here, never normalized/masked (D-h).
+		EventID: protoEvent.EventId,
+	}
+
+	// D-g: the processor-side bounds guard. The proto CEL bound (this.event_id.size() <= 64) and the
+	// ingestor's resolveEventID (apps/ingestor-go/service/service.go) are the contract's front door,
+	// but neither runs for a direct/legacy publisher: a replayed pre-W0 DLQ message, a future
+	// non-ingestor producer, or a test harness bypassing the ingestor entirely can still deliver an
+	// oversized or control-character id straight to this deserializer. Left unchecked, that id would
+	// reach the VARCHAR(64) insert and fail with 22001 (or the CHECK constraint's 23514) — both class
+	// 22/23, which classifyStoreError treats as Permanent, dead-lettering an otherwise perfectly
+	// storable event over a dedup key alone (F-CT-3). Dropping the id and keeping the event is strictly
+	// better than losing it; this mirrors the ingestor's resolveEventID length/control-character
+	// policy but never mints a replacement — the processor only bounds what it accepts, it does not
+	// invent ids.
+	if event.EventID != "" {
+		length := utf8.RuneCountInString(event.EventID)
+		reason := ""
+		// The obs.EventIDReason* constants are the ingestor's vocabulary for the same two conditions
+		// (sentinel_ingest_event_id_replaced_total{reason}); reusing them here keeps one spelling per
+		// state even though this is only a log field, never a metric label (F-VW2-2 — two spellings of
+		// one vocabulary is a B5 seed).
+		switch {
+		case length > maxEventIDLength:
+			reason = obs.EventIDReasonTooLong
+		case strings.ContainsFunc(event.EventID, func(r rune) bool { return r < 0x20 || r == 0x7f }):
+			reason = obs.EventIDReasonInvalidChars
+		}
+		if reason != "" {
+			// Never log the value itself (D15 cardinality/PII rule) — only its length and why it
+			// was dropped.
+			slog.Warn("processor: event_id exceeds the storage bound or carries a control character; dropping the id and storing the event without a dedup key",
+				slog.Int("length", length), slog.String("reason", reason))
+			event.EventID = ""
+		}
 	}
 
 	if protoEvent.Timestamp != nil {

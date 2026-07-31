@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"strings"
 	"testing"
 	_ "unsafe"
 
@@ -106,6 +107,10 @@ func TestDeserialize_HappyPathMapsAllFields(t *testing.T) {
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 		{File: "runtime.go", Line: 7, Function: "runtime.goexit", InApp: false},
 	}
+	// event_id (proto field 17, docs/plans/IDEMPOTENCY_PLAN.md W0/W2). This function has silently
+	// dropped a newly-added field TWICE before (S5, S6) — asserting it here is what would have caught
+	// both.
+	protoEvent.EventId = "evt-happy-path-0001"
 
 	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
 	require.NoError(t, err)
@@ -121,10 +126,71 @@ func TestDeserialize_HappyPathMapsAllFields(t *testing.T) {
 	assert.Equal(t, protoEvent.Fingerprint, got.Fingerprint)
 	assert.Equal(t, timestamp.AsTime(), got.Timestamp)
 	assert.Equal(t, metadata.AsMap(), got.Metadata)
+	assert.Equal(t, protoEvent.EventId, got.EventID)
 	assert.Equal(t, []event.StackFrame{
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 		{File: "runtime.go", Line: 7, Function: "runtime.goexit", InApp: false},
 	}, got.Stacktrace)
+}
+
+// TestDeserialize_EventIDSurvivesNormalizeByteIdentical pins D-h
+// (docs/plans/IDEMPOTENCY_PLAN.md): a UUIDv4 event_id must come out of Deserialize+Normalize
+// byte-for-byte identical to what went in. normalizer.NormalizeString rewrites any string that LOOKS
+// like a UUID to the literal "<UUID>" — TraceID/SpanID intentionally get this treatment in Normalize,
+// but EventID must never be passed through it, or every event on an issue would collide onto one
+// dedup key (the F-TX-1 failure mode, on the fully-upgraded path). This test MUST fail if EventID is
+// ever added to Normalize's field list.
+func TestDeserialize_EventIDSurvivesNormalizeByteIdentical(t *testing.T) {
+	protoEvent := validProtoEvent()
+	protoEvent.Fingerprint = "provided-fingerprint"
+	protoEvent.EventId = "123e4567-e89b-12d3-a456-426614174000" // a real UUIDv4 shape
+
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err)
+
+	assert.Equal(t, "123e4567-e89b-12d3-a456-426614174000", got.EventID,
+		"EventID must survive Deserialize+Normalize byte-identical — if this now reads \"<UUID>\", "+
+			"EventID was added to Normalize's rewrite list (D-h regression)")
+}
+
+// TestDeserialize_OversizedEventIDIsDropped pins D-g: a direct/legacy publisher that bypasses the
+// ingestor's CEL/resolveEventID guard can still deliver an event_id longer than the storage bound
+// (error_occurrences.event_id VARCHAR(64)). The processor must preserve the EVENT and drop only the
+// id, replacing it with "" (-> NULL at the store.StoreEvent insert site) rather than let it reach a
+// 22001/23514 and dead-letter an otherwise perfectly storable event.
+func TestDeserialize_OversizedEventIDIsDropped(t *testing.T) {
+	protoEvent := validProtoEvent()
+	protoEvent.Fingerprint = "provided-fingerprint"
+	protoEvent.EventId = strings.Repeat("a", 65) // one rune over the 64-rune bound
+
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err, "an oversized event_id must not fail the whole event")
+	assert.Empty(t, got.EventID, "an oversized event_id must be dropped to \"\", not truncated or kept")
+}
+
+// TestDeserialize_ControlCharacterEventIDIsDropped pins D-g's second guard: a control character (NUL
+// above all) cannot be stored in a Postgres varchar at all. Passing it through would let a
+// client/direct-publisher dead-letter its own events once it reaches the INSERT.
+func TestDeserialize_ControlCharacterEventIDIsDropped(t *testing.T) {
+	protoEvent := validProtoEvent()
+	protoEvent.Fingerprint = "provided-fingerprint"
+	protoEvent.EventId = "evt-with-a-\x00-nul-byte"
+
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err, "a control-character event_id must not fail the whole event")
+	assert.Empty(t, got.EventID, "a control-character event_id must be dropped to \"\"")
+}
+
+// TestDeserialize_EventIDWithinBoundsIsKeptVerbatim is the negative control for the two drop tests
+// above: a 64-rune id (exactly at the bound, not over it) must survive unchanged.
+func TestDeserialize_EventIDWithinBoundsIsKeptVerbatim(t *testing.T) {
+	protoEvent := validProtoEvent()
+	protoEvent.Fingerprint = "provided-fingerprint"
+	protoEvent.EventId = strings.Repeat("b", 64)
+
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err)
+	assert.Equal(t, strings.Repeat("b", 64), got.EventID)
 }
 
 func TestDeserialize_NilMetadataRemainsNil(t *testing.T) {

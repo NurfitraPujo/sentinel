@@ -373,14 +373,26 @@ type batchItemError struct {
 	Message string `json:"message"`
 }
 
+// batchItemEventID names a single successfully-ingested batch item's EFFECTIVE event_id by its index
+// in the request payload (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f) — mirrors batchItemError's
+// index-keyed shape so a client can diff what it sent against what was used, per item.
+type batchItemEventID struct {
+	Index   int    `json:"index"`
+	EventID string `json:"event_id"`
+}
+
 // batchResult is the /ingest/batch response body. The single-event /ingest
 // endpoint keeps its pre-existing {"status":"accepted"} response shape
 // (docs/sdk-specification.md section 4) — only the batch endpoint's
 // all-or-nothing 202 semantics were in scope for this fix (P2-5).
+//
+// EventIDs is additive (docs/plans/IDEMPOTENCY_PLAN.md D-f): Ingested/Failed/Errors keep their
+// pre-existing shape and semantics unchanged.
 type batchResult struct {
-	Ingested int              `json:"ingested"`
-	Failed   int              `json:"failed"`
-	Errors   []batchItemError `json:"errors,omitempty"`
+	Ingested int                `json:"ingested"`
+	Failed   int                `json:"failed"`
+	Errors   []batchItemError   `json:"errors,omitempty"`
+	EventIDs []batchItemEventID `json:"event_ids,omitempty"`
 }
 
 func handleIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
@@ -423,7 +435,11 @@ func handleIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Log
 		logger.InfoContext(r.Context(), fmt.Sprintf("Successfully ingested error: project=%s, class=%s", payload.ProjectKey, payload.ErrorClass),
 			slog.String("project_key", payload.ProjectKey), slog.String("error_class", payload.ErrorClass))
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+		// event_id is the EFFECTIVE id (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f): svc.Ingest mutates
+		// payload.EventID in place to whatever was actually published - the client's own value when
+		// usable, or a freshly minted UUIDv4 when it was absent/oversized - so a client can diff what it
+		// sent against what was used. Additive key; "status" is unchanged.
+		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "event_id": payload.EventID})
 	}
 }
 
@@ -471,6 +487,9 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 				continue
 			}
 			result.Ingested++
+			// payloads[i].EventID is the EFFECTIVE id: svc.Ingest mutated it in place before publish
+			// (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f).
+			result.EventIDs = append(result.EventIDs, batchItemEventID{Index: i, EventID: payloads[i].EventID})
 		}
 
 		// A batch response is only 2xx if at least one item made it through;

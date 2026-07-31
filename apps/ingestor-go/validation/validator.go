@@ -23,6 +23,15 @@ func (r ValidationResult) ToJSON() []byte {
 }
 
 type ErrorPayload struct {
+	// EventID is the client-side idempotency key (docs/plans/IDEMPOTENCY_PLAN.md D-a), mirroring
+	// ErrorEvent.event_id (proto field 17). Deliberately typed as a plain string, not
+	// *string/json.RawMessage: a client that sends "event_id" as a JSON number fails the whole-body
+	// decode with a 400, exactly like any other field's type mismatch - this is a deliberate accepted
+	// trade-off (IDEMPOTENCY_PLAN.md D-a), not an oversight, and only this SDK sends the field today
+	// (as a string). service.IngestService.Ingest is what applies the present/absent/oversized policy
+	// (mint a UUIDv4 when absent or >64 chars) and stamps the effective id back into this field before
+	// mapping.MapPayloadToEvent runs - see IngestService.Ingest, not this struct.
+	EventID     string                 `json:"event_id"`
 	ProjectKey  string                 `json:"project_key"`
 	Platform    string                 `json:"platform"`
 	Environment string                 `json:"environment"`

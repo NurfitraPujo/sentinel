@@ -117,6 +117,13 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	metadata: jsonb('metadata').notNull().default({}),
 	traceId: varchar('trace_id', { length: 64 }),
 	spanId: varchar('span_id', { length: 64 }),
+	// Idempotency key (P9-3). Matches 1722200000_add_error_occurrences_event_id.sql: nullable, '' never
+	// stored (NULLIF at the insert site maps proto3's absent-field default to NULL; a DB CHECK is the
+	// tripwire if that mapping is ever bypassed), partial-unique on (issue_id, event_id). Hand-maintained
+	// mirror — this file has drifted from the real schema before (see the alertConfigs comment above), so
+	// keep it named after the migration that is the actual source of truth. No dashboard code reads this
+	// yet; that is expected at this stage of the plan.
+	eventId: varchar('event_id', { length: 64 }),
 	createdAt: timestamp('created_at').defaultNow(),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),

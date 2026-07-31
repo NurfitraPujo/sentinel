@@ -24,6 +24,11 @@ func MapPayloadToEvent(payload *validation.ErrorPayload) *sentinelv1.ErrorEvent 
 	}
 
 	return &sentinelv1.ErrorEvent{
+		// EventId is copied verbatim. By the time this runs, service.IngestService.Ingest has already
+		// resolved payload.EventID to its EFFECTIVE value - a usable client id kept as-is, or a freshly
+		// minted UUIDv4 when the client's was absent/oversized (docs/plans/IDEMPOTENCY_PLAN.md D-a).
+		// This mapper does no minting/validation of its own; it only copies whatever is already there.
+		EventId:        payload.EventID,
 		ProjectKey:     payload.ProjectKey,
 		Platform:       payload.Platform,
 		Environment:    payload.Environment,

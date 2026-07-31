@@ -866,6 +866,7 @@ originally promised: **a named test is green.**
 | U33 | ops | Both JetStream streams are bounded (age + size) with the right discard policy | ERROR_EVENTS discards NEW when full (backpressure, never silent loss); the DLQ discards OLD (a full DLQ must never refuse to park poison — that is the S13 livelock) | ✅ `TestU33_StreamsAreBounded` — added after both streams were found unbounded; ERROR_EVENTS held 18,654 fully-acked messages with no limits |
 | U34 | ops | The DLQ backlog is reported so somebody can act on it | `/health` carries a threshold to compare depth against, the age and class of the oldest message, and a severity that does not flip on a single poison message | ✅ `TestU34_DLQBacklogIsReportedActionably`, `TestU34_DLQDepthTracksARealDeadLetter` |
 | U35 | observability | One request carrying a W3C `traceparent` → ingestor → NATS → processor | the response echoes the caller's trace id as `X-Request-Id`, and **one** trace containing spans from BOTH `ingestor-go` and `processor-go` is retrievable from the trace backend; both services serve parseable Prometheus exposition | ✅ `TestU35_OneTraceSpansIngestorAndProcessor`, `TestU35_BothGoServicesExposeParseableMetrics` — the acceptance bar for the observability work (OBSERVABILITY_PLAN.md §7) |
+| U36 | idempotency | The same event delivered twice — as an HTTP re-POST with one client `event_id`, and as identical proto bytes published twice to the stream (a literal redelivery) | both POSTs 202 and echo the client's id; the duplicate is *waited on* via `sentinel_process_events_total{outcome="duplicate"}` before any DB assertion; exactly ONE occurrence whose stored `event_id` equals the client literal; `issues.count` exact; a fresh id on the same fingerprint still increments; batch echo reports `event_ids` for accepted items only | ✅ `TestU36_EventIdempotency`, `TestU36_BatchEchoesEventIDsForSuccessfulItemsOnly` — the acceptance bar for the idempotency work (IDEMPOTENCY_PLAN.md §6); every guard mutation-tested |
 
 **Legend**: ✅ proven by a command that was actually run · 🟡 partially verified (component-level test or
 structural check, not the full row) · ❌ blocked, with the specific blocker named · ⚪ unverified, no attempt
@@ -980,19 +981,32 @@ propagation actually worked.
 
 **What this work did NOT fix** is recorded as P9-5 below rather than left implicit.
 
-### P9-3 · S16 — `issues.count` can inflate on partial-failure redelivery
+### P9-3 · S18 — `issues.count` can inflate on partial-failure redelivery — **DONE 2026-07-31**
 
-**State**: the issue upsert and the occurrence insert are separate transactions with no `event_id`
-idempotency key, so a redelivery that lands after the upsert but before the insert can increment the
-counter twice for one event. U28 currently asserts occurrences are exactly-once **and** that
-`issues.count` agrees, so a regression is visible — but the design has no key preventing it.
+*(Long mislabeled "S16" here and in CLAUDE.md — S16 is the resolved ProjectKey secret/name split at
+P2b-4 above. This defect had no S-number of its own; it lived as S9's "residual, knowingly accepted"
+paragraph in VERIFIED_STATE.md and is now S18. Found during IDEMPOTENCY_PLAN.md's review, F-CT-11.)*
 
-**Why deferred**: it changes the processor's write path, which is the most correctness-sensitive code in
-the system, and deserves isolated testing and revert granularity.
+**Delivered** (see `docs/plans/IDEMPOTENCY_PLAN.md` — the plan was itself adversarially reviewed
+before implementation, and every work package was implemented and independently validated):
+`event_id` end to end (SDK UUID → proto field 17 → ingestor mint/validate/echo → NATS → processor);
+`error_occurrences.event_id` with a partial unique `(issue_id, event_id)` index and a CHECK rejecting
+`''`; and `store.StoreEvent` — one READ COMMITTED transaction whose duplicate path rolls back and ACKs
+as `outcome="duplicate"`, with audit/alerting/indexing gated post-commit on the event actually storing.
 
-**Acceptance**: an idempotency key derived from the event (not the delivery) makes a replayed event a no-op
-at both write sites; U28 extended to force a mid-transaction redelivery and assert `issues.count` is
-exact.
+**Acceptance, met — with two deviations recorded**: (1) the original text asked to "force a
+mid-transaction redelivery". Under the single-transaction design there IS no mid-transaction state to
+force — that is the fix working. What U36 and the integration suite prove instead is the pair that
+remains physically possible: same-bytes republish to the stream (a literal redelivery) and same-id
+HTTP re-POST — plus the legacy empty-id population storing exactly as before (the proto3-has-no-NULL
+trap, F-TX-1). (2) The duplicate log line omits the NATS delivery count D-e asked for — threading it
+to the log site costs a shared handler-signature change at 14 call sites for one diagnostic field;
+`event_id` + `issue_id` already pinpoint the row. U28 is unchanged and still guards the outage path.
+Every proving test was observed failing under the 8-row mutation matrix (7 at go-test speed, 1 — "the
+id survives the deployed wire" — against a deliberately mutated, rebuilt, force-recreated ingestor)
+before being trusted.
+
+**Verified state entry**: S18 in `docs/memory/VERIFIED_STATE.md`. Decisions: D16.
 
 ### P9-4 · Invitation acceptance has no route
 
