@@ -66,6 +66,33 @@ services:
             NATS_URL: nats://nats:4222
         restart: "no"
 
+    jaeger:
+        # Fully qualified on purpose. Podman resolves no unqualified short names unless
+        # /etc/containers/registries.conf defines unqualified-search-registries, so the bare
+        # "jaegertracing/all-in-one:1.65.0" fails with `short-name ... did not resolve to an alias`
+        # and the whole `up` continues WITHOUT a trace backend — the services start fine (they must,
+        # by the degradation mandate), so nothing looks broken until a trace assertion has nowhere to
+        # read from. The other images here only work unqualified because they were already pulled
+        # locally. Docker treats this form identically, so qualifying costs nothing.
+        image: docker.io/jaegertracing/all-in-one:1.65.0
+        container_name: sentinel-jaeger
+        # D-c (docs/plans/OBSERVABILITY_PLAN.md): all-in-one dev/CI trace backend, OTLP in directly —
+        # no separate collector. Host ports are parameterized for exactly the reason documented on the
+        # `nats` service above: this machine runs other stacks that can already be squatting on
+        # Jaeger's default ports, and a host bind failure must not take `docker compose up` down for
+        # services that don't even require Jaeger to be reachable. Only the HOST side moves; in-cluster
+        # traffic (ingestor/processor's OTEL_EXPORTER_OTLP_ENDPOINT below) always uses
+        # http://jaeger:4318 over the compose network, unaffected by these host mappings. Ingestor and
+        # processor deliberately do NOT `depends_on` this service, healthy or otherwise: the whole point
+        # of W0's degradation mandate is that both start and stay fully functional whether or not
+        # Jaeger is up.
+        environment:
+            COLLECTOR_OTLP_ENABLED: "true"
+        ports:
+            - "${JAEGER_OTLP_GRPC_HOST_PORT:-4317}:4317" # OTLP gRPC
+            - "${JAEGER_OTLP_HTTP_HOST_PORT:-4318}:4318" # OTLP HTTP — what ingestor/processor's OTEL_EXPORTER_OTLP_ENDPOINT targets in-cluster
+            - "${JAEGER_UI_HOST_PORT:-16686}:16686" # Jaeger UI — http://localhost:16686
+
     migrate:
         image: golang:1.25-alpine
         container_name: sentinel-migrate
@@ -113,6 +140,11 @@ services:
             REDIS_PASSWORD: ""
             REDIS_DB: 0
             RATELIMIT_STRICT_MODE: "false"
+            # W0 (docs/plans/OBSERVABILITY_PLAN.md): in-cluster address, never the host-mapped port
+            # above. If jaeger is down, obs.Bootstrap degrades to one warning log and the ingestor
+            # stays fully functional — this is not a hard dependency (see the jaeger service's comment).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: ingestor-go
 
     processor:
         ports:
@@ -138,6 +170,11 @@ services:
             POSTGRES_PASSWORD: changeme
             POSTGRES_DB: sentinel
             NATS_URL: nats://nats:4222
+            # W0 (docs/plans/OBSERVABILITY_PLAN.md): in-cluster address, never the host-mapped port
+            # above. If jaeger is down, obs.Bootstrap degrades to one warning log and the processor
+            # stays fully functional — this is not a hard dependency (see the jaeger service's comment).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: processor-go
 
     dlq-drainer:
         build:
@@ -185,6 +222,11 @@ services:
             POSTGRES_USER: sentinel
             POSTGRES_PASSWORD: changeme
             POSTGRES_DB: sentinel
+            # Traces export to the same collector the Go services use. Absent/unreachable must mean
+            # "no traces", never "no dashboard" — instrumentation.mjs degrades on its own, and there is
+            # deliberately no depends_on: jaeger anywhere (OBSERVABILITY_PLAN.md D-b).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: dashboard-web
             # Without this the dashboard cannot invalidate a revoked API key. createNatsPublisher in
             # src/lib/db/queries/apikeys.ts defaults to nats://localhost:4222, which inside a container is
             # nothing, so every api_key.invalidated publish failed with ECONNREFUSED and revocation

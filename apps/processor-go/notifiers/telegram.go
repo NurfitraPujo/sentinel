@@ -2,12 +2,20 @@ package notifiers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
+
+// channelTelegram is the LabelChannel value this worker records on procmetrics.RecordAlertDispatch —
+// the same literal "telegram" alerts.AlertConfig.Channel and notify.go's BuildSender switch on.
+const channelTelegram = "telegram"
 
 type TelegramConfig struct {
 	BotToken   string
@@ -55,26 +63,36 @@ func (w *TelegramWorker) processQueue() {
 }
 
 func (w *TelegramWorker) sendWithRetry(notification *TelegramNotification) {
+	// No request context survives the enqueue — see EmailWorker.sendWithRetry's identical comment;
+	// the queue is the decoupling point for both notifiers.
+	ctx := context.Background()
 	var lastErr error
 
 	for attempt := 0; attempt < w.maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := w.backoffs[attempt-1]
-			log.Printf("Telegram retry %d/%d after %v", attempt+1, w.maxRetries, backoff)
+			slog.InfoContext(ctx, "Telegram retry after backoff",
+				slog.Int("attempt", attempt+1), slog.Int("max_retries", w.maxRetries), slog.Duration("backoff", backoff))
 			time.Sleep(backoff)
 		}
 
 		err := w.sendTelegram(notification)
 		if err == nil {
-			log.Printf("Telegram message sent successfully")
+			slog.InfoContext(ctx, "Telegram message sent successfully",
+				slog.String(obs.LogKeyEvent, "alert.telegram.sent"))
+			procmetrics.RecordAlertDispatch(ctx, channelTelegram, obs.OutcomeDispatchSent)
 			return
 		}
 
 		lastErr = err
-		log.Printf("Telegram attempt %d failed: %v", attempt+1, err)
+		slog.WarnContext(ctx, "Telegram attempt failed",
+			slog.Int("attempt", attempt+1), slog.String("error", err.Error()))
 	}
 
-	log.Printf("Telegram failed after %d attempts: %v", w.maxRetries, lastErr)
+	slog.ErrorContext(ctx, "Telegram failed after max attempts",
+		slog.Int("max_retries", w.maxRetries), slog.String("error", lastErr.Error()),
+		slog.String(obs.LogKeyEvent, "alert.telegram.failed"))
+	procmetrics.RecordAlertDispatch(ctx, channelTelegram, obs.OutcomeDispatchError)
 }
 
 func (w *TelegramWorker) sendTelegram(notification *TelegramNotification) error {

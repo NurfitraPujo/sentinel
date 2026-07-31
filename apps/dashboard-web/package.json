@@ -27,6 +27,13 @@
   "dependencies": {
     "@auth/core": "^0.41.2",
     "@auth/sveltekit": "^1.11.2",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+    "@opentelemetry/instrumentation-http": "^0.221.0",
+    "@opentelemetry/instrumentation-pg": "^0.73.0",
+    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/sdk-node": "^0.221.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
     "drizzle-orm": "^0.30.10",
     "nodemailer": "^7.0.13",
     "postgres": "^3.4.4",

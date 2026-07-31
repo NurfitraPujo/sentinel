@@ -115,6 +115,86 @@ current picture of module boundaries.
 
 ## Resolved
 
+### Observability: structured logs, metrics, and a distributed trace that actually joins (2026-07-31)
+
+Closes P9-2. `docs/plans/OBSERVABILITY_PLAN.md` holds the decisions; `E2E_RECOVERY_PLAN.md` P9-5 holds
+what was deliberately left open.
+
+**Verified** (all run against the tree at the time of writing, not inferred from the diff):
+```
+go build ./... && go vet ./...                                   clean
+GOWORK=off go vet ./...                                          clean
+go test ./tests/unit/... -count=1                                292 passed (was 282)
+SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1           74 passed, 0 failed, 0 skipped
+```
+
+**What is actually proven, and by what.** The load-bearing claim is *not* "spans exist" — it is that the
+two Go services' spans land in ONE trace:
+
+```
+$ curl -s localhost:16686/api/traces/06c073ea88a4cc3e2f87a8e3ed3cb1e9
+spans: 8   services: ['ingestor-go', 'processor-go']
+$ curl -s localhost:16686/api/traces/ffffffffffffffffffffffffffffffff
+{"data":null,"total":0,"errors":[{"code":404,"msg":"trace not found"}]}
+```
+
+The second command is the point: the query is by the *caller-supplied* trace id, so it can only succeed
+if propagation genuinely worked. U35 (`tests/e2e/tracing_test.go`) asserts exactly this against the
+deployed containers.
+
+**Why this needed an e2e row at all.** OpenTelemetry's failure mode is silence. If nobody calls
+`otel.SetTextMapPropagator`, the global propagator is a **no-op**: `Inject` writes nothing, `Extract`
+returns the context unchanged, no error, no log line. Both services still start, still create spans,
+still serve `/metrics` — and emit two disconnected traces. Every unit test stays green. This was
+confirmed empirically, not reasoned about: with the registration mutated out, a probe reported
+`propagator Fields=[]`, and with it restored, `parent-is-producer=true remote=true`.
+
+Two guards were added and each was **observed failing** before being accepted:
+- `TestObsBootstrapRegistersTheGlobalPropagator` — deleting the registration yields
+  `[]string{} does not contain "traceparent"`.
+- `TestObsBootstrapDropsUnboundedMetricAttributes` — deleting the metrics View lets an
+  attacker-controlled `server.address` reach `/metrics`.
+
+**Defects this work found and fixed** (each reproduced at runtime by adversarial review, not read off
+the diff):
+
+| | Defect | Why it mattered |
+|---|---|---|
+| 1 | `otelhttp` recorded `server.address` — the client-supplied `Host` header — as a **metric** label on the ingestor, which is the one publicly exposed port, and it records *outside* the authenticator | Any unauthenticated caller could mint a new time series per distinct header value across several histograms, growing memory inside the ingest process. Fixed with an SDK View in `obs.Bootstrap` that denies request-derived keys for **all** instruments, so future instrumentation inherits it. |
+| 2 | `target_info` on the unauthenticated `/metrics` published hostname, OS user, pid, **full argv** and Go toolchain version | A free fingerprint for CVE targeting, on the public port. Fixed by dropping the `WithProcess()`/`WithHost()` resource detectors — in a container the "host" is disposable and the pid is always 1, so nothing of value was lost. |
+| 3 | The DLQ **destroyed the trace in both directions** — `deadLetter` built a fresh header map, and `tools/dlq` replayed with no headers at all | The single most valuable trace in the system ("this event failed N times and got parked") was severed exactly at the failure. Fixed; replay now carries `traceparent`/`tracestate`/`baggage` forward and deliberately drops the DLQ bookkeeping headers. |
+| 4 | `sentinel_alert_dispatch_total` was recorded **only after a successful enqueue**, so all seven drop paths — including the literal pre-S8 "no sender wired" no-op — were invisible | It re-created the S8 blind spot in metric form: the counter read flat 0 both when healthy-and-quiet and when totally broken. Fixed with an explicit `dropped` outcome at every drop site. |
+| 5 | The `jaeger` compose service used an unqualified image name | Podman resolves no unqualified short names, so `up` continued **without a trace backend** while every service started fine. Nothing looked broken until a trace assertion had nowhere to read from — a textbook B9. Fixed by fully qualifying to `docker.io/...`. |
+
+**Dashboard, treated separately (D-f, best effort).** Review found the SvelteKit side exporting
+`url.query` verbatim as a span attribute — which on the Auth.js magic-link callback carries the login
+token *and* the user's email — and minting a bespoke random correlation id rather than using the OTel
+trace id, in violation of D-d. The correlation bug **hides itself**: when a caller supplies a
+`traceparent` both sides independently honour the W3C header and coincidentally agree, so it diverges
+only for real browser traffic, and the obvious test therefore passes.
+
+Both fixed, and the leak was verified against the **deployed** dashboard rather than in a unit test —
+a request with a real secret in the query string, then the span read back out of Jaeger:
+
+```
+$ curl -H "traceparent: 00-534eef7c…-01" \
+    "localhost:3000/auth/callback/email?token=MAGICLINKSECRET123&email=victim%40example.com"
+$ curl -s localhost:16686/api/traces/534eef7c…
+  url.path  = /auth/callback/email
+  url.query = token=REDACTED&email=REDACTED
+$ ... | grep -c "MAGICLINKSECRET123\|victim@example.com"
+0
+```
+
+A sixth leak of the same family was found while fixing it: NodeSDK's **default** `resourceDetectors` is
+`[envDetector, processDetector, hostDetector]`, so hostname, pid and argv were riding on every span's
+resource — exactly what the Go side had just stopped doing. Now pinned to `[envDetector]`.
+
+Shutdown was measured rather than assumed: SIGTERM→exit was **10.03s** against a black-holed collector,
+which is Docker's default grace period to the millisecond. The real gate was the OTLP exporter's own
+10s per-export timeout, not the await; setting `timeoutMillis: 5000` (matching the Go side's
+`defaultOTLPTimeout`) brings it to **5.02s**.
+
 ### Ops hardening: bounded streams, DLQ alerting and draining, two-layer alert configs (2026-07-30)
 
 **Verified**:

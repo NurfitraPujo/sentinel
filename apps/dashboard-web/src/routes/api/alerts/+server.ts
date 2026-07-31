@@ -6,6 +6,7 @@ import { requireAuth } from '$lib/server/auth';
 import { eq, and, or, inArray, isNull } from 'drizzle-orm';
 import { hasPermission, type Role, type OrgRole } from '$lib/rbac';
 import { createNatsPublisher } from '$lib/db/queries/apikeys';
+import { log } from '$lib/server/observability/log';
 
 // processor-go only reloads alert_configs on a hardcoded 5-minute ticker, so a config created or
 // changed in the UI would not take effect for up to 5 minutes without this. Publishing is
@@ -21,10 +22,12 @@ async function publishAlertConfigChanged(projectId: string, configId: string) {
 	try {
 		await createNatsPublisher().publish('alert_config.changed', { projectId, configId });
 	} catch (err) {
-		console.error(
-			`alert_config.changed publish failed for project ${projectId || '(org-wide)'}, config ${configId} (write already committed to DB):`,
-			err
-		);
+		log.error('alert_config.changed.publish_failed', {
+			projectId: projectId || '(org-wide)',
+			configId,
+			note: 'write already committed to DB',
+			error: err,
+		});
 	}
 }
 
@@ -214,7 +217,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
-		console.error('Error fetching alert configs:', error);
+		log.error('alerts.fetch_failed', { error });
 		return json({ error: 'Internal server error' }, { status: 500 });
 	}
 };
@@ -301,7 +304,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
-		console.error('Error creating alert config:', error);
+		log.error('alerts.create_failed', { error });
 		return json({ error: 'Internal server error' }, { status: 500 });
 	}
 };
@@ -355,7 +358,7 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
-		console.error('Error updating alert config:', error);
+		log.error('alerts.update_failed', { error });
 		return json({ error: 'Internal server error' }, { status: 500 });
 	}
 };
@@ -393,7 +396,7 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 		if (error instanceof Error && error.message === 'Authentication required') {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
-		console.error('Error deleting alert config:', error);
+		log.error('alerts.delete_failed', { error });
 		return json({ error: 'Internal server error' }, { status: 500 });
 	}
 };

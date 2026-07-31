@@ -28,6 +28,12 @@ COPY --from=builder /app/build ./build
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
 
+# OTel bootstrap (docs/plans/OBSERVABILITY_PLAN.md D-f). Deliberately NOT part of the SvelteKit/Vite
+# build (see the file's own header comment) — copied in directly, unbundled, and loaded via `node
+# --import` below so its module-loader hooks register before adapter-node's entrypoint ever touches
+# 'http'/'pg'.
+COPY apps/dashboard-web/instrumentation.mjs ./instrumentation.mjs
+
 USER appuser
 
 EXPOSE 3000
@@ -40,4 +46,4 @@ ENV POSTGRES_PASSWORD=changeme
 ENV POSTGRES_DB=sentinel
 ENV DATABASE_URL=postgres://sentinel:changeme@localhost:5432/sentinel
 
-ENTRYPOINT ["node", "build"]
+ENTRYPOINT ["node", "--import", "./instrumentation.mjs", "build/index.js"]

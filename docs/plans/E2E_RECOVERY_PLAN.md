@@ -803,6 +803,13 @@ incident: the DLQ silently reached 6,148 messages, exhausted JetStream storage, 
 unrelated operations with "insufficient storage resources" — because neither stream was bounded and
 nothing was watching the depth.
 
+A third row, **U35**, was added on 2026-07-31 with the observability work (P9-2). It is the acceptance
+bar for that work and it belongs in this suite rather than anywhere else for a specific reason:
+OpenTelemetry's characteristic failure is silence. If the global text-map propagator is never
+registered, `Inject` writes nothing and `Extract` is a no-op — with no error and no log line — so the
+two services emit two disconnected traces while every unit test stays green. Only an assertion made
+against the deployed containers, reading the trace back out of the collector afterwards, can see it.
+
 `tests/e2e/` exists and every row below has a named test that runs
 against the full compose stack — real HTTP surfaces, real NATS hop, real processor, real database, real
 published SDK. The whole suite:
@@ -858,6 +865,7 @@ originally promised: **a named test is green.**
 | U32 | retention | Cron retention endpoint | deletes only beyond the window; **requires auth** | ✅ `TestU32_RetentionRequiresAuthAndWindow` — found orphan deletion had no age check |
 | U33 | ops | Both JetStream streams are bounded (age + size) with the right discard policy | ERROR_EVENTS discards NEW when full (backpressure, never silent loss); the DLQ discards OLD (a full DLQ must never refuse to park poison — that is the S13 livelock) | ✅ `TestU33_StreamsAreBounded` — added after both streams were found unbounded; ERROR_EVENTS held 18,654 fully-acked messages with no limits |
 | U34 | ops | The DLQ backlog is reported so somebody can act on it | `/health` carries a threshold to compare depth against, the age and class of the oldest message, and a severity that does not flip on a single poison message | ✅ `TestU34_DLQBacklogIsReportedActionably`, `TestU34_DLQDepthTracksARealDeadLetter` |
+| U35 | observability | One request carrying a W3C `traceparent` → ingestor → NATS → processor | the response echoes the caller's trace id as `X-Request-Id`, and **one** trace containing spans from BOTH `ingestor-go` and `processor-go` is retrievable from the trace backend; both services serve parseable Prometheus exposition | ✅ `TestU35_OneTraceSpansIngestorAndProcessor`, `TestU35_BothGoServicesExposeParseableMetrics` — the acceptance bar for the observability work (OBSERVABILITY_PLAN.md §7) |
 
 **Legend**: ✅ proven by a command that was actually run · 🟡 partially verified (component-level test or
 structural check, not the full row) · ❌ blocked, with the specific blocker named · ⚪ unverified, no attempt
@@ -944,23 +952,33 @@ org-wide creation to a role holding `manage_keys`. A user who can see an org-wid
 to edit it without that permission — the API enforces this from the stored row; the UI must not imply
 otherwise.
 
-### P9-2 · No structured logging, no metrics, no tracing
+### P9-2 · No structured logging, no metrics, no tracing — **DONE 2026-07-31**
 
-**State**: every service uses stdlib `log`. There is no `slog`, no `/metrics`, no trace propagation
+**Original state**: every service used stdlib `log`. No `slog`, no `/metrics`, no trace propagation
 anywhere. An error-tracking product with no observability of its own.
 
-**Why deferred**: it touches every service and is large enough to deserve its own review.
+**Delivered** (see `docs/plans/OBSERVABILITY_PLAN.md` for the decisions and work packages):
 
-**Why it should go FIRST of the remaining items**: it is what makes the next defect diagnosable. Several
-defects found on 2026-07-30 were only found by hand-attaching to a live stack and reading container logs —
-the API-key revocation gap surfaced only because a test measured latency, and the JetStream storage
-exhaustion surfaced as unrelated test failures. Structured logs with request IDs and a DLQ/ingest metric
-would have surfaced both directly.
+- `packages/shared-go/obs` — `Setup`/`SetupTo` (trace-aware `slog` handler, `service` on every line),
+  `Bootstrap` (OTLP traces + OTel meter API over a Prometheus exporter), `NATSHeaderCarrier`.
+- Ingestor and processor migrated off stdlib `log`; `/metrics` on `:8080` and `:8081`.
+- W3C trace context propagated over NATS headers, so the processor's consumer span is a genuine child
+  of the ingestor's producer span. The DLQ path preserves it in both directions.
+- Dashboard traced via `node --import ./instrumentation.mjs`, deliberately outside Vite's bundling.
+- `jaeger` in compose as the dev/CI trace backend, wired so no service depends on it being up.
 
-**Acceptance**: `slog` with request IDs across ingestor/processor/dashboard; a `/metrics` endpoint on the
-Go services exposing at least ingest rate, processing latency, DLQ depth and publish failures; and one
-e2e row asserting a request ID propagates from `/ingest` through to the processor's log line for the same
-event.
+**Acceptance, met**: U35 asserts a caller-supplied `traceparent` is echoed as `X-Request-Id` and that
+ONE trace containing spans from both `ingestor-go` and `processor-go` is retrievable from the backend,
+plus both `/metrics` endpoints parse. Verified against the deployed stack, not the diff.
+
+**Deviation from the original acceptance text, recorded deliberately**: that text asked for "a request
+ID propagates from `/ingest` through to the processor's **log line**". U35 asserts the stronger,
+better-typed version — the trace itself, read back out of the collector, containing spans from both
+services. Grepping a container's log stream from a Go test is both brittle and weaker: it proves a
+string appeared, not that the two services' work is joined. The trace assertion cannot pass unless the
+propagation actually worked.
+
+**What this work did NOT fix** is recorded as P9-5 below rather than left implicit.
 
 ### P9-3 · S16 — `issues.count` can inflate on partial-failure redelivery
 
@@ -987,7 +1005,23 @@ and by live-probing five candidate accept URLs, all 404. U22 asserts the wall ra
 **Acceptance**: an accept route that consumes the token exactly once, creates the `organization_members`
 row at the invited role, rejects an expired or already-used token, and U22 extended past the wall.
 
-### Not deferred — decided against
+### P9-5 · Observability findings deliberately left open
+
+The observability work (P9-2) was reviewed adversarially per service; the reviews reproduced each
+finding at runtime rather than reading the diff. Everything of high severity was fixed in that change.
+These remain open **on purpose**, recorded here so the next person does not conclude they were missed:
+
+| Finding | State | Why deferred |
+|---|---|---|
+| Alert delivery is severed from the trace | The notifier workers reset to `context.Background()` before the actual SMTP/HTTP call, so the real send has no span and its log lines carry no `trace_id`. The enqueue is traced; the delivery is not. | The fix needs trace context serialized onto the queued notification struct — a design decision about the queue's contract, not a mechanical change. `sentinel_alert_dispatch_total` (now including a `dropped` outcome) covers the failure class in the meantime. |
+| The consumer span cannot say "dead-lettered" | It records `sentinel.error_permanent` instead. A transient error on the final allowed delivery also dead-letters, and `IsPermanent` reports false for it. | The retry-vs-park decision lives inside the subscriber's private `handleMessage` and exposing it changes a shared signature. The DLQ metrics and `/health` already report the outcome accurately. |
+| `processor.alert_dispatch`'s span can never record an error | `dispatchAlert` and `Dispatcher.Dispatch` are genuinely `void` — deliberately, so a broken notifier can never fail or block event processing. | Changing that to return an error would ripple through the write path for no behavioural gain. The span is documented in place as status-only. |
+| Rejected events produce no span | Validation and marshalling happen before the producer span opens, and otelhttp leaves 4xx server spans `Unset` per spec, so a rejected event looks like an accepted one in a trace. | `sentinel_ingest_requests_total{outcome="rejected"}` still moves, so it is not invisible — only not diagnosable from the trace. |
+| No database spans anywhere | `PgInstrumentation` targets `node-postgres`; the dashboard uses the `postgres` (postgres-js) driver, so it is inert. The Go services have no span around their queries either. | D-f scopes the dashboard to best effort. Doing this properly means enabling SvelteKit's own `experimental.tracing.server` and adding manual spans around the drizzle calls — worth its own change. |
+| Prometheus is scraped by nobody | `/metrics` is served by both Go services and parses, but nothing collects it and there are no alert rules. | The plan (D-c) chose a free upgrade path to otel-collector/Grafana rather than shipping a half-configured Prometheus now. |
+| The Dockerfile installs before copying the lockfile | `pnpm install` runs before `pnpm-lock.yaml` and `pnpm-workspace.yaml` are copied, so the image resolves from the `^` ranges rather than the locked versions. **Pre-existing, not introduced here.** | It is a build-reproducibility defect in its own right and belongs in a change that can be validated by actually building and diffing the image. |
+
+**Not deferred — decided against**
 
 **A graceful in-flight drain on processor SIGTERM.** P8-1 listed it as a gap. It is not a correctness
 problem: unACKed messages are redelivered, which U28 verifies, so an abrupt stop costs duplicate work

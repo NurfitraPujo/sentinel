@@ -1,9 +1,63 @@
+import type { Handle } from '@sveltejs/kit';
 import { sequence } from '@sveltejs/kit/hooks';
 import { handle as authHandle } from '$lib/server/auth-config';
 import { db } from '$lib/server/db';
 import { organizations, organizationMembers, userSessionPreferences, users } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 import { error } from '@sveltejs/kit';
+import { log } from '$lib/server/observability/log';
+import { HTTP_REQUEST_ID_HEADER } from '$lib/server/observability/constants';
+import { runWithTraceContext, traceContextForRequest } from '$lib/server/observability/trace';
+
+// requestContextHandle is FIRST in the sequence (see `handle` below), deliberately outside/around
+// authHandle and orgHandle: it must wrap the entire request lifecycle so every log line emitted by any
+// later handle or route carries this request's trace/span id via AsyncLocalStorage (see
+// observability/trace.ts).
+//
+// Per docs/plans/OBSERVABILITY_PLAN.md D-d/D-e: an inbound W3C `traceparent` is honoured (its trace id
+// carries through; this request gets its OWN span id, not the caller's) and the trace id is echoed back
+// as X-Request-Id in hex — the same header name and log keys packages/shared-go/obs uses, so a trace id
+// grepped from a dashboard log line, an ingestor log line, and a processor log line all refer to the
+// same request end-to-end. A missing/malformed traceparent degrades to a fresh root trace; it must never
+// fail the request (traceContextForRequest handles that).
+const requestContextHandle: Handle = async ({ event, resolve }) => {
+	const ctx = traceContextForRequest(event.request.headers.get('traceparent'));
+
+	// event.setHeaders (rather than response.headers.set after resolve()) so the header lands on every
+	// response produced by the normal resolve() chain — a rendered page, a redirect, or a route handler
+	// that itself returns `json({...}, {status})` on an error (verified: /api/alerts's catch blocks all
+	// do this, and DO carry the header). It does NOT cover the case where a handle throws instead of
+	// returning — e.g. orgHandle's `error(403, ...)`, or an unhandled exception — because SvelteKit's
+	// fatal-error path (handle_fatal_error in @sveltejs/kit) builds a brand-new Response directly and
+	// never merges event.setHeaders' collected headers into it. Verified by hand: a thrown 403/500 in
+	// this app does NOT carry X-Request-Id, only the trace_id in the paired log line. Reconstructing
+	// that response ourselves to force the header on would mean duplicating SvelteKit's own error-page/
+	// handleError rendering inside this hook — out of scope here per the "do not disturb the auth flow"
+	// constraint, and reported as a known gap rather than silently claimed as covered.
+	event.setHeaders({ [HTTP_REQUEST_ID_HEADER]: ctx.traceId });
+
+	return runWithTraceContext(ctx, async () => {
+		const start = Date.now();
+		try {
+			const response = await resolve(event);
+			log.info('http.request', {
+				method: event.request.method,
+				path: event.url.pathname,
+				status: response.status,
+				duration_ms: Date.now() - start,
+			});
+			return response;
+		} catch (err) {
+			log.error('http.request_failed', {
+				method: event.request.method,
+				path: event.url.pathname,
+				duration_ms: Date.now() - start,
+				error: err,
+			});
+			throw err;
+		}
+	});
+};
 
 const orgHandle = async ({ event, resolve }: any) => {
 	const session = await event.locals.auth();
@@ -93,4 +147,4 @@ const orgHandle = async ({ event, resolve }: any) => {
 	return resolve(event);
 };
 
-export const handle = sequence(authHandle, orgHandle);
+export const handle = sequence(requestContextHandle, authHandle, orgHandle);

@@ -37,7 +37,9 @@ Go/SvelteKit monorepo for an error-tracking pipeline:
 - `apps/ingestor-go` — auth, rate limit, validate, publish. The only externally exposed service.
 - `apps/processor-go` — deserialize, normalize, mask, fingerprint, upsert issue + occurrence, index.
 - `apps/dashboard-web` — UI and JSON API.
-- `packages/shared-go` — pgx pool, NATS pub/sub, redis client.
+- `packages/shared-go` — pgx pool, NATS pub/sub, redis client, and `obs` (slog + OpenTelemetry).
+  `obs.Bootstrap` registers the global trace propagator; see D15 and **B11** before touching it, because
+  its failure mode is silence, not an error.
 - `packages/proto` + `gen/` — the `ErrorEvent` contract (buf + protovalidate CEL).
 - `packages/db-migrations` — goose migrations; **one flat directory** for all targets (see A1).
 - `packages/sdk-go` — the public Go client.
@@ -57,18 +59,26 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 
 ```bash
 rtk go build ./... && rtk go vet ./...          # root module — green
-rtk go test ./tests/unit/...                    # green, 282 assertions
+rtk go test ./tests/unit/...                    # green, 292 assertions
 cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
 ./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
-cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 691 files/0 errors, 79 tests
-SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 56 tests, 0 skips, ~125s — NEEDS the compose stack up
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 960 files/0 errors (2 pre-existing warnings), 90 tests
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 74 passed, 0 skips — NEEDS the compose stack up
                                                                   # -tags=e2e is mandatory; without it U8-U10 are silently excluded
+                                                                  # U35 additionally needs `jaeger` up; it fails (never skips) if not
 rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
 ```
 
 Running `tests/integration` is **not** in this list on purpose — see Working conventions below before you run it.
+
+When you do run it, use `FORCE_TESTCONTAINERS=1` (see Working conventions). Current state on that path,
+measured 2026-07-31: **76 passed, 2 failed, 9 skipped**. The two failures are `TestIngestAndProcess` and
+`TestSearchIndexing`, both `Expected status 202, got 401`. They are **pre-existing** — confirmed by
+running the same two tests in a clean worktree at `origin/main`, where they fail identically — so do not
+attribute them to whatever you just changed. Both seed `project_api_keys` correctly and the ingestor's
+auth path is unchanged; the cause has not been diagnosed yet.
 
 **CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs) but has not yet been proven green on a real
 push from this branch — P2/P2b's changes are staged, uncommitted. `go-root`, `go-sdk` and `go-migrations`
@@ -88,10 +98,16 @@ Taskfile comment already recorded that it had never been wired up. It survived o
 values to copy from.
 
 **Work that is deliberately deferred is documented as P9 in
-[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI, observability,
-S16 `event_id` idempotency, and invitation acceptance, each with the reason and the acceptance bar. Read it
-before concluding something is missing by accident; this repo's characteristic failure is status recorded
+[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI, S16 `event_id`
+idempotency, and invitation acceptance, each with the reason and the acceptance bar. Read it before
+concluding something is missing by accident; this repo's characteristic failure is status recorded
 optimistically and then believed.
+
+**P9-2 (observability) is DONE as of 2026-07-31**: `slog` everywhere, `/metrics` on both Go services, and
+one distributed trace spanning ingestor → NATS → processor, gated by U35. The findings that work chose
+*not* to fix are listed as **P9-5** in the same plan — read that before assuming a gap is accidental.
+`docker compose up -d` now also starts `jaeger` (dev/CI trace backend, `http://localhost:16686`); nothing
+depends on it being up, by design.
 
 Remaining known gaps, none of them a regression from that work:
 

@@ -37,6 +37,19 @@ HEALTHCHECKED_SERVICES="postgres redis nats"
 # One-shot services expected to run once and exit 0, rather than stay up.
 ONESHOT_SERVICES="nats-init migrate"
 
+# Services whose absence or failure must NOT fail the gate.
+#
+# jaeger is optional infrastructure by design: the OTel exporters degrade to a single warning when the
+# collector is unreachable and every service runs fully without it (OBSERVABILITY_PLAN.md D-b). But this
+# script enumerates `docker compose config --services`, so simply ADDING the service to the compose file
+# silently made the whole stack gate depend on it — a failed image pull (~200MB, often not cached) or a
+# squatted host port would classify as `failed` and exit 1 for everything, or spin to the timeout when the
+# container is merely `created`. That is the degradation mandate defeated at the gate rather than in code,
+# and it would take CI and every developer down with it.
+#
+# Listed services are still waited for and still reported; they just cannot fail the run.
+OPTIONAL_SERVICES="jaeger"
+
 log() {
   printf '%s\n' "$*" >&2
 }
@@ -107,6 +120,7 @@ while true; do
   all_ready=1
   failed=""
   pending=""
+  optional_down=""
 
   for svc in $services; do
     line="$(printf '%s\n' "$status_tsv" | awk -F'\t' -v s="$svc" '$1 == s {print; exit}')"
@@ -120,6 +134,11 @@ while true; do
         # run" and keep waiting rather than failing immediately.
         all_ready=0
         pending="$pending $svc(no-container)"
+        continue
+      fi
+      if in_list "$svc" "$OPTIONAL_SERVICES"; then
+        # Never created — e.g. the image could not be pulled. Optional means optional.
+        optional_down="$optional_down $svc(no-container)"
         continue
       fi
       all_ready=0
@@ -155,12 +174,20 @@ while true; do
         fi
         ;;
       exited|dead|restarting)
-        failed="$failed $svc($state)"
-        all_ready=0
+        if in_list "$svc" "$OPTIONAL_SERVICES"; then
+          optional_down="$optional_down $svc($state)"
+        else
+          failed="$failed $svc($state)"
+          all_ready=0
+        fi
         ;;
       *)
-        all_ready=0
-        pending="$pending $svc($state)"
+        if in_list "$svc" "$OPTIONAL_SERVICES"; then
+          optional_down="$optional_down $svc($state)"
+        else
+          all_ready=0
+          pending="$pending $svc($state)"
+        fi
         ;;
     esac
   done
@@ -172,6 +199,11 @@ while true; do
   fi
 
   if [ "$all_ready" -eq 1 ]; then
+    if [ -n "$optional_down" ]; then
+      # Visible, not silent: an optional service being down is a real degradation (no traces will be
+      # collected), it just is not a reason to fail the gate.
+      log "wait-healthy: optional service(s) NOT up:$optional_down — continuing (see OPTIONAL_SERVICES)"
+    fi
     log "wait-healthy: all services ready after ${elapsed}s"
     exit 0
   fi

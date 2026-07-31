@@ -558,3 +558,42 @@ observed behaviour. And name the test for the requirement (`ConcurrentRequestsRe
 (`ConcurrentRequestsExceedLimit`) — a passing test named after the defect reads like the defect is still
 there.
 
+
+## B11 — Instrumentation Whose Failure Mode Is Silence
+
+**Status**: active (found and guarded 2026-07-31, during the observability work)
+
+Some libraries are designed so that a missing registration degrades to *doing nothing quietly*, rather
+than erroring. That is friendly for optional features and catastrophic for anything you intend to rely on,
+because there is no failure to observe — no exception, no log line, no metric, no failing test.
+
+The instance that prompted this entry: OpenTelemetry's **default global text-map propagator is a no-op**.
+If nobody calls `otel.SetTextMapPropagator`, then `Inject` writes no header and `Extract` returns the
+context unchanged. In this repo that would have meant:
+
+- the ingestor still opens a producer span,
+- the processor still opens a consumer span,
+- `/metrics` still serves, both services still start,
+- and the two spans land in **two disconnected traces** instead of one.
+
+Every unit test would still pass, because each side is individually correct. Only the *join* is broken,
+and nothing on either side can see it. Verified rather than assumed: with the registration mutated out, a
+probe reported `propagator Fields=[]`; restored, it reported `parent-is-producer=true remote=true`.
+
+This is B3's cousin (shipped-but-unreachable) and B9's cousin (a deployment that never connects two
+correct halves), but it is worth its own entry because the mechanism is different: nothing here is
+unreachable and nothing is misconfigured — the library is *working as designed*, and its design is to
+say nothing.
+
+**The rule**: when a library's absent configuration degrades to silence rather than an error, write a
+test that asserts the *registration itself*, and prove the test fails without it. Two forms, both needed:
+
+1. **A library guard** — reset the global to a known no-op, run your bootstrap, then assert the global
+   changed (`tests/unit`'s `TestObsBootstrapRegistersTheGlobalPropagator`).
+2. **A deployment guard** — assert the joined-up outcome against the running system, because a library
+   guard cannot tell you the containers actually reached a collector (U35).
+
+A related trap in the same family: a guard that only exercises the *happy input* can hide the bug. The
+dashboard's correlation id was a bespoke random value rather than the OTel trace id, but when a caller
+supplies a `traceparent` both sides independently honour the W3C header and coincidentally agree — so
+the obvious test passes and only real browser traffic diverges. **Test the path with nothing supplied.**

@@ -4,17 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/degradation"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer is obtained from the otel API's global accessor rather than threaded in from main() — see
+// procmetrics.meter's doc comment for why this is safe regardless of whether obs.Bootstrap has run
+// yet. Child spans started here (deserialize/store/index/alert dispatch — OBSERVABILITY_PLAN.md W2)
+// attach to whatever span main.go's subscriber handler already put in ctx (the consumer span, itself
+// parented on the ingestor's producer span via the extracted traceparent).
+var tracer trace.Tracer = otel.Tracer("processor-go")
 
 type ProcessorService struct {
 	db          *pgxpool.Pool
@@ -70,7 +83,31 @@ func (s *ProcessorService) Alerts() *alerts.Dispatcher {
 // backoff (1s/5s/15s/30s/60s, MaxDeliver 5) owns recovery, and a DLQ entry
 // preserves anything that outlasts that budget. This function must never call
 // processEventInternal for an event that did not get StatusProcessed.
-func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) error {
+// ProcessEvent records MetricProcessDuration/MetricProcessEvents (OBSERVABILITY_PLAN.md §2/W2) around
+// the whole call, classifying the outcome from the returned error: nil -> OutcomeStored; a
+// nats.Permanent error (dead-lettered on THIS delivery, unconditionally, by the subscriber regardless
+// of delivery count) -> OutcomeDeadLettered; any other error -> OutcomeRetried.
+//
+// That last case is an approximation, not a certainty: whether NATS retries or actually dead-letters a
+// non-permanent error depends on the message's delivery count, which lives entirely inside
+// packages/shared-go/nats.Subscriber.handleMessage (private, and out of scope for this change — see
+// OBSERVABILITY_PLAN.md's W2 brief). A transient error on the LAST allowed delivery is reported here as
+// "retried" even though the subscriber will actually dead-letter it. This is the best classification
+// available from this call's own return value without touching that package.
+func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := obs.OutcomeStored
+		if err != nil {
+			if nats.IsPermanent(err) {
+				outcome = obs.OutcomeDeadLettered
+			} else {
+				outcome = obs.OutcomeRetried
+			}
+		}
+		procmetrics.RecordProcessed(ctx, outcome, time.Since(start))
+	}()
+
 	switch s.degradation.Evaluate(ctx, data) {
 	case degradation.StatusProcessed:
 		return s.processEventInternal(ctx, data)
@@ -108,29 +145,47 @@ func (s *ProcessorService) VerifyAuditLogTable(ctx context.Context) error {
 	return rows.Err()
 }
 
+// withSpan starts a child span named name on ctx, runs fn with the span-carrying context, records fn's
+// error (if any) onto the span, and always ends the span before returning. Used throughout
+// processEventInternal for the "meaningful stages" OBSERVABILITY_PLAN.md's W2 brief calls out:
+// deserialize, store, index, alert dispatch — all children of whatever span is already in ctx (the
+// consumer span main.go's subscriber handler opens after extracting the ingestor's producer span from
+// the NATS traceparent header).
+func withSpan(ctx context.Context, name string, fn func(ctx context.Context) error) error {
+	spanCtx, span := tracer.Start(ctx, name)
+	defer span.End()
+	if err := fn(spanCtx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
 func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {
-	evt, err := event.Deserialize(data)
-	if err != nil {
+	var evt *event.ErrorEvent
+	if err := withSpan(ctx, "processor.deserialize", func(ctx context.Context) error {
+		var deserializeErr error
+		evt, deserializeErr = event.Deserialize(data)
+		return deserializeErr
+	}); err != nil {
 		// A deserialize failure (malformed proto, a required field missing)
 		// is a property of these exact bytes: redelivering the same message
 		// will fail identically forever, so it must not spend its whole
 		// MaxDeliver budget being retried (VERIFIED_STATE.md S13).
-		log.Printf("Failed to deserialize event: %v", err)
+		slog.ErrorContext(ctx, "Failed to deserialize event", slog.String("error", err.Error()))
 		return nats.Permanent(err)
 	}
 
-	log.Printf("Processing event: project=%s, project_id=%s, error_class=%s, fingerprint=%s, release_version=%s",
-		evt.ProjectKey, evt.ProjectID, evt.ErrorClass, evt.Fingerprint, evt.ReleaseVersion)
+	slog.InfoContext(ctx, "Processing event",
+		slog.String("project", evt.ProjectKey), slog.String("project_id", evt.ProjectID),
+		slog.String("error_class", evt.ErrorClass), slog.String("fingerprint", evt.Fingerprint),
+		slog.String("release_version", evt.ReleaseVersion))
 
-	projectID, err := s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
-	if err != nil {
-		log.Printf("Failed to resolve project: %v", err)
-		return classifyProjectLookupError(err)
-	}
-
+	var projectID, issueID string
+	var upsertOutcome store.IssueOutcome
 	issue := &store.Issue{
 		ID:          uuid.New().String(),
-		ProjectID:   projectID,
 		Fingerprint: evt.Fingerprint,
 		Message:     evt.Message,
 		ErrorClass:  evt.ErrorClass,
@@ -138,26 +193,39 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		FirstSeen:   evt.Timestamp,
 		LastSeen:    evt.Timestamp,
 	}
+	storeErr := withSpan(ctx, "processor.store.issue", func(ctx context.Context) error {
+		var err error
+		projectID, err = s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to resolve project", slog.String("error", err.Error()))
+			return classifyProjectLookupError(err)
+		}
+		issue.ProjectID = projectID
 
-	outcome, err := s.store.UpsertIssueWithOutcome(ctx, issue, evt.ReleaseVersion)
-	if err != nil {
-		log.Printf("Failed to upsert issue: %v", err)
-		return classifyStoreError(err)
-	}
+		upsertOutcome, err = s.store.UpsertIssueWithOutcome(ctx, issue, evt.ReleaseVersion)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to upsert issue", slog.String("error", err.Error()))
+			return classifyStoreError(err)
+		}
 
-	s.store.PersistAuditLog(ctx, &store.AuditLog{
-		ID:           uuid.New().String(),
-		Action:       "issue_upserted",
-		ResourceType: "issue",
-		ResourceID:   &issue.ID,
-		ActorID:      "processor-go",
-		Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
+		s.store.PersistAuditLog(ctx, &store.AuditLog{
+			ID:           uuid.New().String(),
+			Action:       "issue_upserted",
+			ResourceType: "issue",
+			ResourceID:   &issue.ID,
+			ActorID:      "processor-go",
+			Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
+		})
+
+		issueID, err = s.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to get issue ID", slog.String("error", err.Error()))
+			return classifyStoreError(err)
+		}
+		return nil
 	})
-
-	issueID, err := s.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
-	if err != nil {
-		log.Printf("Failed to get issue ID: %v", err)
-		return classifyStoreError(err)
+	if storeErr != nil {
+		return storeErr
 	}
 
 	// Alert on NEW issues and REGRESSIONS, not on every occurrence of an
@@ -175,8 +243,20 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	//
 	// Feeding every occurrence in is what the threshold is FOR: "tell me when this error happens 50
 	// times in an hour" is the product behavior, and a threshold of 1 still gives alert-on-first-sight.
-	s.dispatchAlert(ctx, issueID, projectID, evt.ErrorClass, evt.Message)
-	_ = outcome
+	//
+	// This span is best-effort and can never record an error: dispatchAlert (and, beneath it,
+	// alerts.Dispatcher.Dispatch) is void by design — it swallows/logs its own failures internally
+	// (queue-full, unroutable channel_config, panics in a caller-supplied sender, ...) so that a
+	// broken notifier can never fail or block event processing (see dispatchAlert's doc comment).
+	// There is no error left for this closure to propagate; changing that would mean changing
+	// Dispatcher.Dispatch's exported signature, which is out of scope here. sentinel_alert_dispatch_total
+	// (procmetrics.RecordAlertDispatch, including the dropped outcome) is the mechanism that actually
+	// makes alert-dispatch failures observable, not this span's status.
+	_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
+		s.dispatchAlert(ctx, issueID, projectID, evt.ErrorClass, evt.Message)
+		return nil
+	})
+	_ = upsertOutcome
 
 	stacktraceJSON, _ := json.Marshal(evt.Stacktrace)
 	metadataJSON, _ := json.Marshal(evt.Metadata)
@@ -194,19 +274,24 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		CreatedAt:      evt.Timestamp,
 	}
 
-	if err := s.store.InsertOccurrence(ctx, occ); err != nil {
-		log.Printf("Failed to insert occurrence: %v", err)
-		return classifyStoreError(err)
-	}
+	if err := withSpan(ctx, "processor.store.occurrence", func(ctx context.Context) error {
+		if err := s.store.InsertOccurrence(ctx, occ); err != nil {
+			slog.ErrorContext(ctx, "Failed to insert occurrence", slog.String("error", err.Error()))
+			return classifyStoreError(err)
+		}
 
-	s.store.PersistAuditLog(ctx, &store.AuditLog{
-		ID:           uuid.New().String(),
-		Action:       "occurrence_created",
-		ResourceType: "error_occurrence",
-		ResourceID:   &occ.ID,
-		ActorID:      "processor-go",
-		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
-	})
+		s.store.PersistAuditLog(ctx, &store.AuditLog{
+			ID:           uuid.New().String(),
+			Action:       "occurrence_created",
+			ResourceType: "error_occurrence",
+			ResourceID:   &occ.ID,
+			ActorID:      "processor-go",
+			Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
+		})
+		return nil
+	}); err != nil {
+		return err
+	}
 
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
@@ -217,9 +302,13 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		searchEntry.SpanID = evt.SpanID
 	}
 
-	if err := s.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
-		log.Printf("Failed to index occurrence: %v", err)
-	}
+	_ = withSpan(ctx, "processor.index", func(ctx context.Context) error {
+		if err := s.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
+			slog.ErrorContext(ctx, "Failed to index occurrence", slog.String("error", err.Error()))
+			return err
+		}
+		return nil
+	})
 
 	return nil
 }
@@ -234,7 +323,8 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 func (s *ProcessorService) dispatchAlert(ctx context.Context, issueID, projectID, errorClass, message string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("alerts: recovered from panic dispatching alert for issue=%s project=%s: %v", issueID, projectID, r)
+			slog.ErrorContext(ctx, "alerts: recovered from panic dispatching alert",
+				slog.String("issue_id", issueID), slog.String("project_id", projectID), slog.Any("panic", r))
 		}
 	}()
 	s.alerts.Dispatch(ctx, issueID, projectID, errorClass, message)

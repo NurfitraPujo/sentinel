@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -36,7 +36,7 @@ func NewAPIKeyAuthenticator(db *pgxpool.Pool, redis *libredis.Client, sub *nats.
 	auth := &APIKeyAuthenticator{db: db, redis: redis, sub: sub}
 	if sub != nil {
 		go func() {
-			_ = sub.Subscribe(context.Background(), func(msg []byte) error {
+			_ = sub.Subscribe(context.Background(), func(ctx context.Context, msg []byte, headers nats.Header) error {
 				var data map[string]string
 				if err := json.Unmarshal(msg, &data); err == nil {
 					// The dashboard (apps/dashboard-web/src/lib/db/queries/apikeys.ts)
@@ -52,7 +52,7 @@ func NewAPIKeyAuthenticator(db *pgxpool.Pool, redis *libredis.Client, sub *nats.
 					// any future consumer that needs to look the key up by id instead.
 					if keyHash, ok := data["keyHash"]; ok && keyHash != "" {
 						if auth.redis != nil {
-							_ = auth.redis.Del(context.Background(), "apikey:"+keyHash)
+							_ = auth.redis.Del(ctx, "apikey:"+keyHash)
 						}
 					}
 				}
@@ -158,7 +158,8 @@ func cacheTTL() time.Duration {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
-		log.Printf("auth: ignoring unparseable APIKEY_CACHE_TTL=%q; using default", v)
+		slog.Default().Warn(fmt.Sprintf("auth: ignoring unparseable APIKEY_CACHE_TTL=%q; using default", v),
+			slog.String("raw_value", v))
 	}
 	return defaultCacheTTL
 }

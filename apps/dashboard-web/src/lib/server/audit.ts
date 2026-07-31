@@ -1,4 +1,6 @@
-export type AuditEventType = 
+import { log } from './observability/log';
+
+export type AuditEventType =
 	| 'magic_link_requested'
 	| 'magic_link_clicked'
 	| 'magic_link_failed'
@@ -20,7 +22,8 @@ export function logAuditEvent(event: Omit<AuditEvent, 'timestamp'>): void {
 		...event,
 		timestamp: new Date().toISOString(),
 	});
-	console.log('[AUDIT]', JSON.stringify(event));
+	const { type, ...fields } = event;
+	log.info(`audit.${type}`, fields);
 }
 
 export function getAuditLog(): AuditEvent[] {

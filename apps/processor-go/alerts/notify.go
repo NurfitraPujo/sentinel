@@ -3,12 +3,22 @@ package alerts
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/notifiers"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
+
+// channelUnknown is the LabelChannel value recorded for an alertCfg.Channel this switch does not
+// recognize. Deliberately NOT the raw, project-controlled alertCfg.Channel string: unlike "email"/
+// "telegram" (fixed literals every call site already agrees on), an unrecognized channel value comes
+// straight from the alert_configs table with no enum/CHECK constraint behind it, so recording it
+// verbatim would let a project owner mint arbitrary Prometheus label values — the same unbounded-
+// cardinality mistake LabelOutcome's fixed constants exist to prevent (see obs.go's doc comment).
+const channelUnknown = "unknown"
 
 // NotifierConfig holds the operational, environment-provided settings for
 // each outbound alert channel. Per-alert routing (which email address, which
@@ -77,8 +87,9 @@ func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertCo
 		case "email":
 			to, _ := alertCfg.ChannelConfig["to"].(string)
 			if to == "" {
-				log.Printf("alerts: email channel_config missing \"to\" for project=%s issue=%s, dropping alert",
-					alert.ProjectID, alert.IssueID)
+				slog.WarnContext(ctx, "alerts: email channel_config missing \"to\", dropping alert",
+					slog.String("project_id", alert.ProjectID), slog.String("issue_id", alert.IssueID))
+				procmetrics.RecordAlertDispatch(ctx, "email", obs.OutcomeDispatchDropped)
 				return
 			}
 			err := emailWorker.Send(&notifiers.EmailNotification{
@@ -87,8 +98,10 @@ func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertCo
 				Body:      alert.Message,
 			})
 			if err != nil {
-				log.Printf("alerts: failed to queue email for project=%s issue=%s: %v",
-					alert.ProjectID, alert.IssueID, err)
+				slog.ErrorContext(ctx, "alerts: failed to queue email",
+					slog.String("project_id", alert.ProjectID), slog.String("issue_id", alert.IssueID),
+					slog.String("error", err.Error()))
+				procmetrics.RecordAlertDispatch(ctx, "email", obs.OutcomeDispatchDropped)
 			}
 		case "telegram":
 			// Per-alert chat override is not yet supported end-to-end: the
@@ -99,23 +112,29 @@ func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertCo
 			// see the comment on notifiers.TelegramWorker for the follow-up.
 			chatID, _ := alertCfg.ChannelConfig["chat_id"].(string)
 			if chatID != "" && chatID != cfg.Telegram.ChatID {
-				log.Printf("alerts: telegram channel_config chat_id=%q for project=%s does not match the configured default chat, dropping alert (per-project chat routing not yet implemented)",
-					chatID, alert.ProjectID)
+				slog.WarnContext(ctx, "alerts: telegram channel_config chat_id does not match the configured default chat, dropping alert (per-project chat routing not yet implemented)",
+					slog.String("chat_id", chatID), slog.String("project_id", alert.ProjectID))
+				procmetrics.RecordAlertDispatch(ctx, "telegram", obs.OutcomeDispatchDropped)
 				return
 			}
 			if cfg.Telegram.ChatID == "" && chatID == "" {
-				log.Printf("alerts: no telegram chat_id configured for project=%s issue=%s, dropping alert",
-					alert.ProjectID, alert.IssueID)
+				slog.WarnContext(ctx, "alerts: no telegram chat_id configured, dropping alert",
+					slog.String("project_id", alert.ProjectID), slog.String("issue_id", alert.IssueID))
+				procmetrics.RecordAlertDispatch(ctx, "telegram", obs.OutcomeDispatchDropped)
 				return
 			}
 			err := telegramWorker.Send(&notifiers.TelegramNotification{Message: alert.Message})
 			if err != nil {
-				log.Printf("alerts: failed to queue telegram message for project=%s issue=%s: %v",
-					alert.ProjectID, alert.IssueID, err)
+				slog.ErrorContext(ctx, "alerts: failed to queue telegram message",
+					slog.String("project_id", alert.ProjectID), slog.String("issue_id", alert.IssueID),
+					slog.String("error", err.Error()))
+				procmetrics.RecordAlertDispatch(ctx, "telegram", obs.OutcomeDispatchDropped)
 			}
 		default:
-			log.Printf("alerts: unknown channel %q for project=%s issue=%s, dropping alert",
-				alertCfg.Channel, alert.ProjectID, alert.IssueID)
+			slog.WarnContext(ctx, "alerts: unknown channel, dropping alert",
+				slog.String("channel", alertCfg.Channel), slog.String("project_id", alert.ProjectID),
+				slog.String("issue_id", alert.IssueID))
+			procmetrics.RecordAlertDispatch(ctx, channelUnknown, obs.OutcomeDispatchDropped)
 		}
 	}
 }
@@ -148,7 +167,7 @@ func OperationalAlertConfigFromEnv() *AlertConfig {
 		if to := getEnv("PROCESSOR_DLQ_ALERT_TO", ""); to != "" {
 			channelConfig["to"] = to
 		} else {
-			log.Printf("alerts: PROCESSOR_DLQ_ALERT_CHANNEL=email but PROCESSOR_DLQ_ALERT_TO is unset; operational DLQ alerts will drop at BuildSender")
+			slog.Warn("alerts: PROCESSOR_DLQ_ALERT_CHANNEL=email but PROCESSOR_DLQ_ALERT_TO is unset; operational DLQ alerts will drop at BuildSender")
 		}
 	case "telegram":
 		// chat_id may be left unset here: BuildSender falls back to the shared
@@ -157,7 +176,8 @@ func OperationalAlertConfigFromEnv() *AlertConfig {
 			channelConfig["chat_id"] = chatID
 		}
 	default:
-		log.Printf("alerts: unknown PROCESSOR_DLQ_ALERT_CHANNEL=%q (want \"email\" or \"telegram\"); operational DLQ alerts will drop at BuildSender", channel)
+		slog.Warn("alerts: unknown PROCESSOR_DLQ_ALERT_CHANNEL (want \"email\" or \"telegram\"); operational DLQ alerts will drop at BuildSender",
+			slog.String("channel", channel))
 	}
 
 	return &AlertConfig{Channel: channel, ChannelConfig: channelConfig, Enabled: true}

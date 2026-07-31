@@ -3,7 +3,7 @@ package dlqmonitor
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	sharedNats "github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -79,7 +79,8 @@ func (d *JetStreamDetailer) OldestMessage(ctx context.Context, stream string) (b
 	if err != nil {
 		// The age is still real and worth reporting even if the class lookup failed independently
 		// (e.g. the message was replayed/deleted between the two calls) — degrade the class only.
-		log.Printf("dlqmonitor: GetMsg(%s, %d) failed, oldest-message class unavailable: %v", stream, info.State.FirstSeq, err)
+		slog.WarnContext(ctx, "dlqmonitor: GetMsg failed, oldest-message class unavailable",
+			slog.String("stream", stream), slog.Uint64("seq", info.State.FirstSeq), slog.String("error", err.Error()))
 		return true, age, sharedNats.DLQClassUnclassified, nil
 	}
 

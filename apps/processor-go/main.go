@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,16 +12,68 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/dlqmonitor"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Deliverable 1 (OBSERVABILITY_PLAN.md W2): slog + OTel bootstrap, first, before anything else
+	// opens a connection worth tracing. slog.SetDefault means every package elsewhere in
+	// apps/processor-go that logs via the bare slog.InfoContext/WarnContext/ErrorContext package
+	// functions (rather than holding a *slog.Logger of its own) picks up this exact handler — JSON vs
+	// text, level, and the trace_id/span_id auto-injection — without any constructor threading it
+	// through. This keeps every exported signature in this service unchanged (NewProcessorService,
+	// NewDispatcher, NewEmailWorker, ... all keep their existing shape, which matters because
+	// tests/integration constructs several of them directly and is off limits for this change).
+	logger := obs.Setup("processor-go")
+	slog.SetDefault(logger)
+
+	providers, obsErr := obs.Bootstrap(ctx, logger, obs.ProvidersConfig{
+		ServiceName:    "processor-go",
+		ServiceVersion: getEnv("PROCESSOR_VERSION", ""),
+	})
+	if obsErr != nil {
+		// obs.Bootstrap only returns an error for a malformed LOCAL configuration (e.g. bad TLS
+		// material for the OTLP exporter) — never because the collector is unreachable; that failure
+		// mode is async and already handled inside Bootstrap by a rate-limited warning (see
+		// packages/shared-go/obs/provider.go's degradation mandate). A dead collector must never
+		// prevent startup, and neither must this — strictly rarer — config error, so this falls back
+		// to inert providers (metrics/traces off) rather than log.Fatalf.
+		slog.ErrorContext(ctx, "observability bootstrap failed; continuing without tracing/metrics export",
+			slog.String("error", obsErr.Error()))
+		providers = &obs.Providers{
+			MetricsHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+			Shutdown:       func(context.Context) error { return nil },
+		}
+	}
+	// Flushed on SIGTERM below (bounded context) — during an incident the LAST spans emitted are the
+	// interesting ones, so a missing flush here would defeat the whole point of this plan. Declared
+	// this early (right after Bootstrap) so defer's LIFO order runs it AFTER every other resource in
+	// this function has already been torn down (db, subscribers, health server), i.e. once nothing can
+	// still be generating spans.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		if err := providers.Shutdown(shutdownCtx); err != nil {
+			slog.ErrorContext(shutdownCtx, "observability providers shutdown reported an error", slog.String("error", err.Error()))
+		}
+	}()
+
+	tracer := otel.Tracer("processor-go")
 
 	dbCfg := database.Config{
 		Host:            getEnv("POSTGRES_HOST", "localhost"),
@@ -64,6 +116,8 @@ func main() {
 	}
 	defer subscriber.Close()
 
+	registerDLQObservables(subscriber)
+
 	// alert_config.changed lets alerts.Dispatcher reload alert_configs promptly after the dashboard
 	// creates/updates/deletes a config, instead of waiting up to alerts.ConfigRefreshInterval() for the
 	// backstop ticker (see alerts.Dispatcher.StartInvalidationSubscriber and E2E_RECOVERY_PLAN.md U27).
@@ -85,7 +139,8 @@ func main() {
 		if getEnv("ALERT_CONFIG_INVALIDATION_REQUIRED", "false") == "true" {
 			log.Fatalf("Failed to subscribe to alert_config.changed (set ALERT_CONFIG_INVALIDATION_REQUIRED=false to start anyway, accepting up to the periodic backstop refresh interval for new/updated alert configs): %v", alertConfigSubErr)
 		}
-		log.Printf("WARNING: alert_config.changed subscriber unavailable (%v). Alert config changes will take up to %s (the periodic backstop) to take effect.", alertConfigSubErr, alerts.ConfigRefreshInterval())
+		slog.WarnContext(ctx, "alert_config.changed subscriber unavailable; alert config changes will take up to the periodic backstop to take effect",
+			slog.String("error", alertConfigSubErr.Error()), slog.Duration("backstop_interval", alerts.ConfigRefreshInterval()))
 		alertConfigSub = nil
 	} else {
 		defer alertConfigSub.Close()
@@ -97,10 +152,45 @@ func main() {
 	if err := proc.VerifyAuditLogTable(ctx); err != nil {
 		log.Fatalf("AUDIT_VERIFICATION_FAILED: audit_logs table is not writable: %v", err)
 	}
-	log.Println("Audit log table verification passed")
+	slog.InfoContext(ctx, "Audit log table verification passed")
 
-	err = subscriber.Subscribe(ctx, func(data []byte) error {
-		return proc.ProcessEvent(ctx, data)
+	// Deliverable 3 (OBSERVABILITY_PLAN.md W2, the crux of the whole plan): extract whatever trace
+	// context rode in on the NATS message's headers, then open a CONSUMER span parented on it. If this
+	// extraction is wrong, every span started below (and every child span
+	// service.ProcessEvent/processEventInternal opens) becomes a disconnected new root — every test
+	// still passes, but the cross-service trace silently never exists. See the report for how this was
+	// verified empirically (a span-recording exporter, not just a reading of this code).
+	err = subscriber.Subscribe(ctx, func(msgCtx context.Context, data []byte, headers nats.Header) error {
+		msgCtx = otel.GetTextMapPropagator().Extract(msgCtx, obs.NATSHeaderCarrier(headers))
+		// messaging.* attributes mirror the ingestor's producer span (apps/ingestor-go/service/
+		// service.go's publish) so a trace backend can group both sides of the hop by the same
+		// destination — natsCfg.Subject is the compile-time-fixed literal this consumer was
+		// constructed with above, not a per-message value, so there is no cardinality cost.
+		msgCtx, span := tracer.Start(msgCtx, "processor.process_event",
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "nats"),
+				attribute.String("messaging.destination.name", natsCfg.Subject),
+			),
+		)
+		defer span.End()
+
+		err := proc.ProcessEvent(msgCtx, data)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			// This span cannot know whether the subscriber will actually dead-letter this delivery:
+			// that decision (packages/shared-go/nats.Subscriber.handleMessage, private, out of scope
+			// here) also depends on the message's delivery count, which is not visible at this call
+			// site — a transient error on the last allowed delivery dead-letters even though
+			// nats.IsPermanent reports false for it (see processor_service.go's ProcessEvent doc
+			// comment for the identical caveat on OutcomeRetried vs OutcomeDeadLettered). What IS
+			// knowable here, and worth recording, is whether processing classified this failure as
+			// permanent (nats.Permanent(...) was returned somewhere on the call path) — a permanent
+			// error dead-letters unconditionally on this delivery regardless of count.
+			span.SetAttributes(attribute.Bool("sentinel.error_permanent", nats.IsPermanent(err)))
+		}
+		return err
 	})
 	if err != nil {
 		log.Fatalf("Failed to subscribe: %v", err)
@@ -114,7 +204,8 @@ func main() {
 	// depth/publish-failures-only, it does not fail startup.
 	dlqDetailer, dlqDetailerErr := dlqmonitor.NewJetStreamDetailer(natsCfg.URL)
 	if dlqDetailerErr != nil {
-		log.Printf("WARNING: DLQ detail connection unavailable (%v). /health will report dlq_depth/dlq_publish_failures only, without oldest-message age or class.", dlqDetailerErr)
+		slog.WarnContext(ctx, "DLQ detail connection unavailable; /health will report dlq_depth/dlq_publish_failures only, without oldest-message age or class",
+			slog.String("error", dlqDetailerErr.Error()))
 		dlqDetailer = nil
 	} else {
 		defer dlqDetailer.Close()
@@ -122,7 +213,7 @@ func main() {
 
 	dlqThresholds := dlqmonitor.ThresholdsFromEnv()
 
-	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber, dlqDetailer, dlqThresholds)
+	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber, dlqDetailer, dlqThresholds, providers.MetricsHandler)
 	defer func() {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
@@ -144,11 +235,11 @@ func main() {
 	}
 	go dlqMonitor.Run(ctx)
 
-	log.Println("Processor started, waiting for events...")
+	slog.InfoContext(ctx, "Processor started, waiting for events...")
 
 	go func() {
 		for err := range subscriber.Errors() {
-			log.Printf("Subscriber error: %v", err)
+			slog.ErrorContext(ctx, "Subscriber error", slog.String("error", err.Error()))
 		}
 	}()
 
@@ -156,7 +247,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down processor...")
+	slog.InfoContext(ctx, "Shutting down processor...")
 	cancel()
 }
 
@@ -174,6 +265,50 @@ func getEnvInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+// registerDLQObservables wires MetricDLQDepth (a gauge — depth can go back down as tools/dlq drains
+// it) and MetricDLQPublishFailures (a monotonic counter) as OTel observable instruments, read on
+// every /metrics scrape directly from sub.DLQStats — the SAME source /health already reads (deliverable
+// 4: "do not invent a second source of truth for those numbers"). Both instruments share one callback
+// so a scrape costs exactly one DLQStats call, not two. Failure to create the instruments, or a failed
+// DLQStats call inside the callback, degrades to "this scrape omits these two series" — it must never
+// fail metric collection for anything else, and it never touches the request/message path.
+func registerDLQObservables(sub *nats.Subscriber) {
+	meter := otel.Meter("processor-go")
+
+	depthGauge, err := meter.Int64ObservableGauge(
+		obs.MetricDLQDepth,
+		metric.WithDescription("Current depth of the dead-letter queue"),
+	)
+	if err != nil {
+		slog.Error("failed to create DLQ depth gauge", slog.String("error", err.Error()))
+		return
+	}
+
+	publishFailuresCounter, err := meter.Int64ObservableCounter(
+		obs.MetricDLQPublishFailures,
+		metric.WithDescription("Cumulative count of events that could not be captured in the DLQ and were left in the source stream instead"),
+	)
+	if err != nil {
+		slog.Error("failed to create DLQ publish failures counter", slog.String("error", err.Error()))
+		return
+	}
+
+	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		stats, statsErr := sub.DLQStats(ctx)
+		if statsErr != nil {
+			// Best-effort: skip this scrape's observation for these two instruments rather than
+			// failing collection of every other metric registered on this meter.
+			return nil
+		}
+		o.ObserveInt64(depthGauge, int64(stats.Depth))
+		o.ObserveInt64(publishFailuresCounter, int64(stats.PublishFailures))
+		return nil
+	}, depthGauge, publishFailuresCounter)
+	if err != nil {
+		slog.Error("failed to register DLQ observable callback", slog.String("error", err.Error()))
+	}
 }
 
 // serveHealth exposes the processor's liveness and, critically, DLQ depth.
@@ -200,7 +335,10 @@ func getEnvInt(key string, defaultValue int) int {
 //
 // Existing field names (dlq_depth, dlq_publish_failures, dlq_stream, status, database) are unchanged —
 // tests/e2e decodes this body. Only fields are added.
-func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber, detailer dlqmonitor.OldestMessageSource, thresholds dlqmonitor.Thresholds) *http.Server {
+//
+// metricsHandler is mounted at /metrics alongside /health (OBSERVABILITY_PLAN.md §2/W2) — additive
+// only, /health's own JSON contract is untouched above.
+func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber, detailer dlqmonitor.OldestMessageSource, thresholds dlqmonitor.Thresholds, metricsHandler http.Handler) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		statusCode := http.StatusOK
@@ -249,11 +387,15 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 		_ = json.NewEncoder(w).Encode(body)
 	})
 
+	if metricsHandler != nil {
+		mux.Handle("/metrics", metricsHandler)
+	}
+
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Printf("Processor health endpoint listening on %s", addr)
+		slog.InfoContext(ctx, "Processor health endpoint listening", slog.String("addr", addr))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Health endpoint failed: %v", err)
+			slog.ErrorContext(ctx, "Health endpoint failed", slog.String("error", err.Error()))
 		}
 	}()
 	return srv

@@ -3,6 +3,13 @@ import { projectApiKeys, auditLogs } from '../schema';
 import { eq } from 'drizzle-orm';
 import crypto from 'crypto';
 import net from 'net';
+import { log } from '../../server/observability/log';
+
+// Fixed, greppable event name for a failed 'api_key.invalidated' NATS publish (both call sites below).
+// This failure was previously an unstructured `console.error` that nobody alerted on for the entire
+// life of the feature (docs/memory/VERIFIED_STATE.md, API-key revocation entry) — a fixed `event` value
+// is what makes it finally alertable-by-grep instead of relying on someone reading raw stdout.
+const EVENT_API_KEY_INVALIDATED_PUBLISH_FAILED = 'api_key.invalidated.publish_failed';
 
 // getApiKeyById fetches a single key row, including the columns callers need to enforce
 // organization scoping (organizationId) BEFORE acting on a keyId that came from the URL — the
@@ -162,7 +169,12 @@ export async function rotateApiKey(
 		try {
 			await publisher.publish('api_key.invalidated', { keyId: existingKey.id, keyHash: oldKeyRow?.keyHash });
 		} catch (err) {
-			console.error(`api_key.invalidated publish failed for rotated key ${existingKey.id} (revoke already committed to DB):`, err);
+			log.error(EVENT_API_KEY_INVALIDATED_PUBLISH_FAILED, {
+				keyId: existingKey.id,
+				reason: 'rotate',
+				note: 'revoke already committed to DB',
+				error: err,
+			});
 		}
 	}
 
@@ -219,7 +231,12 @@ export async function revokeApiKey(userId: string, keyId: string, publisher?: Na
 		try {
 			await publisher.publish('api_key.invalidated', { keyId, keyHash: revokedKey.keyHash });
 		} catch (err) {
-			console.error(`api_key.invalidated publish failed for key ${keyId} (revoke already committed to DB):`, err);
+			log.error(EVENT_API_KEY_INVALIDATED_PUBLISH_FAILED, {
+				keyId,
+				reason: 'revoke',
+				note: 'revoke already committed to DB',
+				error: err,
+			});
 		}
 	}
 

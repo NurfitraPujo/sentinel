@@ -24,7 +24,7 @@ package degradation
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -131,7 +131,7 @@ func (g *GracefulDegradation) Evaluate(ctx context.Context, event []byte) Buffer
 		g.mu.Unlock()
 
 		if recovering {
-			log.Printf("Database connection restored")
+			slog.InfoContext(ctx, "Database connection restored")
 		}
 		return StatusProcessed
 	}
@@ -142,6 +142,6 @@ func (g *GracefulDegradation) Evaluate(ctx context.Context, event []byte) Buffer
 
 	// The database is down. Do NOT take custody of the event — see the
 	// package doc comment for why buffering it here cannot be made safe.
-	log.Printf("WARNING: Database unavailable, returning event to NATS for bounded retry (D10)")
+	slog.WarnContext(ctx, "WARNING: Database unavailable, returning event to NATS for bounded retry (D10)")
 	return StatusUnavailable
 }

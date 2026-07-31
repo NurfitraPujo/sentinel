@@ -3,7 +3,7 @@ package dlqmonitor
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -22,7 +22,8 @@ func CheckIntervalFromEnv() time.Duration {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
-		log.Printf("dlqmonitor: ignoring invalid PROCESSOR_DLQ_ALERT_INTERVAL=%q; using default %s", v, DefaultCheckInterval)
+		slog.Warn("dlqmonitor: ignoring invalid PROCESSOR_DLQ_ALERT_INTERVAL; using default",
+			slog.String("value", v), slog.Duration("default", DefaultCheckInterval))
 	}
 	return DefaultCheckInterval
 }
@@ -76,7 +77,7 @@ func (m *Monitor) Run(ctx context.Context) {
 func (m *Monitor) checkOnceRecoverable(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("dlqmonitor: recovered from panic during check: %v", r)
+			slog.ErrorContext(ctx, "dlqmonitor: recovered from panic during check", slog.Any("panic", r))
 		}
 	}()
 	m.CheckOnce(ctx)
@@ -106,7 +107,7 @@ func (m *Monitor) CheckOnce(ctx context.Context) {
 
 	detail, err := GetDetail(ctx, m.Stats, m.Oldest)
 	if err != nil {
-		log.Printf("dlqmonitor: failed to read DLQ stats: %v", err)
+		slog.ErrorContext(ctx, "dlqmonitor: failed to read DLQ stats", slog.String("error", err.Error()))
 		return
 	}
 
@@ -127,7 +128,8 @@ func (m *Monitor) CheckOnce(ctx context.Context) {
 	text := alertText(detail, m.Thresholds, nowCritical, statusMsg)
 
 	if m.Dispatcher == nil || m.AlertConfig == nil {
-		log.Printf("dlqmonitor: %s (no PROCESSOR_DLQ_ALERT_CHANNEL configured; see /health)", text)
+		slog.InfoContext(ctx, fmt.Sprintf("dlqmonitor: %s (no PROCESSOR_DLQ_ALERT_CHANNEL configured; see /health)", text),
+			slog.Bool("critical", nowCritical))
 		return
 	}
 	m.Dispatcher.DispatchOperational(ctx, m.AlertConfig, text)
