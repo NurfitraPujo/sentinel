@@ -194,13 +194,15 @@ dedup across issues.
 **Side findings from this work's review, REPRODUCED but deliberately not fixed here** (recorded so a
 true finding does not live only inside a work-package brief):
 
-- **`batchUpdateIssues` can deadlock against itself.** `apps/dashboard-web/src/lib/db/queries/
-  issues.ts` takes an uncapped, UNSORTED `inArray` UPDATE straight from the request body, then
-  re-locks the same rows via `issue_activity` FKs in a different order. Reproduced during the plan's
-  review with a positive control: two concurrent calls with reversed id order → `ERROR: deadlock
-  detected` (`Process 3932 waits for ShareLock on transaction 80255; blocked by process 3930 …`).
-  Fix when touched: sort the ids before the UPDATE and cap the batch. Not this change's scope —
-  `StoreEvent` was proven deadlock-free against it (it holds exactly one contended lock).
+- ~~**`batchUpdateIssues` can deadlock against itself.**~~ **SUPERSEDED — this attribution was wrong;
+  see the dedicated entry further down (`batchUpdateIssues — the "deadlock" does NOT reproduce`).**
+  The deadlock trace quoted here was real, but it was produced against per-row UPDATEs in a loop, not
+  against the single `inArray` statement this function issues. Re-probed against a real Postgres:
+  that UPDATE plans as a Bitmap Heap Scan, so rows lock in PHYSICAL order and the id list's order
+  cannot affect lock acquisition — reversed lists, identical lists and an FK/UPDATE crossing all
+  failed to deadlock. The proposed "sort the ids" fix was implemented, found inert, and removed
+  rather than shipped. What the follow-up DID find in this function was a cross-tenant activity
+  write, now fixed. `StoreEvent` remains proven deadlock-free (it holds exactly one contended lock).
 - **`detectAndHandleRegression` (dashboard) has the same unguarded read-then-write** the processor's
   regression arm has (`issues.ts` ~246): SELECT status, then UPDATE, no FOR UPDATE. It currently has
   NO callers — if it ever gains one, it inherits the concurrent-distinct-deliveries double-count
