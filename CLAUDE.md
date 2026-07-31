@@ -59,13 +59,13 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 
 ```bash
 rtk go build ./... && rtk go vet ./...          # root module — green
-rtk go test ./tests/unit/...                    # green, 292 assertions
+rtk go test ./tests/unit/...                    # green, 303 assertions
 cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
 ./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
 cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 960 files/0 errors (2 pre-existing warnings), 90 tests
-SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 74 passed, 0 skips — NEEDS the compose stack up
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 76 passed, 0 skips — NEEDS the compose stack up
                                                                   # -tags=e2e is mandatory; without it U8-U10 are silently excluded
                                                                   # U35 additionally needs `jaeger` up; it fails (never skips) if not
 rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
@@ -98,10 +98,11 @@ Taskfile comment already recorded that it had never been wired up. It survived o
 values to copy from.
 
 **Work that is deliberately deferred is documented as P9 in
-[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI, S16 `event_id`
-idempotency, and invitation acceptance, each with the reason and the acceptance bar. Read it before
-concluding something is missing by accident; this repo's characteristic failure is status recorded
-optimistically and then believed.
+[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI and
+invitation acceptance, each with the reason and the acceptance bar. Read it before concluding
+something is missing by accident; this repo's characteristic failure is status recorded
+optimistically and then believed. (P9-2 observability and P9-3/S18 `event_id` idempotency are both
+DONE — see their entries there.)
 
 **P9-2 (observability) is DONE as of 2026-07-31**: `slog` everywhere, `/metrics` on both Go services, and
 one distributed trace spanning ingestor → NATS → processor, gated by U35. The findings that work chose
@@ -115,7 +116,13 @@ Remaining known gaps, none of them a regression from that work:
 |---|---|---|
 | — | The DLQ needs an operator to drain it | `tools/dlq` can inspect, replay (`-execute`), discard (`-purge`) and drain transient-only (`-drain`), and a `sentinel-dlq-drainer` compose service runs it on a schedule — but it ships gated OFF (`DLQ_DRAINER_ENABLED` and `DLQ_DRAINER_EXECUTE` both `false`), so nothing drains until someone flips both. Permanent-class messages are never auto-replayed by design (D14). Streams are bounded (D13), so a backlog can no longer exhaust storage. |
 | — | Invitation acceptance has no route | U22 proves the create half end to end; nothing anywhere consumes an invitation token. Asserted as a wall, not assumed. |
-| — | `issues.count` can inflate on partial-failure redelivery (S16) | the issue upsert and the occurrence insert are separate transactions with no `event_id` idempotency. U28 asserts occurrences are exactly-once and checks the counter agrees, so a regression is visible. |
+
+**S18 (`issues.count` inflation on redelivery — long mislabeled "S16") is RESOLVED as of 2026-07-31**:
+`event_id` idempotency end to end and a single-transaction write path (`store.StoreEvent`), gated by
+U36 and a 7-test integration suite, every guard mutation-tested. See IDEMPOTENCY_PLAN.md, D16, and
+VERIFIED_STATE.md S18. The write path's duplicate handling is READ COMMITTED-specific and the
+`NULLIF('')` mapping is load-bearing (proto3 has no null) — read D16's consequences before touching
+`StoreEvent`.
 
 ### Working conventions
 

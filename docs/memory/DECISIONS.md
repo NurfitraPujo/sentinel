@@ -749,3 +749,50 @@ nobody notices that grepping it in the trace backend returns nothing.
 - Because OTel's missing-registration failure mode is *silence*, this decision is only meaningful with
   the guards described in `BUGS.md` **B11** — a library guard plus a deployment guard (U35). Removing
   either makes the decision unenforceable rather than merely untested.
+
+## D16 | Exactly-Once Event Writes: `event_id` End to End, One Transaction, Duplicates Roll Back Loudly
+
+**Date**: 2026-07-31 · **Status**: accepted · **Detail**: `docs/plans/IDEMPOTENCY_PLAN.md` (v2, the
+plan itself was adversarially reviewed before implementation; §0 there records what the review changed).
+
+### Decision
+
+1. **The idempotency key is `event_id`**: the client's when valid (1–64 runes, no control characters),
+   minted as a UUIDv4 by the ingestor otherwise — always stamped into the message BEFORE the NATS
+   publish, so every delivery of one event carries the same key. The effective id is echoed in the
+   202/batch response. Replacements are never silent: `sentinel_ingest_event_id_replaced_total{reason}`.
+2. **The key lives on `error_occurrences`**, scoped `(issue_id, event_id)` via a partial unique index
+   (`WHERE event_id IS NOT NULL`) — no separate ledger table, retention for free, tenant-safe by
+   construction (issues are tenant-scoped, so a client can only suppress itself).
+3. **One transaction** (`store.StoreEvent`, explicit READ COMMITTED): issue upsert + occurrence insert
+   with `NULLIF($n,'')` and a TARGETED `ON CONFLICT ... DO NOTHING`; zero rows affected → ROLLBACK →
+   ACK as a no-op recorded `outcome="duplicate"`. Audit, alerting, and search indexing run after
+   commit, gated on the event having actually stored.
+
+### Why
+
+- Redelivery is NATS's recovery mechanism (D10); a write path that inflates counters under redelivery
+  makes recovery itself corrupting. Atomicity removes the partial-failure window; the unique index
+  covers the other direction (committed but ACK lost).
+- **Proto3 has no NULL** — absent `event_id` arrives as `""`, which IS NOT NULL. The `NULLIF` mapping
+  plus a CHECK constraint rejecting `''` is what keeps every legacy/in-flight message storing exactly
+  as before instead of silently collapsing onto `(issue_id, '')`. This was the plan's one
+  design-breaking review finding (F-TX-1/F-CT-1), found by probing a real Postgres before any code.
+- The duplicate signal must come from `CommandTag.RowsAffected()`, never `QueryRow` + `RETURNING`:
+  `pgx.ErrNoRows` is not a `*pgconn.PgError`, so the error classifier would mark a duplicate
+  retryable and dead-letter an already-stored message.
+- The conflict target is load-bearing twice: it is the only form matching a partial unique index, and
+  it keeps a primary-key collision an ERROR instead of a silent 0-rows result read as dedup. A bare
+  `ON CONFLICT DO NOTHING` is forbidden in this statement.
+
+### Consequences
+
+- `StoreEvent` must hold exactly ONE contended lock (the issues row). Moving indexing/audit into the
+  tx, or batching events per tx, reintroduces deadlock potential (proven with a positive control
+  against `batchUpdateIssues` and the retention cron).
+- The design is READ COMMITTED-specific: stricter isolation converts same-issue contention into 40001
+  retry storms. The level is set explicitly in `BeginTx`, not inherited.
+- Every id bound is CHARACTERS (runes/code points), never bytes — CEL `.size()`, `VARCHAR(64)`, and
+  both Go-side guards agree on 64. A byte count would strip multibyte clients of dedup silently.
+- Duplicates are diagnostic signal, not noise: a dedup hit means a lost ACK, a retry storm, or a
+  client bug — hence the metric, never a silent drop. Silence is this repo's characteristic failure.

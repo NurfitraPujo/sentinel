@@ -58,7 +58,7 @@ func init() {
 
 	processEvents, err = meter.Int64Counter(
 		obs.MetricProcessEvents,
-		metric.WithDescription("Count of processed events by outcome (stored, retried, deadlettered)"),
+		metric.WithDescription("Count of processed events by outcome (stored, duplicate, retried, deadlettered)"),
 	)
 	if err != nil {
 		slog.Error("procmetrics: failed to create process events counter", slog.String("error", err.Error()))

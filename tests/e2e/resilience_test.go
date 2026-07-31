@@ -191,9 +191,12 @@ func TestU28_DatabaseOutageLosesNothingAndDuplicatesNothing(t *testing.T) {
 		t.Fatalf("occurrence count moved after reaching %d: now %d — the outage produced duplicates", want, got)
 	}
 
-	// issues.count is incremented by a different statement than the occurrence insert, in a separate
-	// transaction with no event_id idempotency (the known open gap S16). If redelivery inflated it while
-	// the occurrence rows stayed correct, that is worth reporting precisely rather than hiding.
+	// Post-W2 (docs/plans/IDEMPOTENCY_PLAN.md), the issue upsert and the occurrence insert are no
+	// longer separate transactions: store.StoreEvent folds both into one, keyed on event_id, so a
+	// redelivery that rolls back rolls back the count bump too. This is the INVARIANT the outage must
+	// satisfy, not an open defect — the assertion logic is unchanged; only what a failure here would
+	// mean has changed. (The old S16 label was always wrong for this defect regardless — see W4's S18
+	// renumbering.)
 	issues := f.issues()
 	var total int64
 	for _, i := range issues {
@@ -201,8 +204,8 @@ func TestU28_DatabaseOutageLosesNothingAndDuplicatesNothing(t *testing.T) {
 	}
 	if total != int64(want) {
 		t.Errorf("occurrences are exactly %d but issues.count totals %d — redelivery inflated the counter "+
-			"without duplicating rows. This is S16: the issue upsert and the occurrence insert are separate "+
-			"transactions with no event_id idempotency", want, total)
+			"without duplicating rows. The outage must produce neither loss nor duplicates; the write path "+
+			"is a single transaction keyed on event_id — see IDEMPOTENCY_PLAN.md", want, total)
 	}
 }
 

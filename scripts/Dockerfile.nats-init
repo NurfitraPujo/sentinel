@@ -1,4 +1,12 @@
-FROM natsio/nats-box:latest
+# Fully qualified + pinned, for the same reason docker-compose.yml's jaeger image is: podman resolves
+# no unqualified short names, so a bare "natsio/nats-box" builds only while a cached copy happens to
+# exist locally — the moment an image prune evicts it, `docker compose up --build` aborts with
+# `short-name ... did not resolve to an alias` BEFORE recreating any service, leaving every container
+# running its previous build while looking healthy (B9). That exact failure happened on 2026-07-31 and
+# cost a rebuild cycle: the stack answered 200 on every health probe while running images from four
+# hours earlier and a database missing the migration under test. :latest was replaced with a pin at the
+# same time — an unpinned base here means nats-init's behavior can change on any prune+pull.
+FROM docker.io/natsio/nats-box:0.14.5
 COPY nats-init.sh /scripts/nats-init.sh
 RUN chmod +x /scripts/nats-init.sh
 ENTRYPOINT ["/bin/sh", "/scripts/nats-init.sh"]

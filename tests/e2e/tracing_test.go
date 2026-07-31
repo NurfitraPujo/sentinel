@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -355,6 +356,128 @@ func scrapeMetrics(url string) (map[string]*promFamily, error) {
 		return nil, fmt.Errorf("%s served no metric families at all", url)
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Outcome-labeled series (docs/plans/IDEMPOTENCY_PLAN.md W3 / F-TP-2)
+// ---------------------------------------------------------------------------------------------------
+
+// scrapeSeries fetches and parses a Prometheus exposition endpoint, returning each metric family's
+// series keyed by the value of their `outcome` label — e.g.
+// scrapeSeries(url)["sentinel_process_events_total"]["duplicate"]. `otel_scope_*` labels (attached by
+// the OTel Prometheus exporter to every series, see scrapeMetrics's doc comment above) are ignored:
+// this parser extracts only the `outcome` label, because that is the one dimension the idempotency
+// tests (U36) need. A series with no `outcome` label is keyed under "" and generally not useful to a
+// caller, but is not itself an error — not every family in this exposition carries that label.
+//
+// Extends scrapeMetrics's hand-rolled parser above rather than duplicating a new one; see that
+// function's doc comment for why this does not use prometheus/common/expfmt.
+//
+// Known parsing limit, deliberate (F-VW3-7): the label set is split on ',' and values unquoted with a
+// simple Trim, so a label VALUE containing a comma or an escaped quote would mis-parse. Every value
+// this parser is used for comes from the fixed obs.Outcome* vocabulary (bare ASCII words), so that
+// input is unreachable today — if a future caller needs arbitrary label values, replace the split
+// with a real tokenizer rather than patching this one.
+func scrapeSeries(url string) (map[string]map[string]float64, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned %d: %s", url, resp.StatusCode, truncate(string(body), 200))
+	}
+
+	out := map[string]map[string]float64{}
+	for i, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		var name, labelStr, valuePart string
+		openBrace := strings.Index(line, "{")
+		if openBrace < 0 {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return nil, fmt.Errorf("%s served a malformed exposition line %d: %s", url, i+1, truncate(line, 120))
+			}
+			name = fields[0]
+			valuePart = fields[1]
+		} else {
+			closeBrace := strings.LastIndex(line, "}")
+			if closeBrace < openBrace {
+				return nil, fmt.Errorf("%s served a malformed exposition line %d: %s", url, i+1, truncate(line, 120))
+			}
+			name = line[:openBrace]
+			labelStr = line[openBrace+1 : closeBrace]
+			rest := strings.Fields(line[closeBrace+1:])
+			if len(rest) == 0 {
+				return nil, fmt.Errorf("%s served a sample with no value on line %d: %s", url, i+1, truncate(line, 120))
+			}
+			valuePart = rest[0]
+		}
+
+		value, err := strconv.ParseFloat(valuePart, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s served a non-numeric value on line %d: %s", url, i+1, truncate(line, 120))
+		}
+
+		outcome := ""
+		if labelStr != "" {
+			for _, kv := range strings.Split(labelStr, ",") {
+				kv = strings.TrimSpace(kv)
+				if kv == "" {
+					continue
+				}
+				eq := strings.Index(kv, "=")
+				if eq < 0 {
+					continue
+				}
+				key := kv[:eq]
+				if strings.HasPrefix(key, "otel_scope_") {
+					continue
+				}
+				if key == "outcome" {
+					outcome = strings.Trim(kv[eq+1:], `"`)
+				}
+			}
+		}
+
+		if out[name] == nil {
+			out[name] = map[string]float64{}
+		}
+		out[name][outcome] += value
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s served no series at all", url)
+	}
+	return out, nil
+}
+
+// processOutcomeCounts scrapes the processor's own /metrics and returns
+// sentinel_process_events_total's outcome -> cumulative count map (docs/plans/IDEMPOTENCY_PLAN.md D-e).
+// Counters are stack-lifetime cumulative — never reset between tests — so callers must diff against a
+// `before` snapshot taken earlier in the same test rather than asserting an absolute value.
+func processOutcomeCounts(t *testing.T) map[string]float64 {
+	t.Helper()
+	series, err := scrapeSeries(cfg.ProcessorHealth + "/metrics")
+	if err != nil {
+		t.Fatalf("scraping processor metrics at %s: %v", cfg.ProcessorHealth, err)
+	}
+	// Absent, not merely empty, is a legitimate state: an OTel counter that has never recorded ANY
+	// outcome emits no series at all (see scrapeMetrics's doc comment above) — true on a freshly booted
+	// processor before the first event it has ever processed. Every lookup against the returned map
+	// already reads as 0 for a missing key, so callers taking a "before" snapshot need no special case;
+	// only reject an exposition that failed to parse at all, which scrapeSeries already did above.
+	return series["sentinel_process_events_total"]
 }
 
 func contains(haystack []string, needle string) bool {

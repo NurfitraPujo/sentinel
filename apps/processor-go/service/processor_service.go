@@ -84,33 +84,44 @@ func (s *ProcessorService) Alerts() *alerts.Dispatcher {
 // preserves anything that outlasts that budget. This function must never call
 // processEventInternal for an event that did not get StatusProcessed.
 // ProcessEvent records MetricProcessDuration/MetricProcessEvents (OBSERVABILITY_PLAN.md §2/W2) around
-// the whole call, classifying the outcome from the returned error: nil -> OutcomeStored; a
-// nats.Permanent error (dead-lettered on THIS delivery, unconditionally, by the subscriber regardless
-// of delivery count) -> OutcomeDeadLettered; any other error -> OutcomeRetried.
+// the whole call, classifying the outcome from the returned error AND the stored flag
+// processEventInternal reports (docs/plans/IDEMPOTENCY_PLAN.md D-e): err != nil and nats.IsPermanent ->
+// OutcomeDeadLettered (dead-lettered on THIS delivery, unconditionally, by the subscriber regardless of
+// delivery count); err != nil otherwise -> OutcomeRetried; err == nil && !stored -> obs.OutcomeDuplicate
+// (store.StoreEvent found the (issue_id, event_id) pair already stored and rolled back — a healthy
+// no-op ACK, not a failure); err == nil && stored -> OutcomeStored. This classifier is the ONLY place
+// that records a process outcome for a message — processEventInternal itself must never also record
+// OutcomeDuplicate, or one message would mint two time series and the
+// stored+duplicate+retried+deadlettered == deliveries invariant (W3) would stop holding.
 //
-// That last case is an approximation, not a certainty: whether NATS retries or actually dead-letters a
-// non-permanent error depends on the message's delivery count, which lives entirely inside
-// packages/shared-go/nats.Subscriber.handleMessage (private, and out of scope for this change — see
-// OBSERVABILITY_PLAN.md's W2 brief). A transient error on the LAST allowed delivery is reported here as
-// "retried" even though the subscriber will actually dead-letter it. This is the best classification
-// available from this call's own return value without touching that package.
+// The retried-vs-deadlettered split is an approximation, not a certainty: whether NATS retries or
+// actually dead-letters a non-permanent error depends on the message's delivery count, which lives
+// entirely inside packages/shared-go/nats.Subscriber.handleMessage (private, and out of scope for this
+// change — see OBSERVABILITY_PLAN.md's W2 brief). A transient error on the LAST allowed delivery is
+// reported here as "retried" even though the subscriber will actually dead-letter it. This is the best
+// classification available from this call's own return value without touching that package.
 func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) (err error) {
 	start := time.Now()
+	var stored bool
 	defer func() {
 		outcome := obs.OutcomeStored
-		if err != nil {
+		switch {
+		case err != nil:
 			if nats.IsPermanent(err) {
 				outcome = obs.OutcomeDeadLettered
 			} else {
 				outcome = obs.OutcomeRetried
 			}
+		case !stored:
+			outcome = obs.OutcomeDuplicate
 		}
 		procmetrics.RecordProcessed(ctx, outcome, time.Since(start))
 	}()
 
 	switch s.degradation.Evaluate(ctx, data) {
 	case degradation.StatusProcessed:
-		return s.processEventInternal(ctx, data)
+		stored, err = s.processEventInternal(ctx, data)
+		return err
 	case degradation.StatusUnavailable:
 		// Do NOT ACK. The database is down and this event has not been stored anywhere durable.
 		// Returning an error keeps it in JetStream, where D10's bounded retry with backoff
@@ -162,7 +173,13 @@ func withSpan(ctx context.Context, name string, fn func(ctx context.Context) err
 	return nil
 }
 
-func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) error {
+// processEventInternal deserializes and stores one event, returning (stored, err) instead of a bare
+// error (docs/plans/IDEMPOTENCY_PLAN.md D-e): stored distinguishes "persisted" from "this exact
+// (issue_id, event_id) pair was already stored — store.StoreEvent rolled back and this is a healthy
+// no-op ACK", which ProcessEvent's deferred classifier is the ONLY place allowed to turn into
+// obs.OutcomeDuplicate (see that function's doc comment for why recording it here too would
+// double-count).
+func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) (bool, error) {
 	var evt *event.ErrorEvent
 	if err := withSpan(ctx, "processor.deserialize", func(ctx context.Context) error {
 		var deserializeErr error
@@ -174,7 +191,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// will fail identically forever, so it must not spend its whole
 		// MaxDeliver budget being retried (VERIFIED_STATE.md S13).
 		slog.ErrorContext(ctx, "Failed to deserialize event", slog.String("error", err.Error()))
-		return nats.Permanent(err)
+		return false, nats.Permanent(err)
 	}
 
 	slog.InfoContext(ctx, "Processing event",
@@ -182,8 +199,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		slog.String("error_class", evt.ErrorClass), slog.String("fingerprint", evt.Fingerprint),
 		slog.String("release_version", evt.ReleaseVersion))
 
-	var projectID, issueID string
-	var upsertOutcome store.IssueOutcome
+	var projectID string
 	issue := &store.Issue{
 		ID:          uuid.New().String(),
 		Fingerprint: evt.Fingerprint,
@@ -193,7 +209,24 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		FirstSeen:   evt.Timestamp,
 		LastSeen:    evt.Timestamp,
 	}
-	storeErr := withSpan(ctx, "processor.store.issue", func(ctx context.Context) error {
+
+	stacktraceJSON, _ := json.Marshal(evt.Stacktrace)
+	metadataJSON, _ := json.Marshal(evt.Metadata)
+	occ := &store.ErrorOccurrence{
+		ID:             uuid.New().String(),
+		Environment:    evt.Environment,
+		Platform:       evt.Platform,
+		ReleaseVersion: evt.ReleaseVersion,
+		Stacktrace:     stacktraceJSON,
+		Metadata:       metadataJSON,
+		TraceID:        evt.TraceID,
+		SpanID:         evt.SpanID,
+		CreatedAt:      evt.Timestamp,
+		EventID:        evt.EventID,
+	}
+
+	var stored bool
+	storeErr := withSpan(ctx, "processor.store", func(ctx context.Context) error {
 		var err error
 		projectID, err = s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
 		if err != nil {
@@ -202,37 +235,65 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		}
 		issue.ProjectID = projectID
 
-		upsertOutcome, err = s.store.UpsertIssueWithOutcome(ctx, issue, evt.ReleaseVersion)
+		// StoreEvent (docs/plans/IDEMPOTENCY_PLAN.md D-c) folds the issue upsert/regression
+		// bookkeeping and the event_id-deduplicated occurrence insert into ONE transaction — this
+		// replaces the former three-step UpsertIssueWithOutcome / GetIssueIDByFingerprint /
+		// InsertOccurrence sequence, whose gap between the issue commit and the occurrence insert
+		// was the exact S18 count-inflation window (IDEMPOTENCY_PLAN.md §1). Audit persistence,
+		// alert dispatch, and search indexing all move to AFTER this call returns, gated on
+		// stored==true (D-d) — see below.
+		_, storeResult, err := s.store.StoreEvent(ctx, issue, occ, evt.ReleaseVersion)
 		if err != nil {
-			slog.ErrorContext(ctx, "Failed to upsert issue", slog.String("error", err.Error()))
+			slog.ErrorContext(ctx, "Failed to store event", slog.String("error", err.Error()))
 			return classifyStoreError(err)
 		}
-
-		s.store.PersistAuditLog(ctx, &store.AuditLog{
-			ID:           uuid.New().String(),
-			Action:       "issue_upserted",
-			ResourceType: "issue",
-			ResourceID:   &issue.ID,
-			ActorID:      "processor-go",
-			Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
-		})
-
-		issueID, err = s.store.GetIssueIDByFingerprint(ctx, projectID, evt.Fingerprint)
-		if err != nil {
-			slog.ErrorContext(ctx, "Failed to get issue ID", slog.String("error", err.Error()))
-			return classifyStoreError(err)
-		}
+		stored = storeResult
 		return nil
 	})
 	if storeErr != nil {
-		return storeErr
+		return false, storeErr
 	}
 
-	// Alert on NEW issues and REGRESSIONS, not on every occurrence of an
-	// already-known, still-unresolved issue (VERIFIED_STATE.md S8,
-	// docs/plans/E2E_RECOVERY_PLAN.md P5-1 item 2). outcome comes from
-	// UpsertIssueWithOutcome above, which is the only place that already
-	// distinguishes these cases.
+	if !stored {
+		// Duplicate: store.StoreEvent found (issue_id, event_id) already stored and rolled back
+		// this delivery's issue/occurrence writes. This is a successful no-op — audit, alert
+		// dispatch, and indexing must NOT run for it (D-d: they are gated on stored==true, because
+		// each one reads state this delivery did not actually write). One structured log line is
+		// D-e's whole visibility contract for this branch.
+		//
+		// The NATS delivery count is deliberately omitted here rather than threaded through
+		// (IDEMPOTENCY_PLAN.md W2 brief offers this as an explicit either/or): getting it to this
+		// call site would mean either changing nats.Subscriber's handler signature (14 call sites)
+		// or changing ProcessEvent/processEventInternal's signature to carry headers all the way
+		// down from main.go's Subscribe closure, for a single diagnostic log field. event_id and
+		// issue_id alone are already enough to find the exact duplicate in error_occurrences.
+		slog.InfoContext(ctx, "Duplicate event skipped: (issue_id, event_id) already stored",
+			slog.String("event_id", occ.EventID), slog.String("issue_id", issue.ID))
+		return false, nil
+	}
+
+	// stored == true from here on. Audit, alert dispatch, and indexing all run AFTER StoreEvent's
+	// commit and ONLY for a delivery that actually wrote something (D-d) — order: commit (already
+	// happened, above) -> audit -> alert -> index. All three are best-effort: PersistAuditLog
+	// already swallows/logs its own failures (see its doc comment / AUDIT_PERSIST_FAILURE), and
+	// dispatchAlert/IndexOccurrence are void/logged-not-propagated by design (see below).
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "issue_upserted",
+		ResourceType: "issue",
+		ResourceID:   &issue.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
+	})
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "occurrence_created",
+		ResourceType: "error_occurrence",
+		ResourceID:   &occ.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
+	})
+
 	// Dispatch on EVERY occurrence, not only new/regressed issues.
 	//
 	// Dispatcher.Dispatch is itself the rate limiter: it increments a per-project:issue counter
@@ -252,46 +313,14 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	// Dispatcher.Dispatch's exported signature, which is out of scope here. sentinel_alert_dispatch_total
 	// (procmetrics.RecordAlertDispatch, including the dropped outcome) is the mechanism that actually
 	// makes alert-dispatch failures observable, not this span's status.
+	//
+	// Dispatch now runs AFTER StoreEvent's commit (D-d), fixing the §1 double-feed: a redelivery that
+	// used to feed the alert frequency counter for an event that was then rolled back at the
+	// occurrence step can no longer happen, because dispatch does not run at all when stored==false.
 	_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
-		s.dispatchAlert(ctx, issueID, projectID, evt.ErrorClass, evt.Message)
+		s.dispatchAlert(ctx, issue.ID, projectID, evt.ErrorClass, evt.Message)
 		return nil
 	})
-	_ = upsertOutcome
-
-	stacktraceJSON, _ := json.Marshal(evt.Stacktrace)
-	metadataJSON, _ := json.Marshal(evt.Metadata)
-
-	occ := &store.ErrorOccurrence{
-		ID:             uuid.New().String(),
-		IssueID:        issueID,
-		Environment:    evt.Environment,
-		Platform:       evt.Platform,
-		ReleaseVersion: evt.ReleaseVersion,
-		Stacktrace:     stacktraceJSON,
-		Metadata:       metadataJSON,
-		TraceID:        evt.TraceID,
-		SpanID:         evt.SpanID,
-		CreatedAt:      evt.Timestamp,
-	}
-
-	if err := withSpan(ctx, "processor.store.occurrence", func(ctx context.Context) error {
-		if err := s.store.InsertOccurrence(ctx, occ); err != nil {
-			slog.ErrorContext(ctx, "Failed to insert occurrence", slog.String("error", err.Error()))
-			return classifyStoreError(err)
-		}
-
-		s.store.PersistAuditLog(ctx, &store.AuditLog{
-			ID:           uuid.New().String(),
-			Action:       "occurrence_created",
-			ResourceType: "error_occurrence",
-			ResourceID:   &occ.ID,
-			ActorID:      "processor-go",
-			Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
-		})
-		return nil
-	}); err != nil {
-		return err
-	}
 
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
@@ -310,7 +339,7 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		return nil
 	})
 
-	return nil
+	return true, nil
 }
 
 // dispatchAlert calls the alert dispatcher and guarantees it can never fail

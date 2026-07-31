@@ -293,6 +293,29 @@ func TestObsSetupAttachesServiceToEveryLine(t *testing.T) {
 	}
 }
 
+// TestObsOutcomeDuplicateIsInThePermittedProcessOutcomeSet locks the exact spelling and membership of
+// obs.OutcomeDuplicate (docs/plans/IDEMPOTENCY_PLAN.md D-e) in the fixed "process" outcome family that
+// procmetrics.RecordProcessed's outcome label is drawn from (stored/retried/deadlettered/duplicate).
+// Today nothing statically stops a call site from writing a typo'd literal (e.g. "Duplicate" or
+// "duplicate " instead of obs.OutcomeDuplicate) — that would mint an eighth time series that looks
+// almost like the real one instead of failing loudly, exactly the B5 failure mode obs.go's package doc
+// comment warns about. This pins the set so a future rename of the constant's value is a deliberate,
+// visible test change rather than a silent metric-vocabulary drift.
+func TestObsOutcomeDuplicateIsInThePermittedProcessOutcomeSet(t *testing.T) {
+	permittedProcessOutcomes := map[string]bool{
+		obs.OutcomeStored:       true,
+		obs.OutcomeRetried:      true,
+		obs.OutcomeDeadLettered: true,
+		obs.OutcomeDuplicate:    true,
+	}
+
+	assert.Equal(t, "duplicate", obs.OutcomeDuplicate)
+	assert.True(t, permittedProcessOutcomes[obs.OutcomeDuplicate],
+		"obs.OutcomeDuplicate must be a member of the permitted process-outcome set")
+	assert.Len(t, permittedProcessOutcomes, 4,
+		"the process-outcome set must contain exactly stored/retried/deadlettered/duplicate")
+}
+
 // TestObsBootstrapIsUsableWhenSDKDisabled covers the other gap W0's review named: obs.Bootstrap had no test
 // at all. A nil MeterProvider or TracerProvider here panics at a call site rather than degrading, which is
 // the opposite of the degradation mandate — and OTEL_SDK_DISABLED is the path most likely to be exercised

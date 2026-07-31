@@ -12,9 +12,13 @@
 //   - Buffering + NAKing is not a fix either: the event would be replayed
 //     once by the buffer's own flush and once by NATS redelivery, and
 //     issues.count is an ON CONFLICT increment, so the replay is a visible
-//     duplicate in the product. Deduplicating would need a server-side
-//     idempotency key, and event_id has no server-side destination today
-//     (VERIFIED_STATE.md S16).
+//     duplicate in the product. Deduplicating needs a server-side
+//     idempotency key — event_id now has one: store.StoreEvent writes it to
+//     error_occurrences.event_id and deduplicates on (issue_id, event_id)
+//     inside a single transaction with the issue upsert (docs/plans/
+//     IDEMPOTENCY_PLAN.md D-b/D-c, closing the S18 count-inflation defect).
+//     That fix lives entirely in the store/service write path, not here —
+//     this package still holds no event data of its own; see below.
 //
 // With no third option, durability now belongs entirely to NATS: D10's
 // bounded retry with backoff (1s/5s/15s/30s/60s, MaxDeliver 5), then a DLQ

@@ -50,6 +50,10 @@ const (
 	MetricDLQDepth              = "sentinel_dlq_depth"
 	MetricDLQPublishFailures    = "sentinel_dlq_publish_failures_total"
 	MetricAlertDispatch         = "sentinel_alert_dispatch_total"
+	// MetricIngestEventIDReplaced counts requests whose event_id the ingestor replaced with a minted
+	// UUIDv4 instead of using the client's value verbatim (docs/plans/IDEMPOTENCY_PLAN.md D-a). Never
+	// records the id itself as a label (D15 cardinality rule) - only the fixed EventIDReason* below.
+	MetricIngestEventIDReplaced = "sentinel_ingest_event_id_replaced_total"
 )
 
 // Label keys. Kept few and low-cardinality on purpose: project_id is unbounded and would blow up the
@@ -57,24 +61,44 @@ const (
 const (
 	LabelOutcome = "outcome"
 	LabelChannel = "channel"
+	LabelReason  = "reason"
 )
 
 // Permitted values for LabelOutcome. Fixed sets, so a typo at one call site cannot invent an eighth
 // time series that looks almost like a real one.
 const (
-	OutcomeAccepted        = "accepted"     // ingest: 202
-	OutcomeRejected        = "rejected"     // ingest: 4xx validation failure
-	OutcomeRateLimited     = "ratelimited"  // ingest: 429
-	OutcomeUnauthorized    = "unauthorized" // ingest: 401
-	OutcomeStored          = "stored"       // process: persisted
-	OutcomeRetried         = "retried"      // process: returned to NATS for redelivery
-	OutcomeDeadLettered    = "deadlettered" // process: parked in the DLQ
-	OutcomeDispatchSent    = "sent"         // alert: notifier accepted it
-	OutcomeDispatchError   = "error"        // alert: notifier failed
-	OutcomeDispatchDropped = "dropped"      // alert: never reached a notifier worker (missing/unroutable
+	OutcomeAccepted     = "accepted"     // ingest: 202
+	OutcomeRejected     = "rejected"     // ingest: 4xx validation failure
+	OutcomeRateLimited  = "ratelimited"  // ingest: 429
+	OutcomeUnauthorized = "unauthorized" // ingest: 401
+	OutcomeStored       = "stored"       // process: persisted
+	OutcomeRetried      = "retried"      // process: returned to NATS for redelivery
+	OutcomeDeadLettered = "deadlettered" // process: parked in the DLQ
+	// OutcomeDuplicate marks a message whose (issue_id, event_id) pair was already stored
+	// (docs/plans/IDEMPOTENCY_PLAN.md D-e): store.StoreEvent returned stored=false, nil — a healthy
+	// no-op ACK, not a failure. Recorded EXACTLY ONCE per message, by ProcessEvent's deferred
+	// classifier alone (never inside processEventInternal too — recording it in both places would
+	// double-count one message across two outcome labels, breaking the
+	// stored+duplicate+retried+deadlettered == deliveries invariant W3 asserts).
+	OutcomeDuplicate       = "duplicate" // process: (issue_id, event_id) already stored; no-op ACK
+	OutcomeDispatchSent    = "sent"      // alert: notifier accepted it
+	OutcomeDispatchError   = "error"     // alert: notifier failed
+	OutcomeDispatchDropped = "dropped"   // alert: never reached a notifier worker (missing/unroutable
 	// channel_config, unknown channel, a full notifier queue, or no sender wired at all — see
 	// apps/processor-go/alerts/notify.go and dispatcher.go's sendAlert). Without this outcome,
 	// "alerting configured and quiet" and "alerting silently broken" both read as a flat zero on
 	// sentinel_alert_dispatch_total — the exact blind spot that let alerting ship as a no-op before
 	// S8 was caught (docs/memory/VERIFIED_STATE.md).
+)
+
+// Permitted values for LabelReason on MetricIngestEventIDReplaced (docs/plans/IDEMPOTENCY_PLAN.md
+// D-a). Fixed set for the same reason as the Outcome* block above - a typo'd literal at a call site
+// must not be able to invent a new time series.
+const (
+	EventIDReasonEmpty   = "empty"    // client sent no event_id (or "") - the common absent case
+	EventIDReasonTooLong = "too_long" // client's event_id exceeded 64 characters (counted in runes)
+	// EventIDReasonInvalidChars: the id carried a control character (rune < 0x20 or 0x7f). NUL in
+	// particular cannot be stored in a Postgres varchar at all, so passing it through would let a
+	// client dead-letter its own events once the processor writes the column (F-VW0-2).
+	EventIDReasonInvalidChars = "invalid_chars"
 )

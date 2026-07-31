@@ -281,6 +281,34 @@ type batchResponse struct {
 		Index   int    `json:"index"`
 		Message string `json:"message"`
 	} `json:"errors"`
+	// EventIDs is additive (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f): one entry per SUCCESSFULLY
+	// ingested item, keyed by its index in the request, carrying the EFFECTIVE event_id (the client's
+	// own value when usable, or a freshly minted UUIDv4 otherwise). Failed items never appear here —
+	// see main.go's handleBatchIngest, which only appends after result.Ingested++.
+	EventIDs []struct {
+		Index   int    `json:"index"`
+		EventID string `json:"event_id"`
+	} `json:"event_ids"`
+}
+
+// ingestAcceptedBody is the documented shape of a single-event 202 response
+// (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f): {"status":"accepted","event_id":"..."}. event_id is the
+// EFFECTIVE id — the client's own value when usable, or a freshly minted UUIDv4 otherwise — never the
+// raw client-supplied value verbatim when it was replaced.
+type ingestAcceptedBody struct {
+	Status  string `json:"status"`
+	EventID string `json:"event_id"`
+}
+
+// decodeAccepted parses a single-ingest 202 body, failing the test if it is not the documented
+// {status,event_id} shape.
+func (r ingestResult) decodeAccepted(t *testing.T) ingestAcceptedBody {
+	t.Helper()
+	var out ingestAcceptedBody
+	if err := json.Unmarshal([]byte(r.Body), &out); err != nil {
+		t.Fatalf("202 body was not the documented {status,event_id} shape: %v\n  body: %s", err, r.Body)
+	}
+	return out
 }
 
 // ingestOpts customizes a single request. The zero value presents the fixture's own key and no
@@ -533,13 +561,18 @@ type occurrenceRow struct {
 	Metadata       []byte
 	Stacktrace     []byte
 	CreatedAt      time.Time
+	// EventID is the idempotency key (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-b). NULLABLE — most
+	// pre-W0/legacy rows and any event that never carried a usable id have this as nil, never "": D-b's
+	// NULLIF mapping and CHECK constraint both exist specifically to make "" unreachable in this column.
+	EventID *string
 }
 
 func (f *fixture) occurrences() []occurrenceRow {
 	f.t.Helper()
 	rows, err := pool.Query(context.Background(),
 		`SELECT eo.id::text, eo.issue_id::text, i.message, eo.platform, eo.environment,
-		        eo.release_version, eo.trace_id, eo.span_id, eo.metadata, eo.stacktrace, eo.created_at
+		        eo.release_version, eo.trace_id, eo.span_id, eo.metadata, eo.stacktrace, eo.created_at,
+		        eo.event_id
 		   FROM error_occurrences eo
 		   JOIN issues i ON i.id = eo.issue_id
 		  WHERE i.project_id = $1
@@ -553,7 +586,8 @@ func (f *fixture) occurrences() []occurrenceRow {
 	for rows.Next() {
 		var r occurrenceRow
 		if err := rows.Scan(&r.ID, &r.IssueID, &r.IssueMessage, &r.Platform, &r.Environment,
-			&r.ReleaseVersion, &r.TraceID, &r.SpanID, &r.Metadata, &r.Stacktrace, &r.CreatedAt); err != nil {
+			&r.ReleaseVersion, &r.TraceID, &r.SpanID, &r.Metadata, &r.Stacktrace, &r.CreatedAt,
+			&r.EventID); err != nil {
 			f.t.Fatalf("scanning occurrence: %v", err)
 		}
 		out = append(out, r)

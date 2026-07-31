@@ -111,8 +111,10 @@ here so nobody cites batch-subset retry as a benefit again.
   losing only dedup. Truncation silently merges distinct events. Hashing oversized ids adds a second
   derivation contract — a B5 generator.
 - So: mint, plus (a) `sentinel_ingest_event_id_replaced_total{reason}` with `reason` ∈
-  {`too_long`, `empty`} — never the id itself (D15 cardinality rule); (b) one WARN log with the
-  offending *length* and project; (c) the 202 body echoes the **effective** id —
+  {`too_long`, `empty`, `invalid_chars`} — never the id itself (D15 cardinality rule); (b) one log
+  line with the offending *length* and project — WARN for the anomalous reasons, Debug for `empty`
+  (the designed-for case; WARN there would equal ingest volume — F-VW0-4); (c) the 202 body echoes
+  the **effective** id —
   `{"status":"accepted","event_id":"…"}` and per-item in the batch response — so a client can diff
   what it sent against what was used. Additive response keys are backwards-compatible; D-f is amended
   accordingly.
@@ -120,6 +122,13 @@ here so nobody cites batch-subset retry as a benefit again.
   (a number) fails the whole-body decode → 400. That is consistent with every other field's type
   mismatch behavior, and only our SDK sends the field today (as a string). Accepted; W0 documents it
   in the payload struct comment.
+- Two boundary rules found by W0's validation, both executed rather than assumed (F-VW0-1/2): the
+  ingestor's length guard counts **runes**, because the other two enforcement points both count
+  characters — CEL `.size()` counts code points (proven: 64×'ä' = 128 bytes passes, 65 runes fails)
+  and `VARCHAR(64)` counts characters — so a byte count would strip multibyte clients of dedup with a
+  false `too_long`. And ids carrying **control characters** are minted over (`invalid_chars`): NUL
+  passes JSON decoding and protovalidate but cannot be stored in a Postgres varchar, so passing it
+  through would let a client dead-letter its own events once W2 writes the column.
 
 Trust boundary: the key is scoped per issue (D-b) and issues are tenant-scoped, so a hostile client
 can only suppress its own events (B7 posture: the client value never crosses tenants).

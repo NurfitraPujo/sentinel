@@ -111,81 +111,6 @@ func applyAuthenticatedScopeForTest(payload *validation.ErrorPayload) {
 	}
 }
 
-// eventIDHasNoWireDestination documents a real, currently-existing gap this
-// test discovered while being written: packages/sdk-go/event.go's Event
-// always emits `event_id` (Event.EventID, never empty - see NewEvent), but
-// that key has NO destination anywhere on the server side today:
-// validation.ErrorPayload has no EventID field, mapping.MapPayloadToEvent
-// therefore cannot map it, and the proto (error_event.proto) has no
-// event_id field either. `grep -rn "event_id\|EventID" apps/ packages/proto`
-// confirms it end to end.
-//
-// This is silent in production only because apps/ingestor-go/main.go's
-// handleIngest/handleBatchIngest decode with a plain json.NewDecoder and
-// never call DisallowUnknownFields, so the unknown key is dropped instead of
-// rejected. It is the same B5 class of bug as S4 (a field that exists on
-// one side of the boundary and not the other), just not one of the four
-// fields enumerated in S3/S4/S5/S11, and it was not introduced by this
-// change - it predates it.
-//
-// Fixing it means adding an EventID field to validation.ErrorPayload (and
-// deciding what, if anything, the ingestor/processor should do with it -
-// likely idempotency/dedup) plus a proto field, all of which are outside
-// this file's scope (tests/contract/** only). Stripping it here keeps this
-// test asserting the thing it exists to assert - that message, metadata,
-// platform, release_version, and in_app survive the SDK -> ingestor
-// boundary, and that any FUTURE accidental rename of one of those fails the
-// build via DisallowUnknownFields - without being permanently red on an
-// unrelated, already-known gap. It is reported as a finding, not fixed
-// here; see the work item's final report.
-const eventIDHasNoWireDestination = "event_id"
-
-// stripEventIDField removes the one JSON key (see eventIDHasNoWireDestination
-// above) known to have no destination on validation.ErrorPayload today, from
-// a single-event body, while asserting it was actually present first (so a
-// future SDK change that stops emitting it - closing the gap - makes this
-// helper fail loudly rather than silently becoming a no-op). Every other key
-// passes through DisallowUnknownFields untouched, so a rename of message,
-// metadata, platform, release_version, or in_app still fails this test.
-func stripEventIDField(t *testing.T, body []byte) []byte {
-	t.Helper()
-	var generic map[string]json.RawMessage
-	if err := json.Unmarshal(body, &generic); err != nil {
-		t.Fatalf("stripEventIDField: unmarshal: %v", err)
-	}
-	if _, ok := generic[eventIDHasNoWireDestination]; !ok {
-		t.Fatalf("stripEventIDField: expected SDK event JSON to contain %q (has the SDK stopped emitting it, or has the ingestor gained a destination for it? update this test either way)", eventIDHasNoWireDestination)
-	}
-	delete(generic, eventIDHasNoWireDestination)
-	out, err := json.Marshal(generic)
-	if err != nil {
-		t.Fatalf("stripEventIDField: marshal: %v", err)
-	}
-	return out
-}
-
-// stripEventIDFieldBatch is stripEventIDField for the array-of-objects shape
-// the SDK sends to POST {endpoint}/batch (transport.go sendBatch: json.Marshal(batch)
-// for len(batch) > 1).
-func stripEventIDFieldBatch(t *testing.T, body []byte) []byte {
-	t.Helper()
-	var generic []map[string]json.RawMessage
-	if err := json.Unmarshal(body, &generic); err != nil {
-		t.Fatalf("stripEventIDFieldBatch: unmarshal: %v", err)
-	}
-	for i := range generic {
-		if _, ok := generic[i][eventIDHasNoWireDestination]; !ok {
-			t.Fatalf("stripEventIDFieldBatch: item %d missing %q", i, eventIDHasNoWireDestination)
-		}
-		delete(generic[i], eventIDHasNoWireDestination)
-	}
-	out, err := json.Marshal(generic)
-	if err != nil {
-		t.Fatalf("stripEventIDFieldBatch: marshal: %v", err)
-	}
-	return out
-}
-
 // decodeStrict decodes body into dst with DisallowUnknownFields, which is
 // the entire point of this test suite: a future rename on the SDK side of
 // any field that a real ErrorPayload column depends on turns a silently
@@ -217,6 +142,9 @@ func assertPayloadMatchesEvent(t *testing.T, event *sentinel.Event, payload *val
 	t.Helper()
 
 	// ProjectKey must survive the wire as the project NAME the SDK was configured with.
+	if payload.EventID != event.EventID {
+		t.Errorf("EventID: got %q, want %q (docs/plans/IDEMPOTENCY_PLAN.md D-a: event_id must round-trip byte-identical from the SDK's UUIDv4 through to ErrorPayload)", payload.EventID, event.EventID)
+	}
 	if payload.ProjectKey != event.ProjectKey {
 		t.Errorf("ProjectKey: got %q, want %q", payload.ProjectKey, event.ProjectKey)
 	}
@@ -293,9 +221,12 @@ func formatJSONValue(t *testing.T, v interface{}) string {
 // release_version correct, at least one in_app==true frame - checked on the
 // final, mapped, protovalidate-passing proto message, i.e. what actually
 // gets published to NATS.
-func assertSemanticFieldsSurvived(t *testing.T, event *sentinelv1.ErrorEvent, wantReleaseVersion string) {
+func assertSemanticFieldsSurvived(t *testing.T, event *sentinelv1.ErrorEvent, wantReleaseVersion string, wantEventID string) {
 	t.Helper()
 
+	if event.GetEventId() != wantEventID {
+		t.Errorf("proto ErrorEvent.event_id = %q, want %q (docs/plans/IDEMPOTENCY_PLAN.md D-a: the client's id must survive to the published proto verbatim when it is usable)", event.GetEventId(), wantEventID)
+	}
 	if event.GetMessage() == "" {
 		t.Error("proto ErrorEvent.message is empty - S4 regression")
 	}
@@ -333,10 +264,8 @@ func TestSDKToIngestorContract_SingleEvent(t *testing.T) {
 		t.Fatalf("json.Marshal(event): %v", err)
 	}
 
-	strictBody := stripEventIDField(t, body)
-
 	var payload validation.ErrorPayload
-	decodeStrict(t, strictBody, &payload)
+	decodeStrict(t, body, &payload)
 
 	assertPayloadMatchesEvent(t, event, &payload)
 
@@ -348,7 +277,7 @@ func TestSDKToIngestorContract_SingleEvent(t *testing.T) {
 		t.Fatalf("protovalidate rejected a real SDK-produced single event (this is exactly S3/S4): %v", err)
 	}
 
-	assertSemanticFieldsSurvived(t, protoEvent, event.ReleaseVersion)
+	assertSemanticFieldsSurvived(t, protoEvent, event.ReleaseVersion, event.EventID)
 }
 
 // TestSDKToIngestorContract_Batch covers the batch shape: an array of
@@ -369,12 +298,10 @@ func TestSDKToIngestorContract_Batch(t *testing.T) {
 		t.Fatalf("json.Marshal(batch): %v", err)
 	}
 
-	strictBody := stripEventIDFieldBatch(t, body)
-
 	// Decoded exactly as apps/ingestor-go/main.go's handleBatchIngest does:
 	// var payloads []validation.ErrorPayload
 	var payloads []validation.ErrorPayload
-	decodeStrict(t, strictBody, &payloads)
+	decodeStrict(t, body, &payloads)
 
 	if len(payloads) != len(batch) {
 		t.Fatalf("decoded %d payloads, want %d", len(payloads), len(batch))
@@ -392,7 +319,7 @@ func TestSDKToIngestorContract_Batch(t *testing.T) {
 		if err := validator.Validate(protoEvent); err != nil {
 			t.Fatalf("protovalidate rejected batch item %d (a real SDK-produced event): %v", i, err)
 		}
-		assertSemanticFieldsSurvived(t, protoEvent, wantEvent.ReleaseVersion)
+		assertSemanticFieldsSurvived(t, protoEvent, wantEvent.ReleaseVersion, wantEvent.EventID)
 	}
 
 	// The two items must fingerprint distinctly downstream: same platform
@@ -456,10 +383,8 @@ func TestSDK_RejectsWithoutPlatform_WouldFailValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal(event): %v", err)
 	}
-	strictBody := stripEventIDField(t, body)
-
 	var payload validation.ErrorPayload
-	decodeStrict(t, strictBody, &payload)
+	decodeStrict(t, body, &payload)
 
 	payload.Platform = "" // simulate the pre-P2-3 SDK, which never sent platform at all
 

@@ -33,9 +33,21 @@ type CommandStore interface {
 	// UpsertIssue itself keeps its original single-error signature (it is
 	// exercised directly by tests/integration/processor_store_test.go) and
 	// is now a thin wrapper around this method.
+	//
+	// Kept for tests/integration/processor_store_test.go (W3's file, ~13 call
+	// sites); the service package no longer calls it — see StoreEvent below.
 	UpsertIssueWithOutcome(ctx context.Context, issue *Issue, releaseVersion string) (IssueOutcome, error)
+	// InsertOccurrence is the pre-idempotency bare-exec insert (no event_id, no dedup, no shared
+	// transaction with the issue upsert). Kept for tests/integration/processor_store_test.go; the
+	// service package no longer calls it — see StoreEvent below.
 	InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error
 	PersistAuditLog(ctx context.Context, log *AuditLog) error
+	// StoreEvent is the atomic, duplicate-aware write path (docs/plans/IDEMPOTENCY_PLAN.md D-c): one
+	// transaction folds the issue upsert/regression bookkeeping and the event_id-deduplicated
+	// occurrence insert together, so a partial-failure redelivery (NAK after the issue commits but
+	// before the occurrence lands) rolls back BOTH instead of double-counting issues.count (S18 — the
+	// defect W1/W2 close). See the method doc below for the full contract.
+	StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurrence, releaseVersion string) (outcome IssueOutcome, stored bool, err error)
 }
 
 // IssueOutcome reports what UpsertIssueWithOutcome actually did.
@@ -92,6 +104,13 @@ type ErrorOccurrence struct {
 	TraceID        string
 	SpanID         string
 	CreatedAt      time.Time
+	// EventID is the idempotency key (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-b), copied from the wire by
+	// event.Deserialize BEFORE Normalize (D-h) and bounds-clamped to "" for anything that would not fit
+	// VARCHAR(64) or carries a control character (D-g). "" here means "no key" — StoreEvent maps it to
+	// SQL NULL via NULLIF at the insert site, never storing the empty string (D-b's tripwire CHECK
+	// constraint rejects '' outright). Never log this value verbatim in a metric label (D15); it is a
+	// client-supplied string that can appear an unbounded number of times.
+	EventID string
 }
 
 // isRegressionVersion compares incoming releaseVersion against resolvedInVersion.
@@ -246,6 +265,204 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 		return IssueOutcomeNew, nil
 	default:
 		return IssueOutcomeExisting, nil
+	}
+}
+
+// StoreEvent is the atomic write path for one delivered event (docs/plans/IDEMPOTENCY_PLAN.md D-c,
+// followed verbatim — every clause below is load-bearing and was probed against a real Postgres
+// during the plan's adversarial review; do not "simplify" any of them without re-reading D-c first).
+//
+// One transaction, explicitly READ COMMITTED (pgx's default happens to already be READ COMMITTED, but
+// the isolation level is spelled out anyway: D-c's interleaving THROWS 40001 under REPEATABLE READ/
+// SERIALIZABLE, which classifyStoreError leaves retryable — a hot fingerprint would turn contention
+// into a NAK/retry storm. Never remove the explicit TxOptions on the theory that the default already
+// matches it):
+//  1. Read existing issue state; upsert/update exactly as UpsertIssueWithOutcome did, but with
+//     RETURNING id folded into BOTH arms so the separate GetIssueIDByFingerprint round trip disappears.
+//     BOTH arms check rows affected: a folded RETURNING id yielding pgx.ErrNoRows is a BUG (the
+//     DO UPDATE...WHERE predicate was narrowed, or the plain UPDATE hit a concurrently-deleted issue),
+//     never a duplicate signal — it is surfaced as an error, not stored=false.
+//  2. Insert the occurrence with NULLIF($11,”) mapping ” (proto3's "absent", never a real key) to SQL
+//     NULL, and ON CONFLICT (issue_id, event_id) WHERE event_id IS NOT NULL DO NOTHING — the exact form
+//     that matches the D-b partial unique index. Dropping NULLIF silently destroys every pre-W0 event
+//     after the first per issue (F-TX-1); dropping the WHERE clause, or using a bare
+//     ON CONFLICT DO NOTHING, either fails to match the index or swallows an
+//     error_occurrences_pkey collision as a false "duplicate" (F-TX-5) — both are forbidden here.
+//     Executed via tx.Exec, never QueryRow+RETURNING: pgx.ErrNoRows is not a *pgconn.PgError, so
+//     classifyStoreError would leave a genuine duplicate retryable and eventually dead-letter an
+//     already-stored message (F-TX-8).
+//  3. RowsAffected()==0 on the occurrence insert means this exact (issue_id, event_id) pair already
+//     exists: roll back (undoing this delivery's count/regression writes) and report stored=false with
+//     a nil error — the caller ACKs this as a successful no-op. Otherwise commit.
+//
+// Deadlock-freedom depends on this transaction acquiring exactly ONE contended lock (the issues row,
+// via ON CONFLICT DO UPDATE / the plain UPDATE) and never waiting again — do not add audit persistence,
+// indexing, or any network I/O inside this transaction; move it after commit instead (D-d).
+func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurrence, releaseVersion string) (IssueOutcome, bool, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return IssueOutcomeExisting, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	// --- 1. Issue upsert / regression bookkeeping (UpsertIssueWithOutcome's logic, folded) ---
+
+	var existingStatus, existingResolvedInVersion string
+	var existingID string
+
+	err = tx.QueryRow(ctx,
+		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND fingerprint = $2",
+		issue.ProjectID, issue.Fingerprint,
+	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
+
+	// Only "no such issue yet" is expected here; see UpsertIssueWithOutcome's identical comment for why
+	// falling through on any other error would replace the real cause with a generic 25P02 abort.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return IssueOutcomeExisting, false, fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
+			issue.ProjectID, issue.Fingerprint, err)
+	}
+
+	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
+	isRegressed := false
+	if err == nil {
+		issue.ID = existingID
+		if existingStatus == "resolved" {
+			if existingResolvedInVersion == "" || isRegressionVersion(releaseVersion, existingResolvedInVersion) {
+				isRegressed = true
+			}
+		}
+	}
+
+	if isRegressed {
+		query := `
+			UPDATE issues SET
+				status = 'unresolved',
+				regression_status = 'regressed',
+				regression_count = regression_count + 1,
+				last_regressed_at = NOW(),
+				resolved_in_version = NULL,
+				resolved_at = NULL,
+				resolved_by_type = NULL,
+				resolved_by = NULL,
+				last_seen = GREATEST(issues.last_seen, $1),
+				count = issues.count + 1
+			WHERE id = $2
+			RETURNING id
+		`
+		var updatedID string
+		if scanErr := tx.QueryRow(ctx, query, issue.LastSeen, issue.ID).Scan(&updatedID); scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				// F-TX-7: the row this UPDATE targeted no longer exists — e.g. a concurrent
+				// retention DELETE won the race against this tx's own SELECT above. This is a bug
+				// condition, never a duplicate: report it loudly instead of silently proceeding
+				// with a stale issue.ID that would fail the occurrence insert's FK with a confusing
+				// error, or worse, succeed against a row that means something else now.
+				return IssueOutcomeExisting, false, fmt.Errorf(
+					"regression update matched no row for issue id=%s (concurrently deleted?): %w",
+					issue.ID, scanErr)
+			}
+			return IssueOutcomeExisting, false, scanErr
+		}
+		issue.ID = updatedID
+
+		activityMeta, _ := json.Marshal(map[string]string{
+			"releaseVersion":          releaseVersion,
+			"previousResolvedVersion": existingResolvedInVersion,
+		})
+
+		// issue_activity has no `metadata` column — see UpsertIssueWithOutcome's identical comment
+		// (VERIFIED_STATE.md S-something / the 1721900000 schema) for why old_value/new_value is used.
+		activityQuery := `
+			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, new_value, created_at)
+			VALUES (gen_random_uuid(), $1, 'system', 'sentinel-regression-detector', 'regressed', $2, NOW())
+		`
+		if _, err := tx.Exec(ctx, activityQuery, issue.ID, activityMeta); err != nil {
+			return IssueOutcomeExisting, false, err
+		}
+	} else {
+		query := `
+			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+			ON CONFLICT (project_id, fingerprint)
+			DO UPDATE SET
+				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
+				count = issues.count + 1
+			WHERE issues.fingerprint = EXCLUDED.fingerprint
+			RETURNING id
+		`
+		var returnedID string
+		if scanErr := tx.QueryRow(ctx, query,
+			issue.ID,
+			issue.ProjectID,
+			issue.Fingerprint,
+			issue.Message,
+			issue.ErrorClass,
+			issue.Status,
+			issue.FirstSeen,
+			issue.LastSeen,
+		).Scan(&returnedID); scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				// F-TX-7: the folded RETURNING id yielded no row. The only way this happens is the
+				// DO UPDATE ... WHERE predicate being narrowed so it no longer matches — a bug in
+				// this statement, not "the issue was a duplicate". Must error, never stored=false.
+				return IssueOutcomeExisting, false, fmt.Errorf(
+					"issue upsert returned no row for project=%s fingerprint=%s (WHERE predicate narrowed?): %w",
+					issue.ProjectID, issue.Fingerprint, scanErr)
+			}
+			return IssueOutcomeExisting, false, scanErr
+		}
+		issue.ID = returnedID
+	}
+
+	// --- 2. Occurrence insert, deduplicated on (issue_id, event_id) ---
+
+	occ.IssueID = issue.ID
+	occQuery := `
+		INSERT INTO error_occurrences (id, issue_id, environment, platform, release_version,
+			stacktrace, metadata, trace_id, span_id, created_at, event_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''))
+		ON CONFLICT (issue_id, event_id) WHERE event_id IS NOT NULL DO NOTHING
+	`
+	tag, err := tx.Exec(ctx, occQuery,
+		occ.ID,
+		occ.IssueID,
+		occ.Environment,
+		occ.Platform,
+		occ.ReleaseVersion,
+		occ.Stacktrace,
+		occ.Metadata,
+		occ.TraceID,
+		occ.SpanID,
+		occ.CreatedAt,
+		occ.EventID,
+	)
+	if err != nil {
+		return IssueOutcomeExisting, false, err
+	}
+
+	// --- 3. Duplicate detection strictly from RowsAffected (F-TX-8) ---
+
+	if tag.RowsAffected() == 0 {
+		// This exact (issue_id, event_id) pair is already stored. Roll back everything this
+		// delivery would otherwise have written — the issue's count/regression bookkeeping above
+		// included — so a redelivered duplicate leaves every counter untouched (D-c property 3).
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return IssueOutcomeExisting, false, fmt.Errorf("failed to roll back duplicate occurrence insert: %w", rbErr)
+		}
+		return IssueOutcomeExisting, false, nil
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return IssueOutcomeExisting, false, err
+	}
+
+	switch {
+	case isRegressed:
+		return IssueOutcomeRegressed, true, nil
+	case wasNewIssue:
+		return IssueOutcomeNew, true, nil
+	default:
+		return IssueOutcomeExisting, true, nil
 	}
 }
 
