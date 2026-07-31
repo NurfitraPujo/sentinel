@@ -158,6 +158,7 @@ export async function removeOrganizationMember(organizationId: string, userId: s
 
 /**
  * Creates an invitation for a user to join an organization.
+ * Cleans up any existing pending invitations for the same email in the organization first.
  */
 export async function createOrganizationInvitation(
   organizationId: string,
@@ -166,6 +167,8 @@ export async function createOrganizationInvitation(
   token: string,
   expiresAt: Date
 ) {
+  await deletePendingInvitationsByEmail(organizationId, email);
+
   const [invite] = await db
     .insert(organizationInvitations)
     .values({
@@ -180,3 +183,51 @@ export async function createOrganizationInvitation(
 
   return invite;
 }
+
+/**
+ * Retrieves an invitation by token with its associated organization details.
+ */
+export async function getInvitationByToken(token: string) {
+  const [result] = await db
+    .select({
+      invitation: organizationInvitations,
+      organization: organizations,
+    })
+    .from(organizationInvitations)
+    .leftJoin(organizations, eq(organizationInvitations.organizationId, organizations.id))
+    .where(eq(organizationInvitations.token, token));
+
+  if (!result || !result.organization) {
+    return null;
+  }
+
+  return {
+    invitation: result.invitation,
+    organization: result.organization,
+  };
+}
+
+/**
+ * Deletes an invitation record by ID.
+ */
+export async function deleteInvitationById(id: string) {
+  await db
+    .delete(organizationInvitations)
+    .where(eq(organizationInvitations.id, id));
+}
+
+/**
+ * Deletes pending invitations for a specific email within an organization.
+ */
+export async function deletePendingInvitationsByEmail(organizationId: string, email: string) {
+  await db
+    .delete(organizationInvitations)
+    .where(
+      and(
+        eq(organizationInvitations.organizationId, organizationId),
+        eq(organizationInvitations.email, email),
+        eq(organizationInvitations.status, 'pending')
+      )
+    );
+}
+
