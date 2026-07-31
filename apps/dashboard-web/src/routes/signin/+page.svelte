@@ -12,19 +12,27 @@
 	let loading = false;
 </script>
 
-<div class="flex min-h-screen items-center justify-center">
-	<div class="text-center">
-		<h1 class="text-2xl font-bold mb-4">Sign in to Sentinel</h1>
+<div class="auth-container">
+	<div class="auth-box">
+		<div class="auth-header">
+			<div class="auth-logo">⚡ SENTINEL</div>
+			<h1 class="auth-title">Sign in to Control Room</h1>
+			<p class="auth-subtitle">Production error tracking and telemetry</p>
+		</div>
+
 		{#if error || errorParam}
-			<p class="text-red-500 mb-4">Authentication error: {error || errorParam}</p>
+			<div class="alert error">
+				<span>Authentication error: {error || errorParam}</span>
+			</div>
 		{/if}
+
 		{#if form?.success}
-			<div class="p-4 bg-green-50 text-green-700 rounded-lg mb-4">
-				<p class="font-medium">Check your email</p>
-				<p class="text-sm">A magic link has been sent to your email address.</p>
+			<div class="alert success">
+				<p class="alert-title">Check your email</p>
+				<p class="alert-desc">A magic link has been dispatched to your email address.</p>
 			</div>
 		{:else}
-			<div class="flex flex-col gap-4">
+			<div class="auth-form-group">
 				<form method="POST" action="?/google" use:enhance={() => {
 					loading = true;
 					return async ({ update }) => {
@@ -32,23 +40,16 @@
 						loading = false;
 					};
 				}}>
-					<button
-						type="submit"
-						disabled={loading}
-						class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-					>
+					<button type="submit" disabled={loading} class="btn btn-primary btn-full">
 						Sign in with Google
 					</button>
 				</form>
+
 				{#if data.emailConfigured}
-					<div class="relative">
-						<div class="absolute inset-0 flex items-center">
-							<div class="w-full border-t border-gray-300"></div>
-						</div>
-						<div class="relative flex justify-center text-sm">
-							<span class="px-2 bg-white text-gray-500">or</span>
-						</div>
+					<div class="divider">
+						<span class="divider-text">OR</span>
 					</div>
+
 					<form
 						method="POST"
 						action="?/magiclink"
@@ -59,23 +60,20 @@
 								loading = false;
 							};
 						}}
-						class="flex flex-col gap-2"
+						class="magic-form"
 					>
 						{#if form?.error}
-							<p class="text-red-500 text-sm">{form.error}{#if 'retryAfter' in form && form.retryAfter} Retry after {form.retryAfter}s.{/if}</p>
+							<p class="form-error">{form.error}{#if 'retryAfter' in form && form.retryAfter} Retry after {form.retryAfter}s.{/if}</p>
 						{/if}
+
 						<input
 							type="email"
 							name="email"
-							placeholder="Enter your email"
+							placeholder="engineer@company.com"
 							required
-							class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+							class="input-email"
 						/>
-						<button
-							type="submit"
-							disabled={loading}
-							class="px-6 py-3 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50"
-						>
+						<button type="submit" disabled={loading} class="btn btn-secondary btn-full">
 							{loading ? 'Sending...' : 'Send Magic Link'}
 						</button>
 					</form>
@@ -84,3 +82,165 @@
 		{/if}
 	</div>
 </div>
+
+<style>
+	.auth-container {
+		min-height: calc(100vh - 120px);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 2rem 1rem;
+	}
+
+	.auth-box {
+		width: 100%;
+		max-width: 400px;
+		background-color: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-lg);
+		padding: 2rem;
+		box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+	}
+
+	.auth-header {
+		text-align: center;
+		margin-bottom: 1.5rem;
+	}
+
+	.auth-logo {
+		font-family: var(--font-mono);
+		font-weight: 700;
+		font-size: 0.875rem;
+		letter-spacing: 0.15em;
+		color: var(--color-primary);
+		margin-bottom: 0.75rem;
+	}
+
+	.auth-title {
+		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin-bottom: 0.25rem;
+	}
+
+	.auth-subtitle {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+
+	.alert {
+		padding: 0.75rem 1rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		margin-bottom: 1rem;
+	}
+
+	.alert.error {
+		background-color: var(--severity-critical-bg);
+		color: var(--severity-critical-text);
+		border: 1px solid var(--severity-critical-border);
+	}
+
+	.alert.success {
+		background-color: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
+		border: 1px solid rgba(16, 185, 129, 0.3);
+	}
+
+	.alert-title {
+		font-weight: 600;
+		margin-bottom: 0.25rem;
+	}
+
+	.alert-desc {
+		font-size: 0.75rem;
+		opacity: 0.9;
+	}
+
+	.auth-form-group {
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
+	}
+
+	.magic-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.input-email {
+		padding: 0.625rem 0.875rem;
+		font-size: 0.875rem;
+		width: 100%;
+	}
+
+	.divider {
+		position: relative;
+		text-align: center;
+		margin: 0.5rem 0;
+	}
+
+	.divider::before {
+		content: '';
+		position: absolute;
+		top: 50%;
+		left: 0;
+		right: 0;
+		height: 1px;
+		background-color: var(--border-color);
+	}
+
+	.divider-text {
+		position: relative;
+		background-color: var(--bg-surface);
+		padding: 0 0.5rem;
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		color: var(--text-subtle);
+		letter-spacing: 0.05em;
+	}
+
+	.form-error {
+		color: var(--severity-critical-text);
+		font-size: 0.75rem;
+	}
+
+	.btn {
+		padding: 0.625rem 1rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.875rem;
+		font-weight: 500;
+		cursor: pointer;
+		border: none;
+		transition: background 0.15s ease, opacity 0.15s ease;
+	}
+
+	.btn-full {
+		width: 100%;
+	}
+
+	.btn-primary {
+		background-color: var(--color-primary);
+		color: var(--text-primary);
+	}
+
+	.btn-primary:hover:not(:disabled) {
+		background-color: var(--color-primary-hover);
+	}
+
+	.btn-secondary {
+		background-color: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+	}
+
+	.btn-secondary:hover:not(:disabled) {
+		background-color: var(--bg-surface-hover);
+	}
+
+	.btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+</style>

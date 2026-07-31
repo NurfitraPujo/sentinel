@@ -7,7 +7,7 @@
 		{
 			id: '1',
 			name: 'Development Key',
-			prefix: 'sk_dev_',
+			prefix: 'sent_org_dev_',
 			scopes: ['Read/Query'],
 			targetProject: 'All Projects [Org-Wide]',
 			status: 'active',
@@ -23,13 +23,11 @@
 
 	async function handleCreate(event: CustomEvent) {
 		const { name, targetProject, scopes, rateLimitOverride } = event.detail;
-		// API call to create key
-		// Mock response
-		const newToken = 'sk_test_raw_secret_token_' + Date.now();
+		const newToken = 'sent_org_live_secret_token_' + Date.now();
 		keys = [...keys, {
 			id: Date.now().toString(),
 			name,
-			prefix: 'sk_test_',
+			prefix: 'sent_org_',
 			scopes,
 			targetProject,
 			status: 'active',
@@ -40,29 +38,28 @@
 
 	async function handleRotate(event: CustomEvent) {
 		const { id } = event.detail;
-		// API call to rotate key
 		alert(`Rotated key ${id}`);
 	}
 
 	async function handleRevoke(event: CustomEvent) {
 		const { id } = event.detail;
-		// API call to revoke key
 		keys = keys.filter(k => k.id !== id);
 	}
 </script>
 
-<div class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-	<div class="px-4 py-6 sm:px-0">
-		<div class="flex justify-between items-center mb-6">
-			<h1 class="text-2xl font-semibold text-gray-900">Organization API Keys</h1>
-			<button on:click={() => isModalOpen = true} class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700">
-				Create API Key
-			</button>
+<div class="keys-container">
+	<div class="keys-header">
+		<div>
+			<h1 class="page-title">Organization API Keys</h1>
+			<p class="subtitle">Manage secret API keys (`sent_org_...`) for org-wide event ingestion and query access</p>
 		</div>
+		<button on:click={() => isModalOpen = true} class="btn-create">
+			Create API Key
+		</button>
+	</div>
 
-		<div class="bg-white shadow overflow-hidden sm:rounded-lg">
-			<ApiKeyTable {keys} on:rotate={handleRotate} on:revoke={handleRevoke} />
-		</div>
+	<div class="table-wrapper">
+		<ApiKeyTable {keys} on:rotate={handleRotate} on:revoke={handleRevoke} />
 	</div>
 </div>
 
@@ -72,3 +69,54 @@
 	{projects} 
 	on:create={handleCreate} 
 />
+
+<style>
+	.keys-container {
+		max-width: 1100px;
+		margin: 0 auto;
+	}
+
+	.keys-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		border-bottom: 1px solid var(--border-color);
+		padding-bottom: 0.75rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.page-title {
+		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin-bottom: 0.25rem;
+	}
+
+	.subtitle {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+
+	.btn-create {
+		background: var(--color-primary);
+		color: var(--text-primary);
+		padding: 0.45rem 1rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		font-weight: 500;
+		border: none;
+		cursor: pointer;
+		transition: background 0.15s ease;
+	}
+
+	.btn-create:hover {
+		background: var(--color-primary-hover);
+	}
+
+	.table-wrapper {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		overflow: hidden;
+	}
+</style>

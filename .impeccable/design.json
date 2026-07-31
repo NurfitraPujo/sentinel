@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-31T18:36:10Z",
+  "title": "Design System: Sentinel",
+  "extensions": {
+    "colorMeta": {
+      "primary": { "role": "primary", "displayName": "Signal Blue", "canonical": "oklch(62% 0.22 255)", "tonalRamp": ["#0f172a", "#1e3a8a", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa", "#93c5fd", "#dbeafe"] },
+      "primary-deep": { "role": "primary", "displayName": "Signal Blue Deep", "canonical": "oklch(48% 0.24 255)", "tonalRamp": ["#090d16", "#172554", "#1e40af", "#1d4ed8", "#2563eb", "#3b82f6", "#60a5fa", "#bfdbfe"] },
+      "neutral-bg": { "role": "neutral", "displayName": "Slate Void", "canonical": "oklch(15% 0.02 255)", "tonalRamp": ["#020617", "#090d16", "#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#cbd5e1"] },
+      "surface": { "role": "neutral", "displayName": "Control Surface", "canonical": "oklch(22% 0.02 255)", "tonalRamp": ["#090d16", "#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#e2e8f0"] },
+      "surface-border": { "role": "neutral", "displayName": "Surface Border", "canonical": "oklch(32% 0.02 255)", "tonalRamp": ["#0f172a", "#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#f1f5f9"] },
+      "text-main": { "role": "neutral", "displayName": "Text Main", "canonical": "oklch(98% 0.005 255)", "tonalRamp": ["#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f1f5f9", "#f8fafc"] },
+      "text-muted": { "role": "neutral", "displayName": "Text Muted", "canonical": "oklch(70% 0.02 255)", "tonalRamp": ["#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc"] },
+      "severity-critical": { "role": "status", "displayName": "Critical Red", "canonical": "oklch(62% 0.24 25)", "tonalRamp": ["#450a0a", "#7f1d1d", "#991b1b", "#b91c1c", "#dc2626", "#ef4444", "#f87171", "#fca5a5"] },
+      "severity-warning": { "role": "status", "displayName": "Warning Amber", "canonical": "oklch(75% 0.18 75)", "tonalRamp": ["#451a03", "#78350f", "#92400e", "#b45309", "#d97706", "#f59e0b", "#fbbf24", "#fde68a"] },
+      "status-resolved": { "role": "status", "displayName": "Resolved Emerald", "canonical": "oklch(68% 0.18 160)", "tonalRamp": ["#022c22", "#064e3b", "#047857", "#059669", "#10b981", "#34d399", "#6ee7b7", "#a7f3d0"] },
+      "status-ignored": { "role": "status", "displayName": "Ignored Slate", "canonical": "oklch(70% 0.02 255)", "tonalRamp": ["#1e293b", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0", "#f8fafc"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display Title", "purpose": "Primary view title and key metric values." },
+      "headline": { "displayName": "Section Headline", "purpose": "Card headers and issue title summaries." },
+      "body": { "displayName": "Body Text", "purpose": "General description and text content." },
+      "label": { "displayName": "Monospace Label / Code", "purpose": "Error signatures, stack traces, timestamps, and status badges." }
+    },
+    "shadows": [
+      { "name": "flat-border-only", "value": "none", "purpose": "Depth is created strictly via 1px border contrast (#334155)." }
+    ],
+    "motion": [
+      { "name": "fast-feedback", "value": "150ms ease", "purpose": "Hover and active background feedback transitions." }
+    ],
+    "breakpoints": [
+      { "name": "sm", "value": "640px" },
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary call-to-action button for filters and form actions.",
+      "html": "<button class=\"ds-btn-primary\">FILTER ISSUES</button>",
+      "css": ".ds-btn-primary { background: #3b82f6; color: #f8fafc; padding: 6px 12px; font-family: Inter, sans-serif; font-size: 0.875rem; font-weight: 500; border: none; border-radius: 4px; cursor: pointer; transition: background 0.15s ease; } .ds-btn-primary:hover { background: #1d4ed8; }"
+    },
+    {
+      "name": "Critical Badge",
+      "kind": "chip",
+      "refersTo": "badge-critical",
+      "description": "High severity event indicator.",
+      "html": "<span class=\"ds-badge-critical\">NEW</span>",
+      "css": ".ds-badge-critical { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); font-family: 'JetBrains Mono', monospace; font-size: 0.6875rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.05em; }"
+    },
+    {
+      "name": "Issue Card",
+      "kind": "card",
+      "refersTo": "card-surface",
+      "description": "Dense issue summary container in incident view.",
+      "html": "<div class=\"ds-issue-card\"><div class=\"ds-card-header\"><span class=\"ds-error-class\">NullPointerException</span><span class=\"ds-badge-critical\">NEW</span></div><p class=\"ds-card-msg\">Cannot read property 'id' of undefined in auth/service.go:42</p></div>",
+      "css": ".ds-issue-card { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 16px; font-family: Inter, sans-serif; } .ds-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; } .ds-error-class { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: #ef4444; font-size: 0.875rem; } .ds-card-msg { color: #94a3b8; font-size: 0.875rem; line-height: 1.4; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Incident Control Room",
+    "overview": "Sentinel is built for rapid error triage, log inspection, support ticket tracking, and real-time observability. Its visual system prioritizes extreme data density, instant scannability, and high-contrast status feedback.",
+    "keyCharacteristics": [
+      "High Information Density: Compact tables, zero-padding bloat, and sharp tabular alignment.",
+      "Precision Color System: Monochromatic slate-gray surfaces with high-chroma status accents.",
+      "Monospace Telemetry: Monospace typography for stack traces, error IDs, timestamps, and key-value attributes.",
+      "Zero Decorative Fluff: Rejects glassmorphism, decorative text gradients, and ambient blurs."
+    ],
+    "rules": [
+      { "name": "The Signal-to-Noise Rule", "body": "Saturated color carries less than 5% of any screen surface.", "section": "colors" },
+      { "name": "The Tabular Precision Rule", "body": "All numeric metrics and error IDs must use tabular numbers or monospace fonts.", "section": "typography" },
+      { "name": "The Border-Over-Shadow Rule", "body": "Never use box-shadow for container boundaries; use 1px solid #334155 borders.", "section": "elevation" },
+      { "name": "The Drawer-First Rule", "body": "Never launch full-screen modal overlays; use right-hand sliding drawers or expandable inline rows.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do maintain high line density (36px–40px table row height).",
+      "Do use strict monospace formatting for error signatures, stack traces, and IDs.",
+      "Do use context-preserving drawers and inline expandable rows over disruptive modals."
+    ],
+    "donts": [
+      "Don't use modal dialogs for issue inspection—always use a side drawer or inline detail panel.",
+      "Don't use decorative text gradients, hero-metric cards, or blurs.",
+      "Don't use colored accent side-stripes on cards or alert notifications.",
+      "Don't hide critical error context behind multi-click pagination."
+    ]
+  }
+}

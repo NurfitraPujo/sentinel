@@ -83,27 +83,27 @@
 </script>
 
 <div class="issue-detail">
-	<header>
-		<a href="/">&larr; Back to Issues</a>
+	<header class="detail-nav">
+		<a href="/" class="back-link">&larr; Back to Issues</a>
 	</header>
 
 	<div class="issue-header">
-		<h1>{data.issue.errorClass}</h1>
+		<h1 class="error-title">{data.issue.errorClass}</h1>
 		<span class="status {data.issue.status}">{data.issue.status}</span>
 	</div>
 
 	<div class="issue-info">
 		<p class="message">{data.issue.message}</p>
 		<div class="meta-info">
-			<span>Project: {data.project?.name ?? 'Unknown'}</span>
-			<span>First seen: {formatDate(data.issue.firstSeen)}</span>
-			<span>Last seen: {formatDate(data.issue.lastSeen)}</span>
-			<span>Total occurrences: {Number(data.issue.count).toLocaleString()}</span>
+			<span class="meta-item"><strong class="meta-label">Project:</strong> {data.project?.name ?? 'Unknown'}</span>
+			<span class="meta-item"><strong class="meta-label">First seen:</strong> {formatDate(data.issue.firstSeen)}</span>
+			<span class="meta-item"><strong class="meta-label">Last seen:</strong> {formatDate(data.issue.lastSeen)}</span>
+			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>
 		</div>
 	</div>
 
 	<section class="occurrences">
-		<h2>Occurrence History ({data.occurrences.length})</h2>
+		<h2 class="section-title">Occurrence History ({data.occurrences.length})</h2>
 
 		{#each occurrenceGroups as group}
 			<div class="date-group">
@@ -112,8 +112,8 @@
 					<div class="occurrence-card">
 						<div class="occurrence-header">
 							<span class="timestamp">{formatDate(occurrence.createdAt)}</span>
-							<span class="environment">{occurrence.environment}</span>
-							<span class="platform">{occurrence.platform}</span>
+							<span class="badge env">{occurrence.environment}</span>
+							<span class="badge platform">{occurrence.platform}</span>
 						</div>
 
 						{#if occurrence.traceId}
@@ -156,16 +156,18 @@
 		margin: 0 auto;
 	}
 
-	header {
-		margin-bottom: 2rem;
+	.detail-nav {
+		margin-bottom: 1.5rem;
 	}
 
-	header a {
-		color: #2563eb;
+	.back-link {
+		color: var(--color-primary);
 		text-decoration: none;
+		font-size: 0.875rem;
+		font-weight: 500;
 	}
 
-	header a:hover {
+	.back-link:hover {
 		text-decoration: underline;
 	}
 
@@ -176,44 +178,59 @@
 		margin-bottom: 1rem;
 	}
 
-	.issue-header h1 {
-		font-family: monospace;
-		color: #dc2626;
-	}
-
-	.status {
-		padding: 0.25rem 0.75rem;
-		border-radius: 4px;
-		text-transform: capitalize;
-		font-size: 0.875rem;
+	.error-title {
+		font-family: var(--font-mono);
+		color: var(--severity-critical-text);
+		font-size: 1.5rem;
 		font-weight: 600;
 	}
 
-	.status.open { background: #fef3c7; color: #92400e; }
-	.status.resolved { background: #d1fae5; color: #065f46; }
-	.status.ignored { background: #e5e5e5; color: #666; }
+	.status {
+		padding: 0.125rem 0.5rem;
+		border-radius: var(--radius-sm);
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		text-transform: uppercase;
+		font-weight: 600;
+		letter-spacing: 0.05em;
+	}
+
+	.status.open { background: var(--status-open-bg); color: var(--status-open-text); }
+	.status.resolved { background: var(--status-resolved-bg); color: var(--status-resolved-text); }
+	.status.ignored { background: var(--status-ignored-bg); color: var(--status-ignored-text); }
 
 	.issue-info {
-		background: #f9fafb;
-		padding: 1.5rem;
-		border-radius: 8px;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		padding: 1.25rem;
+		border-radius: var(--radius-md);
 		margin-bottom: 2rem;
 	}
 
 	.message {
-		font-size: 1.125rem;
-		line-height: 1.6;
+		font-size: 1rem;
+		line-height: 1.5;
 		margin-bottom: 1rem;
+		color: var(--text-primary);
 	}
 
 	.meta-info {
 		display: flex;
-		gap: 2rem;
-		font-size: 0.875rem;
-		color: #666;
+		flex-wrap: wrap;
+		gap: 1.5rem;
+		font-size: 0.8125rem;
+		color: var(--text-muted);
 	}
 
-	.occurrences h2 {
+	.meta-label {
+		color: var(--text-subtle);
+		font-weight: 500;
+	}
+
+	.section-title {
+		font-size: 1.125rem;
+		font-weight: 600;
+		color: var(--text-primary);
 		margin-bottom: 1rem;
 	}
 
@@ -222,92 +239,119 @@
 	}
 
 	.date-header {
-		font-size: 0.875rem;
-		color: #666;
-		border-bottom: 1px solid #e5e5e5;
-		padding-bottom: 0.5rem;
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		border-bottom: 1px solid var(--border-color);
+		padding-bottom: 0.375rem;
 		margin-bottom: 0.75rem;
 	}
 
 	.occurrence-card {
-		border: 1px solid #e5e5e5;
-		border-radius: 8px;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
 		padding: 1rem;
-		margin-bottom: 1rem;
+		margin-bottom: 0.75rem;
 	}
 
 	.occurrence-header {
 		display: flex;
-		gap: 1rem;
+		align-items: center;
+		gap: 0.75rem;
 		margin-bottom: 0.75rem;
-		font-size: 0.875rem;
+		font-size: 0.75rem;
 	}
 
-	.occurrence-header span {
-		padding: 0.25rem 0.5rem;
-		border-radius: 4px;
-		background: #f3f4f6;
+	.timestamp {
+		font-family: var(--font-mono);
+		color: var(--text-muted);
+	}
+
+	.badge {
+		padding: 0.125rem 0.375rem;
+		border-radius: var(--radius-sm);
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		background: var(--bg-root);
+		color: var(--text-muted);
+		border: 1px solid var(--border-color);
 	}
 
 	.trace-info {
 		display: flex;
 		gap: 1rem;
-		font-size: 0.875rem;
-		color: #666;
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
 		margin-bottom: 0.75rem;
 	}
 
 	.stacktrace {
-		background: #1f2937;
-		color: #e5e7eb;
-		padding: 1rem;
-		border-radius: 6px;
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		padding: 0.875rem;
+		border-radius: var(--radius-sm);
 		overflow-x: auto;
 	}
 
 	.stacktrace h4 {
-		color: #9ca3af;
+		color: var(--text-subtle);
 		margin-bottom: 0.5rem;
-		font-size: 0.75rem;
+		font-size: 0.6875rem;
+		font-family: var(--font-mono);
 		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 
 	.stacktrace pre {
 		margin: 0;
-		font-family: monospace;
+		font-family: var(--font-mono);
 		font-size: 0.75rem;
+		line-height: 1.4;
 	}
 
 	.metadata-toggle {
 		margin-top: 0.75rem;
-		padding: 0.5rem 1rem;
-		border: 1px solid #d1d5db;
-		border-radius: 6px;
-		background: white;
+		padding: 0.25rem 0.625rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		background: var(--bg-root);
+		color: var(--text-muted);
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
 		cursor: pointer;
+		transition: background 0.15s ease, color 0.15s ease;
 	}
 
 	.metadata-toggle:hover {
-		background: #f3f4f6;
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
 	}
 
 	.metadata {
 		margin-top: 0.75rem;
-		background: #f9fafb;
-		padding: 1rem;
-		border-radius: 6px;
+		background: var(--bg-root);
+		border: 1px solid var(--border-color);
+		padding: 0.875rem;
+		border-radius: var(--radius-sm);
 	}
 
 	.metadata h4 {
-		font-size: 0.75rem;
+		font-size: 0.6875rem;
+		font-family: var(--font-mono);
 		text-transform: uppercase;
-		color: #666;
+		color: var(--text-subtle);
 		margin-bottom: 0.5rem;
 	}
 
 	.metadata pre {
-		font-family: monospace;
+		font-family: var(--font-mono);
 		font-size: 0.75rem;
+		color: var(--text-muted);
 		overflow-x: auto;
 	}
 </style>

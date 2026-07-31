@@ -71,7 +71,10 @@
 </script>
 
 <div class="alerts-page">
-	<h1>Alert Configuration</h1>
+	<header class="page-header">
+		<h1>Alert Configuration</h1>
+		<p class="subtitle">Set up real-time notifications for error spikes and threshold breaches</p>
+	</header>
 
 	{#if data.projects.length === 0}
 		<p class="no-projects">You don't have access to any projects yet.</p>
@@ -136,7 +139,7 @@
 
 				<div class="form-row">
 					<div class="form-group">
-						<label for="frequencyThreshold">Frequency Threshold (errors per window)</label>
+						<label for="frequencyThreshold">Threshold (errors per window)</label>
 						<input
 							id="frequencyThreshold"
 							name="frequencyThreshold"
@@ -163,15 +166,15 @@
 				<div class="form-group checkbox-group">
 					<label>
 						<input type="checkbox" bind:checked={enabled} />
-						Enabled
+						<span>Enabled</span>
 					</label>
 				</div>
 
 				<div class="form-actions">
 					{#if editMode}
-						<button type="button" onclick={cancelEdit}>Cancel</button>
+						<button type="button" class="btn btn-cancel" onclick={cancelEdit}>Cancel</button>
 					{/if}
-					<button type="submit" disabled={isSubmitting}>
+					<button type="submit" class="btn btn-submit" disabled={isSubmitting}>
 						{editMode ? 'Update Alert' : 'Create Alert'}
 					</button>
 				</div>
@@ -196,11 +199,11 @@
 					<tbody>
 						{#each data.alertConfigs as config}
 							<tr>
-								<td>{getProjectName(config.projectId)}</td>
-								<td>{config.channel}</td>
+								<td class="project-cell">{getProjectName(config.projectId)}</td>
+								<td class="channel-cell">{config.channel}</td>
 								<td class="channel-target">{config.channelTarget}</td>
-								<td>{config.frequencyThreshold} errors</td>
-								<td>{config.windowSeconds}s</td>
+								<td class="mono-cell">{config.frequencyThreshold} errors</td>
+								<td class="mono-cell">{config.windowSeconds}s</td>
 								<td>
 									<span class="status-badge" class:enabled={config.enabled} class:disabled={!config.enabled}>
 										{config.enabled ? 'Enabled' : 'Disabled'}
@@ -208,7 +211,7 @@
 								</td>
 								<td>
 									{#if hasWritePermission(config.projectId)}
-										<button type="button" onclick={() => startEdit(config)}>Edit</button>
+										<button type="button" class="btn-action" onclick={() => startEdit(config)}>Edit</button>
 									{:else}
 										<span class="no-permission">View only</span>
 									{/if}
@@ -226,25 +229,40 @@
 
 <style>
 	.alerts-page {
-		padding: 2rem;
-		max-width: 1200px;
+		max-width: 1100px;
 		margin: 0 auto;
 	}
 
-	h1 {
-		font-size: 1.75rem;
+	.page-header {
+		border-bottom: 1px solid var(--border-color);
+		padding-bottom: 0.75rem;
 		margin-bottom: 1.5rem;
 	}
 
-	h2 {
+	h1 {
 		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin-bottom: 0.25rem;
+	}
+
+	.subtitle {
+		color: var(--text-muted);
+		font-size: 0.8125rem;
+	}
+
+	h2 {
+		font-size: 0.9375rem;
+		font-weight: 600;
+		color: var(--text-primary);
 		margin-bottom: 1rem;
 	}
 
 	.form-section {
-		background: #f8f9fa;
-		padding: 1.5rem;
-		border-radius: 8px;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		padding: 1.25rem;
+		border-radius: var(--radius-md);
 		margin-bottom: 2rem;
 	}
 
@@ -260,7 +278,9 @@
 
 	label {
 		display: block;
-		margin-bottom: 0.5rem;
+		margin-bottom: 0.375rem;
+		font-size: 0.75rem;
+		color: var(--text-muted);
 		font-weight: 500;
 	}
 
@@ -268,45 +288,62 @@
 	input[type='text'],
 	input[type='number'] {
 		width: 100%;
-		padding: 0.5rem;
-		border: 1px solid #ddd;
-		border-radius: 4px;
-		font-size: 1rem;
+		padding: 0.45rem 0.625rem;
+		background-color: var(--bg-root);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-size: 0.8125rem;
 	}
 
 	.checkbox-group label {
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
+		cursor: pointer;
+		font-size: 0.8125rem;
+		color: var(--text-primary);
 	}
 
 	.form-actions {
 		display: flex;
-		gap: 1rem;
-		margin-top: 1rem;
+		gap: 0.75rem;
+		margin-top: 1.25rem;
 	}
 
-	button {
-		padding: 0.5rem 1rem;
-		border: none;
-		border-radius: 4px;
-		font-size: 1rem;
+	.btn {
+		padding: 0.45rem 1rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		font-weight: 500;
 		cursor: pointer;
+		border: none;
+		transition: background 0.15s ease;
 	}
 
-	button[type='submit'] {
-		background: #2563eb;
-		color: white;
+	.btn-submit {
+		background: var(--color-primary);
+		color: var(--text-primary);
 	}
 
-	button[type='submit']:disabled {
-		background: #93c5fd;
+	.btn-submit:hover:not(:disabled) {
+		background: var(--color-primary-hover);
+	}
+
+	.btn-submit:disabled {
+		opacity: 0.5;
 		cursor: not-allowed;
 	}
 
-	button[type='button'] {
-		background: #e5e7eb;
-		color: #374151;
+	.btn-cancel {
+		background: var(--bg-root);
+		color: var(--text-muted);
+		border: 1px solid var(--border-color);
+	}
+
+	.btn-cancel:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
 	}
 
 	.configs-section {
@@ -316,22 +353,37 @@
 	.configs-table {
 		width: 100%;
 		border-collapse: collapse;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		overflow: hidden;
 	}
 
 	.configs-table th,
 	.configs-table td {
-		padding: 0.75rem;
+		padding: 0.625rem 0.875rem;
 		text-align: left;
-		border-bottom: 1px solid #e5e7eb;
+		font-size: 0.8125rem;
+		border-bottom: 1px solid var(--border-color);
 	}
 
 	.configs-table th {
-		background: #f8f9fa;
-		font-weight: 600;
+		background: var(--bg-root);
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		text-transform: uppercase;
+		color: var(--text-subtle);
+		letter-spacing: 0.05em;
+	}
+
+	.channel-target, .mono-cell {
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		color: var(--text-muted);
 	}
 
 	.channel-target {
-		max-width: 200px;
+		max-width: 180px;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -339,29 +391,49 @@
 
 	.status-badge {
 		display: inline-block;
-		padding: 0.25rem 0.5rem;
-		border-radius: 4px;
-		font-size: 0.875rem;
+		padding: 0.125rem 0.5rem;
+		border-radius: var(--radius-sm);
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 
 	.status-badge.enabled {
-		background: #d1fae5;
-		color: #065f46;
+		background: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
 	}
 
 	.status-badge.disabled {
-		background: #fee2e2;
-		color: #991b1b;
+		background: var(--severity-critical-bg);
+		color: var(--severity-critical-text);
+	}
+
+	.btn-action {
+		background: transparent;
+		border: 1px solid var(--border-color);
+		color: var(--text-muted);
+		padding: 0.25rem 0.5rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+
+	.btn-action:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
 	}
 
 	.no-projects,
 	.no-configs {
-		color: #6b7280;
+		color: var(--text-subtle);
 		margin-top: 2rem;
+		font-size: 0.875rem;
 	}
 
 	.no-permission {
-		color: #9ca3af;
-		font-size: 0.875rem;
+		color: var(--text-subtle);
+		font-size: 0.75rem;
 	}
 </style>

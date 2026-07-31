@@ -1,5 +1,42 @@
 :root {
-	--font-family: system-ui, -apple-system, sans-serif;
+	/* Fonts */
+	--font-sans: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+	/* Color Tokens */
+	--bg-root: #0f172a;
+	--bg-surface: #1e293b;
+	--bg-surface-hover: #334155;
+
+	--border-color: #334155;
+	--border-color-muted: rgba(51, 65, 85, 0.5);
+
+	--text-primary: #f8fafc;
+	--text-muted: #94a3b8;
+	--text-subtle: #64748b;
+
+	/* Brand & Interactive */
+	--color-primary: #3b82f6;
+	--color-primary-hover: #1d4ed8;
+
+	/* Severities & Statuses */
+	--severity-critical-bg: rgba(239, 68, 68, 0.15);
+	--severity-critical-text: #ef4444;
+	--severity-critical-border: rgba(239, 68, 68, 0.3);
+
+	--status-open-bg: rgba(245, 158, 11, 0.15);
+	--status-open-text: #f59e0b;
+
+	--status-resolved-bg: rgba(16, 185, 129, 0.15);
+	--status-resolved-text: #10b981;
+
+	--status-ignored-bg: rgba(148, 163, 184, 0.15);
+	--status-ignored-text: #94a3b8;
+
+	/* Spacing & Radii */
+	--radius-sm: 4px;
+	--radius-md: 6px;
+	--radius-lg: 8px;
 }
 
 * {
@@ -9,6 +46,64 @@
 }
 
 body {
-	font-family: var(--font-family);
+	font-family: var(--font-sans);
+	background-color: var(--bg-root);
+	color: var(--text-primary);
 	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+input, button, select, textarea {
+	font-family: inherit;
+	color: inherit;
+}
+
+input[type="email"],
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select {
+	background-color: var(--bg-root);
+	border: 1px solid var(--border-color);
+	color: var(--text-primary);
+	border-radius: var(--radius-sm);
+	outline: none;
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type="email"]:focus,
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="password"]:focus,
+select:focus {
+	border-color: var(--color-primary);
+	box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+}
+
+/* Mobile Touch & Element Sizing Safeguards */
+@media (max-width: 640px) {
+	button, 
+	.btn, 
+	.nav-link,
+	.btn-signout, 
+	.btn-signin,
+	.btn-action,
+	.clear-btn,
+	.metadata-toggle {
+		min-height: 44px;
+		min-width: 44px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	input[type="email"],
+	input[type="text"],
+	input[type="number"],
+	input[type="password"],
+	select {
+		min-height: 44px;
+		font-size: 16px !important; /* Prevents iOS auto-zoom on focus */
+	}
 }
