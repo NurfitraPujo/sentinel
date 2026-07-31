@@ -171,11 +171,15 @@ func TestMain(m *testing.M) {
 	}
 	fmt.Println("NATS JetStream initialized")
 
-	// Try to start ingestor
+	// Try to start ingestor. redisCfg.Addr must be the isolated redis
+	// testcontainer started above, not the compose redis — see StartIngestor's
+	// doc comment for why an empty/wrong value here silently reintroduces the
+	// same "talked to the wrong backing service" class of bug the private
+	// port fixed for Postgres/NATS.
 	ingestorContainer, err := tc.StartIngestor(ctx,
 		testConfig.Host, testConfig.Port,
 		testConfig.User, testConfig.Password, testConfig.DB,
-		natsConfig.URL,
+		natsConfig.URL, redisCfg.Addr,
 	)
 	if err != nil {
 		fmt.Printf("Failed to start ingestor: %v\n", err)

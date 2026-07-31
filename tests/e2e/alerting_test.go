@@ -408,9 +408,20 @@ func TestU27_ConfigCreatedViaDashboardTakesEffectPromptly(t *testing.T) {
 	// length of a stale-cache window; if invalidation were broken (reload only on the periodic ticker),
 	// none of these events would dispatch inside the budget and the test still fails with the same
 	// message. What re-sending removes is only the requirement that ONE arbitrary event wins a race.
-	if res := f.ingest(f.newEvent()); res.Status != http.StatusAccepted {
-		t.Fatalf("ingest: status %d body %s", res.Status, res.Body)
+	//
+	// 2026-07-31: the paragraph above was written with the fix, but the fix itself was not applied —
+	// the send stayed OUTSIDE the loop and the loop body only slept, so the row kept racing exactly
+	// one event against the reload and flaked again with the identical signature (CI log: "Processing
+	// event" at 08:32:34.214, "reloaded alert configs after alert_config.changed" at 08:32:34.299 —
+	// the event lost by 85ms, and nothing ever re-triggered). A comment describing behaviour the code
+	// does not have is worse than no comment; the send now genuinely happens every iteration.
+	sendOne := func() {
+		t.Helper()
+		if res := f.ingest(f.newEvent()); res.Status != http.StatusAccepted {
+			t.Fatalf("ingest: status %d body %s", res.Status, res.Body)
+		}
 	}
+	sendOne()
 
 	deadlineAt := time.Now().Add(alertsFreshConfigBudget)
 	missingToNeedle := fmt.Sprintf(`email channel_config missing "to" for project=%s`, f.ProjectID)
@@ -444,6 +455,10 @@ func TestU27_ConfigCreatedViaDashboardTakesEffectPromptly(t *testing.T) {
 				"stale-cache gap U27 exists to catch.\n  log tail:\n%s", f.ProjectID,
 				alertsFreshConfigBudget, alertsTail(logs, 40))
 		}
+		// The re-send the doc comment above promises: every iteration puts a fresh event in front of
+		// the dispatcher, so the row no longer depends on one event beating the config reload. All of
+		// them share a fingerprint, so this adds occurrences to one issue rather than new issues.
 		time.Sleep(2 * time.Second)
+		sendOne()
 	}
 }

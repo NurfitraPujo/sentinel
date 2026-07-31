@@ -74,11 +74,25 @@ rtk buf lint && rtk buf generate                # proto lives at packages/proto/
 Running `tests/integration` is **not** in this list on purpose — see Working conventions below before you run it.
 
 When you do run it, use `FORCE_TESTCONTAINERS=1` (see Working conventions). Current state on that path,
-measured 2026-07-31: **76 passed, 2 failed, 9 skipped**. The two failures are `TestIngestAndProcess` and
-`TestSearchIndexing`, both `Expected status 202, got 401`. They are **pre-existing** — confirmed by
-running the same two tests in a clean worktree at `origin/main`, where they fail identically — so do not
-attribute them to whatever you just changed. Both seed `project_api_keys` correctly and the ingestor's
-auth path is unchanged; the cause has not been diagnosed yet.
+measured 2026-07-31: **78 passed, 0 failed, 9 skipped**.
+
+`TestIngestAndProcess` and `TestSearchIndexing` used to fail with `Expected status 202, got 401` — root
+cause diagnosed and fixed 2026-07-31. `tests/integration/testcontainers/ingestor.go` ran the ingestor
+container with `NetworkMode: "host"` and a hardcoded `HostPort: "8080"`. On a machine where the compose
+stack also owns 8080, the container failed to bind, and three separate fallback paths silently returned
+`{HostIP: "localhost", HostPort: "8080"}` with a nil error — plus a health check that probed
+`http://localhost:8080/health`, which the COMPOSE ingestor happily answered. The suite then drove the
+compose ingestor, pointed at the shared dev database, while the test had seeded its project into the
+testcontainer database — hence 401. The fix: the container now binds a private port chosen via
+`net.Listen("tcp", "127.0.0.1:0")` (or `TEST_INGESTOR_PORT` override), passed through as `PORT`; every
+provisioning failure now returns `(nil, error)` instead of a silent fallback; and the health check polls
+that private port specifically, so a foreign process answering on a well-known port can no longer be
+mistaken for readiness. A second, related bug surfaced only once that one was fixed: the container also
+defaults `REDIS_ADDR` under host networking, so it silently shared the docker-compose redis instead of
+its own isolated one — and since `apps/ingestor-go/auth/apikey.go` caches API-key → project lookups in
+Redis, a previous run's cached project id could leak into the next one within the TTL window, producing
+`project not found` failures. `StartIngestor` now takes an explicit `redisAddr` and refuses to start with
+one unset.
 
 **CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs) but has not yet been proven green on a real
 push from this branch — P2/P2b's changes are staged, uncommitted. `go-root`, `go-sdk` and `go-migrations`
