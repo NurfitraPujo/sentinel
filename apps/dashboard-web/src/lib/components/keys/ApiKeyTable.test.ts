@@ -25,6 +25,6 @@ describe('ApiKeyTable Component', () => {
 
 	it('shows empty state when no keys', () => {
 		const { getByText } = render(ApiKeyTable, { keys: [] });
-		expect(getByText('No API keys found.')).toBeTruthy();
+		expect(getByText(/No API keys found/i)).toBeTruthy();
 	});
 });

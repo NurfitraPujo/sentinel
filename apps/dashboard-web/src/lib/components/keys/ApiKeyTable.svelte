@@ -102,7 +102,7 @@
 			{#if activeKeys.length === 0}
 				<tr>
 					<td colspan="6" class="px-6 py-8 text-center text-sm text-gray-400 bg-gray-900/50">
-						No active API keys found. Click "Create API Key" to provision a new credential.
+						No API keys found. Click "Create API Key" to provision a new credential.
 					</td>
 				</tr>
 			{/if}
