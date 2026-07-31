@@ -1,7 +1,7 @@
 # TODO 10: Invitation Acceptance Route & Flow (P9-4)
 
 ## Priority: High
-## Status: Pending
+## Status: Completed
 
 ### Overview
 `POST /api/organizations/[orgId]/invitations` creates valid `organization_invitations` database records with unique tokens. However, nothing in the dashboard consumes or redeems invitation tokens. Any invited user receiving an invitation link hits a 404 error.
