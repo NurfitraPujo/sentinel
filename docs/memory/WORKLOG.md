@@ -176,3 +176,31 @@ has no consumer, drain, or dashboard surface yet.
 `packages/shared-go/nats/subscriber.go`, `packages/sdk-go/`, `tests/contract/sdk_ingestor_test.go`,
 `packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql`.
 
+---
+
+### 2026-07-30 - Stream Bounding, DLQ Class Operations & Two-Layer Alert Configs Shipped (W7)
+
+- **Why durable**: Prevents pipeline livelocks caused by unbounded NATS retention and enables machine-readable classification (`X-Sentinel-Dlq-Class`) for dead letters.
+- **Future mistake prevented**: Unbounded JetStream streams causing storage exhaustion and endless redelivery loops.
+- **Evidence**: `docs/memory/DECISIONS.md` D12, D13, D14; `tests/e2e/dlq_test.go` (U33, U34).
+- **Where to look**: `packages/shared-go/nats/subscriber.go`, `tools/dlq`, `scripts/nats-init.sh`.
+
+---
+
+### 2026-07-31 - End-to-End OpenTelemetry Observability Shipped (W8)
+
+- **Why durable**: Standardizes correlation across HTTP and NATS boundaries using W3C `traceparent` headers without relying on external trace collector availability.
+- **Future mistake prevented**: Silent propagation failures (B11) or memory exhaustion from high-cardinality metric attributes.
+- **Evidence**: `docs/memory/DECISIONS.md` D15, `docs/memory/BUGS.md` B11; `tests/e2e/tracing_test.go` (U35).
+- **Where to look**: `packages/shared-go/obs/`, `apps/ingestor-go/main.go`, `apps/processor-go/main.go`.
+
+---
+
+### 2026-07-31 - Event ID Idempotency & Deduplication Shipped (W9)
+
+- **Why durable**: Guarantees exactly-once event storage per issue via a single-transaction write path (`StoreEvent`) with `event_id` unique indexing.
+- **Future mistake prevented**: Redelivery retry storms inflating `issues.count` or duplicate occurrences corrupting state.
+- **Evidence**: `docs/memory/DECISIONS.md` D16; `tests/integration/event_idempotency_test.go`, `tests/e2e/idempotency_test.go` (U36).
+- **Where to look**: `apps/processor-go/store/store.go`, `packages/proto/sentinel/v1/error_event.proto`, `packages/db-migrations/migrations/1722200000_add_event_id_idempotency.sql`.
+
+

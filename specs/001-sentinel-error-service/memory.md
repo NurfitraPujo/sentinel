@@ -2,16 +2,16 @@
 
 ## Scope Notes
 - This feature implements the core ingestion and processing for error events.
-- It must integrate with the `GracefulDegradation` buffer.
+- Durability is guaranteed by NATS JetStream stream bounds and bounded retries.
 
 ## Relevant Durable Memory
-- **[D1] Graceful Degradation**: Must use the in-memory buffer when Postgres is down.
+- **[D10] Bounded-Retry NATS Delivery**: Uses NATS JetStream bounded retry with dead-letter capture (`ERROR_EVENTS_DLQ`).
 - **[W1] CEL Validation**: Use the defined Protobuf validation rules.
 
 ## Open Questions
-- Should we apply masking (D2 - pending) before or after buffering?
-- What is the retention policy for buffered events if the DB is down for > 1 hour?
+- What is the retention policy for DLQ events? (Resolved: 30 days / 1 GiB per D13).
 
 ## Watchlist
 - Ensure NATS connection is stable before starting the consumer.
-- Monitor memory usage if the database remains unavailable for extended periods.
+- Monitor DLQ depth on `/health` during processing failures.
+

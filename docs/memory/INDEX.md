@@ -31,6 +31,7 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active — confirmed again 2026-07-30: /auth/signin looped forever, nobody could sign in
 - B9 | A Deployment That Never Connects Two Correct Halves | deployment,config,nats,b3 | [BUGS.md](BUGS.md) | active — two instances fixed, cause structural
 - B10 | Tests That Assert The Defect | testing,regression,process | [BUGS.md](BUGS.md) | active — four instances fixed 2026-07-30
+- B11 | Instrumentation Whose Failure Mode Is Silence | opentelemetry,tracing,metrics,testing | [BUGS.md](BUGS.md) | active — library guard + deployment guard
 - B7 | Authenticated Identity Computed, Then Discarded | security,multitenancy,ingestor | [BUGS.md](BUGS.md) | resolved-2026-07-29
 
 ## Decisions
@@ -48,6 +49,8 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - D12 | Two-Layer Alert Configs (organization-wide + project-scoped), UNION not override | alerts,multitenancy,rbac,postgres | [DECISIONS.md](DECISIONS.md) | active — org-wide is API-only, see P9-1
 - D13 | Every JetStream Stream Is Bounded; Discard Policy Chosen Per Role | nats,jetstream,ops,outage | [DECISIONS.md](DECISIONS.md) | active
 - D14 | Dead Letters Carry a Machine-Readable Class; Permanent Failures Never Auto-Replayed | nats,dlq,ops,contracts | [DECISIONS.md](DECISIONS.md) | active
+- D15 | Observability: OTel Everywhere, Trace ID Correlation & Non-Blocking Exporters | opentelemetry,tracing,metrics,slog | [DECISIONS.md](DECISIONS.md) | active
+- D16 | Exactly-Once Event Writes: event_id End to End, One Transaction | idempotency,database,nats,store | [DECISIONS.md](DECISIONS.md) | active
 
 ## Workflow
 - W1 | Adopted CEL for Protobuf Validation | protobuf,validation,buf | [WORKLOG.md](WORKLOG.md) | active
@@ -56,3 +59,7 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - W4 | Shipped Issue Lifecycle Management & Regression Tracking | milestone,lifecycle,regression,triage | [WORKLOG.md](WORKLOG.md) | active
 - W5 | Shipped Official Go Client SDK & Ingestor Batch API | milestone,sdk,go,ingestion,batch | [WORKLOG.md](WORKLOG.md) | active
 - W6 | Shipped Multi-Tenant Auth & API Key Management | milestone,apikeys,auth,ratelimit,multitenancy | [WORKLOG.md](WORKLOG.md) | active
+- W7 | Stream Bounding & DLQ Class Operations Shipped | milestone,nats,dlq,ops | [WORKLOG.md](WORKLOG.md) | active
+- W8 | End-to-End OpenTelemetry Observability Shipped | milestone,opentelemetry,tracing,metrics | [WORKLOG.md](WORKLOG.md) | active
+- W9 | Event ID Idempotency & Deduplication Shipped | milestone,idempotency,postgres,store | [WORKLOG.md](WORKLOG.md) | active
+

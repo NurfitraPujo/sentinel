@@ -8,10 +8,11 @@
 - Complete missing Error Service tasks (T008, T009, T027, T028).
 
 ## Relevant Durable Memory
-- [D1] Graceful Degradation: Must be preserved during refactor.
-- [B1] Data Loss Prevention: Ensure buffer logic remains intact.
+- [D10] Bounded-Retry NATS Delivery: Recovery handled via bounded retries and DLQ.
+- [D16] Exactly-Once Event Writes: `event_id` end-to-end idempotency and atomic writes.
 - [W1] CEL Validation: The core reason for R001.
 
 ## Open Questions
-- Should we use Redis for the Ingestor rate limiter now, or move it to a shared Go package first?
+- Should we use Redis for the Ingestor rate limiter now, or move it to a shared Go package first? (Resolved: Redis sliding window in ingestor-go).
 - Where should the SMTP configuration be stored? Global settings table or project-specific?
+
