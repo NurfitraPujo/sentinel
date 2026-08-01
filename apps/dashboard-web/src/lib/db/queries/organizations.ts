@@ -272,7 +272,8 @@ export async function createOrganizationInvitation(
   email: string,
   role: OrgRoleValue,
   token: string,
-  expiresAt: Date
+  expiresAt: Date,
+  invitedBy?: string
 ) {
   const tokenHash = hashInvitationToken(token);
 
@@ -298,6 +299,7 @@ export async function createOrganizationInvitation(
         tokenHash,
         status: 'pending',
         expiresAt,
+        invitedBy,
       })
       .returning();
 
@@ -338,7 +340,26 @@ export async function getInvitationByToken(token: string) {
 
 export type ClaimInvitationResult =
   | { ok: true; invitation: typeof organizationInvitations.$inferSelect; organization: typeof organizations.$inferSelect; member: typeof organizationMembers.$inferSelect }
-  | { ok: false; reason: 'not_found' | 'already_used' | 'expired' };
+  | { ok: false; reason: 'not_found' | 'already_used' | 'expired' | 'inviter_no_longer_authorized' };
+
+// D31 (residual): mirrors the authority rule enforced at invitation CREATION time
+// (routes/api/organizations/[orgId]/invitations/+server.ts POST) -- only owner/admin may invite at
+// all, and only owner may invite an owner. Re-applied at redemption against the inviter's CURRENT
+// role, not their role at the time they sent the invite.
+function inviterCanStillGrant(inviterRole: string, grantedRole: OrgRoleValue): boolean {
+  if (!['owner', 'admin'].includes(inviterRole)) return false;
+  if (grantedRole === 'owner' && inviterRole !== 'owner') return false;
+  return true;
+}
+
+// D31 (residual): a sentinel thrown INSIDE the db.transaction below, caught OUTSIDE it. Throwing
+// (rather than an early `return` from the callback) is what makes Drizzle roll back the
+// status='accepted' UPDATE that already ran -- a plain `return` from a transaction callback commits
+// whatever the callback did so far, which would have burned the token on a refused redemption even
+// though no membership was granted. Rolling back instead leaves the invitation 'pending', so it can
+// still be redeemed later if the inviter's authority is restored, without ever being replayable in
+// a way that grants membership on this failed attempt.
+class InviterNoLongerAuthorizedError extends Error {}
 
 /**
  * D07: atomically claims an invitation and provisions membership. This is ONE conditional UPDATE
@@ -354,6 +375,17 @@ export type ClaimInvitationResult =
 export async function claimInvitation(rawToken: string, userId: string): Promise<ClaimInvitationResult> {
   const tokenHash = hashInvitationToken(rawToken);
 
+  try {
+    return await claimInvitationTx(tokenHash, userId);
+  } catch (err) {
+    if (err instanceof InviterNoLongerAuthorizedError) {
+      return { ok: false, reason: 'inviter_no_longer_authorized' };
+    }
+    throw err;
+  }
+}
+
+async function claimInvitationTx(tokenHash: string, userId: string): Promise<ClaimInvitationResult> {
   return await db.transaction(async (tx) => {
     const [claimed] = await tx
       .update(organizationInvitations)
@@ -380,6 +412,30 @@ export async function claimInvitation(rawToken: string, userId: string): Promise
 
     if (!isOrgRole(claimed.role)) {
       throw new Error(`Invitation ${claimed.id} has an unrecognized role '${claimed.role}'; refusing to grant it.`);
+    }
+
+    // D31 (residual): the invitation captured a role that was valid to grant AT CREATION TIME, but
+    // an owner/admin invite can sit pending for up to 7 days. If the inviter has since been
+    // demoted or removed, their outstanding grant must not still be honored -- a pending 'owner'
+    // invite from a now-viewer should not mint a new owner. `invited_by` is nullable (rows created
+    // before this column existed, or an inviter whose account was deleted) and unrecordable
+    // authority is treated the same as *lost* authority: refuse, don't guess. Throwing here (see
+    // InviterNoLongerAuthorizedError above) rolls back the status='accepted' write above, so the
+    // invitation stays 'pending' rather than being burned on a refused attempt.
+    if (!claimed.invitedBy) {
+      throw new InviterNoLongerAuthorizedError();
+    }
+    const [inviterMembership] = await tx
+      .select({ role: organizationMembers.role })
+      .from(organizationMembers)
+      .where(
+        and(
+          eq(organizationMembers.organizationId, claimed.organizationId),
+          eq(organizationMembers.userId, claimed.invitedBy)
+        )
+      );
+    if (!inviterMembership || !inviterCanStillGrant(inviterMembership.role, claimed.role)) {
+      throw new InviterNoLongerAuthorizedError();
     }
 
     const [organization] = await tx.select().from(organizations).where(eq(organizations.id, claimed.organizationId));

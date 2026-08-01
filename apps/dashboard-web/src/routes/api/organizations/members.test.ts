@@ -548,7 +548,10 @@ describe('Organization Member Management Routes', () => {
         'newuser@company.com',
         'engineer',
         expect.any(String),
-        expect.any(Date)
+        expect.any(Date),
+        // D31 (residual): the inviter's id is recorded so redemption can re-check, at claim time,
+        // that they still hold authority to grant this role.
+        'user-caller'
       );
       // The endpoint generates its own 256-bit (32-byte -> 64 hex char) raw token via
       // crypto.randomBytes internally; createOrganizationInvitation hashes it before persisting

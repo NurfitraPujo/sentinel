@@ -31,6 +31,7 @@ vi.mock('$lib/db/schema', () => ({
 		expiresAt: 'expiresAt',
 		createdAt: 'createdAt',
 		acceptedAt: 'acceptedAt',
+		invitedBy: 'invitedBy',
 	},
 	userSessionPreferences: { userId: 'userId', lastActiveOrganizationId: 'lastActiveOrganizationId' },
 	projects: { id: 'id', organizationId: 'organizationId' },
@@ -157,11 +158,36 @@ vi.mock('$lib/server/db', () => ({
 	},
 }));
 
+// Deep-copies every row so a restore doesn't share references with rows a transaction may have
+// mutated in place (the fake's `update` handler does `Object.assign(row, patch)`).
+function snapshotStore(s: typeof store) {
+	return {
+		organizations: new Map(Array.from(s.organizations, ([k, v]) => [k, { ...v }])),
+		organizationMembers: new Map(Array.from(s.organizationMembers, ([k, v]) => [k, { ...v }])),
+		organizationInvitations: new Map(Array.from(s.organizationInvitations, ([k, v]) => [k, { ...v }])),
+	};
+}
+
 function resetDb() {
 	store = makeStore();
 	const executor = makeExecutor(store);
 	Object.assign(dbMock, executor);
-	dbMock.transaction = async (cb: any) => cb(makeExecutor(store));
+	// D31 (residual): claimInvitation throws INSIDE db.transaction to roll back its own earlier
+	// UPDATE when the inviter's authority check fails, so the invitation stays 'pending' rather than
+	// being burned on a refused redemption -- without this, the fake would apply every write a
+	// callback made regardless of whether it threw, and a test asserting "still pending after
+	// refusal" would pass even against a claimInvitation that never rolled back anything for real.
+	dbMock.transaction = async (cb: any) => {
+		const snapshot = snapshotStore(store);
+		try {
+			return await cb(makeExecutor(store));
+		} catch (err) {
+			store.organizations = snapshot.organizations;
+			store.organizationMembers = snapshot.organizationMembers;
+			store.organizationInvitations = snapshot.organizationInvitations;
+			throw err;
+		}
+	};
 }
 
 const {
@@ -177,6 +203,10 @@ beforeEach(() => {
 	idCounter = 0;
 });
 
+// D31 (residual): defaults `invitedBy` to a seeded, currently-authorized owner ('inviter-1') so
+// every EXISTING test below -- written before the inviter-authority check existed -- keeps passing
+// unchanged. Tests that specifically exercise the new check pass `invitedBy: null` or seed a
+// DIFFERENT inviter membership (or none) to defeat it deliberately.
 function seedInvitation(overrides: Partial<Row> = {}) {
 	const token = overrides.__rawToken ?? 'raw-token-abc';
 	const tokenHash = hashInvitationToken(token);
@@ -190,11 +220,20 @@ function seedInvitation(overrides: Partial<Row> = {}) {
 		expiresAt: new Date(Date.now() + 60_000),
 		createdAt: new Date(),
 		acceptedAt: null,
+		invitedBy: 'inviter-1',
 		...overrides,
 	};
 	delete row.__rawToken;
 	store.organizationInvitations.set(row.id, row);
 	store.organizations.set('org-1', { id: 'org-1', name: 'Acme', slug: 'acme' });
+	if (row.invitedBy && !store.organizationMembers.has(`org-1:${row.invitedBy}`)) {
+		store.organizationMembers.set(`org-1:${row.invitedBy}`, {
+			id: `mem-${row.invitedBy}`,
+			organizationId: 'org-1',
+			userId: row.invitedBy,
+			role: 'owner',
+		});
+	}
 	return { token, row };
 }
 
@@ -216,7 +255,10 @@ describe('claimInvitation (D06, D07, D31)', () => {
 			expect(result.invitation.acceptedAt).toBeInstanceOf(Date);
 			expect(result.member.role).toBe('viewer');
 		}
-		expect(store.organizationMembers.size).toBe(1);
+		// Not .size === 1: seedInvitation now also seeds the inviter's own membership row by
+		// default (D31 residual), so asserting the SPECIFIC accepting-user row is what this test
+		// actually means to check.
+		expect(store.organizationMembers.get('org-1:user-1')?.role).toBe('viewer');
 	});
 
 	it('a second redemption of the same token after success returns already_used, with no second membership write', async () => {
@@ -226,7 +268,7 @@ describe('claimInvitation (D06, D07, D31)', () => {
 		const second = await claimInvitation(token, 'user-1');
 
 		expect(second).toEqual({ ok: false, reason: 'already_used' });
-		expect(store.organizationMembers.size).toBe(1);
+		expect(store.organizationMembers.get('org-1:user-1')?.role).toBe('viewer');
 	});
 
 	it('refuses an expired token without provisioning membership', async () => {
@@ -235,7 +277,7 @@ describe('claimInvitation (D06, D07, D31)', () => {
 		const result = await claimInvitation(token, 'user-1');
 
 		expect(result).toEqual({ ok: false, reason: 'expired' });
-		expect(store.organizationMembers.size).toBe(0);
+		expect(store.organizationMembers.has('org-1:user-1')).toBe(false);
 	});
 
 	it('refuses an unknown token', async () => {
@@ -266,7 +308,7 @@ describe('claimInvitation (D06, D07, D31)', () => {
 		expect(successes).toHaveLength(1);
 		expect(failures).toHaveLength(1);
 		expect((failures[0] as any).reason).toBe('already_used');
-		expect(store.organizationMembers.size).toBe(1);
+		expect(store.organizationMembers.get('org-1:user-1')?.role).toBe('viewer');
 	});
 
 	it('D31: refuses to grant a role that is not on the allowlist, even though it was already stored', async () => {
@@ -274,7 +316,7 @@ describe('claimInvitation (D06, D07, D31)', () => {
 		const token = 'raw-token-abc';
 
 		await expect(claimInvitation(token, 'user-1')).rejects.toThrow(/unrecognized role/i);
-		expect(store.organizationMembers.size).toBe(0);
+		expect(store.organizationMembers.has('org-1:user-1')).toBe(false);
 	});
 
 	it('D08: an owner accepting a viewer invitation to their own org remains owner', async () => {
@@ -290,6 +332,108 @@ describe('claimInvitation (D06, D07, D31)', () => {
 
 		expect(result.ok).toBe(true);
 		expect(store.organizationMembers.get('org-1:user-1')?.role).toBe('owner');
+	});
+
+	// D31 residual: a pending invitation's role was validated against the allowlist at redemption,
+	// but nothing checked that the INVITER still had authority to grant it. These four tests cover
+	// the cases that check closes, plus that a refusal rolls back cleanly rather than burning the
+	// token.
+	describe('inviter authority re-checked at redemption (D31 residual)', () => {
+		it('refuses when the invitation has no recorded inviter (invitedBy is null)', async () => {
+			const { token } = seedInvitation({ invitedBy: null });
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result).toEqual({ ok: false, reason: 'inviter_no_longer_authorized' });
+			expect(store.organizationMembers.has('org-1:user-1')).toBe(false);
+		});
+
+		it('refuses when the inviter is no longer a member of the organization', async () => {
+			// seedInvitation's default auto-seeds 'inviter-1' as owner; remove that membership to
+			// simulate the inviter having been removed from the org after sending the invite.
+			const { token } = seedInvitation();
+			store.organizationMembers.delete('org-1:inviter-1');
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result).toEqual({ ok: false, reason: 'inviter_no_longer_authorized' });
+			expect(store.organizationMembers.has('org-1:user-1')).toBe(false);
+		});
+
+		it('refuses when the inviter has been demoted below the authority to grant the invited role', async () => {
+			// An 'owner' invite, but the inviter (who WAS owner when they sent it) has since been
+			// demoted to 'admin' -- an admin cannot grant owner (mirrors the creation-time rule in
+			// routes/api/organizations/[orgId]/invitations/+server.ts).
+			const { token } = seedInvitation({ role: 'owner' });
+			store.organizationMembers.set('org-1:inviter-1', {
+				id: 'mem-inviter-1',
+				organizationId: 'org-1',
+				userId: 'inviter-1',
+				role: 'admin',
+			});
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result).toEqual({ ok: false, reason: 'inviter_no_longer_authorized' });
+		});
+
+		it('refuses when the inviter has been demoted to a role that cannot invite at all', async () => {
+			const { token } = seedInvitation();
+			store.organizationMembers.set('org-1:inviter-1', {
+				id: 'mem-inviter-1',
+				organizationId: 'org-1',
+				userId: 'inviter-1',
+				role: 'viewer',
+			});
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result).toEqual({ ok: false, reason: 'inviter_no_longer_authorized' });
+		});
+
+		it('succeeds when the inviter is demoted but their CURRENT role still authorizes the grant', async () => {
+			// Invited as 'engineer' by an owner; owner is later demoted to 'admin' -- admin can still
+			// grant non-owner roles, so this must succeed. Proves the check is not simply "any change
+			// is refused" but specifically "does the CURRENT role still authorize THIS grant".
+			const { token } = seedInvitation({ role: 'engineer' });
+			store.organizationMembers.set('org-1:inviter-1', {
+				id: 'mem-inviter-1',
+				organizationId: 'org-1',
+				userId: 'inviter-1',
+				role: 'admin',
+			});
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result.ok).toBe(true);
+			expect(store.organizationMembers.get('org-1:user-1')?.role).toBe('engineer');
+		});
+
+		// The regression fence for the transaction-rollback design: a refusal must not consume the
+		// token. If claimInvitation returned early from inside db.transaction instead of throwing,
+		// the fake's rollback (added specifically to catch this) would not fire, and this row would
+		// incorrectly show 'accepted' here.
+		it('leaves the invitation status as pending (not accepted) after a refused redemption, so it is not burned', async () => {
+			const { token, row } = seedInvitation({ invitedBy: null });
+
+			const result = await claimInvitation(token, 'user-1');
+
+			expect(result.ok).toBe(false);
+			expect(store.organizationInvitations.get(row.id)?.status).toBe('pending');
+			expect(store.organizationInvitations.get(row.id)?.acceptedAt).toBeNull();
+
+			// And because it is still pending, restoring the inviter's authority lets the SAME token
+			// succeed on a later attempt -- confirming the token was never consumed.
+			store.organizationMembers.set('org-1:inviter-1', {
+				id: 'mem-inviter-1',
+				organizationId: 'org-1',
+				userId: 'inviter-1',
+				role: 'owner',
+			});
+			store.organizationInvitations.get(row.id)!.invitedBy = 'inviter-1';
+			const retry = await claimInvitation(token, 'user-1');
+			expect(retry.ok).toBe(true);
+		});
 	});
 });
 

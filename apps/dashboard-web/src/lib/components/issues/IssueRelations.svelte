@@ -28,7 +28,20 @@
 
 	let { currentIssueId, initialRelations = [], onStatusChangeRequest }: Props = $props();
 
-	let relations = $state<RelationItem[]>(initialRelations);
+	// Seeded empty, not from `initialRelations` (the declaration referencing a prop directly is what
+	// state_referenced_locally flags) -- the $effect below runs immediately on mount and assigns the
+	// real initial value, then re-runs whenever `initialRelations` itself changes later. Without the
+	// effect, `relations` would only ever reflect what was true the moment this component was
+	// created: if the parent's loader data changes without a full remount (e.g. an `invalidateAll()`
+	// triggered by the status-change handler this component calls into via onStatusChangeRequest),
+	// `relations` would silently drift from what the server now has. Local optimistic updates
+	// (link/unlink below) mutate `relations` directly and never touch `initialRelations`, so
+	// re-syncing on every actual prop change is safe -- it never clobbers an in-flight local edit,
+	// it only fires when NEW data arrives from the server.
+	let relations = $state<RelationItem[]>([]);
+	$effect(() => {
+		relations = initialRelations;
+	});
 	let searchQuery = $state('');
 	let searchResults = $state<RelatedIssue[]>([]);
 	let selectedRelationType = $state<RelationType>('linked_to');

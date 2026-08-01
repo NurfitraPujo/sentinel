@@ -102,7 +102,16 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
 
-  const invite = await createOrganizationInvitation(orgId, normalizedEmail, role as Role, token, expiresAt);
+  // D31 (residual): recorded so claimInvitation can re-check at redemption time that the inviter
+  // still holds authority to grant `role` -- not just that they did when this request was made.
+  const invite = await createOrganizationInvitation(
+    orgId,
+    normalizedEmail,
+    role as Role,
+    token,
+    expiresAt,
+    session.user.id
+  );
 
   // Fetch organization name for email dispatch
   const [org] = await db

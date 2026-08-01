@@ -146,6 +146,16 @@ export const actions: Actions = {
 			if (result.reason === 'expired') {
 				return fail(400, { error: 'This invitation has expired' });
 			}
+			if (result.reason === 'inviter_no_longer_authorized') {
+				// D31 (residual): the invitation itself is untouched -- claimInvitation rolled back the
+				// claim, so it is still 'pending' and can be redeemed later if the inviter's authority is
+				// restored. Deleting the cookie here only ends this browser round trip; it does not burn
+				// the token, so revisiting the emailed link tries again rather than dead-ending.
+				return fail(403, {
+					error:
+						'The person who sent this invitation no longer has permission to grant that role. Ask a current owner or admin to re-invite you.'
+				});
+			}
 			return fail(404, { error: 'Invitation token not found or already redeemed' });
 		}
 

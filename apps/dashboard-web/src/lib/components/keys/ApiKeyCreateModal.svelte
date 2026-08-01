@@ -107,17 +107,23 @@
 				</select>
 			</div>
 
-			<div>
-				<label class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Scope Scope</label>
+			<fieldset class="border-0 p-0 m-0">
+				<!--
+					A `<label>` here (not associated with any single control -- it groups a set of radio
+					inputs, not one) was flagged by a11y_label_has_associated_control. `<fieldset>` +
+					`<legend>` is the correct HTML semantics for a labeled group of radio inputs, and gives
+					the group an accessible name the way a bare label never could.
+				-->
+				<legend class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Scope</legend>
 				<div class="space-y-2">
 					{#each availableScopes as sc}
 						<label class="flex items-start gap-2.5 p-2 rounded-lg bg-gray-950/60 border border-gray-800/80 hover:border-gray-700 cursor-pointer transition-colors">
-							<input 
-								type="radio" 
-								name="scope-group" 
-								value={sc.id} 
-								bind:group={scope} 
-								class="mt-1 accent-emerald-500 bg-gray-900" 
+							<input
+								type="radio"
+								name="scope-group"
+								value={sc.id}
+								bind:group={scope}
+								class="mt-1 accent-emerald-500 bg-gray-900"
 							/>
 							<div>
 								<div class="text-xs font-medium text-gray-200">{sc.label}</div>
@@ -126,7 +132,7 @@
 						</label>
 					{/each}
 				</div>
-			</div>
+			</fieldset>
 
 			<div>
 				<label for="rate-limit" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Rate Limit Override (RPM)</label>

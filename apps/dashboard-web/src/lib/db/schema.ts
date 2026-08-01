@@ -36,6 +36,10 @@ export const organizationInvitations = pgTable('organization_invitations', {
 	createdAt: timestamp('created_at').defaultNow(),
 	// D07: set atomically by the single conditional UPDATE that claims a redemption.
 	acceptedAt: timestamp('accepted_at'),
+	// D31 (residual): who issued this invitation, so claimInvitation can re-check at redemption
+	// time that the inviter still holds authority to grant `role` -- see the migration's comment
+	// (1722500000) for why a demoted/removed inviter's outstanding grant must not still honor.
+	invitedBy: varchar('invited_by', { length: 255 }).references(() => users.id, { onDelete: 'set null' }),
 });
 
 export const userSessionPreferences = pgTable('user_session_preferences', {

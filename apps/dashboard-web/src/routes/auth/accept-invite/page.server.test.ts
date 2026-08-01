@@ -141,6 +141,28 @@ describe('/auth/accept-invite actions.accept (D06, D07)', () => {
 
 		expect(result.status).toBe(409);
 	});
+
+	// D31 (residual): the inviter's authority is re-checked at redemption, not just at creation. A
+	// pending invite from a since-demoted/removed owner or admin must not still mint membership.
+	it('surfaces inviter_no_longer_authorized as a 403 with a message telling the user what to do', async () => {
+		const cookies = makeCookies('raw-token');
+		orgQueries.getInvitationByToken.mockResolvedValueOnce({
+			invitation: { email: 'user@example.com' },
+			organization: { id: 'org-1', slug: 'acme' },
+		});
+		orgQueries.claimInvitation.mockResolvedValueOnce({
+			ok: false,
+			reason: 'inviter_no_longer_authorized',
+		});
+
+		const result: any = await (actions as any).accept({
+			locals: { auth: async () => ({ user: { email: 'user@example.com' } }) },
+			cookies,
+		});
+
+		expect(result.status).toBe(403);
+		expect(result.data.error).toMatch(/no longer has permission/i);
+	});
 });
 
 describe('/auth/accept-invite actions.google / actions.magiclink (D06)', () => {

@@ -239,8 +239,14 @@
 
 				<!-- Form Scope Switcher -->
 				<div class="form-group">
-					<label>Alert Rule Scope</label>
-					<div class="segmented-control">
+					<!--
+						A bare `<label>` above a group of buttons (not one control it can associate with)
+						was flagged by a11y_label_has_associated_control. This is a two-way toggle between
+						buttons, not a set of radio inputs, so fieldset/legend doesn't fit either -- a
+						labeled ARIA group is the correct semantics here.
+					-->
+					<span id="alert-rule-scope-label" class="form-group-label">Alert Rule Scope</span>
+					<div class="segmented-control" role="group" aria-labelledby="alert-rule-scope-label">
 						<button
 							type="button"
 							class="segmented-btn"
@@ -297,7 +303,12 @@
 					</div>
 				{:else}
 					<div class="form-group">
-						<label>Target Scope</label>
+						<!--
+							`for="organizationId"` associates this with the real select below when it renders
+							(userOrganizations.length > 1). When it doesn't (the org-badge branch), there is no
+							form control to associate with at all -- nothing here needs a label then either.
+						-->
+						<label for="organizationId">Target Scope</label>
 						{#if data.userOrganizations.length > 1}
 							<select
 								id="organizationId"
@@ -554,7 +565,8 @@
 		gap: 1rem;
 	}
 
-	label {
+	label,
+	.form-group-label {
 		display: block;
 		margin-bottom: 0.375rem;
 		font-size: 0.75rem;
