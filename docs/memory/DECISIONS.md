@@ -633,7 +633,11 @@ On a collision the project-scoped config wins, so its threshold and window apply
 which has the same blast radius. `PUT`/`DELETE` authorize against the **stored row**, never the request
 body; otherwise a project-only member could edit an org-wide config by misreporting what they are editing.
 
-**Known gap**: org-wide configs are API-only. See P9-1.
+~~**Known gap**: org-wide configs are API-only. See P9-1.~~ **RESOLVED 2026-08-01** — the UI shipped
+(`apps/dashboard-web/src/routes/settings/alerts/+page.svelte`) and, as of the UI parity remediation,
+actually runs. Note it shipped BEFORE it worked: the dispatcher kept only ONE config per key
+(`map[string]*AlertConfig`), so a second org-wide rule was silently dropped at load until finding D04
+was fixed. See `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`.
 
 **Trade-off accepted**: the processor caches `projectOrg` alongside configs so resolution needs no per-event
 organization lookup. All three maps are replaced together under one lock. The cost is that a project moved
@@ -796,3 +800,93 @@ plan itself was adversarially reviewed before implementation; §0 there records 
   both Go-side guards agree on 64. A byte count would strip multibyte clients of dedup silently.
 - Duplicates are diagnostic signal, not noise: a dedup hit means a lost ACK, a retry storm, or a
   client bug — hence the metric, never a silent drop. Silence is this repo's characteristic failure.
+
+
+---
+
+## D17 | An Organization Role Is an Org-Wide Grant; Project Membership Is the Alternative Path, Not an Extra Hurdle
+
+**Date**: 2026-08-01 · **Status**: accepted · **Detail**: `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`
+(findings D10 and D23) · **Code**: `apps/dashboard-web/src/lib/server/issue-access.ts`
+
+### Decision
+
+Two membership tables coexist in this codebase — `organization_members` (org-wide roles: `owner`,
+`admin`, `engineer`, `support`, `viewer`) and `project_members` (per-project grants). Issue access
+resolves them as **OR, not AND**:
+
+1. If the caller's **org role** is on `ISSUE_WRITE_ROLES` (`owner|admin|engineer|support`), that alone
+   grants access to every project in the org. No `project_members` row is required or consulted.
+2. Otherwise (i.e. org `viewer`, or a role with no write authority), a `project_members` row for the
+   specific project grants **read only**. A project grant never conveys write.
+3. Both the single-issue and bulk paths go through one function — `requireProjectAccess`, with
+   `requireIssueAccess` resolving issue→project and delegating to it — so the two cannot drift apart.
+
+### Why
+
+- The two paths had drifted in **both** directions before this was unified. The single-issue endpoints
+  (`PATCH /api/issues/:id/status`, `/api/issues/search`, and the relations endpoints) checked only that
+  an `organization_members` row *existed*, with no role gate at all — so an org `viewer`, who is refused
+  by the bulk endpoint's allowlist, could resolve issues **one at a time** (finding D10). Then, once a
+  role gate was added, the bulk path became the more permissive of the two because it never checked
+  project membership (finding D23).
+- The first attempt required org role **AND** a `project_members` row. That was wrong, and **e2e proved
+  it**: U13 failed because an org admin could not link two issues in their own organization. In practice
+  `project_members` is populated only for per-project grants, never for org-level staff — so requiring
+  both locks administrators out of the projects they administer. A unit test asserting the stricter model
+  had to be rewritten; **the e2e test was right and the unit test was wrong.**
+- Read is gated too, not just write: an org `viewer` with no project membership cannot enumerate a
+  project's issues via `search`, which is what D10's cross-project disclosure concern was actually about.
+
+### Consequences
+
+- `ISSUE_WRITE_ROLES` is the single source of truth for "may mutate an issue". Adding a role to that
+  constant grants it org-wide write on every project — deliberately blunt, and the reason the constant is
+  exported and named rather than inlined per endpoint.
+- `project_members` cannot be used to *restrict* an org-level role, only to *extend* access to someone
+  who lacks one. If a future requirement needs "org admin, but only for projects X and Y", this model
+  cannot express it and must change rather than be worked around at a call site.
+- Page loads still use `checkProjectAccess` (`lib/server/projects.ts`) — that path was not unified here
+  and remains a third, narrower model. Worth converging; not converged.
+
+
+## D18 | An Invitation's Authority Is Re-Validated at Redemption, Not Just at Issue
+
+**Date**: 2026-08-01 · **Status**: accepted · **Detail**: `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`
+(finding D31) · **Code**: `claimInvitation` in `apps/dashboard-web/src/lib/db/queries/organizations.ts`,
+migration `1722500000_add_invitation_invited_by.sql`
+
+### Decision
+
+`organization_invitations` records `invited_by`. At redemption, inside the **same transaction** that
+claims the row, `claimInvitation` re-applies the exact rule enforced at creation — only `owner`/`admin`
+may invite, only `owner` may grant `owner` — against the inviter's **current** role. If the inviter has
+since been demoted, removed, or is unrecorded (`invited_by IS NULL`), redemption is refused with
+`inviter_no_longer_authorized`.
+
+The refusal **throws** rather than returning from the transaction callback, so the `status='accepted'`
+claim rolls back and the invitation stays `pending`.
+
+### Why
+
+- An invitation is valid for 7 days. Without this, a pending `owner` invite issued by someone since
+  demoted to `viewer` still minted a new owner — the grant outlived the granter's authority, which is a
+  privilege-escalation path that needs no attacker, just ordinary staff turnover.
+- Validating the *role value* against an allowlist at redemption (already done) is not the same check:
+  it proves the row is well-formed, not that anyone is still entitled to honour it.
+- **Returning from inside `db.transaction` COMMITS whatever the callback already did.** The first
+  implementation returned early and would therefore have burned the token on every refused redemption —
+  the invitation consumed, no membership granted, no way to retry. Throwing a sentinel error caught
+  outside the transaction is what makes the rollback real. This is not a Drizzle quirk to route around;
+  it is how transaction callbacks work, and the same trap applies to every early return added to one.
+
+### Consequences
+
+- `invited_by` is nullable and `ON DELETE SET NULL`, and a NULL is treated as **lost** authority, not
+  absent policy — fail closed. Invitations created before this column existed therefore cannot be
+  redeemed and must be re-sent. That is the intended trade.
+- A refused redemption is retryable: the row stays `pending`, so restoring the inviter's authority (or
+  re-inviting) makes the same emailed link work. Verified by a test that refuses, restores, and redeems.
+- The test fake for `db.transaction` had to be taught to snapshot and roll back on throw before it could
+  detect a regression here — a fake that always applies the callback's writes cannot distinguish the
+  correct design from the flawed one. See BUGS.md B10's addendum.

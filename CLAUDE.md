@@ -27,6 +27,12 @@ A task is not fully complete until memory has been reviewed and systemic lessons
 > **[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** is the phased plan that fixes those
 > findings, with a 32-row use-case matrix defining "working end-to-end". Work items are ID'd `P0-1`, `P2-3`,
 > … — reference those IDs in commits.
+>
+> **[docs/plans/UI_PARITY_REMEDIATION_PLAN.md](docs/plans/UI_PARITY_REMEDIATION_PLAN.md)** is the same
+> exercise for the dashboard (47 findings, `D01`–`D47`, all closed 2026-08-01). It exists because five
+> reviewed, merged, test-passing dashboard features were audited and **three of them did not run at all**.
+> **Beware the ID collision**: `D01`–`D47` there are *findings*; `D1`–`D18` in `DECISIONS.md` are
+> *architecture decisions*. Always name the file when citing a `D` number.
 
 ### Repository shape
 
@@ -59,12 +65,16 @@ constraint still invalidates test plans that assume `go-root` sees local, uncomm
 
 ```bash
 rtk go build ./... && rtk go vet ./...          # root module — green
-rtk go test ./tests/unit/...                    # green, 303 assertions
+rtk go test ./tests/unit/...                    # green, 308 passed
 cd packages/sdk-go && rtk go test ./...         # separate module — green
 cd packages/db-migrations && rtk go test ./...  # separate module — green
 docker compose up -d --build --force-recreate   # full stack incl. redis + migrate; plain `up -d` does NOT rebuild
 ./scripts/wait-healthy.sh                       # then this — blocks until every service reports healthy
-cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 960 files/0 errors (2 pre-existing warnings), 90 tests
+cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 1024 files/0 errors/0 warnings, 251 tests
+                                                  # run ALL THREE. `pnpm build` is the ONLY one that enforces
+                                                  # SvelteKit's route-export allowlist — check+test pass while
+                                                  # build fails on it (B12). Add --sequence.shuffle to `pnpm test`
+                                                  # before trusting it; order-independence decays silently (B13).
 SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 76 passed, 0 skips — NEEDS the compose stack up
                                                                   # -tags=e2e is mandatory; without it U8-U10 are silently excluded
                                                                   # U35 additionally needs `jaeger` up; it fails (never skips) if not
@@ -74,7 +84,10 @@ rtk buf lint && rtk buf generate                # proto lives at packages/proto/
 Running `tests/integration` is **not** in this list on purpose — see Working conventions below before you run it.
 
 When you do run it, use `FORCE_TESTCONTAINERS=1` (see Working conventions). Current state on that path,
-measured 2026-07-31: **78 passed, 0 failed, 9 skipped**.
+measured 2026-07-31: **78 passed, 0 failed, 9 skipped**. Note that on at least one authoring machine
+(rootless podman) nine `TestProcessorService_*` tests fail with `postgres ping unavailable ... connection
+refused` from a testcontainers lifecycle problem, while **passing in CI** — reproduce in CI before
+"fixing" a failure on this path.
 
 `TestIngestAndProcess` and `TestSearchIndexing` used to fail with `Expected status 202, got 401` — root
 cause diagnosed and fixed 2026-07-31. `tests/integration/testcontainers/ingestor.go` ran the ingestor
@@ -94,17 +107,30 @@ Redis, a previous run's cached project id could leak into the next one within th
 `project not found` failures. `StartIngestor` now takes an explicit `redisAddr` and refuses to start with
 one unset.
 
-**CI exists as of P0-1** (`.github/workflows/ci.yml`, 7 jobs) but has not yet been proven green on a real
-push from this branch — P2/P2b's changes are staged, uncommitted. `go-root`, `go-sdk` and `go-migrations`
-pin `GOWORK=off` deliberately (see A2) — `contract` is the only workspace-mode job; `integration` is
-job-level `continue-on-error` because its failures are real (10 of 75 tests, current count — re-verify, do
-not quote this). Run the relevant command yourself before claiming anything works.
+**CI is green on `main` as of 2026-08-01** — all 9 check runs (8 jobs; `go-sdk` runs a 2-leg
+Go-version matrix) on the `push` event for merge commit `b895df1`
+(PR #11). This is the FIRST green run on `main`; `gh run list --branch main` records the previous
+baseline `b9e2018` as `failure`. Any older claim in this repo that CI "has not yet been proven green on a
+real push" is stale. `go-root`, `go-sdk` and `go-migrations` pin `GOWORK=off` deliberately (see A2) —
+`contract`, `integration` and `e2e` deliberately do NOT set it — they run in workspace mode so the
+real SDK is importable (see the comment at `ci.yml`'s `e2e` job). Run the relevant command yourself before claiming anything
+works; a green CI badge is evidence about `main`, not about your working tree.
 
-### Known-broken as of 2026-07-30
+Two CI failures during that work are worth knowing about, because both were "green locally, red in CI"
+and neither is exotic — see B12/B13 and VERIFIED_STATE.md's UI-parity entry:
+- **Migrations must be idempotent.** One flat directory serves several goose ledgers against the SAME
+  physical database (A1), so every migration is replayed per target. Use `IF NOT EXISTS`; `ADD CONSTRAINT`
+  has no such form and needs a `pg_constraint` catalog guard. An unguarded `ADD COLUMN` took down four
+  migration tests.
+- **A test must create the state it asserts on.** A guard that queried for "any issue row that exists"
+  passed against a dev DB full of e2e leftovers and failed against CI's freshly-migrated, empty one.
 
-S1–S17 are **resolved**, and so is every defect P7 found — see `## Resolved` in `VERIFIED_STATE.md`.
-**All 32 rows of the use-case matrix are green** (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → 56
-passed, 0 skipped, 124.8s), gated in CI by the `e2e` job.
+### Known-broken as of 2026-08-01
+
+S1–S18 are **resolved**, and so is every defect P7 found and the 47-finding UI parity register
+(D01–D47) — see `## Resolved` in `VERIFIED_STATE.md`. **All 32 rows of the use-case matrix are green**
+(`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **76 passed, 0 skipped**), gated in CI by the `e2e`
+job.
 
 `scripts/db/init.sql` — the third, stale schema that caused three separate defects of the same family —
 was **deleted** on 2026-07-30. Nothing referenced it: no container mounted it, no test applied it, and the
@@ -112,11 +138,12 @@ Taskfile comment already recorded that it had never been wired up. It survived o
 values to copy from.
 
 **Work that is deliberately deferred is documented as P9 in
-[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)** — org-wide alert UI and
-invitation acceptance, each with the reason and the acceptance bar. Read it before concluding
-something is missing by accident; this repo's characteristic failure is status recorded
-optimistically and then believed. (P9-2 observability and P9-3/S18 `event_id` idempotency are both
-DONE — see their entries there.)
+[docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md)**, each with the reason and the
+acceptance bar. Read it before concluding something is missing by accident; this repo's characteristic
+failure is status recorded optimistically and then believed. P9-1 (org-wide alert UI), P9-2
+(observability), P9-3/S18 (`event_id` idempotency) and P9-4 (invitation acceptance) are all **DONE** —
+P9-1 and P9-4 shipped in `b9e2018`/`f8d66ac` but did not actually run until the UI parity remediation
+(D01, D04); see `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`.
 
 **P9-2 (observability) is DONE as of 2026-07-31**: `slog` everywhere, `/metrics` on both Go services, and
 one distributed trace spanning ingestor → NATS → processor, gated by U35. The findings that work chose
@@ -129,7 +156,8 @@ Remaining known gaps, none of them a regression from that work:
 | | Symptom | Cause |
 |---|---|---|
 | — | The DLQ needs an operator to drain it | `tools/dlq` can inspect, replay (`-execute`), discard (`-purge`) and drain transient-only (`-drain`), and a `sentinel-dlq-drainer` compose service runs it on a schedule — but it ships gated OFF (`DLQ_DRAINER_ENABLED` and `DLQ_DRAINER_EXECUTE` both `false`), so nothing drains until someone flips both. Permanent-class messages are never auto-replayed by design (D14). Streams are bounded (D13), so a backlog can no longer exhaust storage. |
-| — | ~~Invitation acceptance has no route~~ **Stale, corrected 2026-08-01** | The route exists at `apps/dashboard-web/src/routes/invitations/[token]/+page.server.ts`. It was merely unreachable for already-signed-in invitees because `invitations` was missing from `hooks.server.ts`'s `reservedRoutes` (D01 in `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`), fixed under that plan's P2-1. See `docs/plans/UI_PARITY_REMEDIATION_PLAN.md` for the acceptance-flow defects (D06–D08, D31, D42) that remain in that path — this row previously conflated "unreachable for one case" with "does not exist," which was itself an instance of this repo's characteristic failure. |
+| — | ~~Invitation acceptance has no route~~ **RESOLVED 2026-08-01** | The route always existed (`src/routes/invitations/[token]/+page.server.ts`); it was unreachable for already-signed-in invitees because `invitations` was missing from `hooks.server.ts`'s `reservedRoutes`. That, and every acceptance-flow defect alongside it (plaintext tokens D06, non-atomic redemption D07, owner-demotion D08, inviter-authority D31, reaping D42), are fixed and merged. This row previously conflated "unreachable for one case" with "does not exist" — itself an instance of this repo's characteristic failure. |
+| — | Invitations depend entirely on working email delivery | **A deliberate consequence of D06, not a defect.** The raw token is no longer returned to any client and the modal's copy-paste link was removed, so with no `EMAIL_SERVER` configured an admin can create an invitation with no way to convey it. The create response reports `delivered` so this is at least observable. Affirm or revisit deliberately. |
 
 **S18 (`issues.count` inflation on redelivery — long mislabeled "S16") is RESOLVED as of 2026-07-31**:
 `event_id` idempotency end to end and a single-transaction write path (`store.StoreEvent`), gated by
@@ -140,6 +168,23 @@ VERIFIED_STATE.md S18. The write path's duplicate handling is READ COMMITTED-spe
 
 ### Working conventions
 
+- **Run every gate CI runs before claiming green** — for the dashboard that is `pnpm check` AND
+  `pnpm build` AND `pnpm test`. `pnpm build` is the only one that enforces SvelteKit's route-export
+  allowlist (`+page.server.ts` may export only `load`, `actions`, …); `check` and `test` pass while
+  `build` fails on it. Two constants exported from route files broke the build while the other two gates
+  stayed green (B12). Shared constants belong in `$lib/server/`.
+- **Every new migration must be idempotent.** One flat directory serves all goose targets and each target
+  has its own ledger against the SAME physical database (A1), so migrations are replayed. `IF NOT EXISTS`
+  on columns/indexes; `ADD CONSTRAINT` has no such form and needs a `pg_constraint` catalog guard. Verify
+  by replaying against a disposable Postgres before pushing — an unguarded `ADD COLUMN` took down four
+  migration tests in CI while passing locally.
+- **A test must create the state it asserts on**, and a fix must be proven to FAIL before it passes.
+  Delete the production line and watch the test go red; if it stays green the test is decoration. A mock
+  that returns itself for every call cannot distinguish "did the right thing" from "did nothing" — assert
+  the call (B10 addendum). Run `pnpm test --sequence.shuffle` before trusting a suite (B13).
+- **Never `return` early from inside a `db.transaction` callback to signal failure** — that COMMITS
+  whatever the callback already did. Throw, and catch outside the transaction, or the rollback you think
+  you are getting does not happen (D18).
 - **On a machine where another stack owns NATS 4222**, bring sentinel up with
   `NATS_HOST_PORT=14222 NATS_MONITOR_HOST_PORT=18222 docker compose up -d` and run host-side suites with
   `NATS_URL=nats://localhost:14222`. `tests/e2e`'s preflight verifies it reached `sentinel-nats` and fails

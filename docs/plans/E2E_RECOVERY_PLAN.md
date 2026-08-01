@@ -852,7 +852,7 @@ originally promised: **a named test is green.**
 | U19 | 008 ratelimit | 200 concurrent, limit 100 | ≤100 accepted, 429s carry `Retry-After` (S10) | ✅ `TestU19_SequentialRequestsCutOverExactlyAtLimit`, `TestU19_ConcurrentRequestsRespectLimit` — 111/100 accepted before the Lua fix, ≤100 after |
 | U20 | 008 ratelimit | Redis unreachable at boot | service **refuses to start** (or logs an explicit opt-out), never silently fails open (S10) | ✅ `TestU20_DeadRedisAtBootIsRefusedNotIgnored`, `TestU20_UnavailableRedisDoesNotFailOpen` |
 | U21 | 005 orgs | Two orgs, same project name | no cross-visibility; both resolvable (S6) | ✅ `TestU21_SameProjectNameAcrossOrgsNoCrossVisibility` |
-| U22 | 005 orgs | Invite → accept → role applies | member row + permitted actions | ✅ `TestU22_InviteCreationRBACAndAcceptanceWall` — acceptance has no route; the wall is asserted, not assumed |
+| U22 | 005 orgs | Invite → accept → role applies | member row + permitted actions | ✅ `TestU22_InviteCreationRBACAndAcceptanceWall` — **the "wall" is gone as of 2026-08-01** (see P9-4). The test now asserts the raw token is never returned to a client and checks `organization_id`/`token_hash` against the DB; acceptance itself is a browser page flow, covered by unit tests rather than this HTTP-level test |
 | U23 | RBAC | Each of `owner/admin/engineer/developer/support/viewer` against each protected route | matches the matrix; **no role errors as unknown** (P3-4) | ✅ `TestU23_RBACDecidesEveryDBPermittedRole` — every role both member tables permit; no 500s, none unknown |
 | U24 | auth | Magic-link sign-in (D2) | session established | ✅ `TestU24_MagicLinkSignIn` — found `/auth/signin` looping forever; nobody could sign in |
 | U25 | auth | Google sign-in with domain restriction unset | permitted (P3-4) | ✅ `TestU25_GoogleSignInDomainRestrictionUnset` |
@@ -1008,13 +1008,28 @@ before being trusted.
 
 **Verified state entry**: S18 in `docs/memory/VERIFIED_STATE.md`. Decisions: D16.
 
-### P9-4 · Invitation acceptance has no route
+### P9-4 · Invitation acceptance ~~has no route~~ — **DONE 2026-08-01**
 
-**State**: `POST /api/organizations/[orgId]/invitations` creates a real `organization_invitations` row and
-is proven end to end by U22. **Nothing anywhere consumes an invitation token** — confirmed by source grep
-and by live-probing five candidate accept URLs, all 404. U22 asserts the wall rather than assuming it.
+> [!IMPORTANT]
+> **This item is resolved and the text below is history.** The acceptance route shipped in `f8d66ac`
+> (`src/routes/invitations/[token]/+page.server.ts` → `src/routes/auth/accept-invite/`), but it did NOT
+> RUN: `invitations` was missing from `hooks.server.ts`'s `reservedRoutes`, so the emailed link 403'd for
+> any already-signed-in invitee. Fixed under `docs/plans/UI_PARITY_REMEDIATION_PLAN.md` D01, along with
+> the security defects found in that same path — plaintext tokens (D06), non-atomic redemption with no
+> revocation (D07), owner-demotion on accept (D08), inviter authority not re-checked at redemption (D31),
+> and unreaped expirations (D42). U22 was rewritten: it no longer asserts a "wall", it asserts the raw
+> token is NEVER returned to a client and verifies `organization_id` + the 64-char `token_hash` against
+> the DB.
+>
+> One deliberate consequence: with no raw token returned and the modal's copy-paste link removed,
+> **invitations now depend entirely on working email delivery**. The create response reports `delivered`.
 
-**Why deferred**: it is a missing product feature, not a defect in shipped behaviour.
+**State (historical, pre-2026-08-01)**: `POST /api/organizations/[orgId]/invitations` creates a real
+`organization_invitations` row and is proven end to end by U22. **Nothing anywhere consumes an invitation
+token** — confirmed by source grep and by live-probing five candidate accept URLs, all 404. U22 asserts
+the wall rather than assuming it.
+
+**Why deferred (historical)**: it is a missing product feature, not a defect in shipped behaviour.
 
 **Acceptance**: an accept route that consumes the token exactly once, creates the `organization_members`
 row at the invited role, rejects an expired or already-used token, and U22 extended past the wall.

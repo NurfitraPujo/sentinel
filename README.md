@@ -10,15 +10,29 @@ sdk → ingestor-go (HTTP :8080) → NATS JetStream → processor-go → Postgre
 occurrences, organizations, and alerting configuration.
 
 > [!IMPORTANT]
-> Several features in `specs/` are marked "Completed" but do not work at runtime. Before trusting any
-> feature-complete claim, read [docs/memory/VERIFIED_STATE.md](docs/memory/VERIFIED_STATE.md) — it records
-> what has actually been proven to run, and with which command. As of the P0–P2 work tracked in
-> [docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md), the pipeline above produces real
-> `issues`/`error_occurrences` rows end to end — it did not before (see VERIFIED_STATE.md's S12 entry:
-> the database had zero rows, ever, until this work). Key management, rate limiting, alerting, and the
-> degradation buffer are documented open gaps, not yet fixed — see that same plan for current status. CI
-> exists (`.github/workflows/ci.yml`) but the `integration` job is still lenient and nothing has actually
-> been checked on a push from this branch yet.
+> Several features in `specs/` are marked "Completed", which records a merge event, not verified behavior.
+> Before trusting any feature-complete claim, read
+> [docs/memory/VERIFIED_STATE.md](docs/memory/VERIFIED_STATE.md) — it records what has actually been proven
+> to run, and with which command.
+>
+> As of **2026-08-01** (`b895df1` on `main`): all 32 rows of the
+> [E2E recovery plan](docs/plans/E2E_RECOVERY_PLAN.md)'s use-case matrix are green
+> (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **76 passed, 0 skipped**), covering key management,
+> rate limiting, alerting, observability (structured logs, `/metrics`, a distributed trace joining
+> ingestor → NATS → processor), and idempotent event writes. **CI is green on `main` — all 9 check runs** — for
+> the first time in this repository's history; the previous baseline `b9e2018` was red.
+>
+> That last point is the whole caveat this banner exists for. The dashboard features shipped before it
+> (org-wide alerts, invitation acceptance, issue relations, API-key management, member management) each
+> merged with their own tests passing, and **three of the five did not execute at runtime** until the
+> [UI parity remediation](docs/plans/UI_PARITY_REMEDIATION_PLAN.md) (47 findings, all closed). "Merged"
+> and "reviewed" are not evidence here; a named command with an observed result is.
+>
+> Remaining known gaps, none of them a regression: the DLQ drainer ships gated off by default
+> (`DLQ_DRAINER_ENABLED`/`DLQ_DRAINER_EXECUTE`), rate limiting is still non-atomic and fails open
+> (VERIFIED_STATE.md S10), and invitations now depend entirely on working email delivery — a deliberate
+> consequence of no longer returning the raw token to any client. The degradation buffer was deliberately
+> deleted rather than fixed (S9).
 
 ## Repository layout
 

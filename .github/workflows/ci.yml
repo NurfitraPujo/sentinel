@@ -3,7 +3,10 @@
 # This is the P0-1 deliverable of docs/plans/E2E_RECOVERY_PLAN.md: until this file existed, nothing in the
 # repo was checked on push, which is the documented root cause of every defect in docs/memory/VERIFIED_STATE.md.
 #
-# Status 2026-07-29: all 7 jobs are green and NONE is lenient — the last `continue-on-error` (job-level on
+# Status 2026-08-01: all 8 jobs (9 check runs — `go-sdk` is a 2-leg matrix) are green and NONE is
+# lenient, PROVEN on a real push: merge commit `b895df1` on `main` is the first green run this repo has
+# had. Before that date this file had never actually executed. Earlier status line said "7 jobs".
+# Historical note 2026-07-29: NONE is lenient — the last `continue-on-error` (job-level on
 # `integration`) was removed once its failures were fixed. The suite had 4 real failures, not the ~15 once
 # recorded: that number was measured against a corrupted shared dev database. Do not add a leniency marker
 # back without first re-running the job and recording why in docs/memory/VERIFIED_STATE.md.

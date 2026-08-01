@@ -536,7 +536,8 @@ measurement. A test that only asserted "revocation eventually works" would still
 
 ## B10 — Tests That Assert The Defect
 
-**Status**: active (four instances fixed 2026-07-30)
+**Status**: active (four instances fixed 2026-07-30; **two more 2026-08-01** — see the addendum at the
+end of this entry, including a variant where the test asserted *nothing at all*)
 
 A test written to *document* a known bug will assert the broken behaviour, and then it fails when the bug is
 fixed — the exact inverse of what a regression test is for. Worse, it can report PASS while the defect is
@@ -557,6 +558,33 @@ Instances, all in the P7 harness as first written:
 observed behaviour. And name the test for the requirement (`ConcurrentRequestsRespectLimit`), not the bug
 (`ConcurrentRequestsExceedLimit`) — a passing test named after the defect reads like the defect is still
 there.
+
+### B10 addendum — two recurrences, 2026-08-01 (UI parity remediation)
+
+**1. A test that pinned the defect in place.** `accept-invite/page.server.test.ts` asserted
+`signIn('email', { email, callbackUrl: '/auth/accept-invite' })`. `callbackUrl` is Auth.js **v4**; this
+project is on `@auth/sveltekit` v5, which ignores it — so the post-verification destination was silently
+dropped and magic-link invites could not complete (D29). The test did not merely fail to catch the bug:
+**any correct fix would have failed it**, so it actively defended the defect. Fixed to assert
+`redirectTo`.
+
+**2. A test that asserted nothing — the vacuous-mock variant.** The sole-owner guard (D32) reads owner
+rows under `SELECT ... FOR UPDATE` before counting. Its tests used a chainable mock whose `for()` returned
+itself, and **nothing asserted `for()` was ever called**. Deleting all three `.for('update')` calls from
+the source left **29/29 tests green** (verified by doing exactly that). The concurrency test's
+serialization was enforced by *its own transaction mock*, not by the code under test — so it proved
+something about the mock and nothing about the guard.
+
+This is the more dangerous shape, because B10's original form at least fails loudly once the bug is
+fixed. A vacuous assertion is stable in both worlds: it never fails, so it never draws attention, and it
+reads in review exactly like coverage.
+
+**The additional rule**: when a mock returns itself for every call, the mock cannot distinguish "the code
+did the right thing" from "the code did nothing". Assert the *call* (`expect(dbMock.for).toHaveBeenCalledWith('update')`),
+and then **delete the production line and watch the test fail**. If it still passes, the test is
+decoration. The same applies to a test whose critical invariant is enforced by the test harness rather
+than the code — the fake's `transaction()` here had to be taught to roll back on throw before it could
+detect a regression in the real rollback behaviour (D31).
 
 
 ## B11 — Instrumentation Whose Failure Mode Is Silence
@@ -597,3 +625,91 @@ A related trap in the same family: a guard that only exercises the *happy input*
 dashboard's correlation id was a bespoke random value rather than the OTel trace id, but when a caller
 supplies a `traceparent` both sides independently honour the W3C header and coincidentally agree — so
 the obvious test passes and only real browser traffic diverges. **Test the path with nothing supplied.**
+
+
+## B12 — The Gate You Never Ran
+
+**Status**: active (found 2026-08-01, during the UI parity remediation)
+
+A green suite proves what the gates you actually executed cover — nothing more. This repo already knows
+that a *passing package test* does not imply reachable code (B3). The 2026-08-01 instance is narrower and
+easier to miss: a **different gate in the same toolchain** enforces a rule the others cannot see.
+
+SvelteKit route modules (`+page.server.ts`) may only export a fixed allowlist of names — `load`,
+`actions`, `prerender`, … — and that rule is enforced **only at build time**, during
+`vite build`'s route analysis. Two files exported constants (`INVITE_TOKEN_COOKIE`, and
+`loadObservability`, the latter introduced by the remediation's own first commit). Throughout:
+
+- `pnpm check` — **passed** (it typechecks; an extra export is valid TypeScript)
+- `pnpm test` — **passed** (vitest imports the module directly; nothing analyses it as a route)
+- `pnpm build` — **failed**: `Invalid export 'INVITE_TOKEN_COOKIE' in src/routes/invitations/[token]/+page.server.ts`
+
+The branch was declared green five separate times on the strength of `check` + `test`. `pnpm build` was
+not run locally, and CI — which *does* run it — had never executed, because the branch had never been
+pushed. Two independent "we'll catch it later" gaps lined up so that neither caught it.
+
+Compounding it: both constants were **duplicated across two route files and kept in sync by a comment**.
+A cookie name that disagrees between the writer and the reader breaks invitation acceptance silently
+(B5's cross-boundary family). Both now live in `$lib/server/`, which is also where the export rule does
+not apply.
+
+**The rules**:
+
+1. **Run every gate CI runs, before claiming green.** For this repo that is `pnpm check` **and**
+   `pnpm build` **and** `pnpm test` — not the first two. Cheap to run, and `build` is the only one that
+   sees route-shape violations.
+
+   Related, and still open: the 2026-07-29 entry *"A Framework Misconfiguration Can Break Every Route
+   While All Gates Stay Green"* above records a case where all three passed and every route 500'd, and
+   concludes that the missing gate is a **smoke check against the built server** (`node build/index.js`,
+   not `vite dev`). That gate still does not exist. B12 is the second instance of the same shape —
+   different gate, same lesson — which is the argument for finally adding it.
+2. **A CI config that has never executed is not a safety net.** It is an untested script. Push early
+   enough that CI has run at least once before you rely on it.
+3. **Constants shared between two route files belong in `$lib`,** not duplicated with a "keep in sync"
+   comment — the comment is not a mechanism.
+
+
+## B13 — Tests That Pass For The Wrong Reason: Ambient State and Test Order
+
+**Status**: active (found and fixed 2026-08-01, during the UI parity remediation)
+
+A test can pass because the code is correct, or because its environment happened to supply the answer.
+The two are indistinguishable from a green checkmark, and the second only reveals itself somewhere with a
+different environment — usually CI, usually after a merge.
+
+**Ambient data.** The D02 regression test (the one guarding `issues.id::text ILIKE`, which *must* run
+against real Postgres — a Drizzle mock has no notion of operator typing) queried for **any issue row that
+happened to exist** and asserted one was found. On a dev database full of e2e leftovers it passed. In
+CI's freshly-migrated, empty Postgres it failed with `expected undefined to be truthy`. It now seeds and
+deletes its own org/project/issue, which also lets its assertions be scoped to that organization instead
+of hoping unrelated rows prove the point.
+
+**Test order.** The dashboard suite passed in declaration order and failed under
+`vitest --sequence.shuffle`, non-deterministically (1–5 failures per run). Three independent causes, all
+of which had been latent for some time:
+
+1. **`vi.clearAllMocks()` does not clear queued `mockImplementationOnce` entries** — only call records. An
+   un-consumed queued resolution leaks into the *next* test and answers the wrong query. Fixed with a
+   targeted `mockReset()` on the queue-bearing mock across 10 files. (A blanket switch to
+   `resetAllMocks()` was tried first and reverted: it also wipes module-scope implementations several
+   files never re-establish — 36 failures.)
+2. **Module-level caches survive between tests.** `email.ts` memoises its nodemailer transporter, so
+   whichever test sent first won the cache and the *caching* test passed or failed on order alone. Fixed
+   with `vi.resetModules()` + per-test re-import.
+3. **`@testing-library/svelte` only auto-registers `cleanup()` when vitest runs with `globals: true`**,
+   which this project does not set. Components stayed mounted across tests in the shared jsdom document,
+   so queries matched leftovers (`Found multiple elements`). Fixed with a `vitest-setup.ts` registered via
+   `setupFiles`, so future component tests inherit it.
+
+**The rules**:
+
+- **A test must create the state it asserts on.** If it reads rows it did not write, it is measuring the
+  environment.
+- **Run `pnpm test --sequence.shuffle` before trusting a suite.** Order-independence is a property that
+  decays silently; it was verified across 8 seeds at `b895df1`.
+- **Prefer `mockReset()` on the specific queue-bearing mock** over a blanket reset that also destroys
+  module-scope setup.
+- Beware fixing this class *while* introducing it: the D29 tests added during this same work used a
+  persistent `mockRejectedValue` on a shared `signIn` mock, which survived `clearAllMocks` and failed an
+  unrelated later test with the previous test's error. Caught only by running the shuffle.

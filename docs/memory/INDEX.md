@@ -15,7 +15,7 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 > before building on any of them.
 
 ## Deferred work (read before assuming something is missing by accident)
-- P9 | Deferred work, with the reason and the acceptance bar for each | backlog,deferred,process | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active — 4 items consciously deferred 2026-07-30: org-wide alert UI, observability, S16 idempotency, invitation acceptance
+- P9 | Deferred work, with the reason and the acceptance bar for each | backlog,deferred,process | [../plans/E2E_RECOVERY_PLAN.md](../plans/E2E_RECOVERY_PLAN.md) | active — the 4 items deferred 2026-07-30 (org-wide alert UI, observability, S16/S18 idempotency, invitation acceptance) are ALL DONE as of 2026-08-01; P9-1 and P9-4 shipped earlier but did not run until the UI parity remediation. Read P9-5 for what was deliberately NOT fixed
 
 ## Architecture
 - A1 | Unified Migration Directory Boundary | migrations,architecture,monorepo,postgres | [ARCHITECTURE.md](ARCHITECTURE.md) | active
@@ -30,7 +30,10 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - B6 | Normalization Destroys the Fields Read After It | processor,normalizer,regression | [BUGS.md](BUGS.md) | active
 - B8 | A Framework Misconfiguration Breaks Every Route While All Gates Stay Green | auth,sveltekit,runtime,b3 | [BUGS.md](BUGS.md) | active — confirmed again 2026-07-30: /auth/signin looped forever, nobody could sign in
 - B9 | A Deployment That Never Connects Two Correct Halves | deployment,config,nats,b3 | [BUGS.md](BUGS.md) | active — two instances fixed, cause structural
-- B10 | Tests That Assert The Defect | testing,regression,process | [BUGS.md](BUGS.md) | active — four instances fixed 2026-07-30
+- B10 | Tests That Assert The Defect | testing,regression,process | [BUGS.md](BUGS.md) | active — four instances fixed 2026-07-30; **two more 2026-08-01**, incl. the vacuous-mock variant where deleting the guarded line left 29/29 green
+- B11 | Instrumentation Whose Failure Mode Is Silence | observability,otel,tracing,guards | [BUGS.md](BUGS.md) | active — found and guarded 2026-07-31
+- B12 | The Gate You Never Ran | build,ci,sveltekit,process | [BUGS.md](BUGS.md) | active — `pnpm check`+`test` green while `pnpm build` failed on SvelteKit's route-export allowlist; CI existed but had never run
+- B13 | Tests That Pass For The Wrong Reason: Ambient State and Test Order | testing,flake,mocks,postgres | [BUGS.md](BUGS.md) | active — ambient DB rows, leaked `...Once` mock queues, module caches, missing testing-library cleanup
 - B7 | Authenticated Identity Computed, Then Discarded | security,multitenancy,ingestor | [BUGS.md](BUGS.md) | resolved-2026-07-29
 
 ## Decisions
@@ -45,9 +48,13 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - D9 | Dual-Layer Multi-Tenant API Key Authentication with NATS Invalidation & Hierarchical Sliding-Window Rate Limiting | multitenancy,apikeys,auth,ratelimit,nats,go | [DECISIONS.md](DECISIONS.md) | active — "hierarchical" is false (per-key only, corrected); rate limiting was 100% bypassed until R1
 - D10 | Bounded-Retry NATS Delivery with Dead-Letter Capture | nats,jetstream,reliability,delivery,dlq | [DECISIONS.md](DECISIONS.md) | active
 - D11 | APIKey/ProjectKey Split — a Project Name Is Never a Credential | sdk,go,auth,multitenancy,contracts | [DECISIONS.md](DECISIONS.md) | active
-- D12 | Two-Layer Alert Configs (organization-wide + project-scoped), UNION not override | alerts,multitenancy,rbac,postgres | [DECISIONS.md](DECISIONS.md) | active — org-wide is API-only, see P9-1
+- D12 | Two-Layer Alert Configs (organization-wide + project-scoped), UNION not override | alerts,multitenancy,rbac,postgres | [DECISIONS.md](DECISIONS.md) | active — the "org-wide is API-only" note is STALE: the UI shipped and, as of 2026-08-01, actually runs (the dispatcher kept only ONE config per key until finding D04 was fixed)
 - D13 | Every JetStream Stream Is Bounded; Discard Policy Chosen Per Role | nats,jetstream,ops,outage | [DECISIONS.md](DECISIONS.md) | active
 - D14 | Dead Letters Carry a Machine-Readable Class; Permanent Failures Never Auto-Replayed | nats,dlq,ops,contracts | [DECISIONS.md](DECISIONS.md) | active
+- D15 | OTel Everywhere, the Trace ID Is the Correlation ID | observability,otel,tracing | [DECISIONS.md](DECISIONS.md) | active
+- D16 | Exactly-Once Event Writes: `event_id` End to End, One Transaction | idempotency,postgres,nats,processor | [DECISIONS.md](DECISIONS.md) | active
+- D17 | An Org Role Is an Org-Wide Grant; Project Membership Is the Alternative Path, Not an Extra Hurdle | rbac,multitenancy,issues,authz | [DECISIONS.md](DECISIONS.md) | active — e2e disproved the stricter AND model
+- D18 | An Invitation's Authority Is Re-Validated at Redemption, Not Just at Issue | invitations,authz,transactions,security | [DECISIONS.md](DECISIONS.md) | active — early `return` inside `db.transaction` COMMITS; throw to roll back
 
 ## Workflow
 - W1 | Adopted CEL for Protobuf Validation | protobuf,validation,buf | [WORKLOG.md](WORKLOG.md) | active
@@ -56,3 +63,4 @@ This is a compact routing map for durable project memory (`docs/memory/`). Keep 
 - W4 | Shipped Issue Lifecycle Management & Regression Tracking | milestone,lifecycle,regression,triage | [WORKLOG.md](WORKLOG.md) | active
 - W5 | Shipped Official Go Client SDK & Ingestor Batch API | milestone,sdk,go,ingestion,batch | [WORKLOG.md](WORKLOG.md) | active
 - W6 | Shipped Multi-Tenant Auth & API Key Management | milestone,apikeys,auth,ratelimit,multitenancy | [WORKLOG.md](WORKLOG.md) | active
+- W7 | A Feature Can Merge Green, Be Reviewed, and Still Never Run | process,testing,ci,dashboard,b3 | [WORKLOG.md](WORKLOG.md) | active — 2026-08-01; first green CI run on `main` (`b895df1`)
