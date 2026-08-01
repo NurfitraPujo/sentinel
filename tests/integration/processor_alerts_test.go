@@ -444,6 +444,59 @@ func TestAlertsDispatcher_RefreshConfigsLoadsSeededRow(t *testing.T) {
 	})
 }
 
+// seedProjectAlertConfigWithChannel inserts a PROJECT-SCOPED alert_configs row with a caller-chosen
+// channel and channel_config, so a test can seed TWO rules for the SAME project routing to DIFFERENT
+// destinations. seedAlertConfig above always writes channel 'email' with an empty '{}' config, so two
+// of its rows dedup to one send in resolveConfigs and cannot demonstrate the D04 drop.
+func seedProjectAlertConfigWithChannel(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string, channel string, channelConfigJSON string, threshold int, windowSeconds int, enabled bool) {
+	t.Helper()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES ($1, (SELECT organization_id FROM projects WHERE id = $1), $2, $3::jsonb, $4, $5, $6)`,
+		projectID, channel, channelConfigJSON, threshold, windowSeconds, enabled,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM alert_configs WHERE project_id = $1`, projectID)
+	})
+}
+
+// TestProcessorAlerts_MultipleProjectScopedConfigsLoadFromSQL is the load-path counterpart to
+// TestAlertsDispatcher_ResolveMultipleProjectScopedConfigs in tests/unit (D04, project half).
+//
+// It matters that this one goes through REAL SQL and refreshConfigs rather than SetProjectConfigsForTest.
+// `Dispatcher.configs` was map[string]*AlertConfig, so refreshConfigs OVERWROTE the map entry on each
+// row for the same project and every rule but the last was silently dropped — no error, no log. Every
+// pre-existing test injected the map directly and therefore could not see it. That is the exact seam
+// the bug lived in, on both the org and project halves.
+func TestProcessorAlerts_MultipleProjectScopedConfigsLoadFromSQL(t *testing.T) {
+	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
+		cap := &alertCapture{}
+		ctx := context.Background()
+
+		projectID := seedProject(t, ctx, pool)
+		// Two project-scoped rules, same project, different destinations.
+		seedProjectAlertConfigWithChannel(t, ctx, pool, projectID, "email", `{"to":"team-a@example.test"}`, 1, 60, true)
+		seedProjectAlertConfigWithChannel(t, ctx, pool, projectID, "email", `{"to":"team-b@example.test"}`, 1, 60, true)
+
+		d := alerts.NewDispatcherForTest(pool)
+		d.SetSenderForTest(cap.sender())
+
+		d.RefreshConfigsForTest(ctx)
+		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+
+		got := cap.snapshot()
+		require.Len(t, got, 2,
+			"both project-scoped rows must load and fire; a single-value configs map drops one silently")
+
+		destinations := []string{}
+		for _, g := range got {
+			destinations = append(destinations, g.cfg.ChannelConfig["to"].(string))
+		}
+		assert.ElementsMatch(t, []string{"team-a@example.test", "team-b@example.test"}, destinations)
+	})
+}
+
 func TestAlertsDispatcher_RefreshConfigsSkipsDisabledRows(t *testing.T) {
 	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
 		cap := &alertCapture{}

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { redirect } from '@sveltejs/kit';
 
 const orgQueries = {
 	getInvitationByToken: vi.fn(),
@@ -138,13 +139,85 @@ describe('/auth/accept-invite actions.google / actions.magiclink (D06)', () => {
 		expect(JSON.stringify(options)).not.toContain('token');
 	});
 
-	it('magiclink action never puts the token in callbackUrl', async () => {
+	// This assertion previously required `callbackUrl` — pinning the D29 defect in place, since
+	// @auth/sveltekit v5 ignores that option entirely. Corrected to `redirectTo`, the option this
+	// project's Auth.js version actually reads.
+	it('magiclink action never puts the token in redirectTo', async () => {
 		const request = new Request('http://x', {
 			method: 'POST',
 			headers: { 'content-type': 'application/x-www-form-urlencoded' },
 			body: 'email=user%40example.com',
 		});
 		await (actions as any).magiclink({ request });
-		expect(signInMock).toHaveBeenCalledWith('email', { email: 'user@example.com', callbackUrl: '/auth/accept-invite' });
+		expect(signInMock).toHaveBeenCalledWith('email', { email: 'user@example.com', redirectTo: '/auth/accept-invite' });
+	});
+});
+
+// D29: the magic-link action had two independent bugs that each broke the flow on their own.
+describe('accept-invite magiclink action (D29)', () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		signInMock.mockResolvedValue(undefined);
+	});
+
+	function formRequest(fields: Record<string, string>) {
+		const body = new URLSearchParams(fields);
+		return new Request('http://x', {
+			method: 'POST',
+			body,
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+		});
+	}
+
+	it('passes redirectTo, not the Auth.js v4 callbackUrl that v5 ignores', async () => {
+		await actions.magiclink({ request: formRequest({ email: 'a@b.com' }) } as any);
+
+		expect(signInMock).toHaveBeenCalledTimes(1);
+		const [provider, options] = signInMock.mock.calls[0];
+		expect(provider).toBe('email');
+		expect(options).toHaveProperty('redirectTo', '/auth/accept-invite');
+		// The whole defect: v5 silently ignores `callbackUrl`, so the user never came back here.
+		expect(options).not.toHaveProperty('callbackUrl');
+	});
+
+	it('never puts the invite token in the redirect URL (D06)', async () => {
+		await actions.magiclink({ request: formRequest({ email: 'a@b.com' }) } as any);
+
+		const [, options] = signInMock.mock.calls[0];
+		expect(String(options.redirectTo)).not.toContain('token');
+	});
+
+	it('rethrows the redirect signIn throws on success instead of turning it into a 500', async () => {
+		// @auth/sveltekit signals a successful sign-in by THROWING a redirect. The old catch-all
+		// swallowed it and returned fail(500), so the flow could not complete even once the option
+		// name was correct.
+		// Construct a real SvelteKit Redirect: isRedirect() brand-checks the instance, so a
+		// plain { status, location } object would not be recognised.
+		let redirectSignal: unknown;
+		try {
+			redirect(303, '/verify-request');
+		} catch (e) {
+			redirectSignal = e;
+		}
+		signInMock.mockRejectedValue(redirectSignal);
+
+		await expect(
+			actions.magiclink({ request: formRequest({ email: 'a@b.com' }) } as any)
+		).rejects.toBe(redirectSignal);
+	});
+
+	it('still returns a 500 for a genuine send failure', async () => {
+		signInMock.mockRejectedValue(new Error('SMTP unreachable'));
+
+		const result: any = await actions.magiclink({
+			request: formRequest({ email: 'a@b.com' }),
+		} as any);
+		expect(result.status).toBe(500);
+	});
+
+	it('400s a missing email without calling signIn', async () => {
+		const result: any = await actions.magiclink({ request: formRequest({ email: '' }) } as any);
+		expect(result.status).toBe(400);
+		expect(signInMock).not.toHaveBeenCalled();
 	});
 });

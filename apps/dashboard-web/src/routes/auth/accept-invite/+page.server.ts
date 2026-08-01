@@ -1,4 +1,4 @@
-import { error, redirect, fail } from '@sveltejs/kit';
+import { error, redirect, fail, isRedirect, isHttpError } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
 import { env } from '$env/dynamic/private';
 import { getInvitationByToken, claimInvitation, updateUserLastActiveOrg } from '$lib/db/queries/organizations';
@@ -176,13 +176,26 @@ export const actions: Actions = {
 		}
 
 		try {
-			// D06: same reasoning as `google` above -- no token in the callback URL.
+			// D29: this used to pass `callbackUrl`, an Auth.js v4 option name. This project is on
+			// @auth/sveltekit ^1.11.2 (v5), where the option is `redirectTo` -- v5 ignores
+			// `callbackUrl` outright, so the post-verification destination was silently dropped and
+			// the user landed on the default page instead of back here to finish accepting.
+			//
+			// D06: same reasoning as `google` above -- no token in the redirect URL. The invite token
+			// lives in the HttpOnly cookie set by /invitations/<token>, which survives the round trip.
 			await (signIn as unknown as (provider: string, options: Record<string, unknown>) => Promise<unknown>)(
 				'email',
-				{ email, callbackUrl: '/auth/accept-invite' }
+				{ email, redirectTo: '/auth/accept-invite' }
 			);
 			return { magicLinkSent: true, email };
 		} catch (err) {
+			// D29: `signIn` signals its outcome by THROWING a redirect. Swallowing everything here
+			// turned that success signal into a 500, so the magic-link flow could not complete even
+			// once the option name was right. Redirects (and SvelteKit HttpErrors) must propagate;
+			// only a genuine send failure becomes a 500.
+			if (isRedirect(err) || isHttpError(err)) {
+				throw err;
+			}
 			return fail(500, { error: 'Failed to send magic link' });
 		}
 	},
