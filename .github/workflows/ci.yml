@@ -200,6 +200,13 @@ jobs:
       # report "39 tests passed" while 20 of them silently did nothing — exactly the failure mode this job was
       # changed to close. Mirrors SENTINEL_E2E's role in the `integration` job below.
       SCHEMA_DRIFT_REQUIRED: "1"
+      # Same idea for src/lib/db/queries/issues.integration.test.ts, the ONLY test that runs
+      # searchIssuesInOrg's SQL against a real Postgres (a Drizzle mock has no notion of operator
+      # typing, which is exactly how `issues.id ILIKE` against a uuid column shipped — D02). It
+      # self-skips when no database answers; this makes an unreachable one a hard failure instead.
+      # It seeds and deletes its own org/project/issue, so it needs no pre-existing data.
+      SEARCH_INTEGRATION_REQUIRED: "1"
+      DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel
     steps:
       - uses: actions/checkout@v4
 

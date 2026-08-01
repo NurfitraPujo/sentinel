@@ -14,19 +14,37 @@
 -- yet used becomes invalid; the inviter must re-send it. Non-pending rows (accepted / revoked /
 -- expired) are kept for their audit trail -- they are never looked up by token again, so their
 -- token_hash is left NULL rather than fabricated.
+--
+-- IDEMPOTENCY: every statement below is guarded. This repo keeps ONE flat migration directory for
+-- all goose targets (A1 in docs/memory/ARCHITECTURE.md), and each target has its OWN ledger
+-- (schema_migrations, processor_migrations, dashboard_migrations, ...) tracking the SAME physical
+-- database. So a second target replays this file against a database where it has already been
+-- applied. Unguarded DDL fails there with "column already exists" and takes the whole migration
+-- run down -- which is exactly what broke the `integration` CI job (TestMigrationStatus,
+-- TestSequentialMigrations, TestTargetIsolation, TestBaselineCommand). Every other migration in
+-- this directory follows the same IF NOT EXISTS convention.
 DELETE FROM organization_invitations WHERE status = 'pending';
 
-ALTER TABLE organization_invitations ADD COLUMN token_hash VARCHAR(64);
-ALTER TABLE organization_invitations DROP COLUMN token;
+ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);
+ALTER TABLE organization_invitations DROP COLUMN IF EXISTS token;
 
 -- D07: redemption becomes a single conditional UPDATE ... SET status='accepted', accepted_at=now()
 -- WHERE token_hash=$1 AND status='pending' AND expires_at > now() RETURNING *. That needs somewhere
 -- to record when acceptance happened.
-ALTER TABLE organization_invitations ADD COLUMN accepted_at TIMESTAMP;
+ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP;
 
 -- Multiple NULLs are permitted under a UNIQUE constraint in Postgres, so the historical rows left
 -- with token_hash = NULL above do not collide with each other or with future real hashes.
-ALTER TABLE organization_invitations ADD CONSTRAINT organization_invitations_token_hash_unique UNIQUE (token_hash);
+-- ADD CONSTRAINT has no IF NOT EXISTS in Postgres, so guard it by catalog lookup.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'organization_invitations_token_hash_unique'
+    ) THEN
+        ALTER TABLE organization_invitations
+            ADD CONSTRAINT organization_invitations_token_hash_unique UNIQUE (token_hash);
+    END IF;
+END $$;
 
 -- D30: "user".email has no unique/citext constraint, so an email->userId resolution done with
 -- `LIMIT 1` picks an arbitrary row when duplicates exist, and a case-variant address
@@ -55,8 +73,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_email_lower_unique ON "user" (lower(e
 -- +goose Down
 -- +goose StatementBegin
 DROP INDEX IF EXISTS idx_user_email_lower_unique;
-ALTER TABLE organization_invitations DROP COLUMN accepted_at;
+ALTER TABLE organization_invitations DROP COLUMN IF EXISTS accepted_at;
 ALTER TABLE organization_invitations DROP CONSTRAINT IF EXISTS organization_invitations_token_hash_unique;
-ALTER TABLE organization_invitations ADD COLUMN token VARCHAR(128);
-ALTER TABLE organization_invitations DROP COLUMN token_hash;
+ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS token VARCHAR(128);
+ALTER TABLE organization_invitations DROP COLUMN IF EXISTS token_hash;
 -- +goose StatementEnd
