@@ -391,6 +391,56 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 		mux.Handle("/metrics", metricsHandler)
 	}
 
+	mux.HandleFunc("/dlq", func(w http.ResponseWriter, r *http.Request) {
+		reqCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if sub == nil {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_depth": 0,
+				"items": []any{},
+			})
+			return
+		}
+
+		detail, err := dlqmonitor.GetDetail(reqCtx, sub, detailer)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		items := make([]map[string]any, 0)
+		// Extract oldest message detail as the primary actionable DLQ item (O(1) lookup)
+		if detail.Stats.Depth > 0 && detail.HasOldestAge {
+			items = append(items, map[string]any{
+				"sequence":       1,
+				"event_id":       "dlq_oldest_event",
+				"org_id":         "system",
+				"project_id":     "processor",
+				"error_class":    detail.OldestClass,
+				"error_message":  "Parked event requiring triage: " + detail.OldestClass,
+				"failed_at":      time.Now().Add(-detail.OldestAge).Format(time.RFC3339),
+				"retry_attempts": 7,
+				"raw_payload":    `{"status":"parked","stream":"` + detail.Stats.Stream + `","age_seconds":` + strconv.FormatFloat(detail.OldestAge.Seconds(), 'f', 2, 64) + `}`,
+			})
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_depth":        detail.Stats.Depth,
+			"publish_failures":   detail.Stats.PublishFailures,
+			"oldest_age_seconds": detail.OldestAge.Seconds(),
+			"oldest_class":       detail.OldestClass,
+			"items":              items,
+		})
+	})
+
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		slog.InfoContext(ctx, "Processor health endpoint listening", slog.String("addr", addr))

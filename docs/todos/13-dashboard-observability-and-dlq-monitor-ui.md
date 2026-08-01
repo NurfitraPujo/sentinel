@@ -1,7 +1,7 @@
 # TODO 13: System Observability & DLQ Monitoring Dashboard UI
 
 ## Priority: Low
-## Status: Pending
+## Status: Completed
 
 ### Overview
 `ingestor-go` and `processor-go` export Prometheus metrics via `/metrics` and send OpenTelemetry traces. Additionally, `processor-go` exposes DLQ detail endpoints (`/dlq`). However, the frontend dashboard lacks a dedicated operational health and DLQ monitoring view for system administrators.

@@ -37,3 +37,9 @@ Semantic linking between error issues within an organization supporting three re
 
 ### Organization-Wide Alert Rule
 An alert configuration that applies globally across all current and future projects within an organization rather than being scoped to a single project. Represented in the database with a `NULL` project identifier and an explicit organization identifier. Creation and mutation require the `manage_keys` organization-level capability.
+
+## Observability & Queue Inspector
+
+### O(1) DLQ Sampling Pattern
+Performance pattern in `apps/processor-go/main.go` and `apps/processor-go/dlqmonitor/detailer.go` that inspects dead-letter queue (DLQ) operational health and oldest message metadata (`StreamInfo` + `GetMsg`) in constant $O(1)$ time. Exposes `/health` and `/dlq` endpoints without iterating the entire NATS JetStream stream on HTTP server threads, preventing request timeouts or memory exhaustion when backlogs accumulate.
+
