@@ -2,6 +2,7 @@ import { db } from '$lib/server/db';
 import { issues, issueActivity, issueRelations, projects } from '$lib/db/schema';
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
+import type { RelationType } from '$lib/types/relation-type';
 
 // Robust semver comparison helper with fallback
 function isRegression(releaseVersion: string, resolvedInVersion: string): boolean {
@@ -200,7 +201,7 @@ export async function assignIssue(
 export async function createIssueRelation(
 	sourceIssueId: string,
 	targetIssueId: string,
-	relationType: 'linked_to' | 'caused_by' | 'duplicate_of',
+	relationType: RelationType,
 	createdByType: 'user' | 'agent' | 'system',
 	createdBy: string
 ) {
@@ -237,7 +238,7 @@ export async function createIssueRelation(
 export async function deleteIssueRelation(
 	sourceIssueId: string,
 	targetIssueId: string,
-	relationType: 'linked_to' | 'caused_by' | 'duplicate_of',
+	relationType: RelationType,
 	createdByType: 'user' | 'agent' | 'system',
 	createdBy: string
 ) {

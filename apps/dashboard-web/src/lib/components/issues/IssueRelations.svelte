@@ -1,4 +1,6 @@
 <script lang="ts">
+	import type { RelationType } from '$lib/types/relation-type';
+
 	interface TargetIssue {
 		id: string;
 		errorClass: string;
@@ -11,7 +13,7 @@
 		id: string;
 		sourceIssueId: string;
 		targetIssueId: string;
-		relationType: 'linked_to' | 'caused_by' | 'duplicate_of';
+		relationType: RelationType;
 		direction: 'outgoing' | 'incoming';
 		targetIssue: TargetIssue;
 	}
@@ -27,7 +29,7 @@
 	let relations = $state<RelationItem[]>(initialRelations);
 	let searchQuery = $state('');
 	let searchResults = $state<TargetIssue[]>([]);
-	let selectedRelationType = $state<'linked_to' | 'caused_by' | 'duplicate_of'>('linked_to');
+	let selectedRelationType = $state<RelationType>('linked_to');
 	let isSearching = $state(false);
 	let isSubmitting = $state(false);
 	let errorMessage = $state<string | null>(null);

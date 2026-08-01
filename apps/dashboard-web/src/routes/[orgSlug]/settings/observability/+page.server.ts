@@ -1,5 +1,5 @@
 import type { PageServerLoad } from './$types';
-import { load as baseLoad } from '../../settings/observability/+page.server';
+import { load as baseLoad, type ObservabilityData } from '../../../settings/observability/+page.server';
 
 export const load: PageServerLoad = async (event) => {
 	const { orgSlug } = event.params;
@@ -15,6 +15,22 @@ export const load: PageServerLoad = async (event) => {
 		};
 	}
 
-	return baseLoad(event);
+	// baseLoad only reads `fetch` off the event. Its declared parameter type is pinned to
+	// the non-org route's literal RouteId ("/settings/observability"), which this route's
+	// event ("/[orgSlug]/settings/observability") can never structurally satisfy even though
+	// the two events are otherwise identical — so we pass just the piece baseLoad actually
+	// uses, typed against baseLoad's own parameter shape rather than blanket-cast to `any`.
+	//
+	// baseLoad is declared `: PageServerLoad` with the default (unparameterized) OutputData,
+	// so its *externally visible* return type is that generic's permissive `Record<string,
+	// any> | void` shape, not the concrete `{ observability }` object it actually returns at
+	// runtime. Left alone, that generic shape poisons this function's own inferred return
+	// type when unioned with the branch above, which is exactly what produced the
+	// `{ [x: string]: undefined }` PageData this file exists to fix. Narrow it back to the
+	// concrete, known-at-runtime shape at this one boundary.
+	const result = (await baseLoad({ fetch: event.fetch } as Parameters<typeof baseLoad>[0])) as {
+		observability: ObservabilityData;
+	};
+	return result;
 };
 

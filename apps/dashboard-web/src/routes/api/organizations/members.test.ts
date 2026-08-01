@@ -65,7 +65,18 @@ describe('Organization Member Management Routes', () => {
       expect(orgQueries.upsertOrganizationMember).not.toHaveBeenCalled();
     });
 
-    it('400s on malformed JSON body', async () => {
+    it('403s on malformed JSON body when caller lacks org membership (authz runs before body parsing)', async () => {
+      // No dbMock.then mock is set, so requireOrgMembership resolves to no membership.
+      // The endpoint authorizes the caller BEFORE parsing the request body, so an
+      // unauthorized caller gets 403 even though the body is malformed JSON.
+      const request = new Request('http://x', { method: 'PATCH', body: 'invalid-json' });
+      await expect(
+        PATCH({ params: { orgId: 'org-1', memberId: 'mem-1' }, request, locals: locals({ id: 'user-owner' }) } as any)
+      ).rejects.toMatchObject({ status: 403 });
+    });
+
+    it('400s on malformed JSON body when caller is authorized', async () => {
+      dbMock.then.mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }]));
       const request = new Request('http://x', { method: 'PATCH', body: 'invalid-json' });
       await expect(
         PATCH({ params: { orgId: 'org-1', memberId: 'mem-1' }, request, locals: locals({ id: 'user-owner' }) } as any)
@@ -349,9 +360,13 @@ describe('Organization Member Management Routes', () => {
         expect.any(String),
         expect.any(Date)
       );
+      // The endpoint generates its own 256-bit (32-byte -> 64 hex char) token via
+      // crypto.randomBytes internally and ignores the mocked query result's `token`
+      // field for URL construction, so we assert the URL SHAPE rather than a fixed
+      // value. NOTE: P1-3 will hash the token at rest — revisit this assertion then.
       expect(sendInvitationEmailMock).toHaveBeenCalledWith(
         'newuser@company.com',
-        'http://localhost:5173/invitations/token123',
+        expect.stringMatching(/^http:\/\/localhost:5173\/invitations\/[0-9a-f]{64}$/),
         'Acme Corp'
       );
     });
