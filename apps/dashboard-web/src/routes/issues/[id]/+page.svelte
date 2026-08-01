@@ -47,6 +47,8 @@
 		return date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
 	}
 
+	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
+
 	interface StackFrame {
 		file: string;
 		line: number;
@@ -80,6 +82,19 @@
 		}
 		return groups;
 	}, []));
+
+	async function handleStatusChangeRequest(newStatus: 'resolved') {
+		try {
+			await fetch(`/api/issues/${data.issue.id}/status`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ status: newStatus }),
+			});
+			window.location.reload();
+		} catch (err) {
+			console.error('Failed to update status:', err);
+		}
+	}
 </script>
 
 <div class="issue-detail">
@@ -101,6 +116,12 @@
 			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>
 		</div>
 	</div>
+
+	<IssueRelations
+		currentIssueId={data.issue.id}
+		initialRelations={data.relations || []}
+		onStatusChangeRequest={handleStatusChangeRequest}
+	/>
 
 	<section class="occurrences">
 		<h2 class="section-title">Occurrence History ({data.occurrences.length})</h2>

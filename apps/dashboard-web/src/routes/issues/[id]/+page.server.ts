@@ -2,6 +2,7 @@ import type { PageServerLoad } from './$types';
 import { error } from '@sveltejs/kit';
 import { checkProjectAccess } from '$lib/server/projects';
 import { issueQueries } from '$lib/server/queries/issue-queries';
+import { getIssueRelations } from '$lib/db/queries/issues';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -23,10 +24,12 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 
 	const project = await issueQueries.getProjectById(issue.projectId);
 	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
+	const relations = await getIssueRelations(issueId);
 
 	return {
 		issue,
 		project: project ?? null,
 		occurrences,
+		relations,
 	};
 };

@@ -17,3 +17,19 @@ Formal specification documented in [`docs/sdk-specification.md`](file:///home/fi
 
 ### SDK Package Directory Convention
 All official client SDK implementations reside in the `packages/` directory (e.g. `packages/sdk-go`, `packages/sdk-js`, `packages/sdk-python`) adhering to the monorepo layer boundaries defined in `.specify/memory/architecture_constitution.md`.
+
+## API & Security Architecture
+
+### Ephemeral Secret Token Display
+Security pattern for single-exposure API secrets (`sent_org_...` / `sk_proj_...`) generated on creation or rotation. The raw secret is returned unhashed in the server response payload exactly once and rendered in a single-exposure alert banner. Raw secret tokens are never cached in persistent client state or localStorage; only SHA-256 hashes are stored in the database.
+
+### Email Mismatch Security Guard
+Privacy and security pattern for single-use token redemption routes. Compares the authenticated user's email against the target email bound to the invitation token before returning page data. On mismatch, server load handlers return a clean error state while stripping all target organization titles, roles, and invitation details to prevent metadata enumeration attacks.
+
+## Issue Triage & Relations
+
+### Bi-Directional Issue Relations
+Semantic linking between error issues within an organization supporting three relationship types (`linked_to`, `caused_by`, `duplicate_of`). Outgoing and incoming relation queries are unified in the database query layer so links remain visible across both source and target issue detail pages.
+
+### Organization-Wide Alert Rule
+An alert configuration that applies globally across all current and future projects within an organization rather than being scoped to a single project. Represented in the database with a `NULL` project identifier and an explicit organization identifier. Creation and mutation require the `manage_keys` organization-level capability.

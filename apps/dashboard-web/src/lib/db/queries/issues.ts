@@ -1,5 +1,5 @@
 import { db } from '$lib/server/db';
-import { issues, issueActivity, issueRelations } from '$lib/db/schema';
+import { issues, issueActivity, issueRelations, projects } from '$lib/db/schema';
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
 
@@ -278,10 +278,77 @@ export async function getIssueActivity(issueId: string) {
 }
 
 export async function getIssueRelations(issueId: string) {
-	return await db
-		.select()
+	const outgoing = await db
+		.select({
+			id: issueRelations.id,
+			sourceIssueId: issueRelations.sourceIssueId,
+			targetIssueId: issueRelations.targetIssueId,
+			relationType: issueRelations.relationType,
+			createdByType: issueRelations.createdByType,
+			createdBy: issueRelations.createdBy,
+			createdAt: issueRelations.createdAt,
+			direction: sql<'outgoing' | 'incoming'>`'outgoing'`,
+			targetIssue: {
+				id: issues.id,
+				errorClass: issues.errorClass,
+				message: issues.message,
+				status: issues.status,
+				fingerprint: issues.fingerprint,
+			},
+		})
 		.from(issueRelations)
+		.innerJoin(issues, eq(issues.id, issueRelations.targetIssueId))
 		.where(eq(issueRelations.sourceIssueId, issueId));
+
+	const incoming = await db
+		.select({
+			id: issueRelations.id,
+			sourceIssueId: issueRelations.sourceIssueId,
+			targetIssueId: issueRelations.targetIssueId,
+			relationType: issueRelations.relationType,
+			createdByType: issueRelations.createdByType,
+			createdBy: issueRelations.createdBy,
+			createdAt: issueRelations.createdAt,
+			direction: sql<'outgoing' | 'incoming'>`'incoming'`,
+			targetIssue: {
+				id: issues.id,
+				errorClass: issues.errorClass,
+				message: issues.message,
+				status: issues.status,
+				fingerprint: issues.fingerprint,
+			},
+		})
+		.from(issueRelations)
+		.innerJoin(issues, eq(issues.id, issueRelations.sourceIssueId))
+		.where(eq(issueRelations.targetIssueId, issueId));
+
+	return [...outgoing, ...incoming];
+}
+
+export async function searchIssuesInOrg(orgId: string, query: string, excludeIssueId?: string) {
+	const sanitized = query.trim().replace(/[%_\\]/g, '\\$&');
+	const searchTerm = `%${sanitized}%`;
+	const baseQuery = db
+		.select({
+			id: issues.id,
+			errorClass: issues.errorClass,
+			message: issues.message,
+			status: issues.status,
+			fingerprint: issues.fingerprint,
+			projectId: issues.projectId,
+		})
+		.from(issues)
+		.innerJoin(projects, eq(projects.id, issues.projectId))
+		.where(
+			and(
+				eq(projects.organizationId, orgId),
+				excludeIssueId ? sql`${issues.id} != ${excludeIssueId}` : sql`1=1`,
+				sql`(${issues.id} ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
+			)
+		)
+		.limit(10);
+
+	return await baseQuery;
 }
 
 // No callers as of this writing (grep the repo before assuming otherwise). Left unfixed

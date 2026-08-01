@@ -1,7 +1,7 @@
 # TODO 11: Issue Relations and Duplication UI Component
 
 ## Priority: Medium
-## Status: Pending
+## Status: Completed
 
 ### Overview
 The backend API `/api/issues/[issueId]/relations` (`GET`, `POST`, `DELETE`) fully supports linking issues as `parent_of`, `child_of`, or `duplicate_of`. However, no component or view in the frontend dashboard imports or renders issue relations.
