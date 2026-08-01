@@ -26,6 +26,11 @@ function makeDbMock() {
 	dbMock.update.mockReturnValue(dbMock);
 	dbMock.set.mockReturnValue(dbMock);
 	dbMock.delete.mockReturnValue(dbMock);
+	// `clearAllMocks` clears call records but NOT queued `mockImplementationOnce` entries, so an
+	// un-consumed queued resolution leaks into the NEXT test and answers the wrong query, making
+	// results order-dependent. `mockReset` on the queue-bearing mock drops the queue; the base
+	// implementation is re-established on the next line.
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	return dbMock;
 }
@@ -112,6 +117,7 @@ describe('POST /api/alerts — authorization split between org-wide and project-
 		dbMock.update.mockReturnValue(dbMock);
 		dbMock.set.mockReturnValue(dbMock);
 		dbMock.delete.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 
@@ -231,6 +237,7 @@ describe('PUT/DELETE /api/alerts — org-wide configs cannot be touched by proje
 		dbMock.update.mockReturnValue(dbMock);
 		dbMock.set.mockReturnValue(dbMock);
 		dbMock.delete.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 
@@ -459,6 +466,7 @@ describe('GET /api/alerts — returns both layers with an explicit scope field',
 		dbMock.select.mockReturnValue(dbMock);
 		dbMock.from.mockReturnValue(dbMock);
 		dbMock.where.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 

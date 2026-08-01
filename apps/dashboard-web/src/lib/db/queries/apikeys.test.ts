@@ -22,6 +22,11 @@ vi.mock('../../server/db', () => {
 	dbMock.returning.mockReturnValue(dbMock);
 	dbMock.update.mockReturnValue(dbMock);
 	dbMock.set.mockReturnValue(dbMock);
+	// `clearAllMocks` clears call records but NOT queued `mockImplementationOnce` entries, so an
+	// un-consumed queued resolution leaks into the NEXT test and answers the wrong query, making
+	// results order-dependent. `mockReset` on the queue-bearing mock drops the queue; the base
+	// implementation is re-established on the next line.
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve) => resolve([]));
 
 	return { db: dbMock };

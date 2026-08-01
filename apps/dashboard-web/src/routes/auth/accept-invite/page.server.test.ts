@@ -14,6 +14,11 @@ function makeDbMock() {
 	dbMock.from.mockReturnValue(dbMock);
 	dbMock.where.mockReturnValue(dbMock);
 	dbMock.limit.mockReturnValue(dbMock);
+	// `clearAllMocks` clears call records but NOT queued `mockImplementationOnce` entries, so an
+	// un-consumed queued resolution leaks into the NEXT test and answers the wrong query, making
+	// results order-dependent. `mockReset` on the queue-bearing mock drops the queue; the base
+	// implementation is re-established on the next line.
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve: any) => resolve([{ id: 'user-1' }]));
 	return dbMock;
 }
@@ -47,10 +52,17 @@ function makeCookies(initial?: string) {
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	// signInMock's implementation is set at module scope, and tests below replace it with a
+	// persistent rejection. `clearAllMocks` wipes call records but NOT implementations, so that
+	// rejection leaked into whichever test ran next — an unrelated test then failed with the
+	// previous test's error ("SMTP unreachable") under --sequence.shuffle. Re-establish the default.
+	signInMock.mockReset();
+	signInMock.mockResolvedValue(undefined);
 	dbMock.select.mockReturnValue(dbMock);
 	dbMock.from.mockReturnValue(dbMock);
 	dbMock.where.mockReturnValue(dbMock);
 	dbMock.limit.mockReturnValue(dbMock);
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve: any) => resolve([{ id: 'user-1' }]));
 });
 
@@ -199,7 +211,7 @@ describe('accept-invite magiclink action (D29)', () => {
 		} catch (e) {
 			redirectSignal = e;
 		}
-		signInMock.mockRejectedValue(redirectSignal);
+		signInMock.mockRejectedValueOnce(redirectSignal);
 
 		await expect(
 			actions.magiclink({ request: formRequest({ email: 'a@b.com' }) } as any)
@@ -207,7 +219,7 @@ describe('accept-invite magiclink action (D29)', () => {
 	});
 
 	it('still returns a 500 for a genuine send failure', async () => {
-		signInMock.mockRejectedValue(new Error('SMTP unreachable'));
+		signInMock.mockRejectedValueOnce(new Error('SMTP unreachable'));
 
 		const result: any = await actions.magiclink({
 			request: formRequest({ email: 'a@b.com' }),

@@ -15,6 +15,11 @@ function makeDbMock() {
 	dbMock.from.mockReturnValue(dbMock);
 	dbMock.innerJoin.mockReturnValue(dbMock);
 	dbMock.where.mockReturnValue(dbMock);
+	// `clearAllMocks` clears call records but NOT queued `mockImplementationOnce` entries, so an
+	// un-consumed queued resolution leaks into the NEXT test and answers the wrong query, making
+	// results order-dependent. `mockReset` on the queue-bearing mock drops the queue; the base
+	// implementation is re-established on the next line.
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	return dbMock;
 }
@@ -56,6 +61,7 @@ describe('PATCH /api/issues/:id/status', () => {
 		dbMock.from.mockReturnValue(dbMock);
 		dbMock.innerJoin.mockReturnValue(dbMock);
 		dbMock.where.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 

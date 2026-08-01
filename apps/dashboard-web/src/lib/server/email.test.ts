@@ -17,14 +17,22 @@ vi.mock('nodemailer', () => ({
   default: { createTransport: (...args: any[]) => createTransportMock(...args) },
 }));
 
-const { sendInvitationEmail } = await import('./email');
 const { log } = await import('$lib/server/observability/log');
 
+// email.ts caches the nodemailer transporter in MODULE state, keyed by EMAIL_SERVER. Importing it
+// once for the whole file makes these tests order-dependent: whichever test first sends with a
+// given EMAIL_SERVER creates the transporter, and every later test sees a cache hit -- so the
+// caching test passes or fails purely on execution order (confirmed with --sequence.shuffle).
+// Re-import a FRESH module per test so each starts with an empty cache.
+let sendInvitationEmail: typeof import('./email').sendInvitationEmail;
+
 describe('sendInvitationEmail', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     for (const key of Object.keys(mockEnv)) delete mockEnv[key];
     sendMailMock.mockResolvedValue({ messageId: 'msg-1' });
+    vi.resetModules();
+    ({ sendInvitationEmail } = await import('./email'));
   });
 
   it('returns false and logs (without sending) when EMAIL_SERVER is not configured', async () => {

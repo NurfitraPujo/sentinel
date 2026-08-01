@@ -161,6 +161,12 @@ describe('Organization Member Management Routes', () => {
         PATCH({ params: { orgId: 'org-1', memberId: 'mem-1' }, request, locals: locals({ id: 'user-caller' }) } as any)
       ).rejects.toMatchObject({ status: 400 });
       expect(orgQueries.upsertOrganizationMember).not.toHaveBeenCalled();
+      // D32: the owner count must be read under `SELECT ... FOR UPDATE` inside a transaction, or
+      // two concurrent demotions can both observe "2 owners" and both proceed. Asserted explicitly
+      // because the mock chain returns itself for every call -- without this, deleting the lock
+      // from countLockedOwners leaves this test (and the whole suite) green.
+      expect(dbMock.transaction).toHaveBeenCalled();
+      expect(dbMock.for).toHaveBeenCalledWith('update');
     });
 
     it('403s when caller attempts to change their own role', async () => {
@@ -276,6 +282,9 @@ describe('Organization Member Management Routes', () => {
         DELETE({ params: { orgId: 'org-1', memberId: 'mem-target' }, locals: locals({ id: 'user-owner-caller' }) } as any)
       ).rejects.toMatchObject({ status: 400 });
       expect(dbMock.delete).not.toHaveBeenCalled();
+      // D32: same lock requirement on the revoke path.
+      expect(dbMock.transaction).toHaveBeenCalled();
+      expect(dbMock.for).toHaveBeenCalledWith('update');
     });
 
     it('200s and revokes member access', async () => {
@@ -349,6 +358,14 @@ describe('Organization Member Management Routes', () => {
       const successes = [resultA, resultB].filter((r) => r.ok && r.status === 200);
       expect(successes.length).toBeLessThanOrEqual(1);
       expect(remainingOwners.length).toBeGreaterThanOrEqual(1);
+
+      // The serialization above is enforced by THIS TEST'S transaction mock, not by the code under
+      // test -- so on its own it proves nothing about the real guard. Without these two assertions
+      // the whole suite stayed green with `.for('update')` deleted from countLockedOwners
+      // (verified). Postgres is what actually serializes the two transactions in production; assert
+      // the code asks it to.
+      expect(dbMock.transaction).toHaveBeenCalled();
+      expect(dbMock.for).toHaveBeenCalledWith('update');
     });
   });
 

@@ -13,6 +13,9 @@ export default defineConfig(({ mode }) => ({
 	},
 	test: {
 		environment: 'jsdom',
-		include: ['src/**/*.test.ts', 'tests/**/*.test.ts']
+		include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+		// Unmounts rendered components between tests — see vitest-setup.ts for why this is not
+		// automatic here.
+		setupFiles: ['./vitest-setup.ts']
 	}
 }));
