@@ -54,8 +54,14 @@ type Dispatcher struct {
 	// and shape SetConfigsForTest has always had, kept unchanged so existing callers (including
 	// tests/integration, which this change does not touch) keep compiling.
 	configs map[string]*AlertConfig
-	// orgConfigs holds ORGANIZATION-WIDE rows (project_id IS NULL), keyed by organization id.
-	orgConfigs map[string]*AlertConfig
+	// orgConfigs holds ORGANIZATION-WIDE rows (project_id IS NULL), keyed by organization id. The
+	// value is a SLICE, not a single *AlertConfig: nothing in the schema constrains one row per
+	// (organization_id) with project_id NULL (see 1722100000_add_alert_config_org_layer.sql), and the
+	// dashboard UI lets a user create N org-wide rules (e.g. one email + one telegram). A single-value
+	// map here silently drops every rule but whichever refreshConfigs' query happened to return last
+	// for that key — same channel/target dedup happens, but only after every applicable row for the
+	// org is collected. See resolveConfigs for the union+dedup step.
+	orgConfigs map[string][]*AlertConfig
 	// projectOrg maps a project id to its organization id. Dispatch is only ever called with a
 	// projectID (see the Dispatch signature below) — it has no organizationID to look up orgConfigs
 	// with. Rather than querying the projects table per event (a regression on the hot path),
@@ -88,7 +94,7 @@ func NewDispatcher(db *pgxpool.Pool) *Dispatcher {
 		db:         db,
 		counters:   make(map[string]*alertCounter),
 		configs:    make(map[string]*AlertConfig),
-		orgConfigs: make(map[string]*AlertConfig),
+		orgConfigs: make(map[string][]*AlertConfig),
 		projectOrg: make(map[string]string),
 	}
 
@@ -119,7 +125,7 @@ func NewDispatcherForTest(db *pgxpool.Pool) *Dispatcher {
 		db:         db,
 		counters:   make(map[string]*alertCounter),
 		configs:    make(map[string]*AlertConfig),
-		orgConfigs: make(map[string]*AlertConfig),
+		orgConfigs: make(map[string][]*AlertConfig),
 		projectOrg: make(map[string]string),
 	}
 }
@@ -136,9 +142,10 @@ func (d *Dispatcher) SetConfigsForTest(configs map[string]*AlertConfig) {
 }
 
 // SetOrgConfigsForTest replaces the dispatcher's loaded ORGANIZATION-WIDE configurations (project_id
-// IS NULL rows), keyed by organization id. Pair with SetProjectOrgForTest so Dispatch (which only
-// receives a projectID) can find them.
-func (d *Dispatcher) SetOrgConfigsForTest(configs map[string]*AlertConfig) {
+// IS NULL rows), keyed by organization id, with each value a SLICE of every rule that applies to that
+// org (multiple org-wide rules per organization are supported — see orgConfigs' doc comment). Pair
+// with SetProjectOrgForTest so Dispatch (which only receives a projectID) can find them.
+func (d *Dispatcher) SetOrgConfigsForTest(configs map[string][]*AlertConfig) {
 	d.configMu.Lock()
 	defer d.configMu.Unlock()
 	d.orgConfigs = configs
@@ -293,7 +300,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	}
 
 	projectConfigs := make(map[string]*AlertConfig)
-	orgConfigs := make(map[string]*AlertConfig)
+	orgConfigs := make(map[string][]*AlertConfig)
 
 	for rows.Next() {
 		var cfg AlertConfig
@@ -340,7 +347,7 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 			cfg.ProjectID = projectID.String
 			projectConfigs[cfg.ProjectID] = &cfg
 		} else {
-			orgConfigs[cfg.OrganizationID] = &cfg
+			orgConfigs[cfg.OrganizationID] = append(orgConfigs[cfg.OrganizationID], &cfg)
 		}
 	}
 	rowsErr := rows.Err()
@@ -434,7 +441,12 @@ func (d *Dispatcher) resolveConfigs(projectID string) []*AlertConfig {
 	}
 
 	if orgID, ok := d.projectOrg[projectID]; ok {
-		if cfg, ok := d.orgConfigs[orgID]; ok && !seen[destinationKey(cfg)] {
+		for _, cfg := range d.orgConfigs[orgID] {
+			key := destinationKey(cfg)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			result = append(result, cfg)
 		}
 	}

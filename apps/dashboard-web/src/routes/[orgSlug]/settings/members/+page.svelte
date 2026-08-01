@@ -229,7 +229,11 @@
     aria-modal="true"
     aria-labelledby="revoke-modal-title"
     aria-describedby="revoke-modal-desc"
+    tabindex="-1"
     on:click|self={() => (revokingMember = null)}
+    on:keydown={(e) => {
+      if (e.key === 'Escape') revokingMember = null;
+    }}
   >
     <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-md p-5 text-slate-100 space-y-4">
       <div class="flex items-center gap-3 text-red-400">

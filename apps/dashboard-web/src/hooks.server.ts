@@ -59,7 +59,10 @@ const requestContextHandle: Handle = async ({ event, resolve }) => {
 	});
 };
 
-const orgHandle = async ({ event, resolve }: any) => {
+// Exported (not just used internally) so route-level tests can drive it directly against a fake
+// `event`/`resolve` pair without needing to mock the whole Auth.js handle chain — see
+// hooks.server.test.ts (D01/P2-1).
+export const orgHandle = async ({ event, resolve }: any) => {
 	const session = await event.locals.auth();
 	if (!session?.user?.email) {
 		return resolve(event);
@@ -74,7 +77,29 @@ const orgHandle = async ({ event, resolve }: any) => {
 	const pathParts = event.url.pathname.split('/').filter(Boolean);
 	// 'signin' added alongside the /auth/signin -> /signin move (see auth-config.ts) so the
 	// top-level custom sign-in page is still treated as reserved, not mistaken for an org slug.
-	const reservedRoutes = ['api', 'auth', 'issues', 'search', 'settings', 'admin', 'docs', 'billing', 'support', 'signin'];
+	// 'invitations' added per D01/P2-1: /invitations/<token> is a top-level, non-org route (see
+	// routes/invitations/[token]/+page.server.ts) — without it, an AUTHENTICATED user hitting an
+	// emailed invitation link had it parsed as an org slug here, found no matching org, and got a 403
+	// before the redirect in that route ever ran. Anonymous users were unaffected only because they hit
+	// the early return above.
+	//
+	// This list is hand-maintained and every entry here is a DELIBERATE decision that the corresponding
+	// top-level directory under src/routes/ is NOT an org slug. tests/route-manifest-drift.test.ts
+	// enumerates src/routes/ and fails if a new top-level route shows up that isn't in this list and
+	// isn't `[orgSlug]` — so the next one can't silently repeat this bug.
+	const reservedRoutes = [
+		'api',
+		'auth',
+		'issues',
+		'search',
+		'settings',
+		'admin',
+		'docs',
+		'billing',
+		'support',
+		'signin',
+		'invitations',
+	];
 	let orgSlugFromUrl = null;
 
 	if (pathParts.length > 0 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {

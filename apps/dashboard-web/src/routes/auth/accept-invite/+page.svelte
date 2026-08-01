@@ -59,7 +59,8 @@
 					loading = false;
 				};
 			}}>
-				<input type="hidden" name="token" value={data.token || ''} />
+				<!-- D06: no token field here -- the server action reads the invite token from its
+				     HttpOnly cookie, never from a client-supplied form value. -->
 				<button type="submit" disabled={loading} class="btn btn-primary btn-full">
 					{loading ? 'Joining Organization...' : 'Accept & Join Organization'}
 				</button>

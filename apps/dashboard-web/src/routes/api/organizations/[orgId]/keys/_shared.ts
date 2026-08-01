@@ -5,6 +5,12 @@ import { organizationMembers, projects } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 import type { OrgRole } from '$lib/rbac';
 
+// D38: `length === 36` is not a UUID check — a project literally NAMED a 36-character string (e.g.
+// "my-super-duper-long-project-name!!!") collided with it and got looked up by id instead of by
+// name, 404ing even though the project exists. Match the actual UUID shape (8-4-4-4-12 hex,
+// case-insensitive) instead of just counting characters.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // requireOrgMembership looks up the CALLER's own membership row for orgId, keyed off the
 // authenticated session's user id — never off anything in the request body or URL beyond orgId
 // itself. This is the check VERIFIED_STATE.md S6 warns is easy to skip: authority must come from
@@ -40,7 +46,7 @@ export async function resolveProjectInOrg(
 				eq(projects.organizationId, organizationId),
 				// projectIdOrName may be a UUID (id) or a human-entered project name; either way the
 				// match MUST also be scoped to this organization.
-				projectIdOrName.length === 36
+				UUID_RE.test(projectIdOrName)
 					? eq(projects.id, projectIdOrName)
 					: eq(projects.name, projectIdOrName)
 			)

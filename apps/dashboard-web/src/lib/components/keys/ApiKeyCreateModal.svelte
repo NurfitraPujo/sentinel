@@ -3,13 +3,26 @@
 	
 	export let isOpen = false;
 	export let projects: Array<{ id: string, name: string }> = [];
+	// D27: the project-scoped page (settings/keys/+page.server.ts under projects/[projectId]) ALWAYS
+	// mints a key scoped to `data.projectId` and ignores whatever `targetProject` this modal
+	// dispatches — so rendering an "All Projects [Org-Wide]" option there let a user believe they
+	// were creating an org-wide key while a project-scoped one was silently minted instead. The
+	// project-scoped page passes `allowOrgWide={false}` to remove the misleading option entirely;
+	// the org-level page (which DOES honour targetProject) leaves it at the default `true`.
+	export let allowOrgWide = true;
+	// D26: bound by the parent (via bind:isSubmitting) so a create failure that the parent handles
+	// (toast + early return, modal stays open) can reset this back to false. Previously this was a
+	// local-only variable that only handleClose ever reset — on any 400/403/network error the parent
+	// toasts and returns without closing the modal, so the button stayed disabled reading "Creating..."
+	// forever, with no way to retry short of a full page reload.
+	export let isSubmitting = false;
+
+	const ORG_WIDE_SENTINEL = 'All Projects [Org-Wide]';
 
 	let name = '';
-	let targetProject = 'All Projects [Org-Wide]';
+	let targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 	let scope = 'ingest';
 	let rateLimitRpm = '';
-	
-	let isSubmitting = false;
 	
 	const dispatch = createEventDispatcher();
 	
@@ -33,7 +46,7 @@
 	function handleClose() {
 		isOpen = false;
 		name = '';
-		targetProject = 'All Projects [Org-Wide]';
+		targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 		scope = 'ingest';
 		rateLimitRpm = '';
 		isSubmitting = false;
@@ -64,12 +77,14 @@
 
 			<div>
 				<label for="target-project" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Target Project</label>
-				<select 
-					id="target-project" 
-					bind:value={targetProject} 
+				<select
+					id="target-project"
+					bind:value={targetProject}
 					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-emerald-500 transition-colors"
 				>
-					<option value="All Projects [Org-Wide]">All Projects [Org-Wide]</option>
+					{#if allowOrgWide}
+						<option value={ORG_WIDE_SENTINEL}>{ORG_WIDE_SENTINEL}</option>
+					{/if}
 					{#each projects as project}
 						<option value={project.id}>{project.name}</option>
 					{/each}

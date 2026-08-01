@@ -31,8 +31,32 @@ const apikeyQueries = {
 	revokeApiKey: vi.fn(),
 	rotateApiKey: vi.fn(),
 	createNatsPublisher: vi.fn(() => ({ publish: vi.fn().mockResolvedValue(undefined) })),
+	// Real implementation (not a mock) so the route code under test exercises the actual
+	// stripping behaviour, matching src/lib/db/queries/apikeys.ts's toPublicKey.
+	toPublicKey: (row: Record<string, unknown>) => {
+		const { keyHash: _keyHash, ...rest } = row;
+		return rest;
+	},
 };
 vi.mock('$lib/db/queries/apikeys', () => apikeyQueries);
+
+// Recursively walks an arbitrary response body and fails if a 'keyHash' property is found at
+// any depth (top-level, nested inside `key`, inside arrays, etc). D09: keyHash is the SHA-256 of
+// the live secret and is the exact value the ingestor's Redis cache is keyed on
+// (apps/ingestor-go/auth/apikey.go:53) — it must never reach the browser.
+function assertNoKeyHash(value: unknown, path = 'body') {
+	if (value === null || typeof value !== 'object') return;
+	if (Array.isArray(value)) {
+		value.forEach((item, i) => assertNoKeyHash(item, `${path}[${i}]`));
+		return;
+	}
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (key === 'keyHash') {
+			throw new Error(`Found forbidden 'keyHash' key at ${path}.${key}`);
+		}
+		assertNoKeyHash(val, `${path}.${key}`);
+	}
+}
 
 const { GET, POST } = await import('./[orgId]/keys/+server');
 const { DELETE } = await import('./[orgId]/keys/[keyId]/+server');
@@ -71,11 +95,14 @@ describe('organization API key routes', () => {
 
 		it('200s and lists keys for a viewer member (read-only role can still view)', async () => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('viewer')]));
-			apikeyQueries.getOrganizationApiKeys.mockResolvedValueOnce([{ id: 'key-1' }]);
+			// D09 regression guard: even if getOrganizationApiKeys ever regresses to selecting
+			// keyHash, the route must still strip it before serializing.
+			apikeyQueries.getOrganizationApiKeys.mockResolvedValueOnce([{ id: 'key-1', keyHash: 'deadbeef' }]);
 
 			const res = await GET({ params: { orgId: 'org-1' }, locals: locals({ id: 'user-1' }) } as any);
 			const body = await res.json();
 			expect(body).toEqual({ keys: [{ id: 'key-1' }] });
+			assertNoKeyHash(body);
 			expect(apikeyQueries.getOrganizationApiKeys).toHaveBeenCalledWith('org-1');
 		});
 	});
@@ -97,8 +124,10 @@ describe('organization API key routes', () => {
 
 		it.each(['owner', 'admin', 'engineer'])('201s for an org %s', async (role) => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow(role)]));
+			// D09 regression guard: even if createApiKey's .returning() ever regresses to a bare
+			// call that includes keyHash on the row, the route must still strip it.
 			apikeyQueries.createApiKey.mockResolvedValueOnce({
-				apiKey: { id: 'key-new' },
+				apiKey: { id: 'key-new', keyHash: 'deadbeef-hash' },
 				secretToken: 'sent_org_deadbeef',
 			});
 			const request = new Request('http://x', { method: 'POST', body: JSON.stringify({ name: 'k', scope: 'ingest' }) });
@@ -107,6 +136,7 @@ describe('organization API key routes', () => {
 			expect(res.status).toBe(201);
 			const body = await res.json();
 			expect(body.token).toBe('sent_org_deadbeef');
+			assertNoKeyHash(body);
 			expect(apikeyQueries.createApiKey).toHaveBeenCalledWith(
 				'user-1',
 				expect.objectContaining({ organizationId: 'org-1', name: 'k', scope: 'ingest', projectId: null })
@@ -119,6 +149,52 @@ describe('organization API key routes', () => {
 			await expect(
 				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
 			).rejects.toMatchObject({ status: 403 });
+		});
+
+		// D28: an unrecognized scope used to be silently downgraded to 'ingest' and reported as
+		// a 201 success. It must now be rejected outright.
+		it('400s for an unrecognized scope instead of silently downgrading to ingest', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'k', scope: 'superadmin' }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		// D28: rateLimitRpm accepted any number (negative, zero, or absurdly large) and passed it
+		// straight through.
+		it.each([-1, 0, 1e12, 1.5])('400s for an invalid rateLimitRpm (%s)', async (rpm) => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'k', scope: 'ingest', rateLimitRpm: rpm }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('201s for a valid positive integer rateLimitRpm', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			apikeyQueries.createApiKey.mockResolvedValueOnce({
+				apiKey: { id: 'key-new', keyHash: 'deadbeef-hash' },
+				secretToken: 'sent_org_deadbeef',
+			});
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'k', scope: 'ingest', rateLimitRpm: 1000 }),
+			});
+			const res = await POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any);
+			expect(res.status).toBe(201);
+			expect(apikeyQueries.createApiKey).toHaveBeenCalledWith(
+				'user-1',
+				expect.objectContaining({ rateLimitRpm: 1000 })
+			);
 		});
 	});
 
@@ -167,8 +243,10 @@ describe('organization API key routes', () => {
 		it('rotates for an owner and returns the new secret once', async () => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
 			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1' });
+			// D09 regression guard: even if rotateApiKey's .returning() ever regresses to a bare
+			// call that includes keyHash on the row, the route must still strip it.
 			apikeyQueries.rotateApiKey.mockResolvedValueOnce({
-				apiKey: { id: 'key-2' },
+				apiKey: { id: 'key-2', keyHash: 'new-hash' },
 				secretToken: 'sent_org_newsecret',
 			});
 
@@ -176,6 +254,7 @@ describe('organization API key routes', () => {
 			const body = await res.json();
 			expect(body.success).toBe(true);
 			expect(body.token).toBe('sent_org_newsecret');
+			assertNoKeyHash(body);
 		});
 	});
 });

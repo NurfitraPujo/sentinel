@@ -1,6 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getApiKeyById, rotateApiKey, createNatsPublisher } from '$lib/db/queries/apikeys';
+import { getApiKeyById, rotateApiKey, createNatsPublisher, toPublicKey } from '$lib/db/queries/apikeys';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership } from '../../_shared';
 
@@ -35,7 +35,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 	return json({
 		success: true,
 		message: 'Key rotated successfully. The previous key was revoked immediately (no grace period) — see specs/008-api-key-management/spec.md.',
-		key: apiKey,
+		key: toPublicKey(apiKey),
 		token: secretToken,
 	});
 };

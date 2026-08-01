@@ -1,6 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getOrganizationApiKeys, createApiKey } from '$lib/db/queries/apikeys';
+import { getOrganizationApiKeys, createApiKey, toPublicKey } from '$lib/db/queries/apikeys';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership, resolveProjectInOrg } from './_shared';
 
@@ -22,7 +22,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	}
 
 	const keys = await getOrganizationApiKeys(orgId!);
-	return json({ keys });
+	return json({ keys: keys.map(toPublicKey) });
 };
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
@@ -46,7 +46,31 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		throw error(400, 'name is required');
 	}
 
+	// D28: an unrecognized scope used to be silently downgraded to 'ingest' and reported as a 201
+	// success — the caller believed they created (e.g.) an 'admin' key and got an 'ingest' one with
+	// no indication anything was wrong. Reject it instead. `scope` is optional (defaults to
+	// 'ingest' when omitted entirely), but an explicit, unrecognized value is a client error.
+	if (body.scope !== undefined && !VALID_SCOPES.includes(body.scope)) {
+		throw error(400, `Invalid scope: must be one of ${VALID_SCOPES.join(', ')}`);
+	}
 	const scope = VALID_SCOPES.includes(body.scope) ? body.scope : 'ingest';
+
+	// D28: rateLimitRpm accepted ANY number — negative, zero, or absurdly large (1e12) — and passed
+	// it straight through to the ingestor's rate limiter. Require a positive, finite integer within
+	// a sane operational bound.
+	const MAX_RATE_LIMIT_RPM = 1_000_000;
+	if (body.rateLimitRpm !== undefined) {
+		const rpm = body.rateLimitRpm;
+		if (
+			typeof rpm !== 'number' ||
+			!Number.isFinite(rpm) ||
+			!Number.isInteger(rpm) ||
+			rpm <= 0 ||
+			rpm > MAX_RATE_LIMIT_RPM
+		) {
+			throw error(400, `rateLimitRpm must be a positive integer no greater than ${MAX_RATE_LIMIT_RPM}`);
+		}
+	}
 
 	// targetProject/projectId identifies a project WITHIN this organization; absent (or the
 	// "All Projects [Org-Wide]" sentinel the UI uses) means an organization-wide key. Whatever the
@@ -73,6 +97,8 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	});
 
 	// The raw secret token is returned exactly once, here, and is never stored (only its SHA256
-	// hash is persisted) — FR-002.
-	return json({ key: apiKey, token: secretToken }, { status: 201 });
+	// hash is persisted) — FR-002. `key` is passed through toPublicKey() so keyHash (the value
+	// the ingestor's Redis cache is keyed on, apps/ingestor-go/auth/apikey.go:53) never reaches
+	// the browser even if the query above regresses to a bare .returning().
+	return json({ key: toPublicKey(apiKey), token: secretToken }, { status: 201 });
 };

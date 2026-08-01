@@ -229,8 +229,8 @@ func orgWideConfig(id, to string) *alerts.AlertConfig {
 func TestAlertsDispatcher_ResolveOrgWideOnly(t *testing.T) {
 	d, sent := captureDispatch(t)
 	d.SetConfigsForTest(map[string]*alerts.AlertConfig{})
-	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
-		resolutionOrgID: orgWideConfig("org-cfg", "org-oncall@example.test"),
+	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{
+		resolutionOrgID: {orgWideConfig("org-cfg", "org-oncall@example.test")},
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
@@ -248,7 +248,7 @@ func TestAlertsDispatcher_ResolveProjectScopedOnly(t *testing.T) {
 	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
 		resolutionProjectID: projectScopedConfig("proj-cfg", "project-oncall@example.test"),
 	})
-	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{})
+	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
 	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
@@ -266,8 +266,8 @@ func TestAlertsDispatcher_ResolveBothLayersUnion(t *testing.T) {
 	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
 		resolutionProjectID: projectScopedConfig("proj-cfg", "project-oncall@example.test"),
 	})
-	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
-		resolutionOrgID: orgWideConfig("org-cfg", "org-oncall@example.test"),
+	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{
+		resolutionOrgID: {orgWideConfig("org-cfg", "org-oncall@example.test")},
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
@@ -288,8 +288,8 @@ func TestAlertsDispatcher_ResolveSameDestinationDeduplicated(t *testing.T) {
 	d.SetConfigsForTest(map[string]*alerts.AlertConfig{
 		resolutionProjectID: projectScopedConfig("proj-cfg", "shared-oncall@example.test"),
 	})
-	d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{
-		resolutionOrgID: orgWideConfig("org-cfg", "shared-oncall@example.test"),
+	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{
+		resolutionOrgID: {orgWideConfig("org-cfg", "shared-oncall@example.test")},
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
@@ -313,7 +313,7 @@ func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
 		orgCfg.Enabled = false
 
 		d.SetConfigsForTest(map[string]*alerts.AlertConfig{resolutionProjectID: projCfg})
-		d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{resolutionOrgID: orgCfg})
+		d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{resolutionOrgID: {orgCfg}})
 		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
 		d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
@@ -330,7 +330,7 @@ func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
 		orgCfg := orgWideConfig("org-cfg", "org-oncall@example.test")
 
 		d.SetConfigsForTest(map[string]*alerts.AlertConfig{resolutionProjectID: projCfg})
-		d.SetOrgConfigsForTest(map[string]*alerts.AlertConfig{resolutionOrgID: orgCfg})
+		d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{resolutionOrgID: {orgCfg}})
 		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
 		d.Dispatch(context.Background(), "issue-2", resolutionProjectID, "TestError", "msg")
@@ -339,4 +339,38 @@ func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
 		require.Len(t, got, 1)
 		assert.Equal(t, "org-oncall@example.test", got[0].ChannelConfig["to"])
 	})
+}
+
+// TestAlertsDispatcher_ResolveMultipleOrgWideRulesUnion proves D04/D21: multiple org-wide rules for the
+// SAME organization (e.g. one email + one telegram rule, both created through the dashboard's "create
+// org-wide alert" UI, which has no duplicate check) must ALL fire, not just whichever refreshConfigs'
+// query happened to return last for that organization id. Before this fix, orgConfigs was keyed
+// map[string]*AlertConfig — a single-value map — so the second write for the same key silently
+// overwrote the first and only one config's destination ever fired.
+func TestAlertsDispatcher_ResolveMultipleOrgWideRulesUnion(t *testing.T) {
+	d, sent := captureDispatch(t)
+	d.SetConfigsForTest(map[string]*alerts.AlertConfig{})
+
+	emailCfg := orgWideConfig("org-email-cfg", "org-oncall@example.test")
+	telegramCfg := &alerts.AlertConfig{
+		ID:                 "org-telegram-cfg",
+		OrganizationID:     resolutionOrgID,
+		Channel:            "telegram",
+		ChannelConfig:      map[string]interface{}{"chat_id": "123456"},
+		FrequencyThreshold: 1,
+		FrequencyWindow:    time.Minute,
+		Enabled:            true,
+	}
+
+	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{
+		resolutionOrgID: {emailCfg, telegramCfg},
+	})
+	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
+
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+
+	got := sent()
+	require.Len(t, got, 2, "both org-wide rules (email and telegram) must fire, not just the last one loaded")
+	channels := []string{got[0].Channel, got[1].Channel}
+	assert.ElementsMatch(t, []string{"email", "telegram"}, channels)
 }

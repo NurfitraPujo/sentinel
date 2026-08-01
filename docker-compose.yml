@@ -148,7 +148,15 @@ services:
 
     processor:
         ports:
-            - "8081:8081" # /health — includes dlq_depth (D10); see tools/dlq to replay
+            # D47: kept host-published deliberately. tests/e2e (harness_test.go, tracing_test.go's
+            # U35, resilience_test.go) dial this port directly for /health and /metrics — unpublishing
+            # it breaks the e2e suite, not just local dev. /health and /metrics expose only this
+            # instance's own status and Prometheus counters, no per-tenant payloads. /dlq is the one
+            # that mattered: as of P2-6 (D12) it no longer returns a synthetic or real per-event
+            # "items" array — main.go's /dlq handler now serves aggregates only (total_depth etc.), so
+            # there is nothing tenant-scoped left on this port to authenticate. If /dlq ever grows a
+            # real per-event listing again, gate it (and re-evaluate this port) before that ships.
+            - "8081:8081" # /health, /metrics, /dlq (aggregates only) — see comment above
         build:
             context: .
             dockerfile: apps/processor-go/Dockerfile

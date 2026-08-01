@@ -4,9 +4,12 @@
   export let show = false;
   export let orgId: string;
 
+  // D06 (P1): the invitations endpoint never returns the raw token or a pre-built invite link to
+  // the browser -- the token exists only in the emailed URL, so the modal has no link to display
+  // or copy. `invited` therefore carries the created invitation's public fields only.
   const dispatch = createEventDispatcher<{
     close: void;
-    invited: { id: string; email: string; role: string; token: string };
+    invited: { id: string; email: string; role: string };
   }>();
 
   const roles = [
@@ -21,8 +24,7 @@
   let selectedRole = 'engineer';
   let loading = false;
   let errorMessage = '';
-  let generatedInviteLink = '';
-  let copied = false;
+  let invitationSent = false;
   let emailInputEl: HTMLInputElement | null = null;
 
   function resetForm() {
@@ -30,8 +32,7 @@
     selectedRole = 'engineer';
     loading = false;
     errorMessage = '';
-    generatedInviteLink = '';
-    copied = false;
+    invitationSent = false;
   }
 
   function handleClose() {
@@ -76,35 +77,16 @@
         throw new Error(result.message || result.error || 'Failed to issue invitation');
       }
 
-      generatedInviteLink = `${window.location.origin}/invitations/${result.token}`;
+      // D06/D41: the server never hands the raw invitation token (or a pre-built link) to the
+      // browser -- it exists only inside the email it tries to send. A 201 here means the
+      // invitation row was created; it does NOT mean delivery succeeded (the endpoint swallows
+      // send failures). There is nothing this modal can show as a clickable/copyable link.
+      invitationSent = true;
       dispatch('invited', result);
     } catch (err: any) {
       errorMessage = err.message || 'An unexpected error occurred';
     } finally {
       loading = false;
-    }
-  }
-
-  async function copyToClipboard() {
-    if (!generatedInviteLink) return;
-    try {
-      await navigator.clipboard.writeText(generatedInviteLink);
-      copied = true;
-      setTimeout(() => {
-        copied = false;
-      }, 2000);
-    } catch {
-      const linkInput = document.getElementById('invite-link-input') as HTMLInputElement;
-      if (linkInput) {
-        linkInput.select();
-        document.execCommand('copy');
-        copied = true;
-        setTimeout(() => {
-          copied = false;
-        }, 2000);
-      } else {
-        errorMessage = 'Could not copy link automatically. Please copy text manually.';
-      }
     }
   }
 </script>
@@ -117,7 +99,11 @@
     role="dialog"
     aria-modal="true"
     aria-labelledby="invite-modal-title"
+    tabindex="-1"
     on:click|self={handleClose}
+    on:keydown={(e) => {
+      if (e.key === 'Escape') handleClose();
+    }}
   >
     <div
       class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-md p-6 text-slate-100"
@@ -141,42 +127,12 @@
         </button>
       </div>
 
-      {#if generatedInviteLink}
+      {#if invitationSent}
         <div class="space-y-4">
-          <div class="p-3 bg-emerald-950/40 border border-emerald-500/30 rounded-md text-sm text-emerald-300 break-all">
-            Invitation successfully created! Send the link below to <strong>{email}</strong>.
-          </div>
-
-          <div>
-            <label for="invite-link-input" class="block text-xs font-mono uppercase text-slate-400 mb-1">
-              Invitation Link (Expires in 7 days)
-            </label>
-            <div class="flex gap-2">
-              <input
-                id="invite-link-input"
-                type="text"
-                readonly
-                value={generatedInviteLink}
-                class="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-xs font-mono text-slate-200 focus:outline-hidden focus:border-blue-500"
-              />
-              <button
-                type="button"
-                on:click={copyToClipboard}
-                class="bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-3 py-1.5 rounded transition-colors flex items-center gap-1 focus:outline-hidden focus:ring-2 focus:ring-blue-500 shrink-0"
-              >
-                {#if copied}
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                  </svg>
-                  Copied!
-                {:else}
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-                  </svg>
-                  Copy Link
-                {/if}
-              </button>
-            </div>
+          <div class="p-3 bg-emerald-950/40 border border-emerald-500/30 rounded-md text-sm text-emerald-300">
+            Invitation created for <strong>{email}</strong>. We've sent them an email with a link to
+            accept it. If they don't receive it, they can be re-invited from this org's outstanding
+            invitations list.
           </div>
 
           <div class="pt-4 border-t border-slate-800 flex justify-end">

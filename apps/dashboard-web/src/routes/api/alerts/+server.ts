@@ -308,6 +308,28 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 			return json({ error: access.error }, { status: access.status });
 		}
 
+		// PUT never changes which project/org a config belongs to — an update endpoint is not a move
+		// endpoint, and silently ignoring a scope-changing field (the prior behavior) returned 200 while
+		// changing nothing, which the caller has no way to distinguish from success. Reject explicitly
+		// instead. A field is only checked when the caller actually sent it (undefined means "unchanged").
+		const requestedProjectId: string | null | undefined =
+			body.projectId === undefined ? undefined : body.projectId === '' ? null : body.projectId;
+		if (requestedProjectId !== undefined && requestedProjectId !== existingConfig[0].projectId) {
+			return json(
+				{ error: 'Cannot change an alert config’s project scope via update; delete and recreate instead' },
+				{ status: 400 }
+			);
+		}
+		if (
+			body.organizationId !== undefined &&
+			body.organizationId !== existingConfig[0].organizationId
+		) {
+			return json(
+				{ error: 'Cannot change an alert config’s organization scope via update; delete and recreate instead' },
+				{ status: 400 }
+			);
+		}
+
 		const existingChannelConfig = (existingConfig[0].channelConfig ?? {}) as Record<string, unknown>;
 		const updatedConfig = await db
 			.update(alertConfigs)

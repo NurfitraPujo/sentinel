@@ -289,7 +289,10 @@ export async function getIssueRelations(issueId: string) {
 			createdBy: issueRelations.createdBy,
 			createdAt: issueRelations.createdAt,
 			direction: sql<'outgoing' | 'incoming'>`'outgoing'`,
-			targetIssue: {
+			// D43: this joined issue IS the target for an outgoing row (issueId is the source), so
+			// `relatedIssue` is accurate here too — it is simply named to match the incoming branch
+			// below, where the same key would otherwise lie about which side of the relation it is.
+			relatedIssue: {
 				id: issues.id,
 				errorClass: issues.errorClass,
 				message: issues.message,
@@ -311,7 +314,10 @@ export async function getIssueRelations(issueId: string) {
 			createdBy: issueRelations.createdBy,
 			createdAt: issueRelations.createdAt,
 			direction: sql<'outgoing' | 'incoming'>`'incoming'`,
-			targetIssue: {
+			// D43: this joined issue is issueRelations.sourceIssueId — the SOURCE of the relation, not
+			// the target. The old key name `targetIssue` was simply wrong here; `relatedIssue` names
+			// what it actually is: "the other issue in this relation", regardless of direction.
+			relatedIssue: {
 				id: issues.id,
 				errorClass: issues.errorClass,
 				message: issues.message,
@@ -326,6 +332,19 @@ export async function getIssueRelations(issueId: string) {
 	return [...outgoing, ...incoming];
 }
 
+// issues.id is `uuid` (schema.ts:59), and Postgres has no ILIKE operator for uuid — every search
+// with the raw column in the ILIKE clause threw `operator does not exist: uuid ~~* unknown` (D02),
+// which made this the ONLY way to pick a link target for the relations UI, so the entire link/
+// duplicate flow was unusable.
+//
+// Cast to text (`issues.id::text ILIKE ...`) rather than leaving the column out of the id match:
+// a user pasting a full or partial UUID into the search box is a real, common case (copy-pasting an
+// id from another tab, a linked Slack message, etc.), and dropping id matching entirely would
+// silently break that. Substring matching over a UUID's hex digits is a broad scan, but this table
+// is already filtered to a single organization via the projects join and capped with .limit(10), so
+// the match set stays bounded; a prefix-only match (`id::text ILIKE query || '%'`) would miss the
+// "pasted the middle of an id" case for no real performance win at this scale, so full substring
+// matching was kept for consistency with the other ILIKE columns here.
 export async function searchIssuesInOrg(orgId: string, query: string, excludeIssueId?: string) {
 	const sanitized = query.trim().replace(/[%_\\]/g, '\\$&');
 	const searchTerm = `%${sanitized}%`;
@@ -344,7 +363,7 @@ export async function searchIssuesInOrg(orgId: string, query: string, excludeIss
 			and(
 				eq(projects.organizationId, orgId),
 				excludeIssueId ? sql`${issues.id} != ${excludeIssueId}` : sql`1=1`,
-				sql`(${issues.id} ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
+				sql`(${issues.id}::text ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
 			)
 		)
 		.limit(10);

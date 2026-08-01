@@ -1,21 +1,26 @@
 import { error } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
 import { db } from '$lib/server/db';
-import { organizations, projects } from '$lib/db/schema';
+import { projects } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 
-export const load: PageServerLoad = async ({ params, fetch }) => {
+export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	const { orgSlug, projectId } = params;
 
-	// Resolve organization ID from slug
-	const [org] = await db
-		.select({ id: organizations.id, name: organizations.name })
-		.from(organizations)
-		.where(eq(organizations.slug, orgSlug));
-
-	if (!org) {
-		throw error(404, 'Organization not found');
+	// D39: authenticate BEFORE any org/project lookup — see the sibling org-level loader
+	// (settings/keys/+page.server.ts) for the full rationale. `orgHandle` does not gate anonymous
+	// requests, so this loader must check itself.
+	const session = await locals.auth();
+	if (!session?.user?.email) {
+		throw error(401, 'Unauthorized');
 	}
+
+	const currentOrg = locals.currentOrg;
+	if (!currentOrg || currentOrg.slug !== orgSlug) {
+		throw error(403, 'Forbidden: Unauthorized access to organization');
+	}
+
+	const org = { id: currentOrg.id, name: currentOrg.name };
 
 	// Verify project exists in org
 	const [project] = await db

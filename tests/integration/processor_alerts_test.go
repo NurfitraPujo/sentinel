@@ -195,6 +195,38 @@ func seedAlertConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool, proj
 	})
 }
 
+// seedOrgAlertConfig inserts an ORGANIZATION-WIDE alert_configs row (project_id IS NULL,
+// organization_id = orgID) — the shape 1722100000_add_alert_config_org_layer.sql introduced and that
+// seedAlertConfig above cannot produce (it always derives organization_id from a non-null project_id).
+// channel and channelConfigJSON let a caller seed two rules for the same organization that route to
+// different destinations (e.g. one "email" row and one "telegram" row), which is exactly the shape
+// D04/D21 found nothing in the schema constrains to one row.
+func seedOrgAlertConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool, orgID string, channel string, channelConfigJSON string, threshold int, windowSeconds int, enabled bool) {
+	t.Helper()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES (NULL, $1, $2, $3::jsonb, $4, $5, $6)`,
+		orgID, channel, channelConfigJSON, threshold, windowSeconds, enabled,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM alert_configs WHERE organization_id = $1 AND project_id IS NULL`, orgID)
+	})
+}
+
+// seedOrganizationForOrgConfig creates a bare organizations row (no project) so org-wide alert configs
+// can be seeded against it directly, and seeds a project belonging to that same organization so
+// Dispatch (which is only ever called with a projectID) can resolve back to orgID via
+// Dispatcher.projectOrg, exactly as refreshConfigs' real "SELECT id, organization_id FROM projects"
+// query populates it in production.
+func seedOrganizationForOrgConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (orgID string, projectID string) {
+	t.Helper()
+	projectID = seedProject(t, ctx, pool)
+	err := pool.QueryRow(ctx, `SELECT organization_id::text FROM projects WHERE id = $1`, projectID).Scan(&orgID)
+	require.NoError(t, err)
+	return orgID, projectID
+}
+
 // configFromRow builds an AlertConfig from the package's known shape so that
 // tests can mirror what refreshConfigs populates from the alert_configs row.
 func configFromRow(projectID string, threshold int, windowSeconds int, enabled bool) *alerts.AlertConfig {
@@ -501,6 +533,36 @@ func TestAlertsDispatcher_SendAlertDefaultBranch(t *testing.T) {
 		assert.NotPanics(t, func() {
 			d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
 		}, "Dispatch should fall back to the log.Printf sendAlert path without panicking")
+	})
+}
+
+// TestAlertsDispatcher_RefreshConfigsMultipleOrgWideRulesBothFire is the acceptance test for D04/D21:
+// TWO organization-wide alert_configs rows, seeded through REAL SQL (not SetOrgConfigsForTest, which
+// every prior org-wide test used and which bypasses both the SQL and the map keying the defect lives
+// in), for the SAME organization with DIFFERENT destinations (one email, one telegram). refreshConfigs
+// must load both, and Dispatch must fire both — not silently keep only whichever row Postgres happened
+// to return last, which is what map[string]*AlertConfig keying did before this fix.
+func TestAlertsDispatcher_RefreshConfigsMultipleOrgWideRulesBothFire(t *testing.T) {
+	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
+		cap := &alertCapture{}
+		ctx := context.Background()
+
+		orgID, projectID := seedOrganizationForOrgConfig(t, ctx, pool)
+
+		seedOrgAlertConfig(t, ctx, pool, orgID, "email", `{"to":"org-oncall@example.test"}`, 1, 60, true)
+		seedOrgAlertConfig(t, ctx, pool, orgID, "telegram", `{"chat_id":"987654"}`, 1, 60, true)
+
+		d := alerts.NewDispatcherForTest(pool)
+		d.SetSenderForTest(cap.sender())
+
+		d.RefreshConfigsForTest(ctx)
+
+		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+
+		got := cap.snapshot()
+		require.Len(t, got, 2, "both org-wide rules (email and telegram, different destinations) must fire, not just one")
+		channels := []string{got[0].cfg.Channel, got[1].cfg.Channel}
+		assert.ElementsMatch(t, []string{"email", "telegram"}, channels)
 	})
 }
 

@@ -1,9 +1,9 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { createOrganizationInvitation } from '$lib/db/queries/organizations';
+import { createOrganizationInvitation, listOrganizationInvitations } from '$lib/db/queries/organizations';
 import { db } from '$lib/server/db';
 import { organizationMembers, users, organizations } from '$lib/db/schema';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, sql } from 'drizzle-orm';
 import crypto from 'crypto';
 import { sendInvitationEmail } from '$lib/server/email';
 import { requireOrgMembership } from '../keys/_shared';
@@ -12,6 +12,29 @@ const VALID_ROLES = ['owner', 'admin', 'engineer', 'support', 'viewer'] as const
 type Role = typeof VALID_ROLES[number];
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// D07: an admin can now see what invitations are outstanding, mirroring the create endpoint's own
+// gate. Never includes tokenHash -- listOrganizationInvitations's column list is the enforcement
+// point for that, not this handler.
+export const GET: RequestHandler = async ({ params, locals }) => {
+  const session = await locals.auth();
+  if (!session?.user?.id) {
+    throw error(401, 'Unauthorized');
+  }
+
+  const { orgId } = params;
+  if (!orgId) {
+    throw error(400, 'Missing organizationId');
+  }
+
+  const membership = await requireOrgMembership(session.user.id, orgId);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    throw error(403, 'Forbidden: Only owners and admins can view invitations');
+  }
+
+  const invitations = await listOrganizationInvitations(orgId);
+  return json(invitations);
+};
 
 export const POST: RequestHandler = async ({ params, request, locals, url }) => {
   const session = await locals.auth();
@@ -57,7 +80,9 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
     throw error(403, 'Forbidden: Only owners can issue owner invitations');
   }
 
-  // Check if target email is already an active member of this organization
+  // D08/D30: case-insensitive membership check -- users.email keeps provider casing, so this must
+  // compare lower(email), matching idx_user_email_lower_unique, or a member stored as
+  // "Bob@X.com" is invisible to a lookup for "bob@x.com".
   const [existingMember] = await db
     .select()
     .from(organizationMembers)
@@ -65,7 +90,7 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
     .where(
       and(
         eq(organizationMembers.organizationId, orgId),
-        eq(users.email, normalizedEmail)
+        eq(sql`lower(${users.email})`, normalizedEmail)
       )
     );
 
@@ -84,10 +109,23 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
     .from(organizations)
     .where(eq(organizations.id, orgId));
 
+  // D06: the raw token appears ONLY in this URL (built here, sent by email, never persisted) and
+  // never in the response body below -- the DB row (and therefore `invite`) only ever has
+  // tokenHash, but we still enumerate the response fields explicitly rather than spreading `invite`
+  // so an added DB column can't silently start leaking.
   const inviteUrl = `${url.origin}/invitations/${token}`;
-  
+
   // Non-blocking email dispatch
   sendInvitationEmail(normalizedEmail, inviteUrl, org?.name ?? 'Sentinel Organization').catch(() => {});
 
-  return json(invite, { status: 201 });
+  return json(
+    {
+      id: invite.id,
+      email: invite.email,
+      role: invite.role,
+      status: invite.status,
+      expiresAt: invite.expiresAt,
+    },
+    { status: 201 }
+  );
 };

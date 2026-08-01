@@ -3,6 +3,8 @@ import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { issues, projects, organizationMembers } from '$lib/db/schema';
 import { searchIssuesInOrg } from '$lib/db/queries/issues';
+import { getAccessibleProjectIds } from '$lib/server/issue-access';
+import { hasPermission, isKnownRole } from '$lib/rbac';
 import { eq, and } from 'drizzle-orm';
 
 export const GET: RequestHandler = async ({ url, locals }) => {
@@ -51,9 +53,10 @@ export const GET: RequestHandler = async ({ url, locals }) => {
 		throw error(403, 'Forbidden: No valid organization context');
 	}
 
-	// Validate org access
+	// Validate org access + role. Search is a read operation, so any recognized org role is
+	// sufficient (D10 item 1) — but the role must be one rbac.ts actually recognizes.
 	const orgMember = await db
-		.select()
+		.select({ role: organizationMembers.role })
 		.from(organizationMembers)
 		.where(
 			and(
@@ -66,7 +69,17 @@ export const GET: RequestHandler = async ({ url, locals }) => {
 		throw error(403, 'Forbidden: You do not have access to this organization');
 	}
 
+	const role = orgMember[0].role;
+	if (!isKnownRole(role) || !hasPermission(role, 'read')) {
+		throw error(403, 'Forbidden: Insufficient permissions to search issues');
+	}
+
 	const searchResults = await searchIssuesInOrg(targetOrgId, query, currentIssueId);
 
-	return json({ issues: searchResults });
+	// D10: searchIssuesInOrg has no project filter, so scope results to projects the caller is
+	// actually a member of — an org member who is not on a given project must not see its issues.
+	const accessibleProjectIds = await getAccessibleProjectIds(userId, targetOrgId);
+	const scopedResults = searchResults.filter((issue) => accessibleProjectIds.has(issue.projectId));
+
+	return json({ issues: scopedResults });
 };

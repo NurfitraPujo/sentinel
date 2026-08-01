@@ -44,7 +44,7 @@
 	);
 
 	let activeOrgId = $derived(
-		selectedOrgId || data.projects[0]?.organizationId || data.userOrganizations[0]?.id || ''
+		selectedOrgId || data.userOrganizations[0]?.id || data.projects[0]?.organizationId || ''
 	);
 
 	function getProjectName(projectId: string | null): string {
@@ -122,19 +122,20 @@
 			enabled,
 		};
 
-		if (scope === 'project') {
-			payload.projectId = selectedProjectId;
-		} else {
-			payload.projectId = null;
-			payload.organizationId = activeOrgId;
-		}
-
 		let url = '/api/alerts';
 		let method = 'POST';
 
 		if (editMode && editingConfig) {
+			// Scope (project vs organization, and which one) is immutable via PUT — the toggle is disabled
+			// while editing, and the payload intentionally omits projectId/organizationId so there is nothing
+			// for the API's scope-change guard to reject. See api/alerts/+server.ts PUT.
 			payload.id = editingConfig.id;
 			method = 'PUT';
+		} else if (scope === 'project') {
+			payload.projectId = selectedProjectId;
+		} else {
+			payload.projectId = null;
+			payload.organizationId = activeOrgId;
 		}
 
 		try {
@@ -244,6 +245,8 @@
 							type="button"
 							class="segmented-btn"
 							class:active={scope === 'project'}
+							disabled={editMode}
+							title={editMode ? 'Scope cannot be changed when editing an existing rule' : ''}
 							onclick={() => (scope = 'project')}
 						>
 							Project Alert
@@ -252,8 +255,12 @@
 							type="button"
 							class="segmented-btn"
 							class:active={scope === 'organization'}
-							disabled={!data.canManageOrgAlerts}
-							title={!data.canManageOrgAlerts ? 'Requires manage_keys org permission' : ''}
+							disabled={editMode || !data.canManageOrgAlerts}
+							title={editMode
+								? 'Scope cannot be changed when editing an existing rule'
+								: !data.canManageOrgAlerts
+									? 'Requires manage_keys org permission'
+									: ''}
 							onclick={() => (scope = 'organization')}
 						>
 							Organization-Wide Alert
@@ -262,7 +269,9 @@
 							{/if}
 						</button>
 					</div>
-					{#if !data.canManageOrgAlerts}
+					{#if editMode}
+						<p class="scope-hint">Scope cannot be changed when editing an existing rule.</p>
+					{:else if !data.canManageOrgAlerts}
 						<p class="scope-hint">Organization-wide rules require owner, admin, or engineer org role.</p>
 					{/if}
 				</div>
