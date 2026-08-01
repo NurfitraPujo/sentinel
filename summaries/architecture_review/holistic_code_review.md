@@ -1,3 +1,10 @@
+> [!WARNING]
+> **Superseded 2026-08-01.** This report predates a set of independent code reviews that found the
+> features audited here (member management, invitations) merge clean and pass their own tests but do
+> not run correctly in several respects — see `docs/plans/UI_PARITY_REMEDIATION_PLAN.md` (defect
+> register D01–D47) for the authoritative, current findings. Do not treat this file's verdict below
+> as current; re-verify against `docs/memory/VERIFIED_STATE.md` instead.
+
 # Holistic Codebase Re-Audit Report: Organization Member Management & Invitations
 
 **Target Scope**: Uncommitted changes across `apps/dashboard-web`  

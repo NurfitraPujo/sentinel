@@ -2,18 +2,64 @@ import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { organizationMembers } from '$lib/db/schema';
-import { eq, and, or, count } from 'drizzle-orm';
-import { upsertOrganizationMember, removeOrganizationMember } from '$lib/db/queries/organizations';
+import { eq, and } from 'drizzle-orm';
+import { upsertOrganizationMember } from '$lib/db/queries/organizations';
 import { requireOrgMembership } from '../../keys/_shared';
 
 const VALID_ROLES = ['owner', 'admin', 'engineer', 'support', 'viewer'] as const;
 type Role = typeof VALID_ROLES[number];
+
+// D33: `memberId` in the URL may be either the membership row's own `id` or the target user's
+// `userId` (both are used as links elsewhere in the UI). The old code matched both with a bare
+// `or(...)` and no `orderBy`/`limit`, so if one row's `id` happened to equal a DIFFERENT row's
+// `userId`, which row got hit was undefined. This resolves the ambiguity explicitly: try `id`
+// first, and ONLY if that misses, fall back to `userId` -- never both at once. `executor` is
+// threaded through so callers running inside a transaction can lock the row they find
+// (`FOR UPDATE`) atomically with the rest of the guard logic (D32).
+async function findOrgMember(
+  executor: any,
+  orgId: string,
+  memberId: string,
+  { lock = false }: { lock?: boolean } = {}
+) {
+  const byId = executor
+    .select()
+    .from(organizationMembers)
+    .where(and(eq(organizationMembers.organizationId, orgId), eq(organizationMembers.id, memberId)));
+  const [byIdRow] = lock ? await byId.for('update') : await byId;
+  if (byIdRow) return byIdRow;
+
+  const byUserId = executor
+    .select()
+    .from(organizationMembers)
+    .where(and(eq(organizationMembers.organizationId, orgId), eq(organizationMembers.userId, memberId)))
+    .limit(1);
+  const [byUserIdRow] = lock ? await byUserId.for('update') : await byUserId;
+  return byUserIdRow;
+}
+
+// D32: the sole-owner guard used to be count-then-write with no lock, so two concurrent
+// demotions/revocations of the last two owners could both read "count = 2", both pass, and both
+// proceed -- leaving the org ownerless. This locks every 'owner' membership row in the org
+// (`SELECT ... FOR UPDATE`) before counting, so a second concurrent transaction touching the same
+// org's owners blocks until the first commits (or rolls back), and then sees the up-to-date count.
+// Aggregate functions cannot be combined with `FOR UPDATE` in Postgres, so the rows are locked and
+// counted in application code rather than via `count()`.
+async function countLockedOwners(tx: any, orgId: string): Promise<number> {
+  const ownerRows = await tx
+    .select({ id: organizationMembers.id })
+    .from(organizationMembers)
+    .where(and(eq(organizationMembers.organizationId, orgId), eq(organizationMembers.role, 'owner')))
+    .for('update');
+  return ownerRows.length;
+}
 
 export const PATCH: RequestHandler = async ({ params, request, locals }) => {
   const session = await locals.auth();
   if (!session?.user?.id) {
     throw error(401, 'Unauthorized');
   }
+  const callerUserId = session.user.id;
 
   const { orgId, memberId } = params;
   if (!orgId || !memberId) {
@@ -21,7 +67,7 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
   }
 
   // Caller permission check
-  const callerMembership = await requireOrgMembership(session.user.id, orgId);
+  const callerMembership = await requireOrgMembership(callerUserId, orgId);
   if (!callerMembership || !['owner', 'admin'].includes(callerMembership.role)) {
     throw error(403, 'Forbidden: Only owners and admins can modify member roles');
   }
@@ -44,47 +90,40 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
     throw error(403, 'Forbidden: Only owners can assign the owner role');
   }
 
-  // Locate target member record
-  const [targetMember] = await db
-    .select()
-    .from(organizationMembers)
-    .where(
-      and(
-        eq(organizationMembers.organizationId, orgId),
-        or(
-          eq(organizationMembers.id, memberId),
-          eq(organizationMembers.userId, memberId)
-        )
-      )
-    );
+  // D32/D33: lookup, sole-owner guard, and the role write itself all happen inside one
+  // transaction, with the target row (and, if relevant, every owner row) locked via
+  // `SELECT ... FOR UPDATE` before any decision is made. This closes the race where two
+  // concurrent PATCHes could both observe "not the sole owner" and both demote, leaving the org
+  // ownerless.
+  const updatedMember = await db.transaction(async (tx) => {
+    const targetMember = await findOrgMember(tx, orgId, memberId, { lock: true });
 
-  if (!targetMember) {
-    throw error(404, 'Member not found in this organization');
-  }
-
-  // Admins cannot alter an owner's role
-  if (callerMembership.role === 'admin' && targetMember.role === 'owner') {
-    throw error(403, 'Forbidden: Admins cannot alter an owner\'s role');
-  }
-
-  // Guard against demoting the sole owner
-  if (targetMember.role === 'owner' && role !== 'owner') {
-    const [ownerCountResult] = await db
-      .select({ count: count() })
-      .from(organizationMembers)
-      .where(
-        and(
-          eq(organizationMembers.organizationId, orgId),
-          eq(organizationMembers.role, 'owner')
-        )
-      );
-
-    if (ownerCountResult.count <= 1) {
-      throw error(400, 'Cannot demote the sole owner of an organization');
+    if (!targetMember) {
+      throw error(404, 'Member not found in this organization');
     }
-  }
 
-  const updatedMember = await upsertOrganizationMember(orgId, targetMember.userId, role as Role);
+    // Symmetry with DELETE's self-revoke guard: changing your own role through this endpoint is
+    // not permitted (an owner demoting themselves must go through another owner, same as revoke).
+    if (targetMember.userId === callerUserId) {
+      throw error(400, 'Cannot change your own organization role');
+    }
+
+    // Admins cannot alter an owner's role
+    if (callerMembership.role === 'admin' && targetMember.role === 'owner') {
+      throw error(403, "Forbidden: Admins cannot alter an owner's role");
+    }
+
+    // Guard against demoting the sole owner
+    if (targetMember.role === 'owner' && role !== 'owner') {
+      const ownerCount = await countLockedOwners(tx, orgId);
+      if (ownerCount <= 1) {
+        throw error(400, 'Cannot demote the sole owner of an organization');
+      }
+    }
+
+    return upsertOrganizationMember(orgId, targetMember.userId, role as Role, tx);
+  });
+
   return json({ success: true, member: updatedMember });
 };
 
@@ -93,6 +132,7 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
   if (!session?.user?.id) {
     throw error(401, 'Unauthorized');
   }
+  const callerUserId = session.user.id;
 
   const { orgId, memberId } = params;
   if (!orgId || !memberId) {
@@ -100,56 +140,50 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
   }
 
   // Caller permission check
-  const callerMembership = await requireOrgMembership(session.user.id, orgId);
+  const callerMembership = await requireOrgMembership(callerUserId, orgId);
   if (!callerMembership || !['owner', 'admin'].includes(callerMembership.role)) {
     throw error(403, 'Forbidden: Only owners and admins can revoke organization access');
   }
 
-  // Locate target member record
-  const [targetMember] = await db
-    .select()
-    .from(organizationMembers)
-    .where(
-      and(
-        eq(organizationMembers.organizationId, orgId),
-        or(
-          eq(organizationMembers.id, memberId),
-          eq(organizationMembers.userId, memberId)
-        )
-      )
-    );
+  // D32/D33: same reasoning as PATCH above -- lookup, sole-owner guard, and the delete itself all
+  // happen inside one transaction with the relevant rows locked via `FOR UPDATE`, so two
+  // concurrent revocations of the last two owners cannot both pass.
+  const targetMember = await db.transaction(async (tx) => {
+    const target = await findOrgMember(tx, orgId, memberId, { lock: true });
 
-  if (!targetMember) {
-    throw error(404, 'Member not found in this organization');
-  }
+    if (!target) {
+      throw error(404, 'Member not found in this organization');
+    }
 
-  // Guard against revoking caller's own access
-  if (targetMember.userId === session.user.id) {
-    throw error(400, 'Cannot revoke your own organization access');
-  }
+    // Guard against revoking caller's own access
+    if (target.userId === callerUserId) {
+      throw error(400, 'Cannot revoke your own organization access');
+    }
 
-  // Admins cannot revoke an owner
-  if (callerMembership.role === 'admin' && targetMember.role === 'owner') {
-    throw error(403, 'Forbidden: Admins cannot revoke owners');
-  }
+    // Admins cannot revoke an owner
+    if (callerMembership.role === 'admin' && target.role === 'owner') {
+      throw error(403, 'Forbidden: Admins cannot revoke owners');
+    }
 
-  // Guard against revoking the sole owner
-  if (targetMember.role === 'owner') {
-    const [ownerCountResult] = await db
-      .select({ count: count() })
-      .from(organizationMembers)
+    // Guard against revoking the sole owner
+    if (target.role === 'owner') {
+      const ownerCount = await countLockedOwners(tx, orgId);
+      if (ownerCount <= 1) {
+        throw error(400, 'Cannot revoke the sole owner of an organization');
+      }
+    }
+
+    await tx
+      .delete(organizationMembers)
       .where(
         and(
           eq(organizationMembers.organizationId, orgId),
-          eq(organizationMembers.role, 'owner')
+          eq(organizationMembers.userId, target.userId)
         )
       );
 
-    if (ownerCountResult.count <= 1) {
-      throw error(400, 'Cannot revoke the sole owner of an organization');
-    }
-  }
+    return target;
+  });
 
-  await removeOrganizationMember(orgId, targetMember.userId);
   return json({ success: true, memberId: targetMember.id, userId: targetMember.userId });
 };

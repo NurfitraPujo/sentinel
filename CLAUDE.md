@@ -129,7 +129,7 @@ Remaining known gaps, none of them a regression from that work:
 | | Symptom | Cause |
 |---|---|---|
 | — | The DLQ needs an operator to drain it | `tools/dlq` can inspect, replay (`-execute`), discard (`-purge`) and drain transient-only (`-drain`), and a `sentinel-dlq-drainer` compose service runs it on a schedule — but it ships gated OFF (`DLQ_DRAINER_ENABLED` and `DLQ_DRAINER_EXECUTE` both `false`), so nothing drains until someone flips both. Permanent-class messages are never auto-replayed by design (D14). Streams are bounded (D13), so a backlog can no longer exhaust storage. |
-| — | Invitation acceptance has no route | U22 proves the create half end to end; nothing anywhere consumes an invitation token. Asserted as a wall, not assumed. |
+| — | ~~Invitation acceptance has no route~~ **Stale, corrected 2026-08-01** | The route exists at `apps/dashboard-web/src/routes/invitations/[token]/+page.server.ts`. It was merely unreachable for already-signed-in invitees because `invitations` was missing from `hooks.server.ts`'s `reservedRoutes` (D01 in `docs/plans/UI_PARITY_REMEDIATION_PLAN.md`), fixed under that plan's P2-1. See `docs/plans/UI_PARITY_REMEDIATION_PLAN.md` for the acceptance-flow defects (D06–D08, D31, D42) that remain in that path — this row previously conflated "unreachable for one case" with "does not exist," which was itself an instance of this repo's characteristic failure. |
 
 **S18 (`issues.count` inflation on redelivery — long mislabeled "S16") is RESOLVED as of 2026-07-31**:
 `event_id` idempotency end to end and a single-transaction write path (`store.StoreEvent`), gated by

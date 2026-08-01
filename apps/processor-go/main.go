@@ -369,6 +369,15 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 				if detail.HasOldestAge {
 					body["dlq_oldest_age_seconds"] = detail.OldestAge.Seconds()
 				}
+
+				// D47 revisited: dlq_oldest_class IS reported, deliberately. It was briefly removed
+				// on the reasoning that it is the one field here derived from a customer event's
+				// payload, and so a narrow leak on an unauthenticated port. tests/e2e U34
+				// (dlq_test.go) rejects that: without the oldest message's class, a backlog of
+				// PERMANENTLY dead messages — which will never drain on their own — looks identical
+				// to a transient one that clears when the database recovers. That distinction is the
+				// difference between paging someone and waiting, so the operational value wins.
+				// The port-exposure question is handled where it belongs, in docker-compose.yml.
 				if detail.OldestClass != "" {
 					body["dlq_oldest_class"] = detail.OldestClass
 				}
@@ -397,11 +406,21 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 
 		w.Header().Set("Content-Type", "application/json")
 
+		// D12: this endpoint used to include a synthetic "items" array — at most one entry with
+		// hardcoded sequence/event_id/org_id/project_id/retry_attempts and a hand-concatenated
+		// raw_payload string embedding detail.Stats.Stream unescaped. That was fabricated data, not a
+		// sample of the real backlog, and an operator reading it during an incident would mistake it
+		// for a real parked event. Fetching real parked messages would require a non-destructive
+		// JetStream peek (e.g. an ephemeral pull consumer with explicit ack policy) and would then
+		// carry real tenant payloads across this endpoint, which is unauthenticated today and
+		// interacts with the access decision made in P1-1 (the dashboard's observability page
+		// withholds any DLQ item view entirely for exactly that cross-tenant reason). Per the plan,
+		// option (b): the aggregates below stay real; "items" is removed rather than shipping a
+		// placeholder shape.
 		if sub == nil {
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"total_depth": 0,
-				"items": []any{},
 			})
 			return
 		}
@@ -415,30 +434,8 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 			return
 		}
 
-		items := make([]map[string]any, 0)
-		// Extract oldest message detail as the primary actionable DLQ item (O(1) lookup)
-		if detail.Stats.Depth > 0 && detail.HasOldestAge {
-			items = append(items, map[string]any{
-				"sequence":       1,
-				"event_id":       "dlq_oldest_event",
-				"org_id":         "system",
-				"project_id":     "processor",
-				"error_class":    detail.OldestClass,
-				"error_message":  "Parked event requiring triage: " + detail.OldestClass,
-				"failed_at":      time.Now().Add(-detail.OldestAge).Format(time.RFC3339),
-				"retry_attempts": 7,
-				"raw_payload":    `{"status":"parked","stream":"` + detail.Stats.Stream + `","age_seconds":` + strconv.FormatFloat(detail.OldestAge.Seconds(), 'f', 2, 64) + `}`,
-			})
-		}
-
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"total_depth":        detail.Stats.Depth,
-			"publish_failures":   detail.Stats.PublishFailures,
-			"oldest_age_seconds": detail.OldestAge.Seconds(),
-			"oldest_class":       detail.OldestClass,
-			"items":              items,
-		})
+		_ = json.NewEncoder(w).Encode(dlqmonitor.BuildDLQResponse(detail))
 	})
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

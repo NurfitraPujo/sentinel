@@ -1,5 +1,7 @@
 <script lang="ts">
-	interface TargetIssue {
+	import type { RelationType } from '$lib/types/relation-type';
+
+	interface RelatedIssue {
 		id: string;
 		errorClass: string;
 		message: string;
@@ -11,9 +13,11 @@
 		id: string;
 		sourceIssueId: string;
 		targetIssueId: string;
-		relationType: 'linked_to' | 'caused_by' | 'duplicate_of';
+		relationType: RelationType;
 		direction: 'outgoing' | 'incoming';
-		targetIssue: TargetIssue;
+		// D43: the other issue in the relation, regardless of direction — never necessarily the
+		// "target" (for an incoming relation it is the source).
+		relatedIssue: RelatedIssue;
 	}
 
 	interface Props {
@@ -24,14 +28,27 @@
 
 	let { currentIssueId, initialRelations = [], onStatusChangeRequest }: Props = $props();
 
-	let relations = $state<RelationItem[]>(initialRelations);
+	// Seeded empty, not from `initialRelations` (the declaration referencing a prop directly is what
+	// state_referenced_locally flags) -- the $effect below runs immediately on mount and assigns the
+	// real initial value, then re-runs whenever `initialRelations` itself changes later. Without the
+	// effect, `relations` would only ever reflect what was true the moment this component was
+	// created: if the parent's loader data changes without a full remount (e.g. an `invalidateAll()`
+	// triggered by the status-change handler this component calls into via onStatusChangeRequest),
+	// `relations` would silently drift from what the server now has. Local optimistic updates
+	// (link/unlink below) mutate `relations` directly and never touch `initialRelations`, so
+	// re-syncing on every actual prop change is safe -- it never clobbers an in-flight local edit,
+	// it only fires when NEW data arrives from the server.
+	let relations = $state<RelationItem[]>([]);
+	$effect(() => {
+		relations = initialRelations;
+	});
 	let searchQuery = $state('');
-	let searchResults = $state<TargetIssue[]>([]);
-	let selectedRelationType = $state<'linked_to' | 'caused_by' | 'duplicate_of'>('linked_to');
+	let searchResults = $state<RelatedIssue[]>([]);
+	let selectedRelationType = $state<RelationType>('linked_to');
 	let isSearching = $state(false);
 	let isSubmitting = $state(false);
 	let errorMessage = $state<string | null>(null);
-	let promptResolveTarget = $state<TargetIssue | null>(null);
+	let promptResolveTarget = $state<RelatedIssue | null>(null);
 
 	let debounceTimer: ReturnType<typeof setTimeout>;
 
@@ -61,7 +78,7 @@
 		}, 250);
 	}
 
-	async function linkIssue(target: TargetIssue) {
+	async function linkIssue(target: RelatedIssue) {
 		isSubmitting = true;
 		errorMessage = null;
 
@@ -87,7 +104,7 @@
 				{
 					...createdRelation,
 					direction: 'outgoing',
-					targetIssue: target,
+					relatedIssue: target,
 				},
 			];
 
@@ -105,15 +122,27 @@
 		}
 	}
 
+	// D11: the DELETE handler at /api/issues/[issueId]/relations always treats params.issueId as the
+	// relation's SOURCE and the body's targetIssueId as the relation's TARGET, matching the stored
+	// row by (source, target, relationType) exactly (see deleteIssueRelation). For an INCOMING
+	// relation the stored row is (source=rel.sourceIssueId, target=currentIssueId) — always calling
+	// the endpoint at /api/issues/{currentIssueId}/relations put currentIssueId in the source slot
+	// no matter what targetIssueId was sent, which never matches an incoming row and always 404s.
+	//
+	// Rather than change the endpoint's contract (out of scope here — see D11's note), call it on
+	// whichever issue is actually the relation's source, with the other issue as targetIssueId. That
+	// reproduces the exact (source, target, relationType) triple already stored, for both directions,
+	// with no directional reasoning left in this function beyond picking the right two ids.
 	async function unlinkIssue(rel: RelationItem) {
-		const targetId = rel.direction === 'outgoing' ? rel.targetIssueId : rel.sourceIssueId;
+		const endpointIssueId = rel.direction === 'outgoing' ? currentIssueId : rel.sourceIssueId;
+		const targetId = rel.direction === 'outgoing' ? rel.targetIssueId : currentIssueId;
 
 		// Optimistic removal
 		const prevRelations = [...relations];
 		relations = relations.filter((r) => r.id !== rel.id);
 
 		try {
-			const res = await fetch(`/api/issues/${currentIssueId}/relations`, {
+			const res = await fetch(`/api/issues/${endpointIssueId}/relations`, {
 				method: 'DELETE',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -225,13 +254,13 @@
 					{#each duplicates as rel}
 						<li class="relation-card">
 							<div class="card-content">
-								<a href="/issues/{rel.targetIssue.id}" class="issue-link">
-									<span class="error-class">{rel.targetIssue.errorClass}</span>
-									<span class="issue-msg">{rel.targetIssue.message}</span>
+								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
+									<span class="error-class">{rel.relatedIssue.errorClass}</span>
+									<span class="issue-msg">{rel.relatedIssue.message}</span>
 								</a>
 								<div class="card-meta">
-									<span class="mono-id">{rel.targetIssue.id}</span>
-									<span class="status-tag {rel.targetIssue.status}">{rel.targetIssue.status}</span>
+									<span class="mono-id">{rel.relatedIssue.id}</span>
+									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
 									{#if rel.direction === 'incoming'}
 										<span class="dir-tag">incoming</span>
 									{/if}
@@ -257,13 +286,13 @@
 					{#each causes as rel}
 						<li class="relation-card">
 							<div class="card-content">
-								<a href="/issues/{rel.targetIssue.id}" class="issue-link">
-									<span class="error-class">{rel.targetIssue.errorClass}</span>
-									<span class="issue-msg">{rel.targetIssue.message}</span>
+								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
+									<span class="error-class">{rel.relatedIssue.errorClass}</span>
+									<span class="issue-msg">{rel.relatedIssue.message}</span>
 								</a>
 								<div class="card-meta">
-									<span class="mono-id">{rel.targetIssue.id}</span>
-									<span class="status-tag {rel.targetIssue.status}">{rel.targetIssue.status}</span>
+									<span class="mono-id">{rel.relatedIssue.id}</span>
+									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
 									{#if rel.direction === 'incoming'}
 										<span class="dir-tag">incoming</span>
 									{/if}
@@ -289,13 +318,13 @@
 					{#each linked as rel}
 						<li class="relation-card">
 							<div class="card-content">
-								<a href="/issues/{rel.targetIssue.id}" class="issue-link">
-									<span class="error-class">{rel.targetIssue.errorClass}</span>
-									<span class="issue-msg">{rel.targetIssue.message}</span>
+								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
+									<span class="error-class">{rel.relatedIssue.errorClass}</span>
+									<span class="issue-msg">{rel.relatedIssue.message}</span>
 								</a>
 								<div class="card-meta">
-									<span class="mono-id">{rel.targetIssue.id}</span>
-									<span class="status-tag {rel.targetIssue.status}">{rel.targetIssue.status}</span>
+									<span class="mono-id">{rel.relatedIssue.id}</span>
+									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
 									{#if rel.direction === 'incoming'}
 										<span class="dir-tag">incoming</span>
 									{/if}

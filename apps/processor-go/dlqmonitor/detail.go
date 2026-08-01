@@ -84,6 +84,26 @@ func GetDetail(ctx context.Context, stats StatsSource, oldest OldestMessageSourc
 	return detail, nil
 }
 
+// BuildDLQResponse builds the JSON body for the processor's /dlq endpoint from a Detail.
+//
+// D12 fix: this used to be built inline in apps/processor-go/main.go and included a synthetic
+// "items" array — at most one entry with hardcoded sequence/event_id/org_id/project_id/
+// retry_attempts and a hand-concatenated raw_payload string. That was fabricated data an operator
+// could mistake for a real parked event during an incident. Fetching real parked messages would
+// require a non-destructive JetStream peek and would then carry real tenant payloads across this
+// currently-unauthenticated endpoint (see P1-1's access decision, which is why the dashboard's
+// observability page withholds any DLQ item view entirely). So per the remediation plan's option
+// (b): only the real aggregates are reported; there is deliberately no "items" key at all — not an
+// empty array, which would still invite a table renderer to expect entries.
+func BuildDLQResponse(detail Detail) map[string]any {
+	return map[string]any{
+		"total_depth":        detail.Stats.Depth,
+		"publish_failures":   detail.Stats.PublishFailures,
+		"oldest_age_seconds": detail.OldestAge.Seconds(),
+		"oldest_class":       detail.OldestClass,
+	}
+}
+
 // Severity is the three-tier classification /health and Monitor both use.
 type Severity int
 

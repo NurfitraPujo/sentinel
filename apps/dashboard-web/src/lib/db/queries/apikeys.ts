@@ -86,7 +86,20 @@ export async function createApiKey(
 			createdBy: userId,
 			status: 'active',
 		})
-		.returning();
+		.returning({
+			id: projectApiKeys.id,
+			organizationId: projectApiKeys.organizationId,
+			projectId: projectApiKeys.projectId,
+			name: projectApiKeys.name,
+			keyPrefix: projectApiKeys.keyPrefix,
+			scope: projectApiKeys.scope,
+			status: projectApiKeys.status,
+			rateLimitRpm: projectApiKeys.rateLimitRpm,
+			expiresAt: projectApiKeys.expiresAt,
+			revokedAt: projectApiKeys.revokedAt,
+			createdBy: projectApiKeys.createdBy,
+			createdAt: projectApiKeys.createdAt,
+		});
 
 	await db.insert(auditLogs).values({
 		action: 'api_key.created',
@@ -179,6 +192,17 @@ export async function rotateApiKey(
 	}
 
 	return { apiKey: newKey, secretToken };
+}
+
+// toPublicKey strips keyHash (and any other future secret-bearing column) from an API-key row
+// before it is serialized to the browser. keyHash is the SHA-256 of the live secret and is the
+// exact value the ingestor's Redis cache is keyed on (apps/ingestor-go/auth/apikey.go:53) — every
+// route that returns an api-key row to a client MUST go through this, even though create/rotate's
+// .returning() above already omits keyHash at the query level, because a future column list change
+// (or a query that reverts to a bare .returning()) must not silently reintroduce the leak.
+export function toPublicKey<T extends Record<string, unknown>>(row: T): Omit<T, 'keyHash'> {
+	const { keyHash: _keyHash, ...publicRow } = row as Record<string, unknown> & { keyHash?: unknown };
+	return publicRow as Omit<T, 'keyHash'>;
 }
 
 export interface NatsPublisher {

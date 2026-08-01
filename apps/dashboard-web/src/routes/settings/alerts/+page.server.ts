@@ -97,10 +97,14 @@ export const load: PageServerLoad = async ({ locals }) => {
 		orgRoleMap[membership.organizationId] = membership.role as OrgRole;
 	}
 
-	// Check if user has manage_keys permission in any of their organizations
-	const canManageOrgAlerts = userOrgMemberships.some((m) =>
-		hasPermission(m.role as OrgRole, 'manage_keys')
-	);
+	// Orgs where the user actually holds manage_keys — the only ones an org-wide alert rule can
+	// legitimately target. Filtering here (rather than exposing every org the user belongs to) is what
+	// keeps the scope selector from offering options that are guaranteed to 403 on submit (D35).
+	const manageableOrgIds = userOrgMemberships
+		.filter((m) => hasPermission(m.role as OrgRole, 'manage_keys'))
+		.map((m) => m.organizationId);
+
+	const canManageOrgAlerts = manageableOrgIds.length > 0;
 
 	// Editable configs are project-scoped configs where user has 'write' permission,
 	// or org-wide configs where user has 'manage_keys' permission.
@@ -113,15 +117,16 @@ export const load: PageServerLoad = async ({ locals }) => {
 		return role ? hasPermission(role, 'write') : false;
 	});
 
+	// Only orgs the user can actually manage alerts for are offered as scope choices — see D35 above.
 	const userOrgsList =
-		orgIds.length > 0
+		manageableOrgIds.length > 0
 			? await db
 					.select({
 						id: organizations.id,
 						name: organizations.name,
 					})
 					.from(organizations)
-					.where(inArray(organizations.id, orgIds))
+					.where(inArray(organizations.id, manageableOrgIds))
 			: [];
 
 	return {

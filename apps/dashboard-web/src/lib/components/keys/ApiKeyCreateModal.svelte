@@ -3,13 +3,26 @@
 	
 	export let isOpen = false;
 	export let projects: Array<{ id: string, name: string }> = [];
+	// D27: the project-scoped page (settings/keys/+page.server.ts under projects/[projectId]) ALWAYS
+	// mints a key scoped to `data.projectId` and ignores whatever `targetProject` this modal
+	// dispatches — so rendering an "All Projects [Org-Wide]" option there let a user believe they
+	// were creating an org-wide key while a project-scoped one was silently minted instead. The
+	// project-scoped page passes `allowOrgWide={false}` to remove the misleading option entirely;
+	// the org-level page (which DOES honour targetProject) leaves it at the default `true`.
+	export let allowOrgWide = true;
+	// D26: bound by the parent (via bind:isSubmitting) so a create failure that the parent handles
+	// (toast + early return, modal stays open) can reset this back to false. Previously this was a
+	// local-only variable that only handleClose ever reset — on any 400/403/network error the parent
+	// toasts and returns without closing the modal, so the button stayed disabled reading "Creating..."
+	// forever, with no way to retry short of a full page reload.
+	export let isSubmitting = false;
+
+	const ORG_WIDE_SENTINEL = 'All Projects [Org-Wide]';
 
 	let name = '';
-	let targetProject = 'All Projects [Org-Wide]';
+	let targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 	let scope = 'ingest';
 	let rateLimitRpm = '';
-	
-	let isSubmitting = false;
 	
 	const dispatch = createEventDispatcher();
 	
@@ -30,13 +43,29 @@
 		});
 	}
 
-	function handleClose() {
-		isOpen = false;
+	function resetForm() {
 		name = '';
-		targetProject = 'All Projects [Org-Wide]';
+		targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 		scope = 'ingest';
 		rateLimitRpm = '';
 		isSubmitting = false;
+	}
+
+	// D26: `isSubmitting` latches on until something resets it, and only `handleClose` ever did.
+	// Both failure and success left it stuck: on an error the parent toasts and returns WITHOUT
+	// closing, so the button stayed disabled reading "Creating…" forever; on success the parent
+	// sets `isOpen = false` directly rather than calling `handleClose`, so the NEXT open showed a
+	// permanently disabled form. Resetting on the closed→open transition makes every open start
+	// clean regardless of how the previous one ended, which is the only place that holds for both.
+	let wasOpen = false;
+	$: if (isOpen !== wasOpen) {
+		wasOpen = isOpen;
+		if (isOpen) resetForm();
+	}
+
+	function handleClose() {
+		isOpen = false;
+		resetForm();
 		dispatch('close');
 	}
 </script>
@@ -64,29 +93,37 @@
 
 			<div>
 				<label for="target-project" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Target Project</label>
-				<select 
-					id="target-project" 
-					bind:value={targetProject} 
+				<select
+					id="target-project"
+					bind:value={targetProject}
 					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-emerald-500 transition-colors"
 				>
-					<option value="All Projects [Org-Wide]">All Projects [Org-Wide]</option>
+					{#if allowOrgWide}
+						<option value={ORG_WIDE_SENTINEL}>{ORG_WIDE_SENTINEL}</option>
+					{/if}
 					{#each projects as project}
 						<option value={project.id}>{project.name}</option>
 					{/each}
 				</select>
 			</div>
 
-			<div>
-				<label class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Scope Scope</label>
+			<fieldset class="border-0 p-0 m-0">
+				<!--
+					A `<label>` here (not associated with any single control -- it groups a set of radio
+					inputs, not one) was flagged by a11y_label_has_associated_control. `<fieldset>` +
+					`<legend>` is the correct HTML semantics for a labeled group of radio inputs, and gives
+					the group an accessible name the way a bare label never could.
+				-->
+				<legend class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">Scope</legend>
 				<div class="space-y-2">
 					{#each availableScopes as sc}
 						<label class="flex items-start gap-2.5 p-2 rounded-lg bg-gray-950/60 border border-gray-800/80 hover:border-gray-700 cursor-pointer transition-colors">
-							<input 
-								type="radio" 
-								name="scope-group" 
-								value={sc.id} 
-								bind:group={scope} 
-								class="mt-1 accent-emerald-500 bg-gray-900" 
+							<input
+								type="radio"
+								name="scope-group"
+								value={sc.id}
+								bind:group={scope}
+								class="mt-1 accent-emerald-500 bg-gray-900"
 							/>
 							<div>
 								<div class="text-xs font-medium text-gray-200">{sc.label}</div>
@@ -95,7 +132,7 @@
 						</label>
 					{/each}
 				</div>
-			</div>
+			</fieldset>
 
 			<div>
 				<label for="rate-limit" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Rate Limit Override (RPM)</label>

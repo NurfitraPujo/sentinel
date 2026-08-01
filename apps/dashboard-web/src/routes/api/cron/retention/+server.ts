@@ -1,6 +1,7 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
 import { cleanupRetainedData } from '$lib/server/retention';
+import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { env } from '$env/dynamic/private';
 import { log } from '$lib/server/observability/log';
 
@@ -31,7 +32,13 @@ export const POST: RequestHandler = async ({ request }) => {
 	try {
 		const result = await cleanupRetainedData(retentionDays);
 
+		// D42: sweep expired pending invitations across every organization. The per-org reaper only
+		// fires when that org issues another invitation, so an org that stops inviting never reaps.
+		// Piggy-backed on this existing scheduled job rather than adding a second cron endpoint.
+		const reapedInvitations = await reapAllExpiredInvitations();
+
 		log.info('retention_cron.completed', {
+			reapedInvitations,
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			cutoffDate: result.cutoffDate.toISOString(),
@@ -40,6 +47,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		return json({
 			success: true,
 			result: {
+				reapedInvitations,
 				deletedOccurrences: result.deletedOccurrences,
 					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				retentionDays: result.retentionDays,

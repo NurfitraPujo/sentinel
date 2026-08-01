@@ -22,6 +22,15 @@ compose stack (`podman exec sentinel-postgres psql -U sentinel -d sentinel`, `cu
 > `docs/memory/DECISIONS.md` correction citing its own re-verification. The previous "2026-07-28 partial
 > re-verification" note (S1/S2 only) is superseded by this pass.
 
+> [!IMPORTANT]
+> **2026-08-01**: five independent reviews of the org-member-management, invitation, issue-relations, and
+> observability commits (`dc359cb`, `5639e64`, `f8d66ac`, `b3ccde9`, `49c0307`, `b9e2018`) found the same
+> pattern documented above one layer up — merges that pass their own tests and do not run. That defect
+> register, its phased remediation, and the acceptance command for each fix live in
+> **[docs/plans/UI_PARITY_REMEDIATION_PLAN.md](../plans/UI_PARITY_REMEDIATION_PLAN.md)** (D01–D47). This
+> file gains a dated entry, with the command that proved it, only as each item there is actually closed —
+> not on the strength of the plan's existence.
+
 ---
 
 ## How to verify (copy-paste)

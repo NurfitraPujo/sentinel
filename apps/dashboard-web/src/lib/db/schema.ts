@@ -19,15 +19,27 @@ export const organizationMembers = pgTable('organization_members', {
 	uniqueUserOrg: index('organization_members_user_org_unique').on(table.userId, table.organizationId),
 }));
 
+// D06: the raw invitation token is NEVER stored. `tokenHash` is sha256(token) hex-encoded (64 chars);
+// invitations/organizations.ts's createOrganizationInvitation/getInvitationByToken hash on the way in
+// and on the way out, so no code path in this file's callers should ever compare against a plaintext
+// token. See packages/db-migrations/migrations/1722300000_invitation_token_hash_and_user_email_unique.sql
+// for the migration that replaced the old plaintext `token` column with this one (and deleted every
+// then-pending invitation, since plaintext cannot be backfilled to a hash).
 export const organizationInvitations = pgTable('organization_invitations', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
 	email: varchar('email', { length: 255 }).notNull(),
 	role: varchar('role', { length: 20 }).notNull().default('viewer'),
-	token: varchar('token', { length: 128 }).notNull().unique(),
+	tokenHash: varchar('token_hash', { length: 64 }).unique(),
 	status: varchar('status', { length: 20 }).notNull().default('pending'),
 	expiresAt: timestamp('expires_at').notNull(),
 	createdAt: timestamp('created_at').defaultNow(),
+	// D07: set atomically by the single conditional UPDATE that claims a redemption.
+	acceptedAt: timestamp('accepted_at'),
+	// D31 (residual): who issued this invitation, so claimInvitation can re-check at redemption
+	// time that the inviter still holds authority to grant `role` -- see the migration's comment
+	// (1722500000) for why a demoted/removed inviter's outstanding grant must not still honor.
+	invitedBy: varchar('invited_by', { length: 255 }).references(() => users.id, { onDelete: 'set null' }),
 });
 
 export const userSessionPreferences = pgTable('user_session_preferences', {
@@ -176,6 +188,12 @@ export const settings = pgTable('settings', {
 	updatedAt: timestamp('updated_at').defaultNow(),
 });
 
+// D30: idx_user_email_lower_unique (added by
+// 1722300000_invitation_token_hash_and_user_email_unique.sql — a raw-SQL expression index that this
+// drizzle-orm version's schema builder cannot express directly, so it is not repeated here) enforces
+// that no two rows share a case-insensitive email. Email/organization lookups (e.g. the
+// already-a-member guard on invitation creation) MUST normalize to lower(email) to match it, and
+// writes should normalize the stored value too rather than relying on this index alone.
 export const users = pgTable('user', {
 	id: text('id')
 		.primaryKey()

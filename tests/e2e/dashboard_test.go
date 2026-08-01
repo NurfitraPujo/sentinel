@@ -279,20 +279,34 @@ func TestU22_InviteCreationRBACAndAcceptanceWall(t *testing.T) {
 		t.Fatalf("owner creating an invitation: got %d, want 201, body=%s", res.Status, res.Body)
 	}
 	var invite struct {
-		ID             string `json:"id"`
-		Token          string `json:"token"`
-		Status         string `json:"status"`
-		Role           string `json:"role"`
-		Email          string `json:"email"`
-		OrganizationID string `json:"organizationId"`
+		ID        string `json:"id"`
+		Token     string `json:"token"`
+		Status    string `json:"status"`
+		Role      string `json:"role"`
+		Email     string `json:"email"`
+		Delivered bool   `json:"delivered"`
 	}
 	res.JSON(t, &invite)
-	if invite.Status != "pending" || invite.Role != "engineer" || invite.Email != inviteEmail || invite.OrganizationID != f.OrgID {
+	if invite.Status != "pending" || invite.Role != "engineer" || invite.Email != inviteEmail {
 		t.Fatalf("invite response shape mismatch: %+v", invite)
 	}
-	if invite.ID == "" || invite.Token == "" {
-		t.Fatalf("invite response missing id/token: %+v", invite)
+	if invite.ID == "" {
+		t.Fatalf("invite response missing id: %+v", invite)
 	}
+
+	// D06: the raw token must NOT come back to any client. It used to, and this test used to require
+	// it. The token now exists only in the emailed URL; the DB stores nothing but its sha256 hash,
+	// and InviteMemberModal was updated to stop offering a copy-paste link built from it. Asserting
+	// its ABSENCE is the regression fence for that change.
+	if invite.Token != "" {
+		t.Errorf("invite response leaked the raw token (%q) — it must appear only in the emailed URL", invite.Token)
+	}
+	// `organizationId` is likewise no longer echoed back; it is verified against the DB row below.
+
+	// D41: a 201 no longer implies delivery. With no EMAIL_SERVER configured in the compose stack
+	// this is expected to be false — the point is that the outcome is REPORTED rather than swallowed
+	// by a `.catch(() => {})`, so an operator can tell "created and emailed" from "created only".
+	t.Logf("U22 invitation delivered=%v (false is expected when EMAIL_SERVER is unset)", invite.Delivered)
 	t.Cleanup(func() { exec(context.Background(), `DELETE FROM organization_invitations WHERE id = $1`, invite.ID) })
 
 	// Confirm it is a real row, not just an API-shaped response.
@@ -303,28 +317,48 @@ func TestU22_InviteCreationRBACAndAcceptanceWall(t *testing.T) {
 	if dbStatus != "pending" || dbRole != "engineer" || dbEmail != inviteEmail {
 		t.Fatalf("organization_invitations row mismatch: status=%q role=%q email=%q", dbStatus, dbRole, dbEmail)
 	}
+	var dbOrgID string
+	queryRow(t, &dbOrgID, `SELECT organization_id FROM organization_invitations WHERE id = $1`, invite.ID)
+	if dbOrgID != f.OrgID {
+		t.Fatalf("invitation written to the wrong organization: got %q, want %q", dbOrgID, f.OrgID)
+	}
+	// D06: what is persisted is the HASH, never the raw token. A 64-char hex digest, and never a
+	// value that appeared in any response.
+	var dbTokenHash string
+	queryRow(t, &dbTokenHash, `SELECT token_hash FROM organization_invitations WHERE id = $1`, invite.ID)
+	if len(dbTokenHash) != 64 {
+		t.Errorf("token_hash is %d chars (%q); expected a 64-char sha256 hex digest", len(dbTokenHash), dbTokenHash)
+	}
 
-	// The wall: no route consumes the token. Probe every plausible shape; all must be 404 (route does
-	// not exist), never 401/403/500 (which would mean a route exists but is merely gated or broken).
+	// The "wall" this test was written to document is GONE: acceptance was implemented in P1/P2
+	// (routes/invitations/[token] sets a short-lived HttpOnly cookie and redirects to
+	// routes/auth/accept-invite, which claims the invitation atomically). What remains true is that
+	// no JSON *API* endpoint consumes a token — acceptance is a browser page flow, and these
+	// candidate API shapes must still 404 rather than 401/403/500, which would mean a half-built
+	// endpoint exists. The token-bearing candidates are dropped: the raw token is no longer returned
+	// to any client (D06), so this test cannot construct them, which is itself the point.
 	candidates := []string{
 		fmt.Sprintf("/api/organizations/%s/invitations/accept", f.OrgID),
 		fmt.Sprintf("/api/organizations/%s/invitations/%s/accept", f.OrgID, invite.ID),
-		fmt.Sprintf("/api/organizations/%s/invitations/%s", f.OrgID, invite.ID),
-		fmt.Sprintf("/api/invitations/%s/accept", invite.Token),
-		fmt.Sprintf("/api/invitations/accept?token=%s", invite.Token),
 	}
 	for _, cand := range candidates {
 		r := dashboardRequest(t, http.MethodPost, cand, owner, map[string]any{"token": invite.Token})
-		if r.Status != http.StatusNotFound {
-			t.Errorf("candidate accept route %s answered %d (want 404 = does not exist); an acceptance "+
-				"endpoint may have been added since — U22's second half may now be reachable. body=%s",
+		// 404 = no such route. 405 = the path matches an existing route's dynamic segment (P1 added
+		// DELETE /api/organizations/[orgId]/invitations/[id] for revocation, so ".../invitations/accept"
+		// binds [id]="accept") but that route exposes no POST handler. Both mean the same thing here:
+		// there is no JSON acceptance endpoint. Anything else — 200/401/403/500 — would mean a
+		// half-built one exists and needs review.
+		if r.Status != http.StatusNotFound && r.Status != http.StatusMethodNotAllowed {
+			t.Errorf("candidate accept route %s answered %d (want 404 or 405 = no POST endpoint there); "+
+				"a JSON acceptance endpoint may have been added — review it before this test is trusted. body=%s",
 				cand, r.Status, r.Body)
 		}
 	}
-	t.Log("U22 second half (accept -> membership at invited role) is UNREACHABLE: no HTTP route in " +
-		"apps/dashboard-web/src/routes anywhere consumes an organization_invitations token (confirmed by " +
-		"source grep and by every candidate URL above 404ing). This is not a browser-only gap — there is " +
-		"nothing for a browser to click through to either, since the endpoint itself does not exist.")
+	t.Log("U22: invitation CREATION is verified end to end above (RBAC, real row, hashed token, no " +
+		"token echoed back). Acceptance now exists as a browser page flow (routes/invitations/[token] -> " +
+		"routes/auth/accept-invite), which this HTTP-level test does not drive: it needs a signed-in " +
+		"session and a cookie round trip. Its logic is covered by unit tests instead " +
+		"(routes/auth/accept-invite/page.server.test.ts).")
 }
 
 // ---------------------------------------------------------------------------------------------------

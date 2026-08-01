@@ -1,8 +1,12 @@
 <script lang="ts">
+	// keyPrefix mirrors the API's field name (apps/dashboard-web/src/lib/db/queries/apikeys.ts:26,47
+	// select `keyPrefix`, not `prefix`). Using the wrong field name here meant every row always fell
+	// back to the literal 'sent_' placeholder — the ONLY purpose of this column is telling
+	// sent_org_ keys apart from sent_live_ keys, and the fallback made that impossible (D25).
 	export let keys: Array<{
 		id: string;
 		name: string;
-		prefix: string;
+		keyPrefix?: string;
 		scopes?: string[];
 		scope?: string;
 		targetProject?: string;
@@ -76,7 +80,7 @@
 			{#each activeKeys as key}
 				<tr class="hover:bg-gray-800/40 transition-colors">
 					<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-100">{key.name}</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-emerald-400 font-mono tracking-wide">{key.prefix || 'sent_'}••••</td>
+					<td class="px-6 py-4 whitespace-nowrap text-sm text-emerald-400 font-mono tracking-wide">{key.keyPrefix || 'sent_'}••••</td>
 					<td class="px-6 py-4 whitespace-nowrap text-sm">
 						{#each formatScopes(key) as sc}
 							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-950 text-emerald-300 border border-emerald-800/50 uppercase tracking-wider">
@@ -135,7 +139,7 @@
 						{#each revokedKeys as key}
 							<tr class="opacity-60">
 								<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-400 line-through">{key.name}</td>
-								<td class="px-6 py-3 whitespace-nowrap text-sm font-mono text-gray-500">{key.prefix || 'sent_'}••••</td>
+								<td class="px-6 py-3 whitespace-nowrap text-sm font-mono text-gray-500">{key.keyPrefix || 'sent_'}••••</td>
 								<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-500">{formatScopes(key).join(', ')}</td>
 								<td class="px-6 py-3 whitespace-nowrap text-sm">
 									<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-950 text-red-400 border border-red-900/40">

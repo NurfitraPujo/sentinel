@@ -12,6 +12,7 @@
 	};
 
 	let isModalOpen = false;
+	let isModalSubmitting = false;
 	$: keys = data.keys || [];
 	$: projects = data.projects || [];
 
@@ -57,11 +58,13 @@
 			if (!res.ok) {
 				const err = await res.json().catch(() => ({ message: 'Failed to create key' }));
 				showToast(err.message || `Error ${res.status}: Failed to create key`);
+				// D26: reset so the modal (which stays open on failure) isn't stuck disabled.
+				isModalSubmitting = false;
 				return;
 			}
 
 			const { key, token } = await res.json();
-			
+
 			// Single-exposure secret token banner
 			newlyCreatedToken = token;
 			isModalOpen = false;
@@ -71,6 +74,7 @@
 			showToast('Project API Key created successfully', 'success');
 		} catch (err: any) {
 			showToast(err?.message || 'Network error while creating key');
+			isModalSubmitting = false;
 		}
 	}
 
@@ -93,8 +97,12 @@
 			// Expose rotated raw token once in top inline tray
 			newlyCreatedToken = token;
 
-			// Replace old key in local state
-			keys = keys.map(k => (k.id === id ? { ...key, status: 'active' } : k));
+			// D36: append the new row and mark the old one revoked (matching what the server did)
+			// instead of overwriting the old row in place, which made it vanish until reload.
+			keys = [
+				key,
+				...keys.map(k => (k.id === id ? { ...k, status: 'revoked', revokedAt: new Date().toISOString() } : k))
+			];
 			showToast('Project API Key rotated successfully. Old key invalidated.', 'success');
 		} catch (err: any) {
 			showToast(err?.message || 'Network error while rotating key');
@@ -198,8 +206,10 @@
 	</div>
 </div>
 
-<ApiKeyCreateModal 
-	bind:isOpen={isModalOpen} 
-	{projects} 
-	on:create={handleCreate} 
+<ApiKeyCreateModal
+	bind:isOpen={isModalOpen}
+	bind:isSubmitting={isModalSubmitting}
+	{projects}
+	allowOrgWide={false}
+	on:create={handleCreate}
 />

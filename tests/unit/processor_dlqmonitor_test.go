@@ -384,3 +384,62 @@ func TestOperationalAlertConfigFromEnv_Telegram(t *testing.T) {
 	assert.Equal(t, "telegram", cfg.Channel)
 	assert.Equal(t, "-100123", cfg.ChannelConfig["chat_id"])
 }
+
+// ---------------------------------------------------------------------------
+// dlqmonitor.BuildDLQResponse (D12)
+// ---------------------------------------------------------------------------
+
+// TestBuildDLQResponse_NoFabricatedItems is the D12 regression test. The /dlq endpoint used to
+// fabricate an "items" array — a hardcoded sequence:1, event_id:"dlq_oldest_event", org_id:"system",
+// project_id:"processor", retry_attempts:7 entry with a hand-concatenated raw_payload string — any
+// time depth > 0 and an oldest-message age was available. An operator reading that during an
+// incident would mistake it for a real parked event. This asserts the response built for a backlog
+// that DOES have an oldest message carries only the real aggregates and never an "items" key (not
+// even an empty one, which would still invite a table to expect real entries), and specifically
+// that none of the placeholder's hardcoded values ever appear anywhere in the response.
+func TestBuildDLQResponse_NoFabricatedItems(t *testing.T) {
+	detail := dlqmonitor.Detail{
+		Stats: sharedNats.DLQStats{
+			Stream:          "ERROR_EVENTS_DLQ",
+			Depth:           3,
+			PublishFailures: 0,
+		},
+		HasOldestAge: true,
+		OldestAge:    90 * time.Minute,
+		OldestClass:  sharedNats.DLQClassPermanent,
+	}
+
+	resp := dlqmonitor.BuildDLQResponse(detail)
+
+	_, hasItems := resp["items"]
+	assert.False(t, hasItems, "response must not carry an items key at all (fabricated or otherwise)")
+
+	assert.Equal(t, uint64(3), resp["total_depth"])
+	assert.Equal(t, uint64(0), resp["publish_failures"])
+	assert.Equal(t, sharedNats.DLQClassPermanent, resp["oldest_class"])
+	assert.InDelta(t, (90 * time.Minute).Seconds(), resp["oldest_age_seconds"], 0.001)
+
+	for _, v := range resp {
+		if s, ok := v.(string); ok {
+			assert.NotContains(t, s, "dlq_oldest_event")
+			assert.NotContains(t, s, "\"status\":\"parked\"")
+		}
+	}
+}
+
+// TestBuildDLQResponse_ZeroDepth asserts an empty backlog still reports the real aggregates (all
+// zero/empty) with no items key, exercising the HasOldestAge=false path.
+func TestBuildDLQResponse_ZeroDepth(t *testing.T) {
+	detail := dlqmonitor.Detail{
+		Stats: sharedNats.DLQStats{
+			Stream: "ERROR_EVENTS_DLQ",
+			Depth:  0,
+		},
+	}
+
+	resp := dlqmonitor.BuildDLQResponse(detail)
+
+	_, hasItems := resp["items"]
+	assert.False(t, hasItems)
+	assert.Equal(t, uint64(0), resp["total_depth"])
+}

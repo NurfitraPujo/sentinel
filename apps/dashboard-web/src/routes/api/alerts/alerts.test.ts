@@ -26,6 +26,11 @@ function makeDbMock() {
 	dbMock.update.mockReturnValue(dbMock);
 	dbMock.set.mockReturnValue(dbMock);
 	dbMock.delete.mockReturnValue(dbMock);
+	// `clearAllMocks` clears call records but NOT queued `mockImplementationOnce` entries, so an
+	// un-consumed queued resolution leaks into the NEXT test and answers the wrong query, making
+	// results order-dependent. `mockReset` on the queue-bearing mock drops the queue; the base
+	// implementation is re-established on the next line.
+	dbMock.then.mockReset();
 	dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	return dbMock;
 }
@@ -112,6 +117,7 @@ describe('POST /api/alerts — authorization split between org-wide and project-
 		dbMock.update.mockReturnValue(dbMock);
 		dbMock.set.mockReturnValue(dbMock);
 		dbMock.delete.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 
@@ -231,6 +237,7 @@ describe('PUT/DELETE /api/alerts — org-wide configs cannot be touched by proje
 		dbMock.update.mockReturnValue(dbMock);
 		dbMock.set.mockReturnValue(dbMock);
 		dbMock.delete.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 
@@ -358,6 +365,99 @@ describe('PUT/DELETE /api/alerts — org-wide configs cannot be touched by proje
 		expect(res.status).toBe(403);
 		expect(dbMock.update).not.toHaveBeenCalled();
 	});
+
+	// D24: the edit form used to seed the scope toggle from the config and submit it live, while PUT
+	// silently discarded projectId/organizationId — a scope-changing edit returned 200 and changed
+	// nothing. PUT must now refuse instead of silently no-op-ing.
+	const ORG_B = 'org-2';
+
+	it('PUT: rejects a body that tries to move an org-wide config to a different organization', async () => {
+		queueResults([orgWideConfig]); // existing config lookup
+		queueResults([orgMembershipRow('owner')]); // requireMutationAccess passes for the STORED org
+
+		const res = await PUT({
+			request: mutationRequest('PUT', {
+				id: 'cfg-org-1',
+				organizationId: ORG_B,
+				channelTarget: 'new@b.com',
+			}),
+			locals: locals('user-1'),
+		} as any);
+
+		expect(res.status).toBe(400);
+		expect(dbMock.update).not.toHaveBeenCalled();
+	});
+
+	it('PUT: rejects a body that tries to move a project-scoped config to a different project', async () => {
+		queueResults([projectScopedConfig]); // existing config lookup
+		queueResults([projectMembershipRow('developer')]); // requireMutationAccess passes for the STORED project
+
+		const res = await PUT({
+			request: mutationRequest('PUT', {
+				id: 'cfg-proj-1',
+				projectId: 'proj-other',
+				channelTarget: 'new@b.com',
+			}),
+			locals: locals('user-1'),
+		} as any);
+
+		expect(res.status).toBe(400);
+		expect(dbMock.update).not.toHaveBeenCalled();
+	});
+
+	it('PUT: rejects a body that tries to convert an org-wide config to a project-scoped one', async () => {
+		queueResults([orgWideConfig]);
+		queueResults([orgMembershipRow('owner')]);
+
+		const res = await PUT({
+			request: mutationRequest('PUT', {
+				id: 'cfg-org-1',
+				projectId: PROJECT_ID,
+				channelTarget: 'new@b.com',
+			}),
+			locals: locals('user-1'),
+		} as any);
+
+		expect(res.status).toBe(400);
+		expect(dbMock.update).not.toHaveBeenCalled();
+	});
+
+	it('PUT: a same-value scope field (no actual change) is accepted', async () => {
+		queueResults([orgWideConfig]);
+		queueResults([orgMembershipRow('owner')]);
+		queueResults([{ ...orgWideConfig, channelConfig: { to: 'new@b.com' } }]);
+
+		const res = await PUT({
+			request: mutationRequest('PUT', {
+				id: 'cfg-org-1',
+				organizationId: ORG_ID, // same as stored — not a scope change
+				channelTarget: 'new@b.com',
+			}),
+			locals: locals('user-1'),
+		} as any);
+
+		expect(res.status).toBe(200);
+	});
+
+	// Cross-org IDOR fence: the caller IS a manage_keys member of org A, but tries to create an
+	// org-wide config scoped to org B, where they hold no membership at all. requireOrgAlertAccess
+	// looks up membership by the SPECIFIC organizationId in the body, not "any org the caller manages",
+	// so this must 403 even though the caller has manage_keys somewhere.
+	it('POST: an org A owner cannot create an org-wide config for org B where they have no membership (IDOR fence)', async () => {
+		// requireOrgAlertAccess looks up organizationMembers for (user-1, ORG_B) specifically — no row.
+		queueResults([]);
+
+		const res = await POST({
+			request: new Request('http://x/api/alerts', {
+				method: 'POST',
+				body: JSON.stringify({ organizationId: ORG_B, channel: 'email', channelTarget: 'x@b.com' }),
+			}),
+			locals: locals('user-1'),
+		} as any);
+
+		expect(res.status).toBe(403);
+		expect(dbMock.insert).not.toHaveBeenCalled();
+	});
 });
 
 describe('GET /api/alerts — returns both layers with an explicit scope field', () => {
@@ -366,6 +466,7 @@ describe('GET /api/alerts — returns both layers with an explicit scope field',
 		dbMock.select.mockReturnValue(dbMock);
 		dbMock.from.mockReturnValue(dbMock);
 		dbMock.where.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 	});
 

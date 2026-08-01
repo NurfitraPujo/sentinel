@@ -10,6 +10,7 @@
 	};
 
 	let isModalOpen = false;
+	let isModalSubmitting = false;
 	$: keys = data.keys || [];
 	$: projects = data.projects || [];
 
@@ -55,11 +56,14 @@
 			if (!res.ok) {
 				const err = await res.json().catch(() => ({ message: 'Failed to create key' }));
 				showToast(err.message || `Error ${res.status}: Failed to create key`);
+				// D26: the modal stays open on a create failure, so it must be told its submit
+				// finished — otherwise the button is stuck disabled reading "Creating..." forever.
+				isModalSubmitting = false;
 				return;
 			}
 
 			const { key, token } = await res.json();
-			
+
 			// Single-exposure secret token banner
 			newlyCreatedToken = token;
 			isModalOpen = false;
@@ -69,6 +73,7 @@
 			showToast('API Key created successfully', 'success');
 		} catch (err: any) {
 			showToast(err?.message || 'Network error while creating key');
+			isModalSubmitting = false;
 		}
 	}
 
@@ -91,8 +96,16 @@
 			// Expose rotated raw token once in top inline tray
 			newlyCreatedToken = token;
 
-			// Replace old key in local state with rotated key
-			keys = keys.map(k => (k.id === id ? { ...key, status: 'active' } : k));
+			// D36: rotation creates a NEW key row server-side (the old one is revoked, not deleted
+			// or replaced — see rotateApiKey in lib/db/queries/apikeys.ts). Previously this mapped
+			// the old row directly to the new key's data, which overwrote it in place: the
+			// just-revoked key vanished from the table until the next full reload instead of moving
+			// into the Revoked section. Mark the old row revoked in local state and prepend the new
+			// row, mirroring what the server actually did.
+			keys = [
+				key,
+				...keys.map(k => (k.id === id ? { ...k, status: 'revoked', revokedAt: new Date().toISOString() } : k))
+			];
 			showToast('API Key rotated successfully. Old key invalidated.', 'success');
 		} catch (err: any) {
 			showToast(err?.message || 'Network error while rotating key');
@@ -191,8 +204,9 @@
 	</div>
 </div>
 
-<ApiKeyCreateModal 
-	bind:isOpen={isModalOpen} 
-	{projects} 
-	on:create={handleCreate} 
+<ApiKeyCreateModal
+	bind:isOpen={isModalOpen}
+	bind:isSubmitting={isModalSubmitting}
+	{projects}
+	on:create={handleCreate}
 />

@@ -1,21 +1,26 @@
 import { error } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
 import { db } from '$lib/server/db';
-import { organizations, projects } from '$lib/db/schema';
+import { projects } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 
-export const load: PageServerLoad = async ({ params, fetch }) => {
+export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	const { orgSlug, projectId } = params;
 
-	// Resolve organization ID from slug
-	const [org] = await db
-		.select({ id: organizations.id, name: organizations.name })
-		.from(organizations)
-		.where(eq(organizations.slug, orgSlug));
-
-	if (!org) {
-		throw error(404, 'Organization not found');
+	// D39: authenticate BEFORE any org/project lookup — see the sibling org-level loader
+	// (settings/keys/+page.server.ts) for the full rationale. `orgHandle` does not gate anonymous
+	// requests, so this loader must check itself.
+	const session = await locals.auth();
+	if (!session?.user?.email) {
+		throw error(401, 'Unauthorized');
 	}
+
+	const currentOrg = locals.currentOrg;
+	if (!currentOrg || currentOrg.slug !== orgSlug) {
+		throw error(403, 'Forbidden: Unauthorized access to organization');
+	}
+
+	const org = { id: currentOrg.id, name: currentOrg.name };
 
 	// Verify project exists in org
 	const [project] = await db
@@ -37,7 +42,14 @@ export const load: PageServerLoad = async ({ params, fetch }) => {
 	const { keys } = await res.json();
 
 	// Server-side filter to return only keys targeted to this project
-	const projectKeys = (keys || []).filter((k: any) => k.projectId === projectId);
+	// D37: attach the project NAME. The keys API returns only `projectId`, so without this every
+	// row on this page rendered a raw UUID in the "Target" column (ApiKeyTable falls back to
+	// `key.projectId` when `targetProject` is absent). The org-level loader already does this; the
+	// project-scoped one was missed — and here the name is trivially known, since every key on this
+	// page belongs to the project we just looked up.
+	const projectKeys = (keys || [])
+		.filter((k: any) => k.projectId === projectId)
+		.map((k: any) => ({ ...k, targetProject: project.name }));
 
 	return {
 		orgId: org.id,

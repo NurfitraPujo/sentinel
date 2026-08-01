@@ -48,6 +48,7 @@
 	}
 
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
+	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 
 	interface StackFrame {
 		file: string;
@@ -82,6 +83,13 @@
 		}
 		return groups;
 	}, []));
+
+	// data.relations comes straight off the issue_relations DB column, which is a plain varchar
+	// with no DB-level enum — TypeScript only ever knows it as `relationType: string`. Narrow to
+	// the three values the migration's CHECK constraint (and the relations API) actually permit
+	// here, at the boundary where DB data enters IssueRelations' typed props, dropping (and
+	// logging) anything unrecognized rather than casting it through.
+	let knownRelations = $derived(filterKnownRelationTypes(data.relations || []));
 
 	async function handleStatusChangeRequest(newStatus: 'resolved') {
 		try {
@@ -119,7 +127,7 @@
 
 	<IssueRelations
 		currentIssueId={data.issue.id}
-		initialRelations={data.relations || []}
+		initialRelations={knownRelations}
 		onStatusChangeRequest={handleStatusChangeRequest}
 	/>
 

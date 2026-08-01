@@ -44,7 +44,7 @@
 	);
 
 	let activeOrgId = $derived(
-		selectedOrgId || data.projects[0]?.organizationId || data.userOrganizations[0]?.id || ''
+		selectedOrgId || data.userOrganizations[0]?.id || data.projects[0]?.organizationId || ''
 	);
 
 	function getProjectName(projectId: string | null): string {
@@ -122,19 +122,20 @@
 			enabled,
 		};
 
-		if (scope === 'project') {
-			payload.projectId = selectedProjectId;
-		} else {
-			payload.projectId = null;
-			payload.organizationId = activeOrgId;
-		}
-
 		let url = '/api/alerts';
 		let method = 'POST';
 
 		if (editMode && editingConfig) {
+			// Scope (project vs organization, and which one) is immutable via PUT — the toggle is disabled
+			// while editing, and the payload intentionally omits projectId/organizationId so there is nothing
+			// for the API's scope-change guard to reject. See api/alerts/+server.ts PUT.
 			payload.id = editingConfig.id;
 			method = 'PUT';
+		} else if (scope === 'project') {
+			payload.projectId = selectedProjectId;
+		} else {
+			payload.projectId = null;
+			payload.organizationId = activeOrgId;
 		}
 
 		try {
@@ -238,12 +239,20 @@
 
 				<!-- Form Scope Switcher -->
 				<div class="form-group">
-					<label>Alert Rule Scope</label>
-					<div class="segmented-control">
+					<!--
+						A bare `<label>` above a group of buttons (not one control it can associate with)
+						was flagged by a11y_label_has_associated_control. This is a two-way toggle between
+						buttons, not a set of radio inputs, so fieldset/legend doesn't fit either -- a
+						labeled ARIA group is the correct semantics here.
+					-->
+					<span id="alert-rule-scope-label" class="form-group-label">Alert Rule Scope</span>
+					<div class="segmented-control" role="group" aria-labelledby="alert-rule-scope-label">
 						<button
 							type="button"
 							class="segmented-btn"
 							class:active={scope === 'project'}
+							disabled={editMode}
+							title={editMode ? 'Scope cannot be changed when editing an existing rule' : ''}
 							onclick={() => (scope = 'project')}
 						>
 							Project Alert
@@ -252,8 +261,12 @@
 							type="button"
 							class="segmented-btn"
 							class:active={scope === 'organization'}
-							disabled={!data.canManageOrgAlerts}
-							title={!data.canManageOrgAlerts ? 'Requires manage_keys org permission' : ''}
+							disabled={editMode || !data.canManageOrgAlerts}
+							title={editMode
+								? 'Scope cannot be changed when editing an existing rule'
+								: !data.canManageOrgAlerts
+									? 'Requires manage_keys org permission'
+									: ''}
 							onclick={() => (scope = 'organization')}
 						>
 							Organization-Wide Alert
@@ -262,7 +275,9 @@
 							{/if}
 						</button>
 					</div>
-					{#if !data.canManageOrgAlerts}
+					{#if editMode}
+						<p class="scope-hint">Scope cannot be changed when editing an existing rule.</p>
+					{:else if !data.canManageOrgAlerts}
 						<p class="scope-hint">Organization-wide rules require owner, admin, or engineer org role.</p>
 					{/if}
 				</div>
@@ -288,7 +303,12 @@
 					</div>
 				{:else}
 					<div class="form-group">
-						<label>Target Scope</label>
+						<!--
+							`for="organizationId"` associates this with the real select below when it renders
+							(userOrganizations.length > 1). When it doesn't (the org-badge branch), there is no
+							form control to associate with at all -- nothing here needs a label then either.
+						-->
+						<label for="organizationId">Target Scope</label>
 						{#if data.userOrganizations.length > 1}
 							<select
 								id="organizationId"
@@ -545,7 +565,8 @@
 		gap: 1rem;
 	}
 
-	label {
+	label,
+	.form-group-label {
 		display: block;
 		margin-bottom: 0.375rem;
 		font-size: 0.75rem;
