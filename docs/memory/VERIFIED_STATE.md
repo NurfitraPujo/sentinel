@@ -1,11 +1,28 @@
 # Verified State of the Codebase
 
-Last verified: **2026-07-29**. HEAD at verification time is `cd84d17` (P0+P1, "add CI, make the local
-stack real, restore build and tests") on branch `chore/p0-p1-green-tree`, with **P2/P2b staged and
-uncommitted on top** — 36 files, +2501/-254. Baseline before any of this recovery work was `ad2f967`.
-Verified by running builds, `go vet`, `go test` (root module and `-tags=contract`), the independent
-`packages/sdk-go` module's own test suite, `pnpm check`/`pnpm test`, and live probes against the running
-compose stack (`podman exec sentinel-postgres psql -U sentinel -d sentinel`, `curl` against the ingestor).
+Last verified: **2026-08-01**. HEAD at verification time is `b895df1` on `main` — the merge commit for
+PR #11 (`fix/ui-parity-remediation`, 8 commits), the first time this repository has had a **green CI run
+on `main`**. Every gate below was re-run against that merged tree, not carried over from the branch:
+
+| Gate | Command | Result at `b895df1` |
+|---|---|---|
+| Dashboard typecheck | `cd apps/dashboard-web && pnpm check` | 1024 files, **0 errors, 0 warnings** |
+| Dashboard build | `cd apps/dashboard-web && pnpm build` | pass (adapter-node) |
+| Dashboard tests | `cd apps/dashboard-web && pnpm test` | **32 files, 251 passed** |
+| Root module | `go build ./... && go vet ./...` | clean |
+| Unit suite | `go test ./tests/unit/...` | **308 passed** |
+| E2E (needs the stack up) | `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1` | **76 passed, 0 skipped** |
+| CI | GitHub Actions, `push` event on `main` | **9/9 check runs green** (8 jobs; `go-sdk` is a 2-leg matrix) |
+
+The previous verification (2026-07-29, `cd84d17` on `chore/p0-p1-green-tree` with P2/P2b staged and
+uncommitted, baseline `ad2f967`) remains the provenance for the S1–S18 entries below; re-run before
+trusting any entry older than the current HEAD.
+
+> [!NOTE]
+> **CI on `main` was RED before this merge and is green after it.** `gh run list --branch main` records
+> `b9e2018` (the pre-remediation baseline) as `failure` and `b895df1` as `success`. Any claim in this repo
+> that predates 2026-08-01 and says "CI exists but has never been proven green on a real push" is now
+> stale — that had been true since CI was introduced under P0-1, and is not any more.
 
 > [!IMPORTANT]
 > This file records what the code **actually does when executed**, as distinct from what `specs/`, `docs/todos/`,
@@ -30,6 +47,13 @@ compose stack (`podman exec sentinel-postgres psql -U sentinel -d sentinel`, `cu
 > **[docs/plans/UI_PARITY_REMEDIATION_PLAN.md](../plans/UI_PARITY_REMEDIATION_PLAN.md)** (D01–D47). This
 > file gains a dated entry, with the command that proved it, only as each item there is actually closed —
 > not on the strength of the plan's existence.
+>
+> **That work is now closed and merged** (PR #11 → `b895df1`). See
+> [UI parity remediation](#ui-parity-remediation-d01d47--resolved-2026-08-01) below for what was actually
+> proven, what was deliberately left open, and the three defects the remediation *introduced* and then
+> caught. Note the ID collision: `D01`–`D47` in that plan are **findings**, unrelated to `D1`–`D18` in
+> `DECISIONS.md`, which are **architecture decisions**. The overlap is unfortunate and load-bearing in
+> both directions — always name the file when citing a `D` number.
 
 ---
 
@@ -38,13 +62,21 @@ compose stack (`podman exec sentinel-postgres psql -U sentinel -d sentinel`, `cu
 ```bash
 rtk go build ./...                                    # root module: PASSES
 rtk go vet ./...                                      # PASSES
-rtk go test ./tests/unit/... -count=1                  # PASSES, 241 assertions (was 251 at S1's fix; masker/ratelimit tests added since)
+rtk go test ./tests/unit/... -count=1                  # PASSES, 308 passed (2026-08-01)
 rtk go test -tags=contract ./tests/contract/... -v -count=1   # PASSES, 4/4 (proves S3/S4/S5/S11/S16 against REAL sdk-go + REAL ingestor decode/validate path)
 cd packages/sdk-go && rtk go test ./... -count=1       # PASSES, 4 packages (SDK is an independent module — not covered by the root-module commands above)
-cd apps/dashboard-web && rtk pnpm exec vite build      # PASSES (S2)
-cd apps/dashboard-web && rtk pnpm check                # 707 files, 0 errors (S2)
-cd apps/dashboard-web && rtk pnpm test                 # PASSES, 5 files / 19 tests (S2)
+cd apps/dashboard-web && rtk pnpm build                # PASSES — run this, NOT just check+test: it is the
+                                                       # ONLY gate that enforces SvelteKit's route-export
+                                                       # allowlist (B12)
+cd apps/dashboard-web && rtk pnpm check                # 1024 files, 0 errors, 0 warnings (2026-08-01)
+cd apps/dashboard-web && rtk pnpm test                 # PASSES, 32 files / 251 tests (2026-08-01)
+cd apps/dashboard-web && rtk pnpm test --sequence.shuffle   # must ALSO pass — order-independence decays
+                                                       # silently (B13); verified across 8 seeds
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1  # PASSES, 76 passed — NEEDS the compose stack up
 ```
+
+**CI is now green on `main`** (merge commit `b895df1`, 2026-08-01 — the first green run this repo has
+had; the prior baseline `b9e2018` was red). A green badge is evidence about `main`, not your working tree.
 
 There was **no CI** when the original findings below were recorded — `.github/` contained only
 `copilot-instructions.md`, with no `.github/workflows/` directory. A CI setup was part of P0; if you are
@@ -123,6 +155,85 @@ current picture of module boundaries.
 ---
 
 ## Resolved
+
+### UI parity remediation (D01–D47) — RESOLVED 2026-08-01
+
+**What was wrong.** Five features closed the dashboard/backend parity gaps in `dc359cb`, `5639e64`,
+`f8d66ac`, `b3ccde9`, `49c0307`, `b9e2018`. Each merged with its own tests passing. **Three of the five
+did not execute at runtime**, and the tree was already red at `b9e2018` (`pnpm check` 2 errors,
+`pnpm test` 2 failures) before any remediation started. This is B3 reproducing one layer up, in the
+dashboard rather than the pipeline.
+
+The three dead features, each proven dead rather than assumed:
+
+| Finding | Symptom | Root cause |
+|---|---|---|
+| D01 | Emailed invite link 403'd for **signed-in** invitees only | `invitations` missing from `hooks.server.ts`'s `reservedRoutes`, so the path was parsed as an org slug. Anonymous users escaped via an early return — it failed for the *common* case. |
+| D02 | `/api/issues/search` 500'd on **every** query | `issues.id ILIKE` against a `uuid` column. Reproduced against real Postgres: `operator does not exist: uuid ~~* unknown`. Search is the only way to pick a link target, so the whole relations flow was unusable. |
+| D04 | Only one alert rule per org/project ever fired | `Dispatcher.configs`/`orgConfigs` were `map[string]*AlertConfig` — one entry per key — with no unique index behind them. Extra rules were overwritten silently at load. |
+
+**Security defects closed** (all live on any deployed instance at the time): `/settings/observability`
+served DLQ depth, publish-failure counts and stream names to **anonymous** visitors (D05 — `settings` is
+in `reservedRoutes`, so `orgHandle` never guarded it); invitation tokens stored **plaintext** and moved
+into a `?token=` query string (D06); redemption was check-then-act across five statements with no
+transaction and no revocation path (D07); accepting a `viewer` invite **demoted an existing owner**
+(D08); `keyHash` — the SHA-256 the ingestor's Redis cache is keyed on — was returned to the browser on
+key create and rotate (D09); org `viewer` could mutate issues one at a time though bulk denied them
+(D10).
+
+**Verified by** (re-run at `b895df1`, see the gate table at the top of this file): `pnpm check`
+1024 files / 0 errors / 0 warnings, `pnpm build`, `pnpm test` 251 passed, `go build`/`go vet`,
+`go test ./tests/unit/...` 308 passed, `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` 76 passed, and
+9/9 CI check runs green (8 jobs; `go-sdk` is a 2-leg matrix) on the `push` event for `main`.
+
+**Every fix was verified to FAIL with the fix reverted.** That was applied literally — reverting the
+`.for('update')` calls, the `::text` cast, the `requireIssueAccess` calls, the `redirectTo` option, and
+the inviter-authority check, then observing the specific tests fail and pass again on restore.
+
+#### Three defects the remediation itself introduced — and what caught each
+
+Recorded because *how* they were caught matters more than that they existed:
+
+1. **A 500 on `/[orgSlug]/settings/observability`.** The org route forwarded only `{ fetch }` to a
+   shared loader behind an `as Parameters<typeof baseLoad>[0]` cast; when that loader gained
+   `locals.auth()` for D05, `locals` was `undefined` and every request threw. **The cast hid it from
+   `svelte-check`.** Two agents each made a locally-reasonable change; the composition was broken. Fixed
+   by replacing cast-and-delegate with a shared `loadObservability(event)` both routes call.
+2. **`pnpm build` was broken and nothing noticed.** SvelteKit route modules may only export a fixed
+   allowlist of names; two files exported constants (`INVITE_TOKEN_COOKIE`, and `loadObservability` from
+   the remediation's own P0 fix). `pnpm check` and `pnpm test` passed the entire time — **only `pnpm build`
+   fails on this**, and it had not been run. Both now live in `$lib/server/`. See B12.
+3. **The access model was too strict.** `requireIssueAccess` demanded an org role **and** a
+   `project_members` row; e2e U13 disproved it — an org admin could not link two issues, because
+   `project_members` holds only per-project grants, not org-level staff. Corrected per D17 below. A unit
+   test asserting the stricter model had to be rewritten: **e2e was right and the unit test was wrong.**
+
+#### Two CI failures after the first push, both "passes locally, fails in CI"
+
+The branch was green locally and still failed CI twice. Both causes were environmental state the local
+machine had and CI did not — worth internalising before trusting any local-only green:
+
+- **`integration`**: migration `1722300000` used unguarded DDL, so replaying it failed with
+  `column "token_hash" ... already exists`. One flat migration directory serves several goose ledgers
+  against the **same** physical database (A1), so every migration is replayed per target. Every other
+  migration in the directory already followed an `IF NOT EXISTS` convention; the two new ones did not.
+  Both are now guarded, including the `ADD CONSTRAINT` statements, which have no `IF NOT EXISTS` in
+  Postgres and use a `pg_constraint` catalog check.
+- **`dashboard`**: the D02 uuid-cast test queried for *any issue row that happens to exist* and asserted
+  one was found. That passed against a dev database full of e2e leftovers and failed in CI's
+  freshly-migrated, empty Postgres. It now seeds and deletes its own org/project/issue. See B13.
+
+#### Deliberately open, with reasons
+
+- **A product decision, not a defect**: the raw invitation token is no longer returned to any client and
+  `InviteMemberModal`'s copy-paste link was removed (D06). **Invitations therefore depend entirely on
+  working email delivery.** The create response reports `delivered` so the caller can tell "created and
+  emailed" from "created only", but in an environment with no `EMAIL_SERVER` an admin can create an
+  invitation with no way to convey it. Defensible; should be affirmed deliberately rather than inherited.
+- **9 `TestProcessorService_*` failures in `tests/integration` on the authoring machine**, all
+  `postgres ping unavailable ... connection refused` from a testcontainers/podman lifecycle problem.
+  These **pass in CI**, so they are environmental. Do not "fix" them without first reproducing in CI.
+- `S10` (rate limiting non-atomic / fails open) is untouched by this work and remains open below.
 
 ### S18 — `issues.count` inflated on partial-failure redelivery; the write path had no idempotency key (RESOLVED 2026-07-31)
 

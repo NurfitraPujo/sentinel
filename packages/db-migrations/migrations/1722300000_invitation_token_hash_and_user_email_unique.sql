@@ -15,7 +15,8 @@
 -- expired) are kept for their audit trail -- they are never looked up by token again, so their
 -- token_hash is left NULL rather than fabricated.
 --
--- IDEMPOTENCY: every statement below is guarded. This repo keeps ONE flat migration directory for
+-- IDEMPOTENCY: every statement below is guarded -- the DDL with IF NOT EXISTS / catalog checks, and
+-- the DELETE below with a first-application check. This repo keeps ONE flat migration directory for
 -- all goose targets (A1 in docs/memory/ARCHITECTURE.md), and each target has its OWN ledger
 -- (schema_migrations, processor_migrations, dashboard_migrations, ...) tracking the SAME physical
 -- database. So a second target replays this file against a database where it has already been
@@ -23,7 +24,22 @@
 -- run down -- which is exactly what broke the `integration` CI job (TestMigrationStatus,
 -- TestSequentialMigrations, TestTargetIsolation, TestBaselineCommand). Every other migration in
 -- this directory follows the same IF NOT EXISTS convention.
-DELETE FROM organization_invitations WHERE status = 'pending';
+--
+-- The DELETE needs a DIFFERENT kind of guard from the DDL, and getting this wrong is worse than a
+-- failed migration. `DELETE ... WHERE status='pending'` never ERRORS on replay, so it looks
+-- idempotent -- but it is not: replayed by a second ledger months later it would silently destroy
+-- every invitation issued since the first application. "Does not error on replay" and "is
+-- idempotent" are not the same property. Gate it on the schema state that means "this is the
+-- first application", so the destructive step happens exactly once.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'organization_invitations' AND column_name = 'token_hash'
+    ) THEN
+        DELETE FROM organization_invitations WHERE status = 'pending';
+    END IF;
+END $$;
 
 ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS token_hash VARCHAR(64);
 ALTER TABLE organization_invitations DROP COLUMN IF EXISTS token;

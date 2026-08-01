@@ -34,9 +34,15 @@ export interface IssueAccessContext {
  * `projects/[projectId]/issues/batch` — resolve issues one at a time (D10), and it meant an org
  * member with no project membership at all could still act on any project's issues.
  *
- * This helper checks BOTH: org role gates WRITE using the same allowlist the bulk endpoint
- * enforces, and project membership is required unconditionally (for both `read` and `write`) so
- * visibility of a specific project's issues always requires being on that project.
+ * The two are resolved as **OR, not AND** (see DECISIONS.md D17). An org role on
+ * `ISSUE_WRITE_ROLES` is itself an org-wide grant covering every project in the org — no
+ * `project_members` row is required or consulted. Project membership is the ALTERNATIVE path for a
+ * caller whose org role does not grant access (`viewer`), and it conveys READ only.
+ *
+ * An earlier revision of this helper required BOTH, and this comment described that. It was wrong:
+ * tests/e2e U13 failed because an org admin could not link two issues in their own organization,
+ * since `project_members` is populated only for per-project grants and never for org-level staff.
+ * D10 stays closed either way — an org `viewer` with no project membership is still refused.
  *
  * Throws a SvelteKit `error()` (404/400/403) — call sites should let it propagate.
  */

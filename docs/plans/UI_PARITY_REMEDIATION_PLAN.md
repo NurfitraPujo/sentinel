@@ -5,6 +5,18 @@
 `49c0307`, `b9e2018`, plus a measured baseline (`pnpm check`, `pnpm test`) and two defects reproduced
 against the live stack.
 
+> [!NOTE]
+> **STATUS: COMPLETE — merged 2026-08-01 as PR #11 → `b895df1`.** All 47 findings are closed except the
+> items explicitly listed as deliberately open in §9 and in `VERIFIED_STATE.md`'s "UI parity remediation"
+> entry. Gates at the merge commit: `pnpm check` 1024 files / 0 errors / 0 warnings · `pnpm build` pass ·
+> `pnpm test` 251 passed (order-independent across 8 shuffle seeds) · `go test ./tests/unit/...` 308
+> passed · `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` 76 passed · **9/9 CI check runs green on `main`** (8 jobs; `go-sdk` is a 2-leg matrix) —
+> the first green CI run this repository has had on `main`.
+>
+> This document is now **history plus rationale**, not a work queue. The durable lessons were promoted
+> into `docs/memory/`: B10's addendum, B12, B13, decisions D17 and D18, and the dated
+> `VERIFIED_STATE.md` entry. Read those first; come here for the per-finding detail.
+
 > [!IMPORTANT]
 > This plan exists because the parity audit's five gaps were closed by commits that **merge cleanly, pass
 > their own tests, and do not run**. Three of the five features are dead at runtime. This is the repo's

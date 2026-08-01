@@ -176,3 +176,33 @@ has no consumer, drain, or dashboard surface yet.
 `packages/shared-go/nats/subscriber.go`, `packages/sdk-go/`, `tests/contract/sdk_ingestor_test.go`,
 `packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql`.
 
+
+---
+
+### 2026-08-01 - A Feature Can Merge Green, Be Reviewed, and Still Never Run — Now With a Green CI to Prove Otherwise
+
+- **Why durable**: Five features closed the dashboard↔backend parity gaps, each merging with its own
+  tests passing. **Three of the five did not execute at runtime**: an emailed invite link 403'd for
+  signed-in users (a missing entry in `reservedRoutes`), issue search 500'd on every query
+  (`uuid ILIKE`, no cast), and only one alert rule per org/project ever fired (a `map[string]*Config`
+  where the schema permits many). This is B3 relocated from the pipeline to the dashboard, and it means
+  "reviewed and merged" carries no information about whether code runs. The durable output is not the 47
+  fixes — it is the set of gates and habits that would have caught them: run **every** gate CI runs
+  (B12), make each fix fail before it passes, and never trust a suite you have not shuffled (B13).
+- **Future mistake prevented**: Declaring a dashboard feature complete on the strength of `pnpm check` +
+  `pnpm test`. Neither sees SvelteKit's route-export rule (only `pnpm build` does), neither notices a
+  test passing on ambient data, and neither can tell a real assertion from a vacuous one — deleting all
+  three `.for('update')` calls from the sole-owner guard left 29/29 tests green. Also prevents trusting
+  a CI config that has never actually executed: this repo's CI existed for days before its first real
+  run, and that first run was red.
+- **Evidence**: PR #11 → merge commit `b895df1`, the **first green CI run on `main`** (`gh run list
+  --branch main` records the pre-work baseline `b9e2018` as `failure`). Gates at that commit:
+  `pnpm check` 1024 files / 0 errors / 0 warnings, `pnpm build` pass, `pnpm test` 251 passed and
+  order-independent across 8 shuffle seeds, `go test ./tests/unit/...` 308 passed,
+  `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` 76 passed, 9/9 CI check runs green (8 jobs). The remediation
+  introduced three defects of its own (a 500 behind a type cast, a broken `pnpm build`, an over-strict
+  access model) — each caught by a gate rather than by review, which is the point.
+- **Where to look**: `docs/plans/UI_PARITY_REMEDIATION_PLAN.md` (the 47-finding register, D01–D47 —
+  note these are *findings*, unrelated to `DECISIONS.md`'s D1–D18 *decisions*),
+  `docs/memory/VERIFIED_STATE.md` → "UI parity remediation", `docs/memory/BUGS.md` B10 addendum, B12,
+  B13, `docs/memory/DECISIONS.md` D17 and D18.
