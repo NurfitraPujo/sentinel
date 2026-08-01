@@ -26,6 +26,10 @@ Security pattern for single-exposure API secrets (`sent_org_...` / `sk_proj_...`
 ### Email Mismatch Security Guard
 Privacy and security pattern for single-use token redemption routes. Compares the authenticated user's email against the target email bound to the invitation token before returning page data. On mismatch, server load handlers return a clean error state while stripping all target organization titles, roles, and invitation details to prevent metadata enumeration attacks.
 
+### Sole Owner Protection Guard
+System authorization rule enforcing that the sole remaining owner of an organization cannot be demoted to a non-owner role or revoked from membership. Prevents organizational lockout by rejecting demotion or revocation requests with a 400 Bad Request status whenever active owner count drops to 1.
+
+
 ## Issue Triage & Relations
 
 ### Bi-Directional Issue Relations

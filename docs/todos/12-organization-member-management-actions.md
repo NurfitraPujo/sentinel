@@ -1,7 +1,7 @@
 # TODO 12: Organization Member Management Actions & Invitation Modal
 
 ## Priority: Medium
-## Status: Pending
+## Status: Completed
 
 ### Overview
 `[orgSlug]/settings/members/+page.svelte` loads and renders organization members from the database. However, the action handlers for changing roles (`handleRoleChange`) and revoking access (`handleRevokeAccess`) contain `// TODO` logging stubs, and the "Invite Member" button lacks a modal trigger.
