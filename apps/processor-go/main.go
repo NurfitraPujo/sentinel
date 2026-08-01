@@ -369,6 +369,15 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 				if detail.HasOldestAge {
 					body["dlq_oldest_age_seconds"] = detail.OldestAge.Seconds()
 				}
+
+				// D47 revisited: dlq_oldest_class IS reported, deliberately. It was briefly removed
+				// on the reasoning that it is the one field here derived from a customer event's
+				// payload, and so a narrow leak on an unauthenticated port. tests/e2e U34
+				// (dlq_test.go) rejects that: without the oldest message's class, a backlog of
+				// PERMANENTLY dead messages — which will never drain on their own — looks identical
+				// to a transient one that clears when the database recovers. That distinction is the
+				// difference between paging someone and waiting, so the operational value wins.
+				// The port-exposure question is handled where it belongs, in docker-compose.yml.
 				if detail.OldestClass != "" {
 					body["dlq_oldest_class"] = detail.OldestClass
 				}

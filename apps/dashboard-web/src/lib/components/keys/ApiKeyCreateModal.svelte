@@ -43,13 +43,29 @@
 		});
 	}
 
-	function handleClose() {
-		isOpen = false;
+	function resetForm() {
 		name = '';
 		targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 		scope = 'ingest';
 		rateLimitRpm = '';
 		isSubmitting = false;
+	}
+
+	// D26: `isSubmitting` latches on until something resets it, and only `handleClose` ever did.
+	// Both failure and success left it stuck: on an error the parent toasts and returns WITHOUT
+	// closing, so the button stayed disabled reading "Creating…" forever; on success the parent
+	// sets `isOpen = false` directly rather than calling `handleClose`, so the NEXT open showed a
+	// permanently disabled form. Resetting on the closed→open transition makes every open start
+	// clean regardless of how the previous one ended, which is the only place that holds for both.
+	let wasOpen = false;
+	$: if (isOpen !== wasOpen) {
+		wasOpen = isOpen;
+		if (isOpen) resetForm();
+	}
+
+	function handleClose() {
+		isOpen = false;
+		resetForm();
 		dispatch('close');
 	}
 </script>

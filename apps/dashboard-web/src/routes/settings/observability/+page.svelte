@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ObservabilityData } from './+page.server';
+	import type { ObservabilityData } from '$lib/server/observability';
 
 	// Typed against what this component actually READS, not against either route's `PageData`.
 	// It is rendered by two routes whose PageData differ (`/settings/observability` sits under

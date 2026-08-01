@@ -42,7 +42,14 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	const { keys } = await res.json();
 
 	// Server-side filter to return only keys targeted to this project
-	const projectKeys = (keys || []).filter((k: any) => k.projectId === projectId);
+	// D37: attach the project NAME. The keys API returns only `projectId`, so without this every
+	// row on this page rendered a raw UUID in the "Target" column (ApiKeyTable falls back to
+	// `key.projectId` when `targetProject` is absent). The org-level loader already does this; the
+	// project-scoped one was missed — and here the name is trivially known, since every key on this
+	// page belongs to the project we just looked up.
+	const projectKeys = (keys || [])
+		.filter((k: any) => k.projectId === projectId)
+		.map((k: any) => ({ ...k, targetProject: project.name }));
 
 	return {
 		orgId: org.id,

@@ -116,7 +116,11 @@ describe('[orgSlug]/projects/[projectId]/settings/keys +page.server load', () =>
 
 		expect(result.projectId).toBe('proj-1');
 		expect(result.projectName).toBe('Web App');
-		expect(result.keys).toEqual([{ id: 'key-1', projectId: 'proj-1', name: 'Scoped Key' }]);
+		// D37: the loader now attaches the project NAME, so ApiKeyTable's Target column renders
+		// "Web App" instead of falling back to the raw project UUID.
+		expect(result.keys).toEqual([
+			{ id: 'key-1', projectId: 'proj-1', name: 'Scoped Key', targetProject: 'Web App' },
+		]);
 		expect(result.projects).toEqual([{ id: 'proj-1', name: 'Web App' }]);
 	});
 });

@@ -7,6 +7,7 @@ import { eq, and, sql } from 'drizzle-orm';
 import crypto from 'crypto';
 import { sendInvitationEmail } from '$lib/server/email';
 import { requireOrgMembership } from '../keys/_shared';
+import { log } from '$lib/server/observability/log';
 
 const VALID_ROLES = ['owner', 'admin', 'engineer', 'support', 'viewer'] as const;
 type Role = typeof VALID_ROLES[number];
@@ -115,8 +116,25 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
   // so an added DB column can't silently start leaking.
   const inviteUrl = `${url.origin}/invitations/${token}`;
 
-  // Non-blocking email dispatch
-  sendInvitationEmail(normalizedEmail, inviteUrl, org?.name ?? 'Sentinel Organization').catch(() => {});
+  // D41: the send used to be fire-and-forget with `.catch(() => {})`, and the response was an
+  // unconditional 201 — so a caller could not tell "invitation created and emailed" from
+  // "invitation created, email silently failed or was never configured". The row is created either
+  // way (the copy-paste invite link in InviteMemberModal works without email), so this stays a 201;
+  // what changes is that the outcome is now REPORTED rather than swallowed, and logged on failure.
+  let delivered = false;
+  try {
+    delivered = await sendInvitationEmail(
+      normalizedEmail,
+      inviteUrl,
+      org?.name ?? 'Sentinel Organization'
+    );
+  } catch (err) {
+    log.error('invitation.email_failed', {
+      organizationId: orgId,
+      invitationId: invite.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   return json(
     {
@@ -125,6 +143,9 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
       role: invite.role,
       status: invite.status,
       expiresAt: invite.expiresAt,
+      // false when EMAIL_SERVER is unset or the send failed: the invitation exists and its link is
+      // still valid, but nothing was delivered and the inviter must pass the link on themselves.
+      delivered,
     },
     { status: 201 }
   );

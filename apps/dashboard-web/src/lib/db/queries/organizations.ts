@@ -236,6 +236,32 @@ export async function reapExpiredInvitations(
 }
 
 /**
+ * D42: reaps expired PENDING invitations across EVERY organization, returning the number deleted.
+ *
+ * `reapExpiredInvitations` above is scoped to a single org and only fires when that org happens to
+ * issue another invitation — so an organization that stops inviting never reaps, and its expired
+ * rows accumulate indefinitely. This is the unconditional sweep, driven by the existing
+ * `POST /api/cron/retention` job rather than a new endpoint with its own schedule and secret.
+ *
+ * Now that tokens are stored hashed (D06) an unreaped row is no longer a credential at rest, so
+ * this is hygiene rather than a security control — but an expired invitation still blocks
+ * re-inviting the same address cleanly, and the table otherwise grows without bound.
+ */
+export async function reapAllExpiredInvitations(): Promise<number> {
+  const deleted = await db
+    .delete(organizationInvitations)
+    .where(
+      and(
+        eq(organizationInvitations.status, 'pending'),
+        lt(organizationInvitations.expiresAt, new Date())
+      )
+    )
+    .returning({ id: organizationInvitations.id });
+
+  return deleted.length;
+}
+
+/**
  * Creates an invitation for a user to join an organization. `token` is the RAW, never-persisted
  * token; only its sha256 hash (D06) is written to the row. Cleans up any existing pending invitation
  * for the same email, and reaps this org's other expired pending invitations (D42), all in the same

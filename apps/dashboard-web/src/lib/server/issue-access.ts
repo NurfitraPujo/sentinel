@@ -65,6 +65,50 @@ export async function requireIssueAccess(
 		throw error(400, 'Issue project does not belong to an organization');
 	}
 
+	const { organizationId: orgId } = await requireProjectAccess(userId, projectId, permission, {
+		organizationId,
+	});
+
+	return { issueId: issueRows[0].issueId, projectId, organizationId: orgId };
+}
+
+/**
+ * The project-scoped half of `requireIssueAccess`, callable on its own when the caller has a
+ * projectId but no single issue id — the bulk endpoint
+ * (`api/projects/[projectId]/issues/batch`) being the case that matters.
+ *
+ * Extracted so the bulk and single-issue write paths cannot drift apart again. They previously
+ * disagreed in BOTH directions: the single-issue path had no role gate at all (D10), and once
+ * that was fixed the bulk path was left as the more permissive of the two (D23) because it checked
+ * only `organization_members` and never project membership — so a user in the org but not on the
+ * project could bulk-resolve that project's issues while being refused a single one.
+ *
+ * `knownOrganizationId` lets `requireIssueAccess` pass the org it already resolved via the issue
+ * join, avoiding a second lookup; omit it and the project's organization is fetched here.
+ */
+export async function requireProjectAccess(
+	userId: string,
+	projectId: string,
+	permission: IssuePermission,
+	opts?: { organizationId?: string }
+): Promise<{ projectId: string; organizationId: string }> {
+	let organizationId = opts?.organizationId;
+
+	if (!organizationId) {
+		const projectRows = await db
+			.select({ organizationId: projects.organizationId })
+			.from(projects)
+			.where(eq(projects.id, projectId));
+
+		if (projectRows.length === 0) {
+			throw error(404, 'Project not found');
+		}
+		if (!projectRows[0].organizationId) {
+			throw error(400, 'Project does not belong to an organization');
+		}
+		organizationId = projectRows[0].organizationId;
+	}
+
 	const orgMemberRows = await db
 		.select({ role: organizationMembers.role })
 		.from(organizationMembers)
@@ -79,20 +123,36 @@ export async function requireIssueAccess(
 		throw error(403, 'Forbidden: You do not have access to this organization');
 	}
 
-	if (permission === 'write' && !isIssueWriteRole(orgMemberRows[0].role)) {
-		throw error(403, 'Forbidden: Insufficient permissions to modify this issue');
+	const orgRole = orgMemberRows[0].role;
+	const orgRoleGrantsAccess = isIssueWriteRole(orgRole);
+
+	// An organization-level role IS an org-wide grant: owner/admin/engineer/support administer every
+	// project in their org and are not expected to also hold a `project_members` row for each one.
+	// Requiring both broke exactly that (tests/e2e U13: an org admin could not link two issues),
+	// because in practice `project_members` is populated only for per-project grants.
+	//
+	// Project membership is therefore the ALTERNATIVE path, not an additional hurdle — it is how a
+	// user whose org role does not itself grant issue access (`viewer`) gets access to the specific
+	// projects they were added to. This still closes D10: an org `viewer` with no project membership
+	// is refused, and cannot see or mutate a project they are not on.
+	if (!orgRoleGrantsAccess) {
+		const projectMemberRows = await db
+			.select({ role: projectMembers.role })
+			.from(projectMembers)
+			.where(and(eq(projectMembers.userId, userId), eq(projectMembers.projectId, projectId)));
+
+		if (projectMemberRows.length === 0) {
+			throw error(403, 'Forbidden: You do not have access to this project');
+		}
+
+		// A project grant conveys read only. Writing still requires an org role on the write
+		// allowlist, so the single-issue path can never be more permissive than the bulk one.
+		if (permission === 'write') {
+			throw error(403, 'Forbidden: Insufficient permissions to modify these issues');
+		}
 	}
 
-	const projectMemberRows = await db
-		.select({ role: projectMembers.role })
-		.from(projectMembers)
-		.where(and(eq(projectMembers.userId, userId), eq(projectMembers.projectId, projectId)));
-
-	if (projectMemberRows.length === 0) {
-		throw error(403, 'Forbidden: You do not have access to this project');
-	}
-
-	return { issueId: issueRows[0].issueId, projectId, organizationId };
+	return { projectId, organizationId };
 }
 
 /**

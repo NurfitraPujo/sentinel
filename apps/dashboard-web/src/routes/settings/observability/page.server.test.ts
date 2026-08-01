@@ -7,7 +7,7 @@ function locals(session: { email: string } | null) {
 // Import the concrete shared function, not the `PageServerLoad`-annotated `load`. The latter's
 // declared return type is `void | Record<string, any>`, so `result.observability` does not
 // typecheck against it. `load` is a one-line delegator to this.
-const { loadObservability } = await import('./+page.server');
+const { loadObservability } = await import('$lib/server/observability');
 const { load: layoutLoad } = await import('../+layout.server');
 
 describe('settings/observability +page.server.ts load (D05)', () => {

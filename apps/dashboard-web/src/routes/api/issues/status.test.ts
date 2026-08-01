@@ -128,11 +128,51 @@ describe('PATCH /api/issues/:id/status', () => {
 	);
 
 	// D10 item 2: org role alone is not enough — the caller must also be on the issue's project.
-	it('403s an org admin who is not a member of the issue project', async () => {
+	// This previously asserted that an org ADMIN with no `project_members` row was refused. That
+	// model was wrong and tests/e2e U13 proved it: an org admin could not link two issues in their
+	// own organization, because `project_members` is populated only for per-project grants, not for
+	// org-level staff. An org role on the write allowlist is itself an org-wide grant.
+	it('allows an org admin with no project_members row — an org role is an org-wide grant', async () => {
 		dbMock.then
 			.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
-			.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])) // org role
+			.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])); // org role, no project query
+
+		issueQueries.updateIssueStatus.mockResolvedValueOnce({ id: 'issue-1', status: 'resolved' });
+
+		await PATCH({
+			params: { issueId: 'issue-1' },
+			request: patchRequest({ status: 'resolved' }),
+			locals: locals({ id: 'user-1' }),
+		} as any);
+
+		expect(issueQueries.updateIssueStatus).toHaveBeenCalled();
+	});
+
+	// D10's actual hole, still closed: an org `viewer` gets no write access from the org role, and
+	// with no project membership either, is refused outright.
+	it('403s an org viewer with no project membership', async () => {
+		dbMock.then
+			.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
+			.mockImplementationOnce((resolve: any) => resolve([{ role: 'viewer' }])) // org role
 			.mockImplementationOnce((resolve: any) => resolve([])); // no project membership row
+
+		await expect(
+			PATCH({
+				params: { issueId: 'issue-1' },
+				request: patchRequest({ status: 'resolved' }),
+				locals: locals({ id: 'user-1' }),
+			} as any)
+		).rejects.toMatchObject({ status: 403 });
+		expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+	});
+
+	// A project grant conveys READ only — it must never become a backdoor to writing, or the
+	// single-issue path would again be more permissive than the bulk one (D23).
+	it('403s an org viewer who IS a project member — project grants do not convey write', async () => {
+		dbMock.then
+			.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
+			.mockImplementationOnce((resolve: any) => resolve([{ role: 'viewer' }])) // org role
+			.mockImplementationOnce((resolve: any) => resolve([{ role: 'developer' }])); // project member
 
 		await expect(
 			PATCH({

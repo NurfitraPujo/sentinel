@@ -1,5 +1,5 @@
 import type { PageServerLoad } from './$types';
-import { loadObservability } from '../../../settings/observability/+page.server';
+import { loadObservability } from '$lib/server/observability';
 
 /**
  * Org-scoped view of the same observability data as `/settings/observability`.

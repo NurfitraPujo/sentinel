@@ -7,11 +7,11 @@ import { organizationMembers, users } from '$lib/db/schema';
 import { eq, and, sql } from 'drizzle-orm';
 import { signIn } from '$lib/server/auth-config';
 
-// D06: kept in sync with the same-named constant in routes/invitations/[token]/+page.server.ts,
-// which is what sets this cookie. The raw token travels ONLY in that cookie (short-lived, HttpOnly)
-// and the /invitations/<token> path segment that produced it -- never in a query string, form field
-// trusted from the client, or OAuth redirectTo.
-const INVITE_TOKEN_COOKIE = 'sentinel_invite_token';
+// D06: the raw token travels ONLY in this cookie (short-lived, HttpOnly) and the
+// /invitations/<token> path segment that produced it -- never in a query string, a form field
+// trusted from the client, or an OAuth redirectTo. The name is shared with the route that SETS the
+// cookie rather than duplicated and kept in sync by comment.
+import { INVITE_TOKEN_COOKIE } from '$lib/server/invite-cookie';
 
 export const load: PageServerLoad = async ({ cookies, locals }) => {
 	const token = cookies.get(INVITE_TOKEN_COOKIE);

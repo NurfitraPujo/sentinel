@@ -1,9 +1,7 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { db } from '$lib/server/db';
-import { projects, organizationMembers } from '$lib/db/schema';
 import { batchUpdateIssues, MAX_BATCH_ISSUE_IDS } from '$lib/db/queries/issues';
-import { eq, and } from 'drizzle-orm';
+import { requireProjectAccess, validateResolvedInVersion } from '$lib/server/issue-access';
 
 export const POST: RequestHandler = async ({ request, params, locals }) => {
 	const session = await locals.auth();
@@ -14,29 +12,23 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 	const userId = session.user.id;
 	const { projectId } = params;
 
-	// Validate user has access to the project's org and correct role
-	const projectWithOrg = await db
-		.select({
-			projectId: projects.id,
-			orgId: projects.organizationId,
-			userRole: organizationMembers.role,
-		})
-		.from(projects)
-		.leftJoin(organizationMembers, eq(organizationMembers.organizationId, projects.organizationId))
-		.where(and(eq(projects.id, projectId), eq(organizationMembers.userId, userId)));
+	// D23: this used to check `organization_members` and a locally-declared role allowlist, with no
+	// project-membership check — leaving the BULK path more permissive than the single-issue one
+	// once D10 tightened that. A user in the org but not on the project could bulk-resolve the
+	// project's issues while being refused a single one. Both paths now share one implementation,
+	// so they cannot drift apart again; the role allowlist lives in ISSUE_WRITE_ROLES.
+	await requireProjectAccess(userId, projectId, 'write');
 
-	if (projectWithOrg.length === 0) {
-		throw error(403, 'Forbidden: You do not have access to this project');
-	}
+	// D40-class: a malformed body must 400, not surface as an unhandled 500.
+	const body = await request.json().catch(() => {
+		throw error(400, 'Invalid JSON body');
+	});
+	const { action, issueIds, assigneeType, assignedTo } = body;
 
-	const { userRole } = projectWithOrg[0];
-	const allowedRoles = ['owner', 'admin', 'engineer', 'support'];
-	if (!userRole || !allowedRoles.includes(userRole)) {
-		throw error(403, 'Forbidden: Insufficient permissions to perform bulk updates');
-	}
-
-	const body = await request.json();
-	const { action, issueIds, resolvedInVersion, assigneeType, assignedTo } = body;
+	// D23: resolvedInVersion reached the DB unvalidated here, so an oversized value 500'd on the
+	// varchar(100) constraint. The single-issue path already validated it; share the check.
+	// batchUpdateIssues takes `string | undefined`; the validator normalises omitted/blank to null.
+	const resolvedInVersion = validateResolvedInVersion(body.resolvedInVersion) ?? undefined;
 
 	if (!action || !issueIds || !Array.isArray(issueIds) || issueIds.length === 0) {
 		throw error(400, 'Invalid request body: action and non-empty issueIds array are required');

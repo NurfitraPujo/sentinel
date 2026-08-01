@@ -450,6 +450,52 @@ describe('Organization Member Management Routes', () => {
       expect(orgQueries.createOrganizationInvitation).not.toHaveBeenCalled();
     });
 
+    // Shared happy-path setup for the D41 delivery-reporting tests below.
+    async function postInvitation() {
+      dbMock.then
+        .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }]))
+        .mockImplementationOnce((resolve: any) => resolve([]))
+        .mockImplementationOnce((resolve: any) => resolve([{ name: 'Acme Corp' }]));
+
+      orgQueries.createOrganizationInvitation.mockResolvedValueOnce({
+        id: 'inv-1',
+        email: 'newuser@company.com',
+        role: 'engineer',
+        status: 'pending',
+        expiresAt: new Date('2026-01-01T00:00:00Z'),
+      });
+
+      return POST_INVITATION({
+        params: { orgId: 'org-1' },
+        request: new Request('http://x', {
+          method: 'POST',
+          body: JSON.stringify({ email: 'newuser@company.com', role: 'engineer' }),
+        }),
+        locals: locals({ id: 'user-caller' }),
+        url: new URL('http://localhost:5173'),
+      } as any);
+    }
+
+    // D41: a 201 used to be unconditional and the send was fire-and-forget with `.catch(() => {})`,
+    // so "created and emailed" was indistinguishable from "created, email silently failed". These
+    // fail if the endpoint goes back to swallowing the outcome.
+    it('reports delivered:false when the invitation email could not be sent', async () => {
+      sendInvitationEmailMock.mockResolvedValueOnce(false); // e.g. EMAIL_SERVER not configured
+      const res = await postInvitation();
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.delivered).toBe(false);
+      // The invitation itself still exists -- the copy-paste link remains usable.
+      expect(body.id).toBe('inv-1');
+    });
+
+    it('still 201s (not 500s) when the email transport throws, reporting delivered:false', async () => {
+      sendInvitationEmailMock.mockRejectedValueOnce(new Error('SMTP unreachable'));
+      const res = await postInvitation();
+      expect(res.status).toBe(201);
+      expect((await res.json()).delivered).toBe(false);
+    });
+
     it('201s and returns invitation object for valid request', async () => {
       dbMock.then
         .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }]))
@@ -485,6 +531,10 @@ describe('Organization Member Management Routes', () => {
       // so it can never contain tokenHash (or the raw token, which is never returned to a client at
       // all -- it only ever appears in the emailed URL).
       expect(body).toEqual({
+        // D41: the response now reports whether the email actually went out. The invitation row
+        // exists either way (the modal's copy-paste link works without email), but a 201 alone
+        // used to be indistinguishable from a silently-swallowed send failure.
+        delivered: true,
         id: 'inv-1',
         email: 'newuser@company.com',
         role: 'engineer',
