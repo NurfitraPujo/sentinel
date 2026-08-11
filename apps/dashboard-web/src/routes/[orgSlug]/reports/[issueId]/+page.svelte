@@ -3,12 +3,13 @@
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
 	import IssueTimeline from '$lib/components/issues/IssueTimeline.svelte';
 	import AttachmentList from '$lib/components/attachments/AttachmentList.svelte';
+	import CommentThread from '$lib/components/issues/CommentThread.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
-	let activeTab = $state<'linked' | 'activity'>('linked');
+	let activeTab = $state<'linked' | 'activity' | 'discussion'>('discussion');
 
 	let relationsForPanel = $derived(filterKnownRelationTypes(data.relations || []));
 
@@ -151,6 +152,9 @@
 	{/if}
 
 	<div class="tabs" role="tablist" aria-label="Report detail tabs">
+		<button type="button" class="tab-btn" class:active={activeTab === 'discussion'} onclick={() => (activeTab = 'discussion')}>
+			Discussion
+		</button>
 		<button type="button" class="tab-btn" class:active={activeTab === 'linked'} onclick={() => (activeTab = 'linked')}>
 			Linked issues
 		</button>
@@ -159,7 +163,14 @@
 		</button>
 	</div>
 
-	{#if activeTab === 'linked'}
+	{#if activeTab === 'discussion'}
+		<CommentThread
+			issueId={data.detail.issue.id}
+			organizationId={data.orgId}
+			currentUserId={data.userId}
+			currentUserRole={data.userRole}
+		/>
+	{:else if activeTab === 'linked'}
 		<IssueRelations currentIssueId={data.detail.issue.id} initialRelations={relationsForPanel} />
 	{:else}
 		<IssueTimeline activity={data.activity} />

@@ -130,6 +130,26 @@ export function canEditReport(role: string, reporterId: string, actorId: string)
 	return reporterId === actorId || isWriteRole(role);
 }
 
+/**
+ * M3 (comment-access.ts): the caller's org role, or null if they aren't a member at all. A
+ * standalone read (no throw) for callers that need to branch on the role itself (e.g. "is this
+ * an owner/admin, for the delete-others-comments carve-out") rather than get an allow/deny
+ * verdict the way `requireReportAccess` does.
+ */
+export async function getOrgRole(userId: string, organizationId: string): Promise<string | null> {
+	const rows = await db
+		.select({ role: organizationMembers.role })
+		.from(organizationMembers)
+		.where(
+			and(
+				eq(organizationMembers.userId, userId),
+				eq(organizationMembers.organizationId, organizationId)
+			)
+		);
+
+	return rows[0]?.role ?? null;
+}
+
 /** Reads the reporterId for an issue without pulling in the full report-detail query. */
 export async function getReporterId(issueId: string): Promise<string | null> {
 	const rows = await db

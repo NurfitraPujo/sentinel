@@ -3,6 +3,7 @@ import { error } from '@sveltejs/kit';
 import { checkProjectAccess } from '$lib/server/projects';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getIssueRelations } from '$lib/db/queries/issues';
+import { getOrgRole } from '$lib/server/report-access';
 
 // D03: this route previously had no loader at all, so `data` was undefined and the page fell
 // through to hardcoded mock data (currentIssueId = 'ISSUE-123'). Every mutation then carried a
@@ -33,10 +34,20 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
 	const relations = await getIssueRelations(issueId);
 
+	// Manual Issues M3 (design §5): the thread mounts here too -- "discussion on service issues is
+	// the deliberate by-product" -- so the loader needs organizationId (for uploads) and the
+	// caller's org role (for the thread's owner/admin delete-others rule), same shape as the
+	// reports detail loader.
+	const organizationId = project?.organizationId ?? null;
+	const userRole = organizationId ? await getOrgRole(session.user.id, organizationId) : null;
+
 	return {
 		issue,
 		project: project ?? null,
 		occurrences,
 		relations,
+		organizationId,
+		userId: session.user.id,
+		userRole,
 	};
 };

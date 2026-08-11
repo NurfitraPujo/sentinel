@@ -2,21 +2,21 @@ import { error, json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { issues, attachments } from '$lib/db/schema';
+import { issues, attachments, issueComments } from '$lib/db/schema';
 import { getAttachmentById } from '$lib/db/queries/reports';
 import { requireReportAccessForIssue } from '$lib/server/report-access';
 import { requireIssueAccess } from '$lib/server/issue-access';
 import { getObjectStream, deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
 
-// Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4). Streams the object from MinIO after
-// resolving access:
+// Manual Issues M2/M3 (docs/plans/MANUAL_ISSUES_DESIGN.md §4). Streams the object from MinIO
+// after resolving access:
 //   - Linked to an issue: read access to THAT issue, via whichever access helper matches its
 //     issue_type -- `user_report` issues go through `requireReportAccessForIssue` (§9's viewer
 //     carve-out), `system_error` issues go through the existing `requireIssueAccess` (D10/D17).
-//     (Comment-linked attachments (comment_id set) inherit the SAME rule via the comment's
-//     parent issue -- issue_comments has no separate access model of its own, and M3 has not
-//     shipped yet, so no comment-linked row can exist before that phase regardless.)
+//   - Linked to a comment (M3): resolves access via the comment's PARENT issue, same per-type
+//     dispatch as above -- issue_comments has no separate access model of its own (§5's threads
+//     are exactly as visible as the issue they're attached to).
 //   - Unlinked (still a draft): only the uploader may fetch it -- nobody else even knows the id
 //     exists yet, and it is not attached to anything a permission check could be based on.
 
@@ -53,11 +53,29 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 			await requireIssueAccess(userId, attachment.issueId, 'read');
 		}
 	} else if (attachment.commentId) {
-		// M3 (threads) has not shipped yet -- issue_comments is inert in this phase, so this
-		// branch cannot currently be reached, but is not dead: it fails closed rather than falling
-		// through to the "unlinked" branch below, which would wrongly restrict a legitimately
-		// comment-linked attachment to the uploader only once M3 lands and starts setting comment_id.
-		throw error(501, 'Comment-linked attachments are not supported yet');
+		const [commentRow] = await db
+			.select({ issueId: issueComments.issueId })
+			.from(issueComments)
+			.where(eq(issueComments.id, attachment.commentId));
+
+		if (!commentRow) {
+			throw error(404, 'Attachment not found');
+		}
+
+		const [issueRow] = await db
+			.select({ issueType: issues.issueType })
+			.from(issues)
+			.where(eq(issues.id, commentRow.issueId));
+
+		if (!issueRow) {
+			throw error(404, 'Attachment not found');
+		}
+
+		if (issueRow.issueType === 'user_report') {
+			await requireReportAccessForIssue(userId, commentRow.issueId, 'read');
+		} else {
+			await requireIssueAccess(userId, commentRow.issueId, 'read');
+		}
 	} else {
 		// Draft: not linked to anything. Only the uploader may fetch it.
 		if (attachment.uploaderType !== 'user' || attachment.uploaderId !== userId) {

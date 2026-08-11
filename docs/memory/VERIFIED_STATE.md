@@ -1580,7 +1580,26 @@ any new one-shot compose service must be added there or a legitimate `Exited (0)
 loads its browser build whose stream collector needs `Blob.prototype.arrayBuffer` (absent in jsdom) —
 the integration test swaps in Node's `Blob` before import; production is unaffected.
 
-Not yet built (by design, later phases): threads UI (M3 — the `issue_comments`
+### M3 threads VERIFIED 2026-08-11 (same branch)
+
+`queries/comments.ts` (createComment with reply-to-reply→root resolution, D18 single transaction,
+comment-attachment claiming, `commented` activity, Q11 groundwork: any USER comment clears
+`issues.waiting_on` + writes `question_answered`), `comment-access.ts` per-issue-type dispatch,
+`GET/POST /api/issues/[issueId]/comments` (`?after=` polling, DB-clock cutoff via `select now()` —
+app-clock vs DB-clock skew was a real bug caught while authoring the proof), `PATCH/DELETE` with
+author/moderator rules, the M2 501 flipped (comment-linked attachments resolve via parent issue),
+`CommentThread.svelte` (Slack-like, one-level replies, agent badge, visibility-paused ~10 s polling)
+mounted on BOTH report and service-issue detail pages, comment counts in the reports list. No new
+migration — `issue_comments` from 1722600000 went live.
+
+Proved by running, 2026-08-11: dashboard gates green (`pnpm build`; `check` 1673 files 0/0;
+`test --sequence.shuffle` 344 passed), db-migrations go test green, full-stack e2e **76 passed /
+0 skipped**, and `comments.threads.flow.integration.test.ts` (`M3_THREADS_INTEGRATION_REQUIRED=1`,
+real compose Postgres+MinIO): report → root comment w/ attachment (downloadable via flipped path) →
+reply → reply-to-reply same-parent → SQL-set `waiting_on` cleared by human comment +
+`question_answered` → after-filter exact → delete cascades replies + attachment row AND MinIO object.
+
+Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 
 ---

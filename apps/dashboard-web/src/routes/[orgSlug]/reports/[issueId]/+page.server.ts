@@ -56,6 +56,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		orgId: organizationId,
 		orgSlug,
 		userId,
+		userRole: role,
 		canWrite,
 		detail,
 		relations,

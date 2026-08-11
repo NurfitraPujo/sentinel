@@ -7,6 +7,7 @@ import {
 	projects,
 	users,
 	attachments,
+	issueComments,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 
@@ -181,6 +182,33 @@ export async function claimDraftAttachments(
 	uploaderId: string,
 	organizationId: string
 ): Promise<{ id: string }[]> {
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId);
+}
+
+/**
+ * Manual Issues M3 (design §5 groundwork, §4): the comment-attachment sibling of
+ * `claimDraftAttachments` -- same verification (still a draft, same org (B7), uploaded by the
+ * commenting author), just setting `comment_id` instead of `issue_id`. Both delegate to
+ * `claimDraftAttachmentsOnto` below so the verification logic cannot drift between the two call
+ * sites.
+ */
+export async function claimDraftAttachmentsForComment(
+	tx: any,
+	attachmentIds: string[],
+	commentId: string,
+	authorId: string,
+	organizationId: string
+): Promise<{ id: string }[]> {
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId);
+}
+
+async function claimDraftAttachmentsOnto(
+	tx: any,
+	attachmentIds: string[],
+	target: { issueId: string } | { commentId: string },
+	uploaderId: string,
+	organizationId: string
+): Promise<{ id: string }[]> {
 	if (attachmentIds.length === 0) {
 		return [];
 	}
@@ -212,7 +240,7 @@ export async function claimDraftAttachments(
 
 		const updated = await tx
 			.update(attachments)
-			.set({ issueId })
+			.set(target)
 			.where(
 				and(eq(attachments.id, attachmentId), isNull(attachments.issueId), isNull(attachments.commentId))
 			)
@@ -308,6 +336,10 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 			projectIsInbox: projects.isInbox,
 			reporterName: users.name,
 			reporterEmail: users.email,
+			// M3 (design §5/§10): the "Comments" column that rendered "–" in M1 -- a correlated
+			// scalar subquery rather than a join+group, since a join would fan the base row out
+			// once per comment and force an outer aggregation this query didn't otherwise need.
+			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
 		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
@@ -333,6 +365,8 @@ export async function getReportDetail(issueId: string) {
 			organizationId: projects.organizationId,
 			reporterName: users.name,
 			reporterEmail: users.email,
+			// M3: same "Comments" count surfacing as listReports above.
+			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
 		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))

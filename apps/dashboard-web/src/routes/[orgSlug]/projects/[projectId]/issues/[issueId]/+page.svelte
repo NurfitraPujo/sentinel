@@ -2,6 +2,7 @@
   import IssueStatusBadge from '$lib/components/issues/IssueStatusBadge.svelte';
   import IssueAssigneePicker from '$lib/components/issues/IssueAssigneePicker.svelte';
   import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
+  import CommentThread from '$lib/components/issues/CommentThread.svelte';
   import { filterKnownRelationTypes } from '$lib/types/relation-type';
   import type { PageData } from './$types';
 
@@ -131,5 +132,17 @@
         </div>
       </dl>
     </div>
+  </div>
+
+  <div class="mt-6 bg-white shadow overflow-hidden sm:rounded-lg px-4 py-5 sm:px-6">
+    <h3 class="text-lg leading-6 font-medium text-gray-900 mb-4">Discussion</h3>
+    {#if data.organizationId}
+      <CommentThread
+        issueId={issue.id}
+        organizationId={data.organizationId}
+        currentUserId={data.userId}
+        currentUserRole={data.userRole}
+      />
+    {/if}
   </div>
 </div>
