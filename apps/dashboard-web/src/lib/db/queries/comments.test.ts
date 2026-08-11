@@ -51,6 +51,9 @@ function makeTx() {
 				insertCalls.push({ table, values });
 				const obj: any = {
 					returning: vi.fn(() => Promise.resolve(insertReturningQueue.shift() ?? [])),
+					// subscribe() (queries/subscriptions.ts) upserts via onConflictDoNothing rather
+					// than a plain insert -- it never calls .returning().
+					onConflictDoNothing: vi.fn(() => Promise.resolve(undefined)),
 					then: (resolve: any) => resolve(undefined),
 				};
 				return obj;
@@ -94,6 +97,13 @@ vi.mock('$lib/db/schema', () => ({
 	},
 	users: { id: 'id', name: 'name', email: 'email' },
 	projects: { id: 'id', organizationId: 'organizationId' },
+	issueSubscriptions: {
+		id: 'id',
+		issueId: 'issueId',
+		subscriberType: 'subscriberType',
+		subscriberId: 'subscriberId',
+	},
+	notifications: { id: 'id', userId: 'userId', issueId: 'issueId', kind: 'kind', createdAt: 'createdAt' },
 }));
 
 const { createComment, listComments, getCommentById, editComment, deleteComment, CommentValidationError, CommentNotFoundError } =
@@ -115,7 +125,7 @@ describe('createComment', () => {
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
 
-		const result = await createComment({
+		const { comment: result } = await createComment({
 			issueId: 'issue-1',
 			authorType: 'user',
 			authorId: 'user-1',
@@ -123,8 +133,14 @@ describe('createComment', () => {
 		});
 
 		expect(result).toEqual({ id: 'comment-1', issueId: 'issue-1', parentId: null });
-		expect(txHandle.insertCalls).toHaveLength(2); // comment + activity, no waiting_on clear
+		// comment + commented activity + auto-subscribe (reason 'participant'), no waiting_on clear.
+		expect(txHandle.insertCalls).toHaveLength(3);
 		expect(txHandle.insertCalls[1].values).toMatchObject({ eventType: 'commented', actorType: 'user' });
+		expect(txHandle.insertCalls[2].values).toMatchObject({
+			subscriberType: 'user',
+			subscriberId: 'user-1',
+			reason: 'participant',
+		});
 		expect(txHandle.updateCalls).toHaveLength(0);
 	});
 
@@ -228,7 +244,8 @@ describe('createComment', () => {
 
 		expect(txHandle.updateCalls).toHaveLength(1);
 		expect(txHandle.updateCalls[0].set).toEqual({ waitingOn: null });
-		expect(txHandle.insertCalls).toHaveLength(3); // comment, commented activity, question_answered activity
+		// comment, commented activity, question_answered activity, auto-subscribe.
+		expect(txHandle.insertCalls).toHaveLength(4);
 		expect(txHandle.insertCalls[2].values).toMatchObject({
 			eventType: 'question_answered',
 			oldValue: { waitingOn: 'reporter' },

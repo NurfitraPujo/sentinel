@@ -10,6 +10,8 @@ import {
 	issueComments,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
+import { subscribe } from '$lib/db/queries/subscriptions';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 
 /**
  * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
@@ -138,6 +140,13 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 			actorId: input.reporterId,
 			newValue: { action: 'created', title, severity: input.severity, projectId },
 		});
+
+		// §8 auto-subscribe: the reporter is subscribed to their own report. No fan-out here --
+		// nobody else is subscribed to a brand-new issue yet, so notifyIssueEvent would be a no-op.
+		await subscribe(
+			{ issueId: issue.id, subscriberType: 'user', subscriberId: input.reporterId, reason: 'reporter' },
+			tx
+		);
 
 		// §4/§4 linking step: claim any DRAFT attachments onto the new issue, in the SAME
 		// transaction as creation. Folds into the creation activity above rather than writing a
@@ -380,6 +389,12 @@ export async function getReportDetail(issueId: string) {
 /**
  * §2/§10 write-role "move to project" action: re-homes a manual issue and logs a `moved`
  * activity entry with old/new project ids. D18: throw, don't return, on a bad target.
+ *
+ * §8 M4 scope note: deliberately NO notifyIssueEvent call here. `notifications.kind`'s CHECK
+ * constraint only allows the catalog in the design doc (commented|claimed|status_changed|
+ * resolved|linked|progress_update|question_asked) -- 'moved' is not among them, and folding a
+ * move under 'status_changed' would be semantically wrong (nothing about the issue's status
+ * changed). A move gets no notification in v1; revisit if/when the CHECK grows a 'moved' kind.
  */
 export async function moveIssueToProject(
 	issueId: string,
@@ -438,7 +453,7 @@ export async function claimIssue(
 	issueId: string,
 	actorType: 'user' | 'agent',
 	actorId: string
-) {
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const updated = await tx
 			.update(issues)
@@ -458,7 +473,22 @@ export async function claimIssue(
 			newValue: { assigneeType: actorType, assignedTo: actorId },
 		});
 
-		return updated[0];
+		// §7/§8: the claimant is auto-subscribed (reason 'claimant'), USER claims only -- agent
+		// subscribers get no notifications row in M4 (design §8), so subscribing an agent claimant
+		// here would only ever grow issue_subscriptions with rows notifyIssueEvent will always skip.
+		if (actorType === 'user') {
+			await subscribe({ issueId, subscriberType: 'user', subscriberId: actorId, reason: 'claimant' }, tx);
+		}
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId,
+			kind: 'claimed',
+			actorType,
+			actorId,
+			payload: { assigneeType: actorType, assignedTo: actorId },
+		});
+
+		return { issue: updated[0], notified };
 	});
 }
 
@@ -474,7 +504,7 @@ export async function releaseClaim(
 	issueId: string,
 	actorId: string,
 	options: { force?: boolean } = {}
-) {
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const whereClause = options.force
 			? eq(issues.id, issueId)
@@ -498,7 +528,18 @@ export async function releaseClaim(
 			newValue: { force: Boolean(options.force) },
 		});
 
-		return updated[0];
+		// §8: 'claim_released' is not in notifications.kind's CHECK -- reuse 'claimed' with a
+		// `released: true` payload flag (per the M4 task's instruction), rather than the
+		// activity-timeline eventType.
+		const notified = await notifyIssueEvent(tx, {
+			issueId,
+			kind: 'claimed',
+			actorType: 'user',
+			actorId,
+			payload: { released: true, force: Boolean(options.force) },
+		});
+
+		return { issue: updated[0], notified };
 	});
 }
 

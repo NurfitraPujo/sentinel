@@ -71,6 +71,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved' }),
 				locals: locals(null),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 401 });
 	});
@@ -81,6 +82,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'bogus' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 	});
@@ -97,6 +99,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 403 });
 		expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
@@ -114,6 +117,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any);
 
 			expect(res.status).toBe(200);
@@ -137,12 +141,13 @@ describe('PATCH /api/issues/:id/status', () => {
 			.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
 			.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])); // org role, no project query
 
-		issueQueries.updateIssueStatus.mockResolvedValueOnce({ id: 'issue-1', status: 'resolved' });
+		issueQueries.updateIssueStatus.mockResolvedValueOnce([]);
 
 		await PATCH({
 			params: { issueId: 'issue-1' },
 			request: patchRequest({ status: 'resolved' }),
 			locals: locals({ id: 'user-1' }),
+			url: new URL('http://x'),
 		} as any);
 
 		expect(issueQueries.updateIssueStatus).toHaveBeenCalled();
@@ -161,6 +166,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 403 });
 		expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
@@ -179,6 +185,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 403 });
 		expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
@@ -192,6 +199,7 @@ describe('PATCH /api/issues/:id/status', () => {
 				params: { issueId: 'issue-1' },
 				request: patchRequest({ status: 'resolved', resolvedInVersion: 'v'.repeat(101) }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 		expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
@@ -207,6 +215,7 @@ describe('PATCH /api/issues/:id/status', () => {
 			params: { issueId: 'issue-1' },
 			request: patchRequest({ status: 'resolved', resolvedInVersion: 'v'.repeat(100) }),
 			locals: locals({ id: 'user-1' }),
+			url: new URL('http://x'),
 		} as any);
 
 		expect(res.status).toBe(200);

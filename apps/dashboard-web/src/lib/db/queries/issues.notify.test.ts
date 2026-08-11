@@ -1,0 +1,151 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+/**
+ * Manual Issues M4 (docs/plans/MANUAL_ISSUES_DESIGN.md §8) -- co-located, shuffle-safe unit
+ * tests for the auto-subscribe + notify.ts fan-out wiring added to queries/issues.ts
+ * (updateIssueStatus, assignIssue, createIssueRelation). Kept in its own file rather than folded
+ * into issues.test.ts's batchUpdateIssues-focused chainable mock, since this needs the
+ * subscriptions/notifications schema tokens and the `tx.select` chain notify.ts's
+ * `listSubscribers` relies on -- issues.test.ts's double doesn't need either.
+ */
+
+function makeChainable() {
+	const m: any = {};
+	const methods = [
+		'select',
+		'from',
+		'innerJoin',
+		'leftJoin',
+		'where',
+		'orderBy',
+		'insert',
+		'values',
+		'returning',
+		'update',
+		'set',
+		'delete',
+		'onConflictDoNothing',
+	];
+	for (const name of methods) {
+		m[name] = vi.fn(() => m);
+	}
+	m.__result = [];
+	m.then = vi.fn((resolve: any) => resolve(m.__result));
+	return m;
+}
+
+const txMock = makeChainable();
+const dbMock: any = makeChainable();
+dbMock.transaction = vi.fn(async (cb: any) => cb(txMock));
+
+vi.mock('$lib/server/db', () => ({ db: dbMock }));
+
+vi.mock('$lib/db/schema', () => ({
+	issues: { id: 'id', projectId: 'projectId', status: 'status', assignedTo: 'assignedTo' },
+	issueActivity: { id: 'id', issueId: 'issueId' },
+	issueRelations: {
+		id: 'id',
+		sourceIssueId: 'sourceIssueId',
+		targetIssueId: 'targetIssueId',
+		relationType: 'relationType',
+	},
+	projects: { id: 'id', organizationId: 'organizationId' },
+	issueSubscriptions: {
+		id: 'id',
+		issueId: 'issueId',
+		subscriberType: 'subscriberType',
+		subscriberId: 'subscriberId',
+	},
+	notifications: { id: 'id', userId: 'userId', issueId: 'issueId', kind: 'kind', createdAt: 'createdAt' },
+}));
+
+const { updateIssueStatus, assignIssue, createIssueRelation } = await import('./issues');
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	txMock.__result = [];
+	txMock.then = vi.fn((resolve: any) => resolve([]));
+});
+
+describe('updateIssueStatus', () => {
+	it('fans out kind "resolved" (not "status_changed") when the new status is resolved, excluding the actor', async () => {
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([
+				{ subscriberType: 'user', subscriberId: 'reporter-1' },
+				{ subscriberType: 'user', subscriberId: 'actor-1' },
+			])
+		);
+
+		const notified = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'user', 'actor-1');
+
+		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'resolved' }]);
+	});
+
+	it('fans out kind "status_changed" for a non-resolved transition', async () => {
+		txMock.then = vi.fn((resolve: any) => resolve([{ subscriberType: 'user', subscriberId: 'reporter-1' }]));
+
+		const notified = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
+
+		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'status_changed' }]);
+	});
+
+	it('excludes agent subscribers from the notified list (they poll, no notifications row in M4)', async () => {
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([
+				{ subscriberType: 'agent', subscriberId: 'agent-1' },
+				{ subscriberType: 'user', subscriberId: 'user-1' },
+			])
+		);
+
+		const notified = await updateIssueStatus('issue-1', 'unresolved', undefined, 'agent', 'agent-2');
+
+		expect(notified).toEqual([{ userId: 'user-1', kind: 'status_changed' }]);
+	});
+});
+
+describe('assignIssue', () => {
+	it('auto-subscribes a USER assignee with reason "claimant"', async () => {
+		await assignIssue('issue-1', 'user', 'user-2', 'user', 'admin-1');
+
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ subscriberId: 'user-2', reason: 'claimant' })
+		);
+	});
+
+	it('does not auto-subscribe an AGENT assignee', async () => {
+		await assignIssue('issue-1', 'agent', 'agent-1', 'user', 'admin-1');
+
+		const subscribeCalls = (txMock.values as any).mock.calls.filter(
+			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
+		);
+		expect(subscribeCalls).toHaveLength(0);
+	});
+
+	it('does not auto-subscribe on unassign (assignedTo null)', async () => {
+		await assignIssue('issue-1', null, null, 'user', 'admin-1');
+
+		const subscribeCalls = (txMock.values as any).mock.calls.filter(
+			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
+		);
+		expect(subscribeCalls).toHaveLength(0);
+	});
+});
+
+describe('createIssueRelation', () => {
+	it('fans out kind "linked" scoped to the source issue, excluding the actor', async () => {
+		txMock.returning = vi.fn(() =>
+			Promise.resolve([{ id: 'rel-1', sourceIssueId: 'issue-1', targetIssueId: 'issue-2' }])
+		);
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([
+				{ subscriberType: 'user', subscriberId: 'watcher-1' },
+				{ subscriberType: 'user', subscriberId: 'actor-1' },
+			])
+		);
+
+		const { relation, notified } = await createIssueRelation('issue-1', 'issue-2', 'linked_to', 'user', 'actor-1');
+
+		expect(relation).toEqual({ id: 'rel-1', sourceIssueId: 'issue-1', targetIssueId: 'issue-2' });
+		expect(notified).toEqual([{ userId: 'watcher-1', kind: 'linked' }]);
+	});
+});

@@ -4,6 +4,8 @@ import { eq, inArray } from 'drizzle-orm';
 import { claimDraftAttachmentsForComment } from './reports';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
+import { subscribe } from '$lib/db/queries/subscriptions';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 
 /**
  * Manual Issues M3 (docs/plans/MANUAL_ISSUES_DESIGN.md §5, plus the comment-attachment paths
@@ -40,7 +42,9 @@ export interface CreateCommentInput {
  * and writes a `question_answered` activity row. All in one transaction (D18: throw, never
  * return early, so a bad parent or a failed insert rolls back everything together).
  */
-export async function createComment(input: CreateCommentInput) {
+export async function createComment(
+	input: CreateCommentInput
+): Promise<{ comment: typeof issueComments.$inferSelect; notified: NotifiedUser[] }> {
 	const bodyMd = input.bodyMd.trim();
 	if (bodyMd.length === 0) {
 		throw new CommentValidationError('bodyMd must not be empty');
@@ -142,7 +146,31 @@ export async function createComment(input: CreateCommentInput) {
 			});
 		}
 
-		return comment;
+		// §8 auto-subscribe: any USER commenter is subscribed (reason 'participant') -- including a
+		// commenter who is already subscribed for another reason (reporter/claimant), since
+		// subscribe() is an idempotent upsert that leaves an existing row's reason untouched. Agent
+		// commenters are not subscribed -- they poll (design §8), same as every other agent path in
+		// M4.
+		if (input.authorType === 'user') {
+			await subscribe(
+				{ issueId: input.issueId, subscriberType: 'user', subscriberId: input.authorId, reason: 'participant' },
+				tx
+			);
+		}
+
+		// §8/M4 scope note: M3's comment insert above never reads a `blocking` flag from `input` --
+		// there is no such field on `CreateCommentInput` yet (the agent `POST .../questions`
+		// endpoint that would set it is M5). So this always fans out kind 'commented', never
+		// 'question_asked' -- M5 will thread a blocking flag through to pick the latter.
+		const notified = await notifyIssueEvent(tx, {
+			issueId: input.issueId,
+			kind: 'commented',
+			actorType: input.authorType,
+			actorId: input.authorId,
+			payload: { commentId: comment.id, parentId: resolvedParentId },
+		});
+
+		return { comment, notified };
 	});
 }
 

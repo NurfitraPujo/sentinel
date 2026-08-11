@@ -3,6 +3,7 @@
   import IssueAssigneePicker from '$lib/components/issues/IssueAssigneePicker.svelte';
   import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
   import CommentThread from '$lib/components/issues/CommentThread.svelte';
+  import SubscriptionToggle from '$lib/components/notifications/SubscriptionToggle.svelte';
   import { filterKnownRelationTypes } from '$lib/types/relation-type';
   import type { PageData } from './$types';
 
@@ -87,6 +88,7 @@
       <div class="flex items-center space-x-4">
         <IssueStatusBadge status={statusForBadge} />
         <IssueAssigneePicker assignee={assigneeForPicker} />
+        <SubscriptionToggle issueId={issue.id} />
       </div>
     </div>
     <div class="border-t border-gray-200 px-4 py-5 sm:p-0">

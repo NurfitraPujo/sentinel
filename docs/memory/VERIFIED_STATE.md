@@ -1599,6 +1599,27 @@ real compose Postgres+MinIO): report → root comment w/ attachment (downloadabl
 reply → reply-to-reply same-parent → SQL-set `waiting_on` cleared by human comment +
 `question_answered` → after-filter exact → delete cascades replies + attachment row AND MinIO object.
 
+### M4 notifications VERIFIED 2026-08-11 (same branch)
+
+Migration `1722800000` (issue_subscriptions + notifications, replayed + down/up on disposable
+Postgres, drift test 25/25 under `SCHEMA_DRIFT_REQUIRED=1`), `notify.ts` fan-out called INSIDE the
+existing mutation transactions (D18) with actor exclusion and agent-subscriber skip, auto-subscribe
+on create(reporter)/claim(claimant)/comment(participant)/assign, Q7 email policy via
+`sendIssueNotificationEmail` (15-min per-(user,issue) throttle implemented as a query over emailed
+notification attempts — no extra log table; `question_asked` bypasses per Q11; `linked`/
+`progress_update` never email), `GET/PATCH /api/notifications`, subscription toggle API + UI on both
+detail pages, NotificationBell with visibility-aware polling (extracted shared `visible-poll.ts`),
+`/[orgSlug]/notifications` page. Design deviations, documented in code: claim-release reuses kind
+`claimed` with `payload.released` (no `claim_released` in the CHECK) and move sends no notification
+(no `moved` kind) — revisit in M5+ if needed.
+
+Proved by running, 2026-08-11: dashboard gates green (390 tests shuffled, check 1695 files 0/0,
+build), db-migrations go test green, full-stack e2e **76 passed / 0 skipped** (12 containers), and
+`notifications.flow.integration.test.ts` (`M4_NOTIFICATIONS_INTEGRATION_REQUIRED=1`, real compose
+Postgres): auto-subscribe → claimed notification with no self-notify → commented → mark-read drops
+unread by exactly 1 → resolved → unsubscribe silences further events; email composition proven over
+the `smtp://debug` jsonTransport path.
+
 Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 

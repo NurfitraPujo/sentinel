@@ -100,6 +100,7 @@ describe('POST /api/issues/:id/relations', () => {
 				params: { issueId: 'issue-1' },
 				request: malformedRequest(),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 		expect(issueQueries.createIssueRelation).not.toHaveBeenCalled();
@@ -112,6 +113,7 @@ describe('POST /api/issues/:id/relations', () => {
 				params: { issueId: 'issue-1' },
 				request: postRequest({ targetIssueId: 'issue-1', relationType: 'duplicate_of' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 		expect(issueQueries.createIssueRelation).not.toHaveBeenCalled();
@@ -135,6 +137,7 @@ describe('POST /api/issues/:id/relations', () => {
 				params: { issueId: 'issue-1' },
 				request: postRequest({ targetIssueId: 'issue-2', relationType: 'duplicate_of' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 409 });
 	});
@@ -154,6 +157,7 @@ describe('POST /api/issues/:id/relations', () => {
 				params: { issueId: 'issue-2' },
 				request: postRequest({ targetIssueId: 'issue-1', relationType: 'duplicate_of' }),
 				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 		expect(issueQueries.createIssueRelation).not.toHaveBeenCalled();
@@ -165,12 +169,13 @@ describe('POST /api/issues/:id/relations', () => {
 		dbMock.then
 			.mockImplementationOnce((resolve: any) => resolve([sourceRow]))
 			.mockImplementationOnce((resolve: any) => resolve([targetRow]));
-		issueQueries.createIssueRelation.mockResolvedValueOnce({ id: 'rel-1' });
+		issueQueries.createIssueRelation.mockResolvedValueOnce({ relation: { id: 'rel-1' }, notified: [] });
 
 		await POST({
 			params: { issueId: 'issue-1' },
 			request: postRequest({ targetIssueId: 'issue-2', relationType: 'linked_to' }),
 			locals: locals({ id: 'user-1' }),
+			url: new URL('http://x'),
 		} as any);
 
 		expect(issueAccess.requireIssueAccess).toHaveBeenCalledWith('user-1', 'issue-1', 'write');
@@ -191,6 +196,7 @@ describe('POST /api/issues/:id/relations', () => {
 				params: { issueId: 'issue-1' },
 				request: postRequest({ targetIssueId: 'issue-2', relationType: 'duplicate_of' }),
 				locals: locals({ id: 'viewer-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 403 });
 		expect(issueQueries.createIssueRelation).not.toHaveBeenCalled();
@@ -226,6 +232,7 @@ describe('DELETE /api/issues/:id/relations (D10)', () => {
 			params: { issueId: 'issue-1' },
 			request: postRequest({ targetIssueId: 'issue-2', relationType: 'linked_to' }),
 			locals: locals({ id: 'user-1' }),
+			url: new URL('http://x'),
 		} as any);
 
 		expect(issueAccess.requireIssueAccess).toHaveBeenCalledWith('user-1', 'issue-1', 'write');
@@ -244,6 +251,7 @@ describe('DELETE /api/issues/:id/relations (D10)', () => {
 				params: { issueId: 'issue-1' },
 				request: postRequest({ targetIssueId: 'issue-2', relationType: 'linked_to' }),
 				locals: locals({ id: 'viewer-1' }),
+				url: new URL('http://x'),
 			} as any)
 		).rejects.toMatchObject({ status: 403 });
 		expect(issueQueries.deleteIssueRelation).not.toHaveBeenCalled();

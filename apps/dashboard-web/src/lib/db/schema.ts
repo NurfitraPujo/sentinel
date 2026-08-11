@@ -179,6 +179,37 @@ export const attachments = pgTable('attachments', {
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Manual Issues M4 (design §8): matches
+// 1722800000_add_notifications_and_subscriptions.sql. subscriberId is NOT an FK -- it names a
+// user or an agent depending on subscriberType, exactly like issueComments' authorType/authorId
+// pair. UNIQUE(issueId, subscriberType, subscriberId) backs the idempotent upsert in
+// queries/subscriptions.ts.
+export const issueSubscriptions = pgTable('issue_subscriptions', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	subscriberType: varchar('subscriber_type', { length: 20 }).notNull(), // 'user' | 'agent'
+	subscriberId: varchar('subscriber_id', { length: 255 }).notNull(),
+	reason: varchar('reason', { length: 20 }).notNull(), // 'reporter' | 'claimant' | 'participant' | 'manual'
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Manual Issues M4 (design §8): matches 1722800000_add_notifications_and_subscriptions.sql.
+// userId IS a real FK ("user".id) -- unlike issueSubscriptions, a notifications row is always a
+// user's inbox entry in M4 (agent subscribers get no row -- they poll, see notify.ts). kind CHECK
+// allows 'commented'|'claimed'|'status_changed'|'resolved'|'linked'|'progress_update'|
+// 'question_asked'. actorType CHECK allows 'user'|'agent'|'system'.
+export const notifications = pgTable('notifications', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	kind: varchar('kind', { length: 30 }).notNull(),
+	actorType: varchar('actor_type', { length: 20 }).notNull(),
+	actorId: varchar('actor_id', { length: 255 }).notNull(),
+	payload: jsonb('payload'),
+	readAt: timestamp('read_at', { withTimezone: true }),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const errorOccurrences = pgTable('error_occurrences', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	issueId: uuid('issue_id').notNull().references(() => issues.id),

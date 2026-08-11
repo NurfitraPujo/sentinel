@@ -3,6 +3,8 @@ import { issues, issueActivity, issueRelations, projects } from '$lib/db/schema'
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
 import type { RelationType } from '$lib/types/relation-type';
+import { subscribe } from '$lib/db/queries/subscriptions';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 
 // Robust semver comparison helper with fallback
 function isRegression(releaseVersion: string, resolvedInVersion: string): boolean {
@@ -33,7 +35,7 @@ export async function updateIssueStatus(
 	resolvedInVersion?: string,
 	actorType?: 'user' | 'agent',
 	actorId?: string
-) {
+): Promise<NotifiedUser[]> {
 	return await db.transaction(async (tx) => {
 		const [existing] = await tx.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
 
@@ -63,6 +65,17 @@ export async function updateIssueStatus(
 			actorId: actorId || 'system',
 			oldValue: existing ? { status: existing.status } : null,
 			newValue: { status, resolvedInVersion },
+		});
+
+		// §8: 'resolved' gets its own notification kind (design's email-policy table lists it
+		// separately from 'status_changed'); every other status transition (including back to
+		// 'unresolved'/'ignored') is 'status_changed'.
+		return await notifyIssueEvent(tx, {
+			issueId,
+			kind: status === 'resolved' ? 'resolved' : 'status_changed',
+			actorType: actorType || 'system',
+			actorId: actorId || 'system',
+			payload: { status, resolvedInVersion },
 		});
 	});
 }
@@ -195,6 +208,14 @@ export async function assignIssue(
 			actorId,
 			newValue: { assigneeType, assignedTo },
 		});
+
+		// §8 auto-subscribe: an assignee is treated like a claimant (reason 'claimant'). USER
+		// assignees only -- agents get no notifications row in M4, so subscribing one here would
+		// only grow issue_subscriptions with a row notifyIssueEvent always skips. No fan-out call:
+		// design's fan-out wiring list does not include assignIssue (only auto-subscribe).
+		if (assignedTo && assigneeType === 'user') {
+			await subscribe({ issueId, subscriberType: 'user', subscriberId: assignedTo, reason: 'claimant' }, tx);
+		}
 	});
 }
 
@@ -204,7 +225,7 @@ export async function createIssueRelation(
 	relationType: RelationType,
 	createdByType: 'user' | 'agent' | 'system',
 	createdBy: string
-) {
+): Promise<{ relation: typeof issueRelations.$inferSelect; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const [relation] = await tx.insert(issueRelations).values({
 			sourceIssueId,
@@ -222,7 +243,19 @@ export async function createIssueRelation(
 			newValue: { targetIssueId, relationType },
 		});
 
-		return relation;
+		// §8: 'linked' fan-out is scoped to the SOURCE issue's subscribers only -- the target
+		// issue's own subscribers already see the link via its own activity/comment feed once
+		// something references it; this notification is specifically "something changed on an
+		// issue you're subscribed to", not "your issue got mentioned elsewhere".
+		const notified = await notifyIssueEvent(tx, {
+			issueId: sourceIssueId,
+			kind: 'linked',
+			actorType: createdByType,
+			actorId: createdBy,
+			payload: { targetIssueId, relationType },
+		});
+
+		return { relation, notified };
 	});
 }
 

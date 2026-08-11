@@ -1,6 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import type { LayoutData } from './$types';
+	import NotificationBell from '$lib/components/notifications/NotificationBell.svelte';
 
 	let { data, children } = $props();
 </script>
@@ -24,6 +25,7 @@
 			</nav>
 			<div class="user-menu">
 				{#if data.session}
+					<NotificationBell />
 					<span class="user-email">{data.session.user?.email}</span>
 					<form action="/auth/signout" method="post">
 						<button type="submit" class="btn-signout">Sign Out</button>

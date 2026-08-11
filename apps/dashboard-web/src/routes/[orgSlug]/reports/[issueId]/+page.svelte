@@ -4,6 +4,7 @@
 	import IssueTimeline from '$lib/components/issues/IssueTimeline.svelte';
 	import AttachmentList from '$lib/components/attachments/AttachmentList.svelte';
 	import CommentThread from '$lib/components/issues/CommentThread.svelte';
+	import SubscriptionToggle from '$lib/components/notifications/SubscriptionToggle.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
@@ -96,6 +97,7 @@
 			{#if data.detail.issue.waitingOn}
 				<span class="waiting-badge">waiting on {data.detail.issue.waitingOn}</span>
 			{/if}
+			<SubscriptionToggle issueId={data.detail.issue.id} />
 		</div>
 	</div>
 

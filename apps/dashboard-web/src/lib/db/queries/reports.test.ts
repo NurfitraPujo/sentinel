@@ -19,6 +19,7 @@ function makeChainable() {
 		'update',
 		'set',
 		'delete',
+		'onConflictDoNothing',
 	];
 	for (const name of methods) {
 		m[name] = vi.fn(() => m);
@@ -40,6 +41,19 @@ vi.mock('$lib/db/schema', () => ({
 	manualIssueReports: { issueId: 'issueId', reporterId: 'reporterId' },
 	projects: { id: 'id', organizationId: 'organizationId', isInbox: 'isInbox', name: 'name' },
 	users: { id: 'id', name: 'name', email: 'email' },
+	issueSubscriptions: {
+		id: 'id',
+		issueId: 'issueId',
+		subscriberType: 'subscriberType',
+		subscriberId: 'subscriberId',
+	},
+	notifications: {
+		id: 'id',
+		userId: 'userId',
+		issueId: 'issueId',
+		kind: 'kind',
+		createdAt: 'createdAt',
+	},
 }));
 
 vi.mock('./issues', () => ({
@@ -53,11 +67,15 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	txMock.__result = [];
 	dbMock.__result = [];
+	// listSubscribers (called from inside notifyIssueEvent) runs a plain select against tx that
+	// resolves via txMock.then -- default it to "no subscribers" so claim/release tests don't have
+	// to think about fan-out unless they're the ones testing it.
+	txMock.then = vi.fn((resolve: any) => resolve([]));
 });
 
 describe('createManualIssue', () => {
-	it('creates the issues row, the manual_issue_reports companion, and one activity row inside a single transaction', async () => {
-		// The three inserts below run in sequence against tx; queue each RETURNING result in order.
+	it('creates the issues row, the manual_issue_reports companion, one activity row, and auto-subscribes the reporter, inside a single transaction', async () => {
+		// The inserts below run in sequence against tx; queue each RETURNING result in order.
 		let call = 0;
 		txMock.returning = vi.fn(() => {
 			call += 1;
@@ -78,8 +96,20 @@ describe('createManualIssue', () => {
 		expect(dbMock.transaction).toHaveBeenCalledTimes(1);
 		expect(result.issue).toEqual({ id: 'issue-1', projectId: 'project-1' });
 		expect(result.report).toEqual({ issueId: 'issue-1', reporterId: 'user-1' });
-		// insert called 3 times: issues, manual_issue_reports, issue_activity.
-		expect(txMock.insert).toHaveBeenCalledTimes(3);
+		// insert called 4 times: issues, manual_issue_reports, issue_activity, issue_subscriptions
+		// (the reporter auto-subscribe).
+		expect(txMock.insert).toHaveBeenCalledTimes(4);
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({
+				issueId: 'issue-1',
+				subscriberType: 'user',
+				subscriberId: 'user-1',
+				reason: 'reporter',
+			})
+		);
+		// Idempotent upsert: subscribe() always goes through onConflictDoNothing, never a plain
+		// insert that would 23505 on a re-subscribe.
+		expect(txMock.onConflictDoNothing).toHaveBeenCalled();
 	});
 
 	it('rejects an empty title before opening a transaction', async () => {
@@ -114,18 +144,48 @@ describe('claimIssue', () => {
 		expect(txMock.insert).not.toHaveBeenCalled();
 	});
 
-	it('succeeds and writes exactly one "claimed" activity row when the UPDATE matches', async () => {
+	it('succeeds, writes one "claimed" activity row, auto-subscribes the claimant, and fans out to other subscribers, excluding the actor', async () => {
 		txMock.returning = vi.fn(() =>
 			Promise.resolve([{ id: 'issue-1', assigneeType: 'user', assignedTo: 'user-1' }])
 		);
+		// listSubscribers returns two USER subscribers: the reporter ('user-2', notified) and the
+		// claimant themselves ('user-1', excluded as the actor).
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([
+				{ subscriberType: 'user', subscriberId: 'user-2' },
+				{ subscriberType: 'user', subscriberId: 'user-1' },
+			])
+		);
 
-		const result = await claimIssue('issue-1', 'user', 'user-1');
+		const { issue, notified } = await claimIssue('issue-1', 'user', 'user-1');
 
-		expect(result).toEqual({ id: 'issue-1', assigneeType: 'user', assignedTo: 'user-1' });
-		expect(txMock.insert).toHaveBeenCalledTimes(1);
+		expect(issue).toEqual({ id: 'issue-1', assigneeType: 'user', assignedTo: 'user-1' });
 		expect(txMock.values).toHaveBeenCalledWith(
 			expect.objectContaining({ eventType: 'claimed', actorType: 'user', actorId: 'user-1' })
 		);
+		// Auto-subscribe (reason 'claimant').
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ subscriberId: 'user-1', reason: 'claimant' })
+		);
+		// notifyIssueEvent excludes the actor: only user-2 is notified, never user-1.
+		expect(notified).toEqual([{ userId: 'user-2', kind: 'claimed' }]);
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.arrayContaining([expect.objectContaining({ userId: 'user-2', kind: 'claimed' })])
+		);
+	});
+
+	it('does not auto-subscribe an agent claimant (agents get no notifications row in M4)', async () => {
+		txMock.returning = vi.fn(() =>
+			Promise.resolve([{ id: 'issue-1', assigneeType: 'agent', assignedTo: 'agent-1' }])
+		);
+		txMock.then = vi.fn((resolve: any) => resolve([]));
+
+		await claimIssue('issue-1', 'agent', 'agent-1');
+
+		const subscribeCalls = (txMock.values as any).mock.calls.filter(
+			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
+		);
+		expect(subscribeCalls).toHaveLength(0);
 	});
 });
 
@@ -136,14 +196,21 @@ describe('releaseClaim', () => {
 		await expect(releaseClaim('issue-1', 'user-2')).rejects.toBeInstanceOf(ClaimConflictError);
 	});
 
-	it('force release succeeds and writes a claim_released activity row', async () => {
+	it('force release succeeds, writes a claim_released activity row, and fans out a "claimed" notification with released:true', async () => {
 		txMock.returning = vi.fn(() => Promise.resolve([{ id: 'issue-1', assignedTo: null }]));
+		txMock.then = vi.fn((resolve: any) => resolve([{ subscriberType: 'user', subscriberId: 'user-2' }]));
 
-		const result = await releaseClaim('issue-1', 'admin-1', { force: true });
+		const { issue, notified } = await releaseClaim('issue-1', 'admin-1', { force: true });
 
-		expect(result).toEqual({ id: 'issue-1', assignedTo: null });
+		expect(issue).toEqual({ id: 'issue-1', assignedTo: null });
 		expect(txMock.values).toHaveBeenCalledWith(
 			expect.objectContaining({ eventType: 'claim_released', newValue: { force: true } })
+		);
+		expect(notified).toEqual([{ userId: 'user-2', kind: 'claimed' }]);
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({ userId: 'user-2', kind: 'claimed', payload: { released: true, force: true } }),
+			])
 		);
 	});
 });

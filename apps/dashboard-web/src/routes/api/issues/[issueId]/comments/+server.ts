@@ -7,6 +7,7 @@ import {
 	CommentNotFoundError,
 } from '$lib/db/queries/comments';
 import { requireCommentReadAccess, requireCommentWriteAccess } from '$lib/server/comment-access';
+import { sendIssueNotificationEmails } from '$lib/server/notify';
 
 // Manual Issues M3 (design §5, §9, §10). Manual-validation style (allowlists + throw
 // error(status)), matching uploads/reports. Works on BOTH issue types -- see comment-access.ts's
@@ -43,7 +44,7 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 	return json({ comments });
 };
 
-export const POST: RequestHandler = async ({ params, request, locals }) => {
+export const POST: RequestHandler = async ({ params, request, locals, url }) => {
 	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
@@ -91,7 +92,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		// This route is session-authenticated only -- every comment created here is authored by a
 		// USER. Agent-authored comments arrive through the key-authenticated `/api/agent/*`
 		// work-loop (M5), which will call the SAME `createComment` with `authorType: 'agent'`.
-		const comment = await createComment({
+		const { comment, notified } = await createComment({
 			issueId,
 			authorType: 'user',
 			authorId: userId,
@@ -99,6 +100,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			parentId,
 			attachmentIds,
 		});
+		await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
 
 		return json({ comment }, { status: 201 });
 	} catch (err) {

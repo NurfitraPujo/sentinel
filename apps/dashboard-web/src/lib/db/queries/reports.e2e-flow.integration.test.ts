@@ -146,7 +146,7 @@ describe.skipIf(!dbReachable)('Manual issues M1 flow (integration, real Postgres
 		expect(unclaimedBefore.some((r) => r.issue.id === issueId)).toBe(true);
 
 		// 3. CLAIM by claimant A succeeds.
-		const claimed = await claimIssue(issueId, 'user', claimantAId);
+		const { issue: claimed } = await claimIssue(issueId, 'user', claimantAId);
 		expect(claimed.assignedTo).toBe(claimantAId);
 		expect(claimed.assigneeType).toBe('user');
 

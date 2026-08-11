@@ -4,6 +4,7 @@ import { db } from '$lib/server/db';
 import { issues, projects, issueRelations } from '$lib/db/schema';
 import { createIssueRelation, deleteIssueRelation } from '$lib/db/queries/issues';
 import { requireIssueAccess } from '$lib/server/issue-access';
+import { sendIssueNotificationEmails } from '$lib/server/notify';
 import { eq, and } from 'drizzle-orm';
 
 // Must match the CHECK constraint on issue_relations.relation_type in
@@ -28,7 +29,7 @@ function isCheckViolation(err: unknown): boolean {
 	return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23514';
 }
 
-export const POST: RequestHandler = async ({ request, params, locals }) => {
+export const POST: RequestHandler = async ({ request, params, locals, url }) => {
 	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
@@ -116,7 +117,14 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 
 	// Create the relation and its issue_activity 'linked' entry together, transactionally.
 	try {
-		const relation = await createIssueRelation(sourceIssueId, targetIssueId, relationType, 'user', userId);
+		const { relation, notified } = await createIssueRelation(
+			sourceIssueId,
+			targetIssueId,
+			relationType,
+			'user',
+			userId
+		);
+		await sendIssueNotificationEmails(notified, { issueId: sourceIssueId, origin: url.origin });
 		return json(relation, { status: 201 });
 	} catch (err: unknown) {
 		// 23505 = Postgres unique_violation. Covers both an exact re-link (source, target, type

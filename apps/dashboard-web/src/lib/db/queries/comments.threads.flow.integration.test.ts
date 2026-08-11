@@ -193,7 +193,7 @@ describe.skipIf(!ready)('Manual issues M3 threads flow (integration, real Postgr
 				.returning();
 			expect(draftAttachment).toBeTruthy();
 
-			const rootComment = await createComment({
+			const { comment: rootComment } = await createComment({
 				issueId,
 				authorType: 'user',
 				authorId: reporterId,
@@ -218,7 +218,7 @@ describe.skipIf(!ready)('Manual issues M3 threads flow (integration, real Postgr
 			expect(Buffer.concat(chunks).equals(PNG_BYTES)).toBe(true);
 
 			// --- Step 2: a reply. ---
-			const reply = await createComment({
+			const { comment: reply } = await createComment({
 				issueId,
 				authorType: 'user',
 				authorId: responderId,
@@ -228,7 +228,7 @@ describe.skipIf(!ready)('Manual issues M3 threads flow (integration, real Postgr
 			expect(reply.parentId).toBe(rootComment.id);
 
 			// --- Step 3: a reply-to-the-reply resolves to the SAME parent (root), not nested deeper. ---
-			const replyToReply = await createComment({
+			const { comment: replyToReply } = await createComment({
 				issueId,
 				authorType: 'user',
 				authorId: reporterId,
@@ -250,7 +250,7 @@ describe.skipIf(!ready)('Manual issues M3 threads flow (integration, real Postgr
 			// microseconds earlier.
 			const [{ now: afterFilterCutoff }] = await sql<{ now: Date }[]>`select now() as now`;
 
-			const answerComment = await createComment({
+			const { comment: answerComment } = await createComment({
 				issueId,
 				authorType: 'user',
 				authorId: reporterId,
