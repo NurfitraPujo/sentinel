@@ -33,8 +33,16 @@ vi.mock('$lib/db/schema', () => ({
 	issueRelations: { id: 'id' },
 }));
 
+// M5 (design §7 steps 6/3): updateIssueStatus/createIssueRelation route `actorType` straight
+// into the activity row -- these two collaborators are mocked so those tests assert the ROUTING,
+// not the fan-out plumbing already covered by reports.test.ts/comments.test.ts.
+const subscribeMock = vi.fn();
+vi.mock('$lib/db/queries/subscriptions', () => ({ subscribe: subscribeMock }));
+const notifyIssueEventMock = vi.fn(async () => []);
+vi.mock('$lib/server/notify', () => ({ notifyIssueEvent: notifyIssueEventMock }));
+
 // Top-level await import, as alerts.test.ts does, to dodge vi.mock hoisting/TDZ.
-const { batchUpdateIssues, MAX_BATCH_ISSUE_IDS } = await import('./issues');
+const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISSUE_IDS } = await import('./issues');
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -89,5 +97,44 @@ describe('batchUpdateIssues', () => {
 		txMock.__result = atCap.map((id) => ({ id }));
 
 		await expect(batchUpdateIssues('proj-1', 'resolve', atCap, {})).resolves.toBe(MAX_BATCH_ISSUE_IDS);
+	});
+});
+
+describe('updateIssueStatus actor typing (M5 §7 step 6)', () => {
+	it('records actorType="agent" and resolvedByType="agent" when an agent resolves an issue', async () => {
+		txMock.__result = [{ status: 'unresolved' }];
+
+		await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'agent', 'agent-1');
+
+		expect(txMock.set).toHaveBeenCalledWith(
+			expect.objectContaining({ resolvedByType: 'agent', resolvedBy: 'agent-1' })
+		);
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ eventType: 'status_changed', actorType: 'agent', actorId: 'agent-1' })
+		);
+		expect(notifyIssueEventMock).toHaveBeenCalledWith(
+			txMock,
+			expect.objectContaining({ kind: 'resolved', actorType: 'agent', actorId: 'agent-1' })
+		);
+	});
+});
+
+describe('createIssueRelation actor typing (M5 §7 step 3)', () => {
+	it('records createdByType="agent" on both the relation row and the activity row', async () => {
+		txMock.__result = [{ id: 'rel-1' }];
+
+		const { relation } = await createIssueRelation('issue-1', 'issue-2', 'linked_to', 'agent', 'agent-1');
+
+		expect(relation).toEqual({ id: 'rel-1' });
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ createdByType: 'agent', createdBy: 'agent-1' })
+		);
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ eventType: 'linked', actorType: 'agent', actorId: 'agent-1' })
+		);
+		expect(notifyIssueEventMock).toHaveBeenCalledWith(
+			txMock,
+			expect.objectContaining({ kind: 'linked', actorType: 'agent', actorId: 'agent-1' })
+		);
 	});
 });

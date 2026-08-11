@@ -32,6 +32,7 @@ export async function getApiKeyById(id: string) {
 			revokedAt: projectApiKeys.revokedAt,
 			createdBy: projectApiKeys.createdBy,
 			createdAt: projectApiKeys.createdAt,
+			agentId: projectApiKeys.agentId,
 		})
 		.from(projectApiKeys)
 		.where(eq(projectApiKeys.id, id));
@@ -53,9 +54,32 @@ export async function getOrganizationApiKeys(orgId: string) {
 			revokedAt: projectApiKeys.revokedAt,
 			createdBy: projectApiKeys.createdBy,
 			createdAt: projectApiKeys.createdAt,
+			agentId: projectApiKeys.agentId,
 		})
 		.from(projectApiKeys)
 		.where(eq(projectApiKeys.organizationId, orgId));
+}
+
+// Agent keys (scope='agent') for one agent, newest first — used by the agents settings page to
+// list/issue/revoke an agent's own keys without pulling the whole org's key inventory.
+export async function getAgentApiKeys(agentId: string) {
+	return await db
+		.select({
+			id: projectApiKeys.id,
+			organizationId: projectApiKeys.organizationId,
+			name: projectApiKeys.name,
+			keyPrefix: projectApiKeys.keyPrefix,
+			scope: projectApiKeys.scope,
+			status: projectApiKeys.status,
+			rateLimitRpm: projectApiKeys.rateLimitRpm,
+			expiresAt: projectApiKeys.expiresAt,
+			revokedAt: projectApiKeys.revokedAt,
+			createdBy: projectApiKeys.createdBy,
+			createdAt: projectApiKeys.createdAt,
+			agentId: projectApiKeys.agentId,
+		})
+		.from(projectApiKeys)
+		.where(eq(projectApiKeys.agentId, agentId));
 }
 
 export async function createApiKey(
@@ -64,12 +88,17 @@ export async function createApiKey(
 		organizationId: string;
 		projectId?: string | null;
 		name: string;
-		scope: 'ingest' | 'read' | 'admin';
+		scope: 'ingest' | 'read' | 'admin' | 'agent';
 		rateLimitRpm?: number;
+		// M5 §7: set only for scope='agent'. Agent keys are always org-scoped (projectId stays
+		// null regardless of what the caller passes) — an agent works across every project in
+		// the org, so binding its key to a single project would be wrong, not just unused.
+		agentId?: string | null;
 	}
 ) {
 	const rawBytes = crypto.randomBytes(32).toString('hex');
-	const prefix = data.projectId ? 'sent_live_' : 'sent_org_';
+	const isAgentKey = data.scope === 'agent';
+	const prefix = isAgentKey ? 'sent_agent_' : data.projectId ? 'sent_live_' : 'sent_org_';
 	const secretToken = `${prefix}${rawBytes}`;
 	const keyHash = crypto.createHash('sha256').update(secretToken).digest('hex');
 
@@ -77,7 +106,7 @@ export async function createApiKey(
 		.insert(projectApiKeys)
 		.values({
 			organizationId: data.organizationId,
-			projectId: data.projectId || null,
+			projectId: isAgentKey ? null : data.projectId || null,
 			name: data.name,
 			keyPrefix: prefix,
 			keyHash,
@@ -85,6 +114,7 @@ export async function createApiKey(
 			rateLimitRpm: data.rateLimitRpm ?? 5000,
 			createdBy: userId,
 			status: 'active',
+			agentId: isAgentKey ? data.agentId ?? null : null,
 		})
 		.returning({
 			id: projectApiKeys.id,
@@ -99,6 +129,7 @@ export async function createApiKey(
 			revokedAt: projectApiKeys.revokedAt,
 			createdBy: projectApiKeys.createdBy,
 			createdAt: projectApiKeys.createdAt,
+			agentId: projectApiKeys.agentId,
 		});
 
 	await db.insert(auditLogs).values({
@@ -106,7 +137,7 @@ export async function createApiKey(
 		resourceType: 'api_key',
 		resourceId: newKey.id,
 		actorId: userId,
-		metadata: { name: newKey.name, scope: newKey.scope },
+		metadata: { name: newKey.name, scope: newKey.scope, agentId: newKey.agentId ?? undefined },
 	});
 
 	return { apiKey: newKey, secretToken };
@@ -161,8 +192,9 @@ export async function rotateApiKey(
 		organizationId: existingKey.organizationId,
 		projectId: existingKey.projectId,
 		name: existingKey.name,
-		scope: existingKey.scope as 'ingest' | 'read' | 'admin',
+		scope: existingKey.scope as 'ingest' | 'read' | 'admin' | 'agent',
 		rateLimitRpm: existingKey.rateLimitRpm,
+		agentId: existingKey.agentId,
 	});
 
 	await db.insert(auditLogs).values({

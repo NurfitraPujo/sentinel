@@ -15,7 +15,13 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	if (!membership) {
 		throw error(403, 'Forbidden: not a member of this organization');
 	}
-	if (!hasPermission(membership.role, 'manage_keys')) {
+
+	// Fast-path denial: a role with NEITHER key-management permission can never revoke ANY key
+	// regardless of its scope, so this is checked before fetching the key at all -- same
+	// external behaviour (403, no lookup performed) as before this route knew about agent
+	// scope. A role with at least one of the two permissions falls through to the scope-specific
+	// check below, once the key (and therefore its scope) is known.
+	if (!hasPermission(membership.role, 'manage_keys') && !hasPermission(membership.role, 'manage_agents')) {
 		throw error(403, 'Forbidden: only owners, admins, and engineers can revoke API keys');
 	}
 
@@ -26,6 +32,19 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	// distinguishable error, that keyId belongs to org B.
 	if (!existingKey || existingKey.organizationId !== orgId) {
 		throw error(404, 'API key not found');
+	}
+
+	// M5 §7/§9: revoking an agent's key is agent management, gated the same way agent-key
+	// issuance is (owner/admin via 'manage_agents'), not the broader 'manage_keys' FR-007 gate —
+	// mirrors the create-side split in ../+server.ts's POST handler.
+	const requiredPermission = existingKey.scope === 'agent' ? 'manage_agents' : 'manage_keys';
+	if (!hasPermission(membership.role, requiredPermission)) {
+		throw error(
+			403,
+			existingKey.scope === 'agent'
+				? 'Forbidden: only owners and admins can revoke agent keys'
+				: 'Forbidden: only owners, admins, and engineers can revoke API keys'
+		);
 	}
 
 	const revokedKey = await revokeApiKey(session.user.id, keyId!, createNatsPublisher());

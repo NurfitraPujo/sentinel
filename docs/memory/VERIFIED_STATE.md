@@ -1620,6 +1620,32 @@ Postgres): auto-subscribe → claimed notification with no self-notify → comme
 unread by exactly 1 → resolved → unsubscribe silences further events; email composition proven over
 the `smtp://debug` jsonTransport path.
 
+### M5 agents VERIFIED 2026-08-12 (same branch)
+
+Migration `1722900000` (agents table; `project_api_keys.agent_id` + catalog-guarded scope-CHECK swap
+adding `'agent'`; replayed + down/up, drift test 26/26). `apps/ingestor-go/auth/apikey.go` needed NO
+change — its scope allowlist (`ingest`/`admin` only) already rejects agent keys; proven live: agent
+key against `/ingest` → 403. `agent-auth.ts` (Bearer sha256 lookup, scope/status/expiry + agent
+active; tenant scope from the credential only — B7), `agent-issue-scope.ts` (cross-org → 404),
+`/api/agent/*` work-loop (list both issue types / atomic claim+release with real actorType — M1's
+releaseClaim had hardcoded 'user', fixed / progress / blocking questions setting `waiting_on` +
+`question_asked` fan-out in one transaction / comments+after-polling / status with
+resolved_by_type='agent' / relations / uploads via shared `upload-core.ts`), every mutation writing
+`audit_logs` (`agent.issue.*`, incl. key prefix) alongside `issue_activity`. Management: `agents`
+CRUD API + `/[orgSlug]/settings/agents` UI gated by new `manage_agents` RBAC permission
+(owner/admin only); agent keys use prefix `sent_agent_`, project_id forced NULL; the hardcoded
+"AutoFix Agent" mock in IssueAssigneePicker is replaced by real org agents.
+
+Proved by running, 2026-08-11/12: dashboard gates green (441 tests shuffled, check 1732 files 0/0,
+build), db-migrations go test green, full-stack e2e **76 passed / 0 failed** plus new
+`tests/e2e/agent_work_loop_test.go` (`M5_AGENT_INTEGRATION_REQUIRED=1`, real HTTP against the
+compose dashboard): org-isolation on list, concurrent double-claim → exactly one 200 + one 409,
+progress activity, blocking question → `waiting_on` set + reporter notified `question_asked`, human
+reply via a real Auth.js session cookie clears it, agent polls the answer via `?after=`, resolve as
+agent, audit rows counted and matched by action, ingest rejection 403. Known minor: the shared e2e
+harness cleanup deletes users before `manual_issue_reports` (tolerated FK log line, orphan rows in
+dev/CI DB) — pre-existing gap, tracked separately.
+
 Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 

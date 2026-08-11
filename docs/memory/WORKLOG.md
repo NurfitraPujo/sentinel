@@ -179,6 +179,32 @@ has no consumer, drain, or dashboard surface yet.
 
 ---
 
+### 2026-08-12 - Manual Issues M2–M5: the Whole Feature Shipped Phase-by-Phase, Each Phase Proven Against the Real Stack Before Commit
+
+- **Why durable**: Four phases (attachments/MinIO, threads, notifications, agents) landed as four
+  commits (`f3940f8`, `952d6b0`, `6abbf9e`, M5 next), each gated the same way: Sonnet implementors,
+  Opus adversarial validators with fix loops, Fable holistic review, and a required-env integration
+  flow test against the real compose stack before anything was committed. The pattern paid for
+  itself repeatedly — every phase's only real bugs were ones ONLY the real stack could catch:
+  M1's varchar(64) overflow, M3's app-clock-vs-DB-clock polling skew, M5's hardcoded release
+  actorType. Mock-based suites stayed green through all of them.
+- **Future mistake prevented**: (1) New one-shot compose services silently fail
+  `scripts/wait-healthy.sh` unless added to its `ONESHOT_SERVICES` list (bit us with `minio-init`).
+  (2) vitest's `resolve.conditions: ['browser']` makes `@aws-sdk/client-s3` load its browser build,
+  which needs `Blob.prototype.arrayBuffer` missing in jsdom — integration tests must swap in Node's
+  Blob before import. (3) A `?after=` polling cutoff must come from the DB clock (`select now()`),
+  never the app clock. (4) The ingestor's scope check is an allowlist, which is why adding the
+  `'agent'` key scope required zero Go changes — allowlists age well, denylists don't.
+- **Evidence**: end state 2026-08-12 — dashboard gates 441 tests shuffled / check 0-0 / build green;
+  full-stack `SENTINEL_E2E=1 -tags=e2e` 76 passed 0 failed every phase; four required-env
+  integration flow tests (M2 attachments byte-identity+reaper, M3 threads incl. waiting_on
+  round-trip, M4 notification lifecycle, M5 agent work-loop over real HTTP incl. a concurrent
+  double-claim resolving to exactly one 200 + one 409 and an agent-key ingest attempt rejected 403).
+- **Where to look**: `docs/plans/MANUAL_ISSUES_DESIGN.md` (phase table now all DONE through M5),
+  `VERIFIED_STATE.md` M2/M3/M4/M5 entries, `DECISIONS.md` D19.
+
+---
+
 ### 2026-08-11 - Manual (User-Reported) Issues M1: the Schema Was Waiting, and the Only Real Bug Was One Only a Real Database Could Catch
 
 - **Why durable**: The `issue_type='user_report'` / `source_channel` / `assignee_type` /

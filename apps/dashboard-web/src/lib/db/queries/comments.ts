@@ -33,6 +33,17 @@ export interface CreateCommentInput {
 	parentId?: string | null;
 	/** §4 groundwork: DRAFT attachment ids to claim onto this comment in the same transaction. */
 	attachmentIds?: string[];
+	/**
+	 * M5 §7 step 4 (Q11): set true by the agent `POST /api/agent/issues/[id]/questions` endpoint
+	 * ONLY. Marks the comment row `blocking=true`, sets `issues.waiting_on` to `waitingOnAudience`
+	 * in the SAME transaction, and fans out `notifications.kind='question_asked'` instead of
+	 * 'commented' (bypasses the email throttle per Q11/M4's `BLOCKING_BYPASS_KIND`). Every other
+	 * caller (session-authenticated user comments, agent progress/plain comments) omits this and
+	 * gets the M3 behavior unchanged.
+	 */
+	blocking?: boolean;
+	/** Required when `blocking` is true: who the question is addressed to (Q11). */
+	waitingOnAudience?: 'reporter' | 'team';
 }
 
 /**
@@ -48,6 +59,9 @@ export async function createComment(
 	const bodyMd = input.bodyMd.trim();
 	if (bodyMd.length === 0) {
 		throw new CommentValidationError('bodyMd must not be empty');
+	}
+	if (input.blocking && input.waitingOnAudience !== 'reporter' && input.waitingOnAudience !== 'team') {
+		throw new CommentValidationError('waitingOnAudience is required and must be "reporter" or "team" when blocking');
 	}
 
 	return await db.transaction(async (tx) => {
@@ -100,6 +114,7 @@ export async function createComment(
 				authorType: input.authorType,
 				authorId: input.authorId,
 				bodyMd,
+				blocking: Boolean(input.blocking),
 			})
 			.returning();
 
@@ -119,20 +134,29 @@ export async function createComment(
 			claimedAttachmentIds = claimed.map((a) => a.id);
 		}
 
+		// M5 §7 step 4 (Q11): a blocking question sets issues.waiting_on in the SAME transaction as
+		// the comment insert and its activity row (D18) -- 'question_asked' rather than 'commented'.
+		if (input.blocking) {
+			await tx.update(issues).set({ waitingOn: input.waitingOnAudience }).where(eq(issues.id, input.issueId));
+		}
+
 		await tx.insert(issueActivity).values({
 			issueId: input.issueId,
-			eventType: 'commented',
+			eventType: input.blocking ? 'question_asked' : 'commented',
 			actorType: input.authorType,
 			actorId: input.authorId,
 			newValue: {
 				commentId: comment.id,
 				parentId: resolvedParentId,
+				...(input.blocking ? { waitingOn: input.waitingOnAudience } : {}),
 				...(claimedAttachmentIds.length > 0 ? { attachmentIds: claimedAttachmentIds } : {}),
 			},
 		});
 
-		// Q11 groundwork: any USER reply clears a pending `waiting_on`, regardless of who set it or
+		// Q11 step 5: any USER reply clears a pending `waiting_on`, regardless of who set it or
 		// which audience it targeted -- the agent work-loop (M5) polls comments to notice the answer.
+		// A blocking question is itself authored by an agent (never a user), so this branch and the
+		// one above are mutually exclusive for a single call.
 		if (input.authorType === 'user' && issueRow.waitingOn !== null) {
 			await tx.update(issues).set({ waitingOn: null }).where(eq(issues.id, input.issueId));
 
@@ -158,13 +182,12 @@ export async function createComment(
 			);
 		}
 
-		// §8/M4 scope note: M3's comment insert above never reads a `blocking` flag from `input` --
-		// there is no such field on `CreateCommentInput` yet (the agent `POST .../questions`
-		// endpoint that would set it is M5). So this always fans out kind 'commented', never
-		// 'question_asked' -- M5 will thread a blocking flag through to pick the latter.
+		// M5 §7 step 4/Q11: a blocking question fans out kind 'question_asked' -- notify.ts's
+		// BLOCKING_BYPASS_KIND makes this bypass the 15-min email throttle unconditionally, unlike
+		// plain 'commented'.
 		const notified = await notifyIssueEvent(tx, {
 			issueId: input.issueId,
-			kind: 'commented',
+			kind: input.blocking ? 'question_asked' : 'commented',
 			actorType: input.authorType,
 			actorId: input.authorId,
 			payload: { commentId: comment.id, parentId: resolvedParentId },

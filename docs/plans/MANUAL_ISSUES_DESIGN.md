@@ -285,7 +285,7 @@ invitations endpoint.
 | **M2 Attachments — DONE 2026-08-11** (see VERIFIED_STATE.md "M2 attachments") | MinIO in compose, `attachments`, upload proxy (25 MB, magic bytes), streaming download, orphan reaper | The only new infra; download access control |
 | **M3 Threads — DONE 2026-08-11** (see VERIFIED_STATE.md "M3 threads") | `issue_comments`, thread UI (replies + attachments), polling refresh | UI complexity; shuffle-safe component tests |
 | **M4 Notifications — DONE 2026-08-11** (see VERIFIED_STATE.md "M4 notifications"; claim-release reuses kind `claimed`+`payload.released`, move sends none) | subscriptions + notifications tables, bell UI, email fan-out + throttle + blocking bypass | Transaction discipline (D18); throttle correctness |
-| **M5 Agents** | `agents` table, `'agent'` key scope + `agent_id`, `/api/agent/*` work-loop (pull/claim/progress/ask/resolve), `waiting_on` wiring, audit logging, real assignee picker | Credential scoping (B7); atomic claim under concurrency; replaces the mock |
+| **M5 Agents — DONE 2026-08-12** (see VERIFIED_STATE.md "M5 agents"; agent-key rate limiting deliberately not wired yet — follow-up) | `agents` table, `'agent'` key scope + `agent_id`, `/api/agent/*` work-loop (pull/claim/progress/ask/resolve), `waiting_on` wiring, audit logging, real assignee picker | Credential scoping (B7); atomic claim under concurrency; replaces the mock |
 | **M6 Later** | SSE (LISTEN/NOTIFY or NATS), NATS push discovery, AI triage (project routing + `duplicate_of`), presigned large uploads, toolbar editor | All deliberately deferred |
 
 Per-phase definition of done: migration replayed twice against a disposable

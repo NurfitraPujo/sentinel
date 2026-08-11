@@ -473,12 +473,14 @@ export async function claimIssue(
 			newValue: { assigneeType: actorType, assignedTo: actorId },
 		});
 
-		// §7/§8: the claimant is auto-subscribed (reason 'claimant'), USER claims only -- agent
-		// subscribers get no notifications row in M4 (design §8), so subscribing an agent claimant
-		// here would only ever grow issue_subscriptions with rows notifyIssueEvent will always skip.
-		if (actorType === 'user') {
-			await subscribe({ issueId, subscriberType: 'user', subscriberId: actorId, reason: 'claimant' }, tx);
-		}
+		// §7/§8/M5: the claimant is auto-subscribed (reason 'claimant'), for BOTH actor types as of
+		// M5. M4 only subscribed user claimants (a correct simplification while nothing ever claimed
+		// as an agent); M5's work-loop makes agent claims real, and design §7 step 2 explicitly
+		// requires the subscription ROW to exist ("claimant auto-subscribed") even though
+		// `notifyIssueEvent` (design §8) still skips agent subscribers when building `notifications`
+		// rows -- agents poll comments/activity rather than receive notification rows, so this row's
+		// only consumer today is the subscription-list UI/toggle, not the email/notification fan-out.
+		await subscribe({ issueId, subscriberType: actorType, subscriberId: actorId, reason: 'claimant' }, tx);
 
 		const notified = await notifyIssueEvent(tx, {
 			issueId,
@@ -499,12 +501,19 @@ export async function claimIssue(
  * (owner/admin only, enforced in report-access.ts, not here). 0 rows updated (non-force) throws
  * `ClaimConflictError` the same way claimIssue does, for the same reason: the caller must be able
  * to tell "released" from "nothing happened".
+ *
+ * M5: `actorType` used to be hardcoded 'user' here (the M1 stub), which meant an agent release
+ * (via `/api/agent/issues/[id]/claim` DELETE) recorded a false activity/notification actor type
+ * -- the issue_activity row said 'user' even though `actorId` was an agent id. It now defaults to
+ * 'user' only for source compatibility with the session-authenticated route, which never passes
+ * it; callers that release on behalf of an agent MUST pass `actorType: 'agent'`.
  */
 export async function releaseClaim(
 	issueId: string,
 	actorId: string,
-	options: { force?: boolean } = {}
+	options: { force?: boolean; actorType?: 'user' | 'agent' } = {}
 ): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
+	const actorType = options.actorType ?? 'user';
 	return await db.transaction(async (tx) => {
 		const whereClause = options.force
 			? eq(issues.id, issueId)
@@ -523,7 +532,7 @@ export async function releaseClaim(
 		await tx.insert(issueActivity).values({
 			issueId,
 			eventType: 'claim_released',
-			actorType: 'user',
+			actorType,
 			actorId,
 			newValue: { force: Boolean(options.force) },
 		});
@@ -534,7 +543,7 @@ export async function releaseClaim(
 		const notified = await notifyIssueEvent(tx, {
 			issueId,
 			kind: 'claimed',
-			actorType: 'user',
+			actorType,
 			actorId,
 			payload: { released: true, force: Boolean(options.force) },
 		});

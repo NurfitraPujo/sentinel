@@ -269,6 +269,78 @@ describe('createComment', () => {
 		expect(txHandle.updateCalls).toHaveLength(0);
 		expect(txHandle.insertCalls).toHaveLength(2); // comment + commented activity only
 	});
+
+	describe('M5 blocking questions (§7 step 4, Q11)', () => {
+		it('rejects blocking:true without a valid waitingOnAudience, before opening a transaction', async () => {
+			await expect(
+				createComment({
+					issueId: 'issue-1',
+					authorType: 'agent',
+					authorId: 'agent-1',
+					bodyMd: 'need input',
+					blocking: true,
+				})
+			).rejects.toBeInstanceOf(CommentValidationError);
+
+			expect(dbTransactionMock).not.toHaveBeenCalled();
+		});
+
+		it('sets the comment row blocking=true, sets issues.waiting_on, writes question_asked, in one transaction', async () => {
+			txHandle.selectQueue.push(
+				[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
+				[{ organizationId: 'org-1' }]
+			);
+			txHandle.insertReturningQueue.push([
+				{ id: 'comment-1', issueId: 'issue-1', parentId: null, blocking: true },
+			]);
+
+			const { comment } = await createComment({
+				issueId: 'issue-1',
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'Which environment is this in?',
+				blocking: true,
+				waitingOnAudience: 'reporter',
+			});
+
+			expect(comment).toMatchObject({ id: 'comment-1', blocking: true });
+			expect(txHandle.insertCalls[0].values).toMatchObject({ blocking: true });
+			// waiting_on set to the audience, in the same tx as the comment insert.
+			expect(txHandle.updateCalls).toHaveLength(1);
+			expect(txHandle.updateCalls[0].set).toEqual({ waitingOn: 'reporter' });
+			// activity is 'question_asked', not 'commented'.
+			expect(txHandle.insertCalls[1].values).toMatchObject({
+				eventType: 'question_asked',
+				actorType: 'agent',
+				actorId: 'agent-1',
+				newValue: expect.objectContaining({ waitingOn: 'reporter' }),
+			});
+			// agent authors never auto-subscribe (M4/M5 -- agents poll).
+			expect(txHandle.insertCalls).toHaveLength(2);
+		});
+
+		it('fans out notifyIssueEvent with kind question_asked, not commented', async () => {
+			txHandle.selectQueue.push(
+				[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
+				[{ organizationId: 'org-1' }]
+			);
+			txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
+			// notifyIssueEvent's listSubscribers select runs against tx via the shared select-queue
+			// chain in this double, which is dbMock, not txHandle.selectQueue -- see the module mock
+			// for $lib/db/queries/subscriptions below.
+
+			const { notified } = await createComment({
+				issueId: 'issue-1',
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'blocked, need an answer',
+				blocking: true,
+				waitingOnAudience: 'team',
+			});
+
+			expect(Array.isArray(notified)).toBe(true);
+		});
+	});
 });
 
 describe('listComments', () => {

@@ -174,7 +174,7 @@ describe('claimIssue', () => {
 		);
 	});
 
-	it('does not auto-subscribe an agent claimant (agents get no notifications row in M4)', async () => {
+	it('auto-subscribes an agent claimant as of M5 (row exists; notifyIssueEvent still skips agent subscribers for notification rows)', async () => {
 		txMock.returning = vi.fn(() =>
 			Promise.resolve([{ id: 'issue-1', assigneeType: 'agent', assignedTo: 'agent-1' }])
 		);
@@ -182,10 +182,10 @@ describe('claimIssue', () => {
 
 		await claimIssue('issue-1', 'agent', 'agent-1');
 
-		const subscribeCalls = (txMock.values as any).mock.calls.filter(
-			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ subscriberType: 'agent', subscriberId: 'agent-1', reason: 'claimant' })
 		);
-		expect(subscribeCalls).toHaveLength(0);
+		expect(txMock.onConflictDoNothing).toHaveBeenCalled();
 	});
 });
 

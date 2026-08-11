@@ -354,7 +354,26 @@ export const projectApiKeys = pgTable('project_api_keys', {
 	revokedAt: timestamp('revoked_at', { withTimezone: true }),
 	createdBy: varchar('created_by', { length: 255 }).notNull(),
 	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+	// 1722900000_add_agents.sql (M5 §7): populated only when scope='agent'. Agent keys are always
+	// org-scoped (projectId NULL) since an agent works across every project in the org.
+	agentId: uuid('agent_id').references(() => agents.id, { onDelete: 'cascade' }),
 }, (table) => ({
 	idxApiKeysHashStatus: index('idx_api_keys_hash_status').on(table.keyHash, table.status),
 	idxApiKeysOrgProject: index('idx_api_keys_org_project').on(table.organizationId, table.projectId),
+	idxApiKeysAgent: index('idx_api_keys_agent').on(table.agentId),
+}));
+
+// 1722900000_add_agents.sql (M5 §7, Q5): agent identity. issue_activity/issue_comments'
+// actor_type='agent' ids resolve against this table; IssueAssigneePicker.svelte lists real rows
+// from here instead of the M3 hardcoded "AutoFix Agent" mock.
+export const agents = pgTable('agents', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	orgId: uuid('org_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	name: varchar('name', { length: 255 }).notNull(),
+	kind: varchar('kind', { length: 20 }).notNull(),
+	status: varchar('status', { length: 20 }).notNull().default('active'),
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+}, (table) => ({
+	idxAgentsOrg: index('idx_agents_org').on(table.orgId),
 }));
