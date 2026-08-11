@@ -2,6 +2,7 @@ import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
 import { cleanupRetainedData } from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
+import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
 import { env } from '$env/dynamic/private';
 import { log } from '$lib/server/observability/log';
 
@@ -37,8 +38,14 @@ export const POST: RequestHandler = async ({ request }) => {
 		// Piggy-backed on this existing scheduled job rather than adding a second cron endpoint.
 		const reapedInvitations = await reapAllExpiredInvitations();
 
+		// Manual Issues M2 (design §4): same piggyback as reapAllExpiredInvitations above -- an
+		// unconditional sweep of DRAFT attachments never linked to an issue/comment within 24h,
+		// across every org, driven by this existing scheduled job rather than a second cron route.
+		const reapedAttachments = await reapAllOrphanAttachments();
+
 		log.info('retention_cron.completed', {
 			reapedInvitations,
+			reapedAttachments,
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			cutoffDate: result.cutoffDate.toISOString(),
@@ -48,6 +55,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			success: true,
 			result: {
 				reapedInvitations,
+				reapedAttachments,
 				deletedOccurrences: result.deletedOccurrences,
 					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				retentionDays: result.retentionDays,

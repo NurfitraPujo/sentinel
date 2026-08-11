@@ -75,7 +75,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	await requireReportAccess(userId, orgId, 'create');
 
 	const body = await request.json().catch(() => ({}));
-	const { title, bodyMd, severity, projectId } = body;
+	const { title, bodyMd, severity, projectId, attachmentIds } = body;
 
 	if (typeof title !== 'string' || title.trim().length === 0) {
 		throw error(400, 'title is required');
@@ -107,6 +107,19 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		resolvedProjectId = projectId;
 	}
 
+	// §4 linking: an optional list of DRAFT attachment ids (from POST /api/uploads) to claim onto
+	// the report, inside the SAME transaction as creation (createManualIssue does the claiming).
+	let resolvedAttachmentIds: string[] | undefined;
+	if (attachmentIds !== undefined) {
+		if (
+			!Array.isArray(attachmentIds) ||
+			!attachmentIds.every((value: unknown) => typeof value === 'string')
+		) {
+			throw error(400, 'attachmentIds must be an array of strings');
+		}
+		resolvedAttachmentIds = attachmentIds;
+	}
+
 	const { issue, report } = await createManualIssue({
 		organizationId: orgId,
 		projectId: resolvedProjectId,
@@ -114,6 +127,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		title,
 		bodyMd,
 		severity,
+		attachmentIds: resolvedAttachmentIds,
 	});
 
 	return json({ issue, report }, { status: 201 });

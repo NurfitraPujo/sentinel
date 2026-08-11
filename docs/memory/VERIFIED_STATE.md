@@ -1555,7 +1555,32 @@ Proved by running, 2026-08-11:
   API key was 70 chars against `projects.api_key varchar(64)`, so **every first-use Triage
   provisioning threw** — fixed red-first (`randomBytes(24)`).
 
-Not yet built (by design, later phases): attachments (M2), threads UI (M3 — the `issue_comments`
+### M2 attachments VERIFIED 2026-08-11 (same branch)
+
+MinIO in compose (+ `minio-init` one-shot, bucket `sentinel-attachments`), migration `1722700000`
+(attachments table, single-parent CHECK, reaper partial index — replayed 2×+down/up on disposable
+Postgres AND cross-ledger via `up -target=processor`), `$lib/server/storage.ts` (@aws-sdk/client-s3,
+forcePathStyle), magic-byte sniffer (19 tests; ZIP-claiming-image/png rejected), `POST /api/uploads`
+(25 MB cap pre+post parse, viewer-inclusive membership check), `GET /api/attachments/[id]`
+(draft=uploader-only; linked=per-issue-type authz; comment-linked fails closed 501 until M3), orphan
+reaper on the retention cron + opportunistic per-org sweep, link-on-create inside the
+`createManualIssue` transaction.
+
+Proved by running, 2026-08-11: dashboard gates green (315 tests incl. env-gated integration, shuffled;
+`pnpm check` 0/0; `pnpm build` clean), db-migrations go test green, drift test 23 passed with
+`SCHEMA_DRIFT_REQUIRED=1`, full-stack e2e **76 passed / 0 skipped**, and
+`reports.attachments.flow.integration.test.ts` (`M2_ATTACHMENTS_INTEGRATION_REQUIRED=1`) against the
+real compose MinIO+Postgres: upload → link-on-create → byte-identical download → reaper removes only
+the orphan (object AND row) → mislabeled file rejected. Root-module Go gates deliberately not run this
+phase (no root Go code touched; user instruction).
+
+Two operational gotchas found: `scripts/wait-healthy.sh` has a hardcoded `ONESHOT_SERVICES` list —
+any new one-shot compose service must be added there or a legitimate `Exited (0)` reads as failure
+(fixed for `minio-init`); and under vitest's `resolve.conditions: ['browser']`, `@aws-sdk/client-s3`
+loads its browser build whose stream collector needs `Blob.prototype.arrayBuffer` (absent in jsdom) —
+the integration test swaps in Node's `Blob` before import; production is unaffected.
+
+Not yet built (by design, later phases): threads UI (M3 — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 
 ---

@@ -66,6 +66,41 @@ services:
             NATS_URL: nats://nats:4222
         restart: "no"
 
+    minio:
+        # Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4): S3-compatible object store for
+        # attachments. Client is S3-compatible so prod can point at real S3/R2 instead. Host ports
+        # are parameterized for the same reason as `nats` above (another stack squatting on 9000/9001).
+        image: docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+        container_name: sentinel-minio
+        command: ["server", "/data", "--console-address", ":9001"]
+        environment:
+            MINIO_ROOT_USER: "${S3_ACCESS_KEY:-minioadmin}"
+            MINIO_ROOT_PASSWORD: "${S3_SECRET_KEY:-minioadmin}"
+        ports:
+            - "${MINIO_HOST_PORT:-9000}:9000"
+            - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+        volumes:
+            - minio_data:/data
+        healthcheck:
+            test: ["CMD", "mc", "ready", "local"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    minio-init:
+        build:
+            context: ./scripts
+            dockerfile: Dockerfile.minio-init
+        depends_on:
+            minio:
+                condition: service_healthy
+        environment:
+            S3_ENDPOINT: http://minio:9000
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+        restart: "no"
+
     jaeger:
         # Fully qualified on purpose. Podman resolves no unqualified short names unless
         # /etc/containers/registries.conf defines unqualified-search-registries, so the bare
@@ -223,8 +258,16 @@ services:
                 condition: service_completed_successfully
             nats:
                 condition: service_healthy
+            minio-init:
+                condition: service_completed_successfully
         environment:
             DATABASE_URL: postgres://sentinel:changeme@postgres:5432/sentinel
+            # Manual Issues M2 (design §4): in-cluster MinIO endpoint, never the host-mapped port
+            # above — mirrors NATS_URL's in-cluster-vs-host split.
+            S3_ENDPOINT: http://minio:9000
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
             POSTGRES_HOST: postgres
             POSTGRES_PORT: 5432
             POSTGRES_USER: sentinel
@@ -258,3 +301,4 @@ volumes:
     postgres_data:
     nats_data:
     redis_data:
+    minio_data:

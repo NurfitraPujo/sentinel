@@ -6,6 +6,7 @@ import {
 	manualIssueReports,
 	projects,
 	users,
+	attachments,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 
@@ -72,6 +73,12 @@ export interface CreateManualIssueInput {
 	bodyMd: string;
 	severity: ReportSeverity;
 	sourceChannel?: 'manual_support' | 'api';
+	/**
+	 * Manual Issues M2 (design §4): ids of DRAFT attachments (uploaded via POST /api/uploads,
+	 * issue_id/comment_id still NULL) to claim onto the new issue in the SAME transaction as its
+	 * creation. Ownership/org checks happen in `claimDraftAttachments` below, not here.
+	 */
+	attachmentIds?: string[];
 }
 
 /**
@@ -131,9 +138,117 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 			newValue: { action: 'created', title, severity: input.severity, projectId },
 		});
 
+		// §4/§4 linking step: claim any DRAFT attachments onto the new issue, in the SAME
+		// transaction as creation. Folds into the creation activity above rather than writing a
+		// second `attachment_added` row per design §6 ("... or fold into creation activity").
+		if (input.attachmentIds && input.attachmentIds.length > 0) {
+			const claimed = await claimDraftAttachments(
+				tx,
+				input.attachmentIds,
+				issue.id,
+				input.reporterId,
+				input.organizationId
+			);
+
+			if (claimed.length > 0) {
+				await tx.insert(issueActivity).values({
+					issueId: issue.id,
+					eventType: 'attachment_added',
+					actorType: 'user',
+					actorId: input.reporterId,
+					newValue: { attachmentIds: claimed.map((a) => a.id) },
+				});
+			}
+		}
+
 		return { issue, report };
 	});
 }
+
+/**
+ * §4 linking: claims DRAFT attachments (issue_id/comment_id both NULL) onto `issueId`. Each
+ * candidate id is verified to (a) exist, (b) still be a draft, (c) belong to `organizationId`
+ * (B7: tenant scope from the caller's already-established org, never re-derived from the
+ * attachment row), and (d) have been uploaded by `uploaderId` -- a caller cannot claim someone
+ * else's draft upload onto their own report. Ids that fail any check are silently skipped rather
+ * than throwing (a stale/foreign id in the array must not abort creating the whole report) --
+ * callers that need to know what was actually claimed use the returned array.
+ */
+export async function claimDraftAttachments(
+	tx: any,
+	attachmentIds: string[],
+	issueId: string,
+	uploaderId: string,
+	organizationId: string
+): Promise<{ id: string }[]> {
+	if (attachmentIds.length === 0) {
+		return [];
+	}
+
+	const claimed: { id: string }[] = [];
+
+	for (const attachmentId of attachmentIds) {
+		const rows = await tx
+			.select({
+				id: attachments.id,
+				orgId: attachments.orgId,
+				uploaderId: attachments.uploaderId,
+				issueId: attachments.issueId,
+				commentId: attachments.commentId,
+			})
+			.from(attachments)
+			.where(eq(attachments.id, attachmentId));
+
+		const row = rows[0];
+		if (
+			!row ||
+			row.orgId !== organizationId ||
+			row.uploaderId !== uploaderId ||
+			row.issueId !== null ||
+			row.commentId !== null
+		) {
+			continue;
+		}
+
+		const updated = await tx
+			.update(attachments)
+			.set({ issueId })
+			.where(
+				and(eq(attachments.id, attachmentId), isNull(attachments.issueId), isNull(attachments.commentId))
+			)
+			.returning({ id: attachments.id });
+
+		if (updated.length > 0) {
+			claimed.push(updated[0]);
+		}
+	}
+
+	return claimed;
+}
+
+/**
+ * §4: fetches an attachment row by id, or null. Used by both the download route (access-control
+ * decisions) and reaping.
+ */
+export async function getAttachmentById(attachmentId: string) {
+	const rows = await db.select().from(attachments).where(eq(attachments.id, attachmentId));
+	return rows[0] ?? null;
+}
+
+/**
+ * Manual Issues M2 (design §4/§10): attachments linked to a given issue, oldest first, for the
+ * report detail page's attachments section. Deliberately does not include DRAFT attachments
+ * (issueId still NULL) -- those only ever exist transiently on the /reports/new form, before the
+ * issue they'll be claimed onto has been created.
+ */
+export async function listIssueAttachments(issueId: string) {
+	return await db
+		.select()
+		.from(attachments)
+		.where(eq(attachments.issueId, issueId))
+		.orderBy(attachments.createdAt);
+}
+
 
 export type ReportTab = 'all' | 'mine' | 'claimed-by-me' | 'unclaimed' | 'needs-input' | 'triage';
 

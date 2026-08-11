@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import type { PageServerLoad } from './$types';
 import { db } from '$lib/server/db';
 import { projects } from '$lib/db/schema';
-import { getReportDetail, getIssueActivity } from '$lib/db/queries/reports';
+import { getReportDetail, getIssueActivity, listIssueAttachments } from '$lib/db/queries/reports';
 import { getIssueRelations } from '$lib/db/queries/issues';
 import { requireReportAccessForIssue } from '$lib/server/report-access';
 import { ISSUE_WRITE_ROLES } from '$lib/server/issue-access';
@@ -40,13 +40,14 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		throw error(404, 'Report not found');
 	}
 
-	const [relations, activity, orgProjects] = await Promise.all([
+	const [relations, activity, orgProjects, attachments] = await Promise.all([
 		getIssueRelations(issueId),
 		getIssueActivity(issueId),
 		db
 			.select({ id: projects.id, name: projects.name, isInbox: projects.isInbox })
 			.from(projects)
 			.where(eq(projects.organizationId, organizationId)),
+		listIssueAttachments(issueId),
 	]);
 
 	const canWrite = (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
@@ -59,6 +60,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		detail,
 		relations,
 		activity,
+		attachments,
 		projects: orgProjects,
 	};
 };

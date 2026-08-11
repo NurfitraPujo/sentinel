@@ -33,4 +33,20 @@ describe('Markdown sanitization', () => {
 		const strong = document.querySelector('.markdown-body strong');
 		expect(strong?.textContent).toBe('bold');
 	});
+
+	// M2 §4/§10: embedded attachment images are inserted as `![name](/api/attachments/<id>)` by
+	// the upload zone's "insert into body" action (UploadZone.svelte) -- confirms the sanitize
+	// policy keeps a relative /api/attachments/ img src intact while still stripping handler
+	// attributes on the very same tag.
+	it('keeps a relative /api/attachments/ img src while stripping its handler attributes', async () => {
+		render(Markdown, {
+			source: '![screenshot](/api/attachments/11111111-2222-3333-4444-555555555555 "onerror=alert(1)")',
+		});
+		await tick();
+
+		const img = document.querySelector('.markdown-body img');
+		expect(img).not.toBeNull();
+		expect(img?.getAttribute('src')).toBe('/api/attachments/11111111-2222-3333-4444-555555555555');
+		expect(img?.getAttribute('onerror')).toBeNull();
+	});
 });

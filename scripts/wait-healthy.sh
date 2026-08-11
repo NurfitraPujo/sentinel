@@ -35,7 +35,7 @@ POLL_INTERVAL_SECONDS="${WAIT_HEALTHY_INTERVAL:-2}"
 HEALTHCHECKED_SERVICES="postgres redis nats"
 
 # One-shot services expected to run once and exit 0, rather than stay up.
-ONESHOT_SERVICES="nats-init migrate"
+ONESHOT_SERVICES="nats-init migrate minio-init"
 
 # Services whose absence or failure must NOT fail the gate.
 #

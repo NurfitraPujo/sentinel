@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import Markdown from '$lib/components/Markdown.svelte';
+	import UploadZone from '$lib/components/attachments/UploadZone.svelte';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -14,6 +15,26 @@
 	let showPreview = $state(false);
 	let submitting = $state(false);
 	let errorMessage = $state<string | null>(null);
+	let attachmentIds = $state<string[]>([]);
+	let bodyTextarea: HTMLTextAreaElement | undefined = $state();
+
+	function handleAttachmentsChange(ids: string[]) {
+		attachmentIds = ids;
+	}
+
+	// §4/§10: inserts `![filename](/api/attachments/<id>)` at the current cursor position (falling
+	// back to the end when the textarea has never been focused, e.g. right after an upload while
+	// still in Preview mode).
+	function handleInsertIntoBody(markdown: string) {
+		const el = bodyTextarea;
+		if (!el) {
+			bodyMd = bodyMd.length > 0 ? `${bodyMd}\n${markdown}\n` : `${markdown}\n`;
+			return;
+		}
+		const start = el.selectionStart ?? bodyMd.length;
+		const end = el.selectionEnd ?? bodyMd.length;
+		bodyMd = `${bodyMd.slice(0, start)}${markdown}\n${bodyMd.slice(end)}`;
+	}
 
 	async function handleSubmit(event: SubmitEvent) {
 		event.preventDefault();
@@ -38,6 +59,7 @@
 					bodyMd,
 					severity,
 					projectId: projectId || null,
+					attachmentIds,
 				}),
 			});
 
@@ -107,6 +129,7 @@
 				</div>
 			{:else}
 				<textarea
+					bind:this={bodyTextarea}
 					bind:value={bodyMd}
 					class="field-input body-textarea"
 					rows="10"
@@ -114,6 +137,15 @@
 					required
 				></textarea>
 			{/if}
+		</div>
+
+		<div class="field">
+			<span class="field-label">Attachments</span>
+			<UploadZone
+				organizationId={data.orgId}
+				onchange={handleAttachmentsChange}
+				oninsert={handleInsertIntoBody}
+			/>
 		</div>
 
 		<div class="form-actions">

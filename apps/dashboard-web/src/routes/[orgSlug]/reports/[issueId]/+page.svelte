@@ -2,6 +2,7 @@
 	import Markdown from '$lib/components/Markdown.svelte';
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
 	import IssueTimeline from '$lib/components/issues/IssueTimeline.svelte';
+	import AttachmentList from '$lib/components/attachments/AttachmentList.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
@@ -126,6 +127,11 @@
 		<Markdown source={data.detail.report.bodyMd} />
 	</div>
 
+	<div class="attachments-panel">
+		<h2 class="section-heading">Attachments</h2>
+		<AttachmentList attachments={data.attachments} />
+	</div>
+
 	{#if data.canWrite}
 		<div class="move-box">
 			<span class="move-label">Move to project</span>
@@ -236,6 +242,22 @@
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-md);
 		padding: 1rem;
+	}
+
+	.attachments-panel {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 1rem;
+	}
+
+	.section-heading {
+		font-size: 0.8125rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		margin: 0 0 0.75rem 0;
+		text-transform: uppercase;
+		letter-spacing: 0.02em;
 	}
 
 	.move-box {

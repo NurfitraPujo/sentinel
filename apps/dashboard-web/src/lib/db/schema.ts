@@ -159,6 +159,26 @@ export const issueRelations = pgTable('issue_relations', {
 	createdAt: timestamp('created_at').defaultNow(),
 });
 
+// Manual Issues M2 (design §4): matches
+// 1722700000_add_attachments.sql. orgId NOT NULL — tenant scope for the download access check
+// must never depend on walking through issueId/commentId, both nullable while drafting.
+// issueId/commentId are mutually exclusive-or-neither (attachments_single_parent_check):
+// unlinked while drafting, then linked to exactly one of an issue or a comment, never both.
+// uploaderType CHECK allows 'user'|'agent'. storageKey is UNIQUE (idx_attachments_storage_key).
+export const attachments = pgTable('attachments', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	orgId: uuid('org_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	issueId: uuid('issue_id').references(() => issues.id, { onDelete: 'cascade' }),
+	commentId: uuid('comment_id').references(() => issueComments.id, { onDelete: 'cascade' }),
+	uploaderType: varchar('uploader_type', { length: 20 }).notNull(), // 'user' | 'agent'
+	uploaderId: varchar('uploader_id', { length: 255 }).notNull(),
+	filename: varchar('filename', { length: 512 }).notNull(),
+	contentType: varchar('content_type', { length: 255 }).notNull(),
+	sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+	storageKey: varchar('storage_key', { length: 1024 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const errorOccurrences = pgTable('error_occurrences', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	issueId: uuid('issue_id').notNull().references(() => issues.id),
