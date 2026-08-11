@@ -345,7 +345,18 @@ export async function getIssueRelations(issueId: string) {
 // the match set stays bounded; a prefix-only match (`id::text ILIKE query || '%'`) would miss the
 // "pasted the middle of an id" case for no real performance win at this scale, so full substring
 // matching was kept for consistency with the other ILIKE columns here.
-export async function searchIssuesInOrg(orgId: string, query: string, excludeIssueId?: string) {
+// Manual Issues M1 (design §9/§10, Q9): `issueType` is optional and defaults to unfiltered,
+// because this function is also the search behind the linked-issues panel — the DELIBERATE
+// bridge across the system_error/user_report split (§9: "Linked-issues panel is the only
+// bridge"). The error dashboard's own search bar (routes/api/issues/search) passes
+// issueType='system_error' explicitly; the relations endpoint leaves it unset so a manual
+// report can find and link a service issue (and vice versa).
+export async function searchIssuesInOrg(
+	orgId: string,
+	query: string,
+	excludeIssueId?: string,
+	issueType?: string
+) {
 	const sanitized = query.trim().replace(/[%_\\]/g, '\\$&');
 	const searchTerm = `%${sanitized}%`;
 	const baseQuery = db
@@ -363,6 +374,7 @@ export async function searchIssuesInOrg(orgId: string, query: string, excludeIss
 			and(
 				eq(projects.organizationId, orgId),
 				excludeIssueId ? sql`${issues.id} != ${excludeIssueId}` : sql`1=1`,
+				issueType ? eq(issues.issueType, issueType) : sql`1=1`,
 				sql`(${issues.id}::text ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
 			)
 		)

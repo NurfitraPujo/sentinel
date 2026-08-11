@@ -890,3 +890,36 @@ claim rolls back and the invitation stays `pending`.
 - The test fake for `db.transaction` had to be taught to snapshot and roll back on throw before it could
   detect a regression here — a fake that always applies the callback's writes cannot distinguish the
   correct design from the flawed one. See BUGS.md B10's addendum.
+
+
+## D19 | A Manual Issue Is an `issues` Row; Unrouted Reports Live in a Lazily-Provisioned `is_inbox` Triage Project
+
+**Date**: 2026-08-11 · **Status**: accepted · **Detail**: `docs/plans/MANUAL_ISSUES_DESIGN.md`
+(full 12-decision register in §0) · **Code**: `apps/dashboard-web/src/lib/db/queries/reports.ts`,
+`src/lib/server/report-access.ts`, migration `1722600000_add_manual_issue_reports_and_comments.sql`
+
+### Decision
+
+User-reported ("manual") issues reuse the `issues` table (`issue_type='user_report'`,
+`source_channel='manual_support'|'api'`, random-hex fingerprint satisfying
+`UNIQUE(project_id, fingerprint)`), with a 1:1 `manual_issue_reports` companion (reporter, Markdown
+body, severity). No parallel issue table. Because `issues.project_id` stays NOT NULL and reporters
+often cannot pick between fe/be projects, unrouted reports land in a per-org **Triage** project,
+provisioned lazily inside the create transaction and marked by the durable `projects.is_inbox`
+column — never by name convention. Claims (human now, agent in M5) are atomic conditional UPDATEs
+(`WHERE assigned_to IS NULL`; 0 rows = 409-class conflict), and both dashboards are strictly
+separated: error list/search/alerting filter `issue_type='system_error'` and exclude `is_inbox`
+projects; `issue_relations` is the only bridge.
+
+### Consequences
+
+- Linking, claiming, status, and the `issue_activity` timeline work for both issue types with one
+  code path — the M5 agent API can span both with a `type` filter instead of two surfaces.
+- `count`/`first_seen`/`last_seen`/`fingerprint` are vestigial on `user_report` rows; nothing may
+  ever interpret them semantically for manual issues.
+- Inbox projects carry inert placeholder credentials (`api_key`/`api_key_hash` are NOT NULL); the
+  placeholder must fit `varchar(64)` — a 70-char value made every first-use provisioning throw,
+  caught only by the real-Postgres flow test (`reports.e2e-flow.integration.test.ts`).
+- Permission checks for reports use `requireReportAccess` (viewers may create/read/comment;
+  `ISSUE_WRITE_ROLES` claim/move/resolve; owner/admin force-release) — a deliberate sibling of
+  `issue-access.ts`, not a loosening of it.

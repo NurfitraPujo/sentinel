@@ -1531,6 +1531,35 @@ close, one command at a time.
 
 ---
 
+## Manual (user-reported) issues — M1 core CRUD VERIFIED 2026-08-11 (branch `claude/fervent-kalam-27b223`, pre-merge)
+
+Phase M1 of `docs/plans/MANUAL_ISSUES_DESIGN.md` (agreed design, decision register in its §0):
+migration `1722600000_add_manual_issue_reports_and_comments.sql`, `queries/reports.ts`,
+`server/report-access.ts`, `/[orgSlug]/reports` routes, claim/move/activity APIs, Markdown +
+IssueTimeline components, strict-separation filters on the error-issue list/search paths.
+
+Proved by running, 2026-08-11:
+- Migration replayed twice + down/up against a **disposable** postgres (podman, port 15433) — clean;
+  `cd packages/db-migrations && go test ./...` green. Compose `migrate` applied it on top:
+  `goose: successfully migrated database to version: 1722600000`.
+- `pnpm build && pnpm check && pnpm test --sequence.shuffle` — 0 errors/warnings, 279 tests passed.
+- `go build ./... && go vet ./...`, `go test ./tests/unit/...` — 308 passed.
+- Full stack `docker compose up -d --build --force-recreate` (with `DASHBOARD_HOST_PORT=13000
+  INGESTOR_HOST_PORT=18080` because foreign processes owned 8080/3000) then
+  `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1` — **76 passed, 0 skipped**, no regression
+  from the strict-separation filters.
+- M1 flow proof: `apps/dashboard-web/src/lib/db/queries/reports.e2e-flow.integration.test.ts` runs
+  create(→Triage) → list → claim → second-claim **conflict** → move → activity ordering against a real
+  migrated disposable Postgres (hard-required via `M1_FLOW_INTEGRATION_REQUIRED=1`, same pattern as
+  `SCHEMA_DRIFT_REQUIRED`). This test caught a real bug no mock test could: the Triage placeholder
+  API key was 70 chars against `projects.api_key varchar(64)`, so **every first-use Triage
+  provisioning threw** — fixed red-first (`randomBytes(24)`).
+
+Not yet built (by design, later phases): attachments (M2), threads UI (M3 — the `issue_comments`
+table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
+
+---
+
 ## Keep here
 
 - Observed runtime/build behavior with the command that produced it.

@@ -179,6 +179,34 @@ has no consumer, drain, or dashboard surface yet.
 
 ---
 
+### 2026-08-11 - Manual (User-Reported) Issues M1: the Schema Was Waiting, and the Only Real Bug Was One Only a Real Database Could Catch
+
+- **Why durable**: The `issue_type='user_report'` / `source_channel` / `assignee_type` /
+  `issue_relations` machinery added by `1721900000` sat unused for weeks; M1 is the first feature to
+  exercise it, and it fit with zero schema rework — evidence that speculative-but-typed schema (CHECK
+  discriminators over separate tables) pays off when the feature finally lands. The full design and its
+  12-entry grilled decision register live in `docs/plans/MANUAL_ISSUES_DESIGN.md` §0; the load-bearing
+  ones: reuse `issues` (not a parallel table), per-org lazily-provisioned `is_inbox` Triage project so
+  `project_id` stays NOT NULL, atomic conditional-UPDATE claims, strict `system_error` filtering of the
+  existing dashboards.
+- **Future mistake prevented**: Trusting mock-based query tests for anything Postgres itself enforces.
+  All 19 mocked unit tests were green while `findOrCreateTriageProject` generated a 70-char placeholder
+  key into `varchar(64)` — every first-use Triage provisioning would have thrown in production. Only the
+  integration flow test (`reports.e2e-flow.integration.test.ts`, disposable Postgres, red-first) caught
+  it. Column limits, CHECKs, and FK cascades are invisible to chainable-mock tests — same class as S3/S14.
+- **Evidence**: gates at time of writing (uncommitted branch `claude/fervent-kalam-27b223`): all three
+  dashboard gates green (279 tests, shuffled), `go test ./tests/unit/...` 308 passed, migration replayed
+  2× + down/up on disposable Postgres, full-stack `SENTINEL_E2E=1 -tags=e2e` **76 passed / 0 skipped**
+  after the change. Orchestration: Sonnet implementors, Opus adversarial validators per stage (3-round
+  fix loops), Fable holistic review — the validator loop passed 4/4 stages first-round; the e2e stage
+  found the one real bug.
+- **Where to look**: `docs/plans/MANUAL_ISSUES_DESIGN.md`, `docs/memory/VERIFIED_STATE.md` → "Manual
+  (user-reported) issues — M1", `packages/db-migrations/migrations/1722600000_*.sql`,
+  `apps/dashboard-web/src/lib/db/queries/reports.ts`, `src/lib/server/report-access.ts`,
+  `src/routes/[orgSlug]/reports/`.
+
+---
+
 ### 2026-08-01 - A Feature Can Merge Green, Be Reviewed, and Still Never Run — Now With a Green CI to Prove Otherwise
 
 - **Why durable**: Five features closed the dashboard↔backend parity gaps, each merging with its own

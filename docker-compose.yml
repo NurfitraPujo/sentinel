@@ -117,7 +117,7 @@ services:
             dockerfile: apps/ingestor-go/Dockerfile
         container_name: sentinel-ingestor
         ports:
-            - "8080:8080"
+            - "${INGESTOR_HOST_PORT:-8080}:8080"
         depends_on:
             postgres:
                 condition: service_healthy
@@ -215,7 +215,7 @@ services:
             dockerfile: apps/dashboard-web/Dockerfile
         container_name: sentinel-dashboard
         ports:
-            - "3000:3000"
+            - "${DASHBOARD_HOST_PORT:-3000}:3000"
         depends_on:
             postgres:
                 condition: service_healthy

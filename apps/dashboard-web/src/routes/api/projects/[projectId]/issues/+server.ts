@@ -19,6 +19,7 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 			projectId: projects.id,
 			orgId: projects.organizationId,
 			userRole: organizationMembers.role,
+			isInbox: projects.isInbox,
 		})
 		.from(projects)
 		.leftJoin(organizationMembers, eq(organizationMembers.organizationId, projects.organizationId))
@@ -28,15 +29,26 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 		throw error(403, 'Forbidden: You do not have access to this project');
 	}
 
+	// Manual Issues M1 (§9/§10): Triage inbox projects are excluded from the error dashboard
+	// entirely, not just filtered by issue_type — they hold only user_report issues by
+	// construction, so this always resolves to an empty (but successful) list.
+	if (projectWithOrg[0].isInbox) {
+		return json({ issues: [] });
+	}
+
 	// Multi-dimensional search query params
 	const status = url.searchParams.get('status');
 	const regressionStatus = url.searchParams.get('regression_status');
 	const releaseVersion = url.searchParams.get('release_version');
 	const assigneeType = url.searchParams.get('assignee_type');
 	const assignedTo = url.searchParams.get('assigned_to');
-	const issueType = url.searchParams.get('issue_type');
-	
-	const conditions = [eq(issues.projectId, projectId)];
+
+	// Manual Issues M1 (design §9/§10, Q9): this is the error dashboard's issue listing, so it is
+	// hard-locked to `issue_type='system_error'` — NOT taken from the request. A caller-supplied
+	// `issue_type=user_report` would otherwise leak manual reports into the error dashboard,
+	// exactly the "noise both ways" §9 exists to prevent. Manual reports have their own listing
+	// (queries/reports.ts's listReports).
+	const conditions = [eq(issues.projectId, projectId), eq(issues.issueType, 'system_error')];
 
 	if (status) conditions.push(eq(issues.status, status));
 	if (regressionStatus) conditions.push(eq(issues.regressionStatus, regressionStatus));
@@ -51,7 +63,6 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 	}
 	if (assigneeType) conditions.push(eq(issues.assigneeType, assigneeType));
 	if (assignedTo) conditions.push(eq(issues.assignedTo, assignedTo));
-	if (issueType) conditions.push(eq(issues.issueType, issueType));
 
 	const filteredIssues = await db
 		.select()

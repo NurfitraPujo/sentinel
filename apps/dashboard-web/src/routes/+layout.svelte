@@ -17,6 +17,9 @@
 			<nav class="nav-menu">
 				<a href="/" class="nav-link active">Dashboard</a>
 				<a href="/issues" class="nav-link">Issues</a>
+				{#if data.orgSlug}
+					<a href="/{data.orgSlug}/reports" class="nav-link">Reports</a>
+				{/if}
 				<a href="/settings" class="nav-link">Settings</a>
 			</nav>
 			<div class="user-menu">
