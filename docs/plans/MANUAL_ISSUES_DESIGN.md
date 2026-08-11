@@ -288,6 +288,28 @@ invitations endpoint.
 | **M5 Agents — DONE 2026-08-12** (see VERIFIED_STATE.md "M5 agents"; agent-key rate limiting deliberately not wired yet — follow-up) | `agents` table, `'agent'` key scope + `agent_id`, `/api/agent/*` work-loop (pull/claim/progress/ask/resolve), `waiting_on` wiring, audit logging, real assignee picker | Credential scoping (B7); atomic claim under concurrency; replaces the mock |
 | **M6 Later** | SSE (LISTEN/NOTIFY or NATS), NATS push discovery, AI triage (project routing + `duplicate_of`), presigned large uploads, toolbar editor | All deliberately deferred |
 
+## 12. TODO — M6 backlog (deferred, not scheduled)
+
+M1–M5 are DONE (2026-08-12, branch `feat/manual-issues`). The following are deliberately
+deferred — each retains its acceptance bar from the sections above; none is missing by accident:
+
+- [ ] **SSE realtime** (§5/Q10): streaming `+server.ts` fed by Postgres LISTEN/NOTIFY or NATS,
+      replacing the ~10 s polling behind the same client API (`visible-poll.ts` call sites).
+- [ ] **NATS push discovery for agents** (§7/Q6): publish `issue.created`/`issue.claim_released`
+      so agents can subscribe instead of polling `GET /api/agent/issues`.
+- [ ] **AI triage** (§2/Q12, Q2 note): agent suggests/performs move-out-of-Triage and marks
+      duplicates via `relation_type='duplicate_of'`.
+- [ ] **Presigned multipart uploads** (§4/Q4): large-video path bypassing the 25 MB proxy cap.
+- [ ] **Toolbar Markdown editor** (§3/Q3): e.g. Tiptap with a Markdown serializer; no data
+      migration needed by design.
+- [ ] **Agent-key rate limiting** (M5 follow-up): `agent-auth.ts` notes the hook point;
+      `project_api_keys.rate_limit_rpm` already exists — enforce it on `/api/agent/*`.
+- [ ] **e2e harness cleanup FK ordering** (M5 follow-up): user rows deleted before
+      `manual_issue_reports` dependents — orphan rows in dev/CI DB (task chip filed 2026-08-12).
+- [ ] **Notification kinds for release/move** (M4 deviation): claim-release reuses kind `claimed`
+      with `payload.released`; move sends none. Widen the `notifications.kind` CHECK if product
+      wants distinct kinds.
+
 Per-phase definition of done: migration replayed twice against a disposable
 Postgres; `schema.ts` updated, drift test green; `pnpm build && pnpm check &&
 pnpm test --sequence.shuffle`; route→code call path exists (B3); new e2e matrix
