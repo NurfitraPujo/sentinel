@@ -74,7 +74,11 @@ export const GET: RequestHandler = async ({ url, locals }) => {
 		throw error(403, 'Forbidden: Insufficient permissions to search issues');
 	}
 
-	const searchResults = await searchIssuesInOrg(targetOrgId, query, currentIssueId);
+	// Manual Issues M1 (§9, Q9): this is the error dashboard's search bar, so it is hard-locked to
+	// system_error — a caller cannot widen it via a query param (there isn't one). The
+	// linked-issues panel (relations endpoint) calls searchIssuesInOrg directly without this
+	// filter, since it is the one deliberate bridge across the split.
+	const searchResults = await searchIssuesInOrg(targetOrgId, query, currentIssueId, 'system_error');
 
 	// D10: searchIssuesInOrg has no project filter, so scope results to projects the caller is
 	// actually a member of — an org member who is not on a given project must not see its issues.

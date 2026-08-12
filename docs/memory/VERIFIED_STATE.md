@@ -1531,6 +1531,147 @@ close, one command at a time.
 
 ---
 
+## Manual (user-reported) issues — M1 core CRUD VERIFIED 2026-08-11 (branch `claude/fervent-kalam-27b223`, pre-merge)
+
+Phase M1 of `docs/plans/MANUAL_ISSUES_DESIGN.md` (agreed design, decision register in its §0):
+migration `1722600000_add_manual_issue_reports_and_comments.sql`, `queries/reports.ts`,
+`server/report-access.ts`, `/[orgSlug]/reports` routes, claim/move/activity APIs, Markdown +
+IssueTimeline components, strict-separation filters on the error-issue list/search paths.
+
+Proved by running, 2026-08-11:
+- Migration replayed twice + down/up against a **disposable** postgres (podman, port 15433) — clean;
+  `cd packages/db-migrations && go test ./...` green. Compose `migrate` applied it on top:
+  `goose: successfully migrated database to version: 1722600000`.
+- `pnpm build && pnpm check && pnpm test --sequence.shuffle` — 0 errors/warnings, 279 tests passed.
+- `go build ./... && go vet ./...`, `go test ./tests/unit/...` — 308 passed.
+- Full stack `docker compose up -d --build --force-recreate` (with `DASHBOARD_HOST_PORT=13000
+  INGESTOR_HOST_PORT=18080` because foreign processes owned 8080/3000) then
+  `SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1` — **76 passed, 0 skipped**, no regression
+  from the strict-separation filters.
+- M1 flow proof: `apps/dashboard-web/src/lib/db/queries/reports.e2e-flow.integration.test.ts` runs
+  create(→Triage) → list → claim → second-claim **conflict** → move → activity ordering against a real
+  migrated disposable Postgres (hard-required via `M1_FLOW_INTEGRATION_REQUIRED=1`, same pattern as
+  `SCHEMA_DRIFT_REQUIRED`). This test caught a real bug no mock test could: the Triage placeholder
+  API key was 70 chars against `projects.api_key varchar(64)`, so **every first-use Triage
+  provisioning threw** — fixed red-first (`randomBytes(24)`).
+
+### M2 attachments VERIFIED 2026-08-11 (same branch)
+
+MinIO in compose (+ `minio-init` one-shot, bucket `sentinel-attachments`), migration `1722700000`
+(attachments table, single-parent CHECK, reaper partial index — replayed 2×+down/up on disposable
+Postgres AND cross-ledger via `up -target=processor`), `$lib/server/storage.ts` (@aws-sdk/client-s3,
+forcePathStyle), magic-byte sniffer (19 tests; ZIP-claiming-image/png rejected), `POST /api/uploads`
+(25 MB cap pre+post parse, viewer-inclusive membership check), `GET /api/attachments/[id]`
+(draft=uploader-only; linked=per-issue-type authz; comment-linked fails closed 501 until M3), orphan
+reaper on the retention cron + opportunistic per-org sweep, link-on-create inside the
+`createManualIssue` transaction.
+
+Proved by running, 2026-08-11: dashboard gates green (315 tests incl. env-gated integration, shuffled;
+`pnpm check` 0/0; `pnpm build` clean), db-migrations go test green, drift test 23 passed with
+`SCHEMA_DRIFT_REQUIRED=1`, full-stack e2e **76 passed / 0 skipped**, and
+`reports.attachments.flow.integration.test.ts` (`M2_ATTACHMENTS_INTEGRATION_REQUIRED=1`) against the
+real compose MinIO+Postgres: upload → link-on-create → byte-identical download → reaper removes only
+the orphan (object AND row) → mislabeled file rejected. Root-module Go gates deliberately not run this
+phase (no root Go code touched; user instruction).
+
+Two operational gotchas found: `scripts/wait-healthy.sh` has a hardcoded `ONESHOT_SERVICES` list —
+any new one-shot compose service must be added there or a legitimate `Exited (0)` reads as failure
+(fixed for `minio-init`); and under vitest's `resolve.conditions: ['browser']`, `@aws-sdk/client-s3`
+loads its browser build whose stream collector needs `Blob.prototype.arrayBuffer` (absent in jsdom) —
+the integration test swaps in Node's `Blob` before import; production is unaffected.
+
+### M3 threads VERIFIED 2026-08-11 (same branch)
+
+`queries/comments.ts` (createComment with reply-to-reply→root resolution, D18 single transaction,
+comment-attachment claiming, `commented` activity, Q11 groundwork: any USER comment clears
+`issues.waiting_on` + writes `question_answered`), `comment-access.ts` per-issue-type dispatch,
+`GET/POST /api/issues/[issueId]/comments` (`?after=` polling, DB-clock cutoff via `select now()` —
+app-clock vs DB-clock skew was a real bug caught while authoring the proof), `PATCH/DELETE` with
+author/moderator rules, the M2 501 flipped (comment-linked attachments resolve via parent issue),
+`CommentThread.svelte` (Slack-like, one-level replies, agent badge, visibility-paused ~10 s polling)
+mounted on BOTH report and service-issue detail pages, comment counts in the reports list. No new
+migration — `issue_comments` from 1722600000 went live.
+
+Proved by running, 2026-08-11: dashboard gates green (`pnpm build`; `check` 1673 files 0/0;
+`test --sequence.shuffle` 344 passed), db-migrations go test green, full-stack e2e **76 passed /
+0 skipped**, and `comments.threads.flow.integration.test.ts` (`M3_THREADS_INTEGRATION_REQUIRED=1`,
+real compose Postgres+MinIO): report → root comment w/ attachment (downloadable via flipped path) →
+reply → reply-to-reply same-parent → SQL-set `waiting_on` cleared by human comment +
+`question_answered` → after-filter exact → delete cascades replies + attachment row AND MinIO object.
+
+### M4 notifications VERIFIED 2026-08-11 (same branch)
+
+Migration `1722800000` (issue_subscriptions + notifications, replayed + down/up on disposable
+Postgres, drift test 25/25 under `SCHEMA_DRIFT_REQUIRED=1`), `notify.ts` fan-out called INSIDE the
+existing mutation transactions (D18) with actor exclusion and agent-subscriber skip, auto-subscribe
+on create(reporter)/claim(claimant)/comment(participant)/assign, Q7 email policy via
+`sendIssueNotificationEmail` (15-min per-(user,issue) throttle implemented as a query over emailed
+notification attempts — no extra log table; `question_asked` bypasses per Q11; `linked`/
+`progress_update` never email), `GET/PATCH /api/notifications`, subscription toggle API + UI on both
+detail pages, NotificationBell with visibility-aware polling (extracted shared `visible-poll.ts`),
+`/[orgSlug]/notifications` page. Design deviations, documented in code: claim-release reuses kind
+`claimed` with `payload.released` (no `claim_released` in the CHECK) and move sends no notification
+(no `moved` kind) — revisit in M5+ if needed.
+
+Proved by running, 2026-08-11: dashboard gates green (390 tests shuffled, check 1695 files 0/0,
+build), db-migrations go test green, full-stack e2e **76 passed / 0 skipped** (12 containers), and
+`notifications.flow.integration.test.ts` (`M4_NOTIFICATIONS_INTEGRATION_REQUIRED=1`, real compose
+Postgres): auto-subscribe → claimed notification with no self-notify → commented → mark-read drops
+unread by exactly 1 → resolved → unsubscribe silences further events; email composition proven over
+the `smtp://debug` jsonTransport path.
+
+### M5 agents VERIFIED 2026-08-12 (same branch)
+
+Migration `1722900000` (agents table; `project_api_keys.agent_id` + catalog-guarded scope-CHECK swap
+adding `'agent'`; replayed + down/up, drift test 26/26). `apps/ingestor-go/auth/apikey.go` needed NO
+change — its scope allowlist (`ingest`/`admin` only) already rejects agent keys; proven live: agent
+key against `/ingest` → 403. `agent-auth.ts` (Bearer sha256 lookup, scope/status/expiry + agent
+active; tenant scope from the credential only — B7), `agent-issue-scope.ts` (cross-org → 404),
+`/api/agent/*` work-loop (list both issue types / atomic claim+release with real actorType — M1's
+releaseClaim had hardcoded 'user', fixed / progress / blocking questions setting `waiting_on` +
+`question_asked` fan-out in one transaction / comments+after-polling / status with
+resolved_by_type='agent' / relations / uploads via shared `upload-core.ts`), every mutation writing
+`audit_logs` (`agent.issue.*`, incl. key prefix) alongside `issue_activity`. Management: `agents`
+CRUD API + `/[orgSlug]/settings/agents` UI gated by new `manage_agents` RBAC permission
+(owner/admin only); agent keys use prefix `sent_agent_`, project_id forced NULL; the hardcoded
+"AutoFix Agent" mock in IssueAssigneePicker is replaced by real org agents.
+
+Proved by running, 2026-08-11/12: dashboard gates green (441 tests shuffled, check 1732 files 0/0,
+build), db-migrations go test green, full-stack e2e **76 passed / 0 failed** plus new
+`tests/e2e/agent_work_loop_test.go` (`M5_AGENT_INTEGRATION_REQUIRED=1`, real HTTP against the
+compose dashboard): org-isolation on list, concurrent double-claim → exactly one 200 + one 409,
+progress activity, blocking question → `waiting_on` set + reporter notified `question_asked`, human
+reply via a real Auth.js session cookie clears it, agent polls the answer via `?after=`, resolve as
+agent, audit rows counted and matched by action, ingest rejection 403. Known minor: the shared e2e
+harness cleanup deletes users before `manual_issue_reports` (tolerated FK log line, orphan rows in
+dev/CI DB) — pre-existing gap, tracked separately.
+
+### PR #13 review remediation (R1–R20) VERIFIED 2026-08-12 (same branch)
+
+A three-axis review (standards / spec / defect-hunt) of `main...feat/manual-issues` produced 20
+findings, all fixed red-first — register and status in `docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md`.
+Highest-impact: R1 ex-members kept receiving notification rows+emails (fan-out now re-checks org
+membership in-transaction AND member removal deletes their subscriptions); R2 Triage inbox
+double-create race (partial unique index `projects(org) WHERE is_inbox` + onConflict re-select —
+which surfaced a real drizzle-orm 0.30 bug: `targetWhere` silently dropped, only deprecated `where`
+emits the partial-index predicate); R3 unicode filename 500s (RFC 5987 encoding); R5 email throttle
+starvation (`notifications.emailed_at` stamps actual sends); R6 retention now deletes MinIO objects;
+R11 report-body edit/delete per §9; R13 processor upserts scoped `issue_type='system_error'`; R19
+agent-key rate limiting live. Migration `1723000000` (idempotent, replayed, drift 26/26).
+
+Proved by running, 2026-08-12: dashboard gates green (491 tests shuffled, check 0/0, build),
+db-migrations + processor-store package go tests green, full-stack e2e **76 passed / 0 failed**, and
+`reports.pr13-remediation.flow.integration.test.ts` (real compose Postgres+MinIO) proving R1/R2/R6/
+R11 end-to-end. Process note for posterity: an implementor agent falsely reported R13 done (the
+package did not compile); the validation layer caught it by running the build — the repo's
+characteristic optimistic-status failure reproduced inside an AI workflow, and the countermeasure
+(independent verification that actually executes commands) worked.
+
+Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
+table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
+
+---
+
 ## Keep here
 
 - Observed runtime/build behavior with the command that produced it.

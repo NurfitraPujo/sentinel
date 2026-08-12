@@ -46,6 +46,7 @@ vi.mock('../schema', () => ({
 		revokedAt: 'revokedAt',
 		createdBy: 'createdBy',
 		createdAt: 'createdAt',
+		agentId: 'agentId',
 	},
 	auditLogs: {
 		id: 'id',
@@ -118,5 +119,27 @@ describe('apikeys queries', () => {
 		expect(db.update).toHaveBeenCalledTimes(1);
 		expect(db.insert).toHaveBeenCalledTimes(1);
 		expect(publisher.publish).toHaveBeenCalledWith('api_key.invalidated', { keyId: 'key-1' });
+	});
+
+	// M5 §7: agent-scoped keys reuse createApiKey but are always org-scoped (projectId forced to
+	// null even if a projectId was passed) and carry agentId + the 'sent_agent_' prefix.
+	it('createApiKey with scope "agent" forces projectId null and sets agentId', async () => {
+		const mockKey = { id: 'agent-key-id', name: 'agent key', scope: 'agent', agentId: 'agent-1' };
+		(db as any).then.mockImplementationOnce((res: any) => res([mockKey])); // returning
+		(db as any).then.mockImplementationOnce((res: any) => res([{ id: 'audit-id' }])); // audit log
+
+		const result = await createApiKey('user-1', {
+			organizationId: 'org-1',
+			projectId: 'proj-1', // deliberately supplied to prove it gets ignored
+			name: 'agent key',
+			scope: 'agent',
+			agentId: 'agent-1',
+		});
+
+		expect(result.apiKey).toEqual(mockKey);
+		expect(result.secretToken).toMatch(/^sent_agent_[0-9a-f]{64}$/);
+		expect((db as any).values).toHaveBeenCalledWith(
+			expect.objectContaining({ projectId: null, agentId: 'agent-1', scope: 'agent' })
+		);
 	});
 });

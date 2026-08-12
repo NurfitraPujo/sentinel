@@ -45,6 +45,14 @@ const apikeyQueries = {
 };
 vi.mock('$lib/db/queries/apikeys', () => apikeyQueries);
 
+// M5 §7: keys/+server.ts's POST handler resolves agentId (for scope='agent') via
+// $lib/db/queries/agents, so it needs its own double here — real agents.ts would otherwise hit
+// this file's schema mock, which does not declare an `agents` export.
+const agentQueries = {
+	getAgentById: vi.fn(),
+};
+vi.mock('$lib/db/queries/agents', () => agentQueries);
+
 // Recursively walks an arbitrary response body and fails if a 'keyHash' property is found at
 // any depth (top-level, nested inside `key`, inside arrays, etc). D09: keyHash is the SHA-256 of
 // the live secret and is the exact value the ingestor's Redis cache is keyed on
@@ -185,6 +193,65 @@ describe('organization API key routes', () => {
 			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
 		});
 
+		// M5 §7/§9: agent-key issuance is gated by 'manage_agents' (owner/admin), narrower than
+		// the 'manage_keys' gate (owner/admin/engineer) every other scope uses.
+		it('403s for an engineer trying to issue an agent key', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('engineer')]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'agent key', scope: 'agent', agentId: 'agent-1' }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 403 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('400s issuing an agent key without an agentId', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'agent key', scope: 'agent' }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('400s issuing an agent key whose agentId belongs to a different organization', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-1', orgId: 'org-2' });
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'agent key', scope: 'agent', agentId: 'agent-1' }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('201s for an owner issuing an agent key, org-scoped (projectId null) regardless of a supplied projectId', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-1', orgId: 'org-1' });
+			apikeyQueries.createApiKey.mockResolvedValueOnce({
+				apiKey: { id: 'key-new', keyHash: 'deadbeef-hash', agentId: 'agent-1' },
+				secretToken: 'sent_agent_deadbeef',
+			});
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'agent key', scope: 'agent', agentId: 'agent-1', projectId: 'proj-1' }),
+			});
+
+			const res = await POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any);
+			expect(res.status).toBe(201);
+			expect(apikeyQueries.createApiKey).toHaveBeenCalledWith(
+				'user-1',
+				expect.objectContaining({ scope: 'agent', agentId: 'agent-1', projectId: null })
+			);
+		});
+
 		it('201s for a valid positive integer rateLimitRpm', async () => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
 			apikeyQueries.createApiKey.mockResolvedValueOnce({
@@ -232,6 +299,28 @@ describe('organization API key routes', () => {
 				DELETE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any)
 			).rejects.toMatchObject({ status: 403 });
 			expect(apikeyQueries.getApiKeyById).not.toHaveBeenCalled();
+		});
+
+		// M5 §7/§9: revoking an agent's key needs 'manage_agents' (owner/admin), not the broader
+		// 'manage_keys' (owner/admin/engineer) that every other scope uses.
+		it('403s for an engineer revoking an agent-scoped key', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('engineer')]));
+			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1', scope: 'agent' });
+
+			await expect(
+				DELETE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 403 });
+			expect(apikeyQueries.revokeApiKey).not.toHaveBeenCalled();
+		});
+
+		it('revokes an agent-scoped key for an admin', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('admin')]));
+			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1', scope: 'agent' });
+			apikeyQueries.revokeApiKey.mockResolvedValueOnce({ id: 'key-1', status: 'revoked' });
+
+			const res = await DELETE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any);
+			const body = await res.json();
+			expect(body.success).toBe(true);
 		});
 	});
 

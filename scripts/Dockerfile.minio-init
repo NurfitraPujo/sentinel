@@ -1,0 +1,7 @@
+# Fully qualified + pinned, matching Dockerfile.nats-init's rationale: podman resolves no
+# unqualified short names unless registries.conf defines unqualified-search-registries, and an
+# unpinned tag means behavior can change on any prune+pull.
+FROM docker.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+COPY minio-init.sh /scripts/minio-init.sh
+RUN chmod +x /scripts/minio-init.sh
+ENTRYPOINT ["/bin/sh", "/scripts/minio-init.sh"]

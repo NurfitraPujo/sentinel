@@ -29,3 +29,9 @@ const client = postgres(connectionString, {
 });
 
 export const db = drizzle(client);
+
+// R15 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the Drizzle transaction callback param type,
+// exported so query modules that accept an optional/explicit `tx` (subscriptions, notify,
+// reports' attachment-claim helpers) can type it precisely instead of `tx: any` -- `any` let a
+// caller pass anything (or a typo'd property name) with no compile-time signal.
+export type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];

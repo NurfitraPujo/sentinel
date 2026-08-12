@@ -1,10 +1,11 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getOrganizationApiKeys, createApiKey, toPublicKey } from '$lib/db/queries/apikeys';
+import { getAgentById } from '$lib/db/queries/agents';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership, resolveProjectInOrg } from './_shared';
 
-const VALID_SCOPES = ['ingest', 'read', 'admin'] as const;
+const VALID_SCOPES = ['ingest', 'read', 'admin', 'agent'] as const;
 
 export const GET: RequestHandler = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -36,10 +37,6 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	if (!membership) {
 		throw error(403, 'Forbidden: not a member of this organization');
 	}
-	// FR-007: only owner, admin, engineer may manage API keys.
-	if (!hasPermission(membership.role, 'manage_keys')) {
-		throw error(403, 'Forbidden: only owners, admins, and engineers can create API keys');
-	}
 
 	const body = await request.json().catch(() => ({}) as any);
 	if (!body?.name || typeof body.name !== 'string') {
@@ -54,6 +51,28 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		throw error(400, `Invalid scope: must be one of ${VALID_SCOPES.join(', ')}`);
 	}
 	const scope = VALID_SCOPES.includes(body.scope) ? body.scope : 'ingest';
+
+	// M5 §7/§9: agent-key issuance reuses this same machinery but is gated by 'manage_agents'
+	// (owner/admin only), not 'manage_keys' (owner/admin/engineer) -- an engineer can create
+	// ordinary ingest/read/admin keys but must not be able to mint an agent identity's
+	// credential. Every other scope keeps the FR-007 gate unchanged.
+	if (scope === 'agent') {
+		if (!hasPermission(membership.role, 'manage_agents')) {
+			throw error(403, 'Forbidden: only owners and admins can issue agent keys');
+		}
+		if (!body.agentId || typeof body.agentId !== 'string') {
+			throw error(400, 'agentId is required when scope is "agent"');
+		}
+		const agentRow = await getAgentById(body.agentId);
+		// Same S6-class scoping as everywhere else: an agentId belonging to another organization
+		// must be indistinguishable from one that does not exist.
+		if (!agentRow || agentRow.orgId !== orgId) {
+			throw error(400, 'agentId not found in this organization');
+		}
+	} else if (!hasPermission(membership.role, 'manage_keys')) {
+		// FR-007: only owner, admin, engineer may manage non-agent API keys.
+		throw error(403, 'Forbidden: only owners, admins, and engineers can create API keys');
+	}
 
 	// D28: rateLimitRpm accepted ANY number — negative, zero, or absurdly large (1e12) — and passed
 	// it straight through to the ingestor's rate limiter. Require a positive, finite integer within
@@ -75,17 +94,21 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	// targetProject/projectId identifies a project WITHIN this organization; absent (or the
 	// "All Projects [Org-Wide]" sentinel the UI uses) means an organization-wide key. Whatever the
 	// caller names is resolved scoped to THIS org (never globally) — naming another organization's
-	// project id/name must behave exactly like naming nothing that exists.
-	const requestedProject: string | undefined =
-		body.projectId ?? (body.targetProject && body.targetProject !== 'All Projects [Org-Wide]' ? body.targetProject : undefined);
-
+	// project id/name must behave exactly like naming nothing that exists. Agent keys (§7) are
+	// ALWAYS org-scoped -- an agent works across every project in the org -- so project resolution
+	// is skipped entirely for scope='agent' even if the caller (incorrectly) sent one.
 	let projectId: string | null = null;
-	if (requestedProject) {
-		const resolved = await resolveProjectInOrg(orgId!, requestedProject);
-		if (!resolved) {
-			throw error(400, 'targetProject not found in this organization');
+	if (scope !== 'agent') {
+		const requestedProject: string | undefined =
+			body.projectId ?? (body.targetProject && body.targetProject !== 'All Projects [Org-Wide]' ? body.targetProject : undefined);
+
+		if (requestedProject) {
+			const resolved = await resolveProjectInOrg(orgId!, requestedProject);
+			if (!resolved) {
+				throw error(400, 'targetProject not found in this organization');
+			}
+			projectId = resolved;
 		}
-		projectId = resolved;
 	}
 
 	const { apiKey, secretToken } = await createApiKey(session.user.id, {
@@ -94,6 +117,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		name: body.name,
 		scope,
 		rateLimitRpm: typeof body.rateLimitRpm === 'number' ? body.rateLimitRpm : undefined,
+		agentId: scope === 'agent' ? body.agentId : undefined,
 	});
 
 	// The raw secret token is returned exactly once, here, and is never stored (only its SHA256

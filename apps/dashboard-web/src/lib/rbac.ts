@@ -65,12 +65,40 @@ const ROLE_PERMISSIONS: Record<AnyRole, string[]> = {
 	support: ['read'],
 };
 
-export function hasPermission(role: AnyRole, permission: string): boolean {
+// R14 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): 'manage_agents' gates agent identity +
+// agent-key issuance/revocation per docs/plans/MANUAL_ISSUES_DESIGN.md §9's permission matrix
+// ("Manage agents + agent keys" -> owner, admin **of the organization**) -- deliberately narrower
+// than 'manage_keys'. It used to live on the single shared `ROLE_PERMISSIONS.admin` entry, which
+// is the SAME object key for both the project-scoped `Role` and the org-scoped `OrgRole` (both
+// types include the literal 'admin') -- so a project-scoped admin (project_members.role='admin',
+// who administers exactly one project) transitively got an org-wide permission meant only for an
+// organization admin/owner. A dedicated set, checked only by `hasOrgPermission`/`hasPermission`'s
+// `scope: 'org'` path, keeps the grant off the project-role admin entry entirely.
+const ORG_ONLY_PERMISSIONS: Record<'owner' | 'admin', string[]> = {
+	owner: ['manage_agents'],
+	admin: ['manage_agents'],
+};
+
+export type PermissionScope = 'project' | 'org';
+
+/**
+ * `scope` defaults to `'org'` for backward compatibility -- every existing call site either
+ * passes an `OrgRole` (organization_members.role) or a permission ('read'/'write'/'manage_keys')
+ * that is identical across both scopes, so this default changes no existing behavior. Pass
+ * `scope: 'project'` explicitly for a project-scoped role check that must NOT see org-only
+ * grants like 'manage_agents' (R14).
+ */
+export function hasPermission(role: AnyRole, permission: string, scope: PermissionScope = 'org'): boolean {
+	if (scope === 'org' && (role === 'owner' || role === 'admin')) {
+		if (ORG_ONLY_PERMISSIONS[role].includes(permission)) {
+			return true;
+		}
+	}
 	return ROLE_PERMISSIONS[role]?.includes(permission) ?? false;
 }
 
-export function requirePermission(role: AnyRole, permission: string): void {
-	if (!hasPermission(role, permission)) {
+export function requirePermission(role: AnyRole, permission: string, scope: PermissionScope = 'org'): void {
+	if (!hasPermission(role, permission, scope)) {
 		throw new Error(`Insufficient permissions: ${permission} requires ${role} role`);
 	}
 }

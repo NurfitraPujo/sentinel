@@ -759,10 +759,21 @@ func (f *fixture) newDashboardUser(role string) *dashboardUser {
 	}
 
 	f.t.Cleanup(func() {
-		exec(context.Background(), `DELETE FROM session WHERE user_id = $1`, u.ID)
-		exec(context.Background(), `DELETE FROM organization_members WHERE user_id = $1`, u.ID)
-		exec(context.Background(), `DELETE FROM project_members WHERE user_id = $1`, u.ID)
-		exec(context.Background(), `DELETE FROM "user" WHERE id = $1`, u.ID)
+		cctx := context.Background()
+		exec(cctx, `DELETE FROM session WHERE user_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM organization_members WHERE user_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM project_members WHERE user_id = $1`, u.ID)
+		// Rows that reference this user must go before the "user" row itself.
+		// manual_issue_reports.reporter_id is a RESTRICT FK to "user"(id): deleting the
+		// user first raises a foreign-key violation (which exec() only logs), stranding the
+		// report rows. issue_subscriptions/issue_comments key on the polymorphic
+		// (type, id) pair with no DB-level FK, so they leave silent orphans instead.
+		// notifications cascades, but only once the user delete actually succeeds.
+		exec(cctx, `DELETE FROM manual_issue_reports WHERE reporter_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM issue_subscriptions WHERE subscriber_type = 'user' AND subscriber_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM issue_comments WHERE author_type = 'user' AND author_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM notifications WHERE user_id = $1`, u.ID)
+		exec(cctx, `DELETE FROM "user" WHERE id = $1`, u.ID)
 	})
 
 	return u

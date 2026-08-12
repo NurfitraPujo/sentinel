@@ -3,6 +3,8 @@ import { issues, issueActivity, issueRelations, projects } from '$lib/db/schema'
 import { eq, and, desc, sql, inArray } from 'drizzle-orm';
 import semver from 'semver';
 import type { RelationType } from '$lib/types/relation-type';
+import { subscribe } from '$lib/db/queries/subscriptions';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 
 // Robust semver comparison helper with fallback
 function isRegression(releaseVersion: string, resolvedInVersion: string): boolean {
@@ -33,9 +35,12 @@ export async function updateIssueStatus(
 	resolvedInVersion?: string,
 	actorType?: 'user' | 'agent',
 	actorId?: string
-) {
+): Promise<NotifiedUser[]> {
 	return await db.transaction(async (tx) => {
-		const [existing] = await tx.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+		const [existing] = await tx
+			.select({ status: issues.status, waitingOn: issues.waitingOn })
+			.from(issues)
+			.where(eq(issues.id, issueId));
 
 		const updateData: any = { status };
 
@@ -51,6 +56,14 @@ export async function updateIssueStatus(
 			updateData.resolvedBy = null;
 		}
 
+		// R7 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): resolving or ignoring an issue that was
+		// `waiting_on` someone left it stuck in the "Needs input" tab forever -- nothing else ever
+		// clears `waiting_on` once the issue leaves the unresolved state. Clearing it here mirrors
+		// createComment's own clearing of `waiting_on` on a user reply (queries/comments.ts).
+		if ((status === 'resolved' || status === 'ignored') && existing?.waitingOn) {
+			updateData.waitingOn = null;
+		}
+
 		await tx.update(issues)
 			.set(updateData)
 			.where(eq(issues.id, issueId));
@@ -61,8 +74,19 @@ export async function updateIssueStatus(
 			eventType: 'status_changed',
 			actorType: actorType || 'system',
 			actorId: actorId || 'system',
-			oldValue: existing ? { status: existing.status } : null,
+			oldValue: existing ? { status: existing.status, waitingOn: existing.waitingOn } : null,
 			newValue: { status, resolvedInVersion },
+		});
+
+		// §8: 'resolved' gets its own notification kind (design's email-policy table lists it
+		// separately from 'status_changed'); every other status transition (including back to
+		// 'unresolved'/'ignored') is 'status_changed'.
+		return await notifyIssueEvent(tx, {
+			issueId,
+			kind: status === 'resolved' ? 'resolved' : 'status_changed',
+			actorType: actorType || 'system',
+			actorId: actorId || 'system',
+			payload: { status, resolvedInVersion },
 		});
 	});
 }
@@ -195,6 +219,14 @@ export async function assignIssue(
 			actorId,
 			newValue: { assigneeType, assignedTo },
 		});
+
+		// §8 auto-subscribe: an assignee is treated like a claimant (reason 'claimant'). USER
+		// assignees only -- agents get no notifications row in M4, so subscribing one here would
+		// only grow issue_subscriptions with a row notifyIssueEvent always skips. No fan-out call:
+		// design's fan-out wiring list does not include assignIssue (only auto-subscribe).
+		if (assignedTo && assigneeType === 'user') {
+			await subscribe({ issueId, subscriberType: 'user', subscriberId: assignedTo, reason: 'claimant' }, tx);
+		}
 	});
 }
 
@@ -204,7 +236,7 @@ export async function createIssueRelation(
 	relationType: RelationType,
 	createdByType: 'user' | 'agent' | 'system',
 	createdBy: string
-) {
+): Promise<{ relation: typeof issueRelations.$inferSelect; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const [relation] = await tx.insert(issueRelations).values({
 			sourceIssueId,
@@ -222,7 +254,19 @@ export async function createIssueRelation(
 			newValue: { targetIssueId, relationType },
 		});
 
-		return relation;
+		// §8: 'linked' fan-out is scoped to the SOURCE issue's subscribers only -- the target
+		// issue's own subscribers already see the link via its own activity/comment feed once
+		// something references it; this notification is specifically "something changed on an
+		// issue you're subscribed to", not "your issue got mentioned elsewhere".
+		const notified = await notifyIssueEvent(tx, {
+			issueId: sourceIssueId,
+			kind: 'linked',
+			actorType: createdByType,
+			actorId: createdBy,
+			payload: { targetIssueId, relationType },
+		});
+
+		return { relation, notified };
 	});
 }
 
@@ -345,7 +389,18 @@ export async function getIssueRelations(issueId: string) {
 // the match set stays bounded; a prefix-only match (`id::text ILIKE query || '%'`) would miss the
 // "pasted the middle of an id" case for no real performance win at this scale, so full substring
 // matching was kept for consistency with the other ILIKE columns here.
-export async function searchIssuesInOrg(orgId: string, query: string, excludeIssueId?: string) {
+// Manual Issues M1 (design §9/§10, Q9): `issueType` is optional and defaults to unfiltered,
+// because this function is also the search behind the linked-issues panel — the DELIBERATE
+// bridge across the system_error/user_report split (§9: "Linked-issues panel is the only
+// bridge"). The error dashboard's own search bar (routes/api/issues/search) passes
+// issueType='system_error' explicitly; the relations endpoint leaves it unset so a manual
+// report can find and link a service issue (and vice versa).
+export async function searchIssuesInOrg(
+	orgId: string,
+	query: string,
+	excludeIssueId?: string,
+	issueType?: string
+) {
 	const sanitized = query.trim().replace(/[%_\\]/g, '\\$&');
 	const searchTerm = `%${sanitized}%`;
 	const baseQuery = db
@@ -363,6 +418,7 @@ export async function searchIssuesInOrg(orgId: string, query: string, excludeIss
 			and(
 				eq(projects.organizationId, orgId),
 				excludeIssueId ? sql`${issues.id} != ${excludeIssueId}` : sql`1=1`,
+				issueType ? eq(issues.issueType, issueType) : sql`1=1`,
 				sql`(${issues.id}::text ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
 			)
 		)
