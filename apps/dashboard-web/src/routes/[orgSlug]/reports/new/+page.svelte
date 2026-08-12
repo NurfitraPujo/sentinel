@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import Markdown from '$lib/components/Markdown.svelte';
 	import UploadZone from '$lib/components/attachments/UploadZone.svelte';
+	import MarkdownToolbar from '$lib/components/issues/MarkdownToolbar.svelte';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -128,6 +129,7 @@
 					<Markdown source={bodyMd} />
 				</div>
 			{:else}
+				<MarkdownToolbar textarea={bodyTextarea} value={bodyMd} onchange={(v) => (bodyMd = v)} />
 				<textarea
 					bind:this={bodyTextarea}
 					bind:value={bodyMd}

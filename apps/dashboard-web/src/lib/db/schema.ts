@@ -176,6 +176,12 @@ export const attachments = pgTable('attachments', {
 	contentType: varchar('content_type', { length: 255 }).notNull(),
 	sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
 	storageKey: varchar('storage_key', { length: 1024 }).notNull(),
+	// M6 Feature A (1723100000_add_attachment_status.sql): 'pending' | 'ready'. Presigned-upload
+	// rows start 'pending' and only flip to 'ready' at finalize, after the same
+	// sniffContentType/resolveContentType validation the proxy path runs inline. A 'pending'
+	// object must never be linkable -- claimDraftAttachmentsOnto in queries/reports.ts enforces
+	// this as the single chokepoint. Defaults to 'ready' for the existing proxied-upload path.
+	status: varchar('status', { length: 16 }).notNull().default('ready'),
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

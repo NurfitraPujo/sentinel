@@ -11,6 +11,16 @@
 	// "uploading…" is enough feedback. XHR would give byte progress but this component is tested
 	// by mocking `fetch`, matching every other component test in this codebase (see
 	// IssueRelations.test.ts) -- consistency with that convention outweighs the finer-grained bar.
+	//
+	// M6 Feature A (docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md §Feature A): files over the
+	// 25 MB proxy cap route through a second path instead -- POST /api/uploads/presign for a
+	// direct-to-bucket PUT url, an XHR PUT of the raw bytes (XHR specifically, so a real
+	// byte-percentage progress bar is possible for a large video), then POST
+	// /api/uploads/<id>/finalize, whose JSON is the same UploadedAttachment shape the proxy path
+	// returns. The server treats the object as untrusted until finalize re-sniffs it -- this
+	// component never marks a large file "done" before finalize succeeds.
+	const PROXY_UPLOAD_CAP_BYTES = 25 * 1024 * 1024;
+
 	interface UploadedAttachment {
 		id: string;
 		url: string;
@@ -27,6 +37,8 @@
 		status: FileStatus;
 		errorMessage?: string;
 		attachment?: UploadedAttachment;
+		/** Byte-percentage (0-100) for the large-file presigned-PUT path only. */
+		progress?: number;
 	}
 
 	interface Props {
@@ -57,21 +69,93 @@
 		onchange?.(files.filter((f) => f.status === 'done' && f.attachment).map((f) => f.attachment!.id));
 	}
 
+	function setProgress(key: string, progress: number) {
+		files = files.map((f) => (f.key === key ? { ...f, progress } : f));
+	}
+
+	/** XHR PUT so upload progress is a real byte percentage, not just a spinner (see file-top comment). */
+	function xhrPut(url: string, file: File, onProgress: (pct: number) => void): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const xhr = new XMLHttpRequest();
+			xhr.open('PUT', url);
+			xhr.upload.onprogress = (event) => {
+				if (event.lengthComputable) {
+					onProgress(Math.round((event.loaded / event.total) * 100));
+				}
+			};
+			xhr.onload = () => {
+				if (xhr.status >= 200 && xhr.status < 300) {
+					resolve();
+				} else {
+					reject(new Error(`Upload failed (${xhr.status})`));
+				}
+			};
+			xhr.onerror = () => reject(new Error('Upload failed'));
+			// Send a type-stripped Blob, NOT the File directly: an XHR body with a non-empty Blob
+			// type makes the browser attach a Content-Type header, but the presigned PUT signs only
+			// host+key (see storage.ts), so any unsigned Content-Type is a MinIO "headers present …
+			// which were not signed" rejection. A Blob wrapped with no type sends no Content-Type.
+			// The stored type is irrelevant anyway -- finalize re-sniffs and the download route
+			// serves the sniffed DB content_type.
+			xhr.send(new Blob([file]));
+		});
+	}
+
+	async function uploadProxied(tracked: TrackedFile) {
+		const formData = new FormData();
+		formData.append('organizationId', organizationId);
+		formData.append('file', tracked.file);
+		formData.append('filename', tracked.file.name);
+
+		const res = await fetch('/api/uploads', { method: 'POST', body: formData });
+
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			throw new Error(body.message || `Upload failed (${res.status})`);
+		}
+
+		return (await res.json()) as UploadedAttachment;
+	}
+
+	async function uploadPresigned(tracked: TrackedFile) {
+		const presignRes = await fetch('/api/uploads/presign', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				organizationId,
+				filename: tracked.file.name,
+				contentType: tracked.file.type,
+				sizeBytes: tracked.file.size,
+			}),
+		});
+		if (!presignRes.ok) {
+			const body = await presignRes.json().catch(() => ({}));
+			throw new Error(body.message || `Upload failed (${presignRes.status})`);
+		}
+		const { attachmentId, uploadUrl } = (await presignRes.json()) as {
+			attachmentId: string;
+			uploadUrl: string;
+		};
+
+		setProgress(tracked.key, 0);
+		await xhrPut(uploadUrl, tracked.file, (pct) => setProgress(tracked.key, pct));
+		setProgress(tracked.key, 100);
+
+		const finalizeRes = await fetch(`/api/uploads/${attachmentId}/finalize`, { method: 'POST' });
+		if (!finalizeRes.ok) {
+			const body = await finalizeRes.json().catch(() => ({}));
+			throw new Error(body.message || `Upload failed (${finalizeRes.status})`);
+		}
+
+		return (await finalizeRes.json()) as UploadedAttachment;
+	}
+
 	async function uploadOne(tracked: TrackedFile) {
 		try {
-			const formData = new FormData();
-			formData.append('organizationId', organizationId);
-			formData.append('file', tracked.file);
-			formData.append('filename', tracked.file.name);
-
-			const res = await fetch('/api/uploads', { method: 'POST', body: formData });
-
-			if (!res.ok) {
-				const body = await res.json().catch(() => ({}));
-				throw new Error(body.message || `Upload failed (${res.status})`);
-			}
-
-			const attachment: UploadedAttachment = await res.json();
+			const attachment =
+				tracked.file.size > PROXY_UPLOAD_CAP_BYTES
+					? await uploadPresigned(tracked)
+					: await uploadProxied(tracked);
 
 			files = files.map((f) => (f.key === tracked.key ? { ...f, status: 'done', attachment } : f));
 		} catch (err) {
@@ -162,7 +246,9 @@
 		}}
 	>
 		<p class="dropzone-text">Drag and drop files here, or click to browse</p>
-		<p class="dropzone-hint">Images, video, PDF, text, doc, zip — up to 25 MB each</p>
+		<p class="dropzone-hint">
+			Images, video, PDF, text, doc, zip — up to 25 MB proxied, large video up to 500 MB
+		</p>
 	</div>
 	<input
 		bind:this={fileInput}
@@ -188,7 +274,9 @@
 						<span class="file-meta">
 							{formatBytes(tracked.file.size)}
 							{#if tracked.status === 'uploading'}
-								<span class="status status-uploading">Uploading…</span>
+								<span class="status status-uploading">
+									{tracked.progress !== undefined ? `Uploading… ${tracked.progress}%` : 'Uploading…'}
+								</span>
 							{:else if tracked.status === 'done'}
 								<span class="status status-done">Uploaded</span>
 							{:else if tracked.status === 'error'}

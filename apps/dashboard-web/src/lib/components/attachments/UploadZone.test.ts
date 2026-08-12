@@ -132,6 +132,87 @@ describe('UploadZone', () => {
 		expect(oninsert).toHaveBeenCalledWith('![screenshot.png](/api/attachments/att-3)');
 	});
 
+	it('routes a file over 25 MB through presign -> XHR PUT -> finalize instead of the proxy POST', async () => {
+		const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+			if (url === '/api/uploads/presign') {
+				const body = JSON.parse((init?.body as string) ?? '{}');
+				expect(body).toMatchObject({
+					organizationId: 'org-1',
+					filename: 'big.mp4',
+					contentType: 'video/mp4',
+				});
+				return Promise.resolve({
+					ok: true,
+					json: async () => ({
+						attachmentId: 'att-big',
+						uploadUrl: 'https://minio.example/bucket/org-1/att-big?sig=abc',
+						expiresAt: new Date().toISOString(),
+					}),
+				});
+			}
+			if (url === '/api/uploads/att-big/finalize') {
+				expect(init?.method).toBe('POST');
+				return Promise.resolve({
+					ok: true,
+					json: async () => ({
+						id: 'att-big',
+						url: '/api/attachments/att-big',
+						filename: 'big.mp4',
+						contentType: 'video/mp4',
+						sizeBytes: 30 * 1024 * 1024,
+					}),
+				});
+			}
+			throw new Error(`unexpected fetch call to ${url}`);
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		let capturedUrl: string | undefined;
+		let capturedMethod: string | undefined;
+		let capturedBody: unknown;
+		class FakeXHR {
+			upload = { onprogress: null as ((e: { lengthComputable: boolean; loaded: number; total: number }) => void) | null };
+			onload: (() => void) | null = null;
+			onerror: (() => void) | null = null;
+			status = 200;
+			open(method: string, url: string) {
+				capturedMethod = method;
+				capturedUrl = url;
+			}
+			send(body: unknown) {
+				capturedBody = body;
+				this.upload.onprogress?.({ lengthComputable: true, loaded: 50, total: 100 });
+				this.onload?.();
+			}
+		}
+		vi.stubGlobal('XMLHttpRequest', FakeXHR as unknown as typeof XMLHttpRequest);
+
+		const onchange = vi.fn();
+		render(UploadZone, { organizationId: 'org-1', onchange });
+
+		const bigFile = makeFile('big.mp4', 'video/mp4', 'x'.repeat(1));
+		Object.defineProperty(bigFile, 'size', { value: 30 * 1024 * 1024 });
+
+		const input = screen.getByLabelText(/choose files/i);
+		await selectFiles(input, [bigFile]);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(await screen.findByText(/uploaded/i)).toBeTruthy();
+		expect(capturedMethod).toBe('PUT');
+		expect(capturedUrl).toBe('https://minio.example/bucket/org-1/att-big?sig=abc');
+		// The PUT body must be a type-stripped Blob (empty type => browser sends no Content-Type),
+		// not the File itself: a signed-class Content-Type header the presigned URL did not sign is
+		// a MinIO rejection. See UploadZone's xhrPut comment.
+		expect(capturedBody).toBeInstanceOf(Blob);
+		expect((capturedBody as Blob).type).toBe(''); // the load-bearing bit: no Content-Type gets sent
+		expect(fetchMock).toHaveBeenCalledWith('/api/uploads/presign', expect.objectContaining({ method: 'POST' }));
+		expect(fetchMock).toHaveBeenCalledWith('/api/uploads/att-big/finalize', expect.objectContaining({ method: 'POST' }));
+		expect(fetchMock).not.toHaveBeenCalledWith('/api/uploads', expect.anything());
+		expect(onchange).toHaveBeenLastCalledWith(['att-big']);
+	});
+
 	it('does not offer "Insert into body" for a non-image upload', async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,

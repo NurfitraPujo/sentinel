@@ -299,9 +299,15 @@ deferred — each retains its acceptance bar from the sections above; none is mi
       so agents can subscribe instead of polling `GET /api/agent/issues`.
 - [ ] **AI triage** (§2/Q12, Q2 note): agent suggests/performs move-out-of-Triage and marks
       duplicates via `relation_type='duplicate_of'`.
-- [ ] **Presigned multipart uploads** (§4/Q4): large-video path bypassing the 25 MB proxy cap.
-- [ ] **Toolbar Markdown editor** (§3/Q3): e.g. Tiptap with a Markdown serializer; no data
-      migration needed by design.
+- [x] **Presigned large uploads** (§4/Q4) — DONE 2026-08-12
+      (`docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md`): files > 25 MB (up to a 500 MB cap)
+      go `POST /api/uploads/presign` → direct-to-bucket PUT → `POST /api/uploads/[id]/finalize`,
+      which sniffs the object post-upload and only then flips `attachments.status` from `pending`
+      to `ready`; a `pending` object is un-linkable. Session-only (agents keep the proxy path).
+      Multipart chunking itself was not needed — a single presigned PUT covers the 500 MB target.
+- [x] **Toolbar Markdown editor** (§3/Q3) — DONE 2026-08-12: a dependency-free Markdown-syntax
+      toolbar over the existing textareas (not Tiptap WYSIWYG — that stays deferred), honoring the
+      no-data-migration constraint. Stored content is still Markdown.
 - [x] **Agent-key rate limiting** — DONE 2026-08-12 (R19 in PR13_REVIEW_REMEDIATION_PLAN.md):
       `rate_limit_rpm` enforced in `agent-auth.ts`, 429 + Retry-After.
 - [ ] **e2e harness cleanup FK ordering** (M5 follow-up): user rows deleted before

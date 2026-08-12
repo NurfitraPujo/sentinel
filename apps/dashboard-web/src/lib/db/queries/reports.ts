@@ -279,6 +279,7 @@ async function claimDraftAttachmentsOnto(
 				uploaderType: attachments.uploaderType,
 				issueId: attachments.issueId,
 				commentId: attachments.commentId,
+				status: attachments.status,
 			})
 			.from(attachments)
 			.where(eq(attachments.id, attachmentId));
@@ -290,7 +291,10 @@ async function claimDraftAttachmentsOnto(
 			row.uploaderId !== uploaderId ||
 			row.uploaderType !== uploaderType ||
 			row.issueId !== null ||
-			row.commentId !== null
+			row.commentId !== null ||
+			// M6 Feature A: the load-bearing security property -- a 'pending' object (bytes not yet
+			// validated by finalize's ranged-GET sniff) must never become linkable.
+			row.status !== 'ready'
 		) {
 			continue;
 		}
@@ -299,7 +303,14 @@ async function claimDraftAttachmentsOnto(
 			.update(attachments)
 			.set(target)
 			.where(
-				and(eq(attachments.id, attachmentId), isNull(attachments.issueId), isNull(attachments.commentId))
+				and(
+					eq(attachments.id, attachmentId),
+					isNull(attachments.issueId),
+					isNull(attachments.commentId),
+					// Defense-in-depth alongside the pre-check above: even under a race, the
+					// conditional UPDATE itself refuses to flip a 'pending' row's parent.
+					eq(attachments.status, 'ready')
+				)
 			)
 			.returning({ id: attachments.id });
 

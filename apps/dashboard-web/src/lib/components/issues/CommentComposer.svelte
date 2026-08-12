@@ -7,6 +7,7 @@
 	// onsubmit".
 	import Markdown from '$lib/components/Markdown.svelte';
 	import UploadZone from '$lib/components/attachments/UploadZone.svelte';
+	import MarkdownToolbar from '$lib/components/issues/MarkdownToolbar.svelte';
 
 	interface Props {
 		organizationId: string;
@@ -92,6 +93,7 @@
 	</div>
 
 	{#if mode === 'write'}
+		<MarkdownToolbar textarea={textareaEl} value={body} onchange={(v) => (body = v)} />
 		<textarea
 			bind:this={textareaEl}
 			bind:value={body}

@@ -263,8 +263,14 @@ services:
         environment:
             DATABASE_URL: postgres://sentinel:changeme@postgres:5432/sentinel
             # Manual Issues M2 (design §4): in-cluster MinIO endpoint, never the host-mapped port
-            # above — mirrors NATS_URL's in-cluster-vs-host split.
+            # above — mirrors NATS_URL's in-cluster-vs-host split. Used for all SERVER-side S3 calls
+            # (upload proxy, download stream, finalize sniff).
             S3_ENDPOINT: http://minio:9000
+            # M6 Feature A: browser-reachable endpoint used ONLY to sign presigned PUT URLs. A
+            # presigned URL is handed to the browser, which cannot resolve the in-cluster `minio`
+            # hostname above — so it must be signed against the host-mapped port. In a real
+            # deployment set this to the public S3/MinIO URL (e.g. https://uploads.example.com).
+            S3_PUBLIC_ENDPOINT: "http://localhost:${MINIO_HOST_PORT:-9000}"
             S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
             S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
             S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
