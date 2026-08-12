@@ -1670,6 +1670,65 @@ characteristic optimistic-status failure reproduced inside an AI workflow, and t
 Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 
+## M6 (partial) — presigned large uploads + toolbar Markdown editor — DONE 2026-08-12
+
+Two of the deferred M6 backlog items (`docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md`) shipped
+on branch `feat/manual-issues`.
+
+**Presigned large uploads (§4/Q4).** Files > 25 MB (up to `MAX_PRESIGNED_UPLOAD_BYTES` = 500 MB) now
+bypass the proxy: `POST /api/uploads/presign` mints a direct-to-bucket PUT URL and a `pending`
+`attachments` row; the client PUTs the bytes straight to MinIO; `POST /api/uploads/[id]/finalize`
+does a **full GetObject read of the first `SNIFF_BYTES` (stream stopped early — NOT a ranged GET, see
+below), runs the exact same `sniffContentType`/`resolveContentType` allowlist as the proxy path,
+deletes the object + row on 413 (oversize) or 415 (unrecognized bytes), and only otherwise flips the
+row to `ready` with the sniffed content-type and real object size. **Load-bearing invariant:**
+`claimDraftAttachmentsOnto` refuses any row whose `status != 'ready'` in both its pre-check and its
+conditional UPDATE — a presigned-but-unvalidated object can never be linked to an issue/comment.
+Migration `1723100000_add_attachment_status.sql` (idempotent; `status` column + catalog-guarded
+CHECK); `schema.ts` mirrored, drift 26/26.
+
+Three real-MinIO gotchas fixed while proving this, all invisible to the mocked unit tests and only
+caught by the committed integration flow (`reports.presign.flow.integration.test.ts`):
+- **Do not sign Content-Type into the presigned PUT.** Signing it (and the browser/`fetch` echoing
+  any Content-Type) makes MinIO reject the PUT with *"headers present … which were not signed"*.
+  `createPresignedPutUrl` signs only host+key; the client PUTs a **type-stripped Blob**
+  (`new Blob([file])`, empty type ⇒ no Content-Type header). The stored object type is irrelevant —
+  finalize overwrites the DB `content_type` from the sniff and the download route serves *that*.
+- **AWS SDK v3 (≥ ~3.729) default integrity checksums** pollute presigned URLs the same way; the S3
+  client sets `requestChecksumCalculation`/`responseChecksumValidation: 'WHEN_REQUIRED'`.
+- **The SDK *browser* build mis-signs a ranged GetObject against MinIO** (plain GET is fine). vitest
+  forces that browser build (the `'browser'` resolve condition, same root as the documented Node-Blob
+  swap). So `getObjectRangeBytes` does a full GetObject and breaks out of the stream after
+  `SNIFF_BYTES`, then `destroy()`s it — portable across both builds, only the first chunk crosses the
+  wire regardless of object size.
+- **Presigned URLs must be signed against a BROWSER-reachable endpoint, not the server-side one.**
+  The dashboard container's `S3_ENDPOINT` is the in-cluster `http://minio:9000` (correct for the
+  upload proxy / download / finalize sniff, all server-side), but a presigned PUT URL is handed to
+  the browser, which cannot resolve `minio`. `storage.ts` now signs presign URLs with a separate
+  client pinned to `S3_PUBLIC_ENDPOINT` (falls back to `S3_ENDPOINT` for the dev/host case where both
+  are localhost); compose sets it to `http://localhost:${MINIO_HOST_PORT:-9000}`. The SigV4 host is
+  signed, so this MUST be the signing client's endpoint — rewriting the host post-signing breaks the
+  signature. The M6 integration test masked this by running on the host where both endpoints are
+  localhost; `storage.presign-endpoint.test.ts` now pins the internal≠public split (network-free).
+- **Observability**: the dashboard has no span-creation API — obs = structured `log.*` (JSON with
+  `trace_id`/`span_id` auto-injected via `runWithTraceContext`), no otel wrapping of S3 calls (the S3
+  SDK is not otel-instrumented on the dashboard side, consistent with the rest). `createPresignedAttachment`/
+  `finalizePresignedAttachment` emit `uploads.presign_created` / `uploads.finalize_succeeded` /
+  `uploads.finalize_rejected` (with `reason: oversize|disallowed_content`), matching sibling event
+  naming.
+
+**Toolbar Markdown editor (§3/Q3).** A dependency-free Markdown-syntax toolbar (bold/italic/code/
+strikethrough/heading/quote/ul/ol/link) over the existing textareas — deliberately NOT a Tiptap
+WYSIWYG rewrite, honoring the design's binding "stays Markdown / no data migration" constraint. Pure
+transform in `$lib/markdown-toolbar.ts` (exhaustively unit-tested), thin `MarkdownToolbar.svelte`
+wired above the body textarea in the comment composer, new-report form, and the report edit form.
+
+Proved by running, 2026-08-12: dashboard gates green (`pnpm build`; `pnpm check` 0/0;
+`pnpm test --sequence.shuffle` **531 passed**), drift 26/26 against the real migrated Postgres, and
+`reports.presign.flow.integration.test.ts` (`M6_PRESIGN_INTEGRATION_REQUIRED=1`, real compose
+Postgres+MinIO) proving presign→direct PUT→finalize→ready→claim, the pending-cannot-link gate, and
+415+cleanup on unrecognized bytes; full-stack e2e held at **76 passed / 0 skipped**.
+
 ---
 
 ## Keep here

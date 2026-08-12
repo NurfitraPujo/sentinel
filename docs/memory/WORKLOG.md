@@ -5,6 +5,32 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-08-12 - M6 presigned large uploads + toolbar editor (partial M6)
+
+- **Why durable**: The presigned direct-to-bucket path establishes the pattern for "the server never
+  sees the bytes at upload time" while keeping the magic-byte guarantee — validation moves to a
+  `finalize` step that sniffs the stored object, and a `attachments.status` (`pending`→`ready`) gate
+  makes an unvalidated object un-linkable. That gate (`claimDraftAttachmentsOnto` requires
+  `status='ready'` in both pre-check and conditional UPDATE) is the load-bearing security invariant
+  any future upload path must preserve.
+- **Future mistake prevented**: Three real-MinIO signing failures that mocked unit tests cannot see,
+  and that a future dev will hit again the moment they touch presigned S3: (1) **never sign
+  Content-Type into a presigned PUT** and have the client send a **type-stripped Blob** — a signed
+  Content-Type the client echoes, or any unsigned Content-Type, is a MinIO "headers present … which
+  were not signed" rejection; (2) AWS SDK v3 ≥ ~3.729 **default integrity checksums** pollute
+  presigned URLs — set `requestChecksumCalculation`/`responseChecksumValidation: 'WHEN_REQUIRED'`;
+  (3) the SDK's **browser build mis-signs a ranged GetObject** against MinIO (vitest forces that
+  build), so read the sniff bytes via a full GET whose stream you stop early, not `Range`. All three
+  were caught only by the committed real-Postgres+MinIO integration flow, not by the (green) mocked
+  unit tests — the same "mocks stay green while real infra breaks" lesson as M1's varchar(64) key.
+- **Evidence**: branch `feat/manual-issues`; migration `1723100000_add_attachment_status.sql`;
+  `reports.presign.flow.integration.test.ts` (`M6_PRESIGN_INTEGRATION_REQUIRED=1`) green; dashboard
+  gates green (build, check 0/0, `pnpm test --sequence.shuffle` 531 passed), drift 26/26, e2e 76/0.
+- **Where to look**: `docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md`,
+  `docs/memory/VERIFIED_STATE.md` → "M6 (partial)", `src/lib/server/storage.ts` +
+  `src/lib/server/upload-core.ts`, `src/lib/markdown-toolbar.ts`. Toolbar shipped dependency-free
+  (Markdown-syntax buttons over the textarea); Tiptap WYSIWYG stays deferred by design.
+
 ### 2026-07-17 - Shared DB Migrations Foundation Shipped
 
 - **Why durable**: Sentinel now has a single, enforced boundary for schema evolution across all apps. The architectural invariant (unified migrations directory, loud-failure policy, prod-safety guardrails) will outlive the feature that introduced it.

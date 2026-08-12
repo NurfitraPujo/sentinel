@@ -5,6 +5,7 @@
 	import AttachmentList from '$lib/components/attachments/AttachmentList.svelte';
 	import CommentThread from '$lib/components/issues/CommentThread.svelte';
 	import SubscriptionToggle from '$lib/components/notifications/SubscriptionToggle.svelte';
+	import MarkdownToolbar from '$lib/components/issues/MarkdownToolbar.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
@@ -25,6 +26,7 @@
 	let editTitle = $state('');
 	let editBodyMd = $state('');
 	let editSeverity = $state('low');
+	let editBodyTextarea: HTMLTextAreaElement | undefined = $state();
 	let saving = $state(false);
 	let saveError = $state<string | null>(null);
 	let deleting = $state(false);
@@ -217,7 +219,14 @@
 			</select>
 
 			<label class="edit-label" for="edit-body">Description</label>
-			<textarea id="edit-body" class="edit-textarea" rows="8" bind:value={editBodyMd}></textarea>
+			<MarkdownToolbar textarea={editBodyTextarea} value={editBodyMd} onchange={(v) => (editBodyMd = v)} />
+			<textarea
+				id="edit-body"
+				bind:this={editBodyTextarea}
+				class="edit-textarea"
+				rows="8"
+				bind:value={editBodyMd}
+			></textarea>
 
 			<div class="edit-actions">
 				<button type="button" class="btn-primary" onclick={handleSaveEdit} disabled={saving}>

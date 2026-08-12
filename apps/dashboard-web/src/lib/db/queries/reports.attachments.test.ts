@@ -17,6 +17,7 @@ interface SelectQueueEntry {
 	uploaderType?: string;
 	issueId: string | null;
 	commentId: string | null;
+	status?: string;
 }
 
 vi.mock('$lib/server/db', () => ({ db: { select: vi.fn(), transaction: vi.fn() } }));
@@ -38,6 +39,7 @@ vi.mock('$lib/db/schema', () => ({
 		filename: 'filename',
 		contentType: 'contentType',
 		sizeBytes: 'sizeBytes',
+		status: 'status',
 	},
 }));
 
@@ -88,6 +90,7 @@ describe('claimDraftAttachments', () => {
 			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
+			status: 'ready',
 		});
 		updateQueue.push([{ id: 'att-1' }]);
 
@@ -106,6 +109,7 @@ describe('claimDraftAttachments', () => {
 			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
+			status: 'ready',
 		});
 
 		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'user-1', 'org-1');
@@ -123,6 +127,7 @@ describe('claimDraftAttachments', () => {
 			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
+			status: 'ready',
 		});
 
 		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'user-1', 'org-1');
@@ -140,6 +145,7 @@ describe('claimDraftAttachments', () => {
 			uploaderType: 'user',
 			issueId: 'issue-ALREADY',
 			commentId: null,
+			status: 'ready',
 		});
 
 		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'user-1', 'org-1');
@@ -170,8 +176,24 @@ describe('claimDraftAttachments', () => {
 	it('processes multiple ids independently, claiming only the valid ones', async () => {
 		const { tx, selectQueue, updateQueue } = makeCorrectTx();
 		selectQueue.push(
-			{ id: 'att-1', orgId: 'org-1', uploaderId: 'user-1', uploaderType: 'user', issueId: null, commentId: null },
-			{ id: 'att-2', orgId: 'org-OTHER', uploaderId: 'user-1', uploaderType: 'user', issueId: null, commentId: null }
+			{
+				id: 'att-1',
+				orgId: 'org-1',
+				uploaderId: 'user-1',
+				uploaderType: 'user',
+				issueId: null,
+				commentId: null,
+				status: 'ready',
+			},
+			{
+				id: 'att-2',
+				orgId: 'org-OTHER',
+				uploaderId: 'user-1',
+				uploaderType: 'user',
+				issueId: null,
+				commentId: null,
+				status: 'ready',
+			}
 		);
 		updateQueue.push([{ id: 'att-1' }]);
 
@@ -199,11 +221,54 @@ describe('claimDraftAttachments', () => {
 			uploaderType: 'agent',
 			issueId: null,
 			commentId: null,
+			status: 'ready',
 		});
 
 		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'same-id-1', 'org-1', 'user');
 
 		expect(result).toEqual([]);
 		expect(tx.update).not.toHaveBeenCalled();
+	});
+
+	// M6 Feature A (docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md): the load-bearing security
+	// property of the presigned-upload path -- a 'pending' object (bytes not yet validated by
+	// finalize's ranged-GET sniff) must never become linkable to an issue or comment, even if it
+	// otherwise matches org/uploader/unlinked. Proved RED-FIRST: before the status gate existed in
+	// claimDraftAttachmentsOnto, this attachment would have been claimed.
+	it('refuses to claim a pending attachment even though it matches org, uploader, and is unlinked', async () => {
+		const { tx, selectQueue } = makeCorrectTx();
+		selectQueue.push({
+			id: 'att-1',
+			orgId: 'org-1',
+			uploaderId: 'user-1',
+			uploaderType: 'user',
+			issueId: null,
+			commentId: null,
+			status: 'pending',
+		});
+
+		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'user-1', 'org-1');
+
+		expect(result).toEqual([]);
+		expect(tx.update).not.toHaveBeenCalled();
+	});
+
+	it('claims a ready attachment (status gate does not block the normal path)', async () => {
+		const { tx, selectQueue, updateQueue } = makeCorrectTx();
+		selectQueue.push({
+			id: 'att-1',
+			orgId: 'org-1',
+			uploaderId: 'user-1',
+			uploaderType: 'user',
+			issueId: null,
+			commentId: null,
+			status: 'ready',
+		});
+		updateQueue.push([{ id: 'att-1' }]);
+
+		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'user-1', 'org-1');
+
+		expect(result).toEqual([{ id: 'att-1' }]);
+		expect(tx.update).toHaveBeenCalledTimes(1);
 	});
 });

@@ -1,9 +1,17 @@
 import { error } from '@sveltejs/kit';
 import { randomUUID } from 'node:crypto';
+import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { attachments } from '$lib/db/schema';
-import { isStorageConfigured, putObject } from '$lib/server/storage';
-import { sniffContentType, resolveContentType } from '$lib/server/attachment-sniff';
+import {
+	isStorageConfigured,
+	putObject,
+	createPresignedPutUrl,
+	headObject,
+	getObjectRangeBytes,
+	deleteObject,
+} from '$lib/server/storage';
+import { sniffContentType, resolveContentType, isAllowedContentType } from '$lib/server/attachment-sniff';
 import { reapOrgOrphanAttachments } from '$lib/server/attachment-reaper';
 import { log } from '$lib/server/observability/log';
 
@@ -128,4 +136,180 @@ export function checkDeclaredLength(request: Request): void {
 	if (parsed > MAX_UPLOAD_BYTES) {
 		throw error(413, `File exceeds the ${MAX_UPLOAD_BYTES} byte cap`);
 	}
+}
+
+/**
+ * M6 Feature A (docs/plans/M6_PRESIGNED_UPLOADS_AND_TOOLBAR_PLAN.md §Feature A): presigned
+ * direct-to-bucket path for files above the proxy cap. Declared type/size at presign time are
+ * untrusted -- the real validation happens in `finalizePresignedAttachment` after the bytes
+ * land, via a ranged GET + the exact same sniff/resolve allowlist the proxy path runs inline.
+ */
+export const MAX_PRESIGNED_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB cap (§4/Q4)
+export const SNIFF_BYTES = 4096; // enough for every signature in attachment-sniff.ts
+const PRESIGN_EXPIRES_SECONDS = 15 * 60; // 15 min
+
+export interface CreatePresignedAttachmentInput {
+	organizationId: string;
+	uploaderId: string;
+	filename: string;
+	declaredContentType: string;
+	sizeBytes: number;
+}
+
+export interface CreatePresignedAttachmentResult {
+	attachmentId: string;
+	uploadUrl: string;
+	expiresAt: string;
+}
+
+export async function createPresignedAttachment(
+	input: CreatePresignedAttachmentInput
+): Promise<CreatePresignedAttachmentResult> {
+	if (!isStorageConfigured()) {
+		throw error(503, 'Object storage is not configured');
+	}
+
+	if (!isAllowedContentType(input.declaredContentType)) {
+		throw error(415, 'Content type is not an allowed type');
+	}
+
+	if (!Number.isFinite(input.sizeBytes) || input.sizeBytes <= 0) {
+		throw error(400, 'sizeBytes must be a positive number');
+	}
+	if (input.sizeBytes > MAX_PRESIGNED_UPLOAD_BYTES) {
+		throw error(413, `File exceeds the ${MAX_PRESIGNED_UPLOAD_BYTES} byte cap`);
+	}
+
+	const storageKey = `org/${input.organizationId}/${randomUUID()}`;
+	const filename = input.filename.trim().slice(0, 512) || 'upload';
+
+	const [row] = await db
+		.insert(attachments)
+		.values({
+			orgId: input.organizationId,
+			issueId: null,
+			commentId: null,
+			uploaderType: 'user',
+			uploaderId: input.uploaderId,
+			filename,
+			contentType: input.declaredContentType,
+			sizeBytes: input.sizeBytes,
+			storageKey,
+			status: 'pending',
+		})
+		.returning();
+
+	if (!row) {
+		throw error(500, 'Failed to record attachment');
+	}
+
+	const uploadUrl = await createPresignedPutUrl(storageKey, PRESIGN_EXPIRES_SECONDS);
+	const expiresAt = new Date(Date.now() + PRESIGN_EXPIRES_SECONDS * 1000).toISOString();
+
+	// Opportunistic per-org sweep, same as the proxy path.
+	reapOrgOrphanAttachments(input.organizationId).catch((err) => {
+		log.error('uploads.opportunistic_reap_failed', { organizationId: input.organizationId, error: err });
+	});
+
+	log.info('uploads.presign_created', {
+		attachmentId: row.id,
+		organizationId: input.organizationId,
+		declaredContentType: input.declaredContentType,
+		declaredSizeBytes: input.sizeBytes,
+	});
+
+	return { attachmentId: row.id, uploadUrl, expiresAt };
+}
+
+export interface FinalizePresignedAttachmentInput {
+	attachmentId: string;
+	organizationId: string;
+	uploaderId: string;
+}
+
+export async function finalizePresignedAttachment(
+	input: FinalizePresignedAttachmentInput
+): Promise<UploadCoreResult> {
+	if (!isStorageConfigured()) {
+		throw error(503, 'Object storage is not configured');
+	}
+
+	const [row] = await db.select().from(attachments).where(eq(attachments.id, input.attachmentId));
+
+	if (!row) {
+		throw error(404, 'Attachment not found');
+	}
+	if (row.orgId !== input.organizationId) {
+		throw error(404, 'Attachment not found');
+	}
+	if (row.uploaderType !== 'user' || row.uploaderId !== input.uploaderId) {
+		throw error(403, 'Not the uploader of this attachment');
+	}
+	if (row.status !== 'pending') {
+		throw error(409, 'Attachment is not pending');
+	}
+	if (row.issueId || row.commentId) {
+		throw error(409, 'Attachment is already linked');
+	}
+
+	let contentLength: number;
+	try {
+		const head = await headObject(row.storageKey);
+		contentLength = head.contentLength;
+	} catch {
+		throw error(409, 'upload not completed');
+	}
+
+	if (contentLength > MAX_PRESIGNED_UPLOAD_BYTES) {
+		await deleteObject(row.storageKey);
+		await db.delete(attachments).where(eq(attachments.id, row.id));
+		log.warn('uploads.finalize_rejected', {
+			attachmentId: row.id,
+			organizationId: input.organizationId,
+			reason: 'oversize',
+			contentLength,
+		});
+		throw error(413, `File exceeds the ${MAX_PRESIGNED_UPLOAD_BYTES} byte cap`);
+	}
+
+	const buffer = await getObjectRangeBytes(row.storageKey, SNIFF_BYTES);
+	const detected = sniffContentType(buffer);
+	const resolved = resolveContentType(detected, row.contentType);
+
+	if (!resolved) {
+		await deleteObject(row.storageKey);
+		await db.delete(attachments).where(eq(attachments.id, row.id));
+		log.warn('uploads.finalize_rejected', {
+			attachmentId: row.id,
+			organizationId: input.organizationId,
+			reason: 'disallowed_content',
+			declaredContentType: row.contentType,
+		});
+		throw error(415, 'File content is not an allowed type (or does not match its declared type)');
+	}
+
+	const [updated] = await db
+		.update(attachments)
+		.set({ status: 'ready', contentType: resolved, sizeBytes: contentLength })
+		.where(eq(attachments.id, row.id))
+		.returning();
+
+	if (!updated) {
+		throw error(500, 'Failed to finalize attachment');
+	}
+
+	log.info('uploads.finalize_succeeded', {
+		attachmentId: updated.id,
+		organizationId: input.organizationId,
+		contentType: updated.contentType,
+		sizeBytes: updated.sizeBytes,
+	});
+
+	return {
+		id: updated.id,
+		url: `/api/attachments/${updated.id}`,
+		filename: updated.filename,
+		contentType: updated.contentType,
+		sizeBytes: updated.sizeBytes,
+	};
 }
