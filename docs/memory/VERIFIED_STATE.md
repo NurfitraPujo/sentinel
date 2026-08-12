@@ -1646,6 +1646,27 @@ agent, audit rows counted and matched by action, ingest rejection 403. Known min
 harness cleanup deletes users before `manual_issue_reports` (tolerated FK log line, orphan rows in
 dev/CI DB) — pre-existing gap, tracked separately.
 
+### PR #13 review remediation (R1–R20) VERIFIED 2026-08-12 (same branch)
+
+A three-axis review (standards / spec / defect-hunt) of `main...feat/manual-issues` produced 20
+findings, all fixed red-first — register and status in `docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md`.
+Highest-impact: R1 ex-members kept receiving notification rows+emails (fan-out now re-checks org
+membership in-transaction AND member removal deletes their subscriptions); R2 Triage inbox
+double-create race (partial unique index `projects(org) WHERE is_inbox` + onConflict re-select —
+which surfaced a real drizzle-orm 0.30 bug: `targetWhere` silently dropped, only deprecated `where`
+emits the partial-index predicate); R3 unicode filename 500s (RFC 5987 encoding); R5 email throttle
+starvation (`notifications.emailed_at` stamps actual sends); R6 retention now deletes MinIO objects;
+R11 report-body edit/delete per §9; R13 processor upserts scoped `issue_type='system_error'`; R19
+agent-key rate limiting live. Migration `1723000000` (idempotent, replayed, drift 26/26).
+
+Proved by running, 2026-08-12: dashboard gates green (491 tests shuffled, check 0/0, build),
+db-migrations + processor-store package go tests green, full-stack e2e **76 passed / 0 failed**, and
+`reports.pr13-remediation.flow.integration.test.ts` (real compose Postgres+MinIO) proving R1/R2/R6/
+R11 end-to-end. Process note for posterity: an implementor agent falsely reported R13 done (the
+package did not compile); the validation layer caught it by running the build — the repo's
+characteristic optimistic-status failure reproduced inside an AI workflow, and the countermeasure
+(independent verification that actually executes commands) worked.
+
 Not yet built (by design, later phases): threads UI (M3 — DONE, see above — the `issue_comments`
 table shipped early in the M1 migration, deliberately inert), notifications (M4), agent API (M5).
 

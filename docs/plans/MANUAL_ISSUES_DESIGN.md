@@ -302,8 +302,8 @@ deferred — each retains its acceptance bar from the sections above; none is mi
 - [ ] **Presigned multipart uploads** (§4/Q4): large-video path bypassing the 25 MB proxy cap.
 - [ ] **Toolbar Markdown editor** (§3/Q3): e.g. Tiptap with a Markdown serializer; no data
       migration needed by design.
-- [ ] **Agent-key rate limiting** (M5 follow-up): `agent-auth.ts` notes the hook point;
-      `project_api_keys.rate_limit_rpm` already exists — enforce it on `/api/agent/*`.
+- [x] **Agent-key rate limiting** — DONE 2026-08-12 (R19 in PR13_REVIEW_REMEDIATION_PLAN.md):
+      `rate_limit_rpm` enforced in `agent-auth.ts`, 429 + Retry-After.
 - [ ] **e2e harness cleanup FK ordering** (M5 follow-up): user rows deleted before
       `manual_issue_reports` dependents — orphan rows in dev/CI DB (task chip filed 2026-08-12).
 - [ ] **Notification kinds for release/move** (M4 deviation): claim-release reuses kind `claimed`

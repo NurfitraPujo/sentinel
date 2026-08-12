@@ -45,4 +45,23 @@ describe('rbac role reconciliation', () => {
 	] as const)('org role %s manage_keys -> %s', (role, permission, expected) => {
 		expect(hasPermission(role, permission)).toBe(expected);
 	});
+
+	// R14 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): 'manage_agents' must be an org-level-only
+	// grant. Org owner/admin (organization_members.role) keep it; a PROJECT-scoped admin
+	// (project_members.role='admin', who administers exactly one project and may hold no org role
+	// at all) must NOT get it via the shared 'admin' object key.
+	it('org owner/admin have manage_agents', () => {
+		expect(hasPermission('owner', 'manage_agents')).toBe(true);
+		expect(hasPermission('admin', 'manage_agents')).toBe(true);
+	});
+
+	it('a project-scoped admin (no org role) cannot manage agents', () => {
+		expect(hasPermission('admin', 'manage_agents', 'project')).toBe(false);
+	});
+
+	it('org engineer/support/viewer cannot manage agents', () => {
+		expect(hasPermission('engineer', 'manage_agents')).toBe(false);
+		expect(hasPermission('support', 'manage_agents')).toBe(false);
+		expect(hasPermission('viewer', 'manage_agents')).toBe(false);
+	});
 });

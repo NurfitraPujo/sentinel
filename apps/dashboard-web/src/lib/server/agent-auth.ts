@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { projectApiKeys, agents } from '$lib/db/schema';
+import { checkRateLimitWithLimit } from '$lib/rate-limit';
 
 /**
  * Manual Issues M5 stage 2 (docs/plans/MANUAL_ISSUES_DESIGN.md §7, Q5, Q6, B7): key
@@ -40,11 +41,14 @@ export interface AgentAuthContext {
  * API key" / "Forbidden" split, collapsed further here since scope IS the tenancy boundary for
  * this whole route tree).
  *
- * Rate limiting: NOT wired here. `$lib/rate-limit.ts` exists for session-authenticated dashboard
- * routes; a per-key limiter for `/api/agent/*` (mirroring the ingestor's Redis-backed limiter) is
- * left for a follow-up -- noted here rather than silently absent, since an unthrottled,
- * key-authenticated write surface is exactly the kind of gap this repo's history (S-series) warns
- * gets forgotten.
+ * R19 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): rate limiting IS now wired here, keyed by the
+ * key row's id (never the raw secret, never anything the request supplies -- B7) and limited to
+ * `project_api_keys.rate_limit_rpm` requests per rolling 60s window, via the same in-process
+ * limiter `$lib/rate-limit.ts` already uses for session sign-in. Deliberately checked AFTER key
+ * validation succeeds -- an invalid/unknown key must not be able to burn another key's limit, and
+ * a 401 for a bad key should stay a 401, not get shadowed by a coincidental 429. Throws a raw
+ * `Response` (429, `Retry-After` header) rather than SvelteKit's `error()` helper, since `error()`
+ * has no way to attach a response header.
  */
 export async function authenticateAgentRequest(request: Request): Promise<AgentAuthContext> {
 	const authHeader = request.headers.get('authorization') || request.headers.get('Authorization');
@@ -68,6 +72,7 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 			expiresAt: projectApiKeys.expiresAt,
 			revokedAt: projectApiKeys.revokedAt,
 			agentId: projectApiKeys.agentId,
+			rateLimitRpm: projectApiKeys.rateLimitRpm,
 		})
 		.from(projectApiKeys)
 		.where(eq(projectApiKeys.keyHash, keyHash));
@@ -113,6 +118,18 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 	// other), but B7 means this function must never trust either alone without checking.
 	if (keyRow.organizationId !== agentRow.orgId) {
 		throw error(401, 'Invalid API key');
+	}
+
+	// R19: enforce this key's own rate_limit_rpm, AFTER validation succeeds (see doc comment).
+	const rateLimit = checkRateLimitWithLimit(`agent-key:${keyRow.id}`, keyRow.rateLimitRpm);
+	if (!rateLimit.allowed) {
+		throw new Response(JSON.stringify({ message: 'Rate limit exceeded' }), {
+			status: 429,
+			headers: {
+				'Content-Type': 'application/json',
+				'Retry-After': String(rateLimit.retryAfter ?? 60),
+			},
+		});
 	}
 
 	return {

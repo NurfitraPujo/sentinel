@@ -35,6 +35,7 @@
 		question_answered: 'answered a question',
 		moved: 'moved this issue',
 		attachment_added: 'added an attachment',
+		report_created: 'created this report',
 		report_edited: 'edited the report',
 	};
 

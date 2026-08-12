@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { db } from '$lib/server/db';
+import { db, type Tx } from '$lib/server/db';
 import {
 	issues,
 	issueActivity,
@@ -31,7 +31,7 @@ export type ReportSeverity = 'low' | 'medium' | 'high' | 'critical';
  * inbox is marked by the durable `is_inbox` column, never a name convention, so a user
  * renaming "Triage" must not break this lookup or cause a second Triage project to appear.
  */
-async function findOrCreateTriageProject(tx: any, organizationId: string): Promise<string> {
+async function findOrCreateTriageProject(tx: Tx, organizationId: string): Promise<string> {
 	const existing = await tx
 		.select({ id: projects.id })
 		.from(projects)
@@ -53,6 +53,13 @@ async function findOrCreateTriageProject(tx: any, organizationId: string): Promi
 	// (reports.e2e-flow.integration.test.ts) against a real migrated Postgres, not by any mock-based
 	// unit test, because mocked `db.transaction` calls never round-trip through Postgres's column
 	// typing.
+	// R2 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): this SELECT-then-INSERT has a window
+	// between the SELECT above and this INSERT where a concurrent call for the same org can win
+	// the race -- without a uniqueness constraint, two concurrent first-uses both insert an inbox
+	// project. `idx_projects_org_inbox_unique` (partial unique on
+	// projects(organization_id) WHERE is_inbox, 1723000000_pr13_remediation.sql) makes the loser's
+	// INSERT a no-op (`onConflictDoNothing`) instead of a duplicate row; the loser then re-selects
+	// to return the WINNER's project id rather than its own discarded insert.
 	const placeholder = crypto.randomBytes(24).toString('hex');
 	const [created] = await tx
 		.insert(projects)
@@ -63,9 +70,37 @@ async function findOrCreateTriageProject(tx: any, organizationId: string): Promi
 			apiKeyHash: crypto.createHash('sha256').update(placeholder).digest('hex'),
 			isInbox: true,
 		})
+		// NOTE: `onConflictDoNothing`'s partial-index predicate option is named `where` in this
+		// drizzle-orm version (0.30.10), NOT `targetWhere` -- `targetWhere`/`setWhere` only exist on
+		// `onConflictDoUpdate` here. Passing `targetWhere` here compiles (same config type is
+		// accepted) but is silently DROPPED from the generated SQL, producing a bare
+		// `on conflict ("organization_id") do nothing` with no `WHERE is_inbox` -- which Postgres
+		// then rejects at runtime with 42P10 "no unique or exclusion constraint matching the ON
+		// CONFLICT specification", since the arbiter can't be inferred without the partial
+		// predicate. Caught by reports.e2e-flow.integration.test.ts against a real migrated
+		// Postgres, not by the mock-based unit test above (which never executes real SQL).
+		.onConflictDoNothing({ target: [projects.organizationId], where: eq(projects.isInbox, true) })
 		.returning({ id: projects.id });
 
-	return created.id;
+	if (created) {
+		return created.id;
+	}
+
+	// Lost the race: some other concurrent call already created (and committed, or is about to
+	// commit) the inbox project. Re-select to return the winner's id.
+	const [winner] = await tx
+		.select({ id: projects.id })
+		.from(projects)
+		.where(and(eq(projects.organizationId, organizationId), eq(projects.isInbox, true)));
+
+	if (!winner) {
+		// Should be unreachable (the conflict target guarantees a winning row exists), but throw
+		// rather than return undefined -- D18: never signal failure by returning early with a
+		// falsy value from inside a transaction callback.
+		throw new Error('Triage project conflict resolution found no winner');
+	}
+
+	return winner.id;
 }
 
 export interface CreateManualIssueInput {
@@ -133,9 +168,12 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 			})
 			.returning();
 
+		// R12 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): creation writes 'report_created', not
+		// 'report_edited' -- the latter previously mislabeled creation as an edit; it is now
+		// reserved for R11's actual body/title/severity edits.
 		await tx.insert(issueActivity).values({
 			issueId: issue.id,
-			eventType: 'report_edited',
+			eventType: 'report_created',
 			actorType: 'user',
 			actorId: input.reporterId,
 			newValue: { action: 'created', title, severity: input.severity, projectId },
@@ -185,13 +223,14 @@ export async function createManualIssue(input: CreateManualIssueInput) {
  * callers that need to know what was actually claimed use the returned array.
  */
 export async function claimDraftAttachments(
-	tx: any,
+	tx: Tx,
 	attachmentIds: string[],
 	issueId: string,
 	uploaderId: string,
-	organizationId: string
+	organizationId: string,
+	uploaderType: 'user' | 'agent' = 'user'
 ): Promise<{ id: string }[]> {
-	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId);
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId, uploaderType);
 }
 
 /**
@@ -202,21 +241,28 @@ export async function claimDraftAttachments(
  * sites.
  */
 export async function claimDraftAttachmentsForComment(
-	tx: any,
+	tx: Tx,
 	attachmentIds: string[],
 	commentId: string,
 	authorId: string,
-	organizationId: string
+	organizationId: string,
+	uploaderType: 'user' | 'agent' = 'user'
 ): Promise<{ id: string }[]> {
-	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId);
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId, uploaderType);
 }
 
+// R10 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): `uploaderType` is now matched alongside
+// `uploaderId`, not just `uploaderId` alone -- `attachments.uploader_id` is a bare varchar shared
+// across the 'user' and 'agent' id spaces (users.id vs. agents.id), so an id collision between
+// the two (unlikely, but not prevented by any constraint) previously let a caller's draft claim
+// silently match a same-valued id from the OTHER actor type.
 async function claimDraftAttachmentsOnto(
-	tx: any,
+	tx: Tx,
 	attachmentIds: string[],
 	target: { issueId: string } | { commentId: string },
 	uploaderId: string,
-	organizationId: string
+	organizationId: string,
+	uploaderType: 'user' | 'agent' = 'user'
 ): Promise<{ id: string }[]> {
 	if (attachmentIds.length === 0) {
 		return [];
@@ -230,6 +276,7 @@ async function claimDraftAttachmentsOnto(
 				id: attachments.id,
 				orgId: attachments.orgId,
 				uploaderId: attachments.uploaderId,
+				uploaderType: attachments.uploaderType,
 				issueId: attachments.issueId,
 				commentId: attachments.commentId,
 			})
@@ -241,6 +288,7 @@ async function claimDraftAttachmentsOnto(
 			!row ||
 			row.orgId !== organizationId ||
 			row.uploaderId !== uploaderId ||
+			row.uploaderType !== uploaderType ||
 			row.issueId !== null ||
 			row.commentId !== null
 		) {
@@ -317,7 +365,11 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 			conditions.push(isNull(issues.assignedTo));
 			break;
 		case 'needs-input':
+			// R7: waitingOn is now cleared on resolve/ignore, so this condition alone should already
+			// exclude them going forward -- kept as an explicit filter too (belt-and-suspenders) for
+			// any pre-existing row from before that fix still carries a stale waitingOn value.
 			conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
+			conditions.push(eq(issues.status, 'unresolved'));
 			break;
 		case 'triage':
 			conditions.push(eq(projects.isInbox, true));
@@ -436,6 +488,131 @@ export async function moveIssueToProject(
 	});
 }
 
+export interface UpdateManualIssueReportInput {
+	issueId: string;
+	actorId: string;
+	title?: string;
+	bodyMd?: string;
+	severity?: ReportSeverity;
+}
+
+/**
+ * R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md, §9): author-only edit of a report's
+ * title/body/severity, until the issue is resolved (enforced by the route layer, not here --
+ * this function trusts the caller already checked `canEditReport` + issue status). Updates
+ * `issues.message` (title mirror) and/or `manual_issue_reports.body_md`/`severity` in one
+ * transaction with a `report_edited` activity row carrying old/new values (D18: throw, not
+ * return, on a missing issue/report so a partial update never commits).
+ */
+export async function updateManualIssueReport(input: UpdateManualIssueReportInput) {
+	return await db.transaction(async (tx) => {
+		const [existingIssue] = await tx
+			.select({ id: issues.id, message: issues.message })
+			.from(issues)
+			.where(eq(issues.id, input.issueId));
+
+		if (!existingIssue) {
+			throw new Error(`Issue ${input.issueId} not found`);
+		}
+
+		const [existingReport] = await tx
+			.select({ bodyMd: manualIssueReports.bodyMd, severity: manualIssueReports.severity })
+			.from(manualIssueReports)
+			.where(eq(manualIssueReports.issueId, input.issueId));
+
+		if (!existingReport) {
+			throw new Error(`Report ${input.issueId} not found`);
+		}
+
+		const oldValue: Record<string, unknown> = {};
+		const newValue: Record<string, unknown> = {};
+
+		if (input.title !== undefined && input.title !== existingIssue.message) {
+			oldValue.title = existingIssue.message;
+			newValue.title = input.title;
+			await tx.update(issues).set({ message: input.title }).where(eq(issues.id, input.issueId));
+		}
+
+		const reportUpdate: Partial<typeof manualIssueReports.$inferInsert> = {};
+		if (input.bodyMd !== undefined && input.bodyMd !== existingReport.bodyMd) {
+			oldValue.bodyMd = existingReport.bodyMd;
+			newValue.bodyMd = input.bodyMd;
+			reportUpdate.bodyMd = input.bodyMd;
+		}
+		if (input.severity !== undefined && input.severity !== existingReport.severity) {
+			oldValue.severity = existingReport.severity;
+			newValue.severity = input.severity;
+			reportUpdate.severity = input.severity;
+		}
+		if (Object.keys(reportUpdate).length > 0) {
+			await tx.update(manualIssueReports).set(reportUpdate).where(eq(manualIssueReports.issueId, input.issueId));
+		}
+
+		if (Object.keys(newValue).length > 0) {
+			await tx.insert(issueActivity).values({
+				issueId: input.issueId,
+				eventType: 'report_edited',
+				actorType: 'user',
+				actorId: input.actorId,
+				oldValue,
+				newValue,
+			});
+		}
+
+		const [updatedIssue] = await tx.select().from(issues).where(eq(issues.id, input.issueId));
+		const [updatedReport] = await tx
+			.select()
+			.from(manualIssueReports)
+			.where(eq(manualIssueReports.issueId, input.issueId));
+
+		return { issue: updatedIssue, report: updatedReport };
+	});
+}
+
+/**
+ * R11 (§9, R6): deletes a manual issue entirely (author until resolved, owner/admin anytime --
+ * enforced by the route layer). `issues` row delete cascades away `manual_issue_reports`,
+ * `issue_activity`, `issue_comments`, `issue_subscriptions`, and `attachments` rows (all FK
+ * `ON DELETE CASCADE`, schema.ts) -- but MinIO has no transactional participation in that
+ * cascade, so attachment storage_keys (both linked directly to the issue AND to one of its
+ * comments) are collected BEFORE the delete, same pattern as retention.ts's R6 fix and
+ * `deleteComment` (queries/comments.ts). Returns the collected keys so the route can best-effort
+ * delete the objects AFTER the transaction commits.
+ */
+export async function deleteManualIssue(issueId: string): Promise<{ storageKeys: string[] }> {
+	return await db.transaction(async (tx) => {
+		const [existingIssue] = await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId));
+		if (!existingIssue) {
+			throw new Error(`Issue ${issueId} not found`);
+		}
+
+		const commentRows = await tx
+			.select({ id: issueComments.id })
+			.from(issueComments)
+			.where(eq(issueComments.issueId, issueId));
+		const commentIds = commentRows.map((row) => row.id);
+
+		const directAttachmentRows = await tx
+			.select({ storageKey: attachments.storageKey })
+			.from(attachments)
+			.where(eq(attachments.issueId, issueId));
+
+		let commentAttachmentRows: { storageKey: string }[] = [];
+		if (commentIds.length > 0) {
+			commentAttachmentRows = await tx
+				.select({ storageKey: attachments.storageKey })
+				.from(attachments)
+				.where(sql`${attachments.commentId} IN (${sql.join(commentIds.map((id) => sql`${id}`), sql`, `)})`);
+		}
+
+		const storageKeys = [...directAttachmentRows, ...commentAttachmentRows].map((row) => row.storageKey);
+
+		await tx.delete(issues).where(eq(issues.id, issueId));
+
+		return { storageKeys };
+	});
+}
+
 export class ClaimConflictError extends Error {
 	constructor(message = 'Issue is already claimed') {
 		super(message);
@@ -515,9 +692,14 @@ export async function releaseClaim(
 ): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
 	const actorType = options.actorType ?? 'user';
 	return await db.transaction(async (tx) => {
+		// R10: `assigneeType` is now matched alongside `assignedTo` in the non-force conditional
+		// UPDATE too -- `assigned_to` is a bare varchar shared across the 'user'/'agent' id spaces
+		// (same rationale as claimDraftAttachmentsOnto's uploaderType check above), so without this
+		// an id collision across the two spaces could let one actor type release a claim actually
+		// held by the other.
 		const whereClause = options.force
 			? eq(issues.id, issueId)
-			: and(eq(issues.id, issueId), eq(issues.assignedTo, actorId));
+			: and(eq(issues.id, issueId), eq(issues.assignedTo, actorId), eq(issues.assigneeType, actorType));
 
 		const updated = await tx
 			.update(issues)

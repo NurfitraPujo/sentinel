@@ -208,6 +208,11 @@ export const notifications = pgTable('notifications', {
 	payload: jsonb('payload'),
 	readAt: timestamp('read_at', { withTimezone: true }),
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	// PR13 remediation R5 (1723000000_pr13_remediation.sql): set post-send by
+	// sendIssueNotificationEmails on the rows it actually emailed. isThrottled queries
+	// max(emailedAt) within the 15-min window instead of counting notification rows (which
+	// included rows that were themselves throttled and never emailed).
+	emailedAt: timestamp('emailed_at', { withTimezone: true }),
 });
 
 export const errorOccurrences = pgTable('error_occurrences', {

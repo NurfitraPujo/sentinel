@@ -64,6 +64,13 @@ const (
 	IssueOutcomeRegressed
 )
 
+// issuesUpsertConflictPredicate scopes the issues ON CONFLICT (project_id, fingerprint) DO
+// UPDATE to processor-owned rows only. The processor never writes issue_type, but a manual
+// (issue_type = 'user_report') issue could theoretically collide on (project_id, fingerprint);
+// without this predicate the processor's upsert would bump last_seen/count on that manual issue
+// and Dispatcher.Dispatch would fire for it. See R13, docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md §10.
+const issuesUpsertConflictPredicate = "issues.fingerprint = EXCLUDED.fingerprint AND issues.issue_type = 'system_error'"
+
 // IssueStore combines both Read and Write operations for the Processor.
 type IssueStore interface {
 	QueryStore
@@ -238,7 +245,7 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
-			WHERE issues.fingerprint = EXCLUDED.fingerprint
+			WHERE ` + issuesUpsertConflictPredicate + `
 		`
 		if _, err := tx.Exec(ctx, query,
 			issue.ID,
@@ -395,7 +402,7 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
-			WHERE issues.fingerprint = EXCLUDED.fingerprint
+			WHERE ` + issuesUpsertConflictPredicate + `
 			RETURNING id
 		`
 		var returnedID string

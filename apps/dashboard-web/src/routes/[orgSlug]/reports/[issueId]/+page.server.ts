@@ -52,12 +52,25 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 
 	const canWrite = (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
 
+	// R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md, §9): the author may edit/delete their own
+	// report until it is resolved; an org owner/admin may delete (not edit -- PATCH is strictly
+	// author-only) any report at any time. Computed here, not just re-derived client-side, since
+	// the route itself re-checks on every PATCH/DELETE regardless -- this only controls whether the
+	// UI offers the buttons.
+	const isAuthor = detail.report.reporterId === userId;
+	const isResolved = detail.issue.status === 'resolved';
+	const isModerator = role === 'owner' || role === 'admin';
+	const canEditOwnReport = isAuthor && !isResolved;
+	const canDeleteReport = (isAuthor && !isResolved) || isModerator;
+
 	return {
 		orgId: organizationId,
 		orgSlug,
 		userId,
 		userRole: role,
 		canWrite,
+		canEditOwnReport,
+		canDeleteReport,
 		detail,
 		relations,
 		activity,

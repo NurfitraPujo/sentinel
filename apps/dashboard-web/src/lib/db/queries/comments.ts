@@ -129,7 +129,8 @@ export async function createComment(
 				input.attachmentIds,
 				comment.id,
 				input.authorId,
-				projectRow.organizationId
+				projectRow.organizationId,
+				input.authorType
 			);
 			claimedAttachmentIds = claimed.map((a) => a.id);
 		}
@@ -290,8 +291,24 @@ export async function listComments(
 	}
 
 	const after = options.after;
+	// R9 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): this filtered on `createdAt` only, so an
+	// EDIT to an existing comment (root or reply) never made it back through the poll -- editing
+	// doesn't insert a new row or touch `createdAt`, only `editedAt`. Checked on every node in the
+	// thread (root + each reply), matching the "whole affected thread" contract this function's
+	// own doc comment already establishes for new replies.
+	//
+	// Deletes: a REPLY delete is covered by `deleteComment` touching its root's `editedAt` (see
+	// that function's doc comment) -- the edited-root check below then re-sends the (now-shorter)
+	// thread. A ROOT delete has nothing left in this result set to touch or filter on -- the
+	// deliberately simplest correct contract here is that a deleted root's disappearance is NOT
+	// live-propagated through polling; it surfaces on the next full `listComments()` (unfiltered)
+	// load, same as CommentThread.svelte's initial mount.
+	const wasEdited = (node: CommentWithThread) => node.editedAt !== null && node.editedAt > after;
 	return roots.filter(
-		(root) => root.createdAt > after || root.replies.some((reply) => reply.createdAt > after)
+		(root) =>
+			root.createdAt > after ||
+			wasEdited(root) ||
+			root.replies.some((reply) => reply.createdAt > after || wasEdited(reply))
 	);
 }
 
@@ -351,7 +368,7 @@ export async function editComment(commentId: string, bodyMd: string) {
 export async function deleteComment(commentId: string) {
 	const { issueId, storageKeys } = await db.transaction(async (tx) => {
 		const [comment] = await tx
-			.select({ id: issueComments.id, issueId: issueComments.issueId })
+			.select({ id: issueComments.id, issueId: issueComments.issueId, parentId: issueComments.parentId })
 			.from(issueComments)
 			.where(eq(issueComments.id, commentId));
 
@@ -372,6 +389,16 @@ export async function deleteComment(commentId: string) {
 			.where(inArray(attachments.commentId, allCommentIds));
 
 		await tx.delete(issueComments).where(eq(issueComments.id, commentId));
+
+		// R9 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): deleting a REPLY leaves its root
+		// untouched by the delete above, so a poller's `after` filter (createdAt/editedAt only)
+		// would never notice the reply is gone. Bumping the root's `editedAt` here makes the
+		// thread look "changed" to the next poll, which then re-fetches and replaces it with the
+		// (now shorter) thread -- the same mechanism an edit already relies on. A ROOT delete has
+		// no row left to bump; see listComments's doc comment for that half of the contract.
+		if (comment.parentId) {
+			await tx.update(issueComments).set({ editedAt: new Date() }).where(eq(issueComments.id, comment.parentId));
+		}
 
 		return { issueId: comment.issueId, storageKeys: attachmentRows.map((a) => a.storageKey) };
 	});

@@ -50,14 +50,42 @@ vi.mock('$lib/db/schema', () => ({
 		relationType: 'relationType',
 	},
 	projects: { id: 'id', organizationId: 'organizationId' },
+	organizationMembers: { organizationId: 'organizationId', userId: 'userId' },
 	issueSubscriptions: {
 		id: 'id',
 		issueId: 'issueId',
 		subscriberType: 'subscriberType',
 		subscriberId: 'subscriberId',
 	},
-	notifications: { id: 'id', userId: 'userId', issueId: 'issueId', kind: 'kind', createdAt: 'createdAt' },
+	notifications: {
+		id: 'id',
+		userId: 'userId',
+		issueId: 'issueId',
+		kind: 'kind',
+		createdAt: 'createdAt',
+		emailedAt: 'emailedAt',
+	},
 }));
+
+// notifyIssueEvent (notify.ts, R1) queries current org membership via `tx` right after
+// listSubscribers. This chainable `tx` double resolves EVERY bare-awaited chain (not just
+// selects) through the same `.then`, so calls made by the surrounding mutation BEFORE
+// notifyIssueEvent runs (an update, a plain `.insert().values()` with no `.returning()`, etc.)
+// also consume a slot -- `dummyCallsBefore` accounts for those so the subscribers/members
+// results land on the right calls.
+function queueSubscribersThenMembers(subscribers: unknown[], memberUserIds: string[], dummyCallsBefore = 0) {
+	const fn = vi.fn();
+	for (let i = 0; i < dummyCallsBefore; i++) {
+		fn.mockImplementationOnce((resolve: any) => resolve([]));
+	}
+	fn.mockImplementationOnce((resolve: any) => resolve(subscribers));
+	fn.mockImplementationOnce((resolve: any) => resolve(memberUserIds.map((userId) => ({ userId }))));
+	// notifyIssueEvent's own `notifications` insert (bare-awaited, no `.returning()`) is the NEXT
+	// call whenever any target survives filtering -- a trailing dummy so that await resolves
+	// instead of falling through to the base (no-op) implementation and hanging.
+	fn.mockImplementationOnce((resolve: any) => resolve(undefined));
+	txMock.then = fn;
+}
 
 const { updateIssueStatus, assignIssue, createIssueRelation } = await import('./issues');
 
@@ -69,11 +97,13 @@ beforeEach(() => {
 
 describe('updateIssueStatus', () => {
 	it('fans out kind "resolved" (not "status_changed") when the new status is resolved, excluding the actor', async () => {
-		txMock.then = vi.fn((resolve: any) =>
-			resolve([
+		queueSubscribersThenMembers(
+			[
 				{ subscriberType: 'user', subscriberId: 'reporter-1' },
 				{ subscriberType: 'user', subscriberId: 'actor-1' },
-			])
+			],
+			['reporter-1', 'actor-1'],
+			3
 		);
 
 		const notified = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'user', 'actor-1');
@@ -82,7 +112,7 @@ describe('updateIssueStatus', () => {
 	});
 
 	it('fans out kind "status_changed" for a non-resolved transition', async () => {
-		txMock.then = vi.fn((resolve: any) => resolve([{ subscriberType: 'user', subscriberId: 'reporter-1' }]));
+		queueSubscribersThenMembers([{ subscriberType: 'user', subscriberId: 'reporter-1' }], ['reporter-1'], 3);
 
 		const notified = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
 
@@ -90,16 +120,35 @@ describe('updateIssueStatus', () => {
 	});
 
 	it('excludes agent subscribers from the notified list (they poll, no notifications row in M4)', async () => {
-		txMock.then = vi.fn((resolve: any) =>
-			resolve([
+		queueSubscribersThenMembers(
+			[
 				{ subscriberType: 'agent', subscriberId: 'agent-1' },
 				{ subscriberType: 'user', subscriberId: 'user-1' },
-			])
+			],
+			['user-1'],
+			3
 		);
 
 		const notified = await updateIssueStatus('issue-1', 'unresolved', undefined, 'agent', 'agent-2');
 
 		expect(notified).toEqual([{ userId: 'user-1', kind: 'status_changed' }]);
+	});
+
+	// R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): a subscriber who is no longer an org
+	// member must never be notified, even though their issue_subscriptions row still exists.
+	it('R1: excludes a subscriber who is subscribed but no longer a current org member', async () => {
+		queueSubscribersThenMembers(
+			[
+				{ subscriberType: 'user', subscriberId: 'reporter-1' },
+				{ subscriberType: 'user', subscriberId: 'ex-member-1' },
+			],
+			['reporter-1'], // ex-member-1 removed from the org, no longer in the membership rows
+			3
+		);
+
+		const notified = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
+
+		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'status_changed' }]);
 	});
 });
 
@@ -136,11 +185,13 @@ describe('createIssueRelation', () => {
 		txMock.returning = vi.fn(() =>
 			Promise.resolve([{ id: 'rel-1', sourceIssueId: 'issue-1', targetIssueId: 'issue-2' }])
 		);
-		txMock.then = vi.fn((resolve: any) =>
-			resolve([
+		queueSubscribersThenMembers(
+			[
 				{ subscriberType: 'user', subscriberId: 'watcher-1' },
 				{ subscriberType: 'user', subscriberId: 'actor-1' },
-			])
+			],
+			['watcher-1', 'actor-1'],
+			1
 		);
 
 		const { relation, notified } = await createIssueRelation('issue-1', 'issue-2', 'linked_to', 'user', 'actor-1');

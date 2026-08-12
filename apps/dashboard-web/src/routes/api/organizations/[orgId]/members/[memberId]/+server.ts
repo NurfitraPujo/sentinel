@@ -1,8 +1,8 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
-import { organizationMembers } from '$lib/db/schema';
-import { eq, and } from 'drizzle-orm';
+import { organizationMembers, issues, projects, issueSubscriptions } from '$lib/db/schema';
+import { eq, and, inArray } from 'drizzle-orm';
 import { upsertOrganizationMember } from '$lib/db/queries/organizations';
 import { requireOrgMembership } from '../../keys/_shared';
 
@@ -181,6 +181,31 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
           eq(organizationMembers.userId, target.userId)
         )
       );
+
+    // R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): a removed member must stop receiving
+    // notifications about this org's issues. `notifyIssueEvent` (notify.ts) also re-checks
+    // current org membership at fan-out time as a belt-and-suspenders guard, but the row itself
+    // must go too -- otherwise it lingers forever (e.g. surviving `isSubscribed` checks if the
+    // user is ever re-added, or simply as dead data). Same transaction as the member removal
+    // (D18): a rollback of one must roll back the other.
+    const orgIssueRows = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .innerJoin(projects, eq(projects.id, issues.projectId))
+      .where(eq(projects.organizationId, orgId));
+    const orgIssueIds = orgIssueRows.map((r: { id: string }) => r.id);
+
+    if (orgIssueIds.length > 0) {
+      await tx
+        .delete(issueSubscriptions)
+        .where(
+          and(
+            eq(issueSubscriptions.subscriberType, 'user'),
+            eq(issueSubscriptions.subscriberId, target.userId),
+            inArray(issueSubscriptions.issueId, orgIssueIds)
+          )
+        );
+    }
 
     return target;
   });

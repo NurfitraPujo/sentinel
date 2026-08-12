@@ -37,7 +37,10 @@ export async function updateIssueStatus(
 	actorId?: string
 ): Promise<NotifiedUser[]> {
 	return await db.transaction(async (tx) => {
-		const [existing] = await tx.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+		const [existing] = await tx
+			.select({ status: issues.status, waitingOn: issues.waitingOn })
+			.from(issues)
+			.where(eq(issues.id, issueId));
 
 		const updateData: any = { status };
 
@@ -53,6 +56,14 @@ export async function updateIssueStatus(
 			updateData.resolvedBy = null;
 		}
 
+		// R7 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): resolving or ignoring an issue that was
+		// `waiting_on` someone left it stuck in the "Needs input" tab forever -- nothing else ever
+		// clears `waiting_on` once the issue leaves the unresolved state. Clearing it here mirrors
+		// createComment's own clearing of `waiting_on` on a user reply (queries/comments.ts).
+		if ((status === 'resolved' || status === 'ignored') && existing?.waitingOn) {
+			updateData.waitingOn = null;
+		}
+
 		await tx.update(issues)
 			.set(updateData)
 			.where(eq(issues.id, issueId));
@@ -63,7 +74,7 @@ export async function updateIssueStatus(
 			eventType: 'status_changed',
 			actorType: actorType || 'system',
 			actorId: actorId || 'system',
-			oldValue: existing ? { status: existing.status } : null,
+			oldValue: existing ? { status: existing.status, waitingOn: existing.waitingOn } : null,
 			newValue: { status, resolvedInVersion },
 		});
 

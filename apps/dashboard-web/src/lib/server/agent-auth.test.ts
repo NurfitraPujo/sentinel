@@ -168,3 +168,57 @@ describe('authenticateAgentRequest', () => {
 		expect(ctx.keyPrefixForAudit).toBe(hashKey('sent_agent_valid').slice(0, 12));
 	});
 });
+
+// R19 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): project_api_keys.rate_limit_rpm is now
+// enforced inside authenticateAgentRequest itself.
+describe('authenticateAgentRequest rate limiting (R19)', () => {
+	function validKeyRows(rawKey: string, rateLimitRpm: number) {
+		return [
+			[
+				{
+					id: `key-for-${rawKey}`,
+					organizationId: 'org-1',
+					scope: 'agent',
+					status: 'active',
+					expiresAt: null,
+					revokedAt: null,
+					agentId: 'agent-1',
+					rateLimitRpm,
+				},
+			],
+			[{ id: 'agent-1', orgId: 'org-1', name: 'AutoFix', status: 'active' }],
+		];
+	}
+
+	it('a key under its limit keeps authenticating', async () => {
+		const rawKey = 'sent_agent_under_limit';
+		queueResults(...validKeyRows(rawKey, 2));
+
+		await expect(authenticateAgentRequest(request({ Authorization: `Bearer ${rawKey}` }))).resolves.toMatchObject({
+			agentId: 'agent-1',
+		});
+	});
+
+	it('a key that hits its rate_limit_rpm gets 429 with a Retry-After header', async () => {
+		const rawKey = 'sent_agent_at_limit';
+
+		// limit=1: the FIRST call establishes the window and is allowed (checkRateLimitWithLimit's
+		// "no entry yet" branch always allows the opening request); the SECOND call within the same
+		// window must be rejected.
+		queueResults(...validKeyRows(rawKey, 1));
+		await authenticateAgentRequest(request({ Authorization: `Bearer ${rawKey}` }));
+
+		queueResults(...validKeyRows(rawKey, 1));
+		let caught: unknown;
+		try {
+			await authenticateAgentRequest(request({ Authorization: `Bearer ${rawKey}` }));
+		} catch (err) {
+			caught = err;
+		}
+
+		expect(caught).toBeInstanceOf(Response);
+		const res = caught as Response;
+		expect(res.status).toBe(429);
+		expect(res.headers.get('Retry-After')).toBeTruthy();
+	});
+});

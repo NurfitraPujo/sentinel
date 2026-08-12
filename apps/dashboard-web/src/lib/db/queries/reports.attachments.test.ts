@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Tx } from '$lib/server/db';
 
 /**
  * Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4) -- co-located, shuffle-safe unit
@@ -13,6 +14,7 @@ interface SelectQueueEntry {
 	id: string;
 	orgId: string;
 	uploaderId: string;
+	uploaderType?: string;
 	issueId: string | null;
 	commentId: string | null;
 }
@@ -50,27 +52,30 @@ beforeEach(() => {
 function makeCorrectTx() {
 	const selectQueue: (SelectQueueEntry | undefined)[] = [];
 	const updateQueue: { id: string }[][] = [];
-	return {
-		selectQueue,
-		updateQueue,
-		tx: {
-			select: vi.fn(() => ({
-				from: vi.fn(() => ({
-					where: vi.fn(() => {
-						const row = selectQueue.shift();
-						return Promise.resolve(row ? [row] : []);
-					}),
+	// R15 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): `claimDraftAttachments` now types its `tx`
+	// param as the real Drizzle `Tx` (not `any`), which this hand-built double only structurally
+	// satisfies for the handful of chained calls it actually makes -- the full Drizzle
+	// `PgTransaction` interface (schema, rollback, setTransaction, ...) is irrelevant to this test
+	// and not worth reproducing, so the mock is cast through `unknown` at the boundary rather than
+	// widening the production signature back to `any`.
+	const tx = {
+		select: vi.fn(() => ({
+			from: vi.fn(() => ({
+				where: vi.fn(() => {
+					const row = selectQueue.shift();
+					return Promise.resolve(row ? [row] : []);
+				}),
+			})),
+		})),
+		update: vi.fn(() => ({
+			set: vi.fn(() => ({
+				where: vi.fn(() => ({
+					returning: vi.fn(() => Promise.resolve(updateQueue.shift() ?? [])),
 				})),
 			})),
-			update: vi.fn(() => ({
-				set: vi.fn(() => ({
-					where: vi.fn(() => ({
-						returning: vi.fn(() => Promise.resolve(updateQueue.shift() ?? [])),
-					})),
-				})),
-			})),
-		},
-	};
+		})),
+	} as unknown as Tx;
+	return { selectQueue, updateQueue, tx };
 }
 
 describe('claimDraftAttachments', () => {
@@ -80,6 +85,7 @@ describe('claimDraftAttachments', () => {
 			id: 'att-1',
 			orgId: 'org-1',
 			uploaderId: 'user-1',
+			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
 		});
@@ -97,6 +103,7 @@ describe('claimDraftAttachments', () => {
 			id: 'att-1',
 			orgId: 'org-OTHER',
 			uploaderId: 'user-1',
+			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
 		});
@@ -113,6 +120,7 @@ describe('claimDraftAttachments', () => {
 			id: 'att-1',
 			orgId: 'org-1',
 			uploaderId: 'user-OTHER',
+			uploaderType: 'user',
 			issueId: null,
 			commentId: null,
 		});
@@ -129,6 +137,7 @@ describe('claimDraftAttachments', () => {
 			id: 'att-1',
 			orgId: 'org-1',
 			uploaderId: 'user-1',
+			uploaderType: 'user',
 			issueId: 'issue-ALREADY',
 			commentId: null,
 		});
@@ -161,8 +170,8 @@ describe('claimDraftAttachments', () => {
 	it('processes multiple ids independently, claiming only the valid ones', async () => {
 		const { tx, selectQueue, updateQueue } = makeCorrectTx();
 		selectQueue.push(
-			{ id: 'att-1', orgId: 'org-1', uploaderId: 'user-1', issueId: null, commentId: null },
-			{ id: 'att-2', orgId: 'org-OTHER', uploaderId: 'user-1', issueId: null, commentId: null }
+			{ id: 'att-1', orgId: 'org-1', uploaderId: 'user-1', uploaderType: 'user', issueId: null, commentId: null },
+			{ id: 'att-2', orgId: 'org-OTHER', uploaderId: 'user-1', uploaderType: 'user', issueId: null, commentId: null }
 		);
 		updateQueue.push([{ id: 'att-1' }]);
 
@@ -176,5 +185,25 @@ describe('claimDraftAttachments', () => {
 
 		expect(result).toEqual([{ id: 'att-1' }]);
 		expect(tx.update).toHaveBeenCalledTimes(1);
+	});
+
+	// R10 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): `uploaderId` alone is a bare varchar shared
+	// across the 'user' and 'agent' id spaces -- this proves an attachment uploaded by an AGENT
+	// whose id happens to match a USER id string is not claimable by that user.
+	it('skips an attachment uploaded by the same id string but a different uploaderType', async () => {
+		const { tx, selectQueue } = makeCorrectTx();
+		selectQueue.push({
+			id: 'att-1',
+			orgId: 'org-1',
+			uploaderId: 'same-id-1',
+			uploaderType: 'agent',
+			issueId: null,
+			commentId: null,
+		});
+
+		const result = await claimDraftAttachments(tx, ['att-1'], 'issue-1', 'same-id-1', 'org-1', 'user');
+
+		expect(result).toEqual([]);
+		expect(tx.update).not.toHaveBeenCalled();
 	});
 });

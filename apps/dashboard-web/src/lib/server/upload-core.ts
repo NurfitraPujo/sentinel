@@ -99,10 +99,33 @@ export async function handleAttachmentUpload(input: UploadCoreInput): Promise<Up
 	};
 }
 
-/** Content-Length pre-check shared by both upload routes -- rejects before buffering when possible. */
+/**
+ * Content-Length pre-check shared by both upload routes -- rejects before buffering when
+ * possible.
+ *
+ * R8 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): `Number(declaredLength) > MAX_UPLOAD_BYTES`
+ * silently PASSED a missing or non-numeric header -- `Number(null) > cap` and
+ * `Number('not-a-number') > cap` (== `NaN > cap`) are both `false`, so a request with no
+ * Content-Length, or a garbage one, sailed through this guard and was fully buffered
+ * (`Buffer.from(await file.arrayBuffer())` in `handleAttachmentUpload`) before the `file.size`
+ * check ever ran -- exactly the memory-abuse vector this function exists to stop.
+ *
+ * SvelteKit/undici give no hook to enforce a byte-counting limit on the incoming stream before
+ * `request.formData()` fully buffers it (there is no public streaming multipart parser in this
+ * stack) -- Content-Length is the only signal available before that buffering happens. The
+ * strongest guard achievable here without a body-parsing rewrite is therefore to reject anything
+ * that doesn't declare a numeric length, not just anything that declares an oversized one.
+ */
 export function checkDeclaredLength(request: Request): void {
 	const declaredLength = request.headers.get('content-length');
-	if (declaredLength && Number(declaredLength) > MAX_UPLOAD_BYTES) {
+	if (declaredLength === null || declaredLength.trim() === '') {
+		throw error(411, 'Content-Length header is required');
+	}
+	const parsed = Number(declaredLength);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		throw error(400, 'Content-Length header must be a non-negative number');
+	}
+	if (parsed > MAX_UPLOAD_BYTES) {
 		throw error(413, `File exceeds the ${MAX_UPLOAD_BYTES} byte cap`);
 	}
 }

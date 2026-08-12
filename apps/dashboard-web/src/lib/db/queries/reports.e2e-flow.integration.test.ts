@@ -184,17 +184,17 @@ describe.skipIf(!dbReachable)('Manual issues M1 flow (integration, real Postgres
 		expect(movedRow?.issue.projectId).toBe(targetProjectId);
 		expect(movedRow?.projectIsInbox).toBe(false);
 
-		// 6. ACTIVITY shows created ("report_edited"/created), claimed, and moved, in order.
+		// 6. ACTIVITY shows created ("report_created", R12), claimed, and moved, in order.
 		const activity = await getIssueActivity(issueId);
 		const eventTypesInOrder = activity
 			.slice()
 			.sort((a, b) => new Date(a.createdAt as unknown as string).getTime() - new Date(b.createdAt as unknown as string).getTime())
 			.map((a) => a.eventType);
 
-		expect(eventTypesInOrder).toContain('report_edited');
+		expect(eventTypesInOrder).toContain('report_created');
 		expect(eventTypesInOrder).toContain('claimed');
 		expect(eventTypesInOrder).toContain('moved');
-		expect(eventTypesInOrder.indexOf('report_edited')).toBeLessThan(
+		expect(eventTypesInOrder.indexOf('report_created')).toBeLessThan(
 			eventTypesInOrder.indexOf('claimed')
 		);
 		expect(eventTypesInOrder.indexOf('claimed')).toBeLessThan(eventTypesInOrder.indexOf('moved'));

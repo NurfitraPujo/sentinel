@@ -2,11 +2,11 @@ import { error, json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { issues, attachments, issueComments } from '$lib/db/schema';
+import { attachments, issueComments } from '$lib/db/schema';
 import { getAttachmentById } from '$lib/db/queries/reports';
-import { requireReportAccessForIssue } from '$lib/server/report-access';
-import { requireIssueAccess } from '$lib/server/issue-access';
+import { requireIssueAccessAnyType } from '$lib/server/issue-access-dispatch';
 import { getObjectStream, deleteObject, isStorageConfigured } from '$lib/server/storage';
+import { buildContentDisposition } from '$lib/server/content-disposition';
 import { log } from '$lib/server/observability/log';
 
 // Manual Issues M2/M3 (docs/plans/MANUAL_ISSUES_DESIGN.md §4). Streams the object from MinIO
@@ -38,20 +38,10 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	}
 
 	if (attachment.issueId) {
-		const [issueRow] = await db
-			.select({ issueType: issues.issueType })
-			.from(issues)
-			.where(eq(issues.id, attachment.issueId));
-
-		if (!issueRow) {
-			throw error(404, 'Attachment not found');
-		}
-
-		if (issueRow.issueType === 'user_report') {
-			await requireReportAccessForIssue(userId, attachment.issueId, 'read');
-		} else {
-			await requireIssueAccess(userId, attachment.issueId, 'read');
-		}
+		// R17 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the per-issue-type dispatch (was inlined
+		// here) now lives in issue-access-dispatch.ts, shared with comment-access.ts and R4's claim
+		// release path -- 404s on a missing issue the same way the prior inline lookup did.
+		await requireIssueAccessAnyType(userId, attachment.issueId, 'read');
 	} else if (attachment.commentId) {
 		const [commentRow] = await db
 			.select({ issueId: issueComments.issueId })
@@ -62,20 +52,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 			throw error(404, 'Attachment not found');
 		}
 
-		const [issueRow] = await db
-			.select({ issueType: issues.issueType })
-			.from(issues)
-			.where(eq(issues.id, commentRow.issueId));
-
-		if (!issueRow) {
-			throw error(404, 'Attachment not found');
-		}
-
-		if (issueRow.issueType === 'user_report') {
-			await requireReportAccessForIssue(userId, commentRow.issueId, 'read');
-		} else {
-			await requireIssueAccess(userId, commentRow.issueId, 'read');
-		}
+		await requireIssueAccessAnyType(userId, commentRow.issueId, 'read');
 	} else {
 		// Draft: not linked to anything. Only the uploader may fetch it.
 		if (attachment.uploaderType !== 'user' || attachment.uploaderId !== userId) {
@@ -93,10 +70,12 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	headers.set('Content-Length', String(attachment.sizeBytes));
 
 	const isImage = attachment.contentType.startsWith('image/');
-	const safeFilename = attachment.filename.replace(/["\r\n]/g, '_');
+	// R3: RFC 6266/5987 -- ASCII-sanitized fallback + filename*=UTF-8''<percent-encoded>, backslashes
+	// stripped from both. A non-ASCII filename previously reached headers.set() unchanged and threw
+	// (Node's Headers rejects non-ISO-8859-1 values), a permanent 500 on download.
 	headers.set(
 		'Content-Disposition',
-		`${isImage ? 'inline' : 'attachment'}; filename="${safeFilename}"`
+		buildContentDisposition(isImage ? 'inline' : 'attachment', attachment.filename)
 	);
 
 	// @aws-sdk/client-s3's `Body` is a web ReadableStream in this (fetch-based Node) runtime --

@@ -1,5 +1,5 @@
-import { db } from '$lib/server/db';
-import { issues, projects, organizations, notifications, users } from '$lib/db/schema';
+import { db, type Tx } from '$lib/server/db';
+import { issues, projects, organizations, organizationMembers, notifications, users } from '$lib/db/schema';
 import { and, eq, gt, inArray, sql } from 'drizzle-orm';
 import { listSubscribers } from '$lib/db/queries/subscriptions';
 import { sendIssueNotificationEmail, type IssueNotificationKind } from '$lib/server/email';
@@ -49,11 +49,33 @@ export interface NotifiedUser {
  * module-level `db`, so the insert is atomic with the mutation it describes (D18).
  */
 export async function notifyIssueEvent(
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	tx: any,
+	// R15 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the caller's db.transaction param, typed
+	// via `Tx` instead of `any`.
+	tx: Tx,
 	input: NotifyIssueEventInput
 ): Promise<NotifiedUser[]> {
 	const subscribers = await listSubscribers(input.issueId, tx);
+
+	const userSubscriberIds = subscribers
+		.filter((s: { subscriberType: string }) => s.subscriberType === 'user')
+		.map((s: { subscriberId: string }) => s.subscriberId);
+
+	// R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): a `issue_subscriptions` row can outlive its
+	// subscriber's org membership -- nothing today deletes it when the user is removed from the
+	// org, so fan-out must re-check CURRENT membership at notify time rather than trusting the
+	// subscription row alone (belt-and-suspenders with the removeMember-side cleanup below).
+	// Joined through the issue's project -> its org, inside the SAME tx as the mutation (D18):
+	// this must see membership as of the mutation, not a stale read from before it started.
+	let currentOrgMemberIds = new Set<string>();
+	if (userSubscriberIds.length > 0) {
+		const memberRows = await tx
+			.select({ userId: organizationMembers.userId })
+			.from(issues)
+			.innerJoin(projects, eq(projects.id, issues.projectId))
+			.innerJoin(organizationMembers, eq(organizationMembers.organizationId, projects.organizationId))
+			.where(and(eq(issues.id, input.issueId), inArray(organizationMembers.userId, userSubscriberIds)));
+		currentOrgMemberIds = new Set(memberRows.map((r: { userId: string }) => r.userId));
+	}
 
 	const targets = subscribers.filter((s: { subscriberType: string; subscriberId: string }) => {
 		if (s.subscriberType !== 'user') {
@@ -62,6 +84,12 @@ export async function notifyIssueEvent(
 		}
 		if (input.actorType === 'user' && s.subscriberId === input.actorId) {
 			// Never notify the actor about their own action.
+			return false;
+		}
+		if (!currentOrgMemberIds.has(s.subscriberId)) {
+			// R1: subscribed but no longer an org member (removed since subscribing) -- never
+			// notify. If removeMember's own subscription cleanup ran, this row would already be
+			// gone; this is the belt half of belt-and-suspenders for any path that missed it.
 			return false;
 		}
 		return true;
@@ -97,21 +125,17 @@ const BLOCKING_BYPASS_KIND: NotificationKind = 'question_asked';
 const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
 
 /**
- * Q7 throttle: "at most one email per (user, issue) per 15 min". Implemented as a query over
- * ALREADY-EMAILABLE `notifications` rows rather than a separate `notification_email_log` table
- * or an `emailed_at` column -- the simplest correct option, since an emailable-kind notification
- * row is created (inside the mutation's own transaction, via `notifyIssueEvent` above)
- * IMMEDIATELY before this function attempts to email about it, so "an emailable notification for
- * this (user, issue) exists in the last 15 minutes" is equivalent to "an email for this
- * (user, issue) was attempted in the last 15 minutes" -- with no extra write, no extra table, and
- * no risk of the log and the notifications table drifting apart. It throttles on ATTEMPTS, not
- * confirmed deliveries (a failed send still counts against the window) -- deliberate: retrying a
- * failed send every poll cycle would defeat the point of a throttle.
- *
- * The row just inserted for THIS event is included in the count (it already exists in the DB by
- * the time this runs, since it is inserted pre-commit and this runs post-commit) -- so "more than
- * one emailable row in the window" means "an email was already sent for an earlier one", and this
- * one should be throttled.
+ * R5 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): Q7 throttle: "at most one email per (user,
+ * issue) per 15 min". Previously implemented as a count over ALL emailable `notifications` rows
+ * in the window -- but that counts ATTEMPTS regardless of whether they were actually emailed, so
+ * a throttled attempt at t0 poisoned the count for a later, legitimately-emailable attempt at
+ * t10 even though t0 never actually sent anything: `count > 1` triggered on the second row ever,
+ * so a sub-15-min cadence emailed exactly once, ever, no matter how many more emailable events
+ * followed. Fixed to track actual SENDS: `notifications.emailed_at` (1723000000_pr13_remediation.sql)
+ * is set by this function itself, post-send, only on rows it actually emailed (see the update at
+ * the bottom of the loop below). Throttled = "an emailable notification for this (user, issue)
+ * was actually emailed within the last 15 minutes" -- i.e. `max(emailed_at)` in the window, not a
+ * row count.
  */
 async function isThrottled(userId: string, issueId: string): Promise<boolean> {
 	const since = new Date(Date.now() - THROTTLE_WINDOW_MS);
@@ -122,12 +146,37 @@ async function isThrottled(userId: string, issueId: string): Promise<boolean> {
 			and(
 				eq(notifications.userId, userId),
 				eq(notifications.issueId, issueId),
-				gt(notifications.createdAt, since),
+				gt(notifications.emailedAt, since),
 				inArray(notifications.kind, [...EMAILABLE_KINDS])
 			)
 		);
 	const count = rows[0]?.count ?? 0;
-	return count > 1;
+	return count > 0;
+}
+
+/**
+ * R5: sets `emailed_at = now()` on the most recent not-yet-emailed `notifications` row for
+ * (userId, issueId, kind). Scoped by a `LIMIT 1` subquery rather than a bare `UPDATE ... WHERE`
+ * so it stamps exactly the row this send was for, not every historical unset row for the same
+ * (user, issue, kind) -- an earlier row that was itself throttled (never emailed) must stay
+ * unstamped, or a later legitimate send would wrongly "confirm" a delivery that never happened.
+ * Best-effort: a failed update here must never stop other users in the fan-out loop.
+ */
+async function stampEmailedAt(userId: string, issueId: string, kind: NotificationKind): Promise<void> {
+	try {
+		await db.execute(sql`
+			UPDATE ${notifications}
+			SET emailed_at = now()
+			WHERE id = (
+				SELECT id FROM ${notifications}
+				WHERE user_id = ${userId} AND issue_id = ${issueId} AND kind = ${kind} AND emailed_at IS NULL
+				ORDER BY created_at DESC
+				LIMIT 1
+			)
+		`);
+	} catch (err) {
+		log.error('notify.emailed_at_stamp_failed', { userId, issueId, kind, error: err });
+	}
 }
 
 export interface SendNotificationEmailsContext {
@@ -194,6 +243,13 @@ export async function sendIssueNotificationEmails(
 				kind as IssueNotificationKind,
 				issueInfo.title
 			);
+
+			// R5: stamp the notification row this email was actually for, so isThrottled's
+			// `emailed_at`-based window reflects a real send, not just an attempt. Targets the
+			// latest not-yet-emailed row for this (user, issue, kind) rather than the NotifiedUser
+			// entry directly (it carries no row id) -- best-effort, like the rest of this function:
+			// a failed update here never stops other users' emails from sending.
+			await stampEmailedAt(userId, ctx.issueId, kind);
 		} catch (err) {
 			log.error('notify.email_send_failed', { userId, issueId: ctx.issueId, kind, error: err });
 		}

@@ -1,6 +1,11 @@
-import { db } from '$lib/server/db';
+import { db, type Tx } from '$lib/server/db';
 import { issueSubscriptions } from '$lib/db/schema';
 import { and, eq } from 'drizzle-orm';
+
+// R15 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): a caller passes either the enclosing
+// db.transaction callback param (Tx) or nothing at all (defaults to the top-level `db`), so the
+// accepted type is the union of both instead of `any`.
+type DbOrTx = Tx | typeof db;
 
 /**
  * Manual Issues M4 (docs/plans/MANUAL_ISSUES_DESIGN.md §8): who gets notified about an issue.
@@ -25,8 +30,7 @@ export interface SubscribeInput {
 // tx is optional so auto-subscribe wiring can pass the enclosing db.transaction (D18: same
 // transaction as the mutation it accompanies) while the manual toggle route can call this
 // standalone.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function subscribe(input: SubscribeInput, tx: any = db) {
+export async function subscribe(input: SubscribeInput, tx: DbOrTx = db) {
 	await tx
 		.insert(issueSubscriptions)
 		.values({
@@ -46,8 +50,7 @@ export interface UnsubscribeInput {
 	subscriberId: string;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function unsubscribe(input: UnsubscribeInput, tx: any = db) {
+export async function unsubscribe(input: UnsubscribeInput, tx: DbOrTx = db) {
 	await tx
 		.delete(issueSubscriptions)
 		.where(
@@ -60,8 +63,7 @@ export async function unsubscribe(input: UnsubscribeInput, tx: any = db) {
 }
 
 /** §8 fan-out target list. Returns every subscriber row (user AND agent) for an issue. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function listSubscribers(issueId: string, tx: any = db) {
+export async function listSubscribers(issueId: string, tx: DbOrTx = db) {
 	return await tx.select().from(issueSubscriptions).where(eq(issueSubscriptions.issueId, issueId));
 }
 

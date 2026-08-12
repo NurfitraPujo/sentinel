@@ -20,6 +20,69 @@
 	let moving = $state(false);
 	let moveError = $state<string | null>(null);
 
+	// R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md, §9): author edit/delete of their own report.
+	let editing = $state(false);
+	let editTitle = $state('');
+	let editBodyMd = $state('');
+	let editSeverity = $state('low');
+	let saving = $state(false);
+	let saveError = $state<string | null>(null);
+	let deleting = $state(false);
+	let deleteError = $state<string | null>(null);
+
+	function startEdit() {
+		editTitle = data.detail.issue.message;
+		editBodyMd = data.detail.report.bodyMd;
+		editSeverity = data.detail.report.severity;
+		saveError = null;
+		editing = true;
+	}
+
+	function cancelEdit() {
+		editing = false;
+		saveError = null;
+	}
+
+	async function handleSaveEdit() {
+		saveError = null;
+		saving = true;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/reports/${data.detail.issue.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ title: editTitle, bodyMd: editBodyMd, severity: editSeverity }),
+			});
+			if (!res.ok) {
+				const body = await res.json().catch(() => ({}));
+				throw new Error(body.message || `Failed to save (${res.status})`);
+			}
+			window.location.reload();
+		} catch (err) {
+			saveError = err instanceof Error ? err.message : 'Failed to save';
+		} finally {
+			saving = false;
+		}
+	}
+
+	async function handleDelete() {
+		if (!confirm('Delete this report? This cannot be undone.')) return;
+		deleteError = null;
+		deleting = true;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/reports/${data.detail.issue.id}`, {
+				method: 'DELETE',
+			});
+			if (!res.ok) {
+				const body = await res.json().catch(() => ({}));
+				throw new Error(body.message || `Failed to delete (${res.status})`);
+			}
+			window.location.href = `/${data.orgSlug}/reports`;
+		} catch (err) {
+			deleteError = err instanceof Error ? err.message : 'Failed to delete';
+			deleting = false;
+		}
+	}
+
 	function isClaimedByMe(): boolean {
 		return data.detail.issue.assignedTo === data.userId && data.detail.issue.assigneeType === 'user';
 	}
@@ -98,11 +161,22 @@
 				<span class="waiting-badge">waiting on {data.detail.issue.waitingOn}</span>
 			{/if}
 			<SubscriptionToggle issueId={data.detail.issue.id} />
+			{#if data.canEditOwnReport && !editing}
+				<button type="button" class="btn-secondary" onclick={startEdit}>Edit</button>
+			{/if}
+			{#if data.canDeleteReport}
+				<button type="button" class="btn-danger" onclick={handleDelete} disabled={deleting}>
+					{deleting ? 'Deleting…' : 'Delete'}
+				</button>
+			{/if}
 		</div>
 	</div>
 
 	{#if claimError}
 		<div class="error-banner" role="alert">{claimError}</div>
+	{/if}
+	{#if deleteError}
+		<div class="error-banner" role="alert">{deleteError}</div>
 	{/if}
 
 	<div class="claim-box">
@@ -126,9 +200,37 @@
 		{/if}
 	</div>
 
-	<div class="report-body-panel">
-		<Markdown source={data.detail.report.bodyMd} />
-	</div>
+	{#if editing}
+		<div class="report-body-panel edit-form">
+			{#if saveError}
+				<div class="error-banner" role="alert">{saveError}</div>
+			{/if}
+			<label class="edit-label" for="edit-title">Title</label>
+			<input id="edit-title" class="edit-input" type="text" bind:value={editTitle} />
+
+			<label class="edit-label" for="edit-severity">Severity</label>
+			<select id="edit-severity" class="edit-input" bind:value={editSeverity}>
+				<option value="low">low</option>
+				<option value="medium">medium</option>
+				<option value="high">high</option>
+				<option value="critical">critical</option>
+			</select>
+
+			<label class="edit-label" for="edit-body">Description</label>
+			<textarea id="edit-body" class="edit-textarea" rows="8" bind:value={editBodyMd}></textarea>
+
+			<div class="edit-actions">
+				<button type="button" class="btn-primary" onclick={handleSaveEdit} disabled={saving}>
+					{saving ? 'Saving…' : 'Save'}
+				</button>
+				<button type="button" class="btn-secondary" onclick={cancelEdit} disabled={saving}>Cancel</button>
+			</div>
+		</div>
+	{:else}
+		<div class="report-body-panel">
+			<Markdown source={data.detail.report.bodyMd} />
+		</div>
+	{/if}
 
 	<div class="attachments-panel">
 		<h2 class="section-heading">Attachments</h2>
@@ -332,6 +434,59 @@
 	.btn-secondary:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
+	}
+
+	.btn-danger {
+		border: 1px solid rgba(239, 68, 68, 0.4);
+		border-radius: var(--radius-sm);
+		padding: 0.375rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+		background: transparent;
+		color: #ef4444;
+	}
+
+	.btn-danger:hover {
+		background: rgba(239, 68, 68, 0.1);
+	}
+
+	.btn-danger:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.edit-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.edit-label {
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: var(--text-muted);
+	}
+
+	.edit-input,
+	.edit-textarea {
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem;
+		font-size: 0.8125rem;
+		font-family: inherit;
+	}
+
+	.edit-textarea {
+		resize: vertical;
+	}
+
+	.edit-actions {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.25rem;
 	}
 
 	.tabs {

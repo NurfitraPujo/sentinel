@@ -1,8 +1,18 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { claimIssue, releaseClaim, ClaimConflictError } from '$lib/db/queries/reports';
 import { requireReportAccessForIssue } from '$lib/server/report-access';
+import { requireIssueAccessAnyType } from '$lib/server/issue-access-dispatch';
+import { claimIssue, releaseClaim, ClaimConflictError } from '$lib/db/queries/reports';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
+
+// R4/R17 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the claim DELETE route's per-issue-type
+// access dispatch now goes through the shared `requireIssueAccessAnyType`
+// (issue-access-dispatch.ts) -- `requireReportAccessForIssue` alone 404s on any `system_error`
+// issue id (report-access.ts's §9 strict-separation guarantee), so an agent's claim on a
+// system_error issue could never be force-released by a human before R4. `requireIssueAccessAnyType`
+// covers both `write` and `force-release` (owner/admin-only, same rule report-access.ts's
+// force-release enforces) for both issue types in one place, so this route no longer needs its
+// own copy.
 
 // Manual Issues M1 (design §7, §9): human claim/release through the session-authenticated API,
 // same atomic-conditional-UPDATE mechanics the agent work-loop (M5) will use. `write` role is
@@ -54,8 +64,9 @@ export const DELETE: RequestHandler = async ({ params, url, locals }) => {
 
 	// force-release requires owner/admin; a plain release requires only the ordinary write role
 	// (the caller still has to actually hold the claim — releaseClaim's own conditional UPDATE
-	// enforces that, a 409 if not).
-	await requireReportAccessForIssue(userId, issueId, forceParam ? 'force-release' : 'write');
+	// enforces that, a 409 if not). Dispatches per issue_type (R4/R17) so a system_error issue's
+	// claim can be released here too, not just a user_report's.
+	await requireIssueAccessAnyType(userId, issueId, forceParam ? 'force-release' : 'write');
 
 	try {
 		const { issue: updated, notified } = await releaseClaim(issueId, userId, { force: forceParam });

@@ -36,7 +36,11 @@ vi.mock('$lib/db/schema', () => ({
   users: { id: 'id', email: 'email', name: 'name' },
   organizations: { id: 'id', name: 'name', slug: 'slug' },
   organizationInvitations: { id: 'id', organizationId: 'organizationId', email: 'email' },
+  issues: { id: 'id', projectId: 'projectId' },
+  projects: { id: 'id', organizationId: 'organizationId' },
+  issueSubscriptions: { id: 'id', issueId: 'issueId', subscriberType: 'subscriberType', subscriberId: 'subscriberId' },
 }));
+const schemaMock = await import('$lib/db/schema');
 
 const orgQueries = {
   upsertOrganizationMember: vi.fn(),
@@ -297,6 +301,40 @@ describe('Organization Member Management Routes', () => {
       const body = await res.json();
       expect(body).toEqual({ success: true, memberId: 'mem-target', userId: 'user-target' });
       expect(dbMock.delete).toHaveBeenCalled();
+    });
+
+    // R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): removing a member must also delete their
+    // issue_subscriptions rows for this org's issues, in the SAME transaction (D18) -- otherwise
+    // an ex-member keeps a subscription row that (absent notify.ts's own membership re-check)
+    // would keep generating notifications/emails forever.
+    it('R1: deletes the revoked member\'s issue_subscriptions rows scoped to this org, in the same transaction', async () => {
+      dbMock.then
+        .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }])) // caller
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'mem-target', userId: 'user-target', role: 'engineer' }])) // target
+        .mockImplementationOnce((resolve: any) => resolve([])) // delete organizationMembers await (value unused)
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'issue-1' }, { id: 'issue-2' }])); // this org's issue ids
+
+      const res = await DELETE({ params: { orgId: 'org-1', memberId: 'mem-target' }, locals: locals({ id: 'user-caller' }) } as any);
+
+      expect(res.status).toBe(200);
+      // Two deletes inside the same db.transaction: the membership row, then the subscriptions.
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.organizationMembers);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.issueSubscriptions);
+      expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('R1: skips the subscriptions delete entirely when this org has no issues (no-op, not an error)', async () => {
+      dbMock.then
+        .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }])) // caller
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'mem-target', userId: 'user-target', role: 'engineer' }])) // target
+        .mockImplementationOnce((resolve: any) => resolve([])) // delete organizationMembers await (value unused)
+        .mockImplementationOnce((resolve: any) => resolve([])); // no issues in this org
+
+      const res = await DELETE({ params: { orgId: 'org-1', memberId: 'mem-target' }, locals: locals({ id: 'user-caller' }) } as any);
+
+      expect(res.status).toBe(200);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.organizationMembers);
+      expect(dbMock.delete).not.toHaveBeenCalledWith(schemaMock.issueSubscriptions);
     });
 
     // D32: concurrency regression test. Two "simultaneous" DELETEs both target the last two

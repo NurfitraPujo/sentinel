@@ -220,7 +220,8 @@ describe('createComment', () => {
 			['att-1'],
 			'comment-1',
 			'user-1',
-			'org-1'
+			'org-1',
+			'user'
 		);
 		expect(txHandle.insertCalls[1].values).toMatchObject({
 			eventType: 'commented',
@@ -438,6 +439,85 @@ describe('listComments', () => {
 		expect(result.map((r) => r.id)).toEqual(['root-1']);
 		expect(result[0].replies.map((r) => r.id)).toEqual(['reply-1']);
 	});
+
+	// R9 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the after-filter only looked at
+	// `createdAt`, so an edit (which only bumps `editedAt`) never made a thread reappear through
+	// polling.
+	it('after-filter: an edit-only change (editedAt bumped, no new createdAt) is still included', async () => {
+		dbResultQueue.push(
+			[
+				{
+					id: 'root-1',
+					issueId: 'issue-1',
+					parentId: null,
+					authorType: 'user',
+					authorId: 'user-1',
+					blocking: false,
+					bodyMd: 'edited root',
+					createdAt: new Date('2026-08-01T00:00:00Z'),
+					editedAt: new Date('2026-08-03T00:00:00Z'),
+					authorName: null,
+					authorEmail: null,
+				},
+				{
+					id: 'root-2',
+					issueId: 'issue-1',
+					parentId: null,
+					authorType: 'user',
+					authorId: 'user-1',
+					blocking: false,
+					bodyMd: 'untouched root',
+					createdAt: new Date('2026-08-01T00:00:00Z'),
+					editedAt: null,
+					authorName: null,
+					authorEmail: null,
+				},
+			],
+			[]
+		);
+
+		const result = await listComments('issue-1', { after: new Date('2026-08-02T00:00:00Z') });
+
+		expect(result.map((r) => r.id)).toEqual(['root-1']);
+	});
+
+	it('after-filter: an edited REPLY is included even though its root is untouched', async () => {
+		dbResultQueue.push(
+			[
+				{
+					id: 'root-1',
+					issueId: 'issue-1',
+					parentId: null,
+					authorType: 'user',
+					authorId: 'user-1',
+					blocking: false,
+					bodyMd: 'root',
+					createdAt: new Date('2026-08-01T00:00:00Z'),
+					editedAt: null,
+					authorName: null,
+					authorEmail: null,
+				},
+				{
+					id: 'reply-1',
+					issueId: 'issue-1',
+					parentId: 'root-1',
+					authorType: 'user',
+					authorId: 'user-1',
+					blocking: false,
+					bodyMd: 'edited reply',
+					createdAt: new Date('2026-08-01T00:00:00Z'),
+					editedAt: new Date('2026-08-03T00:00:00Z'),
+					authorName: null,
+					authorEmail: null,
+				},
+			],
+			[]
+		);
+
+		const result = await listComments('issue-1', { after: new Date('2026-08-02T00:00:00Z') });
+
+		expect(result.map((r) => r.id)).toEqual(['root-1']);
+	});
 });
 
 describe('editComment', () => {
@@ -488,6 +568,30 @@ describe('deleteComment', () => {
 
 		await expect(deleteComment('missing')).rejects.toBeInstanceOf(CommentNotFoundError);
 		expect(deleteObject).not.toHaveBeenCalled();
+	});
+
+	// R9 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): deleting a REPLY leaves its root row
+	// untouched, so a poller's `after` filter (createdAt/editedAt) never notices the reply is
+	// gone -- this proves the root's `editedAt` is bumped so the next poll re-sends the thread.
+	it('deleting a REPLY bumps its root comment editedAt (delete propagation)', async () => {
+		txHandle.selectQueue.push(
+			[{ id: 'reply-1', issueId: 'issue-1', parentId: 'root-1' }], // the comment itself (a reply)
+			[], // its own replies (none -- a reply has no children)
+			[] // no attachments
+		);
+
+		await deleteComment('reply-1');
+
+		expect(txHandle.updateCalls).toHaveLength(1);
+		expect(txHandle.updateCalls[0].set).toEqual({ editedAt: expect.any(Date) });
+	});
+
+	it('deleting a ROOT comment does not attempt to bump anything (nothing left to bump)', async () => {
+		txHandle.selectQueue.push([{ id: 'root-1', issueId: 'issue-1', parentId: null }], [], []);
+
+		await deleteComment('root-1');
+
+		expect(txHandle.updateCalls).toHaveLength(0);
 	});
 });
 

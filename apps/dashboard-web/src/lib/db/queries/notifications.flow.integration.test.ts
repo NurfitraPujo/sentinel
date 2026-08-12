@@ -86,6 +86,15 @@ describe.skipIf(!dbReachable)('Manual issues M4 notifications flow (integration,
 			insert into "user" (id, name, email)
 			values (${userBId}, ${'User B ' + suffix}, ${'user-b-' + suffix + '@example.test'})
 		`;
+		// R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): notifyIssueEvent now re-checks CURRENT
+		// org membership before notifying a subscriber, joined through the issue's project -> org.
+		// Without membership rows here, every fan-out in this flow would be silently filtered to
+		// empty, which is correct production behavior but breaks this test's ability to assert on
+		// notified lists unless both actors are actually members of `orgId`.
+		await sql`
+			insert into organization_members (organization_id, user_id, role)
+			values (${orgId}, ${reporterId}, 'viewer'), (${orgId}, ${userBId}, 'viewer')
+		`;
 	});
 
 	afterAll(async () => {
@@ -98,6 +107,7 @@ describe.skipIf(!dbReachable)('Manual issues M4 notifications flow (integration,
 			await sql`delete from manual_issue_reports where issue_id in (select id from issues where project_id = ${projectId})`;
 			await sql`delete from issues where project_id = ${projectId}`;
 			await sql`delete from projects where organization_id = ${orgId}`;
+			await sql`delete from organization_members where organization_id = ${orgId}`;
 			await sql`delete from "user" where id in (${reporterId}, ${userBId})`;
 			await sql`delete from organizations where id = ${orgId}`;
 		} finally {
