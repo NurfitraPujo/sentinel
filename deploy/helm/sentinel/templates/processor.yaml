@@ -1,0 +1,124 @@
+{{- $img := .Values.images.processor -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentinel.fullname" . }}-processor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: processor
+spec:
+  {{- if not .Values.processor.autoscaling.enabled }}
+  replicas: {{ .Values.processor.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: processor
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: processor
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.processor.healthPort | quote }}
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: processor
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.processor.healthPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "sentinel.configMapName" . }}
+          env:
+            - name: PROCESSOR_HEALTH_ADDR
+              value: ":{{ .Values.processor.healthPort }}"
+            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: processor-go
+            {{- include "sentinel.otelEnv" . | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: {{ .Values.processor.livenessPath }}, port: health }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: {{ .Values.processor.readinessPath }}, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.processor.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sentinel.fullname" . }}-processor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: processor
+spec:
+  type: {{ .Values.processor.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: processor
+  ports:
+    - name: health
+      port: {{ .Values.processor.service.port }}
+      targetPort: health
+{{- if .Values.processor.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sentinel.fullname" . }}-processor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "sentinel.fullname" . }}-processor
+  minReplicas: {{ .Values.processor.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.processor.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.processor.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.processor.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sentinel.fullname" . }}-processor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.processor.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: processor
+{{- end }}

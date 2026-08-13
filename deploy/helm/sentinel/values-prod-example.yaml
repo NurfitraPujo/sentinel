@@ -1,0 +1,81 @@
+# Example production overrides. Copy, edit, and install with:
+#   helm upgrade --install sentinel deploy/helm/sentinel -n sentinel --create-namespace \
+#     -f my-prod-values.yaml
+#
+# The two golden rules for a real deployment:
+#   1. Disable every bundled dependency and use managed services.
+#   2. NEVER put secrets in this file. Reference a pre-provisioned Secret via secrets.existingSecret
+#      (ideally populated by External Secrets Operator / Vault / a cloud secret manager).
+
+images:
+  ingestor:  { repository: registry.example.com/sentinel/ingestor-go,  tag: "1.4.0" }
+  processor: { repository: registry.example.com/sentinel/processor-go, tag: "1.4.0" }
+  dashboard: { repository: registry.example.com/sentinel/dashboard-web, tag: "1.4.0" }
+  migrate:   { repository: registry.example.com/sentinel/db-migrate,    tag: "1.4.0" }
+  dlqDrainer: { repository: registry.example.com/sentinel/dlq-drainer,  tag: "1.4.0" }
+
+# The Secret must contain: POSTGRES_PASSWORD, REDIS_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY,
+# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+# EMAIL_SERVER.
+secrets:
+  create: false
+  existingSecret: sentinel-app-secrets
+
+config:
+  postgres:
+    host: sentinel-db.abc123.us-east-1.rds.amazonaws.com   # managed Postgres (RDS/Cloud SQL)
+    port: 5432
+    user: sentinel
+    database: sentinel
+    sslmode: require
+  nats:
+    url: nats://nats.internal.example.com:4222              # managed / dedicated NATS cluster
+  redis:
+    addr: sentinel-redis.abc123.cache.amazonaws.com:6379    # managed Redis
+    db: 0
+  s3:
+    endpoint: https://s3.us-east-1.amazonaws.com            # server-side S3 endpoint
+    publicEndpoint: https://uploads.sentinel.example.com    # BROWSER-reachable; used to sign presigned PUTs
+    bucket: sentinel-attachments-prod
+  otel:
+    exporterEndpoint: http://otel-collector.observability.svc:4318
+  dashboard:
+    authUrl: https://sentinel.example.com
+    emailFrom: noreply@sentinel.example.com
+    dataRetentionDays: "90"
+  ingestor:
+    ratelimitStrictMode: "true"
+
+# Turn OFF every bundled dependency and its init Job (streams/bucket are pre-provisioned in prod,
+# or run the init images once as one-off Jobs against the managed endpoints).
+dependencies:
+  postgres: { enabled: false }
+  nats:     { enabled: false }
+  redis:    { enabled: false }
+  minio:    { enabled: false }
+init:
+  nats:  { enabled: false }
+  minio: { enabled: false }
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+  dashboard: { host: sentinel.example.com,  tlsSecret: sentinel-dashboard-tls }
+  ingestor:  { host: ingest.sentinel.example.com, tlsSecret: sentinel-ingest-tls }
+
+ingestor:
+  autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 20, targetCPUUtilizationPercentage: 65 }
+processor:
+  autoscaling: { enabled: true, minReplicas: 3, maxReplicas: 12, targetCPUUtilizationPercentage: 65 }
+dashboard:
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8,  targetCPUUtilizationPercentage: 70 }
+
+# Keep the DLQ drainer deployed but inert until an operator decides to drain (D14).
+dlqDrainer:
+  enabled: true
+  drainerEnabled: "false"
+  drainerExecute: "false"

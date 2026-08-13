@@ -1,0 +1,140 @@
+{{- $img := .Values.images.dashboard -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $secret := include "sentinel.secretName" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  {{- if not .Values.dashboard.autoscaling.enabled }}
+  replicas: {{ .Values.dashboard.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: dashboard
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dashboard
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.dashboard.containerPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "sentinel.configMapName" . }}
+          env:
+            # POSTGRES_* must precede DATABASE_URL — Kubernetes expands $(VAR) using vars
+            # defined earlier in this list.
+            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode={{ .Values.config.postgres.sslmode }}"
+            - name: OTEL_SERVICE_NAME
+              value: dashboard-web
+            {{- include "sentinel.otelEnv" . | nindent 12 }}
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_SECRET_KEY } }
+            - name: AUTH_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: AUTH_SECRET } }
+            - name: SETTINGS_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SETTINGS_ENCRYPTION_KEY } }
+            - name: CRON_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: CRON_SECRET } }
+            - name: GOOGLE_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_ID } }
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_SECRET } }
+            - name: EMAIL_SERVER
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: EMAIL_SERVER } }
+          livenessProbe:
+            httpGet: { path: {{ .Values.dashboard.livenessPath }}, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: {{ .Values.dashboard.readinessPath }}, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.dashboard.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  type: {{ .Values.dashboard.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: dashboard
+  ports:
+    - name: http
+      port: {{ .Values.dashboard.service.port }}
+      targetPort: http
+{{- if .Values.dashboard.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "sentinel.fullname" . }}-dashboard
+  minReplicas: {{ .Values.dashboard.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.dashboard.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.dashboard.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.dashboard.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.dashboard.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+{{- end }}

@@ -1,0 +1,314 @@
+# Production-leaning Docker Compose for Sentinel.
+#
+# This is the single-host / small-footprint deployment path. For Kubernetes use the Helm chart
+# at deploy/helm/sentinel. See DEPLOYMENT.md for the full runbook.
+#
+# HOW THIS DIFFERS FROM docker-compose.yml (the dev/CI stack):
+#   - NO insecure defaults. Every secret is required from the environment; the stack refuses to
+#     start if one is unset (`:?` expansion). Put them in a root-owned .env (chmod 600), NOT here.
+#   - PgBouncer in front of PostgreSQL for connection pooling (apps connect through it; the
+#     migrate job connects to Postgres DIRECTLY — transaction pooling breaks DDL).
+#   - Resource limits and restart policies on every long-running service.
+#   - No host-published database/NATS/Redis/MinIO ports — only the dashboard and ingestor are
+#     reachable, and in production those belong behind a TLS-terminating reverse proxy.
+#   - Jaeger is NOT included; point OTEL_EXPORTER_OTLP_ENDPOINT at your real collector, or leave
+#     it unset to disable trace export (services stay fully functional either way).
+#
+# Required .env keys (no defaults):
+#   POSTGRES_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY, S3_PUBLIC_ENDPOINT,
+#   AUTH_SECRET, AUTH_URL, SETTINGS_ENCRYPTION_KEY, CRON_SECRET, EMAIL_SERVER, EMAIL_FROM
+# Optional: REDIS_PASSWORD, OTEL_EXPORTER_OTLP_ENDPOINT, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+#           S3_BUCKET (default sentinel-attachments), DATA_RETENTION_DAYS (default 30)
+#
+# Bring up:  docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+
+x-postgres-dsn-direct: &pg_direct
+  # Direct-to-Postgres DSN, used ONLY by the migrate job (DDL must not go through a txn pooler).
+  postgres://sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/sentinel?sslmode=disable
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: sentinel
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.23.1
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: sentinel
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DB_NAME: sentinel
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "25"
+      AUTH_TYPE: scram-sha-256
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U sentinel || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "--server_name", "sentinel-nats", "--sd", "/data/jetstream"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4222"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  nats-init:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.nats-init
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+    restart: "no"
+
+  minio:
+    # For real production prefer managed S3/R2/GCS and delete this service; point S3_ENDPOINT at it.
+    image: docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  minio-init:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:-sentinel-attachments}
+    restart: "no"
+
+  migrate:
+    # Purpose-built migration image (binary + on-disk .sql files). Context is the module dir.
+    build:
+      context: ./packages/db-migrations
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Migrate connects DIRECTLY to Postgres, never through pgbouncer (DDL + transaction pooling
+      # do not mix). All three targets share one physical database (A1) and are idempotent.
+      DB_URL_PROCESSOR: *pg_direct
+      DB_URL_INGESTOR: *pg_direct
+      DB_URL_DASHBOARD: *pg_direct
+    # Override the `migrate` entrypoint to run all three targets in one shot.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "migrate up -target=processor && migrate up -target=ingestor && migrate up -target=dashboard"
+    restart: "no"
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: apps/ingestor-go/Dockerfile
+    restart: unless-stopped
+    # Bind to loopback only; a TLS reverse proxy (nginx/Caddy/Traefik) fronts this. Adjust to
+    # your ingress. Do NOT expose :8080 to the internet without TLS.
+    ports:
+      - "127.0.0.1:${INGESTOR_HOST_PORT:-8080}:8080"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: sentinel
+      NATS_URL: nats://nats:4222
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: 0
+      RATELIMIT_STRICT_MODE: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ingestor-go
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+  processor:
+    build:
+      context: .
+      dockerfile: apps/processor-go/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PROCESSOR_HEALTH_ADDR: ":8081"
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: sentinel
+      NATS_URL: nats://nats:4222
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: processor-go
+    deploy:
+      # Processor is horizontally scalable; run multiple with `--scale processor=N` (no host ports).
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard-web/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-3000}:3000"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@pgbouncer:6432/sentinel
+      S3_ENDPOINT: http://minio:9000
+      # BROWSER-reachable endpoint used to sign presigned PUT URLs (M6 large uploads). MUST be the
+      # public HTTPS URL of your object store — the browser cannot resolve the in-cluster `minio`
+      # host. A wrong value here makes large uploads fail from the browser while server-side works.
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT to a browser-reachable S3 URL}
+      S3_BUCKET: ${S3_BUCKET:-sentinel-attachments}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: sentinel
+      NATS_URL: nats://nats:4222
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: dashboard-web
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET (>=32 chars)}
+      AUTH_URL: ${AUTH_URL:?set AUTH_URL to the public dashboard URL}
+      AUTH_TRUST_HOST: "true"
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      EMAIL_SERVER: ${EMAIL_SERVER:?set EMAIL_SERVER (invitations need it)}
+      EMAIL_FROM: ${EMAIL_FROM:?set EMAIL_FROM}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY (32 chars)}
+      CRON_SECRET: ${CRON_SECRET:?set CRON_SECRET}
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 768M }
+
+  dlq-drainer:
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile.dlq-drainer
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    environment:
+      NATS_URL: nats://nats:4222
+      DLQ_STREAM: ERROR_EVENTS_DLQ
+      # Ships OFF. Both must be "true" for anything destructive to happen (D14).
+      DLQ_DRAINER_ENABLED: ${DLQ_DRAINER_ENABLED:-false}
+      DLQ_DRAINER_EXECUTE: ${DLQ_DRAINER_EXECUTE:-false}
+      DLQ_DRAINER_INTERVAL_SECONDS: "3600"
+      DLQ_DRAINER_LIMIT: "50"
+      DLQ_DRAINER_MAX_REPLAYS: "3"
+      DLQ_DRAINER_STATE_FILE: /var/lib/dlq-drainer/state.json
+    volumes:
+      - dlq_drainer_state:/var/lib/dlq-drainer
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+
+volumes:
+  dlq_drainer_state:
+  postgres_data:
+  nats_data:
+  redis_data:
+  minio_data:

@@ -1,0 +1,54 @@
+{{- if .Values.migrate.enabled }}
+{{- $img := .Values.images.migrate -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-migrate
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Run migrations before the app pods start, on every install and upgrade.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            - name: SSLMODE
+              value: {{ .Values.config.postgres.sslmode | quote }}
+            - name: DB_URL_PROCESSOR
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+            - name: DB_URL_INGESTOR
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+            - name: DB_URL_DASHBOARD
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+          # The migrate image's entrypoint is `migrate`; run every requested target in order.
+          # All targets share one physical database (A1) and each migration is idempotent.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              {{- range .Values.migrate.targets }}
+              echo ">> migrating target={{ . }}"
+              migrate up -target={{ . }}
+              {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+{{- end }}

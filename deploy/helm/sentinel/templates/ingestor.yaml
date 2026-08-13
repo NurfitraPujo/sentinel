@@ -1,0 +1,125 @@
+{{- $img := .Values.images.ingestor -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestor
+spec:
+  {{- if not .Values.ingestor.autoscaling.enabled }}
+  replicas: {{ .Values.ingestor.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: ingestor
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ingestor
+      annotations:
+        # Roll pods when shared config/secret change.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ingestor
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ingestor.containerPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "sentinel.configMapName" . }}
+          env:
+            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            - name: OTEL_SERVICE_NAME
+              value: ingestor-go
+            {{- include "sentinel.otelEnv" . | nindent 12 }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: REDIS_PASSWORD
+          livenessProbe:
+            httpGet: { path: {{ .Values.ingestor.livenessPath }}, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: {{ .Values.ingestor.readinessPath }}, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.ingestor.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestor
+spec:
+  type: {{ .Values.ingestor.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: ingestor
+  ports:
+    - name: http
+      port: {{ .Values.ingestor.service.port }}
+      targetPort: http
+{{- if .Values.ingestor.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "sentinel.fullname" . }}-ingestor
+  minReplicas: {{ .Values.ingestor.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.ingestor.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.ingestor.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.ingestor.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.ingestor.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: ingestor
+{{- end }}

@@ -1,0 +1,66 @@
+{{- $secret := include "sentinel.secretName" . }}
+{{- if .Values.init.nats.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-nats-init
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats-init
+  annotations:
+    # Create the JetStream streams after NATS is up, before the app pods consume them.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nats-init
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: nats-init
+          image: "{{ .Values.init.nats.image }}:{{ .Values.init.nats.tag | default .Chart.AppVersion }}"
+          env:
+            - name: NATS_URL
+              value: {{ include "sentinel.natsUrl" . | quote }}
+{{- end }}
+{{- if .Values.init.minio.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-minio-init
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-init
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-init
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: minio-init
+          image: "{{ .Values.init.minio.image }}:{{ .Values.init.minio.tag | default .Chart.AppVersion }}"
+          env:
+            - name: S3_ENDPOINT
+              value: {{ include "sentinel.s3Endpoint" . | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.config.s3.bucket | quote }}
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_SECRET_KEY } }
+{{- end }}

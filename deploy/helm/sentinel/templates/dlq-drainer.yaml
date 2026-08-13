@@ -1,0 +1,81 @@
+{{- if .Values.dlqDrainer.enabled }}
+{{- $img := .Values.images.dlqDrainer -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dlq-drainer
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dlq-drainer
+spec:
+  # Single instance: it holds a state file and self-schedules. Do not scale >1.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dlq-drainer
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: dlq-drainer
+    spec:
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dlq-drainer
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            - name: NATS_URL
+              value: {{ include "sentinel.natsUrl" . | quote }}
+            - name: DLQ_STREAM
+              value: {{ .Values.dlqDrainer.stream | quote }}
+            # Both gates must be "true" for anything destructive; ships OFF (D14).
+            - name: DLQ_DRAINER_ENABLED
+              value: {{ .Values.dlqDrainer.drainerEnabled | quote }}
+            - name: DLQ_DRAINER_EXECUTE
+              value: {{ .Values.dlqDrainer.drainerExecute | quote }}
+            - name: DLQ_DRAINER_INTERVAL_SECONDS
+              value: {{ .Values.dlqDrainer.intervalSeconds | quote }}
+            - name: DLQ_DRAINER_LIMIT
+              value: {{ .Values.dlqDrainer.limit | quote }}
+            - name: DLQ_DRAINER_MAX_REPLAYS
+              value: {{ .Values.dlqDrainer.maxReplays | quote }}
+            - name: DLQ_DRAINER_STATE_FILE
+              value: {{ .Values.dlqDrainer.stateFile | quote }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ dir .Values.dlqDrainer.stateFile }}
+          resources:
+            {{- toYaml .Values.dlqDrainer.resources | nindent 12 }}
+      volumes:
+        - name: state
+          {{- if .Values.dlqDrainer.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "sentinel.fullname" . }}-dlq-drainer
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.dlqDrainer.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dlq-drainer
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.dlqDrainer.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.dlqDrainer.persistence.size }}
+{{- end }}
+{{- end }}

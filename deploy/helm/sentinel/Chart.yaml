@@ -1,0 +1,21 @@
+apiVersion: v2
+name: sentinel
+description: |
+  Sentinel error-tracking pipeline: ingestor-go (HTTP ingest) -> NATS JetStream ->
+  processor-go -> PostgreSQL, with the SvelteKit dashboard-web reading the same database.
+  The chart ships the three first-party services plus an optional in-cluster copy of every
+  stateful dependency (PostgreSQL, NATS JetStream, Redis, MinIO). For production you are
+  expected to disable the bundled dependencies and point at managed equivalents — see
+  values.yaml and ../../../DEPLOYMENT.md.
+type: application
+# Chart version — bump on any template change.
+version: 0.1.0
+# The app version the default images track. Override image tags per-service in values.yaml.
+appVersion: "0.1.0"
+keywords:
+  - error-tracking
+  - observability
+  - sentinel
+home: https://github.com/NurfitraPujo/sentinel
+maintainers:
+  - name: Sentinel maintainers
