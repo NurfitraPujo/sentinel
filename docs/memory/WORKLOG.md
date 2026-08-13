@@ -5,6 +5,29 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-08-13 - Production deployment artifacts (Helm chart, prod compose, migration image)
+
+- **Why durable**: First production deployment surface for the repo — a Helm chart
+  (`deploy/helm/sentinel`), a hardened `docker-compose.prod.yml`, and a dedicated migration image.
+  The invariants encoded here outlive the artifacts: migrations run **direct-to-Postgres, never
+  through PgBouncer** (DDL and transaction pooling don't mix), and presigned uploads need
+  `S3_PUBLIC_ENDPOINT` set to a **browser-reachable** host because SigV4 signs the host into the URL
+  (the in-cluster `minio:9000` the server uses is unreachable from the browser).
+- **Future mistake prevented**: The migration image (`packages/db-migrations/Dockerfile`) reads its
+  `.sql` files **from disk at runtime — they are NOT embedded in the binary**. The image therefore
+  ships both the binary and `packages/db-migrations/migrations/`, laid out under WORKDIR `/app` so the
+  CLI's default path resolution finds them; its build context is the module dir, not the repo root.
+  A future dev adding a migration must **rebuild and republish this image** — a new `.sql` file that
+  isn't in the image is invisible at deploy time.
+- **Evidence**: PR #15 squash-merged to `main` as `908f491`. Migration image build-tested and
+  run-tested against a throwaway Postgres (applies all migrations incl. M6 attachment status,
+  idempotent across all three targets on the shared DB, redacts the DSN password in logs). Helm chart
+  `helm lint` clean and server-side `kubectl --dry-run` validated for dev and prod value sets;
+  `docker compose -f docker-compose.prod.yml config` parses. No application/runtime code changed.
+- **Where to look**: `DEPLOYMENT.md` (runbook, incl. §0 build/publish and the two gotchas above),
+  `deploy/helm/sentinel/`, `docker-compose.prod.yml`, `packages/db-migrations/Dockerfile`. TODO 03/07
+  checklists reconciled against `VERIFIED_STATE.md`.
+
 ### 2026-08-12 - M6 presigned large uploads + toolbar editor (partial M6)
 
 - **Why durable**: The presigned direct-to-bucket path establishes the pattern for "the server never
