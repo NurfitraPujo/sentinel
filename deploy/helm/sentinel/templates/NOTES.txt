@@ -1,0 +1,29 @@
+Sentinel {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Services:
+  - dashboard : {{ include "sentinel.fullname" . }}-dashboard   (:{{ .Values.dashboard.service.port }})
+  - ingestor  : {{ include "sentinel.fullname" . }}-ingestor    (:{{ .Values.ingestor.service.port }})
+  - processor : {{ include "sentinel.fullname" . }}-processor   (:{{ .Values.processor.service.port }}, /metrics)
+
+{{- if .Values.ingress.enabled }}
+Ingress:
+  - Dashboard : https://{{ .Values.ingress.dashboard.host }}
+  - Ingest    : https://{{ .Values.ingress.ingestor.host }}
+{{- end }}
+
+{{- if or .Values.dependencies.postgres.enabled .Values.dependencies.nats.enabled .Values.dependencies.redis.enabled .Values.dependencies.minio.enabled }}
+
+⚠  You are running one or more BUNDLED dependencies (postgres/nats/redis/minio). These are
+   single-replica and intended for demo/staging only. For production, set
+   dependencies.*.enabled=false and point config.* at managed services. See DEPLOYMENT.md.
+{{- end }}
+
+{{- range $k, $v := .Values.secrets.data }}
+{{- if hasPrefix "change-me" ($v | toString) }}
+⚠  Secret "{{ $k }}" still holds a placeholder ("change-me…"). Set a real value before serving traffic.
+{{- end }}
+{{- end }}
+
+Verify rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "sentinel.fullname" . }}-dashboard
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}

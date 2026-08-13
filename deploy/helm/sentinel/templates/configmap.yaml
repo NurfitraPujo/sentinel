@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sentinel.configMapName" . }}
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+data:
+  # Shared, non-secret configuration. Passwords/keys live in the Secret, not here.
+  NATS_URL: {{ include "sentinel.natsUrl" . | quote }}
+  REDIS_ADDR: {{ include "sentinel.redisAddr" . | quote }}
+  REDIS_DB: {{ .Values.config.redis.db | quote }}
+  S3_ENDPOINT: {{ include "sentinel.s3Endpoint" . | quote }}
+  S3_PUBLIC_ENDPOINT: {{ .Values.config.s3.publicEndpoint | quote }}
+  S3_BUCKET: {{ .Values.config.s3.bucket | quote }}
+  OTEL_SERVICE_NAME_INGESTOR: "ingestor-go"
+  OTEL_SERVICE_NAME_PROCESSOR: "processor-go"
+  OTEL_SERVICE_NAME_DASHBOARD: "dashboard-web"
+  RATELIMIT_STRICT_MODE: {{ .Values.config.ingestor.ratelimitStrictMode | quote }}
+  AUTH_URL: {{ .Values.config.dashboard.authUrl | quote }}
+  AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
+  EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}
+  DATA_RETENTION_DAYS: {{ .Values.config.dashboard.dataRetentionDays | quote }}

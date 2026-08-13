@@ -1,0 +1,307 @@
+# Default values for the Sentinel chart.
+# These defaults render a WORKING but NON-PRODUCTION stack (bundled deps, in-repo secrets).
+# For production, copy values-prod-example.yaml, disable the bundled dependencies, and supply
+# real secrets via `existingSecret` or an external secret manager. See ../../../DEPLOYMENT.md.
+
+# -----------------------------------------------------------------------------
+# Global settings shared by every service.
+# -----------------------------------------------------------------------------
+global:
+  # Prefix for image repositories. Leave empty to use the fully-qualified repos below as-is.
+  imageRegistry: ""
+  imagePullSecrets: []
+  # A namespace-wide name prefix is derived from the release name; see _helpers.tpl.
+
+# Common image pull policy for first-party images.
+imagePullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# First-party application images. Point these at your registry + built tags.
+# The three app Dockerfiles live at apps/<svc>/Dockerfile in the repo.
+# -----------------------------------------------------------------------------
+images:
+  ingestor:
+    repository: ghcr.io/nurfitrapujo/sentinel/ingestor-go
+    tag: "" # defaults to .Chart.AppVersion when empty
+  processor:
+    repository: ghcr.io/nurfitrapujo/sentinel/processor-go
+    tag: ""
+  dashboard:
+    repository: ghcr.io/nurfitrapujo/sentinel/dashboard-web
+    tag: ""
+  # The migrate Job and dlq-drainer reuse a Go toolchain / the built tools image.
+  migrate:
+    repository: ghcr.io/nurfitrapujo/sentinel/db-migrate
+    tag: ""
+  dlqDrainer:
+    repository: ghcr.io/nurfitrapujo/sentinel/dlq-drainer
+    tag: ""
+
+# -----------------------------------------------------------------------------
+# Secrets. In production set `create: false` and reference a pre-provisioned Secret
+# (e.g. from External Secrets Operator / Vault / cloud secret manager) via existingSecret.
+# The Secret MUST contain every key listed under `data` below.
+# -----------------------------------------------------------------------------
+secrets:
+  create: true
+  existingSecret: "" # when set, `create` is ignored and this Secret name is mounted instead
+  # These INSECURE defaults exist only so `helm install` renders on a kicking-the-tyres cluster.
+  # NEVER ship them. `helm lint`/CI should reject any release that keeps a `change-me` value.
+  data:
+    POSTGRES_PASSWORD: "change-me-postgres"
+    REDIS_PASSWORD: ""
+    S3_ACCESS_KEY: "change-me-s3-access"
+    S3_SECRET_KEY: "change-me-s3-secret"
+    # dashboard-only secrets
+    AUTH_SECRET: "change-me-auth-secret-min-32-chars-long"
+    SETTINGS_ENCRYPTION_KEY: "change-me-settings-key-exactly-32ch"
+    CRON_SECRET: "change-me-cron-secret"
+    GOOGLE_CLIENT_ID: ""
+    GOOGLE_CLIENT_SECRET: ""
+    # SMTP DSN for invitation / magic-link email. Without it, invitations cannot be delivered
+    # (a deliberate consequence of design decision D06). e.g. smtp://user:pass@smtp.host:587
+    EMAIL_SERVER: ""
+
+# -----------------------------------------------------------------------------
+# Non-secret shared configuration (rendered into a ConfigMap).
+# -----------------------------------------------------------------------------
+config:
+  postgres:
+    # Host/port/user/db for ALL three services. Password comes from the Secret above.
+    # When `dependencies.postgres.enabled`, host defaults to the bundled StatefulSet service.
+    host: "" # empty => bundled postgres service name; set to your managed host in prod
+    port: 5432
+    user: sentinel
+    database: sentinel
+    # sslmode for the dashboard DATABASE_URL and migrate DB_URL_*. Use "require" or stricter in prod.
+    sslmode: require
+  nats:
+    # empty => bundled nats service; else nats://host:4222 of your managed cluster
+    url: ""
+  redis:
+    # empty => bundled redis service; else host:port
+    addr: ""
+    db: 0
+  s3:
+    # Server-side (in-cluster / VPC) endpoint used for all server S3 calls.
+    # empty => bundled minio service; else e.g. https://s3.us-east-1.amazonaws.com or an R2 endpoint.
+    endpoint: ""
+    # Browser-reachable endpoint used ONLY to sign presigned PUT URLs (M6 large uploads).
+    # MUST be resolvable from end-user browsers. SigV4 signs the host, so a wrong value here
+    # makes large uploads fail from the browser while server-side uploads keep working.
+    publicEndpoint: "https://uploads.example.com"
+    bucket: sentinel-attachments
+  otel:
+    # OTLP HTTP collector endpoint. Empty disables trace export (services stay fully functional).
+    exporterEndpoint: ""
+  dashboard:
+    # Public URL of the dashboard (Auth.js AUTH_URL). MUST be the externally-visible https URL.
+    authUrl: "https://sentinel.example.com"
+    authTrustHost: "true"
+    emailFrom: "noreply@sentinel.example.com"
+    dataRetentionDays: "30"
+  ingestor:
+    # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
+    ratelimitStrictMode: "true"
+
+# -----------------------------------------------------------------------------
+# Database migration Job. Runs `migrate up` for every target as a pre-install/pre-upgrade hook.
+# -----------------------------------------------------------------------------
+migrate:
+  enabled: true
+  # Which goose targets to migrate. Each shares one physical database (see A1 in the repo).
+  targets:
+    - processor
+    - ingestor
+    - dashboard
+  backoffLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# -----------------------------------------------------------------------------
+# ingestor-go — the only externally exposed first-party service (error ingest :8080).
+# -----------------------------------------------------------------------------
+ingestor:
+  replicaCount: 2
+  containerPort: 8080
+  service:
+    type: ClusterIP
+    port: 8080
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # HTTP probes hit /health on the container port.
+  livenessPath: /health
+  readinessPath: /health
+
+# -----------------------------------------------------------------------------
+# processor-go — NATS consumer, no inbound app traffic. :8081 serves /health,/metrics,/dlq.
+# -----------------------------------------------------------------------------
+processor:
+  replicaCount: 2
+  healthPort: 8081
+  service:
+    # Headless-ish ClusterIP so Prometheus can scrape /metrics; no external exposure.
+    type: ClusterIP
+    port: 8081
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  livenessPath: /health
+  readinessPath: /health
+
+# -----------------------------------------------------------------------------
+# dashboard-web — SvelteKit UI + JSON API (:3000).
+# -----------------------------------------------------------------------------
+dashboard:
+  replicaCount: 2
+  containerPort: 3000
+  service:
+    type: ClusterIP
+    port: 3000
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  livenessPath: /
+  readinessPath: /
+
+# -----------------------------------------------------------------------------
+# dlq-drainer — scheduled DLQ maintenance. Ships gated OFF (matches compose default).
+# -----------------------------------------------------------------------------
+dlqDrainer:
+  enabled: true
+  # Both must be true for anything destructive to happen (see tools/dlq + D14).
+  drainerEnabled: "false"
+  drainerExecute: "false"
+  stream: ERROR_EVENTS_DLQ
+  intervalSeconds: "3600"
+  limit: "50"
+  maxReplays: "3"
+  stateFile: /var/lib/dlq-drainer/state.json
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# -----------------------------------------------------------------------------
+# Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    # One secret per host, or a shared wildcard cert. cert-manager can populate these.
+  dashboard:
+    host: sentinel.example.com
+    tlsSecret: sentinel-dashboard-tls
+  ingestor:
+    host: ingest.example.com
+    tlsSecret: sentinel-ingest-tls
+    # Large-payload note: ingest bodies are small, but bump proxy-body-size if you change limits.
+
+# -----------------------------------------------------------------------------
+# Bundled stateful dependencies. DISABLE these in production and use managed services
+# (RDS/Cloud SQL, a managed NATS or self-run StatefulSet, ElastiCache/managed Redis,
+# real S3/R2/GCS). Enabled here only so a demo cluster comes up with one command.
+# -----------------------------------------------------------------------------
+dependencies:
+  postgres:
+    enabled: true
+    image: postgres:15-alpine
+    storage:
+      size: 20Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "2", memory: 2Gi }
+  nats:
+    enabled: true
+    image: nats:2.10-alpine
+    # JetStream file storage MUST be persistent — this is the durability boundary for the pipeline.
+    storage:
+      size: 20Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  redis:
+    enabled: true
+    image: redis:7-alpine
+    storage:
+      size: 5Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  minio:
+    enabled: true
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    storage:
+      size: 50Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+
+# Optional: run the NATS/MinIO one-shot init steps as Jobs (create the JetStream streams /
+# the attachments bucket). Disable if your managed deps are pre-provisioned.
+init:
+  nats:
+    enabled: true
+    image: ghcr.io/nurfitrapujo/sentinel/nats-init
+    tag: ""
+  minio:
+    enabled: true
+    image: ghcr.io/nurfitrapujo/sentinel/minio-init
+    tag: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
