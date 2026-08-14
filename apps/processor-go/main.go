@@ -17,6 +17,8 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/dlqmonitor"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/webhooks"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
@@ -234,6 +236,22 @@ func main() {
 		Interval:    dlqmonitor.CheckIntervalFromEnv(),
 	}
 	go dlqMonitor.Run(ctx)
+
+	// N3b: outbound webhook delivery dispatcher, off by default (WEBHOOK_DISPATCH_ENABLED unset
+	// or not exactly "true") — see webhooks.EnabledFromEnv and webhooks/dispatcher.go's package
+	// doc for the polling/CAS design. Uses the same *pgxpool.Pool as everything else in this
+	// process; store.NewStore's pgStore satisfies store.WebhookStore.
+	if webhooks.EnabledFromEnv() {
+		webhookStore, ok := store.NewStore(db).(store.WebhookStore)
+		if !ok {
+			slog.ErrorContext(ctx, "webhooks: store.NewStore does not implement store.WebhookStore; dispatcher not started")
+		} else {
+			dispatcher := webhooks.NewDispatcher(webhookStore)
+			slog.InfoContext(ctx, "webhooks: dispatch enabled",
+				slog.Duration("interval", dispatcher.Interval), slog.Int("failure_threshold", dispatcher.FailureThreshold))
+			go dispatcher.Run(ctx)
+		}
+	}
 
 	slog.InfoContext(ctx, "Processor started, waiting for events...")
 

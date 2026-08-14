@@ -218,6 +218,12 @@ services:
             # stays fully functional — this is not a hard dependency (see the jaeger service's comment).
             OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
             OTEL_SERVICE_NAME: processor-go
+            # N3b: outbound webhook delivery dispatcher (apps/processor-go/webhooks). Off by
+            # default — flip to "true" to activate. Interval/threshold below are the same
+            # defaults the code falls back to when unset; listed here for discoverability.
+            WEBHOOK_DISPATCH_ENABLED: "false"
+            WEBHOOK_DISPATCH_INTERVAL: "5s"
+            WEBHOOK_FAILURE_THRESHOLD: "20"
 
     dlq-drainer:
         build:

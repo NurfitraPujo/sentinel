@@ -21,6 +21,17 @@
 		createdAt: string | null;
 	}
 
+	interface WebhookRow {
+		id: string;
+		agentId: string;
+		url: string;
+		secretPrefix: string;
+		eventTypes: string[];
+		status: 'active' | 'disabled' | 'failed';
+		consecutiveFailures: number;
+		createdAt: string | null;
+	}
+
 	interface Props {
 		data: { orgId: string; orgSlug: string; agents: AgentRow[] };
 	}
@@ -43,6 +54,13 @@
 	let toastType = $state<'error' | 'success'>('error');
 	let newlyIssuedToken = $state<string | null>(null);
 	let issuingForAgent = $state<string | null>(null);
+
+	// N3a: webhooks, keyed by agentId, mirroring keysByAgent's shape/lifecycle above.
+	let webhooksByAgent = $state<Record<string, WebhookRow[]>>({});
+	let webhooksLoaded = $state<Record<string, boolean>>({});
+	let newWebhookUrlByAgent = $state<Record<string, string>>({});
+	let creatingWebhookForAgent = $state<string | null>(null);
+	let newlyIssuedWebhookSecret = $state<string | null>(null);
 
 	function showToast(message: string, type: 'error' | 'success' = 'error') {
 		toastMessage = message;
@@ -70,6 +88,23 @@
 
 	$effect(() => {
 		void loadKeys();
+	});
+
+	async function loadWebhooks(agentId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks`);
+			if (!res.ok) return;
+			const body = await res.json();
+			webhooksByAgent = { ...webhooksByAgent, [agentId]: body.webhooks ?? [] };
+		} finally {
+			webhooksLoaded = { ...webhooksLoaded, [agentId]: true };
+		}
+	}
+
+	$effect(() => {
+		for (const agent of agents) {
+			if (!webhooksLoaded[agent.id]) void loadWebhooks(agent.id);
+		}
 	});
 
 	async function createAgent() {
@@ -160,6 +195,79 @@
 			showToast(err?.message || 'Network error while revoking key');
 		}
 	}
+
+	async function createWebhook(agent: AgentRow) {
+		const url = (newWebhookUrlByAgent[agent.id] ?? '').trim();
+		if (!url) {
+			showToast('Webhook URL is required');
+			return;
+		}
+		creatingWebhookForAgent = agent.id;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agent.id}/webhooks`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ url }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to create webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to create webhook`);
+				return;
+			}
+			const { webhook, secret } = await res.json();
+			newlyIssuedWebhookSecret = secret;
+			webhooksByAgent = { ...webhooksByAgent, [agent.id]: [webhook, ...(webhooksByAgent[agent.id] ?? [])] };
+			newWebhookUrlByAgent = { ...newWebhookUrlByAgent, [agent.id]: '' };
+			showToast('Webhook created', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while creating webhook');
+		} finally {
+			creatingWebhookForAgent = null;
+		}
+	}
+
+	async function setWebhookStatus(agentId: string, webhook: WebhookRow, status: 'active' | 'disabled') {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks/${webhook.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ status }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to update webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to update webhook`);
+				return;
+			}
+			const { webhook: updated } = await res.json();
+			webhooksByAgent = {
+				...webhooksByAgent,
+				[agentId]: (webhooksByAgent[agentId] ?? []).map((w) => (w.id === webhook.id ? updated : w)),
+			};
+			showToast(status === 'disabled' ? 'Webhook disabled' : 'Webhook re-enabled', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while updating webhook');
+		}
+	}
+
+	async function deleteWebhook(agentId: string, webhookId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks/${webhookId}`, {
+				method: 'DELETE',
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to delete webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to delete webhook`);
+				return;
+			}
+			webhooksByAgent = {
+				...webhooksByAgent,
+				[agentId]: (webhooksByAgent[agentId] ?? []).filter((w) => w.id !== webhookId),
+			};
+			showToast('Webhook deleted', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while deleting webhook');
+		}
+	}
 </script>
 
 <div class="agents-page">
@@ -186,6 +294,16 @@
 				<button type="button" onclick={() => (newlyIssuedToken = null)}>✕</button>
 			</div>
 			<code class="secret-token">{newlyIssuedToken}</code>
+		</div>
+	{/if}
+
+	{#if newlyIssuedWebhookSecret}
+		<div class="secret-tray" role="alert">
+			<div class="secret-tray-head">
+				<strong>Save this webhook secret now — it will never be shown again.</strong>
+				<button type="button" onclick={() => (newlyIssuedWebhookSecret = null)}>✕</button>
+			</div>
+			<code class="secret-token">{newlyIssuedWebhookSecret}</code>
 		</div>
 	{/if}
 
@@ -246,6 +364,65 @@
 								{/each}
 							</ul>
 						{/if}
+					</div>
+
+					<div class="agent-webhooks">
+						<div class="webhooks-head">Webhooks</div>
+						{#if !webhooksLoaded[agent.id]}
+							<p class="empty-state small">Loading webhooks…</p>
+						{:else if (webhooksByAgent[agent.id] ?? []).length === 0}
+							<p class="empty-state small">No webhooks registered.</p>
+						{:else}
+							<ul>
+								{#each webhooksByAgent[agent.id] as webhook (webhook.id)}
+									<li class="webhook-row">
+										<div class="webhook-row-main">
+											<code>{webhook.url}</code>
+											<span class="key-status" class:is-revoked={webhook.status !== 'active'}>
+												{webhook.status}
+											</span>
+										</div>
+										<div class="webhook-row-meta">
+											<span>{webhook.secretPrefix}…</span>
+											<span>{webhook.eventTypes.length === 0 ? 'all events' : webhook.eventTypes.join(', ')}</span>
+											{#if webhook.consecutiveFailures > 0}
+												<span class="webhook-failures">{webhook.consecutiveFailures} consecutive failures</span>
+											{/if}
+										</div>
+										<div class="webhook-row-actions">
+											{#if webhook.status === 'active'}
+												<button type="button" class="danger small" onclick={() => setWebhookStatus(agent.id, webhook, 'disabled')}>
+													Disable
+												</button>
+											{:else}
+												<button type="button" class="small" onclick={() => setWebhookStatus(agent.id, webhook, 'active')}>
+													Re-enable
+												</button>
+											{/if}
+											<button type="button" class="danger small" onclick={() => deleteWebhook(agent.id, webhook.id)}>
+												Delete
+											</button>
+										</div>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+
+						<div class="webhook-create">
+							<input
+								type="text"
+								placeholder="https://example.com/webhooks/sentinel"
+								value={newWebhookUrlByAgent[agent.id] ?? ''}
+								oninput={(e) => (newWebhookUrlByAgent = { ...newWebhookUrlByAgent, [agent.id]: (e.currentTarget as HTMLInputElement).value })}
+							/>
+							<button
+								type="button"
+								disabled={creatingWebhookForAgent === agent.id}
+								onclick={() => createWebhook(agent)}
+							>
+								{creatingWebhookForAgent === agent.id ? 'Adding…' : '+ Add webhook'}
+							</button>
+						</div>
 					</div>
 				</li>
 			{/each}
@@ -482,5 +659,96 @@
 
 	.key-row button.small {
 		padding: 0.25rem 0.5rem;
+	}
+
+	.agent-webhooks {
+		margin-top: 0.625rem;
+		padding-top: 0.625rem;
+		border-top: 1px dashed var(--border-color);
+	}
+
+	.webhooks-head {
+		font-size: 0.7rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		opacity: 0.7;
+		margin-bottom: 0.375rem;
+	}
+
+	.agent-webhooks ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.webhook-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.625rem;
+	}
+
+	.webhook-row-main {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.webhook-row-meta {
+		display: flex;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+		font-size: 0.7rem;
+		opacity: 0.75;
+	}
+
+	.webhook-failures {
+		color: #f87171;
+	}
+
+	.webhook-row-actions {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.webhook-create {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.5rem;
+	}
+
+	.webhook-create input {
+		flex: 1;
+		min-width: 12rem;
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.webhook-create button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.webhook-create button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 </style>
