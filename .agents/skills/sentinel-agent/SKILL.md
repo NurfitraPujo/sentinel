@@ -46,9 +46,12 @@ sentinel issues get <issueId>
 sentinel claim <issueId>            # 409 = owned by someone else, back off
 sentinel release <issueId>          # releases only your own claim
 sentinel comment <issueId> --body <md>
+sentinel comment edit <issueId> <commentId> --body <md>      # own comment only, 403 otherwise
+sentinel comment delete <issueId> <commentId>                # own comment only, 403 otherwise
 sentinel progress <issueId> --body <md>       # in-app only, no email
 sentinel question <issueId> --body <md> --waiting-on <reporter|team>
 sentinel status <issueId> <unresolved|resolved|ignored> [--resolved-in VERSION]
+sentinel severity <issueId> <low|medium|high|critical>       # user_report issues only
 sentinel link <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
 sentinel events --follow [--type T]           # NDJSON stream, ~2s lag guard
 sentinel batch -f ops.json                    # up to 20 mutations, one round trip

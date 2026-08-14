@@ -64,6 +64,8 @@ export interface AgentIssueListItem {
 	severity: string | null;
 	reporterId: string | null;
 	isWaiting: boolean;
+	/** N7e (A07): when the CURRENT claim (assigneeType/assignedTo) was made -- null if unclaimed. */
+	claimedAt: Date | null;
 }
 
 export interface ListAgentIssuesResult {
@@ -151,6 +153,7 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			status: issues.status,
 			assigneeType: issues.assigneeType,
 			assignedTo: issues.assignedTo,
+			claimedAt: issues.claimedAt,
 			waitingOn: issues.waitingOn,
 			firstSeen: issues.firstSeen,
 			lastSeen: issues.lastSeen,

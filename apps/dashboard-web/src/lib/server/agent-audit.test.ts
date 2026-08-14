@@ -25,7 +25,15 @@ beforeEach(() => {
 	vi.clearAllMocks();
 });
 
-const ctx = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'AutoFix', keyPrefixForAudit: 'abc123def456' };
+const ctx = {
+	agentId: 'agent-1',
+	organizationId: 'org-1',
+	agentName: 'AutoFix',
+	keyPrefixForAudit: 'abc123def456',
+	keyId: 'key-1',
+	keyPrefix: 'sent_agent_',
+	keyExpiresAt: null,
+};
 
 describe('writeAgentAuditLog', () => {
 	it('inserts an audit_logs row with actorId=agentId and metadata including the key prefix', async () => {

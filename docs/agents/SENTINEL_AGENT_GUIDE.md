@@ -40,19 +40,35 @@ with the actual routes under `src/routes/api/agent/**`.
 
 ## 2. Authentication and your first request
 
-Every request needs `Authorization: Bearer <key>`. There is no separate identity endpoint — see
-§13 "whoami" for why — so the simplest way to check a key works is to list issues:
+Every request needs `Authorization: Bearer <key>`. The simplest way to check a key works AND see
+which agent/org/key it resolves to is `GET /api/agent/self` (R1a, §13):
 
 ```bash
-curl -s https://sentinel.example.com/api/agent/issues \
+curl -s https://sentinel.example.com/api/agent/self \
   -H "Authorization: Bearer sent_agent_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# {"agentId":"...","name":"...","organizationId":"...",
+#  "key":{"id":"...","prefix":"sent_agent_","expiresAt":null,"lastUsedAt":null}}
 ```
 
 A `401` with body `{"message":"Invalid API key"}` (or `"Missing or malformed Authorization header"`;
 note the field is `message` — only per-route 400 validation bodies use `{"error": ...}`)
 covers unknown key, wrong scope, revoked/expired key, and a disabled agent — deliberately the same
-message for all of those, so the endpoint can't be used to probe which is true. A `429` means you
-hit `project_api_keys.rate_limit_rpm` for this key; respect `Retry-After`.
+message for all of those, so the endpoint can't be used to probe which is true.
+
+A `429` means you hit `project_api_keys.rate_limit_rpm` for this key. The limiter is a **fixed
+60-second window**, not a sliding one — a burst can legitimately reach up to 2x your configured
+rate across a window boundary (see DEPLOYMENT.md §9 for why this is the deliberate choice, not a
+bug). Every 429 carries an accurate `Retry-After` header (seconds until that window resets, not a
+fixed guess) — back off for exactly that long rather than polling immediately or applying your own
+backoff heuristic on top.
+
+**Key rotation.** `POST /api/agent/key/rotate` mints a new secret for the SAME agent this key
+authenticates as and returns it in the response body ONCE — never persist the response, only the
+secret. The OLD key is not revoked immediately: it stays valid (its `expires_at` is pulled forward)
+for `AGENT_KEY_ROTATION_GRACE_HOURS` (operator-configured, default 24h, `0` = immediate), so an
+unattended loop mid-task with the old key cached keeps working until you've had a chance to swap
+it in. `sentinel key rotate` wraps this and prints the new secret to stdout with a warning to
+stderr.
 
 ## 3. Work discovery: the events feed
 
@@ -128,14 +144,31 @@ polling:
 - `hasMore: true` means keep paging with the same filters and the new `cursor` before you go back
   to sleep/poll-interval — there's more backlog waiting right now.
 
-## 4. Claim etiquette
+## 4. Claims are advisory — always check `claimedBy`
 
-Claiming is how you signal "I'm working on this" and stops other agents from double-handling it.
+**Claiming is NOT enforcement.** It is a signal, checked by nothing except the claim endpoints
+themselves — a claimed issue's `status`/`comments`/`progress`/`relations` mutations still succeed
+for ANY agent, claimant or not (A11, `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md` — deliberate,
+kept advisory rather than enforced so this stays consistent with how human collaborators already
+work in this product; enforcing it would also break existing automation that mutates without
+claiming first). **Do not assume a claim protects you from a collaborator.** Before mutating an
+issue you did not just claim yourself, read its current `assignedTo`/`assigneeType`/`claimedAt`
+(from `GET /api/agent/issues/:id` or the scope embedded in any mutation response) and treat a
+non-null, non-you `assignedTo` as "someone else is actively on this — coordinate or back off",
+even though the server will not stop you.
+
+When a non-claimant agent mutates a claimed issue anyway, the server logs a structured
+`agent.mutated_claimed_issue` warning server-side (observability only — this never changes the
+response you get). If you want a REAL synchronization primitive, claim/release's 409 is it — see
+below.
 
 - `POST /api/agent/issues/:id/claim` — atomic conditional UPDATE. Succeeds (200) with the updated
-  issue if unclaimed or already claimed by you; **409** if claimed by someone else. Back off on 409
-  — don't retry-loop, don't force-claim (there is no force option for agents; force-release is
-  owner/admin-only through the session-authenticated UI).
+  issue (which includes `assignedTo`/`claimedAt`) if unclaimed or already claimed by you; **409**
+  if claimed by someone else. As of N7f (A11) the 409 body is enriched with the current claim
+  state so you don't need a second read: `{"message": "...", "claimedBy": "<agentId or userId>",
+  "claimedAt": "<ISO timestamp or null>"}`. Back off on 409 — don't retry-loop, don't force-claim
+  (there is no force option for agents; force-release is owner/admin-only through the
+  session-authenticated UI).
 - `DELETE /api/agent/issues/:id/claim` — releases **your own** claim only. The underlying query's
   `WHERE assigned_to = <your agentId>` (sourced from your credential, never a request param) is
   what enforces this; you cannot release someone else's claim by any means. **Idempotent as of
@@ -143,7 +176,8 @@ Claiming is how you signal "I'm working on this" and stops other agents from dou
   simply unclaimed (by anyone) means your release already succeeded on an earlier attempt whose
   response you never saw, and this call returns 200 with the current issue, no new activity row,
   no notification. Only a REAL conflict (the issue is claimed by a different agent/user now) still
-  409s. This means a plain retry-on-timeout of a release call is always safe to resend.
+  409s, with the same `{message, claimedBy, claimedAt}` enrichment as claim's 409. This means a
+  plain retry-on-timeout of a release call is always safe to resend.
 - Release when you're done, or when you're blocked and waiting (see §6) so another agent — or a
   human — can pick it up if you never come back.
 
@@ -195,6 +229,13 @@ A minimal, working loop:
 4. **Post a triage summary** — `POST /api/agent/issues/:id/comments` with
    `{"body_md": "...", "attachment_ids": ["..."]}` (both optional except `body_md`). This is a
    normal, non-blocking comment — it emails subscribers like any human comment would.
+   - **Edit or delete your own comment** — `PATCH`/`DELETE /api/agent/issues/:id/comments/:commentId`
+     (N7e). `PATCH` takes `{"body_md": "..."}`. Both 403 if the comment wasn't authored by YOUR
+     agent id (no moderator carve-out for agents — that's a human-only role), 404 if the comment
+     belongs to a different issue or no longer exists.
+   - **Set a `user_report` issue's severity** — `PATCH /api/agent/issues/:id/report/severity` with
+     `{"severity": "low"|"medium"|"high"|"critical"}` (N7e). 400 on a `system_error` issue (it has
+     no `manual_issue_reports` row to set severity on).
 5. **Resolve, or ask a blocking question** (§6) if you can't proceed without more info.
 6. **Set status** — `PATCH /api/agent/issues/:id/status` with
    `{"status": "resolved"|"unresolved"|"ignored", "resolved_in_version": "v1.2.3"}` (the version
@@ -302,9 +343,12 @@ assuming.
 ```
 
 Available `op` values (mutations only — no GETs, no `issues.question.*`, no upload): `issues.status`,
-`issues.claim`, `issues.claim.release`, `issues.comment`, `issues.progress`, `issues.relations.add`,
-`issues.relations.remove`. Each op's `params` shape is exactly the JSON body its single-route
-equivalent takes (see §5–§8, and the per-endpoint reference in §14).
+`issues.claim`, `issues.claim.release`, `issues.comment`, `comments.edit`, `comments.delete`,
+`issues.report.severity`, `issues.progress`, `issues.relations.add`, `issues.relations.remove`.
+Each op's `params` shape is exactly the JSON body its single-route equivalent takes (see §5–§8, and
+the per-endpoint reference in §14) — with one exception: `comments.edit`/`comments.delete` also
+need `comment_id` in `params` (there's no second `:id` slot in a batch op), since their single-route
+form gets it from the URL instead.
 
 **Partial-completion semantics — read this before relying on batch for anything transactional:**
 
@@ -449,17 +493,22 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` (own claim only) |
 | `sentinel status <issueId> <unresolved\|resolved\|ignored> [--resolved-in VERSION]` | `PATCH /api/agent/issues/:id/status` |
 | `sentinel comment <issueId> --body <md> [--attachment <id> ...]` | `POST /api/agent/issues/:id/comments` |
+| `sentinel comment edit <issueId> <commentId> --body <md>` | `PATCH /api/agent/issues/:id/comments/:commentId` (own comment only) |
+| `sentinel comment delete <issueId> <commentId>` | `DELETE /api/agent/issues/:id/comments/:commentId` (own comment only) |
 | `sentinel comments <issueId> [--after <ts>]` | `GET /api/agent/issues/:id/comments` |
 | `sentinel question <issueId> --body <md> --waiting-on <reporter\|team>` | `POST /api/agent/issues/:id/questions` |
 | `sentinel progress <issueId> --body <md>` | `POST /api/agent/issues/:id/progress` |
+| `sentinel severity <issueId> <low\|medium\|high\|critical>` | `PATCH /api/agent/issues/:id/report/severity` (`user_report` only) |
 | `sentinel link <issueId> <targetIssueId> --type <linked_to\|caused_by\|duplicate_of>` | `POST /api/agent/issues/:id/relations` |
 | `sentinel unlink <issueId> <targetIssueId> --type <...>` | `DELETE /api/agent/issues/:id/relations` |
 | `sentinel projects` | `GET /api/agent/projects` |
-| `sentinel whoami` | probes `GET /api/agent/issues` — no identity route exists (see below) |
+| `sentinel whoami` | `GET /api/agent/self` — real identity as of N7f (R1a), see below |
+| `sentinel key rotate` | `POST /api/agent/key/rotate` — new secret printed to stdout ONCE (N7f, R1b) |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` (one page) |
 | `sentinel events --follow [--interval SEC]` | polls `GET /api/agent/events`, NDJSON to stdout, cursor persisted |
 | `sentinel batch -f ops.json\|- [--stop-on-error=false]` | `POST /api/agent/batch` |
-| `sentinel upload <issueId> <file>` | `POST /api/agent/uploads` (multipart; `issueId` positional is cosmetic — see below) |
+| `sentinel upload <file> --issue <id> [--comment <text>]` | upload + comment-with-attachment in one call (N7f, A15) |
+| `sentinel upload <issueId> <file>` | deprecated two-positional form — plain upload, `issueId` ignored, warns (see below) |
 
 Global flags (`-url`, `-key`, `-format json|table`) go before the subcommand. `-format table`
 renders list-shaped responses as a column table.
@@ -473,11 +522,10 @@ for the full explanation):
   is no threading support in the agent comment path today.
 - `unlink` takes `<issueId> <targetIssueId> --type>`, not a relation id — there is no relation-id
   delete endpoint.
-- `whoami` cannot actually tell you which agent/org a key authenticates as — no route echoes
-  identity back; it's an auth-reachability probe only (2xx = valid, 401/403 = not).
-- `upload <issueId> <file>` — the server's `POST /api/agent/uploads` does not take an `issueId` at
-  all; the uploaded attachment is created with no issue association and is only linked to one
-  later via `comment --attachment <id>`. The CLI's `<issueId>` argument is never sent to the server.
+- `upload <issueId> <file>` (the old, deprecated two-positional form) — `POST /api/agent/uploads`
+  does not take an `issueId` at all; this form does a plain upload with no issue association. Use
+  `upload <file> --issue <id> [--comment <text>]` instead, which chains the follow-up
+  `comment --attachment <id>` call for you.
 
 ## 12. Runnable examples
 
@@ -488,12 +536,25 @@ See `docs/agents/examples/`:
 - `webhook-receiver.md` — ~20-line Node and Python signature-verifying receivers, matching the
   recipe in §10 exactly.
 
-## 13. Why there's no `/api/agent/whoami` or identity-echo route
+## 13. Identity: `GET /api/agent/self`
 
-`authenticateAgentRequest` resolves an `AgentAuthContext` (agent id, org id, agent name) entirely
-server-side for use in the current request — nothing returns it to the caller today. If you need to
-confirm which agent/org a key belongs to, ask whoever issued the key, or check the dashboard's
-agent list. The CLI's `whoami` only proves reachability (§11).
+R1a (`docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md` N7f) closed what used to be a real gap:
+`authenticateAgentRequest` resolves an `AgentAuthContext` (agent id, org id, agent name, plus the
+key row) server-side for every request, and `GET /api/agent/self` now echoes exactly that back:
+
+```json
+{
+  "agentId": "...",
+  "name": "Triage Bot",
+  "organizationId": "...",
+  "key": { "id": "...", "prefix": "sent_agent_", "expiresAt": null, "lastUsedAt": null }
+}
+```
+
+`key.lastUsedAt` is always `null` — `project_api_keys` tracks no such column; it's kept in the
+shape so a future column addition wouldn't be a breaking response-shape change. Use this to
+confirm which agent/org a key resolves to (e.g. at the start of an unattended loop, or after
+rotating — see §2), instead of the old CLI-side reachability probe against `/api/agent/issues`.
 
 ## 14. Raw-curl appendix
 
@@ -505,6 +566,12 @@ AUTH="Authorization: Bearer $SENTINEL_AGENT_KEY"
 ```
 
 ```bash
+# Identity
+curl -s "$SENTINEL_URL/api/agent/self" -H "$AUTH"
+
+# Rotate this key (prints the new secret ONCE — capture it, don't just print-and-discard)
+curl -s -X POST "$SENTINEL_URL/api/agent/key/rotate" -H "$AUTH"
+
 # List issues
 curl -s "$SENTINEL_URL/api/agent/issues?type=system_error&claimed=false&waiting=false" -H "$AUTH"
 

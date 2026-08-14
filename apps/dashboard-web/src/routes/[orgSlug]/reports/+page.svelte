@@ -37,6 +37,21 @@
 		if (!row.issue.assignedTo) return '—';
 		return row.issue.assigneeType === 'agent' ? '\u{1F916}' : '\u{1F464}';
 	}
+
+	// N7e (A07, docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md): "agent working" visibility --
+	// UI-only, no new status (per decision). `row.issue` is the full `issues` row (listReports
+	// selects `issue: issues`), so `claimedAt` is already present without a query change.
+	function isAgentWorking(row: (typeof data.reports)[number]): boolean {
+		return row.issue.assigneeType === 'agent' && !!row.issue.assignedTo;
+	}
+
+	function claimedAtTooltip(row: (typeof data.reports)[number]): string {
+		const claimedAt = row.issue.claimedAt;
+		if (!claimedAt) return 'Agent working';
+		const date = claimedAt instanceof Date ? claimedAt : new Date(claimedAt);
+		if (Number.isNaN(date.getTime())) return 'Agent working';
+		return `Agent working — claimed ${date.toLocaleString()}`;
+	}
 </script>
 
 <div class="reports-page">
@@ -93,6 +108,11 @@
 								<span aria-hidden="true">{claimantIcon(row)}</span>
 								{claimantLabel(row)}
 							</span>
+							{#if isAgentWorking(row)}
+								<span class="agent-working-badge" data-testid="agent-working-badge" title={claimedAtTooltip(row)}>
+									agent working
+								</span>
+							{/if}
 						</td>
 						<td class="dim-cell">–</td>
 						<td class="dim-cell">–</td>
@@ -260,6 +280,18 @@
 		color: #f59e0b;
 		border-radius: 3px;
 		padding: 0.125rem 0.375rem;
+	}
+
+	.agent-working-badge {
+		display: inline-block;
+		margin-top: 0.25rem;
+		font-size: 0.625rem;
+		text-transform: uppercase;
+		letter-spacing: 0.02em;
+		background: rgba(99, 102, 241, 0.15);
+		color: #6366f1;
+		border-radius: 3px;
+		padding: 0.0625rem 0.3rem;
 	}
 
 	.severity-tag,

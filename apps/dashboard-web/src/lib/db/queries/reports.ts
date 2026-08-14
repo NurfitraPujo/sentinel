@@ -505,6 +505,10 @@ export interface UpdateManualIssueReportInput {
 	title?: string;
 	bodyMd?: string;
 	severity?: ReportSeverity;
+	/** N7e (A09): who made this edit, for the `report_edited` activity row's `actorType`. Defaults
+	 *  to 'user' -- every pre-existing caller (the session-authenticated route) is a user and must
+	 *  keep attributing edits to 'user' unchanged; only the agent severity op passes 'agent'. */
+	actorType?: 'user' | 'agent';
 }
 
 /**
@@ -563,7 +567,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			await tx.insert(issueActivity).values({
 				issueId: input.issueId,
 				eventType: 'report_edited',
-				actorType: 'user',
+				actorType: input.actorType ?? 'user',
 				actorId: input.actorId,
 				oldValue,
 				newValue,

@@ -141,6 +141,11 @@ paths:
                             - "null"
                         isWaiting:
                           type: boolean
+                        claimedAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
                       required:
                         - id
                         - projectId
@@ -159,6 +164,7 @@ paths:
                         - severity
                         - reporterId
                         - isWaiting
+                        - claimedAt
                       additionalProperties: false
                   nextCursor:
                     type: string
@@ -280,6 +286,11 @@ paths:
                         type:
                           - string
                           - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
                     required:
                       - id
                       - projectId
@@ -302,6 +313,7 @@ paths:
                       - lastSeen
                       - count
                       - waitingOn
+                      - claimedAt
                     additionalProperties: false
                   report:
                     type:
@@ -635,6 +647,11 @@ paths:
                         type:
                           - string
                           - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
                     required:
                       - id
                       - projectId
@@ -657,6 +674,7 @@ paths:
                       - lastSeen
                       - count
                       - waitingOn
+                      - claimedAt
                     additionalProperties: false
                 required:
                   - success
@@ -695,8 +713,18 @@ paths:
                 properties:
                   message:
                     type: string
+                  claimedBy:
+                    type:
+                      - string
+                      - "null"
+                  claimedAt:
+                    type:
+                      - string
+                      - "null"
                 required:
                   - message
+                  - claimedBy
+                  - claimedAt
                 additionalProperties: false
     delete:
       operationId: releaseClaim
@@ -792,6 +820,11 @@ paths:
                         type:
                           - string
                           - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
                     required:
                       - id
                       - projectId
@@ -814,6 +847,7 @@ paths:
                       - lastSeen
                       - count
                       - waitingOn
+                      - claimedAt
                     additionalProperties: false
                 required:
                   - success
@@ -852,8 +886,18 @@ paths:
                 properties:
                   message:
                     type: string
+                  claimedBy:
+                    type:
+                      - string
+                      - "null"
+                  claimedAt:
+                    type:
+                      - string
+                      - "null"
                 required:
                   - message
+                  - claimedBy
+                  - claimedAt
                 additionalProperties: false
   /api/agent/issues/{issueId}/status:
     patch:
@@ -1087,6 +1131,276 @@ paths:
                     additionalProperties: false
                 required:
                   - comment
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/comments/{commentId}:
+    patch:
+      operationId: editComment
+      summary: Edit your own comment (403 for another author, agent or human)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body_md:
+                  type: string
+              required:
+                - body_md
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      issueId:
+                        type: string
+                      parentId:
+                        type:
+                          - string
+                          - "null"
+                      authorType:
+                        type: string
+                        enum:
+                          - user
+                          - agent
+                      authorId:
+                        type: string
+                      blocking:
+                        type: boolean
+                      bodyMd:
+                        type: string
+                      createdAt:
+                        type: string
+                        format: date-time
+                      editedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                    required:
+                      - id
+                      - issueId
+                      - parentId
+                      - authorType
+                      - authorId
+                      - blocking
+                      - bodyMd
+                      - createdAt
+                      - editedAt
+                    additionalProperties: false
+                required:
+                  - comment
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+    delete:
+      operationId: deleteComment
+      summary: Delete your own comment (403 for another author, agent or human)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  issueId:
+                    type: string
+                required:
+                  - success
+                  - issueId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/report/severity:
+    patch:
+      operationId: updateReportSeverity
+      summary: Set the severity of a user_report issue (400 for a system_error issue)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                severity:
+                  type: string
+                  enum:
+                    - low
+                    - medium
+                    - high
+                    - critical
+              required:
+                - severity
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  severity:
+                    type: string
+                    enum:
+                      - low
+                      - medium
+                      - high
+                      - critical
+                required:
+                  - success
                 additionalProperties: false
         "400":
           description: Bad request
@@ -1802,6 +2116,135 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+  /api/agent/self:
+    get:
+      operationId: getSelf
+      summary: "Identity of the calling key: agent, org, and the key row itself"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentId:
+                    type: string
+                  name:
+                    type: string
+                  organizationId:
+                    type: string
+                  key:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      prefix:
+                        type: string
+                      expiresAt:
+                        type:
+                          - string
+                          - "null"
+                      lastUsedAt:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - prefix
+                      - expiresAt
+                      - lastUsedAt
+                    additionalProperties: false
+                required:
+                  - agentId
+                  - name
+                  - organizationId
+                  - key
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/key/rotate:
+    post:
+      operationId: rotateKey
+      summary: "Rotate the calling key: mints a new secret, keeps the old key valid for AGENT_KEY_ROTATION_GRACE_HOURS (default 24, 0 = immediate)"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  oldKey:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      expiresAt:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - expiresAt
+                    additionalProperties: false
+                  newKey:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      prefix:
+                        type: string
+                      secret:
+                        type: string
+                    required:
+                      - id
+                      - prefix
+                      - secret
+                    additionalProperties: false
+                required:
+                  - success
+                  - oldKey
+                  - newKey
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/batch:
     post:
       operationId: runBatch
@@ -1825,6 +2268,9 @@ paths:
                           - issues.claim
                           - issues.claim.release
                           - issues.comment
+                          - comments.edit
+                          - comments.delete
+                          - issues.report.severity
                           - issues.progress
                           - issues.relations.add
                           - issues.relations.remove
@@ -1864,6 +2310,14 @@ paths:
                           type: string
                         skipped:
                           type: boolean
+                        claimedBy:
+                          type:
+                            - string
+                            - "null"
+                        claimedAt:
+                          type:
+                            - string
+                            - "null"
                       required:
                         - ok
                         - status

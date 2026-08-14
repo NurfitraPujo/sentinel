@@ -313,6 +313,7 @@ services:
             DATA_RETENTION_DAYS: "30"
             MANUAL_ISSUE_RETENTION_DAYS: "365"
             CLAIM_STALE_HOURS: "24"
+            AGENT_KEY_ROTATION_GRACE_HOURS: "24"
 
 volumes:
     dlq_drainer_state:

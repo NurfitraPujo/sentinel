@@ -46,6 +46,7 @@ const ISSUE_ROW = {
 	lastSeen: new Date().toISOString(),
 	count: 1,
 	waitingOn: null,
+	claimedAt: null,
 };
 
 const COMMENT_ROW = {
@@ -210,6 +211,7 @@ describe('GET /api/agent/issues', () => {
 					severity: null,
 					reporterId: null,
 					isWaiting: false,
+					claimedAt: null,
 				},
 			],
 		});

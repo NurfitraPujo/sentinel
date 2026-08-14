@@ -31,16 +31,21 @@
 //	sentinel release <issueId>
 //	sentinel status <issueId> <unresolved|resolved|ignored> [--resolved-in VERSION]
 //	sentinel comment <issueId> --body <md> [--parent <commentId>] [--attachment <id> ...]
+//	sentinel comment edit <issueId> <commentId> --body <md>
+//	sentinel comment delete <issueId> <commentId>
 //	sentinel comments <issueId> [--after <ts>]
 //	sentinel question <issueId> --body <md> --waiting-on <reporter|team>
 //	sentinel progress <issueId> --body <md>
+//	sentinel severity <issueId> <low|medium|high|critical>
 //	sentinel link <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
 //	sentinel unlink <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
 //	sentinel projects
 //	sentinel whoami
+//	sentinel key rotate
 //	sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me] [--follow] [--interval SEC]
 //	sentinel batch -f ops.json [--stop-on-error=false]
-//	sentinel upload <issueId> <file>
+//	sentinel upload <file> --issue <id> [--comment <text>]
+//	sentinel upload <issueId> <file>   (deprecated two-positional form, issueId ignored)
 //
 // Exit codes: 0 ok, 1 network/server error, 2 usage error, 3 auth failure (401/403), 4 not found
 // (404), 5 conflict (409), 6 validation error (400/422). On any non-zero exit the server's error
@@ -75,7 +80,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	format := fs.String("format", "json", `output format: "json" (default) or "table" (list-shaped commands only)`)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]")
-		fmt.Fprintln(stderr, "commands: issues, claim, release, status, comment, comments, question, progress, link, unlink, projects, whoami, events, batch, upload")
+		fmt.Fprintln(stderr, "commands: issues, claim, release, status, comment, comments, question, progress, link, unlink, projects, whoami, key, events, batch, upload")
 	}
 
 	if err := fs.Parse(args); err != nil {

@@ -20,6 +20,13 @@ export interface AgentIssueScope {
 	assignedTo: string | null;
 	assigneeType: string | null;
 	waitingOn: string | null;
+	/**
+	 * A11 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): surfaced alongside `assignedTo`
+	 * so callers building claim-conflict/claimed-issue context (`{claimedBy, claimedAt}`) don't
+	 * need a second query -- this is the SAME `issues.claimed_at` column N7c (A03) added for the
+	 * stale-claim reaper.
+	 */
+	claimedAt: Date | null;
 }
 
 export async function resolveAgentIssueScope(issueId: string, organizationId: string): Promise<AgentIssueScope> {
@@ -32,6 +39,7 @@ export async function resolveAgentIssueScope(issueId: string, organizationId: st
 			assignedTo: issues.assignedTo,
 			assigneeType: issues.assigneeType,
 			waitingOn: issues.waitingOn,
+			claimedAt: issues.claimedAt,
 		})
 		.from(issues)
 		.innerJoin(projects, eq(projects.id, issues.projectId))

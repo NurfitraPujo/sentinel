@@ -120,6 +120,26 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 			wantBody:   map[string]interface{}{"body_md": "hello **world**"},
 		},
 		{
+			name:       "comment edit",
+			args:       []string{"comment", "edit", "iss-1", "c-1", "--body", "revised"},
+			wantMethod: "PATCH",
+			wantPath:   "/api/agent/issues/iss-1/comments/c-1",
+			wantBody:   map[string]interface{}{"body_md": "revised"},
+		},
+		{
+			name:       "comment delete",
+			args:       []string{"comment", "delete", "iss-1", "c-1"},
+			wantMethod: "DELETE",
+			wantPath:   "/api/agent/issues/iss-1/comments/c-1",
+		},
+		{
+			name:       "severity",
+			args:       []string{"severity", "iss-1", "high"},
+			wantMethod: "PATCH",
+			wantPath:   "/api/agent/issues/iss-1/report/severity",
+			wantBody:   map[string]interface{}{"severity": "high"},
+		},
+		{
 			name:       "comments list with after",
 			args:       []string{"comments", "iss-1", "--after", "2026-01-01T00:00:00Z"},
 			wantMethod: "GET",
@@ -470,6 +490,35 @@ func TestEventsFollow_TwoPollsAdvanceCursorAndPersist(t *testing.T) {
 	}
 }
 
+// A08/A09 (N7e): usage-level guards must fail fast (ExitUsage) without ever hitting the network.
+func TestCommentEditAndSeverity_UsageGuards(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  cmdFunc
+		args []string
+	}{
+		{"comment edit missing --body", cmdComment, []string{"edit", "iss-1", "c-1"}},
+		{"comment edit wrong arity", cmdComment, []string{"edit", "iss-1", "--body", "x"}},
+		{"comment delete wrong arity", cmdComment, []string{"delete", "iss-1"}},
+		{"severity invalid level", cmdSeverity, []string{"iss-1", "urgent"}},
+		{"severity wrong arity", cmdSeverity, []string{"iss-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected network call for a usage error: %s %s", r.Method, r.URL.Path)
+			}))
+			t.Cleanup(srv.Close)
+			e, _, _ := newTestEnv(srv, "k")
+
+			code := tc.cmd(context.Background(), e, tc.args)
+			if code != ExitUsage {
+				t.Errorf("exit code = %d, want ExitUsage (%d)", code, ExitUsage)
+			}
+		})
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -480,4 +529,177 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met before deadline")
+}
+
+// R1a (N7f): whoami now calls GET /api/agent/self and prints the real identity, not a reachability
+// probe against /api/agent/issues.
+func TestWhoami_CallsSelfAndPrintsIdentity(t *testing.T) {
+	srv, rec := newRecordingServer(t, 200, `{"agentId":"ag-1","name":"Triage Bot","organizationId":"org-1","key":{"id":"k-1","prefix":"sent_agent_","expiresAt":null,"lastUsedAt":null}}`)
+	e, out, _ := newTestEnv(srv, "sent_agent_secret")
+
+	code := cmdWhoami(context.Background(), e, nil)
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want ExitOK", code)
+	}
+	if rec.Method != "GET" || rec.Path != "/api/agent/self" {
+		t.Errorf("request = %s %s, want GET /api/agent/self", rec.Method, rec.Path)
+	}
+	if rec.Auth != "Bearer sent_agent_secret" {
+		t.Errorf("Authorization = %q", rec.Auth)
+	}
+	if !strings.Contains(out.String(), "ag-1") || !strings.Contains(out.String(), "Triage Bot") {
+		t.Errorf("stdout %q does not contain the identity fields from /self", out.String())
+	}
+}
+
+func TestWhoami_AuthFailureReportsStatus(t *testing.T) {
+	srv, _ := newRecordingServer(t, 401, `{"message":"Invalid API key"}`)
+	e, out, _ := newTestEnv(srv, "bad-key")
+
+	code := cmdWhoami(context.Background(), e, nil)
+	if code != ExitAuth {
+		t.Fatalf("exit code = %d, want ExitAuth", code)
+	}
+	if !strings.Contains(out.String(), "auth: failed") {
+		t.Errorf("stdout %q does not report auth failure", out.String())
+	}
+}
+
+// R1b (N7f): `sentinel key rotate` prints the new secret to stdout exactly once and a warning to
+// stderr, and never echoes the old key.
+func TestKeyRotate_PrintsNewSecretOnceWithWarning(t *testing.T) {
+	srv, rec := newRecordingServer(t, 200, `{"success":true,"oldKey":{"id":"k-1","expiresAt":"2026-08-15T00:00:00Z"},"newKey":{"id":"k-2","prefix":"sent_agent_","secret":"sent_agent_brandnew"}}`)
+	e, out, errBuf := newTestEnv(srv, "sent_agent_old")
+
+	code := cmdKey(context.Background(), e, []string{"rotate"})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want ExitOK; stderr=%s", code, errBuf.String())
+	}
+	if rec.Method != "POST" || rec.Path != "/api/agent/key/rotate" {
+		t.Errorf("request = %s %s, want POST /api/agent/key/rotate", rec.Method, rec.Path)
+	}
+	stdout := strings.TrimSpace(out.String())
+	if stdout != "sent_agent_brandnew" {
+		t.Errorf("stdout = %q, want exactly the new secret", stdout)
+	}
+	if strings.Count(out.String(), "sent_agent_brandnew") != 1 {
+		t.Errorf("new secret must appear exactly once in stdout, got: %q", out.String())
+	}
+	if !strings.Contains(errBuf.String(), "WARNING") {
+		t.Errorf("stderr %q does not carry the one-time-reveal warning", errBuf.String())
+	}
+	if strings.Contains(out.String(), "sent_agent_old") || strings.Contains(errBuf.String(), "sent_agent_old") {
+		t.Error("the OLD key must never be echoed by rotate")
+	}
+}
+
+func TestKey_UnknownSubcommandIsUsageError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected network call: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	e, _, _ := newTestEnv(srv, "k")
+
+	if code := cmdKey(context.Background(), e, []string{"revoke"}); code != ExitUsage {
+		t.Errorf("exit code = %d, want ExitUsage", code)
+	}
+	if code := cmdKey(context.Background(), e, nil); code != ExitUsage {
+		t.Errorf("exit code = %d, want ExitUsage", code)
+	}
+}
+
+// A15 (N7f): `sentinel upload <file> --issue <id> --comment "text"` uploads, then posts exactly
+// one comment on that issue with the returned attachment id.
+func TestUpload_OneShotWithIssueAndComment(t *testing.T) {
+	var requests []recordedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Auth: r.Header.Get("Authorization")}
+		if r.URL.Path == "/api/agent/uploads" {
+			w.WriteHeader(201)
+			fmt.Fprint(w, `{"id":"att-1","url":"https://x/att-1","filename":"f.txt","contentType":"text/plain","sizeBytes":3}`)
+			requests = append(requests, rec)
+			return
+		}
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		rec.Body = body
+		requests = append(requests, rec)
+		w.WriteHeader(201)
+		fmt.Fprint(w, `{"comment":{"id":"c-1"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	e, _, errBuf := newTestEnv(srv, "k")
+
+	tmp := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(tmp, []byte("hey"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := cmdUpload(context.Background(), e, []string{tmp, "--issue", "iss-1", "--comment", "see attached"})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want ExitOK; stderr=%s", code, errBuf.String())
+	}
+	if len(requests) != 2 {
+		t.Fatalf("got %d requests, want 2 (upload then comment)", len(requests))
+	}
+	upload, comment := requests[0], requests[1]
+	if upload.Method != "POST" || upload.Path != "/api/agent/uploads" {
+		t.Errorf("first request = %s %s, want POST /api/agent/uploads", upload.Method, upload.Path)
+	}
+	if comment.Method != "POST" || comment.Path != "/api/agent/issues/iss-1/comments" {
+		t.Errorf("second request = %s %s, want POST /api/agent/issues/iss-1/comments", comment.Method, comment.Path)
+	}
+	if comment.Body["body_md"] != "see attached" {
+		t.Errorf("comment body_md = %v, want %q", comment.Body["body_md"], "see attached")
+	}
+	ids, ok := comment.Body["attachment_ids"].([]interface{})
+	if !ok || len(ids) != 1 || ids[0] != "att-1" {
+		t.Errorf("comment attachment_ids = %v, want [\"att-1\"]", comment.Body["attachment_ids"])
+	}
+}
+
+// A15: the old two-positional form still works (plain upload, no comment), but now warns.
+func TestUpload_DeprecatedTwoPositionalFormStillWorksAndWarns(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/agent/uploads" {
+			t.Fatalf("unexpected request %s %s (old form must never comment)", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(201)
+		fmt.Fprint(w, `{"id":"att-1","url":"https://x/att-1","filename":"f.txt","contentType":"text/plain","sizeBytes":3}`)
+	}))
+	t.Cleanup(srv.Close)
+	e, _, errBuf := newTestEnv(srv, "k")
+
+	tmp := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(tmp, []byte("hey"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := cmdUpload(context.Background(), e, []string{"iss-1", tmp})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want ExitOK; stderr=%s", code, errBuf.String())
+	}
+	if calls != 1 {
+		t.Errorf("got %d requests, want 1 (upload only, no comment)", calls)
+	}
+	if !strings.Contains(errBuf.String(), "deprecated") {
+		t.Errorf("stderr %q does not warn about the deprecated form", errBuf.String())
+	}
+}
+
+func TestUpload_UsageErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected network call for a usage error: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	e, _, _ := newTestEnv(srv, "k")
+
+	if code := cmdUpload(context.Background(), e, nil); code != ExitUsage {
+		t.Errorf("no args: exit code = %d, want ExitUsage", code)
+	}
+	if code := cmdUpload(context.Background(), e, []string{"a", "b", "c"}); code != ExitUsage {
+		t.Errorf("three positionals: exit code = %d, want ExitUsage", code)
+	}
 }

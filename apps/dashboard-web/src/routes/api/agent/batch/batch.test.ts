@@ -36,12 +36,28 @@ vi.mock('$lib/db/queries/issues', () => ({
 class ClaimConflictError extends Error {}
 const claimIssue = vi.fn();
 const releaseClaim = vi.fn();
-vi.mock('$lib/db/queries/reports', () => ({ claimIssue, releaseClaim, ClaimConflictError }));
+const updateManualIssueReport = vi.fn();
+vi.mock('$lib/db/queries/reports', () => ({
+	claimIssue,
+	releaseClaim,
+	updateManualIssueReport,
+	ClaimConflictError,
+}));
 
 class CommentValidationError extends Error {}
 class CommentNotFoundError extends Error {}
 const createComment = vi.fn();
-vi.mock('$lib/db/queries/comments', () => ({ createComment, CommentValidationError, CommentNotFoundError }));
+const editComment = vi.fn();
+const deleteComment = vi.fn();
+const getCommentById = vi.fn();
+vi.mock('$lib/db/queries/comments', () => ({
+	createComment,
+	editComment,
+	deleteComment,
+	getCommentById,
+	CommentValidationError,
+	CommentNotFoundError,
+}));
 
 const recordAgentProgress = vi.fn();
 vi.mock('$lib/db/queries/agent-work', () => ({ recordAgentProgress }));

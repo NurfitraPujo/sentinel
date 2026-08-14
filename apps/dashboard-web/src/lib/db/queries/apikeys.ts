@@ -143,6 +143,71 @@ export async function createApiKey(
 	return { apiKey: newKey, secretToken };
 }
 
+export class AgentKeyRotationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'AgentKeyRotationError';
+	}
+}
+
+/**
+ * R1b (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): self-service rotation for an
+ * AGENT-scoped key, called from `POST /api/agent/key/rotate` with `oldKeyId`/`oldKeyId`'s agent
+ * resolved from the caller's OWN authenticated context (B7: an agent can only ever rotate the key
+ * it authenticated with -- never one it names in the request body).
+ *
+ * Deliberately NOT a variant of `rotateApiKey` above: that function's whole point (S7) is
+ * IMMEDIATE revocation of the old key, which is correct for a human operator retiring a
+ * potentially-compromised credential, but wrong here -- an unattended agent mid-task with the old
+ * key cached has no synchronous way to pick up a new one, so an immediate cutover would break it
+ * mid-flight. Instead the OLD key's `status` stays `'active'` and only its `expires_at` is pulled
+ * forward to `now() + graceHours` (0 = immediate expiry, same effect as `rotateApiKey` if an
+ * operator wants that). Expiry IS enforced (S7, `agent-auth.ts`'s `expiresAt` check), so the old
+ * key genuinely stops authenticating once the grace window elapses -- this does not reopen S7,
+ * it just widens the window deliberately, on a per-rotation, operator-tunable basis
+ * (`AGENT_KEY_ROTATION_GRACE_HOURS`).
+ *
+ * Returns the new secret ONCE, same contract as `createApiKey`/`rotateApiKey` -- callers must
+ * never log or persist it beyond handing it back to the caller in the HTTP response body.
+ *
+ * This function does NOT itself re-check the old key's status/expiry -- the
+ * only-a-live-key-can-rotate guarantee is ROUTE-ENFORCED (`authenticateAgentRequest` runs first
+ * and rejects revoked/expired keys). During its grace window the old key remains active and can
+ * rotate again (same agent, same org -- not an escalation); callers adding a new call site must
+ * keep the authenticate-first ordering.
+ */
+export async function rotateAgentKeyWithGrace(oldKeyId: string, graceHours: number) {
+	const [existingKey] = await db.select().from(projectApiKeys).where(eq(projectApiKeys.id, oldKeyId));
+
+	if (!existingKey) {
+		throw new AgentKeyRotationError('API key not found');
+	}
+	if (existingKey.scope !== 'agent' || !existingKey.agentId) {
+		throw new AgentKeyRotationError('Only agent-scoped keys support self-rotation with grace');
+	}
+
+	const now = Date.now();
+	const graceMs = Math.max(0, graceHours) * 60 * 60 * 1000;
+	const newExpiresAt = new Date(now + graceMs);
+
+	const [oldKeyRow] = await db
+		.update(projectApiKeys)
+		.set({ expiresAt: newExpiresAt })
+		.where(eq(projectApiKeys.id, oldKeyId))
+		.returning();
+
+	const { apiKey: newKey, secretToken } = await createApiKey(existingKey.agentId, {
+		organizationId: existingKey.organizationId,
+		projectId: existingKey.projectId,
+		name: existingKey.name,
+		scope: 'agent',
+		rateLimitRpm: existingKey.rateLimitRpm,
+		agentId: existingKey.agentId,
+	});
+
+	return { oldKey: oldKeyRow, newKey, secretToken };
+}
+
 export async function rotateApiKey(
 	userId: string,
 	keyId: string,

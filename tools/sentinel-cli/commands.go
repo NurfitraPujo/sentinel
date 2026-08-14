@@ -35,6 +35,7 @@ var commands = map[string]cmdFunc{
 	"comments": cmdComments,
 	"question": cmdQuestion,
 	"progress": cmdProgress,
+	"severity": cmdSeverity,
 	"link":     cmdLink,
 	"unlink":   cmdUnlink,
 	"projects": cmdProjects,
@@ -42,6 +43,7 @@ var commands = map[string]cmdFunc{
 	"events":   cmdEvents,
 	"batch":    cmdBatch,
 	"upload":   cmdUpload,
+	"key":      cmdKey,
 }
 
 // reorderArgs moves every "-flag value" (or "-flag=value", or a bare boolean "-flag") pair to the
@@ -267,13 +269,30 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 
 // --- comment / comments --------------------------------------------------------------------------
 
-// cmdComment posts a non-blocking comment. NOTE (API-contract mismatch, server wins): the agent
-// comment op (apps/dashboard-web/src/lib/server/agent-ops.ts's issuesComment) reads only body_md
-// and attachment_ids from the request body — it does not read or honor a parent/thread id, even
-// though the underlying createComment() query does support one. -parent is still accepted here
-// (sent as "parent_id" in the body) so this stays forward-compatible if the server starts reading
-// it, but as of this writing the server silently ignores it. See README.md.
+// cmdComment dispatches `comment edit|delete <issueId> <commentId> ...` (A08, N7e) to their own
+// subcommand handlers; anything else falls through to the original bare
+// `comment <issueId> --body <md>` post-a-comment behavior below, preserved byte-for-byte for
+// backward compatibility (an issueId happening to literally be "edit" or "delete" is not a real
+// concern — the server's ids are never bare English words).
 func cmdComment(ctx context.Context, e *env, args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "edit":
+			return cmdCommentEdit(ctx, e, args[1:])
+		case "delete":
+			return cmdCommentDelete(ctx, e, args[1:])
+		}
+	}
+	return cmdCommentPost(ctx, e, args)
+}
+
+// cmdCommentPost posts a non-blocking comment. NOTE (API-contract mismatch, server wins): the
+// agent comment op (apps/dashboard-web/src/lib/server/agent-ops.ts's issuesComment) reads only
+// body_md and attachment_ids from the request body — it does not read or honor a parent/thread
+// id, even though the underlying createComment() query does support one. -parent is still
+// accepted here (sent as "parent_id" in the body) so this stays forward-compatible if the server
+// starts reading it, but as of this writing the server silently ignores it. See README.md.
+func cmdCommentPost(ctx context.Context, e *env, args []string) int {
 	fs := flag.NewFlagSet("comment", flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
 	args = reorderArgs(args, nil)
@@ -329,6 +348,97 @@ func cmdComments(ctx context.Context, e *env, args []string) int {
 		return e.networkErr(err)
 	}
 	return e.respond(res, "comments")
+}
+
+// A08 (N7e): edit/delete your OWN comment. PATCH/DELETE
+// /api/agent/issues/{issueId}/comments/{commentId} — 403 if the calling agent didn't author it
+// (no moderator carve-out for agents, see the server route's doc comment), 404 if it belongs to a
+// different issue or no longer exists.
+
+func cmdCommentEdit(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("comment edit", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	args = reorderArgs(args, nil)
+	body := fs.String("body", "", "new comment body (Markdown), required")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return usageErr(e, "usage: sentinel comment edit <issueId> <commentId> --body <md>")
+	}
+	if *body == "" {
+		return usageErr(e, "--body is required")
+	}
+
+	issueID, commentID := rest[0], rest[1]
+	reqBody := map[string]interface{}{"body_md": *body}
+	res, err := e.client.Do(
+		ctx, "PATCH",
+		"/api/agent/issues/"+url.PathEscape(issueID)+"/comments/"+url.PathEscape(commentID),
+		nil, reqBody,
+	)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	return e.respond(res, "")
+}
+
+func cmdCommentDelete(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("comment delete", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	args = reorderArgs(args, nil)
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return usageErr(e, "usage: sentinel comment delete <issueId> <commentId>")
+	}
+
+	issueID, commentID := rest[0], rest[1]
+	res, err := e.client.Do(
+		ctx, "DELETE",
+		"/api/agent/issues/"+url.PathEscape(issueID)+"/comments/"+url.PathEscape(commentID),
+		nil, nil,
+	)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	return e.respond(res, "")
+}
+
+// --- severity --------------------------------------------------------------------------------------
+
+var validSeverities = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
+
+// cmdSeverity sets the severity of a user_report issue (A09, N7e). PATCH
+// /api/agent/issues/{issueId}/report/severity — the server 400s if the issue isn't a user_report.
+func cmdSeverity(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("severity", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	args = reorderArgs(args, nil)
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return usageErr(e, "usage: sentinel severity <issueId> <low|medium|high|critical>")
+	}
+	issueID, severity := rest[0], rest[1]
+	if !validSeverities[severity] {
+		return usageErr(e, "severity must be one of: low, medium, high, critical")
+	}
+
+	res, err := e.client.Do(
+		ctx, "PATCH",
+		"/api/agent/issues/"+url.PathEscape(issueID)+"/report/severity",
+		nil, map[string]interface{}{"severity": severity},
+	)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	return e.respond(res, "")
 }
 
 // --- question --------------------------------------------------------------------------------------
@@ -457,30 +567,86 @@ func cmdProjects(ctx context.Context, e *env, args []string) int {
 	return e.respond(res, "projects")
 }
 
-// cmdWhoami. NOTE (API-contract mismatch, documented per the task): there is no identity-returning
-// route under /api/agent/* — authenticateAgentRequest() (agent-auth.ts) never echoes agentId/
-// agentName/organizationId back to the caller anywhere. So whoami is implemented as an auth probe:
-// it calls GET /api/agent/issues (the cheapest read route) and reports reachability + the
-// configured URL/key prefix, rather than any real identity. A 401/403 here means the key is
-// wrong/revoked/expired; any 2xx means the key is valid, but this command cannot tell the caller
-// WHICH agent or org it authenticated as.
+// cmdWhoami. R1a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): upgraded to call the
+// real identity route, GET /api/agent/self, instead of the old reachability-only probe against
+// GET /api/agent/issues. Exit codes are unchanged (0 = ok, network/auth codes as before) so
+// existing scripts checking `$?` keep working; only the printed output gained real identity
+// fields.
 func cmdWhoami(ctx context.Context, e *env, args []string) int {
 	fmt.Fprintf(e.stdout, "url: %s\n", e.client.BaseURL)
 	fmt.Fprintf(e.stdout, "key: %s\n", keyPrefix(e.client.Key))
 
-	res, err := e.client.Do(ctx, "GET", "/api/agent/issues", url.Values{"waiting": []string{"true"}}, nil)
+	res, err := e.client.Do(ctx, "GET", "/api/agent/self", nil, nil)
 	if err != nil {
 		fmt.Fprintf(e.stdout, "reachable: no (%v)\n", err)
 		return ExitNetwork
 	}
 
 	code := exitCodeForStatus(res.Status)
-	if code == ExitOK {
-		fmt.Fprintln(e.stdout, "auth: ok (no dedicated identity endpoint exists; this only confirms the key authenticates)")
-		return ExitOK
+	if code != ExitOK {
+		fmt.Fprintf(e.stdout, "auth: failed (%d %s)\n", res.Status, errorMessage(res.Body))
+		return code
 	}
-	fmt.Fprintf(e.stdout, "auth: failed (%d %s)\n", res.Status, errorMessage(res.Body))
-	return code
+
+	fmt.Fprintln(e.stdout, "auth: ok")
+	if err := output(e.stdout, e.format, res.Body, ""); err != nil {
+		fmt.Fprintln(e.stderr, "error rendering response:", err)
+		return ExitNetwork
+	}
+	return ExitOK
+}
+
+// --- key -------------------------------------------------------------------------------------
+
+// cmdKey dispatches `key rotate`. R1b (N7f): the only subcommand today.
+func cmdKey(ctx context.Context, e *env, args []string) int {
+	if len(args) == 0 || args[0] != "rotate" {
+		return usageErr(e, "usage: sentinel key rotate")
+	}
+	return cmdKeyRotate(ctx, e, args[1:])
+}
+
+// cmdKeyRotate calls POST /api/agent/key/rotate: mints a new key for the SAME agent this key
+// already authenticates as, and leaves the calling key valid for its grace window
+// (AGENT_KEY_ROTATION_GRACE_HOURS server-side). The new secret is printed to STDOUT exactly
+// once, with a loud warning to STDERR — same one-time-reveal contract as the dashboard's own key
+// creation UI. Reconfigure SENTINEL_AGENT_KEY (env, flag, or config file) with the new secret
+// before the old key's grace window elapses.
+func cmdKeyRotate(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("key rotate", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if len(fs.Args()) != 0 {
+		return usageErr(e, "usage: sentinel key rotate")
+	}
+
+	res, err := e.client.Do(ctx, "POST", "/api/agent/key/rotate", nil, nil)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	code := exitCodeForStatus(res.Status)
+	if code != ExitOK {
+		fmt.Fprintf(e.stderr, "error: server returned %d: %s\n", res.Status, errorMessage(res.Body))
+		return code
+	}
+
+	var parsed struct {
+		NewKey struct {
+			ID     string `json:"id"`
+			Prefix string `json:"prefix"`
+			Secret string `json:"secret"`
+		} `json:"newKey"`
+	}
+	if err := json.Unmarshal(res.Body, &parsed); err != nil {
+		fmt.Fprintln(e.stderr, "error decoding rotate response:", err)
+		return ExitNetwork
+	}
+
+	fmt.Fprintln(e.stderr, "WARNING: this secret is shown ONCE and never again. Store it now (e.g. update SENTINEL_AGENT_KEY) before it scrolls off your terminal.")
+	fmt.Fprintln(e.stdout, parsed.NewKey.Secret)
+	return ExitOK
 }
 
 // --- events --------------------------------------------------------------------------------------
@@ -725,19 +891,60 @@ func cmdBatch(ctx context.Context, e *env, args []string) int {
 
 // --- upload --------------------------------------------------------------------------------------
 
-// cmdUpload. NOTE (API-contract mismatch, server wins): POST /api/agent/uploads
-// (apps/dashboard-web/src/routes/api/agent/uploads/+server.ts, via upload-core.ts's
-// handleAttachmentUpload) does NOT take an issueId at all — the row is inserted with
-// `issueId: null` and only later associated with an issue by passing the returned attachment id
-// to `sentinel comment --attachment <id>`. The <issueId> positional here is accepted for
-// consistency with every other issue-scoped command and printed in the response context, but it
-// is never sent to the server. See README.md.
-func cmdUpload(ctx context.Context, e *env, args []string) int {
-	if len(args) != 2 {
-		return usageErr(e, "usage: sentinel upload <issueId> <file>")
+// baseName returns the final path segment of filePath (handles both '/' and '\' separators).
+func baseName(filePath string) string {
+	base := filePath
+	if idx := strings.LastIndexAny(filePath, "/\\"); idx >= 0 {
+		base = filePath[idx+1:]
 	}
-	issueID, filePath := args[0], args[1]
-	_ = issueID // accepted for CLI symmetry only; the server route has no issueId param — see doc comment.
+	return base
+}
+
+// cmdUpload. A15 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): one-shot upload +
+// comment. `sentinel upload <file> --issue <id> --comment "text"` uploads the file (POST
+// /api/agent/uploads, which itself has no issueId param — it returns an unassociated attachment
+// id) and then, when --issue is given, immediately posts a comment on that issue with
+// `attachment_ids: [<id>]` (optionally with --comment's text as the body; empty body defaults to
+// a fixed placeholder since postComment requires non-empty body_md). This replaces the old
+// documented no-op: previously `<issueId>` was a bare positional the server never received, so
+// "uploading to an issue" always took a second manual `sentinel comment --attachment <id>` call.
+//
+// Backward compatibility: the OLD two-positional form `sentinel upload <issueId> <file>` (no
+// flags) is still accepted — it performs a plain upload with no follow-up comment, exactly like
+// before, but now prints a deprecation warning to stderr pointing at the new flag form, since that
+// positional issueId was always silently discarded.
+func cmdUpload(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("upload", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	issueFlag := fs.String("issue", "", "issue id to comment on with the uploaded attachment")
+	commentFlag := fs.String("comment", "", `comment body (Markdown) for the follow-up comment; defaults to "Uploaded attachment." if --issue is set and this is empty`)
+	reordered := reorderArgs(args, nil)
+	if err := fs.Parse(reordered); err != nil {
+		return ExitUsage
+	}
+	rest := fs.Args()
+
+	var filePath, issueID string
+	switch {
+	case *issueFlag != "":
+		// New one-shot form: exactly one positional, the file.
+		if len(rest) != 1 {
+			return usageErr(e, `usage: sentinel upload <file> --issue <id> [--comment "text"]`)
+		}
+		filePath = rest[0]
+		issueID = *issueFlag
+	case len(rest) == 2:
+		// Old two-positional form, kept for backward compatibility. The first positional used to
+		// be silently discarded (the server route has no issueId param); it still is here — this
+		// branch is a plain upload, same behavior as before this phase.
+		fmt.Fprintln(e.stderr, `warning: "sentinel upload <issueId> <file>" is deprecated and the issueId is ignored; use "sentinel upload <file> --issue <id> --comment \"text\"" to upload AND comment in one call`)
+		issueID, filePath = rest[0], rest[1]
+		_ = issueID
+	case len(rest) == 1:
+		filePath = rest[0]
+	default:
+		return usageErr(e, `usage: sentinel upload <file> --issue <id> [--comment "text"]`)
+	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -745,16 +952,41 @@ func cmdUpload(ctx context.Context, e *env, args []string) int {
 	}
 	defer f.Close()
 
-	base := filePath
-	if idx := strings.LastIndexAny(filePath, "/\\"); idx >= 0 {
-		base = filePath[idx+1:]
-	}
-
-	res, err := e.client.UploadFile(ctx, "/api/agent/uploads", filePath, f, base)
+	uploadRes, err := e.client.UploadFile(ctx, "/api/agent/uploads", filePath, f, baseName(filePath))
 	if err != nil {
 		return e.networkErr(err)
 	}
-	return e.respond(res, "")
+	if code := exitCodeForStatus(uploadRes.Status); code != ExitOK {
+		fmt.Fprintf(e.stderr, "error: server returned %d: %s\n", uploadRes.Status, errorMessage(uploadRes.Body))
+		return code
+	}
+
+	if *issueFlag == "" {
+		// No --issue: same as before, just the upload response.
+		return e.respond(uploadRes, "")
+	}
+
+	var uploaded struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(uploadRes.Body, &uploaded); err != nil || uploaded.ID == "" {
+		fmt.Fprintln(e.stderr, "error: upload succeeded but response had no attachment id:", err)
+		return ExitNetwork
+	}
+
+	commentBody := *commentFlag
+	if commentBody == "" {
+		commentBody = "Uploaded attachment."
+	}
+	reqBody := map[string]interface{}{
+		"body_md":        commentBody,
+		"attachment_ids": []string{uploaded.ID},
+	}
+	commentRes, err := e.client.Do(ctx, "POST", "/api/agent/issues/"+url.PathEscape(*issueFlag)+"/comments", nil, reqBody)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	return e.respond(commentRes, "")
 }
 
 // stringList implements flag.Value for a repeatable string flag (e.g. -attachment).

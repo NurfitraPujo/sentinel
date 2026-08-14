@@ -412,6 +412,33 @@ describe('updateManualIssueReport', () => {
 			updateManualIssueReport({ issueId: 'missing', actorId: 'author-1', bodyMd: 'x' })
 		).rejects.toThrow('not found');
 	});
+
+	// N7e (A09): the agent severity op passes actorType: 'agent' so the report_edited activity row
+	// attributes the change correctly instead of the hardcoded 'user' this function used to write
+	// unconditionally.
+	it('attributes the report_edited row to actorType "agent" when the caller passes one', async () => {
+		let thenCall = 0;
+		txMock.then = vi.fn((resolve: any) => {
+			thenCall += 1;
+			if (thenCall === 1) return resolve([{ id: 'issue-1', message: 'title' }]);
+			if (thenCall === 2) return resolve([{ bodyMd: 'body', severity: 'low' }]);
+			if (thenCall === 3) return resolve(undefined); // update manual_issue_reports
+			if (thenCall === 4) return resolve(undefined); // insert issue_activity
+			if (thenCall === 5) return resolve([{ id: 'issue-1', message: 'title' }]);
+			return resolve([{ issueId: 'issue-1', bodyMd: 'body', severity: 'high' }]);
+		});
+
+		await updateManualIssueReport({
+			issueId: 'issue-1',
+			actorId: 'agent-1',
+			actorType: 'agent',
+			severity: 'high',
+		});
+
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ eventType: 'report_edited', actorType: 'agent', actorId: 'agent-1' })
+		);
+	});
 });
 
 describe('deleteManualIssue', () => {

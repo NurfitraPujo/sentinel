@@ -217,3 +217,48 @@ The short version:
 - **Object store** holds attachments — enable versioning/lifecycle on the bucket.
 - The **DLQ** (`ERROR_EVENTS_DLQ`) collects events the processor could not handle. Inspect/replay
   with `tools/dlq`; the drainer stays OFF until an operator enables both gates (D14).
+
+## 8. Provisioning agents
+
+There is no headless/self-service provisioning API for `/api/agent/*` credentials as of N7f
+(A14, `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`) — every agent identity and key is
+created by a human, once, through the dashboard:
+
+1. Sign in as an org owner/admin and open **Settings → Agents**.
+2. Create the agent (name + kind). This inserts one row in `agents`.
+3. Issue a key for that agent (scope `agent`, org-scoped — never project-scoped). The raw secret
+   is shown exactly once at creation time, the same one-time-reveal contract `sentinel key rotate`
+   uses for a rotated secret (R1b). Store it in whatever secret manager the calling agent's
+   deployment already uses; Sentinel never re-displays it.
+4. Hand the agent `SENTINEL_URL` and the key (`SENTINEL_AGENT_KEY`) — see
+   `docs/agents/SENTINEL_AGENT_GUIDE.md` for how an agent should use them (discovery, claiming,
+   `sentinel whoami` to confirm the key resolves to the identity you expect).
+5. Rotate on a schedule or on suspected leak with `POST /api/agent/key/rotate` /
+   `sentinel key rotate` — self-service from here on; grace window is
+   `AGENT_KEY_ROTATION_GRACE_HOURS` (default 24h, `.env.example`).
+
+**Future work (sketch, not built):** an org-owner-mintable one-time provisioning token — owner
+generates a short-lived, single-use token in the dashboard, hands it to whatever is standing up
+the agent (a script, another agent, a CI job), and that caller exchanges the token for step 2+3
+above via one unauthenticated-except-for-the-token endpoint, without a human ever handling the
+long-lived agent key directly. Would need: a new short-TTL single-use token table (separate from
+`project_api_keys` — it authenticates a PROVISIONING action, not ongoing API access), an
+exchange endpoint that creates the agent + key server-side and returns the secret once, and an
+audit trail distinguishing "provisioned via token" from "provisioned via dashboard session". Filed
+here rather than built because A14's audit finding rated it a nice-to-have (one manual step,
+infrequent) against real implementation cost (a new credential type to reason about token replay
+and expiry). Revisit if agent fleet size makes the manual step a bottleneck.
+
+## 9. Agent key rate limiting
+
+Each agent key enforces its own `project_api_keys.rate_limit_rpm` (default 5000) via a
+**fixed-window** counter (`$lib/rate-limit.ts`, 60s windows) — deliberately not a sliding/token-
+bucket limiter. A10 (`docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`) evaluated switching and
+decided to keep it: this is a single-instance deployment, the default is generous, and the limiter
+already errs permissive on its own failure modes, so it should never be the thing standing between
+an automation loop and the API. The one sharp edge worth knowing: a fixed window allows up to
+**2x** the configured rate across a window boundary (e.g. `rate_limit_rpm` requests in the last
+instant of one window, followed immediately by another `rate_limit_rpm` in the first instant of
+the next) — budget for that burst factor when sizing `rate_limit_rpm` for a specific agent. Every
+429 response carries an accurate `Retry-After` header (seconds until the current window resets);
+well-behaved clients should back off for exactly that long rather than polling immediately.

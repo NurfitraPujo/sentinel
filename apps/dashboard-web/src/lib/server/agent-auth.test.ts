@@ -219,6 +219,12 @@ describe('authenticateAgentRequest rate limiting (R19)', () => {
 		expect(caught).toBeInstanceOf(Response);
 		const res = caught as Response;
 		expect(res.status).toBe(429);
-		expect(res.headers.get('Retry-After')).toBeTruthy();
+		// A10 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): must be a positive integer
+		// number of seconds computed from the limiter's own `resetAt` (rate-limit.ts), not a
+		// placeholder/fixed value -- "truthy" alone would pass a garbage non-numeric header.
+		const retryAfter = res.headers.get('Retry-After');
+		expect(retryAfter).toMatch(/^\d+$/);
+		expect(Number(retryAfter)).toBeGreaterThan(0);
+		expect(Number(retryAfter)).toBeLessThanOrEqual(60);
 	});
 });
