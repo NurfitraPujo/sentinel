@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,24 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// occurrenceEventMinInterval is the R2 throttle window for 'occurrence_burst' issue_activity
+// rows (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7a): at most one burst event per issue
+// per this interval, bounding org-wide event volume to active_issues/interval regardless of
+// traffic. Configurable via OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS (default 3600 = 1h); read once
+// at package init since it never changes for the life of the process.
+var occurrenceEventMinInterval = readOccurrenceEventMinInterval()
+
+func readOccurrenceEventMinInterval() time.Duration {
+	const defaultSeconds = 3600
+	seconds := defaultSeconds
+	if s := os.Getenv("OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			seconds = v
+		}
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 // QueryStore defines the "Read" side of the Issue store.
 type QueryStore interface {
@@ -395,6 +414,12 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			return IssueOutcomeExisting, false, err
 		}
 	} else {
+		// N7a (A01/A06): RETURNING (xmax = 0) AS inserted gives an EXACT new-vs-existing signal
+		// from the upsert statement itself, unlike wasNewIssue above (a pre-upsert SELECT in the
+		// same tx — see the outcome-inexactness caveat in this method's doc comment, and
+		// store.go:309-315 for UpsertIssueWithOutcome's equivalent). xmax=0 means this row's
+		// current version was created by THIS command (a fresh INSERT), never by the DO UPDATE
+		// arm — so it cannot alias a concurrent-race duplicate the way wasNewIssue can.
 		query := `
 			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
@@ -403,9 +428,10 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
 			WHERE ` + issuesUpsertConflictPredicate + `
-			RETURNING id
+			RETURNING id, (xmax = 0) AS inserted
 		`
 		var returnedID string
+		var wasFreshInsert bool
 		if scanErr := tx.QueryRow(ctx, query,
 			issue.ID,
 			issue.ProjectID,
@@ -415,7 +441,7 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			issue.Status,
 			issue.FirstSeen,
 			issue.LastSeen,
-		).Scan(&returnedID); scanErr != nil {
+		).Scan(&returnedID, &wasFreshInsert); scanErr != nil {
 			if errors.Is(scanErr, pgx.ErrNoRows) {
 				// F-TX-7: the folded RETURNING id yielded no row. The only way this happens is the
 				// DO UPDATE ... WHERE predicate being narrowed so it no longer matches — a bug in
@@ -427,6 +453,46 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			return IssueOutcomeExisting, false, scanErr
 		}
 		issue.ID = returnedID
+
+		if wasFreshInsert {
+			// A01/A06: agents currently have no reliable "a new issue exists" signal in the
+			// events feed. One 'created' row per genuinely-new issue, inside this same tx so a
+			// duplicate-occurrence rollback below undoes it too.
+			activityMeta, _ := json.Marshal(map[string]string{
+				"errorClass": issue.ErrorClass,
+				"projectId":  issue.ProjectID,
+			})
+			createdQuery := `
+				INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, new_value, created_at)
+				VALUES (gen_random_uuid(), $1, 'system', 'sentinel-processor', 'created', $2, NOW())
+			`
+			if _, err := tx.Exec(ctx, createdQuery, issue.ID, activityMeta); err != nil {
+				return IssueOutcomeExisting, false, err
+			}
+		} else {
+			// R2: repeat-occurrence discovery signal, throttled to at most one 'occurrence_burst'
+			// row per issue per occurrenceEventMinInterval — a single INSERT ... SELECT guarded by
+			// NOT EXISTS, same tx, no new contended lock (the NOT EXISTS only reads). Skipped
+			// entirely when a 'created' or 'regressed' row already covers this issue recently
+			// (isRegressed always takes the other branch above, so a same-delivery regression can
+			// never race this — a 'regressed' row here can only be from an earlier delivery).
+			burstQuery := `
+				INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, new_value, created_at)
+				SELECT gen_random_uuid(), $1, 'system', 'sentinel-processor', 'occurrence_burst',
+					jsonb_build_object('count', issues.count, 'lastSeen', issues.last_seen), NOW()
+				FROM issues
+				WHERE issues.id = $1
+				AND NOT EXISTS (
+					SELECT 1 FROM issue_activity
+					WHERE issue_activity.issue_id = $1
+					AND issue_activity.event_type IN ('created', 'occurrence_burst', 'regressed')
+					AND issue_activity.created_at > NOW() - make_interval(secs => $2)
+				)
+			`
+			if _, err := tx.Exec(ctx, burstQuery, issue.ID, occurrenceEventMinInterval.Seconds()); err != nil {
+				return IssueOutcomeExisting, false, err
+			}
+		}
 	}
 
 	// --- 2. Occurrence insert, deduplicated on (issue_id, event_id) ---

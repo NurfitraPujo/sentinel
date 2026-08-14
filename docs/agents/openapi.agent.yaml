@@ -1571,6 +1571,25 @@ paths:
                           type: number
                         eventType:
                           type: string
+                          enum:
+                            - status_changed
+                            - assigned
+                            - unassigned
+                            - regressed
+                            - ai_analysis
+                            - linked
+                            - commented
+                            - claimed
+                            - claim_released
+                            - progress_update
+                            - question_asked
+                            - question_answered
+                            - moved
+                            - attachment_added
+                            - report_edited
+                            - report_created
+                            - created
+                            - occurrence_burst
                         actorType:
                           type: string
                           enum:

@@ -24,6 +24,13 @@ export const AGENT_EVENT_TYPES = [
 	'attachment_added',
 	'report_edited',
 	'report_created',
+	// N7a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md, A01/A06/R2): written by
+	// apps/processor-go/store/store.go's StoreEvent, not by any dashboard-web code path.
+	// 'created' fires once per genuinely-new issue; 'occurrence_burst' fires at most once per
+	// issue per OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS on repeat occurrences. No backfill for
+	// pre-existing issues — see the 1723400000 migration header.
+	'created',
+	'occurrence_burst',
 ] as const;
 
 export type AgentEventType = (typeof AGENT_EVENT_TYPES)[number];

@@ -288,7 +288,7 @@ export const EventsQuerySchema = z
 export const OrgActivityEventSchema = z
 	.object({
 		seq: z.number(),
-		eventType: z.string(),
+		eventType: AgentEventTypeSchema,
 		actorType: z.enum(['user', 'agent', 'system']),
 		actorId: z.string(),
 		oldValue: z.unknown(),

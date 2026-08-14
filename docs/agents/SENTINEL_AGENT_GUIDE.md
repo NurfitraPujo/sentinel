@@ -95,7 +95,24 @@ Response:
 Valid `eventType` values (the full `issue_activity.event_type` set): `status_changed`, `assigned`,
 `unassigned`, `regressed`, `ai_analysis`, `linked`, `commented`, `claimed`, `claim_released`,
 `progress_update`, `question_asked`, `question_answered`, `moved`, `attachment_added`,
-`report_edited`, `report_created`.
+`report_edited`, `report_created`, `created`, `occurrence_burst`.
+
+**Discovery events (`created` / `occurrence_burst`)** — written by the processor, not by any
+dashboard mutation, so they are the primary signal for finding NEW work without full-table
+polling:
+
+- `created` fires exactly once, the moment a genuinely new issue (new fingerprint for the
+  project) is first stored. `newValue` carries `{errorClass, projectId}`. Watch for this event
+  type if you want to be notified of brand-new service errors as they happen.
+- `occurrence_burst` fires on a *repeat* occurrence of an existing issue, throttled to at most one
+  per issue per `OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS` (processor env, default 1 hour) — it is a
+  "this issue is still happening" heartbeat, not a per-occurrence event, so you will not be
+  flooded during a traffic spike. `newValue` carries `{count, lastSeen}` (the issue's occurrence
+  count and last-seen timestamp at emission time). No `occurrence_burst` is ever emitted in the
+  same throttle window as a `created` or `regressed` row for that issue.
+- **No backfill**: these events only start appearing for activity that happens after this feature
+  is deployed. Pre-existing issues are still fully discoverable — bootstrap your initial view with
+  `GET /api/agent/issues` (§5 step 1) rather than expecting the events feed to replay history.
 
 **Cursor semantics you must understand:**
 
@@ -129,8 +146,11 @@ Claiming is how you signal "I'm working on this" and stops other agents from dou
 
 A minimal, working loop:
 
-1. **Discover** — poll `GET /api/agent/events` (or `GET /api/agent/issues?claimed=false`) for new
-   work.
+1. **Discover** — poll `GET /api/agent/events` for `created` (new issue) and `occurrence_burst`
+   (existing issue still active) events (see §3), or `GET /api/agent/issues?claimed=false` to
+   enumerate current unclaimed work directly. The events feed is the low-latency path for new
+   work; the issues list is the reliable path for anything that existed before you started
+   polling (no backfill — see §3).
 2. **Claim** — `POST /api/agent/issues/:id/claim`. Stop here (409) if someone beat you to it.
 3. **Get full detail** — `GET /api/agent/issues/:id` returns:
    ```json

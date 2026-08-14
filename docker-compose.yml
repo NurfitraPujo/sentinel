@@ -224,6 +224,10 @@ services:
             WEBHOOK_DISPATCH_ENABLED: "false"
             WEBHOOK_DISPATCH_INTERVAL: "5s"
             WEBHOOK_FAILURE_THRESHOLD: "20"
+            # N7a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md): throttle window for the
+            # 'occurrence_burst' issue_activity discovery event — at most one per issue per this
+            # many seconds. Default matches the code's own fallback; listed for discoverability.
+            OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS: "3600"
 
     dlq-drainer:
         build:
