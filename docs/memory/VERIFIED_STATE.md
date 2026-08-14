@@ -1757,9 +1757,17 @@ Provider-agnostic continuous-automation layer on top of the M5 `/api/agent/*` su
   code 5 = claim 409. Contract cross-checked against every route file: zero breaking mismatches
   (4 documented server-wins notes in code).
 - **N5**: `docs/agents/SENTINEL_AGENT_GUIDE.md` (canonical, every claim verified against handlers;
-  worked HMAC example recomputed independently), `openapi.agent.yaml` (informative),
+  worked HMAC example recomputed independently), `openapi.agent.yaml`,
   `.agents/skills/sentinel-agent/SKILL.md` (canonical provider-neutral skill) + `.claude` shim,
   runnable examples.
+- **N6** (`6d8e2ae`, verified 2026-08-14): `openapi.agent.yaml` is now **GENERATED** from zod
+  schemas + a route registry in `src/lib/server/agent-api-spec/` (`pnpm openapi:agent`,
+  deterministic — double-generate byte-identical). Never hand-edit the YAML. Three gates run inside
+  the normal `pnpm test` (already CI-enforced): drift (in-memory generate vs committed YAML),
+  completeness (walks `+server.ts` exports, exact bidirectional path+method equality with the
+  registry), contract (real handlers' responses parsed under `.strict()` schemas). All three
+  red-proven by mutation (schema edit / fake route / deleted schema field), then green. Adding or
+  changing an agent route now FAILS CI until `agent-api-spec/` and the regenerated YAML follow.
 
 Proved by running, 2026-08-14 (each phase adversarially validated by re-running gates, not by
 reading): dashboard `pnpm build`/`check`/`test --sequence.shuffle` green throughout (637 passed at
