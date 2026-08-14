@@ -645,7 +645,7 @@ export async function claimIssue(
 	return await db.transaction(async (tx) => {
 		const updated = await tx
 			.update(issues)
-			.set({ assigneeType: actorType, assignedTo: actorId })
+			.set({ assigneeType: actorType, assignedTo: actorId, claimedAt: new Date() })
 			.where(and(eq(issues.id, issueId), isNull(issues.assignedTo)))
 			.returning();
 
@@ -714,7 +714,7 @@ export async function releaseClaim(
 
 		const updated = await tx
 			.update(issues)
-			.set({ assigneeType: null, assignedTo: null })
+			.set({ assigneeType: null, assignedTo: null, claimedAt: null })
 			.where(whereClause)
 			.returning();
 

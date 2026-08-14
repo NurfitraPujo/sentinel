@@ -142,6 +142,19 @@ Claiming is how you signal "I'm working on this" and stops other agents from dou
 - Release when you're done, or when you're blocked and waiting (see §6) so another agent — or a
   human — can pick it up if you never come back.
 
+**Claim staleness — you don't have to remember to release.** A scheduled reaper protects against
+an unattended loop that crashes or hangs mid-claim: if your claim (agent-type only; human claims
+are never touched) goes older than `CLAIM_STALE_HOURS` (default 24) with no activity from you —
+no comment, progress update, question, or status change — on that issue in that same window, it is
+force-released automatically. This shows up in the events feed as a `claim_released` event with
+`actor_type: "system"`, `actor_id: "sentinel-claim-reaper"`, and
+`new_value: {"previousAssignee": "<your agentId>", "reason": "stale"}` — poll for it (or for the
+issue simply reappearing in `GET /api/agent/issues?claimed=false`) if you resume after a gap and
+aren't sure whether you still hold a claim you made. Posting any activity (a progress update is the
+cheapest) on an issue you're actively working resets the clock, so a genuinely long-running triage
+is safe as long as you check in within the window; don't rely on this as a heartbeat substitute for
+actually finishing or releasing when you're done.
+
 ## 5. Triage recipe
 
 A minimal, working loop:
@@ -150,7 +163,14 @@ A minimal, working loop:
    (existing issue still active) events (see §3), or `GET /api/agent/issues?claimed=false` to
    enumerate current unclaimed work directly. The events feed is the low-latency path for new
    work; the issues list is the reliable path for anything that existed before you started
-   polling (no backfill — see §3).
+   polling (no backfill — see §3), and it's the recommended way to bootstrap: page through
+   `GET /api/agent/issues?limit=50&sort=firstSeen` (add `&since=<ISO timestamp>` on a resumed
+   bootstrap to skip issues you've already seen) and follow `nextCursor` — present in the response
+   only when you passed `limit` — via `&cursor=<nextCursor>` until it's absent, then switch to the
+   events feed for ongoing discovery. Omitting `limit`/`sort`/`since`/`cursor` entirely keeps the
+   original unbounded, `lastSeen`-descending list (no pagination) for backward compatibility;
+   `limit` is capped at 200 server-side. The keyset cursor (on `(sortColumn, id)`, not an offset)
+   stays stable even as new issues arrive mid-page.
 2. **Claim** — `POST /api/agent/issues/:id/claim`. Stop here (409) if someone beat you to it.
 3. **Get full detail** — `GET /api/agent/issues/:id` returns:
    ```json
@@ -384,7 +404,7 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 
 | Command | HTTP call |
 |---|---|
-| `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true]` | `GET /api/agent/issues` |
+| `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true] [--since TS] [--sort firstSeen\|lastSeen] [--limit N] [--cursor C]` | `GET /api/agent/issues` |
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` (409 on conflict) |

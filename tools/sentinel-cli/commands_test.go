@@ -74,6 +74,13 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 			wantQuery:  map[string]string{"type": "system_error", "claimed": "true", "project": "p1", "waiting": "true"},
 		},
 		{
+			name:       "issues list with pagination flags",
+			args:       []string{"issues", "list", "--since", "2026-01-01T00:00:00Z", "--sort", "firstSeen", "--limit", "25", "--cursor", "abc123"},
+			wantMethod: "GET",
+			wantPath:   "/api/agent/issues",
+			wantQuery:  map[string]string{"since": "2026-01-01T00:00:00Z", "sort": "firstSeen", "limit": "25", "cursor": "abc123"},
+		},
+		{
 			name:       "issues get",
 			args:       []string{"issues", "get", "iss-1"},
 			wantMethod: "GET",
@@ -339,6 +346,23 @@ func TestConfigFile_WorldReadableWarns(t *testing.T) {
 	}
 	if !strings.Contains(warned, "600") {
 		t.Errorf("warning %q does not mention chmod 600", warned)
+	}
+}
+
+// N7b (A02): `issues list` with no pagination flags must send NO since/sort/limit/cursor query
+// params at all -- byte-identical to pre-N7b request shape, matching the server's "params absent
+// ⇒ byte-identical current behavior" contract. Deleting the `if *since != ""` (etc.) guards in
+// cmdIssuesList and always calling q.Set would fail this test.
+func TestCmdIssuesList_NoFlagsOmitsPaginationParams(t *testing.T) {
+	srv, rec := newRecordingServer(t, 200, `{"issues":[]}`)
+	e, _, errBuf := newTestEnv(srv, "sk_test_key")
+
+	code := cmdIssues(context.Background(), e, []string{"list"})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want 0; stderr=%s", code, errBuf.String())
+	}
+	if rec.Query != "" {
+		t.Errorf("query = %q, want empty (no pagination params sent when no flags given)", rec.Query)
 	}
 }
 

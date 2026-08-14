@@ -85,6 +85,11 @@ export const issues = pgTable('issues', {
 	sourceChannel: varchar('source_channel', { length: 50 }).notNull().default('ingestion_sdk'),
 	assigneeType: varchar('assignee_type', { length: 20 }),
 	assignedTo: varchar('assigned_to', { length: 255 }),
+	// N7c (1723500000_add_claimed_at.sql, A03): when the CURRENT claim (assigneeType/assignedTo)
+	// was made. Set by claimIssue, cleared by releaseClaim (both non-force and force). NULL means
+	// either unclaimed, or a pre-migration claim -- reapStaleClaims (retention.ts) treats NULL as
+	// stale-eligible. Not exposed in any /api/agent response yet (that's N7e).
+	claimedAt: timestamp('claimed_at', { withTimezone: true }),
 	resolvedInVersion: varchar('resolved_in_version', { length: 100 }),
 	resolvedAt: timestamp('resolved_at', { withTimezone: true }),
 	resolvedByType: varchar('resolved_by_type', { length: 20 }),

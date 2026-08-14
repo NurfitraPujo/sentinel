@@ -75,6 +75,8 @@ openssl rand -base64 24 # POSTGRES_PASSWORD, S3_SECRET_KEY, REDIS_PASSWORD
 | `AUTH_SECRET` | dashboard | Auth.js; rotating it invalidates all sessions |
 | `SETTINGS_ENCRYPTION_KEY` | dashboard | **exactly 32 chars**; encrypts stored org settings — rotating it makes existing encrypted settings unreadable |
 | `CRON_SECRET` | dashboard | bearer token for retention cron |
+| `MANUAL_ISSUE_RETENTION_DAYS` | dashboard | not a secret, but read by the same cron; default 365 — see §5 checklist |
+| `CLAIM_STALE_HOURS` | dashboard | not a secret, but read by the same cron; default 24 — see §5 checklist |
 | `EMAIL_SERVER` | dashboard | SMTP DSN; **without it, invitations cannot be delivered** (by design, D06) |
 | `GOOGLE_CLIENT_ID/SECRET` | dashboard | only if using Google SSO |
 
@@ -191,6 +193,8 @@ The short version:
 - [ ] `EMAIL_SERVER` configured (invitations depend on it, D06)
 - [ ] `OTEL_EXPORTER_OTLP_ENDPOINT` pointed at your collector (optional; absent = no traces, still functional)
 - [ ] Retention cron scheduled to POST `/api/cron/retention` with the `CRON_SECRET` bearer token
+      — the same run also force-releases stale agent claims (`CLAIM_STALE_HOURS`, default 24) and
+      applies the longer manual-issue cutoff (`MANUAL_ISSUE_RETENTION_DAYS`, default 365)
 - [ ] Object-store lifecycle/backup policy for attachments
 
 ---

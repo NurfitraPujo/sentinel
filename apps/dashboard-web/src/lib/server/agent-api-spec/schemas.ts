@@ -90,7 +90,12 @@ export const AgentIssueListItemSchema = z
 	})
 	.strict();
 
-export const ListIssuesResponseSchema = z.object({ issues: z.array(AgentIssueListItemSchema) }).strict();
+// N7b (A02): `nextCursor` is present ONLY when the request supplied `limit` and more rows exist
+// beyond this page -- absent (not null) otherwise, matching the route's byte-identical-when-
+// absent contract for pre-N7b callers.
+export const ListIssuesResponseSchema = z
+	.object({ issues: z.array(AgentIssueListItemSchema), nextCursor: z.string().optional() })
+	.strict();
 
 export const ListIssuesQuerySchema = z
 	.object({
@@ -98,6 +103,14 @@ export const ListIssuesQuerySchema = z
 		claimed: z.enum(['true', 'false']).optional(),
 		project: z.string().optional(),
 		waiting: z.enum(['true', 'false']).optional(),
+		/** ISO timestamp; only issues with firstSeen >= since. */
+		since: z.string().optional(),
+		/** Default 'lastSeen' (pre-N7b ordering) when omitted. */
+		sort: z.enum(['firstSeen', 'lastSeen']).optional(),
+		/** No `.limit()` applied when omitted (legacy unbounded). 1..200 when supplied. */
+		limit: z.coerce.number().int().min(1).max(200).optional(),
+		/** Opaque keyset cursor from a prior response's `nextCursor`. */
+		cursor: z.string().optional(),
 	})
 	.strict();
 

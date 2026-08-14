@@ -127,6 +127,10 @@ func cmdIssuesList(ctx context.Context, e *env, args []string) int {
 	claimed := fs.String("claimed", "", `filter: "true" or "false"`)
 	project := fs.String("project", "", "filter: project id")
 	waiting := fs.String("waiting", "", `filter: "true" to show only issues waiting on a reply`)
+	since := fs.String("since", "", "ISO timestamp: only issues first seen at or after this time")
+	sort := fs.String("sort", "", `sort column: "firstSeen" or "lastSeen" (default lastSeen)`)
+	limit := fs.String("limit", "", "max rows per page (server clamps to [1,200]; omit for unbounded legacy list)")
+	cursor := fs.String("cursor", "", "opaque keyset cursor from a prior response's nextCursor")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
@@ -143,6 +147,18 @@ func cmdIssuesList(ctx context.Context, e *env, args []string) int {
 	}
 	if *waiting != "" {
 		q.Set("waiting", *waiting)
+	}
+	if *since != "" {
+		q.Set("since", *since)
+	}
+	if *sort != "" {
+		q.Set("sort", *sort)
+	}
+	if *limit != "" {
+		q.Set("limit", *limit)
+	}
+	if *cursor != "" {
+		q.Set("cursor", *cursor)
 	}
 
 	res, err := e.client.Do(ctx, "GET", "/api/agent/issues", q, nil)

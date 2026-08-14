@@ -188,30 +188,51 @@ beforeEach(() => {
 
 describe('GET /api/agent/issues', () => {
 	it('200: matches ListIssuesResponseSchema', async () => {
-		listAgentIssues.mockResolvedValue([
-			{
-				id: 'issue-1',
-				projectId: 'project-1',
-				projectName: 'Inbox',
-				isInbox: true,
-				issueType: 'system_error',
-				message: 'msg',
-				errorClass: 'Error',
-				status: 'unresolved',
-				assigneeType: null,
-				assignedTo: null,
-				waitingOn: null,
-				firstSeen: new Date().toISOString(),
-				lastSeen: new Date().toISOString(),
-				count: 1,
-				severity: null,
-				reporterId: null,
-				isWaiting: false,
-			},
-		]);
+		listAgentIssues.mockResolvedValue({
+			issues: [
+				{
+					id: 'issue-1',
+					projectId: 'project-1',
+					projectName: 'Inbox',
+					isInbox: true,
+					issueType: 'system_error',
+					message: 'msg',
+					errorClass: 'Error',
+					status: 'unresolved',
+					assigneeType: null,
+					assignedTo: null,
+					waitingOn: null,
+					firstSeen: new Date().toISOString(),
+					lastSeen: new Date().toISOString(),
+					count: 1,
+					severity: null,
+					reporterId: null,
+					isWaiting: false,
+				},
+			],
+		});
 		const res = await issuesListRoute.GET(makeEvent('http://localhost/api/agent/issues'));
 		expect(res.status).toBe(200);
 		expect(S.ListIssuesResponseSchema.parse(await res.json())).toBeTruthy();
+	});
+
+	it('200: matches ListIssuesResponseSchema with nextCursor when limit is supplied', async () => {
+		listAgentIssues.mockResolvedValue({ issues: [], nextCursor: 'abc123' });
+		const res = await issuesListRoute.GET(makeEvent('http://localhost/api/agent/issues?limit=10'));
+		expect(res.status).toBe(200);
+		expect(S.ListIssuesResponseSchema.parse(await res.json())).toBeTruthy();
+	});
+
+	it('400: matches ErrorFieldErrorSchema for an invalid since param', async () => {
+		const res = await issuesListRoute.GET(makeEvent('http://localhost/api/agent/issues?since=not-a-date'));
+		expect(res.status).toBe(400);
+		expect(S.ErrorFieldErrorSchema.parse(await res.json())).toBeTruthy();
+	});
+
+	it('400: matches ErrorFieldErrorSchema for an invalid sort param', async () => {
+		const res = await issuesListRoute.GET(makeEvent('http://localhost/api/agent/issues?sort=bogus'));
+		expect(res.status).toBe(400);
+		expect(S.ErrorFieldErrorSchema.parse(await res.json())).toBeTruthy();
 	});
 
 	it('400: matches ErrorFieldErrorSchema for an invalid type param', async () => {
