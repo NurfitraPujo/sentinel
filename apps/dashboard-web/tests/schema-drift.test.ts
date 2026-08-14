@@ -116,6 +116,11 @@ function normalizeDrizzleSqlType(sqlType: string): TypeFamily {
 		return { family: 'string', length: varcharMatch[1] ? Number(varcharMatch[1]) : null };
 	}
 	if (sqlType === 'text') return { family: 'string', length: null };
+	// Postgres reports every array column's information_schema.columns.data_type as the bare string
+	// "ARRAY" regardless of element type (the real element type is in udt_name, which this guard does
+	// not otherwise inspect) — so any Drizzle `.array()` column (getSQLType() === '<elem>[]') maps to
+	// that same family rather than being compared element-type-to-element-type.
+	if (sqlType.endsWith('[]')) return { family: 'array', length: null };
 	if (sqlType === 'uuid') return { family: 'uuid', length: null };
 	if (sqlType === 'jsonb') return { family: 'json', length: null };
 	if (sqlType === 'json') return { family: 'json', length: null };
@@ -148,6 +153,8 @@ function normalizePgDataType(dataType: string, maxLength: number | null): TypeFa
 		case 'timestamp without time zone':
 		case 'timestamp with time zone':
 			return { family: 'timestamp', length: null };
+		case 'ARRAY':
+			return { family: 'array', length: null };
 		default:
 			return { family: `unknown:${dataType}`, length: null };
 	}
