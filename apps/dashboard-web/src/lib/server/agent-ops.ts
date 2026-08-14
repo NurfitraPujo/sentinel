@@ -9,7 +9,7 @@ import { sendIssueNotificationEmails } from '$lib/server/notify';
 import { claimIssue, releaseClaim, ClaimConflictError } from '$lib/db/queries/reports';
 import { createComment, CommentValidationError, CommentNotFoundError } from '$lib/db/queries/comments';
 import { recordAgentProgress } from '$lib/db/queries/agent-work';
-import { createIssueRelation, deleteIssueRelation } from '$lib/db/queries/issues';
+import { createIssueRelation, deleteIssueRelation, RelationCycleError } from '$lib/db/queries/issues';
 import type { AgentAuditDescriptor } from '$lib/server/agent-route';
 
 /**
@@ -64,23 +64,28 @@ const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => 
 
 	const validatedResolvedInVersion = validateResolvedInVersion(body.resolved_in_version);
 
-	const notified = await updateIssueStatus(
+	// A05-status: `changed:false` means updateIssueStatus recognized this as an exact retry of the
+	// already-applied status (same status AND same resolved_in_version) -- no activity row, no
+	// notification. Notification emails are only ever sent on the `changed:true` path.
+	const { changed, notified } = await updateIssueStatus(
 		issue.issueId,
 		status,
 		validatedResolvedInVersion ?? undefined,
 		'agent',
 		ctx.agentId
 	);
-	await sendIssueNotificationEmails(notified, { issueId: issue.issueId, origin: originUrl });
+	if (changed) {
+		await sendIssueNotificationEmails(notified, { issueId: issue.issueId, origin: originUrl });
+	}
 
 	return {
 		status: 200,
-		body: { success: true, status },
+		body: { success: true, status, changed },
 		audit: {
 			action: 'agent.issue.status_changed',
 			resourceType: 'issue',
 			resourceId: issue.issueId,
-			metadata: { status, resolvedInVersion: validatedResolvedInVersion ?? undefined },
+			metadata: { status, resolvedInVersion: validatedResolvedInVersion ?? undefined, changed },
 		},
 	};
 };
@@ -242,6 +247,9 @@ const issuesRelationsAdd: AgentOpHandler = async (ctx, issueId, params, originUr
 			},
 		};
 	} catch (err) {
+		if (err instanceof RelationCycleError) {
+			throw error(409, err.message);
+		}
 		if (isUniqueViolation(err)) {
 			throw error(409, 'This relation already exists');
 		}

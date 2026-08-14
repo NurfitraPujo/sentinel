@@ -2,6 +2,7 @@ import { db } from '$lib/server/db';
 import { issues, projects, manualIssueReports, issueActivity } from '$lib/db/schema';
 import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
 
 /**
  * Manual Issues M5 stage 2 (design §7 step 1): `GET /api/agent/issues` -- the one deliberate
@@ -200,6 +201,27 @@ export async function recordAgentProgress(
 	messageMd: string
 ): Promise<{ notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
+		// A05-comment/progress (N7d): dedupe a retried progress post by natural key (same
+		// issue+agent+message within AGENT_DEDUPE_WINDOW_MS) -- mirrors createComment's plain-comment
+		// dedupe. `newValue` is jsonb; `->>'messageMd'` does a text comparison against the stored key.
+		const recentDuplicates = await tx
+			.select({ id: issueActivity.id })
+			.from(issueActivity)
+			.where(
+				and(
+					eq(issueActivity.issueId, issueId),
+					eq(issueActivity.eventType, 'progress_update'),
+					eq(issueActivity.actorType, 'agent'),
+					eq(issueActivity.actorId, agentId),
+					sql`${issueActivity.newValue}->>'messageMd' = ${messageMd}`,
+					gte(issueActivity.createdAt, new Date(Date.now() - AGENT_DEDUPE_WINDOW_MS))
+				)
+			);
+
+		if (recentDuplicates.length > 0) {
+			return { notified: [] };
+		}
+
 		await tx.insert(issueActivity).values({
 			issueId,
 			eventType: 'progress_update',

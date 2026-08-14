@@ -35,12 +35,31 @@ export async function updateIssueStatus(
 	resolvedInVersion?: string,
 	actorType?: 'user' | 'agent',
 	actorId?: string
-): Promise<NotifiedUser[]> {
+): Promise<{ changed: boolean; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const [existing] = await tx
-			.select({ status: issues.status, waitingOn: issues.waitingOn })
+			.select({
+				status: issues.status,
+				waitingOn: issues.waitingOn,
+				resolvedInVersion: issues.resolvedInVersion,
+			})
 			.from(issues)
 			.where(eq(issues.id, issueId));
+
+		// A05-status (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): a retried PATCH .../status
+		// with the SAME status AND the same resolved_in_version is a natural no-op guard against a
+		// dropped-response retry -- it must not insert a second `status_changed` activity row or
+		// re-fire the resolved-notification email. Only `status` + `resolvedInVersion` are compared:
+		// a different actor re-sending the identical transition is still a no-op by this contract
+		// (the activity trail already has the original actor on the first, real write).
+		const normalizedResolvedInVersion = status === 'resolved' ? resolvedInVersion || null : null;
+		if (
+			existing &&
+			existing.status === status &&
+			(existing.resolvedInVersion ?? null) === normalizedResolvedInVersion
+		) {
+			return { changed: false, notified: [] };
+		}
 
 		const updateData: any = { status };
 
@@ -81,13 +100,15 @@ export async function updateIssueStatus(
 		// §8: 'resolved' gets its own notification kind (design's email-policy table lists it
 		// separately from 'status_changed'); every other status transition (including back to
 		// 'unresolved'/'ignored') is 'status_changed'.
-		return await notifyIssueEvent(tx, {
+		const notified = await notifyIssueEvent(tx, {
 			issueId,
 			kind: status === 'resolved' ? 'resolved' : 'status_changed',
 			actorType: actorType || 'system',
 			actorId: actorId || 'system',
 			payload: { status, resolvedInVersion },
 		});
+
+		return { changed: true, notified };
 	});
 }
 
@@ -230,6 +251,14 @@ export async function assignIssue(
 	});
 }
 
+// A12 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): mirrors the human relations route's
+// existing `duplicate_of` 2-cycle guard (routes/api/issues/[issueId]/relations/+server.ts:101-115)
+// but for `caused_by`, and lives in the QUERY layer so both the human route and the agent op
+// (issuesRelationsAdd -> createIssueRelation) get it uniformly instead of duplicating the check at
+// each call site. 2-cycle only (A caused_by B, then B caused_by A) -- NOT full graph-cycle
+// detection, which is out of scope (plan explicitly declines it).
+export class RelationCycleError extends Error {}
+
 export async function createIssueRelation(
 	sourceIssueId: string,
 	targetIssueId: string,
@@ -238,6 +267,23 @@ export async function createIssueRelation(
 	createdBy: string
 ): Promise<{ relation: typeof issueRelations.$inferSelect; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
+		if (relationType === 'caused_by') {
+			const reverse = await tx
+				.select({ id: issueRelations.id })
+				.from(issueRelations)
+				.where(
+					and(
+						eq(issueRelations.sourceIssueId, targetIssueId),
+						eq(issueRelations.targetIssueId, sourceIssueId),
+						eq(issueRelations.relationType, 'caused_by')
+					)
+				);
+
+			if (reverse.length > 0) {
+				throw new RelationCycleError('Reverse relation already exists (would create a cycle)');
+			}
+		}
+
 		const [relation] = await tx.insert(issueRelations).values({
 			sourceIssueId,
 			targetIssueId,

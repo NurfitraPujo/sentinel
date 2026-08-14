@@ -114,11 +114,13 @@ const updateIssueStatus = vi.fn();
 const createIssueRelation = vi.fn();
 const deleteIssueRelation = vi.fn();
 const getIssueRelations = vi.fn();
+class RelationCycleError extends Error {}
 vi.mock('$lib/db/queries/issues', () => ({
 	updateIssueStatus,
 	createIssueRelation,
 	deleteIssueRelation,
 	getIssueRelations,
+	RelationCycleError,
 }));
 
 const recordAgentProgress = vi.fn();
@@ -309,7 +311,7 @@ describe('POST/DELETE /api/agent/issues/{issueId}/claim', () => {
 
 describe('PATCH /api/agent/issues/{issueId}/status', () => {
 	it('200: matches StatusResponseSchema', async () => {
-		updateIssueStatus.mockResolvedValue([]);
+		updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
 		const res = await statusRoute.PATCH(
 			makeEvent('http://localhost/api/agent/issues/issue-1/status', {
 				method: 'PATCH',
@@ -451,6 +453,22 @@ describe('POST/DELETE /api/agent/issues/{issueId}/relations', () => {
 		).rejects.toMatchObject({ status: 409 });
 	});
 
+	// A12 (N7d): the agent op maps createIssueRelation's RelationCycleError (query-layer reverse-pair
+	// guard for caused_by) to 409, the same way the human route does (see issues.test.ts for the
+	// query-layer guard itself and relations.test.ts for the human route's mapping).
+	it('409 POST: caused_by reverse-pair cycle maps to 409', async () => {
+		createIssueRelation.mockRejectedValue(new RelationCycleError('Reverse relation already exists (would create a cycle)'));
+		await expect(
+			relationsRoute.POST(
+				makeEvent('http://localhost/api/agent/issues/issue-1/relations', {
+					method: 'POST',
+					issueId: 'issue-1',
+					body: { target_issue_id: 'issue-2', relation_type: 'caused_by' },
+				})
+			)
+		).rejects.toMatchObject({ status: 409 });
+	});
+
 	it('200 DELETE: matches RelationRemoveResponseSchema', async () => {
 		deleteIssueRelation.mockResolvedValue(RELATION_ROW);
 		const res = await relationsRoute.DELETE(
@@ -552,7 +570,7 @@ describe('POST /api/agent/uploads', () => {
 
 describe('POST /api/agent/batch', () => {
 	it('200: matches BatchResponseSchema', async () => {
-		updateIssueStatus.mockResolvedValue([]);
+		updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
 		const res = await batchRoute.POST(
 			makeEvent('http://localhost/api/agent/batch', {
 				method: 'POST',

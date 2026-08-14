@@ -83,7 +83,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'delete',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',
 		operationId: 'releaseClaim',
-		summary: "Release your own claim (no-op-safe; cannot release another agent's claim)",
+		summary:
+			"Release your own claim (idempotent: releasing an already-unclaimed issue returns 200, not 409; cannot release another agent's claim)",
 		responses: {
 			'200': S.ReleaseResponseSchema,
 			'401': S.UnauthorizedErrorSchema,
@@ -96,7 +97,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'patch',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/status/+server.ts',
 		operationId: 'updateIssueStatus',
-		summary: 'Change issue status',
+		summary:
+			'Change issue status (idempotent: retrying the same status+resolved_in_version returns changed:false, no duplicate activity/notification)',
 		request: { bodySchema: S.StatusBodySchema },
 		responses: {
 			'200': S.StatusResponseSchema,
@@ -166,7 +168,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/relations/+server.ts',
 		operationId: 'addRelation',
-		summary: 'Add a relation from this issue to another',
+		summary:
+			"Add a relation from this issue to another (409 for an exact duplicate; also 409 for caused_by if the REVERSE pair already exists -- would create a 2-cycle)",
 		request: { bodySchema: S.RelationBodySchema },
 		responses: {
 			'201': S.RelationRowSchema,

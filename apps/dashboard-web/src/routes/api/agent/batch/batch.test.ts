@@ -25,7 +25,13 @@ vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion }));
 const updateIssueStatus = vi.fn();
 const createIssueRelation = vi.fn();
 const deleteIssueRelation = vi.fn();
-vi.mock('$lib/db/queries/issues', () => ({ updateIssueStatus, createIssueRelation, deleteIssueRelation }));
+class RelationCycleError extends Error {}
+vi.mock('$lib/db/queries/issues', () => ({
+	updateIssueStatus,
+	createIssueRelation,
+	deleteIssueRelation,
+	RelationCycleError,
+}));
 
 class ClaimConflictError extends Error {}
 const claimIssue = vi.fn();
@@ -71,7 +77,7 @@ beforeEach(() => {
 		};
 	});
 	sendIssueNotificationEmails.mockResolvedValue(undefined);
-	updateIssueStatus.mockResolvedValue([]);
+	updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
 	recordAgentProgress.mockResolvedValue(undefined);
 	createComment.mockResolvedValue({ comment: { id: 'c1' }, notified: [] });
 	claimIssue.mockResolvedValue({ issue: { id: 'issue-1', assignedTo: 'agent-1' }, notified: [] });

@@ -700,7 +700,7 @@ paths:
                 additionalProperties: false
     delete:
       operationId: releaseClaim
-      summary: Release your own claim (no-op-safe; cannot release another agent's claim)
+      summary: "Release your own claim (idempotent: releasing an already-unclaimed issue returns 200, not 409; cannot release another agent's claim)"
       parameters:
         - name: issueId
           in: path
@@ -858,7 +858,7 @@ paths:
   /api/agent/issues/{issueId}/status:
     patch:
       operationId: updateIssueStatus
-      summary: Change issue status
+      summary: "Change issue status (idempotent: retrying the same status+resolved_in_version returns changed:false, no duplicate activity/notification)"
       parameters:
         - name: issueId
           in: path
@@ -901,9 +901,12 @@ paths:
                       - unresolved
                       - resolved
                       - ignored
+                  changed:
+                    type: boolean
                 required:
                   - success
                   - status
+                  - changed
                 additionalProperties: false
         "400":
           description: Bad request
@@ -1313,7 +1316,7 @@ paths:
   /api/agent/issues/{issueId}/relations:
     post:
       operationId: addRelation
-      summary: Add a relation from this issue to another
+      summary: Add a relation from this issue to another (409 for an exact duplicate; also 409 for caused_by if the REVERSE pair already exists -- would create a 2-cycle)
       parameters:
         - name: issueId
           in: path

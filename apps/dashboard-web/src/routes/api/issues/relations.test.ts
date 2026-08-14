@@ -40,9 +40,11 @@ vi.mock('$lib/db/schema', () => ({
 	},
 }));
 
+class RelationCycleError extends Error {}
 const issueQueries = {
 	createIssueRelation: vi.fn(),
 	deleteIssueRelation: vi.fn(),
+	RelationCycleError,
 };
 vi.mock('$lib/db/queries/issues', () => issueQueries);
 
@@ -136,6 +138,29 @@ describe('POST /api/issues/:id/relations', () => {
 			POST({
 				params: { issueId: 'issue-1' },
 				request: postRequest({ targetIssueId: 'issue-2', relationType: 'duplicate_of' }),
+				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
+			} as any)
+		).rejects.toMatchObject({ status: 409 });
+	});
+
+	// A12 (N7d): createIssueRelation's query-layer reverse-pair guard for caused_by (see
+	// issues.test.ts) throws RelationCycleError; the human route must map that to 409, the same way
+	// the agent op does (contract.test.ts's "409 POST: caused_by reverse-pair cycle maps to 409").
+	it('409s a caused_by reverse-pair cycle (A caused_by B, then B caused_by A)', async () => {
+		dbMock.then
+			.mockImplementationOnce((resolve: any) => resolve([sourceRow])) // source issue+project lookup
+			.mockImplementationOnce((resolve: any) => resolve([targetRow])); // target issue+project lookup
+		// caused_by has no route-level inverse-cycle SELECT (only duplicate_of does) -- the guard
+		// lives entirely in the query layer, which is mocked here to throw directly.
+		issueQueries.createIssueRelation.mockRejectedValueOnce(
+			new RelationCycleError('Reverse relation already exists (would create a cycle)')
+		);
+
+		await expect(
+			POST({
+				params: { issueId: 'issue-1' },
+				request: postRequest({ targetIssueId: 'issue-2', relationType: 'caused_by' }),
 				locals: locals({ id: 'user-1' }),
 				url: new URL('http://x'),
 			} as any)

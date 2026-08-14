@@ -303,6 +303,34 @@ describe('releaseClaim', () => {
 		expect(serialized).toContain('assigneeType');
 	});
 
+	// A13 (N7d): a retry of an already-successful release must not surface as a conflict. This is
+	// the red-proof for the guard -- delete the re-read branch in releaseClaim (reverting to the
+	// unconditional throw on 0 rows) and this test fails, because the old code cannot tell
+	// "already released" from "never held".
+	it('release-after-release (issue is now simply unclaimed) is idempotent success: 200, no activity, no notify', async () => {
+		txMock.returning = vi.fn(() => Promise.resolve([])); // conditional UPDATE matched 0 rows
+		// The re-read (a plain select, awaited via `.then`) finds the issue unclaimed by anyone.
+		txMock.then = vi.fn((resolve: any) => resolve([{ id: 'issue-1', assignedTo: null, assigneeType: null }]));
+
+		const { issue, notified } = await releaseClaim('issue-1', 'agent-1', { actorType: 'agent' });
+
+		expect(issue).toEqual({ id: 'issue-1', assignedTo: null, assigneeType: null });
+		expect(notified).toEqual([]);
+		expect(txMock.insert).not.toHaveBeenCalled();
+	});
+
+	// A13: the flip side -- the issue is claimed by SOMEONE ELSE now, which is a real conflict, not
+	// a self-retry. Must still 409.
+	it('release when the issue is now claimed by a different actor still throws ClaimConflictError', async () => {
+		txMock.returning = vi.fn(() => Promise.resolve([]));
+		txMock.then = vi.fn((resolve: any) => resolve([{ id: 'issue-1', assignedTo: 'agent-2', assigneeType: 'agent' }]));
+
+		await expect(releaseClaim('issue-1', 'agent-1', { actorType: 'agent' })).rejects.toBeInstanceOf(
+			ClaimConflictError
+		);
+		expect(txMock.insert).not.toHaveBeenCalled();
+	});
+
 	it('force release succeeds, writes a claim_released activity row, and fans out a "claimed" notification with released:true', async () => {
 		txMock.returning = vi.fn(() => Promise.resolve([{ id: 'issue-1', assignedTo: null }]));
 		// One dummy for releaseClaim's own issue_activity insert, then listSubscribers, then R1's

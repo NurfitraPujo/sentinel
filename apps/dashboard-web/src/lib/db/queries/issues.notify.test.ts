@@ -106,7 +106,7 @@ describe('updateIssueStatus', () => {
 			3
 		);
 
-		const notified = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'user', 'actor-1');
+		const { notified } = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'user', 'actor-1');
 
 		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'resolved' }]);
 	});
@@ -114,7 +114,7 @@ describe('updateIssueStatus', () => {
 	it('fans out kind "status_changed" for a non-resolved transition', async () => {
 		queueSubscribersThenMembers([{ subscriberType: 'user', subscriberId: 'reporter-1' }], ['reporter-1'], 3);
 
-		const notified = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
+		const { notified } = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
 
 		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'status_changed' }]);
 	});
@@ -129,7 +129,7 @@ describe('updateIssueStatus', () => {
 			3
 		);
 
-		const notified = await updateIssueStatus('issue-1', 'unresolved', undefined, 'agent', 'agent-2');
+		const { notified } = await updateIssueStatus('issue-1', 'unresolved', undefined, 'agent', 'agent-2');
 
 		expect(notified).toEqual([{ userId: 'user-1', kind: 'status_changed' }]);
 	});
@@ -146,7 +146,7 @@ describe('updateIssueStatus', () => {
 			3
 		);
 
-		const notified = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
+		const { notified } = await updateIssueStatus('issue-1', 'ignored', undefined, 'user', 'actor-1');
 
 		expect(notified).toEqual([{ userId: 'reporter-1', kind: 'status_changed' }]);
 	});

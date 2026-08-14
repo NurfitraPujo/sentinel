@@ -195,8 +195,16 @@ export const StatusBodySchema = z
 	})
 	.strict();
 
+// N7d (A05-status): `changed` is additive -- `false` means this call was recognized as an exact
+// retry of the already-applied status (same status AND same resolved_in_version): no new
+// issue_activity row, no notification email. `true` is the normal, real-transition path
+// (unchanged from before this field existed).
 export const StatusResponseSchema = z
-	.object({ success: z.literal(true), status: z.enum(['unresolved', 'resolved', 'ignored']) })
+	.object({
+		success: z.literal(true),
+		status: z.enum(['unresolved', 'resolved', 'ignored']),
+		changed: z.boolean(),
+	})
 	.strict();
 
 // ---------------------------------------------------------------------------

@@ -63,6 +63,11 @@ describe('PATCH /api/issues/:id/status', () => {
 		dbMock.where.mockReturnValue(dbMock);
 		dbMock.then.mockReset();
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
+		// N7d (A05-status): updateIssueStatus now returns `{changed, notified}` instead of a bare
+		// notified array -- default every test to the "changed" shape so the route's destructure
+		// (`const {changed, notified} = await updateIssueStatus(...)`) doesn't blow up on tests that
+		// don't care about the return value at all.
+		issueQueries.updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
 	});
 
 	it('401s when there is no session', async () => {
@@ -141,7 +146,7 @@ describe('PATCH /api/issues/:id/status', () => {
 			.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
 			.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])); // org role, no project query
 
-		issueQueries.updateIssueStatus.mockResolvedValueOnce([]);
+		issueQueries.updateIssueStatus.mockResolvedValueOnce({ changed: true, notified: [] });
 
 		await PATCH({
 			params: { issueId: 'issue-1' },

@@ -719,6 +719,17 @@ export async function releaseClaim(
 			.returning();
 
 		if (updated.length === 0) {
+			// A13 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): 0 rows updated used to always
+			// mean ClaimConflictError, which made a plain network retry of a SUCCESSFUL release
+			// (response dropped, agent retries) wire-indistinguishable from someone else actually
+			// holding the issue. Re-read to tell the two apart: if the issue is simply unclaimed now
+			// (by anyone), the release already happened -- idempotent success, no second activity row,
+			// no second notification. Only "claimed by someone/something else" (or force's target row
+			// having vanished entirely) is a real conflict.
+			const [current] = await tx.select().from(issues).where(eq(issues.id, issueId));
+			if (current && current.assignedTo === null) {
+				return { issue: current, notified: [] };
+			}
 			throw new ClaimConflictError('Issue is not claimed by this actor');
 		}
 

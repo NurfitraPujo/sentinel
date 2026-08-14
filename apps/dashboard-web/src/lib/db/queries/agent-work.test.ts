@@ -224,4 +224,16 @@ describe('recordAgentProgress', () => {
 			expect.objectContaining({ issueId: 'issue-1', kind: 'progress_update', actorType: 'agent', actorId: 'agent-1' })
 		);
 	});
+
+	// A05-comment/progress (N7d) guard-deletion red-proof: delete the dedupe SELECT/early-return in
+	// recordAgentProgress and this fails, because a second insert/notify would fire.
+	it('an identical retry within the dedupe window inserts nothing and does not notify', async () => {
+		txMock.__result = [{ id: 'activity-1' }]; // dedupe SELECT finds a matching recent row
+
+		const { notified } = await recordAgentProgress('issue-1', 'agent-1', 'still investigating');
+
+		expect(notified).toEqual([]);
+		expect(txMock.insert).not.toHaveBeenCalled();
+		expect(notifyIssueEvent).not.toHaveBeenCalled();
+	});
 });

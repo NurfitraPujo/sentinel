@@ -1,11 +1,12 @@
 import { db } from '$lib/server/db';
 import { issues, issueActivity, issueComments, attachments, users, projects } from '$lib/db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, and, desc, gte, inArray } from 'drizzle-orm';
 import { claimDraftAttachmentsForComment } from './reports';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
 
 /**
  * Manual Issues M3 (docs/plans/MANUAL_ISSUES_DESIGN.md §5, plus the comment-attachment paths
@@ -104,6 +105,34 @@ export async function createComment(
 			}
 
 			resolvedParentId = parent.parentId ?? parent.id;
+		}
+
+		// A05-comment (N7d): dedupe a plain-comment retry (dropped response, agent resends the
+		// identical request) by natural key -- same issue+author+body within AGENT_DEDUPE_WINDOW_MS.
+		// Deliberately NOT applied to blocking questions: a question's `waiting_on` side effect must
+		// be predictable (a caller always gets a definite "this question is now live" signal), and
+		// silently reusing an older row here could mask whether the CURRENT `waiting_on` state
+		// actually reflects this call. Plain comments have no such side effect to protect, so
+		// swallowing a rare identical-repost is the safer trade there (documented risk, N7d plan).
+		if (!input.blocking) {
+			const recentDuplicates = await tx
+				.select()
+				.from(issueComments)
+				.where(
+					and(
+						eq(issueComments.issueId, input.issueId),
+						eq(issueComments.authorType, input.authorType),
+						eq(issueComments.authorId, input.authorId),
+						eq(issueComments.bodyMd, bodyMd),
+						gte(issueComments.createdAt, new Date(Date.now() - AGENT_DEDUPE_WINDOW_MS))
+					)
+				)
+				.orderBy(desc(issueComments.createdAt));
+
+			const existing = recentDuplicates[0];
+			if (existing) {
+				return { comment: existing, notified: [] };
+			}
 		}
 
 		const [comment] = await tx

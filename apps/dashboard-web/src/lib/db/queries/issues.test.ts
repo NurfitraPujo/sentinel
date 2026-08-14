@@ -42,7 +42,8 @@ const notifyIssueEventMock = vi.fn(async () => []);
 vi.mock('$lib/server/notify', () => ({ notifyIssueEvent: notifyIssueEventMock }));
 
 // Top-level await import, as alerts.test.ts does, to dodge vi.mock hoisting/TDZ.
-const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISSUE_IDS } = await import('./issues');
+const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISSUE_IDS, RelationCycleError } =
+	await import('./issues');
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -104,8 +105,9 @@ describe('updateIssueStatus actor typing (M5 §7 step 6)', () => {
 	it('records actorType="agent" and resolvedByType="agent" when an agent resolves an issue', async () => {
 		txMock.__result = [{ status: 'unresolved' }];
 
-		await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'agent', 'agent-1');
+		const result = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'agent', 'agent-1');
 
+		expect(result.changed).toBe(true);
 		expect(txMock.set).toHaveBeenCalledWith(
 			expect.objectContaining({ resolvedByType: 'agent', resolvedBy: 'agent-1' })
 		);
@@ -116,6 +118,31 @@ describe('updateIssueStatus actor typing (M5 §7 step 6)', () => {
 			txMock,
 			expect.objectContaining({ kind: 'resolved', actorType: 'agent', actorId: 'agent-1' })
 		);
+	});
+});
+
+describe('updateIssueStatus retry no-op (A05-status, N7d)', () => {
+	// Guard-deletion red-proof: delete the unchanged-check in updateIssueStatus (revert to the old
+	// unconditional write) and this fails, because txMock.insert/notifyIssueEventMock would then be
+	// called on the second, identical call.
+	it('a retried PATCH with the SAME status and resolved_in_version writes zero new activity rows and does not notify', async () => {
+		txMock.__result = [{ status: 'resolved', resolvedInVersion: '1.2.3' }];
+
+		const result = await updateIssueStatus('issue-1', 'resolved', '1.2.3', 'agent', 'agent-1');
+
+		expect(result).toEqual({ changed: false, notified: [] });
+		expect(txMock.update).not.toHaveBeenCalled();
+		expect(txMock.insert).not.toHaveBeenCalled();
+		expect(notifyIssueEventMock).not.toHaveBeenCalled();
+	});
+
+	it('treats a retry with a DIFFERENT resolved_in_version as a real change', async () => {
+		txMock.__result = [{ status: 'resolved', resolvedInVersion: '1.2.3' }];
+
+		const result = await updateIssueStatus('issue-1', 'resolved', '1.3.0', 'agent', 'agent-1');
+
+		expect(result.changed).toBe(true);
+		expect(txMock.insert).toHaveBeenCalled();
 	});
 });
 
@@ -136,5 +163,36 @@ describe('createIssueRelation actor typing (M5 §7 step 3)', () => {
 			txMock,
 			expect.objectContaining({ kind: 'linked', actorType: 'agent', actorId: 'agent-1' })
 		);
+	});
+});
+
+describe('createIssueRelation reverse-pair cycle guard (A12, N7d)', () => {
+	// Guard-deletion red-proof: delete the reverse-pair SELECT in createIssueRelation and this
+	// fails, because the insert would proceed instead of throwing.
+	it('rejects caused_by when the reverse pair (target->source) already exists', async () => {
+		// The reverse-pair SELECT is the only query issued before the insert would run; __result
+		// stands in for its resolved rows here (a non-empty array = the reverse relation exists).
+		txMock.__result = [{ id: 'existing-reverse-rel' }];
+
+		await expect(
+			createIssueRelation('issue-a', 'issue-b', 'caused_by', 'agent', 'agent-1')
+		).rejects.toBeInstanceOf(RelationCycleError);
+
+		expect(txMock.insert).not.toHaveBeenCalled();
+	});
+
+	it('allows caused_by when no reverse pair exists', async () => {
+		// First resolved chain (the reverse-pair SELECT) returns nothing; the second/insert path
+		// below re-seeds __result for the insert...returning() the same shared-chain way the actor
+		// typing test above does.
+		txMock.__result = [];
+		txMock.then = vi
+			.fn()
+			.mockImplementationOnce((resolve: any) => resolve([])) // reverse-pair select: none found
+			.mockImplementation((resolve: any) => resolve([{ id: 'rel-1' }])); // insert...returning() etc.
+
+		const { relation } = await createIssueRelation('issue-a', 'issue-b', 'caused_by', 'agent', 'agent-1');
+
+		expect(relation).toEqual({ id: 'rel-1' });
 	});
 });

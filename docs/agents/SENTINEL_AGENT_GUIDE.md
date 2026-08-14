@@ -138,7 +138,12 @@ Claiming is how you signal "I'm working on this" and stops other agents from dou
   owner/admin-only through the session-authenticated UI).
 - `DELETE /api/agent/issues/:id/claim` — releases **your own** claim only. The underlying query's
   `WHERE assigned_to = <your agentId>` (sourced from your credential, never a request param) is
-  what enforces this; you cannot release someone else's claim by any means.
+  what enforces this; you cannot release someone else's claim by any means. **Idempotent as of
+  N7d**: if the conditional UPDATE matches zero rows, the server re-checks — an issue that is now
+  simply unclaimed (by anyone) means your release already succeeded on an earlier attempt whose
+  response you never saw, and this call returns 200 with the current issue, no new activity row,
+  no notification. Only a REAL conflict (the issue is claimed by a different agent/user now) still
+  409s. This means a plain retry-on-timeout of a release call is always safe to resend.
 - Release when you're done, or when you're blocked and waiting (see §6) so another agent — or a
   human — can pick it up if you never come back.
 
@@ -244,9 +249,42 @@ DELETE /api/agent/issues/:id/relations   { "target_issue_id": "...", "relation_t
 - Both the source and target issue must resolve within your own organization.
 - Self-relation (`target_issue_id === issueId`) is rejected with 400.
 - A duplicate relation (same source/target/type already exists) is rejected with 409.
+- **Cycle rule (`caused_by`, N7d):** if the REVERSE pair already exists — you already have
+  `B caused_by A` and you POST `A caused_by B` — this is rejected with 409
+  ("Reverse relation already exists (would create a cycle)"), the same way `duplicate_of` has
+  always rejected its own reverse pair. This is a **2-cycle guard only**: it catches the direct
+  A→B/B→A case, not longer cycles through a third issue (A→B→C→A) — there is no full graph-cycle
+  detection. `linked_to` has no such guard (it's symmetric-ish by design).
 - `DELETE` identifies the relation to remove **by `{target_issue_id, relation_type}`**, the same
   way `POST` identifies one to create — there is no relation-id-based delete. 404 if no such
   relation exists.
+
+## 8a. Idempotency and retry semantics (N7d)
+
+An unattended agent's standard retry policy — resend on a dropped response, a timeout, a network
+blip — will produce genuine duplicate requests. As of N7d, the mutation endpoints below have
+natural, built-in guards against the most common shapes of that, so you generally do **not** need
+your own client-side idempotency key or dedupe layer for these:
+
+| Endpoint | Retry-safe how |
+|---|---|
+| `PATCH /api/agent/issues/:id/status` | An exact retry (same `status` **and** the same `resolved_in_version`) is recognized as a no-op: no second `status_changed` activity row, no repeat notification email. The response gains a `changed` field — `false` on the no-op path, `true` when a real transition happened — so you can tell the two apart if you care. A retry with a *different* `resolved_in_version` is treated as a real change, not a no-op. |
+| `POST /api/agent/issues/:id/comments` (plain, non-blocking only) | An identical retry (same issue, same author, same `body_md`, within a short window) returns the existing comment instead of inserting a duplicate. **Blocking questions (`POST .../questions`) are deliberately excluded from this** — a question's `waiting_on` side effect must be predictable on every call, so it is never silently skipped. |
+| `POST /api/agent/issues/:id/progress` | Same natural-key dedupe as plain comments (same issue, same agent, same `message_md`, within the window). |
+| `DELETE /api/agent/issues/:id/claim` | See §4 — releasing an already-unclaimed issue is 200, not 409. |
+
+The comment/progress dedupe window is a fixed, short duration (2 minutes) measured from the
+original insert. This means a **deliberate** identical re-post — you genuinely want to say
+"Investigating." twice in quick succession — can get silently absorbed into the first one. This is
+a known, accepted trade-off (documented in the plan as a risk, not treated as a bug): if you need a
+second, distinguishable entry close together, vary the wording slightly, or wait for the window to
+pass.
+
+None of this applies across a **process restart with no memory of what you already sent** — these
+guards protect against a retry of a request you just made, not against re-deriving the same action
+independently after forgetting you already did it. For that, poll the issue's current state
+(`GET /api/agent/issues/:id`, `GET /api/agent/issues/:id/comments`) before re-acting rather than
+assuming.
 
 ## 9. Batch endpoint
 
