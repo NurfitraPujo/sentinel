@@ -1,0 +1,476 @@
+openapi: 3.1.0
+info:
+  title: Sentinel Agent API
+  version: "1.0.0"
+  description: >
+    Informative OpenAPI description of Sentinel's /api/agent/* surface, for tooling that wants a
+    machine-readable schema. It is NOT the source of truth: docs/agents/SENTINEL_AGENT_GUIDE.md is
+    authoritative, and this file is generated to match it. Every path/param/field here is verified
+    against the route handlers under apps/dashboard-web/src/routes/api/agent/**. If the two ever
+    disagree, trust the guide and the source.
+servers:
+  - url: https://{host}
+    variables:
+      host:
+        default: sentinel.example.com
+security:
+  - agentKey: []
+components:
+  securitySchemes:
+    agentKey:
+      type: http
+      scheme: bearer
+      bearerFormat: sent_agent_<64 lowercase hex chars>
+      description: >
+        Org-scoped agent key. project_api_keys.scope='agent', linked to one agent, one
+        organization. organizationId is always derived from this credential server-side, never
+        from any request parameter.
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
+    Issue:
+      type: object
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        fingerprint: { type: string }
+        message: { type: string }
+        errorClass: { type: string }
+        status: { type: string, enum: [unresolved, resolved, ignored] }
+        regressionStatus: { type: string }
+        issueType: { type: string, enum: [user_report, system_error] }
+        sourceChannel: { type: string }
+        assigneeType: { type: [string, "null"] }
+        assignedTo: { type: [string, "null"] }
+        resolvedInVersion: { type: [string, "null"] }
+        resolvedAt: { type: [string, "null"], format: date-time }
+        resolvedByType: { type: [string, "null"] }
+        resolvedBy: { type: [string, "null"] }
+        regressionCount: { type: integer }
+        lastRegressedAt: { type: [string, "null"], format: date-time }
+        firstSeen: { type: [string, "null"], format: date-time }
+        lastSeen: { type: [string, "null"], format: date-time }
+        count: { type: integer }
+        waitingOn: { type: [string, "null"], enum: [reporter, team, null] }
+    IssueDetail:
+      type: object
+      properties:
+        issue: { $ref: "#/components/schemas/Issue" }
+        report:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                bodyMd: { type: string }
+                severity: { type: string }
+                reporterId: { type: [string, "null"] }
+        latestOccurrence:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Occurrence"
+        relations:
+          type: array
+          items: { type: object }
+    Occurrence:
+      type: object
+      properties:
+        id: { type: string }
+        environment: { type: string }
+        platform: { type: string }
+        releaseVersion: { type: [string, "null"] }
+        stacktrace: {}
+        metadata: {}
+        traceId: { type: [string, "null"] }
+        createdAt: { type: [string, "null"], format: date-time }
+    Comment:
+      type: object
+      properties:
+        id: { type: string }
+        issueId: { type: string }
+        authorType: { type: string, enum: [user, agent] }
+        authorId: { type: string }
+        bodyMd: { type: string }
+        blocking: { type: boolean }
+        waitingOnAudience: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+    Project:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        isInbox: { type: boolean }
+    EventTypeEnum:
+      type: string
+      enum:
+        - status_changed
+        - assigned
+        - unassigned
+        - regressed
+        - ai_analysis
+        - linked
+        - commented
+        - claimed
+        - claim_released
+        - progress_update
+        - question_asked
+        - question_answered
+        - moved
+        - attachment_added
+        - report_edited
+        - report_created
+    ActivityEvent:
+      type: object
+      properties:
+        seq: { type: integer }
+        eventType: { $ref: "#/components/schemas/EventTypeEnum" }
+        actorType: { type: string, enum: [user, agent, system] }
+        actorId: { type: string }
+        oldValue: {}
+        newValue: {}
+        createdAt: { type: [string, "null"], format: date-time }
+        issue:
+          type: object
+          properties:
+            id: { type: string }
+            title: { type: string }
+            status: { type: string }
+            issueType: { type: string }
+            projectId: { type: string }
+    EventsPage:
+      type: object
+      properties:
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/ActivityEvent" }
+        cursor: { type: integer }
+        hasMore: { type: boolean }
+    BatchOperation:
+      type: object
+      required: [op, issueId]
+      properties:
+        op:
+          type: string
+          enum:
+            - issues.status
+            - issues.claim
+            - issues.claim.release
+            - issues.comment
+            - issues.progress
+            - issues.relations.add
+            - issues.relations.remove
+        issueId: { type: string }
+        params: { type: object }
+    BatchRequest:
+      type: object
+      required: [operations]
+      properties:
+        operations:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { $ref: "#/components/schemas/BatchOperation" }
+        stopOnError:
+          type: boolean
+          default: true
+    BatchResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        status: { type: integer }
+        result: {}
+        error: { type: string }
+        skipped: { type: boolean }
+    BatchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/BatchResult" }
+        completed: { type: integer }
+  parameters:
+    issueId:
+      name: issueId
+      in: path
+      required: true
+      schema: { type: string }
+paths:
+  /api/agent/issues:
+    get:
+      summary: List issues in the calling key's organization
+      parameters:
+        - name: type
+          in: query
+          schema: { type: string, enum: [any, user_report, system_error] }
+        - name: claimed
+          in: query
+          schema: { type: string, enum: ["true", "false"] }
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: waiting
+          in: query
+          schema: { type: string, enum: ["true", "false"] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issues:
+                    type: array
+                    items: { $ref: "#/components/schemas/Issue" }
+        "400": { description: Invalid query param, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { description: Unauthorized }
+  /api/agent/issues/{issueId}:
+    get:
+      summary: Full issue detail (spans user_report and system_error)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssueDetail" }
+        "404": { description: Not found }
+  /api/agent/issues/{issueId}/occurrences:
+    get:
+      summary: Newest-first page of occurrences (system_error issues)
+      parameters:
+        - { $ref: "#/components/parameters/issueId" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: before
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  occurrences:
+                    type: array
+                    items: { $ref: "#/components/schemas/Occurrence" }
+  /api/agent/issues/{issueId}/claim:
+    post:
+      summary: Atomically claim an issue
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      responses:
+        "200": { description: Claimed (or already claimed by you) }
+        "409": { description: Claimed by another agent }
+    delete:
+      summary: Release your own claim (no-op-safe; cannot release another agent's claim)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      responses:
+        "200": { description: Released }
+        "409": { description: Not currently claimed by you }
+  /api/agent/issues/{issueId}/status:
+    patch:
+      summary: Change issue status
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [unresolved, resolved, ignored] }
+                resolved_in_version: { type: string }
+      responses:
+        "200": { description: Updated }
+        "400": { description: Invalid status }
+  /api/agent/issues/{issueId}/comments:
+    get:
+      summary: Poll comments (e.g. to see answers to a blocking question)
+      parameters:
+        - { $ref: "#/components/parameters/issueId" }
+        - name: after
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comments:
+                    type: array
+                    items: { $ref: "#/components/schemas/Comment" }
+    post:
+      summary: Post a non-blocking comment (emails subscribers)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body_md]
+              properties:
+                body_md: { type: string }
+                attachment_ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment: { $ref: "#/components/schemas/Comment" }
+  /api/agent/issues/{issueId}/questions:
+    post:
+      summary: Ask a blocking question (sets waiting_on, forces an immediate email)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body_md, audience]
+              properties:
+                body_md: { type: string }
+                audience: { type: string, enum: [reporter, team] }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment: { $ref: "#/components/schemas/Comment" }
+  /api/agent/issues/{issueId}/progress:
+    post:
+      summary: Post an in-app-only progress update (no email)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_md]
+              properties:
+                message_md: { type: string }
+      responses:
+        "201": { description: Recorded }
+  /api/agent/issues/{issueId}/relations:
+    post:
+      summary: Add a relation from this issue to another
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_issue_id, relation_type]
+              properties:
+                target_issue_id: { type: string }
+                relation_type: { type: string, enum: [linked_to, caused_by, duplicate_of] }
+      responses:
+        "201": { description: Created }
+        "409": { description: Relation already exists }
+    delete:
+      summary: Remove a relation, identified by (target_issue_id, relation_type)
+      parameters: [ { $ref: "#/components/parameters/issueId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_issue_id, relation_type]
+              properties:
+                target_issue_id: { type: string }
+                relation_type: { type: string, enum: [linked_to, caused_by, duplicate_of] }
+      responses:
+        "200": { description: Removed }
+        "404": { description: Relation not found }
+  /api/agent/projects:
+    get:
+      summary: List the calling key's organization's projects
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items: { $ref: "#/components/schemas/Project" }
+  /api/agent/events:
+    get:
+      summary: Seq-cursored org activity feed (at-least-once, ~2s lag guard)
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: type
+          in: query
+          schema: { type: string }
+          description: Comma-separated EventTypeEnum values
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: claimed
+          in: query
+          schema: { type: string, enum: [me] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventsPage" }
+  /api/agent/uploads:
+    post:
+      summary: Upload an attachment (multipart; not associated with an issue until referenced in a comment)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                filename: { type: string }
+      responses:
+        "201": { description: Created }
+  /api/agent/batch:
+    post:
+      summary: Run up to 20 mutations sequentially in one HTTP round trip
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BatchRequest" }
+      responses:
+        "200":
+          description: >
+            Always 200 if the envelope is well-formed and auth succeeds. Check each
+            results[i].ok — batch has no all-or-nothing guarantee (see the guide, §9).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchResponse" }
