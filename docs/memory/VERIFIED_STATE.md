@@ -1731,6 +1731,57 @@ Postgres+MinIO) proving presign→direct PUT→finalize→ready→claim, the pen
 
 ---
 
+## Agent-native layer (N1–N5) VERIFIED 2026-08-14 (branch `feat/agent-native`, pre-merge)
+
+Provider-agnostic continuous-automation layer on top of the M5 `/api/agent/*` surface
+(plan: `~/.claude/plans/calm-cooking-waterfall.md`; commits `bb94cce`..`c7e16ff`):
+
+- **N1**: `issue_activity.seq` (bigint `GENERATED ALWAYS AS IDENTITY`, migration `1723200000`) +
+  `agent_webhooks` (migration `1723300000`, **secret stored plaintext by design** — the server must
+  SIGN outbound HMAC, unlike API keys which only verify hashes); `GET /api/agent/events`
+  (org-scoped seq cursor, **2s created_at lag guard** against identity commit-order inversion,
+  at-least-once/dedupe-by-seq contract); agent reads: issue detail (report | latestOccurrence
+  branch), occurrences, projects.
+- **N2**: `$lib/server/agent-ops.ts` 7-op registry extracted verbatim from the single routes (now
+  thin `agentOpRoute()` wrappers); `POST /api/agent/batch` — ≤20 sequential ops, per-op status in a
+  200 envelope, `stopOnError`+skipped reporting, NO outer transaction (deliberate: identical to N
+  sequential calls), one rate-limit charge per batch.
+- **N3**: webhook registration CRUD (RBAC `manage_agents`, secret shown once, SSRF URL validator —
+  bypass attempts `0177.0.0.1`/`127.1`/`::ffff:127.0.0.1`/hex/decimal all rejected) + processor-go
+  outbox dispatcher (`apps/processor-go/webhooks/`): payload field-for-field identical to the events
+  feed (B5-checked), `X-Sentinel-Signature: t=<unix>,v1=hmac-sha256(secret, t + "." + body)`
+  (byte-identical to an external oracle), CAS cursor advance (`WHERE last_delivered_seq=$old`),
+  auto-`failed` after 20 consecutive failures, **gated OFF** (`WEBHOOK_DISPATCH_ENABLED=false`).
+- **N4**: `tools/sentinel-cli` — independent Go module (stdlib-only, NOT in go.work, own CI job with
+  `GOWORK=off`); commands 1:1 with the API; `events --follow` NDJSON with persisted cursor; exit
+  code 5 = claim 409. Contract cross-checked against every route file: zero breaking mismatches
+  (4 documented server-wins notes in code).
+- **N5**: `docs/agents/SENTINEL_AGENT_GUIDE.md` (canonical, every claim verified against handlers;
+  worked HMAC example recomputed independently), `openapi.agent.yaml`,
+  `.agents/skills/sentinel-agent/SKILL.md` (canonical provider-neutral skill) + `.claude` shim,
+  runnable examples.
+- **N6** (`6d8e2ae`, verified 2026-08-14): `openapi.agent.yaml` is now **GENERATED** from zod
+  schemas + a route registry in `src/lib/server/agent-api-spec/` (`pnpm openapi:agent`,
+  deterministic — double-generate byte-identical). Never hand-edit the YAML. Three gates run inside
+  the normal `pnpm test` (already CI-enforced): drift (in-memory generate vs committed YAML),
+  completeness (walks `+server.ts` exports, exact bidirectional path+method equality with the
+  registry), contract (real handlers' responses parsed under `.strict()` schemas). All three
+  red-proven by mutation (schema edit / fake route / deleted schema field), then green. Adding or
+  changing an agent route now FAILS CI until `agent-api-spec/` and the regenerated YAML follow.
+
+Proved by running, 2026-08-14 (each phase adversarially validated by re-running gates, not by
+reading): dashboard `pnpm build`/`check`/`test --sequence.shuffle` green throughout (637 passed at
+N3; the sole recurring failure is the **pre-existing** `notifications.flow.integration.test.ts` 5s
+timeout under 78-file parallel load — proven pre-existing by failing identically with the change
+stashed and passing in isolation); root `go build`/`vet` clean, `go test ./apps/processor-go/...
+./tests/unit/...` 324 passed; migrations replayed 3× across ledgers on disposable postgres:15;
+guard-deletion checks red-then-green on the B7/cursor/SSRF tests; full-stack
+`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/ -count=1` — **79 passed / 0 failed / 0 skipped**
+(76 prior + U37 events-ordering/org-isolation/batch, which create all their own state and assert a
+second org's credential sees nothing).
+
+---
+
 ## Keep here
 
 - Observed runtime/build behavior with the command that produced it.

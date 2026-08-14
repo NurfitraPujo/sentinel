@@ -5,6 +5,30 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-08-14 - Agent-native layer (events feed, webhooks, batch, sentinel CLI) — provider-agnostic
+
+- **Why durable**: Sentinel is now operable by ANY external AI agent (Claude/GPT/Gemini/scripts)
+  end-to-end: discover work via `GET /api/agent/events` (seq cursor over `issue_activity`), read
+  occurrences/reports, claim/comment/status/link/question, compose ops via `POST /api/agent/batch`,
+  receive pushes via HMAC-signed webhooks, all through the org-scoped Bearer surface. Canonical
+  docs live in `docs/agents/SENTINEL_AGENT_GUIDE.md` + `.agents/skills/sentinel-agent/SKILL.md`
+  (`.claude` shim points there). Details + proofs: VERIFIED_STATE.md "Agent-native layer (N1–N5)".
+- **Future mistakes prevented**:
+  - `issue_activity.seq` is an IDENTITY column: gaps and brief commit-order inversion are normal.
+    Every consumer (feed, dispatcher) MUST keep the 2s `created_at` lag guard; removing it silently
+    loses events to cursor advancement. Contract is at-least-once; consumers dedupe by seq.
+  - `agent_webhooks.secret` is plaintext BY DESIGN (server signs outbound HMAC); do not "fix" it to
+    a hash — that breaks signing. Signature: `t=<unix>,v1=hmac-sha256(secret, t + "." + body)`.
+  - Webhook cursor advance is CAS (`WHERE last_delivered_seq=$old`) so replicated processors never
+    double-deliver; failure paths must never advance the cursor.
+  - The dispatcher payload must stay field-for-field identical to `queries/events.ts` (B5 — no
+    compiler crosses that boundary); `issues.message` maps to `issue.title`.
+  - `tools/sentinel-cli` is deliberately NOT in `go.work` (stdlib-only, own CI job, `GOWORK=off`);
+    adding it to the workspace would couple it to root-module hygiene for no benefit.
+  - Batch has NO outer transaction on purpose (partial completion == N sequential calls); wrapping
+    it in one would change claim-conflict semantics agents already rely on.
+- Dispatcher ships gated OFF (`WEBHOOK_DISPATCH_ENABLED=false`), same posture as the DLQ drainer.
+
 ### 2026-08-13 - Production deployment artifacts (Helm chart, prod compose, migration image)
 
 - **Why durable**: First production deployment surface for the repo — a Helm chart

@@ -1,4 +1,5 @@
 import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 export const organizations = pgTable('organizations', {
 	id: uuid('id').primaryKey().defaultRandom(),
@@ -116,6 +117,21 @@ export const issueActivity = pgTable('issue_activity', {
 	oldValue: jsonb('old_value'),
 	newValue: jsonb('new_value'),
 	createdAt: timestamp('created_at').defaultNow(),
+	// N1a (1723200000_add_activity_seq.sql), source of truth is that migration: GENERATED ALWAYS
+	// AS IDENTITY cursor for the agent events feed. Gaps and brief commit-order inversion are
+	// expected -- consumers apply a 2s created_at lag guard. Never set on insert; every
+	// issueActivity insert site uses an explicit column list and does not reference `seq`.
+	// NOT NULL at the database level (identity columns always are). drizzle-orm 0.30.10 predates
+	// `.generatedAlwaysAsIdentity()` (added 0.32), so there is no first-class way to mark this
+	// column "database-generated" for insert-type purposes. `.default(sql\`...\`)` below is a
+	// type-only stand-in for that: it makes drizzle treat `seq` as optional on `.values()` (every
+	// existing issueActivity insert site uses an explicit column list that omits it, and must keep
+	// compiling) without emitting anything at runtime that matters, since goose -- not
+	// drizzle-kit -- owns the real DDL. The expression itself is the accurate description of an
+	// identity column's default: `nextval` over the sequence Postgres created for it.
+	seq: bigint('seq', { mode: 'number' })
+		.notNull()
+		.default(sql`nextval(pg_get_serial_sequence('issue_activity', 'seq'))`),
 });
 
 // Manual Issues M1 (design §2, §5): a manual issue is an `issues` row (issue_type='user_report') plus
@@ -387,4 +403,28 @@ export const agents = pgTable('agents', {
 	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 }, (table) => ({
 	idxAgentsOrg: index('idx_agents_org').on(table.orgId),
+}));
+
+// N1a (AI-agent-native Sentinel), source of truth is
+// 1723300000_add_agent_webhooks.sql. `secret` is stored in plaintext (deliberate divergence from
+// project_api_keys, which only stores a hash) -- the server must SIGN outbound deliveries with the
+// raw secret, not merely verify against it, so hashing would make delivery impossible.
+// `secretPrefix` supports display/rotation UX without re-exposing the full secret. status CHECK
+// allows 'active'|'disabled'|'failed'.
+export const agentWebhooks = pgTable('agent_webhooks', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	agentId: uuid('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+	url: text('url').notNull(),
+	secret: text('secret').notNull(),
+	secretPrefix: varchar('secret_prefix', { length: 16 }).notNull(),
+	eventTypes: text('event_types').array().notNull().default([]),
+	status: varchar('status', { length: 20 }).notNull().default('active'), // 'active' | 'disabled' | 'failed'
+	lastDeliveredSeq: bigint('last_delivered_seq', { mode: 'number' }).notNull().default(0),
+	consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+	lastAttemptAt: timestamp('last_attempt_at', { withTimezone: true }),
+	lastError: text('last_error'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	idxAgentWebhooksAgent: index('idx_agent_webhooks_agent').on(table.agentId),
 }));

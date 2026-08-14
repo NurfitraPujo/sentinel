@@ -7,7 +7,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "openapi:agent": "vite-node scripts/generate-agent-openapi.ts"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.0.1",
@@ -22,7 +23,9 @@
     "svelte-check": "^4.4.8",
     "typescript": "^5.4.5",
     "vite": "^5.2.11",
-    "vitest": "^2.1.9"
+    "vite-node": "^6.0.0",
+    "vitest": "^2.1.9",
+    "yaml": "^2.9.0"
   },
   "dependencies": {
     "@auth/core": "^0.41.2",
