@@ -1,0 +1,2 @@
+# Local build artifact (`go build .` drops the binary here).
+/sentinel-cli

@@ -152,6 +152,37 @@ jobs:
         run: go test ./... -count=1
 
   # ---------------------------------------------------------------------------------------------------------
+  # sentinel-cli: independent module (tools/sentinel-cli), N4 (AI-agent-native plan). Zero dependencies on
+  # any other module in this repo and zero external deps (stdlib only), so it is not in go.work and, like
+  # go-migrations/go-sdk above, must run with GOWORK=off or the repo-root go.work (found by walking up) would
+  # pull it into the workspace build instead of testing it standalone as the independently `go install`-able
+  # module it is meant to be.
+  # ---------------------------------------------------------------------------------------------------------
+  sentinel-cli:
+    name: sentinel-cli
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    defaults:
+      run:
+        working-directory: tools/sentinel-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/sentinel-cli/go.mod
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  # ---------------------------------------------------------------------------------------------------------
   # dashboard: apps/dashboard-web (SvelteKit + Auth.js + Drizzle). All three steps below are hard-gates: `pnpm
   # check` exits non-zero on type errors (error-gating by construction), and `pnpm build` / `pnpm test` are
   # ordinary build/test commands. S2 in VERIFIED_STATE.md (the outage that made this job red) is resolved.
