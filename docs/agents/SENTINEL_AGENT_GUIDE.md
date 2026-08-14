@@ -13,6 +13,13 @@ Everything in this guide is verified against the route handlers under
 `apps/processor-go/webhooks/dispatcher.go`, and `tools/sentinel-cli/`. Where this guide and any other
 document disagree, trust this guide or the source files it cites.
 
+`docs/agents/openapi.agent.yaml` is a machine-readable OpenAPI 3.1 companion to this guide. As of N6
+it is **GENERATED** from `apps/dashboard-web/src/lib/server/agent-api-spec/` (`schemas.ts` +
+`registry.ts`) via `pnpm --dir apps/dashboard-web openapi:agent` — never hand-edit the YAML, it will
+be overwritten. `openapi-drift.test.ts` and `completeness.test.ts` (run as part of `pnpm test`) fail
+CI if the committed YAML falls out of sync with the registry, or if the registry falls out of sync
+with the actual routes under `src/routes/api/agent/**`.
+
 ---
 
 ## 1. Concepts
