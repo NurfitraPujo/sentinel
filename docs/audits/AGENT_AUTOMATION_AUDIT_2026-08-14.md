@@ -1,5 +1,33 @@
 # Agent-Automation Blocker Audit — 2026-08-14
 
+## Remediation status (N7, 2026-08-14)
+
+All findings below were addressed in branch `feat/agent-remediation`, phases N7a–f (plan:
+`docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`). Verified against `rtk git log main..HEAD
+--oneline` and the cited code, not just commit messages.
+
+| Finding | Outcome | Where |
+|---|---|---|
+| A01 (new-issue creation writes no event) | Remediated in N7a | `eafb88c` — processor `StoreEvent` writes a `created` issue_activity row on race-exact new-issue detection (`RETURNING xmax=0`) |
+| A02 (no since/pagination on issue list) | Remediated in N7b | `fd752ee` — `since`/`sort`/`limit`/keyset `cursor` added to `GET /api/agent/issues` |
+| A03 (stuck claims, no reaper) | Remediated in N7c | `fd752ee` — `issues.claimed_at` + `reapStaleClaims()` in the retention cron, `CLAIM_STALE_HOURS` (default 24) |
+| A04 (retention deletes claimed/unresolved manual issues) | Remediated in N7c | `fd752ee` — occurrence-less deletion now requires resolved/ignored AND unclaimed, plus a separate `MANUAL_ISSUE_RETENTION_DAYS` cutoff |
+| A05 (no idempotency on mutations) | Remediated in N7d | `3661d96` — exact-retry no-op on `updateIssueStatus`; natural-key dedupe on `createComment`/`recordAgentProgress` (2min window); blocking questions excluded by design |
+| A06 (IssueOutcome computed but discarded) | Remediated in N7a | `eafb88c` — `IssueOutcomeNew` now drives the `created` row instead of being discarded |
+| A07 (no in_progress status / claim visibility) | Accepted-with-docs | N7e — `claimedAt` exposed in agent list/detail + UI "agent working" badge; no new status added (deliberate — see plan) |
+| A08 (agents can't edit/delete own comments) | Remediated in N7e | `faf6f34` — `comments.edit`/`comments.delete` ops + `PATCH`/`DELETE /api/agent/issues/:id/comments/:commentId`, ownership-gated (403/404) |
+| A09 (agents can't set severity on manual issues) | Remediated in N7e | `faf6f34` — `issues.report.severity` op, `user_report`-only (400 on `system_error`) |
+| A10 (fixed-window rate limiter allows ~2x burst at boundary) | Accepted-with-docs | `faf6f34` — behavior unchanged by design; `Retry-After` now emitted accurately from `resetAt`, and the guide/DEPLOYMENT.md document the fixed-window trade-off explicitly rather than presenting it as a hard ceiling |
+| A11 (claim is advisory, no ownership re-check on mutations) | Accepted-with-docs | `faf6f34` — enforcement deliberately NOT added (would break existing human-parity mutation semantics); 409 bodies enriched with `claimedBy`/`claimedAt`, a structured `agent.mutated_claimed_issue` warn log added, and the guide's §4 states plainly that claims are advisory and must be checked, not trusted |
+| A12 (caused_by relation cycles unguarded) | Remediated in N7d | `3661d96` — reverse-pair `caused_by` insert rejected 409 (`RelationCycleError`); explicitly a 2-cycle guard only, documented as such |
+| A13 (release retry indistinguishable from real conflict) | Remediated in N7d | `3661d96` — releasing an already-unclaimed issue is now idempotent 200; only a genuine other-claimant still 409s |
+| A14 (no scripted agent/key provisioning path) | Deferred-with-runbook | `faf6f34` — no Credentials/headless auth path added (would require a new auth provider, out of scope for this phase); `DEPLOYMENT.md` gained an agent-provisioning runbook documenting the one-time human bootstrap step instead |
+| A15 (upload has no issue association at creation) | Remediated in N7f | `faf6f34` — CLI gained `upload <file> --issue <id> [--comment <text>]` one-shot (upload + attach via comment in one call); the old two-positional form is kept but deprecated with a warning; server-side `POST /api/agent/uploads` itself still takes no `issueId` (unchanged, documented) |
+| R1 (refuted: no whoami endpoint; no self-service key rotation) | Remediated in N7f | `faf6f34` — `GET /api/agent/self` added (R1a); CLI `whoami` now calls it instead of probing reachability. `POST /api/agent/key/rotate` added (R1b) with `AGENT_KEY_ROTATION_GRACE_HOURS` grace window |
+| R2 (refuted: repeat occurrences produce no event) | Remediated in N7a | `eafb88c` — `occurrence_burst` event added, throttled to 1/issue/`OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS` (default 1h) |
+
+
+
 Repo-wide audit answering: **what blocks or degrades an AI agent doing continuous, unattended
 automation on service errors (`system_error`) and manual issues (`user_report`)?** Run immediately
 after the agent-native layer merged (PR #17, N1–N6).
