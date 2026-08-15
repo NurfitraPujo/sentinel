@@ -104,7 +104,11 @@ func TestAgentDiscoveryEvents_RegressionWritesRegressedNotCreated(t *testing.T) 
 	require.NoError(t, err)
 
 	issue2 := eidIssue(projectID, fingerprint)
-	_, stored2, err2 := s.StoreEvent(ctx, issue2, eidOccurrence("evt-ade3-b-"+uuid.New().String()), "0.9.0")
+	// The occurrence's release must be >= resolved_in_version: isRegressionVersion (store.go:143)
+	// deliberately does NOT count an occurrence from an OLDER release than the fix as a regression.
+	// "0.9.0" here (vs resolved_in 1.0.0) made this test fail on its first CI run — the product was
+	// right, the fixture was wrong.
+	_, stored2, err2 := s.StoreEvent(ctx, issue2, eidOccurrence("evt-ade3-b-"+uuid.New().String()), "1.1.0")
 	require.NoError(t, err2)
 	require.True(t, stored2)
 
