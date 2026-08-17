@@ -180,3 +180,33 @@ describe('A11: non-claimant mutation warning (observability only, no behavior ch
 		expect(logWarn).not.toHaveBeenCalled();
 	});
 });
+
+// N9 (sentinel-worker plan, contract correction C1): self-reclaim is idempotent -- when claimIssue
+// reports `alreadyClaimed: true` the op returns 200 with the flag surfaced, and a normal first
+// claim's body does NOT carry the flag (additive contract; ClaimResponseSchema is .strict()).
+describe('N9: idempotent self-reclaim', () => {
+	it('returns 200 with alreadyClaimed:true when claimIssue reports an existing self-claim', async () => {
+		resolveAgentIssueScope.mockResolvedValueOnce(
+			issueScope({ assignedTo: 'agent-1', assigneeType: 'agent', claimedAt: new Date('2026-08-14T09:00:00.000Z') })
+		);
+		const existing = { id: 'issue-1', assignedTo: 'agent-1', assigneeType: 'agent' };
+		claimIssue.mockResolvedValue({ issue: existing, notified: [], alreadyClaimed: true });
+
+		const result = await runAgentOp('issues.claim', CTX as any, 'issue-1', {}, 'http://localhost');
+
+		expect(result.status).toBe(200);
+		expect(result.body).toEqual({ success: true, issue: existing, alreadyClaimed: true });
+		expect(result.audit).toMatchObject({ metadata: { alreadyClaimed: true } });
+	});
+
+	it('a normal first claim does not carry the alreadyClaimed flag', async () => {
+		resolveAgentIssueScope.mockResolvedValueOnce(issueScope());
+		const claimed = { id: 'issue-1', assignedTo: 'agent-1', assigneeType: 'agent' };
+		claimIssue.mockResolvedValue({ issue: claimed, notified: [] });
+
+		const result = await runAgentOp('issues.claim', CTX as any, 'issue-1', {}, 'http://localhost');
+
+		expect(result.status).toBe(200);
+		expect(result.body).toEqual({ success: true, issue: claimed });
+	});
+});

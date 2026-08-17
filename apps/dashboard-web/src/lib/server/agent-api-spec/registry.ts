@@ -70,7 +70,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',
 		operationId: 'claimIssue',
-		summary: 'Atomically claim an issue',
+		summary:
+			'Atomically claim an issue (idempotent self-reclaim: re-claiming an issue you already hold returns 200 with alreadyClaimed:true, not 409; 409 only if held by someone else)',
 		responses: {
 			'200': S.ClaimResponseSchema,
 			'401': S.UnauthorizedErrorSchema,

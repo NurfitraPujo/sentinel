@@ -640,12 +640,21 @@ export class ClaimConflictError extends Error {
  * else won the race, and this throws `ClaimConflictError` rather than silently no-op'ing (D18:
  * the caller must be able to distinguish "I claimed it" from "I did nothing"). Works for both
  * users and agents; `actorType` records which.
+ *
+ * N9 (sentinel-worker plan, contract correction C1): self-reclaim is idempotent, mirroring
+ * releaseClaim's A13 guard below. 0 rows updated used to always mean ClaimConflictError, which
+ * made a plain network retry of a SUCCESSFUL claim (response dropped, agent retries)
+ * wire-indistinguishable from someone else holding the issue. Re-read to tell the two apart: if
+ * the CURRENT claimant is this same actor (both `assignedTo` AND `assigneeType` -- assigned_to is
+ * a bare varchar shared across the user/agent id spaces, see R10), return the existing claim with
+ * `alreadyClaimed: true`, no second activity row, no second notification. Anyone else holding it
+ * is still a real conflict.
  */
 export async function claimIssue(
 	issueId: string,
 	actorType: 'user' | 'agent',
 	actorId: string
-): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[]; alreadyClaimed?: boolean }> {
 	return await db.transaction(async (tx) => {
 		const updated = await tx
 			.update(issues)
@@ -654,6 +663,10 @@ export async function claimIssue(
 			.returning();
 
 		if (updated.length === 0) {
+			const [current] = await tx.select().from(issues).where(eq(issues.id, issueId));
+			if (current && current.assignedTo === actorId && current.assigneeType === actorType) {
+				return { issue: current, notified: [], alreadyClaimed: true };
+			}
 			throw new ClaimConflictError();
 		}
 
