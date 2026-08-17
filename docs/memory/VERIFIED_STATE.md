@@ -72,8 +72,18 @@ cd apps/dashboard-web && rtk pnpm check                # 1024 files, 0 errors, 0
 cd apps/dashboard-web && rtk pnpm test                 # PASSES, 32 files / 251 tests (2026-08-01)
 cd apps/dashboard-web && rtk pnpm test --sequence.shuffle   # must ALSO pass — order-independence decays
                                                        # silently (B13); verified across 8 seeds
-SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1  # PASSES, 76 passed — NEEDS the compose stack up
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1  # PASSES, 81 passed, 0 skipped (2026-08-17) — NEEDS the compose stack up
 ```
+
+> [!NOTE]
+> **2026-08-17 — agent e2e dead-coverage gap closed.** The 5 M5 agent-work-loop proofs
+> (`TestM5AgentWorkLoopIntegration`, `TestU37_*`, `TestU38_*`, `TestU39_*`) gated on
+> `M5_AGENT_INTEGRATION_REQUIRED=1`, an env **no workflow ever set**, so they `t.Skip`ped on every CI
+> run since merge while the `e2e` job stayed green — this repo's characteristic "recorded green, never
+> executed" failure (AGENT_WORKER_PLAN.md §8). Fixed by dropping that separate gate: the tests now gate
+> only on `requireStack`, which fatals rather than skips under `SENTINEL_E2E=1`, so the CI `e2e` job
+> (which already sets `SENTINEL_E2E=1`) runs them unconditionally. Verified locally against the compose
+> stack: all 5 report `--- PASS` (not SKIP). Suite count rose **76 → 81 passed, 0 skipped**.
 
 **CI is now green on `main`** (merge commit `b895df1`, 2026-08-01 — the first green run this repo has
 had; the prior baseline `b9e2018` was red). A green badge is evidence about `main`, not your working tree.

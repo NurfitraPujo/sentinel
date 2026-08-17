@@ -2,9 +2,11 @@
 
 // Package e2e — M5 agent work-loop integration proof.
 //
-// Gated by M5_AGENT_INTEGRATION_REQUIRED=1 (mirrors SENTINEL_E2E's skip-vs-fail asymmetry, see
-// main_test.go's package comment): unset, the test skips so the rest of the suite stays usable
-// without it; set, a failure to complete any step is fatal, never a silent skip.
+// Gated by stack availability through requireStack, which under SENTINEL_E2E=1 fatals rather than
+// skips (see main_test.go's requireStack/skipNotPermitted): so the CI e2e job — which sets
+// SENTINEL_E2E=1 and brings the compose stack up — runs this proof unconditionally. It previously
+// gated on a separate M5_AGENT_INTEGRATION_REQUIRED=1 env that NO workflow ever set, so the proof
+// skipped on every CI run while the job stayed green (the "recorded green, never executed" trap).
 //
 // Drives the REAL /api/agent/* surface over real HTTP against the compose dashboard (Bearer key
 // auth needs no browser session, so this goes straight over HTTP — no server-module shortcut).
@@ -27,14 +29,11 @@ import (
 
 func requireM5AgentIntegration(t *testing.T) {
 	t.Helper()
-	if v := envOrEmpty("M5_AGENT_INTEGRATION_REQUIRED"); v != "1" {
-		t.Skip("M5_AGENT_INTEGRATION_REQUIRED != 1: skipping the agent work-loop integration proof")
-	}
+	// Under SENTINEL_E2E=1 requireStack fatals when the stack is down (never skips), so the agent
+	// proof is mandatory in CI. There is no separate opt-in env: gating on one that no workflow set
+	// is exactly how this coverage went dead. Locally without SENTINEL_E2E, an unavailable stack
+	// still skips.
 	requireStack(t)
-}
-
-func envOrEmpty(key string) string {
-	return env(key, "")
 }
 
 // seedAgent creates an org agent + an active 'agent'-scope key via the SAME session-authenticated
