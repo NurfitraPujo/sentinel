@@ -7,6 +7,12 @@ import { log } from '$lib/server/observability/log';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
+import {
+	findIdempotencyKey,
+	recordIdempotencyKey,
+	readIdempotentCommentId,
+	IdempotencyRaceError,
+} from '$lib/server/agent-idempotency';
 
 /**
  * Manual Issues M3 (docs/plans/MANUAL_ISSUES_DESIGN.md §5, plus the comment-attachment paths
@@ -45,6 +51,16 @@ export interface CreateCommentInput {
 	blocking?: boolean;
 	/** Required when `blocking` is true: who the question is addressed to (Q11). */
 	waitingOnAudience?: 'reporter' | 'team';
+	/**
+	 * N9 (D21): client-supplied idempotency key (agent callers only -- `authorId` is the agent id).
+	 * A repeat key returns the ORIGINAL comment with `deduplicated: true`, no second activity row,
+	 * no second notification/email. For a blocking question the ORIGINAL question's comment id comes
+	 * back and `issues.waiting_on` is NOT re-set (preserving the waiting_on-predictability rationale
+	 * without emitting a duplicate side effect). The op it is scoped to is derived from `blocking`:
+	 * `issues.question` when blocking, `issues.comment` otherwise -- reusing one key across both is a
+	 * client error surfaced as `IdempotencyKeyOpMismatchError`.
+	 */
+	idempotencyKey?: string;
 }
 
 /**
@@ -56,7 +72,7 @@ export interface CreateCommentInput {
  */
 export async function createComment(
 	input: CreateCommentInput
-): Promise<{ comment: typeof issueComments.$inferSelect; notified: NotifiedUser[] }> {
+): Promise<{ comment: typeof issueComments.$inferSelect; notified: NotifiedUser[]; deduplicated: boolean }> {
 	const bodyMd = input.bodyMd.trim();
 	if (bodyMd.length === 0) {
 		throw new CommentValidationError('bodyMd must not be empty');
@@ -65,6 +81,32 @@ export async function createComment(
 		throw new CommentValidationError('waitingOnAudience is required and must be "reporter" or "team" when blocking');
 	}
 
+	// N9 (D21): the op an idempotency key is scoped to is derived from `blocking`, so a question and
+	// a plain comment can never share a key (findIdempotencyKey throws on an op mismatch).
+	const idempotencyOp = input.blocking ? 'issues.question' : 'issues.comment';
+
+	try {
+		return await createCommentTxn(input, bodyMd, idempotencyOp);
+	} catch (err) {
+		// A concurrent duplicate committed our key first; our transaction rolled back its side
+		// effects. Replay the winner's original comment -- 200-equivalent, deduplicated, no email.
+		if (err instanceof IdempotencyRaceError && input.idempotencyKey) {
+			const commentId = await readIdempotentCommentId(input.authorId, input.idempotencyKey);
+			const original = commentId ? await getCommentById(commentId) : null;
+			if (!original) {
+				throw new CommentNotFoundError('Idempotent replay target comment not found');
+			}
+			return { comment: original as typeof issueComments.$inferSelect, notified: [], deduplicated: true };
+		}
+		throw err;
+	}
+}
+
+async function createCommentTxn(
+	input: CreateCommentInput,
+	bodyMd: string,
+	idempotencyOp: string
+): Promise<{ comment: typeof issueComments.$inferSelect; notified: NotifiedUser[]; deduplicated: boolean }> {
 	return await db.transaction(async (tx) => {
 		const issueRows = await tx
 			.select({ id: issues.id, projectId: issues.projectId, waitingOn: issues.waitingOn })
@@ -83,6 +125,21 @@ export async function createComment(
 
 		if (!projectRow?.organizationId) {
 			throw new Error('Issue project does not belong to an organization');
+		}
+
+		// N9 (D21): idempotency-key replay -- checked BEFORE any write. A hit returns the ORIGINAL
+		// comment (for a question, the original question's comment id) with no second activity row,
+		// no waiting_on re-set, and no notification/email. This is a read-only early return, so it
+		// commits nothing (safe under D18, which only forbids returning AFTER staging writes).
+		if (input.idempotencyKey) {
+			const hit = await findIdempotencyKey(tx, input.authorId, input.idempotencyKey, idempotencyOp);
+			if (hit && hit.commentId) {
+				const [original] = await tx.select().from(issueComments).where(eq(issueComments.id, hit.commentId));
+				if (!original) {
+					throw new CommentNotFoundError('Idempotent replay target comment not found');
+				}
+				return { comment: original, notified: [], deduplicated: true };
+			}
 		}
 
 		// §5: replying to a reply resolves to the SAME parent as the comment it replies to, rather
@@ -131,7 +188,7 @@ export async function createComment(
 
 			const existing = recentDuplicates[0];
 			if (existing) {
-				return { comment: existing, notified: [] };
+				return { comment: existing, notified: [], deduplicated: true };
 			}
 		}
 
@@ -229,7 +286,15 @@ export async function createComment(
 			payload: { commentId: comment.id, parentId: resolvedParentId },
 		});
 
-		return { comment, notified };
+		// N9 (D21): stamp the key LAST, inside the same transaction as the comment/activity/waiting_on
+		// writes above. On a concurrent-duplicate conflict this throws IdempotencyRaceError, rolling
+		// the whole transaction back so only the winner's single side effect survives; createComment's
+		// outer catch then replays the winner's stored comment.
+		if (input.idempotencyKey) {
+			await recordIdempotencyKey(tx, input.authorId, input.idempotencyKey, idempotencyOp, comment.id);
+		}
+
+		return { comment, notified, deduplicated: false };
 	});
 }
 

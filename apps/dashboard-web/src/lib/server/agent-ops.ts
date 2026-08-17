@@ -17,6 +17,7 @@ import {
 	CommentNotFoundError,
 } from '$lib/db/queries/comments';
 import { recordAgentProgress } from '$lib/db/queries/agent-work';
+import { IdempotencyKeyOpMismatchError } from '$lib/server/agent-idempotency';
 import { createIssueRelation, deleteIssueRelation, RelationCycleError } from '$lib/db/queries/issues';
 import type { AgentAuditDescriptor } from '$lib/server/agent-route';
 import { log } from '$lib/server/observability/log';
@@ -55,6 +56,26 @@ export type AgentOpHandler = (
 
 function asRecord(params: unknown): Record<string, unknown> {
 	return params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+}
+
+/**
+ * N9 (D21): extracts an optional client-supplied `idempotency_key` from an op's params (snake_case,
+ * matching `body_md`/`message_md`). A repeat key replays the original result with `deduplicated:
+ * true` and no second side effect/email. Length-bounded to the column width (varchar(255)) so an
+ * over-long key is a clean 400 rather than a database insert error. Undefined ⇒ no idempotency
+ * (byte-identical to pre-N9 behavior).
+ */
+const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
+function extractIdempotencyKey(body: Record<string, unknown>): string | undefined {
+	const raw = body.idempotency_key;
+	if (raw === undefined || raw === null) return undefined;
+	if (typeof raw !== 'string' || raw.trim().length === 0) {
+		throw error(400, 'idempotency_key must be a non-empty string');
+	}
+	if (raw.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+		throw error(400, `idempotency_key must not exceed ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`);
+	}
+	return raw;
 }
 
 /**
@@ -212,27 +233,34 @@ const issuesComment: AgentOpHandler = async (ctx, issueId, params, originUrl) =>
 		attachmentIds = body.attachment_ids as string[];
 	}
 
+	const idempotencyKey = extractIdempotencyKey(body);
+
 	try {
-		const { comment, notified } = await createComment({
+		const { comment, notified, deduplicated } = await createComment({
 			issueId: issue.issueId,
 			authorType: 'agent',
 			authorId: ctx.agentId,
 			bodyMd: body.body_md as string,
 			attachmentIds,
+			idempotencyKey,
 		});
+		// A deduplicated replay carries `notified: []`, so this send is a no-op -- no second email.
 		await sendIssueNotificationEmails(notified, { issueId: issue.issueId, origin: originUrl });
 
 		return {
 			status: 201,
-			body: { comment },
+			body: deduplicated ? { comment, deduplicated: true } : { comment },
 			audit: {
 				action: 'agent.issue.commented',
 				resourceType: 'issue',
 				resourceId: issue.issueId,
-				metadata: { commentId: comment.id },
+				metadata: { commentId: comment.id, deduplicated },
 			},
 		};
 	} catch (err) {
+		if (err instanceof IdempotencyKeyOpMismatchError) {
+			throw error(409, err.message);
+		}
 		if (err instanceof CommentValidationError) {
 			throw error(400, err.message);
 		}
@@ -385,13 +413,32 @@ const issuesProgress: AgentOpHandler = async (ctx, issueId, params) => {
 	}
 	warnIfMutatingSomeoneElsesClaim(ctx, issue, 'issues.progress');
 
-	await recordAgentProgress(issue.issueId, ctx.agentId, body.message_md.trim());
+	const idempotencyKey = extractIdempotencyKey(body);
 
-	return {
-		status: 201,
-		body: { success: true },
-		audit: { action: 'agent.issue.progress_update', resourceType: 'issue', resourceId: issue.issueId },
-	};
+	try {
+		const { deduplicated } = await recordAgentProgress(
+			issue.issueId,
+			ctx.agentId,
+			body.message_md.trim(),
+			idempotencyKey
+		);
+
+		return {
+			status: 201,
+			body: deduplicated ? { success: true, deduplicated: true } : { success: true },
+			audit: {
+				action: 'agent.issue.progress_update',
+				resourceType: 'issue',
+				resourceId: issue.issueId,
+				metadata: { deduplicated },
+			},
+		};
+	} catch (err) {
+		if (err instanceof IdempotencyKeyOpMismatchError) {
+			throw error(409, err.message);
+		}
+		throw err;
+	}
 };
 
 const VALID_RELATION_TYPES = ['linked_to', 'caused_by', 'duplicate_of'] as const;

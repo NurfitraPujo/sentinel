@@ -279,6 +279,11 @@ describe('listOrgActivity', () => {
 				status: 'deleted',
 				issueType: 'user_report',
 				projectId: 'project-1',
+				// N9 (C2): a deleted issue has no CURRENT claim/waiting state.
+				assigneeType: null,
+				assignedTo: null,
+				claimedAt: null,
+				waitingOn: null,
 			},
 		});
 		// cursor advances to the highest merged seq.

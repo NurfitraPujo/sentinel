@@ -200,7 +200,12 @@ func TestM5AgentWorkLoopIntegration(t *testing.T) {
 		t.Fatalf("POST claim: got %d, want 200, body=%s", claimRes.Status, claimRes.Body)
 	}
 
-	// ---- 3. Concurrency: two simultaneous claim attempts on a FRESH issue, exactly one 200 and one 409 ----
+	// ---- 3. Concurrency: two simultaneous claim attempts on a FRESH issue by the SAME agent ----
+	// N9 (contract correction C1, idempotent self-reclaim): both requests use the same agent key, so
+	// the loser of the conditional-UPDATE race (`WHERE assigned_to IS NULL`) re-reads, finds ITSELF
+	// the current claimant, and returns 200 with `alreadyClaimed: true` rather than a 409 -- a 409 is
+	// reserved for a DIFFERENT holder. The race therefore resolves to exactly one fresh claim + one
+	// idempotent self-reclaim (both 200), which is what this asserts.
 	concRes := dashboardRequest(t, "POST", "/api/organizations/"+f1.OrgID+"/reports", reporter1, map[string]any{
 		"title":     "concurrency target " + uniqueSuffix(),
 		"bodyMd":    "race the claim",
@@ -220,27 +225,39 @@ func TestM5AgentWorkLoopIntegration(t *testing.T) {
 
 	var wg sync.WaitGroup
 	statuses := make([]int, 2)
+	bodies := make([]string, 2)
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
 			r := agentRequest(t, "POST", "/api/agent/issues/"+concurrencyIssueID+"/claim", bearer, nil)
 			statuses[idx] = r.Status
+			bodies[idx] = r.Body
 		}(i)
 	}
 	wg.Wait()
 
-	var ok200, ok409 int
-	for _, s := range statuses {
-		switch s {
-		case 200:
-			ok200++
-		case 409:
-			ok409++
+	// Both must be 200 (C1); exactly one carries alreadyClaimed:true (the self-reclaim), the other
+	// is the fresh claim. A 409 here would mean the self-reclaim guard regressed.
+	var freshClaims, selfReclaims int
+	for i, s := range statuses {
+		if s != 200 {
+			t.Fatalf("concurrent claim: got statuses %v, want both 200 (one fresh, one self-reclaim); body[%d]=%s", statuses, i, bodies[i])
+		}
+		var parsed struct {
+			AlreadyClaimed bool `json:"alreadyClaimed"`
+		}
+		if err := json.Unmarshal([]byte(bodies[i]), &parsed); err != nil {
+			t.Fatalf("concurrent claim: response %d not JSON: %v (body=%s)", i, err, bodies[i])
+		}
+		if parsed.AlreadyClaimed {
+			selfReclaims++
+		} else {
+			freshClaims++
 		}
 	}
-	if ok200 != 1 || ok409 != 1 {
-		t.Fatalf("concurrent claim: got statuses %v, want exactly one 200 and one 409", statuses)
+	if freshClaims != 1 || selfReclaims != 1 {
+		t.Fatalf("concurrent claim: want exactly one fresh claim and one self-reclaim, got fresh=%d reclaim=%d statuses=%v", freshClaims, selfReclaims, statuses)
 	}
 
 	// ---- 4. Progress update: activity row, in-app only (no email kind on 'progress_update') ----

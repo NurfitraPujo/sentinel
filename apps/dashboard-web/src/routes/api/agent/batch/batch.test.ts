@@ -94,8 +94,10 @@ beforeEach(() => {
 	});
 	sendIssueNotificationEmails.mockResolvedValue(undefined);
 	updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
-	recordAgentProgress.mockResolvedValue(undefined);
-	createComment.mockResolvedValue({ comment: { id: 'c1' }, notified: [] });
+	// N9 (D21): recordAgentProgress/createComment now return a `deduplicated` flag that the ops
+	// destructure, so the doubles must carry it.
+	recordAgentProgress.mockResolvedValue({ notified: [], deduplicated: false });
+	createComment.mockResolvedValue({ comment: { id: 'c1' }, notified: [], deduplicated: false });
 	claimIssue.mockResolvedValue({ issue: { id: 'issue-1', assignedTo: 'agent-1' }, notified: [] });
 	releaseClaim.mockResolvedValue({ issue: { id: 'issue-1', assignedTo: null }, notified: [] });
 	createIssueRelation.mockResolvedValue({ relation: { id: 'rel-1' }, notified: [] });
@@ -122,7 +124,8 @@ describe('POST /api/agent/batch', () => {
 		expect(data.results[1]).toMatchObject({ ok: true, status: 201 });
 		expect(data.results[2]).toMatchObject({ ok: true, status: 201 });
 		expect(updateIssueStatus).toHaveBeenCalledWith('issue-1', 'resolved', undefined, 'agent', 'agent-1');
-		expect(recordAgentProgress).toHaveBeenCalledWith('issue-1', 'agent-1', 'working on it');
+		// N9 (D21): the op now forwards an optional idempotency key (undefined when absent).
+		expect(recordAgentProgress).toHaveBeenCalledWith('issue-1', 'agent-1', 'working on it', undefined);
 		expect(createComment).toHaveBeenCalledTimes(1);
 		expect(writeAgentAuditLog).toHaveBeenCalledTimes(3);
 	});

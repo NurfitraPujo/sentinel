@@ -7,8 +7,10 @@ import {
 	issueActivity,
 	issueTombstones,
 	projects,
+	agentIdempotencyKeys,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
+import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
 
@@ -235,6 +237,27 @@ export async function cleanupRetainedData(
 		deletedTombstones,
 		tombstoneRetentionDays,
 	};
+}
+
+/**
+ * N9 (D21): ages out client-supplied idempotency keys older than
+ * `AGENT_IDEMPOTENCY_RETENTION_DAYS` (7). Past that window a repeat key is no longer deduplicated --
+ * a retry that late is a fresh logical request, not a resend of a dropped response -- so the row's
+ * only remaining purpose is table bloat. Same piggyback pattern as reapStaleClaims: driven by the
+ * existing retention cron rather than a second scheduled route. Returns the count deleted.
+ */
+export async function reapExpiredIdempotencyKeys(
+	retentionDays: number = AGENT_IDEMPOTENCY_RETENTION_DAYS
+): Promise<number> {
+	const cutoff = new Date();
+	cutoff.setDate(cutoff.getDate() - retentionDays);
+
+	const deleted = await db
+		.delete(agentIdempotencyKeys)
+		.where(lt(agentIdempotencyKeys.createdAt, cutoff))
+		.returning({ id: agentIdempotencyKeys.id });
+
+	return deleted.length;
 }
 
 // N7c (A03): result of a single stale-claim reap pass.

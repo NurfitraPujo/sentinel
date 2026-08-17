@@ -1,6 +1,6 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
-import { cleanupRetainedData, reapStaleClaims } from '$lib/server/retention';
+import { cleanupRetainedData, reapStaleClaims, reapExpiredIdempotencyKeys } from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
 import { env } from '$env/dynamic/private';
@@ -58,10 +58,14 @@ export const POST: RequestHandler = async ({ request }) => {
 		// N7c (A03): same piggyback again -- force-release agent claims an unattended loop abandoned.
 		const claimReap = await reapStaleClaims(claimStaleHours);
 
+		// N9 (D21): and once more -- age out idempotency keys past their 7-day dedupe window.
+		const reapedIdempotencyKeys = await reapExpiredIdempotencyKeys();
+
 		log.info('retention_cron.completed', {
 			reapedInvitations,
 			reapedAttachments,
 			releasedClaims: claimReap.releasedClaims,
+			reapedIdempotencyKeys,
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			tombstonesWritten: result.tombstonesWritten,
@@ -75,6 +79,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				reapedInvitations,
 				reapedAttachments,
 				releasedClaims: claimReap.releasedClaims,
+				reapedIdempotencyKeys,
 				deletedOccurrences: result.deletedOccurrences,
 					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				tombstonesWritten: result.tombstonesWritten,

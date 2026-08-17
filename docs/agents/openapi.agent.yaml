@@ -1068,7 +1068,7 @@ paths:
                 additionalProperties: false
     post:
       operationId: postComment
-      summary: Post a non-blocking comment (emails subscribers)
+      summary: "Post a non-blocking comment (emails subscribers). Optional idempotency_key: a repeat replays the original comment with deduplicated:true, no second email"
       parameters:
         - name: issueId
           in: path
@@ -1088,6 +1088,8 @@ paths:
                   type: array
                   items:
                     type: string
+                idempotency_key:
+                  type: string
               required:
                 - body_md
               additionalProperties: false
@@ -1140,6 +1142,10 @@ paths:
                       - createdAt
                       - editedAt
                     additionalProperties: false
+                  deduplicated:
+                    type: boolean
+                    enum:
+                      - true
                 required:
                   - comment
                 additionalProperties: false
@@ -1169,6 +1175,18 @@ paths:
                 additionalProperties: false
         "404":
           description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
           content:
             application/json:
               schema:
@@ -1452,7 +1470,7 @@ paths:
   /api/agent/issues/{issueId}/questions:
     post:
       operationId: askQuestion
-      summary: Ask a blocking question (sets waiting_on, forces an immediate email)
+      summary: "Ask a blocking question (sets waiting_on, forces an immediate email). Optional idempotency_key: a repeat replays the original question comment id with deduplicated:true and no second email"
       parameters:
         - name: issueId
           in: path
@@ -1473,6 +1491,8 @@ paths:
                   enum:
                     - reporter
                     - team
+                idempotency_key:
+                  type: string
               required:
                 - body_md
                 - audience
@@ -1526,6 +1546,10 @@ paths:
                       - createdAt
                       - editedAt
                     additionalProperties: false
+                  deduplicated:
+                    type: boolean
+                    enum:
+                      - true
                 required:
                   - comment
                 additionalProperties: false
@@ -1565,10 +1589,22 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/issues/{issueId}/progress:
     post:
       operationId: postProgress
-      summary: Post an in-app-only progress update (no email)
+      summary: "Post an in-app-only progress update (no email). Optional idempotency_key: a repeat replays a deduplicated success with no second progress row"
       parameters:
         - name: issueId
           in: path
@@ -1584,6 +1620,8 @@ paths:
               properties:
                 message_md:
                   type: string
+                idempotency_key:
+                  type: string
               required:
                 - message_md
               additionalProperties: false
@@ -1596,6 +1634,10 @@ paths:
                 type: object
                 properties:
                   success:
+                    type: boolean
+                    enum:
+                      - true
+                  deduplicated:
                     type: boolean
                     enum:
                       - true
@@ -1628,6 +1670,18 @@ paths:
                 additionalProperties: false
         "404":
           description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
           content:
             application/json:
               schema:
