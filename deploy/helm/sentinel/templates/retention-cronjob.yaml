@@ -1,0 +1,57 @@
+{{- if .Values.retentionCron.enabled }}
+{{- $secret := include "sentinel.secretName" . -}}
+# N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11): schedules POST /api/cron/retention.
+# Where the compose stack wraps a curl in a sleep-loop (a container has no external scheduler), Kubernetes
+# has a first-class CronJob primitive, so this uses it directly rather than a long-running sleep-loop pod.
+# Each run is a short curlimages/curl Job that POSTs the in-cluster dashboard Service with the shared
+# CRON_SECRET (read from the existing chart Secret, same key the dashboard Deployment consumes).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "sentinel.fullname" . }}-retention
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: retention-cron
+spec:
+  schedule: {{ .Values.retentionCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.retentionCron.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.retentionCron.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.retentionCron.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.retentionCron.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.retentionCron.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sentinel.labels" . | nindent 12 }}
+            app.kubernetes.io/component: retention-cron
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: retention-cron
+              image: "{{ .Values.retentionCron.image.repository }}:{{ .Values.retentionCron.image.tag }}"
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              env:
+                - name: CRON_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: CRON_SECRET
+              command: ["/bin/sh", "-c"]
+              args:
+                # -sS quiet-but-loud-on-error, -f so a non-2xx fails the Job (backoffLimit retries),
+                # --max-time bounds a hung dashboard. The in-cluster Service DNS name never leaves the
+                # cluster, so the secret header is not exposed on any external hop.
+                - >-
+                  curl -sS -f --max-time {{ .Values.retentionCron.timeoutSeconds }}
+                  -X POST
+                  -H "x-cron-secret: ${CRON_SECRET}"
+                  {{ include "sentinel.fullname" . }}-dashboard:{{ .Values.dashboard.service.port }}/api/cron/retention
+              resources:
+                {{- toYaml .Values.retentionCron.resources | nindent 16 }}
+{{- end }}

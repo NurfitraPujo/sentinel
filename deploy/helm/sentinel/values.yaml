@@ -212,6 +212,33 @@ dlqDrainer:
     limits: { cpu: 200m, memory: 128Mi }
 
 # -----------------------------------------------------------------------------
+# retention-cron — schedules POST /api/cron/retention (N9). A batch/v1 CronJob that runs a short
+# curl Job on `schedule`, POSTing the in-cluster dashboard Service with CRON_SECRET (from the chart
+# Secret). The same run force-releases stale agent claims (CLAIM_STALE_HOURS) and applies retention
+# windows. Ships ENABLED — unlike the destructive dlq-drainer, this only invokes an endpoint that is
+# itself the authority on what it deletes, and a stack with no scheduler leaks crashed-agent claims.
+# -----------------------------------------------------------------------------
+retentionCron:
+  enabled: true
+  # Standard cron syntax (cluster timezone). Default: hourly, matching the compose interval.
+  schedule: "0 * * * *"
+  image:
+    # A plain curl image — the Job only makes one HTTP POST, no first-party code.
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  timeoutSeconds: 30
+  # If the controller misses a scheduled time by more than this (e.g. controller downtime), skip it.
+  startingDeadlineSeconds: 120
+  # Kill a run that hangs past this so a wedged Job cannot block the next (concurrencyPolicy: Forbid).
+  activeDeadlineSeconds: 120
+  backoffLimit: 2
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
 # Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.
 # -----------------------------------------------------------------------------
 ingress:

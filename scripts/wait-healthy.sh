@@ -48,7 +48,12 @@ ONESHOT_SERVICES="nats-init migrate minio-init"
 # and it would take CI and every developer down with it.
 #
 # Listed services are still waited for and still reported; they just cannot fail the run.
-OPTIONAL_SERVICES="jaeger"
+# sentinel-cron (N9) joins jaeger here for a different but related reason: it is a long-running service
+# with no healthcheck that ships gated OFF (RETENTION_CRON_ENABLED=false), so it sits in `sleep infinity`
+# and simply reports `running`. Left off this list it would be waited on like any app container — fine
+# while it stays up, but a crash-looping cron image (e.g. a bad CRON_SECRET makes entrypoint exit 1)
+# would then fail the whole gate. It is genuinely optional to stack readiness, so it cannot fail the run.
+OPTIONAL_SERVICES="jaeger cron"
 
 log() {
   printf '%s\n' "$*" >&2

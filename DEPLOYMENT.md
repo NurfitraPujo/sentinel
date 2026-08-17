@@ -192,9 +192,19 @@ The short version:
 - [ ] `S3_PUBLIC_ENDPOINT` set to a browser-reachable URL (see §2)
 - [ ] `EMAIL_SERVER` configured (invitations depend on it, D06)
 - [ ] `OTEL_EXPORTER_OTLP_ENDPOINT` pointed at your collector (optional; absent = no traces, still functional)
-- [ ] Retention cron scheduled to POST `/api/cron/retention` with the `CRON_SECRET` bearer token
-      — the same run also force-releases stale agent claims (`CLAIM_STALE_HOURS`, default 24) and
-      applies the longer manual-issue cutoff (`MANUAL_ISSUE_RETENTION_DAYS`, default 365)
+- [x] Retention cron scheduled to POST `/api/cron/retention` with the `CRON_SECRET` header — **shipped
+      (N9)**, no longer an operator to-do. The same run force-releases stale agent claims
+      (`CLAIM_STALE_HOURS`, default 24) and applies the longer manual-issue cutoff
+      (`MANUAL_ISSUE_RETENTION_DAYS`, default 365). Two mechanisms, one per target:
+      - **Compose:** a `sentinel-cron` service (`scripts/Dockerfile.cron` + `scripts/cron-entrypoint.sh`)
+        POSTs the endpoint every `RETENTION_CRON_INTERVAL_SECONDS` (default `3600`). It ships gated OFF
+        (`RETENTION_CRON_ENABLED=false`) per repo convention — flip it to `"true"` to activate. It refuses
+        to start if `CRON_SECRET` is unset (the endpoint would 401 every call).
+      - **Kubernetes:** a `batch/v1` CronJob (`deploy/helm/sentinel/templates/retention-cronjob.yaml`),
+        `retentionCron.schedule` (default hourly), reading `CRON_SECRET` from the existing chart Secret.
+        Ships **enabled** (`retentionCron.enabled: true`) — unlike the destructive dlq-drainer, it only
+        invokes an endpoint that is itself the authority on what it deletes, and a cluster with no
+        scheduler leaks the claims of crashed agents.
 - [ ] Object-store lifecycle/backup policy for attachments
 
 ---

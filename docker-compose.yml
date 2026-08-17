@@ -315,6 +315,34 @@ services:
             CLAIM_STALE_HOURS: "24"
             AGENT_KEY_ROTATION_GRACE_HOURS: "24"
 
+    # N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11): schedules the retention endpoint.
+    # Without this NOTHING invoked POST /api/cron/retention in the reference stack, so reapStaleClaims
+    # never ran — a crashed agent's claim was never force-released and the claim_released(reason=stale)
+    # event path was untestable. Wraps a curl of that endpoint in a sleep-loop (scripts/cron-entrypoint.sh),
+    # the same "wrap it in a sleep-loop" pattern the dlq-drainer uses.
+    #
+    # NOTE (wait-healthy.sh): this is a long-running service with no healthcheck, so it MUST also be listed
+    # in that script's OPTIONAL_SERVICES — enumerating `docker compose config --services` otherwise makes
+    # the whole stack gate wait on / fail with it (see the comment block at scripts/wait-healthy.sh:51).
+    cron:
+        build:
+            context: .
+            dockerfile: scripts/Dockerfile.cron
+        container_name: sentinel-cron
+        depends_on:
+            dashboard:
+                condition: service_started
+        environment:
+            # In-cluster address of the dashboard, never a host-mapped port.
+            RETENTION_CRON_URL: http://dashboard:3000/api/cron/retention
+            # Must match the dashboard's CRON_SECRET above, or every call is rejected 401.
+            CRON_SECRET: dev-only-cron-secret-change-me
+            # Gate: ships OFF per repo convention. Flip to "true" to activate the schedule.
+            RETENTION_CRON_ENABLED: "false"
+            RETENTION_CRON_INTERVAL_SECONDS: "3600" # how often it POSTs the endpoint (1h)
+            RETENTION_CRON_TIMEOUT_SECONDS: "30"
+        restart: unless-stopped
+
 volumes:
     dlq_drainer_state:
     postgres_data:
