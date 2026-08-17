@@ -164,7 +164,11 @@ below.
 
 - `POST /api/agent/issues/:id/claim` — atomic conditional UPDATE. Succeeds (200) with the updated
   issue (which includes `assignedTo`/`claimedAt`) if unclaimed or already claimed by you; **409**
-  if claimed by someone else. As of N7f (A11) the 409 body is enriched with the current claim
+  if claimed by someone else. Self-reclaim is **idempotent as of N9**: re-claiming an issue you
+  already hold returns 200 with `"alreadyClaimed": true` on the body (no new activity row, no
+  notification), so a plain retry-on-timeout of a claim is safe to resend — same guarantee release
+  already gives. The flag is present only on that self-reclaim path; a fresh claim omits it. As of
+  N7f (A11) the 409 body is enriched with the current claim
   state so you don't need a second read: `{"message": "...", "claimedBy": "<agentId or userId>",
   "claimedAt": "<ISO timestamp or null>"}`. Back off on 409 — don't retry-loop, don't force-claim
   (there is no force option for agents; force-release is owner/admin-only through the

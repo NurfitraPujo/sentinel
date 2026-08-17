@@ -221,6 +221,46 @@ describe('claimIssue', () => {
 		expect(txMock.insert).not.toHaveBeenCalled();
 	});
 
+	// N9 (sentinel-worker plan, contract correction C1): a retry of an already-successful claim by
+	// the SAME actor must be idempotent success, not a 409 -- mirrors releaseClaim's A13 guard.
+	// Red-proof: delete the re-read branch (revert to the unconditional throw on 0 rows) and this
+	// test fails.
+	it('self-reclaim (already claimed by the same actor) is idempotent success: no activity, no notify', async () => {
+		txMock.returning = vi.fn(() => Promise.resolve([])); // conditional UPDATE matched 0 rows
+		// Re-read (plain select awaited via `.then`) shows this actor already holds the claim.
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([{ id: 'issue-1', assignedTo: 'agent-1', assigneeType: 'agent' }])
+		);
+
+		const { issue, notified, alreadyClaimed } = await claimIssue('issue-1', 'agent', 'agent-1');
+
+		expect(alreadyClaimed).toBe(true);
+		expect(issue).toEqual({ id: 'issue-1', assignedTo: 'agent-1', assigneeType: 'agent' });
+		expect(notified).toEqual([]);
+		expect(txMock.insert).not.toHaveBeenCalled();
+	});
+
+	it('claim when the issue is held by a DIFFERENT actor still throws ClaimConflictError', async () => {
+		txMock.returning = vi.fn(() => Promise.resolve([]));
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([{ id: 'issue-1', assignedTo: 'agent-2', assigneeType: 'agent' }])
+		);
+
+		await expect(claimIssue('issue-1', 'agent', 'agent-1')).rejects.toBeInstanceOf(ClaimConflictError);
+		expect(txMock.insert).not.toHaveBeenCalled();
+	});
+
+	// Same id-space caveat as R10 on releaseClaim: assigned_to is a bare varchar shared across
+	// 'user'/'agent' ids, so an id collision across actor types must NOT read as self-reclaim.
+	it('an id collision across actor types is a conflict, not a self-reclaim', async () => {
+		txMock.returning = vi.fn(() => Promise.resolve([]));
+		txMock.then = vi.fn((resolve: any) =>
+			resolve([{ id: 'issue-1', assignedTo: 'agent-1', assigneeType: 'user' }])
+		);
+
+		await expect(claimIssue('issue-1', 'agent', 'agent-1')).rejects.toBeInstanceOf(ClaimConflictError);
+	});
+
 	it('succeeds, writes one "claimed" activity row, auto-subscribes the claimant, and fans out to other subscribers, excluding the actor', async () => {
 		txMock.returning = vi.fn(() =>
 			Promise.resolve([{ id: 'issue-1', assigneeType: 'user', assignedTo: 'user-1' }])

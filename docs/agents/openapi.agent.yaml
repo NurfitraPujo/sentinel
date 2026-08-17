@@ -555,7 +555,7 @@ paths:
   /api/agent/issues/{issueId}/claim:
     post:
       operationId: claimIssue
-      summary: Atomically claim an issue
+      summary: "Atomically claim an issue (idempotent self-reclaim: re-claiming an issue you already hold returns 200 with alreadyClaimed:true, not 409; 409 only if held by someone else)"
       parameters:
         - name: issueId
           in: path
@@ -676,6 +676,10 @@ paths:
                       - waitingOn
                       - claimedAt
                     additionalProperties: false
+                  alreadyClaimed:
+                    type: boolean
+                    enum:
+                      - true
                 required:
                   - success
                   - issue

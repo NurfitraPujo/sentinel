@@ -186,7 +186,12 @@ export const OccurrencesResponseSchema = z.object({ occurrences: z.array(AgentOc
 // POST/DELETE /api/agent/issues/{issueId}/claim -- agent-ops.ts's `issuesClaim`/`issuesClaimRelease`
 // ---------------------------------------------------------------------------
 
-export const ClaimResponseSchema = z.object({ success: z.literal(true), issue: IssueRowSchema }).strict();
+// N9 (sentinel-worker plan, C1): `alreadyClaimed` is present ONLY on an idempotent self-reclaim
+// (200) -- the caller already held the claim, so no new activity/notification was written. Absent
+// on a fresh claim (additive; the schema is `.strict()`).
+export const ClaimResponseSchema = z
+	.object({ success: z.literal(true), issue: IssueRowSchema, alreadyClaimed: z.literal(true).optional() })
+	.strict();
 export const ReleaseResponseSchema = z.object({ success: z.literal(true), issue: IssueRowSchema }).strict();
 
 /**

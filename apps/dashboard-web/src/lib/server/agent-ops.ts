@@ -149,12 +149,22 @@ const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => 
 const issuesClaim: AgentOpHandler = async (ctx, issueId, _params, originUrl) => {
 	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
 	try {
-		const { issue: updated, notified } = await claimIssue(issue.issueId, 'agent', ctx.agentId);
+		// N9 (sentinel-worker plan, C1): `alreadyClaimed` means this was an idempotent self-reclaim --
+		// the caller already holds the claim, no new activity/notification was written (notified is []),
+		// and the flag is surfaced on the 200 body + audit so a retrying worker can tell it apart from a
+		// fresh claim. The flag is only present on the self-reclaim path (additive; ClaimResponseSchema
+		// is `.strict()`, so a first claim's body must NOT carry it).
+		const { issue: updated, notified, alreadyClaimed } = await claimIssue(issue.issueId, 'agent', ctx.agentId);
 		await sendIssueNotificationEmails(notified, { issueId: issue.issueId, origin: originUrl });
 		return {
 			status: 200,
-			body: { success: true, issue: updated },
-			audit: { action: 'agent.issue.claimed', resourceType: 'issue', resourceId: issue.issueId },
+			body: alreadyClaimed ? { success: true, issue: updated, alreadyClaimed: true } : { success: true, issue: updated },
+			audit: {
+				action: 'agent.issue.claimed',
+				resourceType: 'issue',
+				resourceId: issue.issueId,
+				...(alreadyClaimed ? { metadata: { alreadyClaimed: true } } : {}),
+			},
 		};
 	} catch (err) {
 		if (err instanceof ClaimConflictError) {
