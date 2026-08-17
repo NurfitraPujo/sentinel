@@ -25,17 +25,39 @@ vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion }));
 const updateIssueStatus = vi.fn();
 const createIssueRelation = vi.fn();
 const deleteIssueRelation = vi.fn();
-vi.mock('$lib/db/queries/issues', () => ({ updateIssueStatus, createIssueRelation, deleteIssueRelation }));
+class RelationCycleError extends Error {}
+vi.mock('$lib/db/queries/issues', () => ({
+	updateIssueStatus,
+	createIssueRelation,
+	deleteIssueRelation,
+	RelationCycleError,
+}));
 
 class ClaimConflictError extends Error {}
 const claimIssue = vi.fn();
 const releaseClaim = vi.fn();
-vi.mock('$lib/db/queries/reports', () => ({ claimIssue, releaseClaim, ClaimConflictError }));
+const updateManualIssueReport = vi.fn();
+vi.mock('$lib/db/queries/reports', () => ({
+	claimIssue,
+	releaseClaim,
+	updateManualIssueReport,
+	ClaimConflictError,
+}));
 
 class CommentValidationError extends Error {}
 class CommentNotFoundError extends Error {}
 const createComment = vi.fn();
-vi.mock('$lib/db/queries/comments', () => ({ createComment, CommentValidationError, CommentNotFoundError }));
+const editComment = vi.fn();
+const deleteComment = vi.fn();
+const getCommentById = vi.fn();
+vi.mock('$lib/db/queries/comments', () => ({
+	createComment,
+	editComment,
+	deleteComment,
+	getCommentById,
+	CommentValidationError,
+	CommentNotFoundError,
+}));
 
 const recordAgentProgress = vi.fn();
 vi.mock('$lib/db/queries/agent-work', () => ({ recordAgentProgress }));
@@ -71,7 +93,7 @@ beforeEach(() => {
 		};
 	});
 	sendIssueNotificationEmails.mockResolvedValue(undefined);
-	updateIssueStatus.mockResolvedValue([]);
+	updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
 	recordAgentProgress.mockResolvedValue(undefined);
 	createComment.mockResolvedValue({ comment: { id: 'c1' }, notified: [] });
 	claimIssue.mockResolvedValue({ issue: { id: 'issue-1', assignedTo: 'agent-1' }, notified: [] });

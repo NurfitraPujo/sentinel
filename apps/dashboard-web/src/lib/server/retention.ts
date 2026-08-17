@@ -1,6 +1,6 @@
 import { db } from '$lib/server/db';
-import { errorOccurrences, issues, attachments, issueComments } from '$lib/db/schema';
-import { sql, lt, and, inArray, or } from 'drizzle-orm';
+import { errorOccurrences, issues, attachments, issueComments, issueActivity } from '$lib/db/schema';
+import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
 
@@ -21,6 +21,12 @@ export interface RetentionResult {
 	deletedOrphanedIssues: number;
 	retentionDays: number;
 	cutoffDate: Date;
+	// A04 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md): the second, longer cutoff that gates
+	// deletion of occurrence-less manual issues (issueType='user_report') — see orphanCondition
+	// below. Manual issues never HAVE occurrence rows by construction, so gating them on the same
+	// short `retentionDays` used for system-error issues would delete a legitimate, still-open
+	// manually-reported issue for no reason other than its type.
+	manualRetentionDays: number;
 }
 
 /**
@@ -45,9 +51,20 @@ export async function bestEffortDeleteObjects(storageKeys: string[], context: st
 	}
 }
 
-export async function cleanupRetainedData(retentionDays: number = 30): Promise<RetentionResult> {
+export async function cleanupRetainedData(
+	retentionDays: number = 30,
+	manualRetentionDays: number = 365
+): Promise<RetentionResult> {
 	const cutoffDate = new Date();
 	cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
+
+	// A04: manual issues (issueType='user_report') never accumulate errorOccurrences rows by
+	// construction (they are reported directly, not ingested), so they are ALWAYS "occurrence-less"
+	// -- gating their deletion on `retentionDays` (default 30) would delete a legitimate,
+	// still-relevant manual issue purely because of its type. `manualCutoff` is a second, longer
+	// cutoff (default 365d) that applies only to them.
+	const manualCutoff = new Date();
+	manualCutoff.setDate(manualCutoff.getDate() - manualRetentionDays);
 
 	const deletedOccurrencesResult = await db
 		.delete(errorOccurrences)
@@ -67,13 +84,30 @@ export async function cleanupRetainedData(retentionDays: number = 30): Promise<R
 	// that meaning even after its occurrences are gone. `last_seen` would also default to the
 	// creation time for a brand-new issue, but conceptually it tracks the most recent occurrence,
 	// which is the wrong signal to gate deletion of a row precisely because it has none.
-	const orphanCondition = and(
-		sql`${issues.id} NOT IN (
-			SELECT DISTINCT ${errorOccurrences.issueId}
-			FROM ${errorOccurrences}
-		)`,
+	const noOccurrencesCondition = sql`${issues.id} NOT IN (
+		SELECT DISTINCT ${errorOccurrences.issueId}
+		FROM ${errorOccurrences}
+	)`;
+
+	// System-error (ingested) issues: unchanged behavior, gated on the short `retentionDays` cutoff.
+	const systemErrorOrphanCondition = and(
+		noOccurrencesCondition,
+		sql`${issues.issueType} <> 'user_report'`,
 		lt(issues.firstSeen, cutoffDate)
 	);
+
+	// A04: manual issues additionally require status IN ('resolved','ignored') -- never delete an
+	// 'unresolved' one, however old -- AND assigned_to IS NULL -- never delete a claimed one, agent
+	// or human, mid-triage -- AND the longer `manualCutoff`.
+	const manualIssueOrphanCondition = and(
+		noOccurrencesCondition,
+		eq(issues.issueType, 'user_report'),
+		or(eq(issues.status, 'resolved'), eq(issues.status, 'ignored')),
+		isNull(issues.assignedTo),
+		lt(issues.firstSeen, manualCutoff)
+	);
+
+	const orphanCondition = or(systemErrorOrphanCondition, manualIssueOrphanCondition);
 
 	// R6: this delete cascades away any attachments rows tied to a doomed issue (directly, via
 	// attachments.issue_id) or to one of its comments (via attachments.comment_id ->
@@ -123,5 +157,92 @@ export async function cleanupRetainedData(retentionDays: number = 30): Promise<R
 		deletedOrphanedIssues,
 		retentionDays,
 		cutoffDate,
+		manualRetentionDays,
 	};
+}
+
+// N7c (A03): result of a single stale-claim reap pass.
+export interface ReapStaleClaimsResult {
+	releasedClaims: number;
+	staleHours: number;
+}
+
+/**
+ * A03: force-releases agent claims an unattended loop abandoned. Only claims with
+ * assigneeType='agent' are eligible -- human claims are never auto-released. A claim is
+ * stale-eligible when `claimedAt` is either NULL (pre-migration claim, or somehow never set) or
+ * older than `staleHours` (default 24, env CLAIM_STALE_HOURS). Even a stale-eligible claim is
+ * still protected if the claimant has written an issue_activity row on that issue within the
+ * same window -- an agent making visible progress should not be reaped just because it claimed a
+ * while ago.
+ *
+ * Per-candidate: read (select stale-eligible issues) -> check recent activity -> conditional
+ * UPDATE re-scoped to the same claimant, so a claim that changed hands between the select and the
+ * update (release + reclaim by someone else) is never touched (0 rows updated -> skipped, not an
+ * error -- this is a best-effort sweep, not a caller-facing conditional mutation like claimIssue).
+ * D18: every skip is a `continue` over a candidate, never an early `return` out of the
+ * transaction -- the loop's own writes so far always land as part of one commit.
+ */
+export async function reapStaleClaims(staleHours: number = 24): Promise<ReapStaleClaimsResult> {
+	const cutoff = new Date();
+	cutoff.setHours(cutoff.getHours() - staleHours);
+
+	return await db.transaction(async (tx) => {
+		const candidates = await tx
+			.select({ id: issues.id, assignedTo: issues.assignedTo })
+			.from(issues)
+			.where(
+				and(
+					eq(issues.assigneeType, 'agent'),
+					sql`${issues.assignedTo} IS NOT NULL`,
+					or(isNull(issues.claimedAt), lt(issues.claimedAt, cutoff))
+				)
+			);
+
+		let releasedClaims = 0;
+
+		for (const candidate of candidates) {
+			if (!candidate.assignedTo) continue;
+
+			const recentActivity = await tx
+				.select({ id: issueActivity.id })
+				.from(issueActivity)
+				.where(
+					and(
+						eq(issueActivity.issueId, candidate.id),
+						eq(issueActivity.actorId, candidate.assignedTo),
+						gte(issueActivity.createdAt, cutoff)
+					)
+				)
+				.limit(1);
+
+			if (recentActivity.length > 0) continue;
+
+			const updated = await tx
+				.update(issues)
+				.set({ assigneeType: null, assignedTo: null, claimedAt: null })
+				.where(
+					and(
+						eq(issues.id, candidate.id),
+						eq(issues.assignedTo, candidate.assignedTo),
+						eq(issues.assigneeType, 'agent')
+					)
+				)
+				.returning({ id: issues.id });
+
+			if (updated.length === 0) continue;
+
+			await tx.insert(issueActivity).values({
+				issueId: candidate.id,
+				eventType: 'claim_released',
+				actorType: 'system',
+				actorId: 'sentinel-claim-reaper',
+				newValue: { previousAssignee: candidate.assignedTo, reason: 'stale' },
+			});
+
+			releasedClaims++;
+		}
+
+		return { releasedClaims, staleHours };
+	});
 }

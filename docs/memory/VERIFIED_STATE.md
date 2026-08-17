@@ -1782,6 +1782,73 @@ second org's credential sees nothing).
 
 ---
 
+## Agent-automation remediation (N7) VERIFIED 2026-08-14
+
+Fixes for the 15 confirmed + 2 refuted-but-real findings in
+`docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md` (branch `feat/agent-remediation`, commits
+`ebe6be8`..`faf6f34`, pre-merge). Full finding→outcome mapping is now a table at the top of that
+audit file; this entry summarizes what actually runs.
+
+- **N7a** (`eafb88c`, A01/A06/R2): processor `StoreEvent` writes a `created` issue_activity row on
+  race-exact new-issue detection (`RETURNING xmax=0`) and a throttled `occurrence_burst` row on
+  repeat occurrences (1/issue/`OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS`, default 1h). Migration
+  `1723400000` widens the `issue_activity` event-type CHECK (idempotent, replay-proven 3x).
+  New-service-error discovery via the events feed — the audit's near-blocker — now works; it did
+  not before this phase.
+- **N7b** (`fd752ee`, A02): `GET /api/agent/issues` gains `since`/`sort=firstSeen|lastSeen`/`limit`
+  (clamped `[1,200]`) + opaque keyset cursor on `(sortColumn, id)`. Omitting the new params keeps
+  the old unbounded `lastSeen`-desc behavior for compatibility.
+- **N7c** (`fd752ee`, A03/A04): `issues.claimed_at` + a stale-claim reaper in the retention cron
+  (`CLAIM_STALE_HOURS`, default 24, agent claims only, resets on any claimant activity); retention's
+  occurrence-less-deletion path now requires resolved/ignored AND unclaimed, so a claimed or
+  in-progress manual issue can no longer be silently deleted mid-triage.
+- **N7d** (`3661d96`, A05/A12/A13): exact-retry no-op on `updateIssueStatus` (`changed:false`, no
+  duplicate activity/notification); natural-key dedupe (2min window) on `createComment`/
+  `recordAgentProgress`, blocking questions excluded by design; idempotent `releaseClaim` (releasing
+  an already-unclaimed issue is 200, not 409); `caused_by` reverse-pair insert rejected 409
+  (2-cycle guard only, matches `duplicate_of`'s existing behavior).
+- **N7e** (`faf6f34`, A07–A09): `comments.edit`/`comments.delete` ops + route, ownership-gated
+  (403 wrong author, 404 cross-issue); `issues.report.severity` op (`user_report` only, 400 on
+  `system_error`); `claimedAt` exposed in agent list/detail + dashboard "agent working" badge
+  (UI-only, no new status — deliberate).
+- **N7f** (`faf6f34`, R1/A10/A11/A14/A15): `GET /api/agent/self` (identity + key metadata);
+  `POST /api/agent/key/rotate` (grace-window rotation, `AGENT_KEY_ROTATION_GRACE_HOURS`, revoked/
+  expired keys cannot rotate); `Retry-After` on 429 computed from the limiter's actual `resetAt`;
+  claim-conflict 409 bodies enriched with `claimedBy`/`claimedAt`; `DEPLOYMENT.md`
+  agent-provisioning runbook (A14 stays a documented one-time human bootstrap step, not a scripted
+  path); CLI `upload <file> --issue <id> [--comment <text>]` one-shot.
+
+Proved by running, 2026-08-14: `rtk go build ./... && rtk go vet ./...` clean;
+`rtk go test ./tests/unit/...` — 308 passed. Each phase's own commit message additionally records
+its adversarial validation (guard-deletion red-proofs per phase, migration replay 3x, dedupe
+boundary tests at t+119/t+121, revoked-key-cannot-rotate proof, batch enum exclusion of non-issue
+ops) — see the individual commit bodies for the full per-phase gate list; not independently
+re-run here beyond the build/vet/unit-test slice above.
+
+**Full-stack e2e re-proven 2026-08-15** against the rebuilt compose stack (N7a processor image +
+migrations 1723400000/1723500000 applied): `SENTINEL_E2E=1 M5_AGENT_INTEGRATION_REQUIRED=1
+INGESTOR_URL=http://localhost:18080 DASHBOARD_URL=http://localhost:13000 go test -tags=e2e
+./tests/e2e/ -count=1` — **81 passed / 0 failed / 0 skipped** (incl. new U38 discovery and U39
+lifecycle). TWO OPERATIONAL GOTCHAS discovered during this proof, both worth knowing:
+1. **`M5_AGENT_INTEGRATION_REQUIRED=1` is mandatory for the agent e2e suite** — without it every
+   agent test (U37–U39, M5 work-loop) SKIPS silently and the run still reports ok. A "green" e2e
+   run without that env proves nothing about the agent surface.
+2. **`error_class` values containing digit runs are normalized to `<NUMERIC_ID>`** by the
+   processor (fingerprint stability) — a test asserting round-trip equality must use an
+   alphabetic unique suffix (`alphaSuffix()` in tests/e2e/agent_n7_test.go), or it fails against
+   the masked value. This bit U38 on its first full-stack run.
+Also: on a machine where the compose project was created from a different worktree, `docker
+compose` from this worktree hangs forever waiting on `service_completed_successfully` init
+containers that only exist under the ORIGINAL project name — pass
+`COMPOSE_PROJECT_NAME=<original>` to join the existing project instead.
+
+`docs/agents/SENTINEL_AGENT_GUIDE.md` and
+`.agents/skills/sentinel-agent/SKILL.md` were re-read end-to-end against current routes/CLI on
+2026-08-14 (N7g) and found already consistent — both were kept current as part of N7e/N7f
+themselves, so no correction was needed at close-out.
+
+---
+
 ## Keep here
 
 - Observed runtime/build behavior with the command that produced it.

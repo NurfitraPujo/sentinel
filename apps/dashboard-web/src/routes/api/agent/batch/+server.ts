@@ -48,6 +48,10 @@ interface BatchResult {
 	result?: unknown;
 	error?: string;
 	skipped?: boolean;
+	// A11 (N7f): present only for claim/release conflict results -- see agent-ops.ts's
+	// `throwClaimConflict`.
+	claimedBy?: string | null;
+	claimedAt?: string | null;
 }
 
 function isBatchOperation(value: unknown): value is BatchOperation {
@@ -109,7 +113,17 @@ export const POST: RequestHandler = async (event) => {
 					typeof err.body === 'object' && err.body && 'message' in err.body
 						? String((err.body as { message: unknown }).message)
 						: 'Request failed';
-				results.push({ ok: false, status: err.status, error: message });
+				// A11 (N7f): claim/release 409s carry claimedBy/claimedAt on the error body
+				// (agent-ops.ts's `throwClaimConflict`) -- surface them in the batch result too, not
+				// just the single-route response, so a batch caller gets the same enrichment.
+				const extra =
+					typeof err.body === 'object' && err.body && ('claimedBy' in err.body || 'claimedAt' in err.body)
+						? {
+								claimedBy: ((err.body as { claimedBy?: unknown }).claimedBy ?? null) as string | null,
+								claimedAt: ((err.body as { claimedAt?: unknown }).claimedAt ?? null) as string | null,
+							}
+						: undefined;
+				results.push({ ok: false, status: err.status, error: message, ...extra });
 			} else {
 				results.push({ ok: false, status: 500, error: 'Internal error' });
 			}

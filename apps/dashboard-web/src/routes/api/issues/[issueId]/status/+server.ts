@@ -34,14 +34,16 @@ export const PATCH: RequestHandler = async ({ request, params, locals, url }) =>
 	// D10/D23: same role allowlist as the bulk endpoint, plus project membership.
 	await requireIssueAccess(userId, issueId, 'write');
 
-	const notified = await updateIssueStatus(
+	const { changed, notified } = await updateIssueStatus(
 		issueId,
 		status,
 		validatedResolvedInVersion ?? undefined,
 		'user',
 		userId
 	);
-	await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
+	if (changed) {
+		await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
+	}
 
-	return json({ success: true, status });
+	return json({ success: true, status, changed });
 };

@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getOrganizationApiKeys, createApiKey, rotateApiKey, revokeApiKey, type NatsPublisher } from './apikeys';
+import {
+	getOrganizationApiKeys,
+	createApiKey,
+	rotateApiKey,
+	revokeApiKey,
+	rotateAgentKeyWithGrace,
+	AgentKeyRotationError,
+	type NatsPublisher,
+} from './apikeys';
 import { db } from '../../server/db';
 
 vi.mock('../../server/db', () => {
@@ -141,5 +149,89 @@ describe('apikeys queries', () => {
 		expect((db as any).values).toHaveBeenCalledWith(
 			expect.objectContaining({ projectId: null, agentId: 'agent-1', scope: 'agent' })
 		);
+	});
+
+	// R1b (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): self-rotation with a grace
+	// window, deliberately NOT immediate revoke (see rotateAgentKeyWithGrace's doc comment for why
+	// this is a separate function from rotateApiKey rather than a variant).
+	describe('rotateAgentKeyWithGrace', () => {
+		it('sets the OLD key expires_at to now + graceHours, keeps status untouched, and returns a fresh secret', async () => {
+			const existingKey = {
+				id: 'key-1',
+				organizationId: 'org-1',
+				projectId: null,
+				name: 'agent key',
+				scope: 'agent',
+				rateLimitRpm: 5000,
+				agentId: 'agent-1',
+			};
+			(db as any).then.mockImplementationOnce((res: any) => res([existingKey])); // select existing
+			const updatedOldKey = { id: 'key-1', expiresAt: new Date('2026-08-15T00:00:00.000Z') };
+			(db as any).then.mockImplementationOnce((res: any) => res([updatedOldKey])); // update .returning()
+			const newKeyMock = { id: 'key-2', name: 'agent key', scope: 'agent', agentId: 'agent-1' };
+			(db as any).then.mockImplementationOnce((res: any) => res([newKeyMock])); // createApiKey .returning()
+			(db as any).then.mockImplementationOnce((res: any) => res([{ id: 'audit-1' }])); // createApiKey audit
+
+			const before = Date.now();
+			const result = await rotateAgentKeyWithGrace('key-1', 24);
+			const after = Date.now();
+
+			expect(result.oldKey).toEqual(updatedOldKey);
+			expect(result.newKey).toEqual(newKeyMock);
+			expect(result.secretToken).toMatch(/^sent_agent_[0-9a-f]{64}$/);
+
+			// The update call set expires_at to roughly now + 24h -- assert the SET payload directly
+			// rather than trusting `updatedOldKey`'s mocked .returning() value.
+			const setCall = (db as any).set.mock.calls.find(
+				(args: any[]) => args[0] && Object.prototype.hasOwnProperty.call(args[0], 'expiresAt')
+			);
+			expect(setCall).toBeDefined();
+			const setAt = (setCall![0].expiresAt as Date).getTime();
+			expect(setAt).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000 - 1000);
+			expect(setAt).toBeLessThanOrEqual(after + 24 * 60 * 60 * 1000 + 1000);
+			// Status is never touched by this path (unlike rotateApiKey's immediate revoke).
+			expect(setCall![0]).not.toHaveProperty('status');
+		});
+
+		it('graceHours=0 sets expires_at to (approximately) now — immediate expiry', async () => {
+			const existingKey = {
+				id: 'key-1',
+				organizationId: 'org-1',
+				projectId: null,
+				name: 'agent key',
+				scope: 'agent',
+				rateLimitRpm: 5000,
+				agentId: 'agent-1',
+			};
+			(db as any).then.mockImplementationOnce((res: any) => res([existingKey]));
+			(db as any).then.mockImplementationOnce((res: any) => res([{ id: 'key-1', expiresAt: new Date() }]));
+			(db as any).then.mockImplementationOnce((res: any) => res([{ id: 'key-2' }]));
+			(db as any).then.mockImplementationOnce((res: any) => res([{ id: 'audit-1' }]));
+
+			const before = Date.now();
+			await rotateAgentKeyWithGrace('key-1', 0);
+			const after = Date.now();
+
+			const setCall = (db as any).set.mock.calls.find(
+				(args: any[]) => args[0] && Object.prototype.hasOwnProperty.call(args[0], 'expiresAt')
+			);
+			const setAt = (setCall![0].expiresAt as Date).getTime();
+			expect(setAt).toBeGreaterThanOrEqual(before - 1000);
+			expect(setAt).toBeLessThanOrEqual(after + 1000);
+		});
+
+		it('throws AgentKeyRotationError for an unknown key', async () => {
+			(db as any).then.mockImplementationOnce((res: any) => res([])); // select: not found
+
+			await expect(rotateAgentKeyWithGrace('missing', 24)).rejects.toBeInstanceOf(AgentKeyRotationError);
+		});
+
+		it('throws AgentKeyRotationError for a non-agent-scoped key', async () => {
+			(db as any).then.mockImplementationOnce((res: any) =>
+				res([{ id: 'key-1', scope: 'ingest', agentId: null, organizationId: 'org-1' }])
+			);
+
+			await expect(rotateAgentKeyWithGrace('key-1', 24)).rejects.toBeInstanceOf(AgentKeyRotationError);
+		});
 	});
 });

@@ -1,6 +1,6 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
-import { cleanupRetainedData } from '$lib/server/retention';
+import { cleanupRetainedData, reapStaleClaims } from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
 import { env } from '$env/dynamic/private';
@@ -27,11 +27,13 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	const retentionDays = parseInt(env.DATA_RETENTION_DAYS ?? '30', 10);
+	const manualRetentionDays = parseInt(env.MANUAL_ISSUE_RETENTION_DAYS ?? '365', 10);
+	const claimStaleHours = parseInt(env.CLAIM_STALE_HOURS ?? '24', 10);
 
-	log.info('retention_cron.started', { retentionDays });
+	log.info('retention_cron.started', { retentionDays, manualRetentionDays, claimStaleHours });
 
 	try {
-		const result = await cleanupRetainedData(retentionDays);
+		const result = await cleanupRetainedData(retentionDays, manualRetentionDays);
 
 		// D42: sweep expired pending invitations across every organization. The per-org reaper only
 		// fires when that org issues another invitation, so an org that stops inviting never reaps.
@@ -43,9 +45,13 @@ export const POST: RequestHandler = async ({ request }) => {
 		// across every org, driven by this existing scheduled job rather than a second cron route.
 		const reapedAttachments = await reapAllOrphanAttachments();
 
+		// N7c (A03): same piggyback again -- force-release agent claims an unattended loop abandoned.
+		const claimReap = await reapStaleClaims(claimStaleHours);
+
 		log.info('retention_cron.completed', {
 			reapedInvitations,
 			reapedAttachments,
+			releasedClaims: claimReap.releasedClaims,
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			cutoffDate: result.cutoffDate.toISOString(),
@@ -56,9 +62,11 @@ export const POST: RequestHandler = async ({ request }) => {
 			result: {
 				reapedInvitations,
 				reapedAttachments,
+				releasedClaims: claimReap.releasedClaims,
 				deletedOccurrences: result.deletedOccurrences,
 					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				retentionDays: result.retentionDays,
+				manualRetentionDays: result.manualRetentionDays,
 				cutoffDate: result.cutoffDate.toISOString(),
 			},
 		});

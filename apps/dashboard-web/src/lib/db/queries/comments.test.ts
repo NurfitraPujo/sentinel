@@ -43,7 +43,17 @@ function makeTx() {
 	const tx: any = {
 		select: vi.fn(() => ({
 			from: vi.fn(() => ({
-				where: vi.fn(() => Promise.resolve(selectQueue.shift() ?? [])),
+				where: vi.fn(() => {
+					// A05-comment's dedupe SELECT chains `.orderBy()` after `.where()`; every other
+					// select in this module bare-awaits `.where()` directly. Support both off the same
+					// queue by making `.where()`'s return value BOTH thenable (resolves the next queued
+					// result) AND carry `.orderBy()` (which resolves that same next queued result).
+					const result = selectQueue.shift() ?? [];
+					return {
+						orderBy: vi.fn(() => Promise.resolve(result)),
+						then: (resolve: any) => resolve(result),
+					};
+				}),
 			})),
 		})),
 		insert: vi.fn((table: unknown) => ({
@@ -121,7 +131,8 @@ describe('createComment', () => {
 	it('creates a root comment and writes exactly one "commented" activity row', async () => {
 		txHandle.selectQueue.push(
 			[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }], // issue lookup
-			[{ organizationId: 'org-1' }] // project lookup
+			[{ organizationId: 'org-1' }], // project lookup
+			[] // A05-comment dedupe check: no identical recent comment
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
 
@@ -156,7 +167,8 @@ describe('createComment', () => {
 		txHandle.selectQueue.push(
 			[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
 			[{ organizationId: 'org-1' }],
-			[{ id: 'reply-1', issueId: 'issue-1', parentId: 'root-1' }] // parentId names a REPLY
+			[{ id: 'reply-1', issueId: 'issue-1', parentId: 'root-1' }], // parentId names a REPLY
+			[] // A05-comment dedupe check: no identical recent comment
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-2', issueId: 'issue-1', parentId: 'root-1' }]);
 
@@ -202,7 +214,8 @@ describe('createComment', () => {
 	it('claims draft attachments onto the new comment via claimDraftAttachmentsForComment', async () => {
 		txHandle.selectQueue.push(
 			[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
-			[{ organizationId: 'org-1' }]
+			[{ organizationId: 'org-1' }],
+			[] // A05-comment dedupe check: no identical recent comment
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
 		claimDraftAttachmentsForComment.mockResolvedValueOnce([{ id: 'att-1' }]);
@@ -232,7 +245,8 @@ describe('createComment', () => {
 	it('Q11: a USER reply clears a pending waiting_on and writes question_answered', async () => {
 		txHandle.selectQueue.push(
 			[{ id: 'issue-1', projectId: 'project-1', waitingOn: 'reporter' }],
-			[{ organizationId: 'org-1' }]
+			[{ organizationId: 'org-1' }],
+			[] // A05-comment dedupe check: no identical recent comment
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
 
@@ -256,7 +270,8 @@ describe('createComment', () => {
 	it('an AGENT reply does NOT clear waiting_on (only a human reply unblocks)', async () => {
 		txHandle.selectQueue.push(
 			[{ id: 'issue-1', projectId: 'project-1', waitingOn: 'team' }],
-			[{ organizationId: 'org-1' }]
+			[{ organizationId: 'org-1' }],
+			[] // A05-comment dedupe check: no identical recent comment
 		);
 		txHandle.insertReturningQueue.push([{ id: 'comment-1', issueId: 'issue-1', parentId: null }]);
 
@@ -269,6 +284,83 @@ describe('createComment', () => {
 
 		expect(txHandle.updateCalls).toHaveLength(0);
 		expect(txHandle.insertCalls).toHaveLength(2); // comment + commented activity only
+	});
+
+	describe('A05-comment dedupe window (N7d)', () => {
+		// Guard-deletion red-proof: delete the dedupe SELECT/early-return in createComment and this
+		// fails, because a second insertReturningQueue entry and a real second row would be produced.
+		it('an identical retry within the window returns the existing row and inserts nothing new', async () => {
+			const existingRow = {
+				id: 'comment-1',
+				issueId: 'issue-1',
+				parentId: null,
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'Investigating.',
+				blocking: false,
+				createdAt: new Date(),
+				editedAt: null,
+			};
+			txHandle.selectQueue.push(
+				[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }], // issue lookup
+				[{ organizationId: 'org-1' }], // project lookup
+				[existingRow] // dedupe check: an identical recent comment already exists
+			);
+
+			const { comment, notified } = await createComment({
+				issueId: 'issue-1',
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'Investigating.',
+			});
+
+			expect(comment).toEqual(existingRow);
+			expect(notified).toEqual([]);
+			expect(txHandle.insertCalls).toHaveLength(0);
+		});
+
+		it('a DIFFERENT body from the same author is not deduped', async () => {
+			txHandle.selectQueue.push(
+				[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
+				[{ organizationId: 'org-1' }],
+				[] // dedupe check finds nothing (different body -- the WHERE excludes it)
+			);
+			txHandle.insertReturningQueue.push([{ id: 'comment-2', issueId: 'issue-1', parentId: null }]);
+
+			await createComment({
+				issueId: 'issue-1',
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'A new, different update.',
+			});
+
+			expect(txHandle.insertCalls.length).toBeGreaterThan(0);
+		});
+
+		it('a blocking question is NEVER deduped, even if identical to a recent one -- waiting_on side effects must be predictable', async () => {
+			txHandle.selectQueue.push(
+				[{ id: 'issue-1', projectId: 'project-1', waitingOn: null }],
+				[{ organizationId: 'org-1' }]
+				// No dedupe select pushed at all: blocking:true must skip the dedupe check entirely,
+				// so if the guard were wrongly applied here, this test would consume a select() that
+				// doesn't exist and fail loudly rather than silently passing.
+			);
+			txHandle.insertReturningQueue.push([
+				{ id: 'comment-3', issueId: 'issue-1', parentId: null, blocking: true },
+			]);
+
+			const { comment } = await createComment({
+				issueId: 'issue-1',
+				authorType: 'agent',
+				authorId: 'agent-1',
+				bodyMd: 'Which environment is this in?',
+				blocking: true,
+				waitingOnAudience: 'reporter',
+			});
+
+			expect(comment).toMatchObject({ id: 'comment-3', blocking: true });
+			expect(txHandle.insertCalls[0].values).toMatchObject({ blocking: true });
+		});
 	});
 
 	describe('M5 blocking questions (§7 step 4, Q11)', () => {

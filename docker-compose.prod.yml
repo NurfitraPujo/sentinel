@@ -18,7 +18,8 @@
 #   POSTGRES_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY, S3_PUBLIC_ENDPOINT,
 #   AUTH_SECRET, AUTH_URL, SETTINGS_ENCRYPTION_KEY, CRON_SECRET, EMAIL_SERVER, EMAIL_FROM
 # Optional: REDIS_PASSWORD, OTEL_EXPORTER_OTLP_ENDPOINT, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-#           S3_BUCKET (default sentinel-attachments), DATA_RETENTION_DAYS (default 30)
+#           S3_BUCKET (default sentinel-attachments), DATA_RETENTION_DAYS (default 30),
+#           MANUAL_ISSUE_RETENTION_DAYS (default 365), CLAIM_STALE_HOURS (default 24)
 #
 # Bring up:  docker compose -f docker-compose.prod.yml --env-file .env up -d --build
 
@@ -276,6 +277,8 @@ services:
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY (32 chars)}
       CRON_SECRET: ${CRON_SECRET:?set CRON_SECRET}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
+      MANUAL_ISSUE_RETENTION_DAYS: ${MANUAL_ISSUE_RETENTION_DAYS:-365}
+      CLAIM_STALE_HOURS: ${CLAIM_STALE_HOURS:-24}
     deploy:
       resources:
         limits: { cpus: "1", memory: 768M }

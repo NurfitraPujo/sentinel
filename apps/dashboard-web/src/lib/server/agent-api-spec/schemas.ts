@@ -57,6 +57,9 @@ export const IssueRowSchema = z
 		lastSeen: z.coerce.date().nullable(),
 		count: z.number(),
 		waitingOn: z.string().nullable(),
+		// N7e (A07): when the CURRENT claim (assigneeType/assignedTo) was made -- null if unclaimed
+		// or claimed before the 1723500000_add_claimed_at.sql backfill (N7c).
+		claimedAt: z.coerce.date().nullable(),
 	})
 	.strict();
 
@@ -87,10 +90,17 @@ export const AgentIssueListItemSchema = z
 		severity: z.string().nullable(),
 		reporterId: z.string().nullable(),
 		isWaiting: z.boolean(),
+		// N7e (A07): see IssueRowSchema's claimedAt note.
+		claimedAt: z.coerce.date().nullable(),
 	})
 	.strict();
 
-export const ListIssuesResponseSchema = z.object({ issues: z.array(AgentIssueListItemSchema) }).strict();
+// N7b (A02): `nextCursor` is present ONLY when the request supplied `limit` and more rows exist
+// beyond this page -- absent (not null) otherwise, matching the route's byte-identical-when-
+// absent contract for pre-N7b callers.
+export const ListIssuesResponseSchema = z
+	.object({ issues: z.array(AgentIssueListItemSchema), nextCursor: z.string().optional() })
+	.strict();
 
 export const ListIssuesQuerySchema = z
 	.object({
@@ -98,6 +108,14 @@ export const ListIssuesQuerySchema = z
 		claimed: z.enum(['true', 'false']).optional(),
 		project: z.string().optional(),
 		waiting: z.enum(['true', 'false']).optional(),
+		/** ISO timestamp; only issues with firstSeen >= since. */
+		since: z.string().optional(),
+		/** Default 'lastSeen' (pre-N7b ordering) when omitted. */
+		sort: z.enum(['firstSeen', 'lastSeen']).optional(),
+		/** No `.limit()` applied when omitted (legacy unbounded). 1..200 when supplied. */
+		limit: z.coerce.number().int().min(1).max(200).optional(),
+		/** Opaque keyset cursor from a prior response's `nextCursor`. */
+		cursor: z.string().optional(),
 	})
 	.strict();
 
@@ -171,6 +189,14 @@ export const OccurrencesResponseSchema = z.object({ occurrences: z.array(AgentOc
 export const ClaimResponseSchema = z.object({ success: z.literal(true), issue: IssueRowSchema }).strict();
 export const ReleaseResponseSchema = z.object({ success: z.literal(true), issue: IssueRowSchema }).strict();
 
+/**
+ * A11 (N7f): claim/release's 409 -- enriched with the current claim state (`throwClaimConflict`
+ * in agent-ops.ts) so a caller can see WHO holds the claim without a second read.
+ */
+export const ClaimConflictErrorSchema = z
+	.object({ message: z.string(), claimedBy: z.string().nullable(), claimedAt: z.string().nullable() })
+	.strict();
+
 // ---------------------------------------------------------------------------
 // PATCH /api/agent/issues/{issueId}/status -- agent-ops.ts's `issuesStatus`
 // ---------------------------------------------------------------------------
@@ -182,8 +208,16 @@ export const StatusBodySchema = z
 	})
 	.strict();
 
+// N7d (A05-status): `changed` is additive -- `false` means this call was recognized as an exact
+// retry of the already-applied status (same status AND same resolved_in_version): no new
+// issue_activity row, no notification email. `true` is the normal, real-transition path
+// (unchanged from before this field existed).
 export const StatusResponseSchema = z
-	.object({ success: z.literal(true), status: z.enum(['unresolved', 'resolved', 'ignored']) })
+	.object({
+		success: z.literal(true),
+		status: z.enum(['unresolved', 'resolved', 'ignored']),
+		changed: z.boolean(),
+	})
 	.strict();
 
 // ---------------------------------------------------------------------------
@@ -215,6 +249,28 @@ export const PostCommentBodySchema = z
 	.strict();
 
 export const PostCommentResponseSchema = z.object({ comment: CommentRowSchema }).strict();
+
+// ---------------------------------------------------------------------------
+// PATCH/DELETE /api/agent/issues/{issueId}/comments/{commentId} -- A08 (N7e), agent-ops.ts's
+// `issuesCommentsEdit`/`issuesCommentsDelete`
+// ---------------------------------------------------------------------------
+
+export const EditCommentBodySchema = z.object({ body_md: z.string() }).strict();
+export const EditCommentResponseSchema = z.object({ comment: CommentRowSchema }).strict();
+export const DeleteCommentResponseSchema = z.object({ success: z.literal(true), issueId: z.string() }).strict();
+
+// ---------------------------------------------------------------------------
+// PATCH /api/agent/issues/{issueId}/report/severity -- A09 (N7e), agent-ops.ts's
+// `issuesReportSeverity`
+// ---------------------------------------------------------------------------
+
+export const SeverityBodySchema = z
+	.object({ severity: z.enum(['low', 'medium', 'high', 'critical']) })
+	.strict();
+
+export const SeverityResponseSchema = z
+	.object({ success: z.literal(true), severity: z.enum(['low', 'medium', 'high', 'critical']).optional() })
+	.strict();
 
 // ---------------------------------------------------------------------------
 // POST /api/agent/issues/{issueId}/questions
@@ -288,7 +344,7 @@ export const EventsQuerySchema = z
 export const OrgActivityEventSchema = z
 	.object({
 		seq: z.number(),
-		eventType: z.string(),
+		eventType: AgentEventTypeSchema,
 		actorType: z.enum(['user', 'agent', 'system']),
 		actorId: z.string(),
 		oldValue: z.unknown(),
@@ -339,6 +395,9 @@ export const BatchOperationSchema = z
 			'issues.claim',
 			'issues.claim.release',
 			'issues.comment',
+			'comments.edit',
+			'comments.delete',
+			'issues.report.severity',
 			'issues.progress',
 			'issues.relations.add',
 			'issues.relations.remove',
@@ -362,6 +421,9 @@ export const BatchResultSchema = z
 		result: z.unknown().optional(),
 		error: z.string().optional(),
 		skipped: z.boolean().optional(),
+		// A11 (N7f): present only for a claim/release conflict result.
+		claimedBy: z.string().nullable().optional(),
+		claimedAt: z.string().nullable().optional(),
 	})
 	.strict();
 
@@ -373,3 +435,37 @@ export const BatchResponseSchema = z
 	.strict();
 
 export const BatchValidationErrorSchema = z.object({ message: z.string() }).strict();
+
+// ---------------------------------------------------------------------------
+// GET /api/agent/self -- R1a (N7f)
+// ---------------------------------------------------------------------------
+
+export const SelfResponseSchema = z
+	.object({
+		agentId: z.string(),
+		name: z.string(),
+		organizationId: z.string(),
+		key: z
+			.object({
+				id: z.string(),
+				prefix: z.string(),
+				expiresAt: z.string().nullable(),
+				// project_api_keys tracks no last-used timestamp (N7f R1 note) -- always null today,
+				// kept in the shape so a future column addition doesn't break this contract.
+				lastUsedAt: z.string().nullable(),
+			})
+			.strict(),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
+// POST /api/agent/key/rotate -- R1b (N7f)
+// ---------------------------------------------------------------------------
+
+export const KeyRotateResponseSchema = z
+	.object({
+		success: z.literal(true),
+		oldKey: z.object({ id: z.string(), expiresAt: z.string().nullable() }).strict(),
+		newKey: z.object({ id: z.string(), prefix: z.string(), secret: z.string() }).strict(),
+	})
+	.strict();

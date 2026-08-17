@@ -30,6 +30,17 @@ export interface AgentAuthContext {
 	agentName: string;
 	/** First 12 chars of the raw key hash -- never the raw secret -- for audit metadata (Q5). */
 	keyPrefixForAudit: string;
+	/**
+	 * R1a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): the authenticated key's own row
+	 * id/prefix/expiry, carried through from the SAME `project_api_keys` lookup this function
+	 * already does -- GET /api/agent/self reads these off the context instead of re-querying.
+	 * `keyPrefix` here is the real, displayable `project_api_keys.key_prefix` column (e.g.
+	 * "sent_agent_"), NOT `keyPrefixForAudit` above (which is a hash fragment, never shown to a
+	 * caller).
+	 */
+	keyId: string;
+	keyPrefix: string;
+	keyExpiresAt: Date | null;
 }
 
 /**
@@ -73,6 +84,7 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 			revokedAt: projectApiKeys.revokedAt,
 			agentId: projectApiKeys.agentId,
 			rateLimitRpm: projectApiKeys.rateLimitRpm,
+			keyPrefix: projectApiKeys.keyPrefix,
 		})
 		.from(projectApiKeys)
 		.where(eq(projectApiKeys.keyHash, keyHash));
@@ -137,5 +149,8 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 		organizationId: keyRow.organizationId,
 		agentName: agentRow.name,
 		keyPrefixForAudit: keyHash.slice(0, 12),
+		keyId: keyRow.id,
+		keyPrefix: keyRow.keyPrefix,
+		keyExpiresAt: keyRow.expiresAt,
 	};
 }

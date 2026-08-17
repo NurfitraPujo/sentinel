@@ -23,6 +23,9 @@ export interface AgentIssueDetail {
 	sourceChannel: string;
 	assigneeType: string | null;
 	assignedTo: string | null;
+	/** N7e (A07): when the CURRENT claim was made -- null if unclaimed. Already present on the raw
+	 *  row (`db.select().from(issues)` is a full-row select); this only widens the declared type. */
+	claimedAt: Date | null;
 	resolvedInVersion: string | null;
 	resolvedAt: Date | null;
 	resolvedByType: string | null;

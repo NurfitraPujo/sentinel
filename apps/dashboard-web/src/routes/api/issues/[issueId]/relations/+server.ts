@@ -2,7 +2,7 @@ import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { issues, projects, issueRelations } from '$lib/db/schema';
-import { createIssueRelation, deleteIssueRelation } from '$lib/db/queries/issues';
+import { createIssueRelation, deleteIssueRelation, RelationCycleError } from '$lib/db/queries/issues';
 import { requireIssueAccess } from '$lib/server/issue-access';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
 import { eq, and } from 'drizzle-orm';
@@ -127,6 +127,12 @@ export const POST: RequestHandler = async ({ request, params, locals, url }) => 
 		await sendIssueNotificationEmails(notified, { issueId: sourceIssueId, origin: url.origin });
 		return json(relation, { status: 201 });
 	} catch (err: unknown) {
+		// A12 (N7d): createIssueRelation's own reverse-pair guard for `caused_by` (mirrors the
+		// duplicate_of check above, but lives in the query layer so this route and the agent op both
+		// get it) -- surfaced the same way as the other relation conflicts, 409.
+		if (err instanceof RelationCycleError) {
+			throw error(409, err.message);
+		}
 		// 23505 = Postgres unique_violation. Covers both an exact re-link (source, target, type
 		// already exists via issue_relations_unique) and, for duplicate_of, the inverse-cycle check
 		// above having raced -- surface both as 409 rather than an unhandled 500.

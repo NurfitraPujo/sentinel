@@ -48,17 +48,22 @@ if it finds the file group- or world-readable.
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` | releases only YOUR OWN claim |
 | `sentinel status <issueId> <unresolved\|resolved\|ignored> [--resolved-in VERSION]` | `PATCH /api/agent/issues/:id/status` | |
 | `sentinel comment <issueId> --body <md> [--parent <id>] [--attachment <id> ...]` | `POST /api/agent/issues/:id/comments` | see mismatch note below re. `--parent` |
+| `sentinel comment edit <issueId> <commentId> --body <md>` | `PATCH /api/agent/issues/:id/comments/:commentId` | own comment only; 403 otherwise |
+| `sentinel comment delete <issueId> <commentId>` | `DELETE /api/agent/issues/:id/comments/:commentId` | own comment only; 403 otherwise |
 | `sentinel comments <issueId> [--after <ts>]` | `GET /api/agent/issues/:id/comments` | poll this for replies to a question |
 | `sentinel question <issueId> --body <md> --waiting-on <reporter\|team>` | `POST /api/agent/issues/:id/questions` | blocking; sets `issues.waiting_on` |
 | `sentinel progress <issueId> --body <md>` | `POST /api/agent/issues/:id/progress` | in-app only, no email |
+| `sentinel severity <issueId> <low\|medium\|high\|critical>` | `PATCH /api/agent/issues/:id/report/severity` | `user_report` issues only; 400 on `system_error` |
 | `sentinel link <issueId> <targetIssueId> --type <linked_to\|caused_by\|duplicate_of>` | `POST /api/agent/issues/:id/relations` | |
 | `sentinel unlink <issueId> <targetIssueId> --type <...>` | `DELETE /api/agent/issues/:id/relations` | see mismatch note below |
 | `sentinel projects` | `GET /api/agent/projects` | |
-| `sentinel whoami` | `GET /api/agent/issues` (probe) | see mismatch note below |
+| `sentinel whoami` | `GET /api/agent/self` | prints agentId/name/organizationId + key id/prefix/expiresAt |
+| `sentinel key rotate` | `POST /api/agent/key/rotate` | mints a new secret, prints it to stdout ONCE; old key stays valid for its grace window |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` | one page |
 | `sentinel events --follow [--interval SEC]` | polls `GET /api/agent/events` | NDJSON to stdout, cursor persisted |
 | `sentinel batch -f ops.json\|- [--stop-on-error=false]` | `POST /api/agent/batch` | up to 20 ops, one round trip |
-| `sentinel upload <issueId> <file>` | `POST /api/agent/uploads` (multipart) | see mismatch note below |
+| `sentinel upload <file> --issue <id> [--comment <text>]` | `POST /api/agent/uploads` then `POST /api/agent/issues/:id/comments` | one-shot upload + attach-to-comment |
+| `sentinel upload <issueId> <file>` | `POST /api/agent/uploads` (multipart) | deprecated two-positional form; see mismatch note below |
 
 Global flags (`-url`, `-key`, `-format json|table`) go **before** the subcommand name; every
 per-command flag is accepted either before or after its positional arguments.
@@ -96,17 +101,18 @@ the CLI and server disagreed, the server won:
   endpoint. `DELETE /api/agent/issues/:id/relations` (`issuesRelationsRemove`) identifies the
   relation to remove the same way `link` identifies one to create — `{target_issue_id,
   relation_type}` — not by the relation row's own id.
-- **`whoami`**: no `/api/agent/*` route echoes back agent/org identity. `authenticateAgentRequest`
-  (`agent-auth.ts`) resolves an `AgentAuthContext` server-side but nothing returns it to the
-  caller. `whoami` is implemented as an auth probe: it calls `GET /api/agent/issues` and reports
-  reachability plus the configured URL and key prefix. A 401/403 means the key is wrong, revoked,
-  or expired; a 2xx means the key authenticates, but this command cannot tell you which agent or
-  org it authenticated as.
-- **`upload <issueId> <file>`**: `POST /api/agent/uploads` takes no `issueId` — the uploaded
-  attachment row is inserted with `issue_id = NULL` and is only associated with an issue later, by
-  passing the returned attachment id to `comment --attachment <id>`. The `<issueId>` positional
-  here exists only for symmetry with every other issue-scoped command; it is never sent to the
-  server.
+- **`whoami`** (resolved in N7f, R1): `GET /api/agent/self` now exists and returns
+  `{agentId, name, organizationId, key: {id, prefix, expiresAt, lastUsedAt}}` — `whoami` calls it
+  directly and prints the real identity. `lastUsedAt` is always `null`: `project_api_keys` tracks
+  no such column; this is documented in the response shape, not a bug.
+- **`upload <issueId> <file>`** (resolved in N7f, A15, for the common case): `POST
+  /api/agent/uploads` still takes no `issueId` itself — the uploaded attachment row is still
+  inserted with `issue_id = NULL`. But `sentinel upload <file> --issue <id> [--comment <text>]`
+  now chains the follow-up `POST /api/agent/issues/:id/comments` call with
+  `attachment_ids: [<uploaded id>]` for you, in one command. The OLD two-positional form
+  (`sentinel upload <issueId> <file>`, no flags) is still accepted for backward compatibility — it
+  performs a plain upload with no follow-up comment, and the `issueId` is still silently ignored,
+  exactly as before — but now prints a deprecation warning pointing at the flag form.
 
 ## Example: a triage loop
 

@@ -75,7 +75,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 			'200': S.ClaimResponseSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
-			'409': S.MessageErrorSchema,
+			'409': S.ClaimConflictErrorSchema,
 		},
 	},
 	{
@@ -83,12 +83,13 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'delete',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',
 		operationId: 'releaseClaim',
-		summary: "Release your own claim (no-op-safe; cannot release another agent's claim)",
+		summary:
+			"Release your own claim (idempotent: releasing an already-unclaimed issue returns 200, not 409; cannot release another agent's claim)",
 		responses: {
 			'200': S.ReleaseResponseSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
-			'409': S.MessageErrorSchema,
+			'409': S.ClaimConflictErrorSchema,
 		},
 	},
 	{
@@ -96,7 +97,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'patch',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/status/+server.ts',
 		operationId: 'updateIssueStatus',
-		summary: 'Change issue status',
+		summary:
+			'Change issue status (idempotent: retrying the same status+resolved_in_version returns changed:false, no duplicate activity/notification)',
 		request: { bodySchema: S.StatusBodySchema },
 		responses: {
 			'200': S.StatusResponseSchema,
@@ -128,6 +130,48 @@ export const agentApiRegistry: RegistryEntry[] = [
 		request: { bodySchema: S.PostCommentBodySchema },
 		responses: {
 			'201': S.PostCommentResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/issues/{issueId}/comments/{commentId}',
+		method: 'patch',
+		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/[commentId]/+server.ts',
+		operationId: 'editComment',
+		summary: 'Edit your own comment (403 for another author, agent or human)',
+		request: { bodySchema: S.EditCommentBodySchema },
+		responses: {
+			'200': S.EditCommentResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'403': S.MessageErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/issues/{issueId}/comments/{commentId}',
+		method: 'delete',
+		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/[commentId]/+server.ts',
+		operationId: 'deleteComment',
+		summary: 'Delete your own comment (403 for another author, agent or human)',
+		responses: {
+			'200': S.DeleteCommentResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'403': S.MessageErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/issues/{issueId}/report/severity',
+		method: 'patch',
+		routeFile: 'src/routes/api/agent/issues/[issueId]/report/severity/+server.ts',
+		operationId: 'updateReportSeverity',
+		summary: 'Set the severity of a user_report issue (400 for a system_error issue)',
+		request: { bodySchema: S.SeverityBodySchema },
+		responses: {
+			'200': S.SeverityResponseSchema,
 			'400': S.MessageErrorSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
@@ -166,7 +210,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/relations/+server.ts',
 		operationId: 'addRelation',
-		summary: 'Add a relation from this issue to another',
+		summary:
+			"Add a relation from this issue to another (409 for an exact duplicate; also 409 for caused_by if the REVERSE pair already exists -- would create a 2-cycle)",
 		request: { bodySchema: S.RelationBodySchema },
 		responses: {
 			'201': S.RelationRowSchema,
@@ -227,6 +272,30 @@ export const agentApiRegistry: RegistryEntry[] = [
 			'413': S.MessageErrorSchema,
 			'415': S.MessageErrorSchema,
 			'503': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/self',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/self/+server.ts',
+		operationId: 'getSelf',
+		summary: 'Identity of the calling key: agent, org, and the key row itself',
+		responses: {
+			'200': S.SelfResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/key/rotate',
+		method: 'post',
+		routeFile: 'src/routes/api/agent/key/rotate/+server.ts',
+		operationId: 'rotateKey',
+		summary:
+			'Rotate the calling key: mints a new secret, keeps the old key valid for AGENT_KEY_ROTATION_GRACE_HOURS (default 24, 0 = immediate)',
+		responses: {
+			'200': S.KeyRotateResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
 		},
 	},
 	{

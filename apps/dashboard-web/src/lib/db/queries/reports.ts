@@ -505,6 +505,10 @@ export interface UpdateManualIssueReportInput {
 	title?: string;
 	bodyMd?: string;
 	severity?: ReportSeverity;
+	/** N7e (A09): who made this edit, for the `report_edited` activity row's `actorType`. Defaults
+	 *  to 'user' -- every pre-existing caller (the session-authenticated route) is a user and must
+	 *  keep attributing edits to 'user' unchanged; only the agent severity op passes 'agent'. */
+	actorType?: 'user' | 'agent';
 }
 
 /**
@@ -563,7 +567,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			await tx.insert(issueActivity).values({
 				issueId: input.issueId,
 				eventType: 'report_edited',
-				actorType: 'user',
+				actorType: input.actorType ?? 'user',
 				actorId: input.actorId,
 				oldValue,
 				newValue,
@@ -645,7 +649,7 @@ export async function claimIssue(
 	return await db.transaction(async (tx) => {
 		const updated = await tx
 			.update(issues)
-			.set({ assigneeType: actorType, assignedTo: actorId })
+			.set({ assigneeType: actorType, assignedTo: actorId, claimedAt: new Date() })
 			.where(and(eq(issues.id, issueId), isNull(issues.assignedTo)))
 			.returning();
 
@@ -714,11 +718,22 @@ export async function releaseClaim(
 
 		const updated = await tx
 			.update(issues)
-			.set({ assigneeType: null, assignedTo: null })
+			.set({ assigneeType: null, assignedTo: null, claimedAt: null })
 			.where(whereClause)
 			.returning();
 
 		if (updated.length === 0) {
+			// A13 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): 0 rows updated used to always
+			// mean ClaimConflictError, which made a plain network retry of a SUCCESSFUL release
+			// (response dropped, agent retries) wire-indistinguishable from someone else actually
+			// holding the issue. Re-read to tell the two apart: if the issue is simply unclaimed now
+			// (by anyone), the release already happened -- idempotent success, no second activity row,
+			// no second notification. Only "claimed by someone/something else" (or force's target row
+			// having vanished entirely) is a real conflict.
+			const [current] = await tx.select().from(issues).where(eq(issues.id, issueId));
+			if (current && current.assignedTo === null) {
+				return { issue: current, notified: [] };
+			}
 			throw new ClaimConflictError('Issue is not claimed by this actor');
 		}
 

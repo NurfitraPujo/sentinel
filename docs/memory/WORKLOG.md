@@ -333,3 +333,51 @@ has no consumer, drain, or dashboard surface yet.
   note these are *findings*, unrelated to `DECISIONS.md`'s D1–D18 *decisions*),
   `docs/memory/VERIFIED_STATE.md` → "UI parity remediation", `docs/memory/BUGS.md` B10 addendum, B12,
   B13, `docs/memory/DECISIONS.md` D17 and D18.
+
+---
+
+### 2026-08-14 - Agent-Automation Audit Found the Product Working But Undiscoverable: an Adversarially-Verified Blocker List, and Four Durable Lessons From Closing It
+
+- **Why durable**: A 5-lens audit of the freshly-merged agent-native layer (N1–N6) found no single
+  blocker, but two majors — no `created`/repeat-occurrence events (A01/A02) — combined into a
+  near-blocker: brand-new service errors were silently invisible to event-driven discovery, the exact
+  use case the layer exists for. The audit's own method (every raw finding adversarially
+  re-verified by a separate reviewer instructed to refute it) downgraded 7 of 22 raw findings and
+  recalibrated several severities — treat "blocker" claims in any future audit as provisional until
+  a refuter has tried to kill them; this one records both the finding AND the refutation note for
+  each surviving item, not just the conclusion.
+- **Future mistake prevented — events-feed coverage must be re-audited whenever a new issue-mutating
+  writer is added.** A01's root cause was structural, not a bug: `StoreEvent`'s new-issue branch
+  simply never wrote an `issue_activity` row, and the value that would have driven it
+  (`IssueOutcomeNew`) was already computed and explicitly documented as "consumed by nobody"
+  (store.go:309) — a correct-looking, fully-tested function whose result nobody downstream reads is
+  a standing invitation for exactly this gap. Any future writer that mutates `issues`/creates new
+  ones outside `StoreEvent` (a bulk-import path, an admin merge tool, a future ingestion source)
+  must be checked against the events feed the same way, not assumed to inherit coverage.
+- **Future mistake prevented — "claim" is advisory, not a lock, and that is a deliberate, documented
+  contract, not a bug to eventually fix.** A11 found no mutation handler checks `assignedTo` against
+  the caller; N7 did not add that check on purpose (agent-ops.ts's own handlers now log a structured
+  `agent.mutated_claimed_issue` warning instead) — enforcing it would silently change what "any org
+  agent can act like any other" already means for human collaborators on the same issue, which this
+  product never enforced either. If a future need for real mutual exclusion appears, the correct
+  primitive is claim/release's atomic 409 (already race-safe), not retrofitting an ownership check
+  onto every other mutation.
+- **Future mistake prevented — the retention/reaper pattern for anything that can go stale
+  unattended.** A03 (stuck claims) and A04 (retention deleting claimed manual issues) were the same
+  underlying gap in two places: state that an unattended loop can abandon mid-flight with no
+  built-in expiry. Both were fixed the same way — a scheduled sweep with an explicit, configurable
+  grace window (`CLAIM_STALE_HOURS`, `MANUAL_ISSUE_RETENTION_DAYS`) that only acts on state with no
+  recent activity, and that writes its own audit trail (`claim_released` with
+  `reason:"stale"`) so the agent that comes back can tell what happened rather than just finding the
+  issue mysteriously unclaimed. Any future "an agent holds X and might vanish" state should default
+  to this pattern, not to "add a manual admin override and call it done" (which is what A03 had
+  before N7c).
+- **Evidence**: `docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md` (15 confirmed / 7 refuted, now with
+  a remediation-status table mapping every finding to its N7 outcome), `feat/agent-remediation`
+  commits `ebe6be8`..`faf6f34` (phases N7a–f), `docs/memory/VERIFIED_STATE.md` → "Agent-automation
+  remediation (N7)". `rtk go build ./... && rtk go vet ./...` clean and `rtk go test
+  ./tests/unit/...` 308 passed re-run at close-out 2026-08-14; per-phase gates (guard-deletion
+  red-proofs, migration replays, dedupe boundary tests) recorded in each phase's own commit message.
+- **Where to look**: `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`,
+  `docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md`, `docs/memory/VERIFIED_STATE.md` → "Agent-automation
+  remediation (N7)".

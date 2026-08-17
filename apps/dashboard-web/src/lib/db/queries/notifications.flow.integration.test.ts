@@ -184,7 +184,7 @@ describe.skipIf(!dbReachable)('Manual issues M4 notifications flow (integration,
 		expect(refetchedCommented?.readAt).not.toBeNull();
 
 		// 5. STATUS -> resolved by B: reporter notified 'resolved'.
-		const resolveNotified = await updateIssueStatus(issueId, 'resolved', undefined, 'user', userBId);
+		const { notified: resolveNotified } = await updateIssueStatus(issueId, 'resolved', undefined, 'user', userBId);
 		expect(resolveNotified.map((n) => n.userId)).toEqual([reporterId]);
 		reporterNotifications = await listNotifications({ userId: reporterId });
 		expect(reporterNotifications.some((n) => n.issueId === issueId && n.kind === 'resolved')).toBe(
@@ -195,7 +195,7 @@ describe.skipIf(!dbReachable)('Manual issues M4 notifications flow (integration,
 		await unsubscribe({ issueId, subscriberType: 'user', subscriberId: reporterId });
 		expect(await isSubscribed(issueId, 'user', reporterId)).toBe(false);
 
-		const notifiedAfterUnsub = await updateIssueStatus(
+		const { notified: notifiedAfterUnsub } = await updateIssueStatus(
 			issueId,
 			'unresolved',
 			undefined,
