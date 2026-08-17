@@ -1,0 +1,28 @@
+# Builds the tiny sentinel-cron scheduler image: an alpine + curl base that runs
+# scripts/cron-entrypoint.sh, which POSTs the dashboard's /api/cron/retention endpoint on a schedule.
+#
+# N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11). Mirrors the dlq-drainer's "wrap a CLI
+# in a sleep-loop" pattern (scripts/Dockerfile.dlq-drainer) but needs no Go build — the only tool it
+# invokes is curl against an HTTP endpoint, so the whole image is alpine + ca-certificates + curl.
+
+FROM docker.io/library/alpine:3.19
+
+RUN apk add --no-cache ca-certificates curl tzdata
+
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
+
+WORKDIR /app
+
+COPY scripts/cron-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER appuser
+
+# Safe-by-default: the schedule is inert until RETENTION_CRON_ENABLED is explicitly "true".
+# See scripts/cron-entrypoint.sh for the full knob list.
+ENV RETENTION_CRON_ENABLED=false
+ENV RETENTION_CRON_INTERVAL_SECONDS=3600
+ENV RETENTION_CRON_URL=http://dashboard:3000/api/cron/retention
+ENV RETENTION_CRON_TIMEOUT_SECONDS=30
+
+ENTRYPOINT ["/app/entrypoint.sh"]
