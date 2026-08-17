@@ -1934,6 +1934,7 @@ paths:
                             - report_created
                             - created
                             - occurrence_burst
+                            - issue_deleted
                         actorType:
                           type: string
                           enum:

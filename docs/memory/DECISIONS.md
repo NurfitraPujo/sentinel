@@ -923,3 +923,53 @@ projects; `issue_relations` is the only bridge.
 - Permission checks for reports use `requireReportAccess` (viewers may create/read/comment;
   `ISSUE_WRITE_ROLES` claim/move/resolve; owner/admin force-release) — a deliberate sibling of
   `issue-access.ts`, not a loosening of it.
+
+
+## D20 | Retention Emits an `issue_deleted` Tombstone on a Sibling Table, Surfaced in the Agent Events Feed via UNION
+
+**Date**: 2026-08-17 · **Status**: accepted · **Detail**: `docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md`
+(A04) · **Code**: `apps/dashboard-web/src/lib/server/retention.ts`,
+`src/lib/db/queries/events.ts`, `src/lib/db/schema.ts` (`issueTombstones`),
+migration `1723700000_add_issue_tombstones.sql`
+
+### Decision
+
+Retention deletes issue rows, and `issue_activity` is FK'd to `issues` with `ON DELETE CASCADE`, so a
+deleted issue's entire history vanishes from `GET /api/agent/events` — an agent holding a claim or
+awaiting a human answer just starts getting 404s with no terminal signal. The fix emits a **tombstone**
+when retention deletes an issue. Two options were weighed:
+
+- **(a) a dedicated `issue_tombstones` table** — no FK to `issues` (so it outlives the deletion),
+  carrying denormalized `organization_id`/`project_id`/`issue_message`/`issue_type` and a claim snapshot
+  (`assignee_type`/`assigned_to`), surfaced in the feed via UNION with a synthetic eventType
+  `issue_deleted`.
+- **(b) relax the `issue_activity` FK** so a terminal activity row survives its issue's deletion.
+
+**Chose (a).** Option (b) would either break the cascade every other activity row depends on, or need a
+partial/conditional cascade Postgres does not offer without triggers — it touches an invariant the whole
+timeline rests on, to serve one row type. (a) isolates the new concern in its own table and leaves the
+cascade untouched.
+
+`issue_tombstones.seq` shares `issue_activity`'s IDENTITY sequence (via
+`nextval(pg_get_serial_sequence('issue_activity','seq'))`), so a tombstone interleaves into the single
+monotonic order the events-feed cursor reads by — a poller sees the deletion in `seq` order, never before
+an event it already consumed. The feed is the UNION of two independently-fetched, `seq`-ordered sources
+(activity ⋈ issue, and tombstones) merged in JS rather than a single SQL UNION, so the existing
+query-builder unit assertions on the activity half stay intact; a merge of two ascending lists each capped
+at `limit + 1` still yields the exact smallest `limit + 1` of the union, preserving cursor/hasMore. The
+claim snapshot exists so `?claimed=me` still surfaces a deleted claim even though the assignment lived on
+the now-deleted issue row.
+
+### Consequences
+
+- `issue_deleted` joins the documented event-type chain — the migration widens the `issue_activity`
+  CHECK constraint (even though no `issue_activity` row ever holds it), `AGENT_EVENT_TYPES`
+  (`agent-events.ts`), the agent-api-spec enum, and the regenerated `openapi.agent.yaml` all carry it, or
+  CI fails. The synthetic event reports `status: 'deleted'` and `actorId: 'sentinel-retention'`.
+- The tombstone table is itself bounded: retention prunes tombstones older than
+  `TOMBSTONE_RETENTION_DAYS` (default 30). A consumer offline longer than that loses the deletion signal —
+  the same forward-window trade the feed already makes (agents bootstrap current state via
+  `GET /api/agent/issues`, not by replaying unbounded history).
+- The tombstone is written for exactly the issues the DELETE actually removed (keyed off its `returning`),
+  not the candidate set — a concurrent occurrence insert that spares a candidate must not leave a
+  false tombstone.

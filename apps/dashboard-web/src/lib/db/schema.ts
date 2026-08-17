@@ -139,6 +139,34 @@ export const issueActivity = pgTable('issue_activity', {
 		.default(sql`nextval(pg_get_serial_sequence('issue_activity', 'seq'))`),
 });
 
+// N8 (docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md A04, DECISIONS.md D20): a terminal marker
+// that OUTLIVES the deleted issue it describes. It deliberately has NO FK back to `issues`
+// (issueActivity's FK is exactly why activity rows cascade away with the issue), so
+// organizationId/projectId/message/type/assignee are denormalized snapshots taken at deletion time.
+// Surfaced in the agent events feed (queries/events.ts) via UNION with a synthetic eventType
+// 'issue_deleted'. Migration: 1723700000_add_issue_tombstones.sql.
+export const issueTombstones = pgTable('issue_tombstones', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	// The id of the now-deleted issue. Not a FK -- the referenced row is gone by construction.
+	issueId: uuid('issue_id').notNull(),
+	organizationId: uuid('organization_id').notNull(),
+	projectId: uuid('project_id').notNull(),
+	issueMessage: text('issue_message'),
+	issueType: varchar('issue_type', { length: 50 }),
+	// Snapshot of the claim at deletion time, so a claim-holding agent still discovers the deletion
+	// via `?claimed=me` even though the assignment lived on the (now deleted) issues row.
+	assigneeType: varchar('assignee_type', { length: 20 }),
+	assignedTo: varchar('assigned_to', { length: 255 }),
+	reason: varchar('reason', { length: 50 }).notNull().default('retention'),
+	deletedAt: timestamp('deleted_at', { withTimezone: true }).notNull().defaultNow(),
+	// Shares issue_activity's IDENTITY sequence (see migration) so tombstones interleave into the
+	// one monotonic seq order the events-feed cursor reads by. Same drizzle type-only default trick
+	// as issueActivity.seq above: the real DDL is owned by goose, not drizzle-kit.
+	seq: bigint('seq', { mode: 'number' })
+		.notNull()
+		.default(sql`nextval(pg_get_serial_sequence('issue_activity', 'seq'))`),
+});
+
 // Manual Issues M1 (design §2, §5): a manual issue is an `issues` row (issue_type='user_report') plus
 // this 1:1 companion. reporterId references "user".id (better-auth's TEXT id) — VARCHAR(255) to match
 // every other *_user_id column in this schema. severity CHECK allows 'low'|'medium'|'high'|'critical'.

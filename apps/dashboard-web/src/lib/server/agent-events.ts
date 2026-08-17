@@ -31,6 +31,11 @@ export const AGENT_EVENT_TYPES = [
 	// pre-existing issues — see the 1723400000 migration header.
 	'created',
 	'occurrence_burst',
+	// N8 (docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md A04, DECISIONS.md D20): synthesized in
+	// the events feed from an `issue_tombstones` row (queries/events.ts), never written into
+	// issue_activity -- the issue and its activity have been deleted by retention. Still part of
+	// the issue_activity CHECK set (1723700000 migration) so this documented chain stays whole.
+	'issue_deleted',
 ] as const;
 
 export type AgentEventType = (typeof AGENT_EVENT_TYPES)[number];

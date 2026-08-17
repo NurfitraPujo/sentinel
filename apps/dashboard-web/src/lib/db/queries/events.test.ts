@@ -7,6 +7,12 @@ import { EVENTS_LAG_GUARD_INTERVAL } from '$lib/server/agent-events';
  * chainable/queue-based db double.
  */
 
+// N8: listOrgActivity now awaits TWO queries -- the issue_activity half, then the issue_tombstones
+// half (queries/events.ts's listOrgTombstones). The chainable resolves the first await from
+// `__result` (activity rows) and the second from `__tombstones` (tombstone rows), so existing
+// single-source tests keep their exact meaning (tombstones default to []) while new tests can drive
+// the deleted-issue path. The tombstone query is skipped entirely when an eventTypes filter
+// excludes 'issue_deleted', in which case only the first await fires.
 function makeChainable() {
 	const m: any = {};
 	const methods = ['select', 'from', 'innerJoin', 'where', 'orderBy', 'limit'];
@@ -14,7 +20,13 @@ function makeChainable() {
 		m[name] = vi.fn(() => m);
 	}
 	m.__result = [];
-	m.then = vi.fn((resolve: any) => resolve(m.__result));
+	m.__tombstones = [];
+	m.__awaitIndex = 0;
+	m.then = vi.fn((resolve: any) => {
+		const rows = m.__awaitIndex === 0 ? m.__result : m.__tombstones;
+		m.__awaitIndex += 1;
+		return resolve(rows);
+	});
 	return m;
 }
 
@@ -42,6 +54,18 @@ vi.mock('$lib/db/schema', () => ({
 		assignedTo: 'assignedTo',
 	},
 	projects: { id: 'id', organizationId: 'organizationId' },
+	issueTombstones: {
+		seq: 'seq',
+		reason: 'reason',
+		deletedAt: 'deletedAt',
+		issueId: 'issueId',
+		issueMessage: 'issueMessage',
+		issueType: 'issueType',
+		projectId: 'projectId',
+		organizationId: 'organizationId',
+		assigneeType: 'assigneeType',
+		assignedTo: 'assignedTo',
+	},
 }));
 
 const { listOrgActivity } = await import('./events');
@@ -93,9 +117,24 @@ function row(overrides: Partial<Record<string, unknown>> = {}) {
 	};
 }
 
+function tombstoneRow(overrides: Partial<Record<string, unknown>> = {}) {
+	return {
+		seq: 7,
+		reason: 'retention',
+		deletedAt: new Date('2026-08-15T00:00:00Z'),
+		issueId: 'issue-gone',
+		issueMessage: 'Deleted issue title',
+		issueType: 'user_report',
+		issueProjectId: 'project-1',
+		...overrides,
+	};
+}
+
 beforeEach(() => {
 	vi.clearAllMocks();
 	dbMock.__result = [];
+	dbMock.__tombstones = [];
+	dbMock.__awaitIndex = 0;
 });
 
 describe('listOrgActivity', () => {
@@ -164,7 +203,8 @@ describe('listOrgActivity', () => {
 
 		await listOrgActivity({ organizationId: 'org-1', after: 0, limit: 50 });
 
-		expect(dbMock.where).toHaveBeenCalledTimes(1);
+		// Two WHEREs now: the issue_activity half (call[0], asserted below) and the tombstone half.
+		expect(dbMock.where).toHaveBeenCalledTimes(2);
 
 		const expected = serializeSqlNode(
 			and(
@@ -204,5 +244,78 @@ describe('listOrgActivity', () => {
 		});
 
 		expect(dbMock.where).toHaveBeenCalledTimes(1);
+	});
+
+	// N8 (DECISIONS.md D20): the tombstone half of the feed.
+	it('surfaces a tombstone as an issue_deleted event merged into seq order', async () => {
+		dbMock.__result = [row({ seq: 3 }), row({ seq: 9 })];
+		dbMock.__tombstones = [tombstoneRow({ seq: 5 })];
+
+		const result = await listOrgActivity({ organizationId: 'org-1', after: 0, limit: 50 });
+
+		expect(result.events.map((e) => e.seq)).toEqual([3, 5, 9]);
+		const deleted = result.events.find((e) => e.seq === 5)!;
+		expect(deleted).toEqual({
+			seq: 5,
+			eventType: 'issue_deleted',
+			actorType: 'system',
+			actorId: 'sentinel-retention',
+			oldValue: null,
+			newValue: { reason: 'retention', deletedAt: new Date('2026-08-15T00:00:00Z') },
+			createdAt: new Date('2026-08-15T00:00:00Z'),
+			issue: {
+				id: 'issue-gone',
+				title: 'Deleted issue title',
+				status: 'deleted',
+				issueType: 'user_report',
+				projectId: 'project-1',
+			},
+		});
+		// cursor advances to the highest merged seq.
+		expect(result.cursor).toBe(9);
+	});
+
+	it('re-applies hasMore/cursor over the merged set, slicing across both sources', async () => {
+		dbMock.__result = [row({ seq: 1 }), row({ seq: 4 })];
+		dbMock.__tombstones = [tombstoneRow({ seq: 2 }), tombstoneRow({ seq: 3 })];
+
+		const result = await listOrgActivity({ organizationId: 'org-1', after: 0, limit: 2 });
+
+		// Combined ascending order is [1,2,3,4]; limit 2 keeps [1,2], and the merge is what makes
+		// hasMore true even though neither source alone exceeded the limit.
+		expect(result.events.map((e) => e.seq)).toEqual([1, 2]);
+		expect(result.hasMore).toBe(true);
+		expect(result.cursor).toBe(2);
+	});
+
+	it('skips the tombstone source entirely when eventTypes excludes issue_deleted', async () => {
+		dbMock.__result = [row({ seq: 1 })];
+		dbMock.__tombstones = [tombstoneRow({ seq: 2 })];
+
+		const result = await listOrgActivity({
+			organizationId: 'org-1',
+			after: 0,
+			limit: 50,
+			eventTypes: ['status_changed'],
+		});
+
+		// Only one query fired (the activity half); the tombstone row must not appear.
+		expect(dbMock.where).toHaveBeenCalledTimes(1);
+		expect(result.events.map((e) => e.seq)).toEqual([1]);
+	});
+
+	it('includes the tombstone source when eventTypes explicitly requests issue_deleted', async () => {
+		dbMock.__result = [];
+		dbMock.__tombstones = [tombstoneRow({ seq: 8 })];
+
+		const result = await listOrgActivity({
+			organizationId: 'org-1',
+			after: 0,
+			limit: 50,
+			eventTypes: ['issue_deleted'],
+		});
+
+		expect(dbMock.where).toHaveBeenCalledTimes(2);
+		expect(result.events.map((e) => e.eventType)).toEqual(['issue_deleted']);
 	});
 });
