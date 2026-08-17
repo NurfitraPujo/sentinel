@@ -75,7 +75,7 @@ cd apps/dashboard-web && pnpm build && pnpm check && pnpm test   # green: 1024 f
                                                   # SvelteKit's route-export allowlist — check+test pass while
                                                   # build fails on it (B12). Add --sequence.shuffle to `pnpm test`
                                                   # before trusting it; order-independence decays silently (B13).
-SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 76 passed, 0 skips — NEEDS the compose stack up
+SENTINEL_E2E=1 rtk go test -tags=e2e ./tests/e2e/ -count=1        # green: 81 passed, 0 skips — NEEDS the compose stack up
                                                                   # -tags=e2e is mandatory; without it U8-U10 are silently excluded
                                                                   # U35 additionally needs `jaeger` up; it fails (never skips) if not
 rtk buf lint && rtk buf generate                # proto lives at packages/proto/sentinel/v1/; generate is not optional after an edit
@@ -129,7 +129,7 @@ and neither is exotic — see B12/B13 and VERIFIED_STATE.md's UI-parity entry:
 
 S1–S18 are **resolved**, and so is every defect P7 found and the 47-finding UI parity register
 (D01–D47) — see `## Resolved` in `VERIFIED_STATE.md`. **All 32 rows of the use-case matrix are green**
-(`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **76 passed, 0 skipped**), gated in CI by the `e2e`
+(`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **81 passed, 0 skipped**), gated in CI by the `e2e`
 job.
 
 `scripts/db/init.sql` — the third, stale schema that caused three separate defects of the same family —
