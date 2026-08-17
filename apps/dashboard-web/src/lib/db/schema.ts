@@ -103,6 +103,10 @@ export const issues = pgTable('issues', {
 	// human reply. Nullable CHECK ('reporter'|'team'); NULL = not blocked. Not a new `status`
 	// value -- the existing check_status constraint on `status` is untouched.
 	waitingOn: varchar('waiting_on', { length: 20 }),
+	// N9 (AGENT_WORKER_PLAN C12): when the CURRENT blocking question was asked. Set alongside
+	// waitingOn (comments.ts blocking branch), cleared to NULL alongside it (human reply, or
+	// resolve/ignore in issues.ts). Only meaningful while waitingOn is non-NULL.
+	waitingSince: timestamp('waiting_since', { withTimezone: true }),
 });
 
 // Matches packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql — the table

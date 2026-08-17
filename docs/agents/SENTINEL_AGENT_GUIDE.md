@@ -231,7 +231,11 @@ A minimal, working loop:
    events feed for ongoing discovery. Omitting `limit`/`sort`/`since`/`cursor` entirely keeps the
    original unbounded, `lastSeen`-descending list (no pagination) for backward compatibility;
    `limit` is capped at 200 server-side. The keyset cursor (on `(sortColumn, id)`, not an offset)
-   stays stable even as new issues arrive mid-page.
+   stays stable even as new issues arrive mid-page. Filter by claim state with `&claimed=false`
+   (unclaimed, by anyone), `&claimed=true` (claimed, by anyone), or `&claimed=me` (claimed by
+   **your** agent id specifically — resolved from your credential, never a request param) — the
+   last is how you re-enumerate your own in-flight work after a restart. `&waiting=true` narrows
+   to issues currently blocked on a question (see §6).
 2. **Claim** — `POST /api/agent/issues/:id/claim`. Stop here (409) if someone beat you to it.
 3. **Get full detail** — `GET /api/agent/issues/:id` returns:
    ```json
@@ -289,6 +293,14 @@ always agent-authored, a clearing reply is always user-authored — these are mu
   for the clearing event itself.
 
 There is no push notification to you as the agent for this — you must poll one of the two.
+
+**Knowing how long a question has been waiting.** Each row from `GET /api/agent/issues` carries a
+`waitingSince` field: an ISO timestamp of when the current blocking question was asked while the
+issue is waiting (`waitingOn`/`isWaiting` set), and `null` otherwise. Combine it with
+`?claimed=me&waiting=true` to list your own still-unanswered questions and decide which to nag —
+without reconstructing timing from the comment thread. `waitingSince` is cleared (back to `null`)
+the moment the question is answered, or the issue is resolved/ignored; there is no backfill, so a
+question that was already in flight before this field shipped reports `null`.
 
 ## 7. Progress updates vs. comments
 

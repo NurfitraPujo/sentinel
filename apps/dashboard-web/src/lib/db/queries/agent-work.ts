@@ -19,6 +19,10 @@ import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
  * `firstSeen`/`lastSeen` timestamp (matches the events feed's cursor philosophy, events.ts's
  * header). `limit` undefined ⇒ no `.limit()` clause at all and no `nextCursor` in the result --
  * byte-identical to pre-N7b behavior for callers that pass nothing (backward compat).
+ *
+ * N9 (AGENT_WORKER_PLAN C12): adds `claimedByAgentId` (`claimed=me` -- this agent's own claims,
+ * resolved from the credential per B7) and a `waitingSince` list field (when the current blocking
+ * question was asked), so an agent can enumerate and age its own waiting questions directly.
  */
 export const AGENT_ISSUES_MAX_LIMIT = 200;
 
@@ -34,6 +38,13 @@ export interface ListAgentIssuesOptions {
 	organizationId: string;
 	type?: 'user_report' | 'system_error';
 	claimed?: boolean;
+	/**
+	 * N9 (AGENT_WORKER_PLAN C12): `claimed=me` -- restrict to issues claimed by THIS agent
+	 * (assigneeType='agent' AND assignedTo=agentId), mirroring the events feed's claimed=me
+	 * (events.ts). B7: the route resolves this from the credential's agentId, never a request param.
+	 * Mutually exclusive with `claimed` at the route layer; if both arrive here this wins.
+	 */
+	claimedByAgentId?: string;
 	projectId?: string;
 	waiting?: boolean;
 	/** Only issues whose firstSeen >= since. */
@@ -58,6 +69,10 @@ export interface AgentIssueListItem {
 	assigneeType: string | null;
 	assignedTo: string | null;
 	waitingOn: string | null;
+	/** N9 (AGENT_WORKER_PLAN C12): when the current blocking question was asked -- null unless the
+	 *  issue is currently waiting (waitingOn set). Lets an agent nag stale questions by age without
+	 *  reconstructing timing from the comment thread. */
+	waitingSince: Date | null;
 	firstSeen: Date | null;
 	lastSeen: Date | null;
 	count: number;
@@ -111,7 +126,12 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	if (options.type) {
 		conditions.push(eq(issues.issueType, options.type));
 	}
-	if (options.claimed === true) {
+	if (options.claimedByAgentId) {
+		// N9 (C12): `claimed=me` -- this agent's own claims only. Mirrors events.ts's claimed=me
+		// (assigneeType='agent' AND assignedTo=agentId). Takes precedence over the boolean `claimed`.
+		conditions.push(eq(issues.assigneeType, 'agent'));
+		conditions.push(eq(issues.assignedTo, options.claimedByAgentId));
+	} else if (options.claimed === true) {
 		conditions.push(sql`${issues.assignedTo} IS NOT NULL`);
 	} else if (options.claimed === false) {
 		conditions.push(isNull(issues.assignedTo));
@@ -155,6 +175,7 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			assignedTo: issues.assignedTo,
 			claimedAt: issues.claimedAt,
 			waitingOn: issues.waitingOn,
+			waitingSince: issues.waitingSince,
 			firstSeen: issues.firstSeen,
 			lastSeen: issues.lastSeen,
 			count: issues.count,
@@ -178,6 +199,9 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	const mapped: AgentIssueListItem[] = page.map((row: (typeof rows)[number]) => ({
 		...row,
 		isWaiting: row.waitingOn !== null,
+		// N9 (C12): only surface waitingSince for a currently-waiting issue -- a cleared question can
+		// leave a stale timestamp behind (issues.ts backfill/re-open paths), so gate on waitingOn.
+		waitingSince: row.waitingOn !== null ? row.waitingSince : null,
 	}));
 
 	let nextCursor: string | undefined;

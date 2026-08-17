@@ -90,6 +90,9 @@ export const AgentIssueListItemSchema = z
 		severity: z.string().nullable(),
 		reporterId: z.string().nullable(),
 		isWaiting: z.boolean(),
+		// N9 (AGENT_WORKER_PLAN C12): when the current blocking question was asked -- null unless the
+		// issue is currently waiting (waitingOn set). Lets an agent nag stale questions by age.
+		waitingSince: z.coerce.date().nullable(),
 		// N7e (A07): see IssueRowSchema's claimedAt note.
 		claimedAt: z.coerce.date().nullable(),
 	})
@@ -105,7 +108,8 @@ export const ListIssuesResponseSchema = z
 export const ListIssuesQuerySchema = z
 	.object({
 		type: z.enum(['any', 'user_report', 'system_error']).optional(),
-		claimed: z.enum(['true', 'false']).optional(),
+		// N9 (C12): `me` restricts to the calling agent's own claims (resolved from the credential).
+		claimed: z.enum(['true', 'false', 'me']).optional(),
 		project: z.string().optional(),
 		waiting: z.enum(['true', 'false']).optional(),
 		/** ISO timestamp; only issues with firstSeen >= since. */

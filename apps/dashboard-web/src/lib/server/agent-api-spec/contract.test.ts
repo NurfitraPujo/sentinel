@@ -211,6 +211,7 @@ describe('GET /api/agent/issues', () => {
 					severity: null,
 					reporterId: null,
 					isWaiting: false,
+					waitingSince: null,
 					claimedAt: null,
 				},
 			],

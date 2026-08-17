@@ -258,7 +258,8 @@ describe('createComment', () => {
 		});
 
 		expect(txHandle.updateCalls).toHaveLength(1);
-		expect(txHandle.updateCalls[0].set).toEqual({ waitingOn: null });
+		// N9 (C12): waiting_since is cleared to null alongside waiting_on.
+		expect(txHandle.updateCalls[0].set).toEqual({ waitingOn: null, waitingSince: null });
 		// comment, commented activity, question_answered activity, auto-subscribe.
 		expect(txHandle.insertCalls).toHaveLength(4);
 		expect(txHandle.insertCalls[2].values).toMatchObject({
@@ -400,7 +401,9 @@ describe('createComment', () => {
 			expect(txHandle.insertCalls[0].values).toMatchObject({ blocking: true });
 			// waiting_on set to the audience, in the same tx as the comment insert.
 			expect(txHandle.updateCalls).toHaveLength(1);
-			expect(txHandle.updateCalls[0].set).toEqual({ waitingOn: 'reporter' });
+			// N9 (C12): waiting_since is stamped in the same update as waiting_on.
+			expect(txHandle.updateCalls[0].set).toMatchObject({ waitingOn: 'reporter' });
+			expect((txHandle.updateCalls[0].set as { waitingSince: unknown }).waitingSince).toBeInstanceOf(Date);
 			// activity is 'question_asked', not 'commented'.
 			expect(txHandle.insertCalls[1].values).toMatchObject({
 				eventType: 'question_asked',

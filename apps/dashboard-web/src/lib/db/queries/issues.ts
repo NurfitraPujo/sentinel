@@ -81,6 +81,9 @@ export async function updateIssueStatus(
 		// createComment's own clearing of `waiting_on` on a user reply (queries/comments.ts).
 		if ((status === 'resolved' || status === 'ignored') && existing?.waitingOn) {
 			updateData.waitingOn = null;
+			// N9 (AGENT_WORKER_PLAN C12): clear waiting_since alongside waiting_on so a resolved issue
+			// never surfaces a stale "waiting since" age if it is later re-opened without a new question.
+			updateData.waitingSince = null;
 		}
 
 		await tx.update(issues)
