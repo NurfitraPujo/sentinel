@@ -111,6 +111,24 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		}
 	}
 
+	// N9 (docs/plans/AGENT_WORKER_PLAN.md, C6/C13): optional key lifetime. Applies to every scope
+	// (org keys UI and the agent-provisioning path both flow through here). A positive integer
+	// number of days; omitted mints a non-expiring key as before. Bounded to keep `now + days` well
+	// within a representable Date and to reject obvious typos.
+	const MAX_EXPIRES_IN_DAYS = 3650;
+	if (body.expiresInDays !== undefined && body.expiresInDays !== null) {
+		const days = body.expiresInDays;
+		if (
+			typeof days !== 'number' ||
+			!Number.isFinite(days) ||
+			!Number.isInteger(days) ||
+			days <= 0 ||
+			days > MAX_EXPIRES_IN_DAYS
+		) {
+			throw error(400, `expiresInDays must be a positive integer no greater than ${MAX_EXPIRES_IN_DAYS}`);
+		}
+	}
+
 	const { apiKey, secretToken } = await createApiKey(session.user.id, {
 		organizationId: orgId!,
 		projectId,
@@ -118,6 +136,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		scope,
 		rateLimitRpm: typeof body.rateLimitRpm === 'number' ? body.rateLimitRpm : undefined,
 		agentId: scope === 'agent' ? body.agentId : undefined,
+		expiresInDays: typeof body.expiresInDays === 'number' ? body.expiresInDays : undefined,
 	});
 
 	// The raw secret token is returned exactly once, here, and is never stored (only its SHA256

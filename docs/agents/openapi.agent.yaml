@@ -2141,6 +2141,10 @@ paths:
                         type: string
                       prefix:
                         type: string
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
                       expiresAt:
                         type:
                           - string
@@ -2152,6 +2156,7 @@ paths:
                     required:
                       - id
                       - prefix
+                      - createdAt
                       - expiresAt
                       - lastUsedAt
                     additionalProperties: false

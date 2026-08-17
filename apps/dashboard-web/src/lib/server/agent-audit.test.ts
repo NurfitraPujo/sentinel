@@ -33,6 +33,7 @@ const ctx = {
 	keyId: 'key-1',
 	keyPrefix: 'sent_agent_',
 	keyExpiresAt: null,
+	keyCreatedAt: null,
 };
 
 describe('writeAgentAuditLog', () => {

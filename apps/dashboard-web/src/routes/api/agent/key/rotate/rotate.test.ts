@@ -35,6 +35,7 @@ const ctx = {
 beforeEach(() => {
 	vi.clearAllMocks();
 	delete mockEnv.AGENT_KEY_ROTATION_GRACE_HOURS;
+	delete mockEnv.AGENT_KEY_ROTATION_DEFAULT_DAYS;
 	authenticateAgentRequest.mockResolvedValue(ctx);
 });
 
@@ -57,7 +58,7 @@ describe('POST /api/agent/key/rotate', () => {
 		expect(res.status).toBe(200);
 		const body = await res.json();
 
-		expect(rotateAgentKeyWithGrace).toHaveBeenCalledWith('key-old', 24);
+		expect(rotateAgentKeyWithGrace).toHaveBeenCalledWith('key-old', 24, null);
 		expect(body).toEqual({
 			success: true,
 			oldKey: { id: 'key-old', expiresAt: '2026-08-15T00:00:00.000Z' },
@@ -86,7 +87,27 @@ describe('POST /api/agent/key/rotate', () => {
 		});
 
 		await POST(makeEvent());
-		expect(rotateAgentKeyWithGrace).toHaveBeenCalledWith('key-old', 0);
+		expect(rotateAgentKeyWithGrace).toHaveBeenCalledWith('key-old', 0, null);
+	});
+
+	// N9 (C13): AGENT_KEY_ROTATION_DEFAULT_DAYS is parsed and passed through as the fallback
+	// lifetime for the new key.
+	it('passes AGENT_KEY_ROTATION_DEFAULT_DAYS through to rotateAgentKeyWithGrace', async () => {
+		mockEnv.AGENT_KEY_ROTATION_DEFAULT_DAYS = '90';
+		rotateAgentKeyWithGrace.mockResolvedValue({
+			oldKey: { expiresAt: new Date() },
+			newKey: { id: 'key-new', keyPrefix: 'sent_agent_' },
+			secretToken: 'sent_agent_x',
+		});
+
+		await POST(makeEvent());
+		expect(rotateAgentKeyWithGrace).toHaveBeenCalledWith('key-old', 24, 90);
+	});
+
+	it('500s when AGENT_KEY_ROTATION_DEFAULT_DAYS is misconfigured', async () => {
+		mockEnv.AGENT_KEY_ROTATION_DEFAULT_DAYS = 'soon';
+		await expect(POST(makeEvent())).rejects.toMatchObject({ status: 500 });
+		expect(rotateAgentKeyWithGrace).not.toHaveBeenCalled();
 	});
 
 	it('maps AgentKeyRotationError to 400', async () => {

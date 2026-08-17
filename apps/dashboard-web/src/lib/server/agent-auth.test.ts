@@ -30,6 +30,7 @@ vi.mock('$lib/db/schema', () => ({
 		revokedAt: 'revokedAt',
 		agentId: 'agentId',
 		keyHash: 'keyHash',
+		createdAt: 'createdAt',
 	},
 	agents: { id: 'id', orgId: 'orgId', name: 'name', status: 'status' },
 }));
@@ -155,6 +156,7 @@ describe('authenticateAgentRequest', () => {
 					expiresAt: null,
 					revokedAt: null,
 					agentId: 'agent-1',
+					createdAt: new Date('2026-08-01T00:00:00.000Z'),
 				},
 			],
 			[{ id: 'agent-1', orgId: 'org-1', name: 'AutoFix', status: 'active' }]
@@ -166,6 +168,8 @@ describe('authenticateAgentRequest', () => {
 		expect(ctx.organizationId).toBe('org-1');
 		expect(ctx.agentName).toBe('AutoFix');
 		expect(ctx.keyPrefixForAudit).toBe(hashKey('sent_agent_valid').slice(0, 12));
+		// N9 (C6): created_at is carried through from the same lookup for age-based rotation.
+		expect(ctx.keyCreatedAt).toEqual(new Date('2026-08-01T00:00:00.000Z'));
 	});
 });
 

@@ -230,12 +230,23 @@ created by a human, once, through the dashboard:
    is shown exactly once at creation time, the same one-time-reveal contract `sentinel key rotate`
    uses for a rotated secret (R1b). Store it in whatever secret manager the calling agent's
    deployment already uses; Sentinel never re-displays it.
+   - **Expiry (N9):** the create form's optional **Expires In (Days)** field sets an enforced
+     `expires_at` on the key; leave it blank for a non-expiring key (historical default). Expiry is
+     enforced at auth time — once it passes, every `/api/agent/*` call returns `401`. Prefer a
+     finite lifetime for unattended agents and pair it with rotation (step 5) so the agent renews
+     before the window closes. The agent can read its own `createdAt`/`expiresAt` from
+     `GET /api/agent/self`.
 4. Hand the agent `SENTINEL_URL` and the key (`SENTINEL_AGENT_KEY`) — see
    `docs/agents/SENTINEL_AGENT_GUIDE.md` for how an agent should use them (discovery, claiming,
    `sentinel whoami` to confirm the key resolves to the identity you expect).
 5. Rotate on a schedule or on suspected leak with `POST /api/agent/key/rotate` /
    `sentinel key rotate` — self-service from here on; grace window is
    `AGENT_KEY_ROTATION_GRACE_HOURS` (default 24h, `.env.example`).
+   - **Lifetime propagation (N9):** the rotated-in key inherits the old key's original lifetime
+     (`expires_at − created_at`), so rotation is a steady state, not a one-shot that mints a
+     non-expiring key. If the old key had no expiry, the new key gets `AGENT_KEY_ROTATION_DEFAULT_DAYS`
+     (unset = stays non-expiring). Set that env var to force every rotation of a legacy
+     never-expiring key onto a finite schedule from then on.
 
 **Future work (sketch, not built):** an org-owner-mintable one-time provisioning token — owner
 generates a short-lived, single-use token in the dashboard, hands it to whatever is standing up
