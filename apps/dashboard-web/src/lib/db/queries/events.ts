@@ -44,6 +44,13 @@ export interface OrgActivityEvent {
 		status: string;
 		issueType: string;
 		projectId: string;
+		// N9 (C2): CURRENT claim/waiting state at read time -- NOT the state when this event
+		// occurred. Lets an agent dispatcher evaluate "claimed by me" per-event without a
+		// follow-up GET /api/agent/issues/:id.
+		assigneeType: string | null;
+		assignedTo: string | null;
+		claimedAt: Date | null;
+		waitingOn: string | null;
 	};
 }
 
@@ -87,6 +94,10 @@ export async function listOrgActivity(
 			issueStatus: issues.status,
 			issueType: issues.issueType,
 			issueProjectId: issues.projectId,
+			issueAssigneeType: issues.assigneeType,
+			issueAssignedTo: issues.assignedTo,
+			issueClaimedAt: issues.claimedAt,
+			issueWaitingOn: issues.waitingOn,
 		})
 		.from(issueActivity)
 		.innerJoin(issues, eq(issues.id, issueActivity.issueId))
@@ -112,6 +123,10 @@ export async function listOrgActivity(
 			status: row.issueStatus,
 			issueType: row.issueType,
 			projectId: row.issueProjectId,
+			assigneeType: row.issueAssigneeType,
+			assignedTo: row.issueAssignedTo,
+			claimedAt: row.issueClaimedAt,
+			waitingOn: row.issueWaitingOn,
 		},
 	}));
 

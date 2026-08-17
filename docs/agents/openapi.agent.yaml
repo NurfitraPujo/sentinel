@@ -1966,12 +1966,33 @@ paths:
                               type: string
                             projectId:
                               type: string
+                            assigneeType:
+                              type:
+                                - string
+                                - "null"
+                            assignedTo:
+                              type:
+                                - string
+                                - "null"
+                            claimedAt:
+                              type:
+                                - string
+                                - "null"
+                              format: date-time
+                            waitingOn:
+                              type:
+                                - string
+                                - "null"
                           required:
                             - id
                             - title
                             - status
                             - issueType
                             - projectId
+                            - assigneeType
+                            - assignedTo
+                            - claimedAt
+                            - waitingOn
                           additionalProperties: false
                       required:
                         - seq

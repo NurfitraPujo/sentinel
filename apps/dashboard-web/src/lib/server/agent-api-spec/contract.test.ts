@@ -524,7 +524,7 @@ describe('GET /api/agent/events', () => {
 					oldValue: null,
 					newValue: null,
 					createdAt: new Date().toISOString(),
-					issue: { id: 'issue-1', title: 'msg', status: 'unresolved', issueType: 'system_error', projectId: 'project-1' },
+					issue: { id: 'issue-1', title: 'msg', status: 'unresolved', issueType: 'system_error', projectId: 'project-1', assigneeType: 'agent', assignedTo: 'agent-1', claimedAt: new Date().toISOString(), waitingOn: null },
 				},
 			],
 			cursor: 1,

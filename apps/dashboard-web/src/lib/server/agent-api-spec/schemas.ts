@@ -362,6 +362,13 @@ export const OrgActivityEventSchema = z
 				status: z.string(),
 				issueType: z.string(),
 				projectId: z.string(),
+				// N9 (C2): CURRENT claim/waiting state at read time -- NOT the state at event time.
+				// Lets an agent dispatcher evaluate "claimed by me" per-event without a follow-up
+				// GET /api/agent/issues/:id.
+				assigneeType: z.string().nullable(),
+				assignedTo: z.string().nullable(),
+				claimedAt: z.coerce.date().nullable(),
+				waitingOn: z.string().nullable(),
 			})
 			.strict(),
 	})
