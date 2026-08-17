@@ -39,7 +39,7 @@
 	}
 
 	async function handleCreate(event: CustomEvent) {
-		const { name, targetProject, scope, rateLimitRpm } = event.detail;
+		const { name, targetProject, scope, rateLimitRpm, expiresInDays } = event.detail;
 
 		try {
 			const res = await fetch(`/api/organizations/${data.orgId}/keys`, {
@@ -49,7 +49,8 @@
 					name,
 					scope,
 					projectId: targetProject !== 'All Projects [Org-Wide]' ? targetProject : undefined,
-					rateLimitRpm
+					rateLimitRpm,
+					expiresInDays
 				})
 			});
 

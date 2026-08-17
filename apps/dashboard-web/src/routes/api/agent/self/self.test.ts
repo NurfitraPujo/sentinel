@@ -22,7 +22,8 @@ describe('GET /api/agent/self', () => {
 		await expect(GET(makeEvent())).rejects.toMatchObject({ status: 401 });
 	});
 
-	it('returns agentId/name/organizationId and the key row, with expiresAt ISO-formatted', async () => {
+	it('returns agentId/name/organizationId and the key row, with createdAt/expiresAt ISO-formatted', async () => {
+		const createdAt = new Date('2026-08-01T00:00:00.000Z');
 		const expiresAt = new Date('2026-09-01T00:00:00.000Z');
 		authenticateAgentRequest.mockResolvedValue({
 			agentId: 'agent-1',
@@ -31,6 +32,7 @@ describe('GET /api/agent/self', () => {
 			keyPrefixForAudit: 'abc123def456',
 			keyId: 'key-1',
 			keyPrefix: 'sent_agent_',
+			keyCreatedAt: createdAt,
 			keyExpiresAt: expiresAt,
 		});
 
@@ -45,13 +47,14 @@ describe('GET /api/agent/self', () => {
 			key: {
 				id: 'key-1',
 				prefix: 'sent_agent_',
+				createdAt: '2026-08-01T00:00:00.000Z',
 				expiresAt: '2026-09-01T00:00:00.000Z',
 				lastUsedAt: null,
 			},
 		});
 	});
 
-	it('returns null expiresAt for a non-expiring key', async () => {
+	it('returns null createdAt/expiresAt for a non-expiring key with no createdAt', async () => {
 		authenticateAgentRequest.mockResolvedValue({
 			agentId: 'agent-1',
 			organizationId: 'org-1',
@@ -59,11 +62,13 @@ describe('GET /api/agent/self', () => {
 			keyPrefixForAudit: 'abc123def456',
 			keyId: 'key-1',
 			keyPrefix: 'sent_agent_',
+			keyCreatedAt: null,
 			keyExpiresAt: null,
 		});
 
 		const res = await GET(makeEvent());
 		const body = await res.json();
 		expect(body.key.expiresAt).toBeNull();
+		expect(body.key.createdAt).toBeNull();
 	});
 });

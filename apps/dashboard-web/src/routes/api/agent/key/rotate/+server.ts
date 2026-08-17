@@ -18,9 +18,20 @@ export const POST: RequestHandler = async ({ request }) => {
 		throw error(500, 'AGENT_KEY_ROTATION_GRACE_HOURS is misconfigured');
 	}
 
+	// N9 (C13): fallback lifetime for the NEW key when the rotated key had no expiry to inherit.
+	// Unset => the new key stays non-expiring (backward-compatible). Any set value must be a
+	// positive integer number of days.
+	let rotationDefaultDays: number | null = null;
+	if (env.AGENT_KEY_ROTATION_DEFAULT_DAYS !== undefined && env.AGENT_KEY_ROTATION_DEFAULT_DAYS !== '') {
+		rotationDefaultDays = parseInt(env.AGENT_KEY_ROTATION_DEFAULT_DAYS, 10);
+		if (Number.isNaN(rotationDefaultDays) || rotationDefaultDays <= 0) {
+			throw error(500, 'AGENT_KEY_ROTATION_DEFAULT_DAYS is misconfigured');
+		}
+	}
+
 	let result;
 	try {
-		result = await rotateAgentKeyWithGrace(ctx.keyId, graceHours);
+		result = await rotateAgentKeyWithGrace(ctx.keyId, graceHours, rotationDefaultDays);
 	} catch (err) {
 		if (err instanceof AgentKeyRotationError) {
 			throw error(400, err.message);

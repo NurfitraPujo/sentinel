@@ -9,6 +9,9 @@ import { authenticateAgentRequest } from '$lib/server/agent-auth';
  * what `authenticateAgentRequest` already resolved for THIS request -- no second query, no
  * `lastUsedAt` (project_api_keys tracks no such column; adding one is out of scope for this
  * phase, see the plan's R1 note).
+ *
+ * N9 (docs/plans/AGENT_WORKER_PLAN.md, C6): `createdAt` is now included so a client can do
+ * age-based rotation even for a key with no `expiresAt`.
  */
 export const GET: RequestHandler = async ({ request }) => {
 	const ctx = await authenticateAgentRequest(request);
@@ -20,6 +23,7 @@ export const GET: RequestHandler = async ({ request }) => {
 		key: {
 			id: ctx.keyId,
 			prefix: ctx.keyPrefix,
+			createdAt: ctx.keyCreatedAt ? ctx.keyCreatedAt.toISOString() : null,
 			expiresAt: ctx.keyExpiresAt ? ctx.keyExpiresAt.toISOString() : null,
 			lastUsedAt: null,
 		},

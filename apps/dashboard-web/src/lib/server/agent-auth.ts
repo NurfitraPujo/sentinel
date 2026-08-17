@@ -41,6 +41,12 @@ export interface AgentAuthContext {
 	keyId: string;
 	keyPrefix: string;
 	keyExpiresAt: Date | null;
+	/**
+	 * N9 (docs/plans/AGENT_WORKER_PLAN.md, C6): the authenticated key's `created_at`, carried
+	 * through from the same lookup, so GET /api/agent/self can expose key age and clients can do
+	 * age-based rotation even for keys minted with no `expires_at`.
+	 */
+	keyCreatedAt: Date | null;
 }
 
 /**
@@ -85,6 +91,7 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 			agentId: projectApiKeys.agentId,
 			rateLimitRpm: projectApiKeys.rateLimitRpm,
 			keyPrefix: projectApiKeys.keyPrefix,
+			createdAt: projectApiKeys.createdAt,
 		})
 		.from(projectApiKeys)
 		.where(eq(projectApiKeys.keyHash, keyHash));
@@ -152,5 +159,6 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 		keyId: keyRow.id,
 		keyPrefix: keyRow.keyPrefix,
 		keyExpiresAt: keyRow.expiresAt,
+		keyCreatedAt: keyRow.createdAt,
 	};
 }

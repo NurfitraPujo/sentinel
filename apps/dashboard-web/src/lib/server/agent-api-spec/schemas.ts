@@ -449,6 +449,8 @@ export const SelfResponseSchema = z
 			.object({
 				id: z.string(),
 				prefix: z.string(),
+				// N9 (C6): key `created_at`, ISO string or null, for age-based rotation.
+				createdAt: z.string().nullable(),
 				expiresAt: z.string().nullable(),
 				// project_api_keys tracks no last-used timestamp (N7f R1 note) -- always null today,
 				// kept in the shape so a future column addition doesn't break this contract.

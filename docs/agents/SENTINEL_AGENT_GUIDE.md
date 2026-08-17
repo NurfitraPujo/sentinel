@@ -547,9 +547,23 @@ key row) server-side for every request, and `GET /api/agent/self` now echoes exa
   "agentId": "...",
   "name": "Triage Bot",
   "organizationId": "...",
-  "key": { "id": "...", "prefix": "sent_agent_", "expiresAt": null, "lastUsedAt": null }
+  "key": {
+    "id": "...",
+    "prefix": "sent_agent_",
+    "createdAt": "2026-08-01T00:00:00.000Z",
+    "expiresAt": null,
+    "lastUsedAt": null
+  }
 }
 ```
+
+`key.createdAt` (N9) is the key's mint time, ISO-8601 or `null` for keys created before the column
+was populated. `key.expiresAt` is the enforced expiry (`null` = non-expiring); once it passes, the
+key stops authenticating and every `/api/agent/*` call — including `/self` — returns `401`. Together
+they let an unattended agent do **age-based rotation without guessing**: rotate proactively when
+`expiresAt` is near, or when `now - createdAt` exceeds your own policy for keys that never expire.
+Rotate via `POST /api/agent/key/rotate` (§2) and the new key inherits the old key's lifetime, so the
+schedule is steady-state rather than one-shot.
 
 `key.lastUsedAt` is always `null` — `project_api_keys` tracks no such column; it's kept in the
 shape so a future column addition wouldn't be a breaking response-shape change. Use this to

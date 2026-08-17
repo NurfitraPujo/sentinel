@@ -41,7 +41,7 @@
 	}
 
 	async function handleCreate(event: CustomEvent) {
-		const { name, scope, rateLimitRpm } = event.detail;
+		const { name, scope, rateLimitRpm, expiresInDays } = event.detail;
 
 		try {
 			const res = await fetch(`/api/organizations/${data.orgId}/keys`, {
@@ -51,7 +51,8 @@
 					name,
 					scope,
 					projectId: data.projectId,
-					rateLimitRpm
+					rateLimitRpm,
+					expiresInDays
 				})
 			});
 

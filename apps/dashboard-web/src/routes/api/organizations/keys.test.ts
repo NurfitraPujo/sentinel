@@ -252,6 +252,37 @@ describe('organization API key routes', () => {
 			);
 		});
 
+		// N9 (C6/C13): optional key lifetime.
+		it.each([-1, 0, 1.5, 4000, 'thirty'])('400s for an invalid expiresInDays (%s)', async (days) => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'k', scope: 'ingest', expiresInDays: days }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('201s and forwards a valid expiresInDays to createApiKey', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			apikeyQueries.createApiKey.mockResolvedValueOnce({
+				apiKey: { id: 'key-new', keyHash: 'deadbeef-hash' },
+				secretToken: 'sent_org_deadbeef',
+			});
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'k', scope: 'ingest', expiresInDays: 90 }),
+			});
+			const res = await POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any);
+			expect(res.status).toBe(201);
+			expect(apikeyQueries.createApiKey).toHaveBeenCalledWith(
+				'user-1',
+				expect.objectContaining({ expiresInDays: 90 })
+			);
+		});
+
 		it('201s for a valid positive integer rateLimitRpm', async () => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
 			apikeyQueries.createApiKey.mockResolvedValueOnce({

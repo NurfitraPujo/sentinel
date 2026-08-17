@@ -94,6 +94,13 @@ export async function createApiKey(
 		// null regardless of what the caller passes) — an agent works across every project in
 		// the org, so binding its key to a single project would be wrong, not just unused.
 		agentId?: string | null;
+		// N9 (docs/plans/AGENT_WORKER_PLAN.md, C6/C13): optional key lifetime in days. Absent/null
+		// mints a non-expiring key (the historical behavior — `expires_at` stays NULL); a positive
+		// number sets `expires_at = now + expiresInDays`. Fractional days are honored so rotation
+		// can preserve an exact lifetime (see rotateAgentKeyWithGrace). `expires_at` is enforced at
+		// auth time (agent-auth.ts and the ingestor's apikey.go), so this is a real expiry, not a
+		// display hint.
+		expiresInDays?: number | null;
 	}
 ) {
 	const rawBytes = crypto.randomBytes(32).toString('hex');
@@ -101,6 +108,11 @@ export async function createApiKey(
 	const prefix = isAgentKey ? 'sent_agent_' : data.projectId ? 'sent_live_' : 'sent_org_';
 	const secretToken = `${prefix}${rawBytes}`;
 	const keyHash = crypto.createHash('sha256').update(secretToken).digest('hex');
+
+	const expiresAt =
+		typeof data.expiresInDays === 'number' && data.expiresInDays > 0
+			? new Date(Date.now() + data.expiresInDays * 24 * 60 * 60 * 1000)
+			: null;
 
 	const [newKey] = await db
 		.insert(projectApiKeys)
@@ -114,6 +126,7 @@ export async function createApiKey(
 			rateLimitRpm: data.rateLimitRpm ?? 5000,
 			createdBy: userId,
 			status: 'active',
+			expiresAt,
 			agentId: isAgentKey ? data.agentId ?? null : null,
 		})
 		.returning({
@@ -176,7 +189,14 @@ export class AgentKeyRotationError extends Error {
  * rotate again (same agent, same org -- not an escalation); callers adding a new call site must
  * keep the authenticate-first ordering.
  */
-export async function rotateAgentKeyWithGrace(oldKeyId: string, graceHours: number) {
+export async function rotateAgentKeyWithGrace(
+	oldKeyId: string,
+	graceHours: number,
+	// N9 (docs/plans/AGENT_WORKER_PLAN.md, C13): fallback lifetime (in days) for the NEW key when
+	// the old key had none to inherit. Absent/null means the new key also gets no expiry in that
+	// case — see the lifetime computation below.
+	rotationDefaultDays: number | null = null
+) {
 	const [existingKey] = await db.select().from(projectApiKeys).where(eq(projectApiKeys.id, oldKeyId));
 
 	if (!existingKey) {
@@ -189,6 +209,21 @@ export async function rotateAgentKeyWithGrace(oldKeyId: string, graceHours: numb
 	const now = Date.now();
 	const graceMs = Math.max(0, graceHours) * 60 * 60 * 1000;
 	const newExpiresAt = new Date(now + graceMs);
+
+	// N9 (C13): propagate a LIFETIME, not just an expiry instant, so rotation is a steady state
+	// rather than a one-shot. The new key inherits the old key's ORIGINAL intended lifetime
+	// (expires_at − created_at, both read from the pre-rotation row above, before the old key's
+	// expiry is pulled forward to now+grace just below). A legacy key with no expiry has no
+	// lifetime to inherit, so the new key falls back to `rotationDefaultDays` (null = stay
+	// non-expiring). Once a key carries a finite lifetime, every subsequent rotation preserves it.
+	const MS_PER_DAY = 24 * 60 * 60 * 1000;
+	let newKeyExpiresInDays: number | null = null;
+	if (existingKey.expiresAt && existingKey.createdAt) {
+		const lifetimeMs = Math.max(0, existingKey.expiresAt.getTime() - existingKey.createdAt.getTime());
+		newKeyExpiresInDays = lifetimeMs / MS_PER_DAY;
+	} else if (typeof rotationDefaultDays === 'number' && rotationDefaultDays > 0) {
+		newKeyExpiresInDays = rotationDefaultDays;
+	}
 
 	const [oldKeyRow] = await db
 		.update(projectApiKeys)
@@ -203,6 +238,7 @@ export async function rotateAgentKeyWithGrace(oldKeyId: string, graceHours: numb
 		scope: 'agent',
 		rateLimitRpm: existingKey.rateLimitRpm,
 		agentId: existingKey.agentId,
+		expiresInDays: newKeyExpiresInDays,
 	});
 
 	return { oldKey: oldKeyRow, newKey, secretToken };

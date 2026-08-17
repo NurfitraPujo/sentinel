@@ -23,6 +23,8 @@
 	let targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 	let scope = 'ingest';
 	let rateLimitRpm = '';
+	// N9: optional key lifetime in days. Empty = non-expiring (historical default).
+	let expiresInDays = '';
 	
 	const dispatch = createEventDispatcher();
 	
@@ -35,11 +37,12 @@
 	function handleSubmit() {
 		if (!name.trim()) return;
 		isSubmitting = true;
-		dispatch('create', { 
-			name: name.trim(), 
-			targetProject, 
-			scope, 
-			rateLimitRpm: rateLimitRpm ? parseInt(rateLimitRpm, 10) : undefined 
+		dispatch('create', {
+			name: name.trim(),
+			targetProject,
+			scope,
+			rateLimitRpm: rateLimitRpm ? parseInt(rateLimitRpm, 10) : undefined,
+			expiresInDays: expiresInDays ? parseInt(expiresInDays, 10) : undefined
 		});
 	}
 
@@ -48,6 +51,7 @@
 		targetProject = allowOrgWide ? ORG_WIDE_SENTINEL : (projects[0]?.id ?? ORG_WIDE_SENTINEL);
 		scope = 'ingest';
 		rateLimitRpm = '';
+		expiresInDays = '';
 		isSubmitting = false;
 	}
 
@@ -141,7 +145,19 @@
 					id="rate-limit" 
 					bind:value={rateLimitRpm} 
 					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-emerald-500 transition-colors" 
-					placeholder="Default (6000 rpm)" 
+					placeholder="Default (6000 rpm)"
+				/>
+			</div>
+
+			<div>
+				<label for="expires-in-days" class="block text-xs font-semibold text-gray-300 uppercase tracking-wider mb-1">Expires In (Days)</label>
+				<input
+					type="number"
+					id="expires-in-days"
+					min="1"
+					bind:value={expiresInDays}
+					class="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-emerald-500 transition-colors"
+					placeholder="Never expires"
 				/>
 			</div>
 
