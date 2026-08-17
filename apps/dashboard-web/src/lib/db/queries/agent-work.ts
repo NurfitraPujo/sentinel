@@ -3,6 +3,11 @@ import { issues, projects, manualIssueReports, issueActivity } from '$lib/db/sch
 import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
+import {
+	findIdempotencyKey,
+	recordIdempotencyKey,
+	IdempotencyRaceError,
+} from '$lib/server/agent-idempotency';
 
 /**
  * Manual Issues M5 stage 2 (design §7 step 1): `GET /api/agent/issues` -- the one deliberate
@@ -225,9 +230,38 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 export async function recordAgentProgress(
 	issueId: string,
 	agentId: string,
-	messageMd: string
-): Promise<{ notified: NotifiedUser[] }> {
+	messageMd: string,
+	idempotencyKey?: string
+): Promise<{ notified: NotifiedUser[]; deduplicated: boolean }> {
+	const IDEMPOTENCY_OP = 'issues.progress';
+	try {
+		return await recordAgentProgressTxn(issueId, agentId, messageMd, idempotencyKey, IDEMPOTENCY_OP);
+	} catch (err) {
+		// A concurrent duplicate committed our key first and rolled our transaction back. A progress
+		// update has no result to re-fetch beyond "it happened" -- replay a bare deduplicated success.
+		if (err instanceof IdempotencyRaceError) {
+			return { notified: [], deduplicated: true };
+		}
+		throw err;
+	}
+}
+
+async function recordAgentProgressTxn(
+	issueId: string,
+	agentId: string,
+	messageMd: string,
+	idempotencyKey: string | undefined,
+	idempotencyOp: string
+): Promise<{ notified: NotifiedUser[]; deduplicated: boolean }> {
 	return await db.transaction(async (tx) => {
+		// N9 (D21): idempotency-key replay -- checked BEFORE any write, read-only early return.
+		if (idempotencyKey) {
+			const hit = await findIdempotencyKey(tx, agentId, idempotencyKey, idempotencyOp);
+			if (hit) {
+				return { notified: [], deduplicated: true };
+			}
+		}
+
 		// A05-comment/progress (N7d): dedupe a retried progress post by natural key (same
 		// issue+agent+message within AGENT_DEDUPE_WINDOW_MS) -- mirrors createComment's plain-comment
 		// dedupe. `newValue` is jsonb; `->>'messageMd'` does a text comparison against the stored key.
@@ -246,7 +280,7 @@ export async function recordAgentProgress(
 			);
 
 		if (recentDuplicates.length > 0) {
-			return { notified: [] };
+			return { notified: [], deduplicated: true };
 		}
 
 		await tx.insert(issueActivity).values({
@@ -265,6 +299,12 @@ export async function recordAgentProgress(
 			payload: { messageMd },
 		});
 
-		return { notified };
+		// N9 (D21): stamp the key LAST, in the same transaction; a concurrent-duplicate conflict
+		// throws IdempotencyRaceError and rolls back this progress row so only the winner survives.
+		if (idempotencyKey) {
+			await recordIdempotencyKey(tx, agentId, idempotencyKey, idempotencyOp, null);
+		}
+
+		return { notified, deduplicated: false };
 	});
 }

@@ -254,10 +254,15 @@ export const PostCommentBodySchema = z
 	.object({
 		body_md: z.string(),
 		attachment_ids: z.array(z.string()).optional(),
+		// N9 (D21): optional client-generated key (e.g. per-job UUID). A repeat replays the original
+		// comment with `deduplicated: true` -- no second activity row, no second email.
+		idempotency_key: z.string().max(255).optional(),
 	})
 	.strict();
 
-export const PostCommentResponseSchema = z.object({ comment: CommentRowSchema }).strict();
+export const PostCommentResponseSchema = z
+	.object({ comment: CommentRowSchema, deduplicated: z.literal(true).optional() })
+	.strict();
 
 // ---------------------------------------------------------------------------
 // PATCH/DELETE /api/agent/issues/{issueId}/comments/{commentId} -- A08 (N7e), agent-ops.ts's
@@ -289,17 +294,30 @@ export const QuestionBodySchema = z
 	.object({
 		body_md: z.string(),
 		audience: z.enum(['reporter', 'team']),
+		// N9 (D21): a repeat key replays the ORIGINAL question's comment id and sends NO second email
+		// (a blocking question bypasses the throttle, so the dedupe is what prevents a double-notify).
+		idempotency_key: z.string().max(255).optional(),
 	})
 	.strict();
 
-export const QuestionResponseSchema = z.object({ comment: CommentRowSchema }).strict();
+export const QuestionResponseSchema = z
+	.object({ comment: CommentRowSchema, deduplicated: z.literal(true).optional() })
+	.strict();
 
 // ---------------------------------------------------------------------------
 // POST /api/agent/issues/{issueId}/progress
 // ---------------------------------------------------------------------------
 
-export const ProgressBodySchema = z.object({ message_md: z.string() }).strict();
-export const ProgressResponseSchema = z.object({ success: z.literal(true) }).strict();
+export const ProgressBodySchema = z
+	.object({
+		message_md: z.string(),
+		// N9 (D21): a repeat key replays a bare deduplicated success -- no second progress row.
+		idempotency_key: z.string().max(255).optional(),
+	})
+	.strict();
+export const ProgressResponseSchema = z
+	.object({ success: z.literal(true), deduplicated: z.literal(true).optional() })
+	.strict();
 
 // ---------------------------------------------------------------------------
 // POST/DELETE /api/agent/issues/{issueId}/relations

@@ -127,13 +127,15 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/+server.ts',
 		operationId: 'postComment',
-		summary: 'Post a non-blocking comment (emails subscribers)',
+		summary:
+			'Post a non-blocking comment (emails subscribers). Optional idempotency_key: a repeat replays the original comment with deduplicated:true, no second email',
 		request: { bodySchema: S.PostCommentBodySchema },
 		responses: {
 			'201': S.PostCommentResponseSchema,
 			'400': S.MessageErrorSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
+			'409': S.MessageErrorSchema,
 		},
 	},
 	{
@@ -183,13 +185,15 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/questions/+server.ts',
 		operationId: 'askQuestion',
-		summary: 'Ask a blocking question (sets waiting_on, forces an immediate email)',
+		summary:
+			'Ask a blocking question (sets waiting_on, forces an immediate email). Optional idempotency_key: a repeat replays the original question comment id with deduplicated:true and no second email',
 		request: { bodySchema: S.QuestionBodySchema },
 		responses: {
 			'201': S.QuestionResponseSchema,
 			'400': S.MessageErrorSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
+			'409': S.MessageErrorSchema,
 		},
 	},
 	{
@@ -197,13 +201,15 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/progress/+server.ts',
 		operationId: 'postProgress',
-		summary: 'Post an in-app-only progress update (no email)',
+		summary:
+			'Post an in-app-only progress update (no email). Optional idempotency_key: a repeat replays a deduplicated success with no second progress row',
 		request: { bodySchema: S.ProgressBodySchema },
 		responses: {
 			'201': S.ProgressResponseSchema,
 			'400': S.MessageErrorSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
+			'409': S.MessageErrorSchema,
 		},
 	},
 	{

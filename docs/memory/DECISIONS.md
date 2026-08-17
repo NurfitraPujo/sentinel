@@ -973,3 +973,55 @@ the now-deleted issue row.
 - The tombstone is written for exactly the issues the DELETE actually removed (keyed off its `returning`),
   not the candidate set — a concurrent occurrence insert that spares a candidate must not leave a
   false tombstone.
+## D21 | Client-Supplied Idempotency Keys for Agent Write Endpoints
+
+**Date**: 2026-08-17 · **Status**: accepted · **Detail**: N9, server-side prerequisite for the N8
+sentinel-worker plan (`docs/plans/AGENT_WORKER_PLAN.md`, contract corrections C4/C5) ·
+**Code**: `apps/dashboard-web/src/lib/server/agent-idempotency.ts`,
+`src/lib/db/queries/comments.ts`, `src/lib/db/queries/agent-work.ts`,
+`src/lib/server/agent-ops.ts`, `src/routes/api/agent/issues/[issueId]/questions/+server.ts`,
+migration `1723800000_add_agent_idempotency_keys.sql`
+
+### Decision
+
+Agent write endpoints (`issues.comment`, `issues.progress`, the blocking-question endpoint, and the
+same ops as driven through `POST /api/agent/batch`) accept an optional client-generated
+`idempotency_key` (e.g. a per-job UUID). Keys are stored in a dedicated `agent_idempotency_keys`
+table with a UNIQUE index on `(agent_id, idempotency_key)` — the key space belongs to the calling
+agent (B7: `agent_id` derives from the credential, never a request field), so two agents may reuse
+the same UUID without colliding. A repeat key returns the ORIGINAL result with `deduplicated: true`,
+no second activity row, and no second notification/email. `op` is stored alongside the key so a key
+accidentally reused across two operations is a 409 (`IdempotencyKeyOpMismatchError`), not a
+mis-shaped replay. Keys are aged out after 7 days (`AGENT_IDEMPOTENCY_RETENTION_DAYS`), piggybacked
+on the existing retention cron.
+
+The check-and-record is done INSIDE the write's own transaction: `findIdempotencyKey` short-circuits
+before any write (a read-only early return, safe under D18); on the fresh path `recordIdempotencyKey`
+stamps the key LAST via `INSERT ... ON CONFLICT DO NOTHING`, and an empty RETURNING (a concurrent
+duplicate committed first) throws `IdempotencyRaceError`, which rolls the whole transaction back so
+only the winner's single side effect survives — the loser then replays the winner's stored result.
+`ON CONFLICT DO NOTHING` rather than catching a raw 23505 is load-bearing: a bare unique violation
+aborts the Postgres transaction and cannot be caught-and-continued.
+
+### Consequences
+
+- This is a SUPERSET of, not a replacement for, N7d's natural-key dedupe (`agent-dedupe.ts`,
+  `AGENT_DEDUPE_WINDOW_MS`), which stays as a keyless backstop for comment/progress. The gaps N7d
+  documented — a retry >2min later, reworded text, and (deliberately) blocking questions — are all
+  closed only when the client supplies a key.
+- **Blocking questions are now safe to retry.** N7d excluded them from dedupe on purpose (waiting_on
+  predictability), and `question_asked` bypasses the 15-min email throttle, so a crashed agent's
+  retried question used to double-email the reporter. An idempotency-key hit returns the ORIGINAL
+  question's comment id, does NOT re-set `issues.waiting_on` (so a since-answered question is not
+  reopened), and fires no second notification. Proven by `comments.idempotency.test.ts` asserting
+  exactly one `notifyIssueEvent` across the original call and the replay.
+- Migration is idempotent (A1): `CREATE TABLE IF NOT EXISTS` with the UNIQUE + PK inline, plus
+  `CREATE INDEX IF NOT EXISTS` — no bare `ADD CONSTRAINT`. Replay-safe across every goose ledger.
+- `comment_id` carries no FK on purpose: if the original comment is later deleted the dedupe guard
+  must still stand (a retry must not resurrect a deleted comment via a fresh write); the row is aged
+  out by the reaper instead.
+- Residual risk (documented, matching N7d's style): a SERVER crash between the write's commit and the
+  key stamp is impossible because they share one transaction; a crash mid-transaction rolls both
+  back, so the retry re-runs cleanly. The only at-least-once window is the pre-existing one any HTTP
+  call has (client never learns the outcome and the server did commit) — which is exactly what the
+  key closes on the retry.

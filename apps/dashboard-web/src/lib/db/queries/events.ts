@@ -219,6 +219,12 @@ async function listOrgTombstones(options: ListOrgActivityOptions): Promise<OrgAc
 			status: 'deleted',
 			issueType: row.issueType ?? '',
 			projectId: row.issueProjectId,
+			// N9 (C2): the issue is gone, so there is no CURRENT claim/waiting state to report --
+			// these are null for every tombstone event (a deleted issue is not claimed or waiting).
+			assigneeType: null,
+			assignedTo: null,
+			claimedAt: null,
+			waitingOn: null,
 		},
 	}));
 }

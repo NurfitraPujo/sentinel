@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, integer, boolean } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, uniqueIndex, integer, boolean } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const organizations = pgTable('organizations', {
@@ -464,4 +464,23 @@ export const agentWebhooks = pgTable('agent_webhooks', {
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => ({
 	idxAgentWebhooksAgent: index('idx_agent_webhooks_agent').on(table.agentId),
+}));
+
+// N9 (docs/plans/AGENT_WORKER_PLAN.md C4/C5), source of truth is
+// 1723800000_add_agent_idempotency_keys.sql. Client-supplied idempotency keys for agent write
+// endpoints (D21). Scope is (agentId, idempotencyKey) -- the UNIQUE constraint below is what makes
+// a concurrent duplicate lose the race (createComment/recordAgentProgress insert with
+// onConflictDoNothing inside their own transaction and roll back on conflict). `op` guards against
+// a key reused across two different operations; `commentId` is the only original-result reference
+// needed to replay (NULL for progress). Aged out after 7 days by retention.ts's reaper.
+export const agentIdempotencyKeys = pgTable('agent_idempotency_keys', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	agentId: varchar('agent_id', { length: 255 }).notNull(),
+	idempotencyKey: varchar('idempotency_key', { length: 255 }).notNull(),
+	op: varchar('op', { length: 50 }).notNull(),
+	commentId: uuid('comment_id'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	uniqAgentKey: uniqueIndex('agent_idempotency_keys_agent_key_unique').on(table.agentId, table.idempotencyKey),
+	idxCreatedAt: index('idx_agent_idempotency_keys_created_at').on(table.createdAt),
 }));
