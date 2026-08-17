@@ -88,6 +88,29 @@ describe('GET /api/agent/issues -- limit', () => {
 	});
 });
 
+describe('GET /api/agent/issues -- claimed', () => {
+	it('N9 (C12): claimed=me resolves claimedByAgentId from the credential (B7), not a param', async () => {
+		await GET(makeEvent('?claimed=me'));
+		expect(listAgentIssues).toHaveBeenCalledWith(
+			expect.objectContaining({ claimedByAgentId: 'agent-1', claimed: undefined })
+		);
+	});
+
+	it('forwards claimed=true/false as the boolean, with no claimedByAgentId', async () => {
+		await GET(makeEvent('?claimed=true'));
+		expect(listAgentIssues).toHaveBeenCalledWith(
+			expect.objectContaining({ claimed: true, claimedByAgentId: undefined })
+		);
+	});
+
+	it('400s on an invalid claimed value', async () => {
+		const res = await GET(makeEvent('?claimed=bogus'));
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({ error: 'claimed must be "true", "false", or "me"' });
+		expect(listAgentIssues).not.toHaveBeenCalled();
+	});
+});
+
 describe('GET /api/agent/issues -- cursor', () => {
 	it('400s when decodeAgentIssuesCursor throws', async () => {
 		decodeAgentIssuesCursor.mockImplementation(() => {

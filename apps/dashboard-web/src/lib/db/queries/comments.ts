@@ -167,7 +167,12 @@ export async function createComment(
 		// M5 §7 step 4 (Q11): a blocking question sets issues.waiting_on in the SAME transaction as
 		// the comment insert and its activity row (D18) -- 'question_asked' rather than 'commented'.
 		if (input.blocking) {
-			await tx.update(issues).set({ waitingOn: input.waitingOnAudience }).where(eq(issues.id, input.issueId));
+			// N9 (AGENT_WORKER_PLAN C12): stamp waiting_since in the SAME transaction as waiting_on so
+			// the list's `waitingSince` reflects when THIS question started blocking.
+			await tx
+				.update(issues)
+				.set({ waitingOn: input.waitingOnAudience, waitingSince: new Date() })
+				.where(eq(issues.id, input.issueId));
 		}
 
 		await tx.insert(issueActivity).values({
@@ -188,7 +193,8 @@ export async function createComment(
 		// A blocking question is itself authored by an agent (never a user), so this branch and the
 		// one above are mutually exclusive for a single call.
 		if (input.authorType === 'user' && issueRow.waitingOn !== null) {
-			await tx.update(issues).set({ waitingOn: null }).where(eq(issues.id, input.issueId));
+			// N9 (AGENT_WORKER_PLAN C12): clear waiting_since alongside waiting_on.
+			await tx.update(issues).set({ waitingOn: null, waitingSince: null }).where(eq(issues.id, input.issueId));
 
 			await tx.insert(issueActivity).values({
 				issueId: input.issueId,

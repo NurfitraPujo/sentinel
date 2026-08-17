@@ -31,12 +31,16 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		type = typeParam as 'user_report' | 'system_error';
 	}
 
+	// N9 (AGENT_WORKER_PLAN C12): `claimed=me` restricts to THIS agent's own claims, resolved from
+	// the credential (B7 -- never a request param), mirroring the events feed's claimed=me.
 	const claimedParam = url.searchParams.get('claimed');
 	let claimed: boolean | undefined;
+	let claimedByAgentId: string | undefined;
 	if (claimedParam === 'true') claimed = true;
 	else if (claimedParam === 'false') claimed = false;
+	else if (claimedParam === 'me') claimedByAgentId = ctx.agentId;
 	else if (claimedParam !== null) {
-		return json({ error: 'claimed must be "true" or "false"' }, { status: 400 });
+		return json({ error: 'claimed must be "true", "false", or "me"' }, { status: 400 });
 	}
 
 	const projectId = url.searchParams.get('project') || undefined;
@@ -91,6 +95,7 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		organizationId: ctx.organizationId,
 		type,
 		claimed,
+		claimedByAgentId,
 		projectId,
 		waiting,
 		since,

@@ -44,7 +44,9 @@ vi.mock('$lib/db/schema', () => ({
 		status: 'status',
 		assigneeType: 'assigneeType',
 		assignedTo: 'assignedTo',
+		claimedAt: 'claimedAt',
 		waitingOn: 'waitingOn',
+		waitingSince: 'waitingSince',
 		firstSeen: 'firstSeen',
 		lastSeen: 'lastSeen',
 		count: 'count',
@@ -100,6 +102,31 @@ describe('listAgentIssues', () => {
 
 		expect(result.issues).toHaveLength(1);
 		expect(result.issues[0].isWaiting).toBe(true);
+	});
+
+	it('N9 (C12): surfaces waitingSince only for a currently-waiting row', async () => {
+		const ws = new Date('2026-08-15T09:00:00Z');
+		dbMock.__result = [
+			{ id: 'i1', waitingOn: 'reporter', waitingSince: ws, firstSeen: null, lastSeen: null },
+			{ id: 'i2', waitingOn: null, waitingSince: ws, firstSeen: null, lastSeen: null },
+		];
+
+		const result = await listAgentIssues({ organizationId: 'org-1' });
+
+		// Deleting the `row.waitingOn !== null ? row.waitingSince : null` gate makes i2 leak a stale ws.
+		expect(result.issues[0].waitingSince).toEqual(ws);
+		expect(result.issues[1].waitingSince).toBeNull();
+	});
+
+	it('N9 (C12): claimed=me pushes assigneeType=agent AND assignedTo=agentId conditions', async () => {
+		dbMock.__result = [];
+
+		await listAgentIssues({ organizationId: 'org-1', claimedByAgentId: 'agent-42' });
+
+		expect(dbMock.where).toHaveBeenCalledTimes(1);
+		// Deleting the claimedByAgentId branch in agent-work.ts drops these nodes from the AND.
+		const serialized = JSON.stringify(dbMock.where.mock.calls[0][0]);
+		expect(serialized).toContain('agent-42');
 	});
 
 	it('legacy default: no limit param means no .limit() call and no nextCursor (byte-identical)', async () => {
