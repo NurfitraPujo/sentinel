@@ -100,13 +100,31 @@ Response:
       "oldValue": { "status": "unresolved" },
       "newValue": { "status": "resolved" },
       "createdAt": "2026-08-14T12:00:00.000Z",
-      "issue": { "id": "iss_...", "title": "...", "status": "resolved", "issueType": "system_error", "projectId": "prj_..." }
+      "issue": {
+        "id": "iss_...",
+        "title": "...",
+        "status": "resolved",
+        "issueType": "system_error",
+        "projectId": "prj_...",
+        "assigneeType": "agent",
+        "assignedTo": "agt_...",
+        "claimedAt": "2026-08-14T11:59:00.000Z",
+        "waitingOn": null
+      }
     }
   ],
   "cursor": 42,
   "hasMore": false
 }
 ```
+
+The embedded `issue` object's `assigneeType`, `assignedTo`, `claimedAt`, and `waitingOn` reflect
+the issue's **current** state at read time, **not** its state when the event occurred. A
+dispatcher can therefore evaluate "is this issue claimed by me right now?" straight from the feed —
+`assigneeType === "agent" && assignedTo === <your agent id>` — without a follow-up
+`GET /api/agent/issues/:id` per event. `assignedTo`/`assigneeType`/`claimedAt` are `null` when the
+issue is currently unclaimed; `waitingOn` is `null` unless an unanswered blocking question is
+outstanding (`"reporter"` or `"team"`).
 
 Valid `eventType` values (the full `issue_activity.event_type` set): `status_changed`, `assigned`,
 `unassigned`, `regressed`, `ai_analysis`, `linked`, `commented`, `claimed`, `claim_released`,

@@ -40,6 +40,8 @@ vi.mock('$lib/db/schema', () => ({
 		projectId: 'projectId',
 		assigneeType: 'assigneeType',
 		assignedTo: 'assignedTo',
+		claimedAt: 'claimedAt',
+		waitingOn: 'waitingOn',
 	},
 	projects: { id: 'id', organizationId: 'organizationId' },
 }));
@@ -89,6 +91,10 @@ function row(overrides: Partial<Record<string, unknown>> = {}) {
 		issueStatus: 'resolved',
 		issueType: 'system_error',
 		issueProjectId: 'project-1',
+		issueAssigneeType: 'agent',
+		issueAssignedTo: 'agent-1',
+		issueClaimedAt: new Date('2026-08-14T00:00:00Z'),
+		issueWaitingOn: 'reporter',
 		...overrides,
 	};
 }
@@ -119,6 +125,10 @@ describe('listOrgActivity', () => {
 				status: 'resolved',
 				issueType: 'system_error',
 				projectId: 'project-1',
+				assigneeType: 'agent',
+				assignedTo: 'agent-1',
+				claimedAt: new Date('2026-08-14T00:00:00Z'),
+				waitingOn: 'reporter',
 			},
 		});
 	});
