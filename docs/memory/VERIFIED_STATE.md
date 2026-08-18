@@ -1937,3 +1937,17 @@ Branch `feat/agent-project-settings` (commit `00d2394`, pre-merge), worktree
 
 - Fix plans (those belong in `specs/<feature>/` or `docs/plans/`).
 - Findings not reproduced by running something.
+
+## N8a — sentinel-worker skeleton (2026-08-18, branch feat/agent-worker, NOT yet merged)
+
+What runs, with the command that proved it:
+- `cd tools/sentinel-worker && GOWORK=off go build ./... && GOWORK=off go vet ./... && test -z "$(gofmt -l .)" && GOWORK=off go test ./... -count=1 -race` → all packages ok.
+- Dashboard gates after the claim_released `previousAssignee` change (queries/issues.ts):
+  `pnpm build` done, `pnpm check` 1884 files / 0 errors, `pnpm test -- --sequence.shuffle`
+  864 passed / 11 skipped.
+- Live boot against the compose stack (dashboard :13000): healthz 200; readyz 503 with honest
+  reason; recovery scan runs BEFORE identity resolution; bogus key → 401 retried on the
+  backoff ladder without crash; SIGTERM → clean exit 0 (dispatcher ctx-drain).
+NOT yet verified (deliberate, per plan §9): real-credential dry-run (U40, N8d e2e); guard/
+keyguard/batch-writers/runner-circuits are tested-but-unwired seams — see the plan's §9
+"N8a unwired seams" note before trusting their green suites (B3).

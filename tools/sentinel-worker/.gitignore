@@ -1,0 +1,9 @@
+# Runtime state written by a running worker under WORKER_STATE_DIR when it happens to default to
+# this directory (e.g. a bare `go run .` during local dev) -- none of this belongs in the repo.
+cursor.json
+jobs.journal
+agent-logs/
+
+# Built binaries.
+sentinel-worker
+worker

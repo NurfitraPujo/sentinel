@@ -264,12 +264,14 @@ export async function assignIssue(
 		// claim — that's the release path, so it must be journaled as claim_released, not a generic
 		// unassigned. Read the prior state to tell the two apart.
 		let priorAgentClaim = false;
+		let priorAssignedTo: string | null = null;
 		if (!assignedTo) {
 			const [current] = await tx
 				.select({ assigneeType: issues.assigneeType, assignedTo: issues.assignedTo })
 				.from(issues)
 				.where(eq(issues.id, issueId));
 			priorAgentClaim = current?.assigneeType === 'agent' && current.assignedTo !== null;
+			priorAssignedTo = current?.assignedTo ?? null;
 		}
 
 		// claimedAt is always cleared: an assignment is not a claim (only claimIssue sets it), and
@@ -280,12 +282,22 @@ export async function assignIssue(
 
 		const eventType = assignedTo ? 'assigned' : priorAgentClaim ? 'claim_released' : 'unassigned';
 
+		// tools/sentinel-worker's dispatch.go (loop.Classify) reads claim_released's
+		// `newValue.previousAssignee` to decide whether this release is ITS OWN claim being taken
+		// back (KindSweepReconcile) -- the reaper (retention.ts) already writes this field, and this
+		// path must match that shape or the worker can never see a dashboard-initiated unassign of
+		// its own claim.
+		const newValue: Record<string, unknown> = { assigneeType, assignedTo };
+		if (eventType === 'claim_released') {
+			newValue.previousAssignee = priorAssignedTo;
+		}
+
 		await tx.insert(issueActivity).values({
 			issueId,
 			eventType,
 			actorType,
 			actorId,
-			newValue: { assigneeType, assignedTo },
+			newValue,
 		});
 
 		// §8 auto-subscribe: an assignee is treated like a claimant (reason 'claimant'). USER

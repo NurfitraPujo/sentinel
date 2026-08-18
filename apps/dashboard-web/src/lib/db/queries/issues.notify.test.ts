@@ -200,6 +200,16 @@ describe('assignIssue', () => {
 		expect(txMock.values).toHaveBeenCalledWith(
 			expect.objectContaining({ eventType: 'claim_released', actorType: 'user', actorId: 'admin-1' })
 		);
+		// B5 cross-boundary contract: tools/sentinel-worker's dispatcher (loop.Classify,
+		// KindSweepReconcile) identifies its own released claims by newValue.previousAssignee —
+		// the same shape the stale-claim reaper writes (retention.ts). Regressing this field
+		// silently breaks the Agent Worker's reaped-claim reconciliation.
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({
+				eventType: 'claim_released',
+				newValue: expect.objectContaining({ previousAssignee: 'agent-1' })
+			})
+		);
 	});
 
 	it('unassigning a user-assigned issue still emits unassigned', async () => {

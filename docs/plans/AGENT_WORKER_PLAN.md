@@ -124,7 +124,7 @@ tools/sentinel-worker (4th independent Go module, GOWORK=off in CI, like sentine
  │     ▼                                                                      │
  │  N job runners (default 2):                                                │
  │    resolve issue state (1 GET) → check preconditions → ensure-claimed(C1)  │
- │    → brain → JOURNAL DECISION → act (batch) → done                         │
+ │    → Advisor → JOURNAL DECISION → act (batch) → done                         │
  │        │                              │                                    │
  │        │                        ┌─────┴──────┐                             │
  │        │                        │ TRIAGE     │ Chat-loop, ≤6 turns         │
@@ -155,7 +155,7 @@ tools/sentinel-worker/
   sentinel/retry.go          # two-level classification: envelope status AND per-op results[i].status
   loop/poll.go               # events poll loop + cursor + bootstrap sweep
   loop/dispatch.go           # event-type-only classification + per-issue serial queues + coalescing
-  loop/runner.go             # resolve → preconditions → ensure-claimed → brain → journal → act
+  loop/runner.go             # resolve → preconditions → ensure-claimed → Advisor → journal → act
   state/cursor.go            # atomic cursor persistence (dlq state.go tmp+rename pattern)
   state/journal.go           # append-only job journal: dedupe, decision storage, crash recovery
   llm/llm.go                 # the Chat interface + Msg/ToolDef/Response types
@@ -163,8 +163,8 @@ tools/sentinel-worker/
   llm/anthropic.go           # Anthropic Messages API adapter (native tool use)
   llm/gemini.go              # Google GenAI adapter
   llm/toolloop.go            # the agentic while-tool-calls loop, turn/token caps, structured re-ask
-  jobs/triage.go             # TRIAGE brain: prompt, tools, structured decision, act()
-  jobs/followup.go           # FOLLOW-UP brain
+  jobs/triage.go             # TRIAGE Advisor: prompt, tools, structured decision, act()
+  jobs/followup.go           # FOLLOW-UP Advisor
   jobs/fix.go                # FIX: workspace prep, $FIX_EXECUTOR_CMD invocation, validation, reporting
   jobs/sweep.go              # periodic sweep: claim heartbeat, PR-status poll, nag, budget reset
   gitprovider/provider.go    # Provider interface: auth material, CreatePR, PRStatus
@@ -216,14 +216,14 @@ comment is cheaper. Revisit only if a third consumer appears.
 
 Append-only NDJSON `jobs.journal` in the state dir, one record per state transition:
 `{jobId, issueId, kind, triggerSeq, state, at, payload?}` with states
-`queued | superseded | claimed | brained | questioned | acting | acted | done | failed | skipped`.
+`queued | superseded | claimed | advised (previously 'brained') | questioned | acting | acted | done | failed | skipped`.
 
 - **Dedupe**: `jobId = hash(kind + issueId + triggerSeq)`. A re-delivered event whose jobId has any
   terminal record (`done|failed|skipped|superseded`) is dropped.
 - **Coalescing writes `superseded`**: when queued same-kind jobs for one issue collapse (§3), the
   losers get a terminal `superseded` record — otherwise crash recovery would resurrect them.
-- **`brained` stores the decision**: the record's `payload` is the brain's decision JSON *and* the
-  compiled batch body. **Recovery from `brained`/`acting` replays the journaled batch verbatim —
+- **`advised` stores the decision**: the record's `payload` is the Advisor's decision JSON *and* the
+  compiled batch body. **Recovery from `advised`/`acting` replays the journaled batch verbatim —
   the LLM is NEVER re-invoked for a job that already produced a decision** (this is what makes the
   server's exact-body dedupe able to fire at all, C5, and it saves the tokens).
 - **Idempotency keys close the replay windows (C4)**: every keyable write (comment, progress,
@@ -234,7 +234,7 @@ Append-only NDJSON `jobs.journal` in the state dir, one record per state transit
   the returned `commentId` for the thread-link); its read-back-reconcile dance is DELETED — the
   key makes it unnecessary.
 - **`acting {batchBodyHash}`** is written before the batch POST; `acted {completed, results}`
-  after. Replay from `brained`/`acting` re-sends the journaled body (same keys) and reconciles
+  after. Replay from `advised`/`acting` re-sends the journaled body (same keys) and reconciles
   per-op (§2.3). Residual duplicate risk now covers only the un-keyable ops (`relations.add` —
   409-dropped anyway; `issues.report.severity` — replay writes a second `report_edited` activity
   row, cosmetic) — the rev 2 ">120s lost-response" comment/question window is closed by C4.
@@ -694,7 +694,7 @@ prompt** plus the template version (template-only hashes can't reconstruct "why"
 
 - **Unit (Go, httptest; fixture repos are local bare repos — no network)**: cursor atomicity;
   journal dedupe, `superseded` on coalesce, decision-storage + **replay-without-re-invoking-LLM**
-  (assert zero brain calls on recovery from `brained`/`acting`); bootstrap sweep (fresh start
+  (assert zero Advisor calls on recovery from `advised`/`acting`); bootstrap sweep (fresh start
   enqueues from issues list, sets cursor to head, never pages history); dispatcher table (all 18
   event types, echo suppression, C10 double-event coalescing + debounce); runner preconditions
   (each `skipped` reason) and **ensure-claimed C1** (`alreadyClaimed: true` proceeds without a
@@ -714,7 +714,7 @@ prompt** plus the template version (template-only hashes can't reconstruct "why"
   (traversal, symlink escape, absolute path, `.git/` denial, `release=-x` injection) + refresh
   throttle; guard: delimiter wrapping + gate rejection goldens (injected stacktrace → publish
   blocked). Every guard mutation-tested: delete the production line, watch red.
-- **Brain tests without a real LLM**: scripted `llm.Chat` fake plays multi-turn conversations;
+- **Advisor tests without a real LLM**: scripted `llm.Chat` fake plays multi-turn conversations;
   prompts are goldens.
 - **e2e** (tests/e2e, `-tags=e2e`): **build step decided** — the module is outside go.work and the
   e2e CI job deliberately runs in workspace mode, where `go build ./tools/sentinel-worker` fails;
@@ -747,10 +747,26 @@ Fable holistic review; green gates + memory sync + commit per phase)
 | **N8a** | Skeleton: config+gates, client + two-level retry (incl. idempotency-key plumbing), cursor+bootstrap, journal (all states), poll loop, dispatcher (payload claim-state pre-filter + `issue_deleted` row) + runner preconditions, health, CI job | unit suites; worker against compose stack with `WORKER_ENABLED=true, WORKER_EXECUTE=false` (dry-run journals decisions) |
 | **N8b** | `llm` package: interface, toolloop + re-ask, 3 adapters, budgets/volume caps | adapter goldens + scripted-fake loop tests |
 | **N8c** | `gitprovider` + `repoctx` confinement + `guard` (delimiting/output gate) + repo-map validation | provider goldens, extended leak test, confinement + injection-golden tests |
-| **N8d** | TRIAGE + FOLLOW-UP brains, act() per-op compilation (all dispositions incl. needs_human), sweep (heartbeat/nag/reconcile), C10 coalescing e2e | unit goldens + e2e U40/U41 |
+| **N8d** | TRIAGE + FOLLOW-UP Advisors, act() per-op compilation (all dispositions incl. needs_human), sweep (heartbeat/nag/reconcile), C10 coalescing e2e | unit goldens + e2e U40/U41 |
 | **N8e** | keyguard (expiry-driven + null-expiry fallback) + hardening: circuits, tombstone/404 handling, kill -9 replay proofs | keyguard units + both kill -9 e2e assertions |
 | **N8f** | FIX engine: workspace (TASK.md outside clone), $FIX_EXECUTOR_CMD, validation gates, askpass push, provider PR flow + PRSpec templates, caps | stub-agent units + manual recipe doc |
 | **N8g** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | compose boot green incl. wait-healthy with worker present-but-gated; helm lint; full gate sweep; CI shows U40/U41 run |
+
+**N8a unwired seams**: `tools/sentinel-worker/guard/` and `tools/sentinel-worker/keyguard/` are
+built and unit-tested in N8a but imported by nothing yet — `guard` wires into the Advisor output
+path in N8c, `keyguard` wires into key rotation in N8e. Passing tests for either package prove the
+package works in isolation, not that anything in the running worker calls it (B3); don't read
+green `guard`/`keyguard` suites as evidence the harness enforces the output gate or rotates keys
+until N8c/N8e land. The same caveat applies to three more seams built in N8a: `sentinel/retry.go`'s
+`ClassifyBatch`/`ClassifyOp` (per-op batch classification) and `sentinel/client.go`'s
+batch/comment/question/progress writers are unit-tested in isolation but not yet called by
+anything in the running worker — they are wired in by N8d's `act()` compilation step. Runner
+in-lane retry (re-driving a job through the Transient-class backoff ladder without leaving the
+per-issue queue) and the circuit breaker (`sentinel/retry.go`'s `CircuitBreaker`) are likewise
+unit-tested but not yet consulted by `loop.Runner.Run`/`Dispatcher` — full wiring is N8e. N8a's
+minimum bar for a transient runner failure is narrower: journal a terminal `failed(transient:
+<class>)` record and count it via `OnOutcome` so it is never silently stranded at a non-terminal
+state, without yet retrying it in-lane or tripping a circuit.
 
 ## 10. Risks & consciously-deferred
 

@@ -421,3 +421,23 @@ has no consumer, drain, or dashboard surface yet.
 - **Where to look**: `apps/dashboard-web/src/lib/server/repo-credential-crypto.ts`,
   `src/lib/db/queries/repo-credentials.ts`, `src/routes/api/agent/repo-credentials/`,
   `docs/memory/DECISIONS.md` D22, `docs/memory/VERIFIED_STATE.md` → "N10 part 2".
+
+## 2026-08-18 — N8a: sentinel-worker skeleton (branch feat/agent-worker)
+
+Built `tools/sentinel-worker` (4th independent Go module, stdlib-only, GOWORK=off) per
+docs/plans/AGENT_WORKER_PLAN.md rev 5 §9 N8a: config+gates (WORKER_ENABLED/WORKER_EXECUTE;
+EXECUTE=true rejected until N8d ships the Actor), sentinel client + two-level retry/circuits +
+IdempotencyKey derivation, atomic cursor + journal (10 states incl. `advised`, fsync'd
+compaction, O(1) jobId index), poll loop (drain-before-sleep, ctx-aware waits) + C9 bootstrap
+(no history replay; delta bounded by headCapturedAt), dispatcher (§3 table + issue_deleted,
+echo suppression, coalescing w/ superseded, per-issue serial queues, shutdown drain) + runner
+(preconditions, ensure-claimed C1, dry-run, panic recovery, transient⇒terminal-failed), health
+server (/healthz /readyz /metrics), CI job (build/vet/gofmt/test -race). Orchestration: Sonnet
+implementors + Opus adversarial validators, 20+ validation rounds total; two transient-infra
+aborts recovered out-of-band. Notable catches: readyz wiring unasserted (B3), Brain→Advisor
+rename before "brained" became a persisted string, same-seq redelivery self-supersede event
+loss, flaky panic-victim test, dashboard assignIssue claim_released lacking previousAssignee
+(B5 — fixed server-side + tested red-first). Proofs: module gate green incl. -race; dashboard
+build/check/test(shuffled) green; live boot vs compose stack (healthz 200, readyz 503 honest,
+recovery-before-identity, 401 backoff, SIGTERM exit 0). Unwired-by-design seams documented in
+plan §9 note (guard→N8c, keyguard→N8e, batch writers→N8d, runner circuits→N8e).
