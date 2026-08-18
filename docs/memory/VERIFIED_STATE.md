@@ -1883,6 +1883,51 @@ themselves, so no correction was needed at close-out.
 
 ---
 
+## N10 part 1 — per-project agent settings + repository connections VERIFIED 2026-08-18
+
+Branch `feat/agent-project-settings` (commit `00d2394`, pre-merge), worktree
+`gallant-roentgen-186e66`. Server-side policy surface the N8 `sentinel-worker` consumes
+(AGENT_WORKER_PLAN.md rev 4 §4.5; risk acceptance recorded as DECISIONS.md D22).
+
+- **Schema**: migration `1723800000` → `1723900000_add_project_agent_settings.sql`:
+  `project_agent_settings` (`fix_enabled` default false, `max_prs_per_day` CHECK > 0) and
+  `project_repo_connections` (provider CHECK github|bitbucket, owner/repo/default_branch/test_cmd
+  NOT NULL, agent_cmd/clone_depth nullable; **PK on project_id enforces one connection per
+  project v1**). Idempotency: CREATE TABLE IF NOT EXISTS + pg_constraint DO-block guards.
+  **Replay-proven independently**: disposable `postgres:16`, `go run ./cmd/migrate up -target
+  {processor,ingestor,dashboard}` × 2 each — all six runs clean, both tables present via
+  `to_regclass`. NO credentials columns — the encrypted git-credentials store is a sibling task.
+- **Dashboard**: `[orgSlug]/projects/[projectId]/settings` "Agent automation" section +
+  `/api/organizations/[orgId]/projects/[projectId]/{agent-settings,repo-connection}` (GET/PUT[/DELETE]).
+  `manage_agents` RBAC on load AND every action (same `requireOrgMembership` + `hasPermission`
+  mechanism as the agents pages); every mutation writes `audit_logs`
+  (`agent_settings.updated`, `agent_repo_connection.created|updated|deleted`) with before/after.
+  Shared provider constant in `$lib/constants/agent-repo.ts` (B12: never exported from routes).
+- **Agent API**: `GET /api/agent/projects` rows carry
+  `agentSettings: {fixEnabled, maxPrsPerDay, repo|null}`, defaults
+  `{false, null, null}` when no rows exist; repo includes full `testCmd`/`agentCmd` deliberately
+  (D22). Batch read (no N+1); B7 scope from `AgentAuthContext` only. OpenAPI regenerated via
+  `pnpm openapi:agent`; drift/completeness/contract gates green; SENTINEL_AGENT_GUIDE.md updated.
+- **Proofs**: `pnpm build` green; `pnpm check` 1870 files / 0 / 0; `pnpm test --sequence.shuffle`
+  826 passed / 7 skipped / 2 failed — the 2 are the pre-existing shared-Postgres concurrency
+  timeouts (`retention.claims.integration`, `notifications.flow.integration`), 8/8 in isolation.
+  Full e2e re-proven against the live compose stack with the dashboard image REBUILT from this
+  branch and migration applied by the `migrate` one-shot:
+  `SENTINEL_E2E=1 M5_AGENT_INTEGRATION_REQUIRED=1 INGESTOR_URL=http://localhost:18080
+  DASHBOARD_URL=http://localhost:13000 go test -tags=e2e ./tests/e2e/ -count=1` → **ok, 0 fail**.
+  Delivery per the standing mandate: Sonnet implementors + Opus adversarial validators (schema
+  track needed one fix round: decoration write-path tests, unscoped-delete blind spot,
+  varchar/TEXT drizzle drift, dangling D22 ref — all re-proven by mutation).
+- **Operational gotcha (repeat of the 2026-08-15 one, sharper)**: cross-worktree
+  `COMPOSE_PROJECT_NAME=<original> docker compose up -d --build --force-recreate migrate dashboard`
+  under podman **built the image, ran migrate, then hung forever after creating (not starting) the
+  new dashboard container — and REMOVED ingestor/processor/nats-init without recreating them**.
+  Recovery: kill the compose process, `docker start sentinel-dashboard`, then
+  `COMPOSE_PROJECT_NAME=<original> docker compose up -d --no-build nats-init ingestor processor
+  dlq-drainer` (plain `up -d --no-build` does not hang).
+
+---
+
 ## Keep here
 
 - Observed runtime/build behavior with the command that produced it.
