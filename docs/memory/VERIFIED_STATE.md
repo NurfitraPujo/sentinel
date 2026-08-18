@@ -1887,9 +1887,9 @@ themselves, so no correction was needed at close-out.
 
 Branch `feat/agent-project-settings` (commit `00d2394`, pre-merge), worktree
 `gallant-roentgen-186e66`. Server-side policy surface the N8 `sentinel-worker` consumes
-(AGENT_WORKER_PLAN.md rev 4 §4.5; risk acceptance recorded as DECISIONS.md D22).
+(AGENT_WORKER_PLAN.md rev 4 §4.5; risk acceptance recorded as DECISIONS.md D23).
 
-- **Schema**: migration `1723800000` → `1723900000_add_project_agent_settings.sql`:
+- **Schema**: migration `1723900000` (sibling, repo credentials) → `1724000000_add_project_agent_settings.sql` (renumbered post-rebase: the sibling N10 part 2 branch had claimed 1723900000 concurrently — the exact silent-skip goose version collision):
   `project_agent_settings` (`fix_enabled` default false, `max_prs_per_day` CHECK > 0) and
   `project_repo_connections` (provider CHECK github|bitbucket, owner/repo/default_branch/test_cmd
   NOT NULL, agent_cmd/clone_depth nullable; **PK on project_id enforces one connection per
@@ -1906,7 +1906,7 @@ Branch `feat/agent-project-settings` (commit `00d2394`, pre-merge), worktree
 - **Agent API**: `GET /api/agent/projects` rows carry
   `agentSettings: {fixEnabled, maxPrsPerDay, repo|null}`, defaults
   `{false, null, null}` when no rows exist; repo includes full `testCmd`/`agentCmd` deliberately
-  (D22). Batch read (no N+1); B7 scope from `AgentAuthContext` only. OpenAPI regenerated via
+  (D23). Batch read (no N+1); B7 scope from `AgentAuthContext` only. OpenAPI regenerated via
   `pnpm openapi:agent`; drift/completeness/contract gates green; SENTINEL_AGENT_GUIDE.md updated.
 - **Proofs**: `pnpm build` green; `pnpm check` 1870 files / 0 / 0; `pnpm test --sequence.shuffle`
   826 passed / 7 skipped / 2 failed — the 2 are the pre-existing shared-Postgres concurrency
@@ -1917,7 +1917,7 @@ Branch `feat/agent-project-settings` (commit `00d2394`, pre-merge), worktree
   DASHBOARD_URL=http://localhost:13000 go test -tags=e2e ./tests/e2e/ -count=1` → **ok, 0 fail**.
   Delivery per the standing mandate: Sonnet implementors + Opus adversarial validators (schema
   track needed one fix round: decoration write-path tests, unscoped-delete blind spot,
-  varchar/TEXT drizzle drift, dangling D22 ref — all re-proven by mutation).
+  varchar/TEXT drizzle drift, dangling D-ref — all re-proven by mutation).
 - **Operational gotcha (repeat of the 2026-08-15 one, sharper)**: cross-worktree
   `COMPOSE_PROJECT_NAME=<original> docker compose up -d --build --force-recreate migrate dashboard`
   under podman **built the image, ran migrate, then hung forever after creating (not starting) the

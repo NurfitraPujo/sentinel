@@ -15,7 +15,7 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
   redeploy; `WORKER_FIX_ENABLED` is only a kill switch. Proofs in VERIFIED_STATE.md "N10 part 1".
 - **Future mistakes prevented**:
   - `test_cmd`/`agent_cmd` are server-stored commands the worker executes — a DELIBERATE,
-    documented acceptance (DECISIONS.md D22: cloned-repo tests already run repo-controlled code;
+    documented acceptance (DECISIONS.md D23: cloned-repo tests already run repo-controlled code;
     the fix-container sandbox is the boundary; RBAC + audit are the controls). Do not "fix" this
     by stripping them from the agent API.
   - The encrypted git-credentials store is a SEPARATE sibling schema — never add credential
