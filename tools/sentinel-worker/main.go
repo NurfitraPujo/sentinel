@@ -26,6 +26,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/loop"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/settings"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
 
@@ -52,6 +53,10 @@ type Config struct {
 	WorkerEventTypes    []string
 	WorkerProjects      []string
 	WorkerSweepInterval time.Duration
+	// WorkerSettingsRefresh is the settings-refresh cadence (plan §4.5, C15/C16): how often the
+	// worker re-pulls GET /api/agent/projects (and, when any project has a repo connection, GET
+	// /api/agent/repo-credentials) into settings.Store.
+	WorkerSettingsRefresh time.Duration
 	// WorkerShutdownTimeout bounds how long runWorker waits, after srv.Shutdown, for the
 	// dispatcher's per-issue queue goroutines to drain in-flight work (finding 1's WaitGroup
 	// drain) before the process exits anyway. Plan §5.
@@ -252,6 +257,7 @@ func LoadConfig(env envLookup) (Config, []string) {
 		WorkerEventTypes:      getList(env, "WORKER_EVENT_TYPES"),
 		WorkerProjects:        getList(env, "WORKER_PROJECTS"),
 		WorkerSweepInterval:   getDuration(env, "WORKER_SWEEP_INTERVAL", time.Hour, &errs),
+		WorkerSettingsRefresh: getDuration(env, "WORKER_SETTINGS_REFRESH", 5*time.Minute, &errs),
 		WorkerShutdownTimeout: getDuration(env, "WORKER_SHUTDOWN_TIMEOUT", 30*time.Second, &errs),
 
 		LLMProvider:         getStr(env, "LLM_PROVIDER", "openai"),
@@ -337,6 +343,9 @@ func LoadConfig(env envLookup) (Config, []string) {
 	}
 	if c.WorkerSweepInterval <= 0 {
 		errs = append(errs, "WORKER_SWEEP_INTERVAL: must be > 0")
+	}
+	if c.WorkerSettingsRefresh <= 0 {
+		errs = append(errs, "WORKER_SETTINGS_REFRESH: must be > 0")
 	}
 	if c.WorkerShutdownTimeout <= 0 {
 		errs = append(errs, "WORKER_SHUTDOWN_TIMEOUT: must be > 0")
@@ -658,6 +667,45 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	runJournalMaintenance(journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st)
 	go journalMaintenanceLoop(ctx, journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st)
 
+	// Settings store (plan §4.5, C15/C16): first Refresh runs synchronously below so a snapshot is
+	// available before the poll loop starts routing jobs (same convention as the other startup
+	// passes in this function), then RefreshLoop keeps it current on WORKER_SETTINGS_REFRESH. This
+	// needs no agent identity, so it does not wait on resolveAgentID's retry loop below.
+	settingsStore := settings.NewStore()
+	settingsEnv := settings.EnvFallback{
+		GitHubToken:          cfg.GitGitHubToken,
+		BitbucketToken:       cfg.GitBitbucketToken,
+		BitbucketUser:        cfg.GitBitbucketUser,
+		BitbucketAppPassword: cfg.GitBitbucketAppPassword,
+	}
+	if err := settingsStore.Refresh(ctx, client, cfg.WorkerCredentialLabels, settingsEnv, logger); err != nil {
+		logger.Error("initial settings refresh failed, worker starts with an empty settings snapshot", "error", err)
+	}
+	publishSettingsGauges(settingsStore, st)
+	if st != nil {
+		st.SetReadyDetail(func() any { return settingsStore.Readiness() })
+	}
+	go func() {
+		settings.RefreshLoop(ctx, settingsStore, client, cfg.WorkerSettingsRefresh, cfg.WorkerCredentialLabels, settingsEnv, logger)
+	}()
+	// publishSettingsGauges only runs once above and again per pollInterval-ish cadence would need a
+	// hook into RefreshLoop; instead a small ticker keeps /metrics gauges in sync with the Store on
+	// the same cadence as the refresh itself.
+	if cfg.WorkerSettingsRefresh > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.WorkerSettingsRefresh)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					publishSettingsGauges(settingsStore, st)
+				}
+			}
+		}()
+	}
+
 	agentID, err := resolveAgentID(ctx, client)
 	for attempt := 1; err != nil; attempt++ {
 		backoff := sentinel.BackoffForAttempt(attempt)
@@ -817,6 +865,25 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		"startCursor", poller.Cursor(),
 	)
 	poller.Run(ctx)
+}
+
+// publishSettingsGauges pushes the current settings.Store snapshot into /metrics gauges (plan
+// §4.5, N8c task brief: "health gauges gain per-provider credential availability and repo-
+// connection counts"). A nil st (no health server wired, e.g. some tests) is a no-op.
+func publishSettingsGauges(store *settings.Store, st *health.Status) {
+	if st == nil {
+		return
+	}
+	detail := store.Readiness()
+	st.SetGauge(health.MetricRepoConnectionsTotal, int64(detail.RepoConnectionsTotal))
+	st.SetGauge(health.MetricRepoConnectionsReady, int64(detail.RepoConnectionsReady))
+	for _, p := range detail.Providers {
+		v := int64(0)
+		if p.Available {
+			v = 1
+		}
+		st.SetGauge(health.CredentialAvailableMetricName(p.Provider), v)
+	}
 }
 
 // journalRetention is the plan §2.2 "rewrite the journal dropping records of jobs terminal for >7

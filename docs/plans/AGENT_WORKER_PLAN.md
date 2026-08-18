@@ -615,7 +615,8 @@ sent; this is the operator's watch-it-for-a-week mode and N8a's proof mode), `WO
 (deployment kill switch only, default true — real FIX policy is per-project server-side, §4.5).
 Loop: `WORKER_STATE_DIR` (/var/lib/sentinel-worker), `WORKER_POLL_INTERVAL` (10s),
 `WORKER_POLL_JITTER` (0.2), `WORKER_CONCURRENCY` (2), `WORKER_BACKFILL_HOURS` (24),
-`WORKER_EVENT_TYPES`, `WORKER_PROJECTS`, `WORKER_SWEEP_INTERVAL` (1h).
+`WORKER_EVENT_TYPES`, `WORKER_PROJECTS`, `WORKER_SWEEP_INTERVAL` (1h), `WORKER_SETTINGS_REFRESH`
+(5m — settings-refresh loop interval, §4.5/C15/C16).
 LLM: `LLM_PROVIDER/MODEL/API_KEY/BASE_URL`, `LLM_FALLBACK_*`.
 Budgets: `WORKER_DAILY_TOKEN_BUDGET`, `WORKER_TRIAGE_MAX_TURNS` (6), `WORKER_FOLLOWUP_MAX_TURNS`
 (4), `WORKER_MAX_OUTPUT_TOKENS`, `WORKER_TRIAGE_TIMEOUT` (3m), `WORKER_FOLLOWUP_TIMEOUT` (2m),
@@ -628,7 +629,9 @@ State/snapshots: `WORKER_SNAPSHOT_BACKEND` (none|s3), `WORKER_SNAPSHOT_INTERVAL`
 `WORKER_KEY_SECRET_NAME`/`_NAMESPACE` (kubernetes-secret backend).
 Git: `WORKER_REPO_CACHE_DIR`, `WORKER_REPO_REFRESH` (15m); fallback creds `GIT_GITHUB_TOKEN`,
 `GIT_BITBUCKET_TOKEN` | `GIT_BITBUCKET_USER`+`GIT_BITBUCKET_APP_PASSWORD` (primary creds come
-from the server, §4.5); `FIX_EXECUTOR_CMD`,
+from the server, §4.5); `WORKER_CREDENTIAL_LABELS` (optional "provider=label" list, disambiguates
+multiple active credentials per provider — §4.5/C16, default is single active credential per
+provider); `FIX_EXECUTOR_CMD`,
 `WORKER_WORKSPACE_DIR`, `WORKER_KEEP_FAILED_WORKSPACES` (false),
 `WORKER_WORKSPACE_RETENTION_DAYS` (3), `WORKER_AGENT_LOG_MAX_MB` (10).
 Keys: `WORKER_ROTATE_BEFORE_HOURS` (72), `WORKER_ROTATE_EVERY_DAYS` (30; 0 off).
@@ -753,11 +756,15 @@ Fable holistic review; green gates + memory sync + commit per phase)
 | **N8g** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | compose boot green incl. wait-healthy with worker present-but-gated; helm lint; full gate sweep; CI shows U40/U41 run |
 
 **N8a unwired seams**: `tools/sentinel-worker/guard/` and `tools/sentinel-worker/keyguard/` are
-built and unit-tested in N8a but imported by nothing yet — `guard` wires into the Advisor output
-path in N8c, `keyguard` wires into key rotation in N8e. Passing tests for either package prove the
+built and unit-tested in N8a but imported by nothing yet — `guard` is IMPLEMENTED and injection-
+golden-tested in N8c but still WIRED in N8d (its consumer, the Advisor output path, does not exist
+until N8d ships the real TRIAGE/FOLLOW-UP Advisors; N8c's `main.go` still constructs
+`jobs.StubAdvisor{}`, and `guard.Check`/`guard.WrapUntrusted` are imported by nothing in the
+running worker as of N8c — verified: no non-test importer). `keyguard` wires into key rotation in
+N8e. Passing tests for either package prove the
 package works in isolation, not that anything in the running worker calls it (B3); don't read
 green `guard`/`keyguard` suites as evidence the harness enforces the output gate or rotates keys
-until N8c/N8e land. The same caveat applies to three more seams built in N8a: `sentinel/retry.go`'s
+until N8d/N8e land. The same caveat applies to three more seams built in N8a: `sentinel/retry.go`'s
 `ClassifyBatch`/`ClassifyOp` (per-op batch classification) and `sentinel/client.go`'s
 batch/comment/question/progress writers are unit-tested in isolation but not yet called by
 anything in the running worker — they are wired in by N8d's `act()` compilation step. Runner
@@ -778,6 +785,47 @@ that the running worker ever calls an LLM, honours `WORKER_DAILY_TOKEN_BUDGET`, 
 re-ask ceiling. `main.go` validating `LLM_PROVIDER`/`LLM_MODEL`/`LLM_BASE_URL` is config
 validation only — no adapter is constructed from it until N8d. Do not read N8b green as evidence
 of any runtime LLM behaviour.
+
+**N8c wiring status**: `gitprovider/` and `settings/` ARE wired into the running worker — the
+settings refresh loop runs from `main.go` (periodic `GET /api/agent/projects` +
+`/api/agent/repo-credentials`, memory-only credentials, per-provider readiness on `/readyz`), and
+`gitprovider`'s askpass/redactor/PR-API surface is the transport `settings`' credentials feed.
+`repoctx/` (the confined clone cache + `read_file`/`search_code` Advisor tools) and `guard/`
+(delimiting + the §4.6 output gate) are **implemented and adversarially hardened in N8c but not yet
+consulted by an Advisor** — they are handed to the TRIAGE/FOLLOW-UP toolchain in **N8d**. The
+security controls (host-pinned askpass, credential-helper neutralization, the verbatim/secret
+output gate, repoctx path confinement) are unit-proven against exploit reproductions but enforce
+nothing on a live decision until N8d builds the Advisor that routes through them; `gitprovider`'s
+`CreatePR`/`PRStatus` are not invoked until **N8f**'s FIX engine. Same B3 caveat.
+
+**N8c adds one more unwired seam**: `tools/sentinel-worker/settings/` (`Store`'s consumer-facing
+API — `Store.Projects`, `Store.Project`, `Store.CredentialFor`, `ProjectSettings.FixReady`,
+`Store.ProviderUnavailableReason`, `CredentialSecret.IsToken`/`Usable`) is built and unit-tested in
+N8c — the refresh loop against `GET /api/agent/projects` + `GET /api/agent/repo-credentials`,
+label disambiguation, 403 handling, env fallback, and `/readyz`/metrics readiness detail all run
+and are covered — but `Store` is **built and populated, not yet consumed** by the FIX-engine
+execution path: nothing in the running worker calls `Store.CredentialFor` to authenticate a git
+push, and `Store.FixReady`/`ProviderUnavailableReason` are not yet consulted by any job runner to
+gate or explain a FIX attempt. That wiring — FIX_EXECUTOR_CMD, workspaces, the PR flow — is N8f.
+The same B3 caveat applies verbatim: a green `settings` suite (including the memory-only proof and
+the credential-usability mutation test) proves the Store's fetch/disambiguation/readiness logic
+works in isolation, **not** that the running worker ever authenticates a git operation with a
+server- or env-resolved credential, until N8f lands. What N8c DOES wire from `settings`: the
+refresh loop (`settings.RefreshLoop`) and the readiness detail (`Store.Readiness` via
+`st.SetReadyDetail`) + `/metrics` gauges (`publishSettingsGauges`) are reachable from `main()`
+(runPipeline) and run in the live worker — it is only the credential-CONSUMER path
+(`Store.CredentialFor`/`FixReady`/`ProviderUnavailableReason` driving a git push or gating a FIX)
+that stays unwired until N8f.
+
+**`repoctx` tools are the same shape of seam in N8c**: `repoctx.Tools`/`ReadFileToolFunc`/
+`SearchCodeToolFunc` (the `read_file`/`search_code` `llm.ToolFunc`s), `repoctx.Cache`
+(clone/fetch/evict), and `CheckoutRelease` are IMPLEMENTED and confinement/injection-tested in N8c
+but **constructed by nothing in the running worker and handed to no live Advisor** — verified: the
+only non-test importer of `repoctx` is `repoctx` itself, and `main.go` never builds a `Cache` or
+registers these tools. They are consumed the moment N8d's real Advisors register them against the
+per-job Repo (plan §4.5: "Expose as Advisor ToolFuncs ... the N8d Advisors consume these"). A green
+`repoctx` suite proves the confinement guards and the tool binding work in isolation, **not** that
+any running-worker code path ever reads a repo file for the model, until N8d lands.
 
 ## 10. Risks & consciously-deferred
 

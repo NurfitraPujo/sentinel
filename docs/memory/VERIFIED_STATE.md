@@ -1960,3 +1960,17 @@ suite includes the 11-scenario × 3-adapter parity table over real wire fixtures
 any call against a real provider (unit/httptest only, by design); llm is tested-but-unwired
 until N8d (documented in plan §9 seams note). Gemini usage parity depends on summing
 thoughtsTokenCount — asserted by golden; re-verify if the Gemini wire schema changes.
+
+## N8c — gitprovider/repoctx/guard/settings (2026-08-18, branch feat/agent-worker, NOT merged)
+
+Proved: full worker gate `GOWORK=off go build/vet/gofmt/test ./... -race` green (11 packages).
+Security controls proven against EXPLOIT REPRODUCTIONS (red-first tests reproduce the attack):
+askpass no-leak under url.insteadOf (host:port pin) + credential.helper store (neutralized) +
+argv/.git/config inspection; repoctx confinement (traversal, committed-symlink escape, .git alias,
+absolute path, -ref injection); guard §4.6 gate (filler-period table 2..12 × 5 fillers, short
+secret, alnum-chunked secret, prose-padded dilution, secret-value + slog/%v/%#v redaction).
+settings credentials memory-only (never journaled/state-dir/snapshot). NOT verified: any real git
+host or real credential (httptest + local bare fixtures only); repoctx/guard enforce nothing on a
+live decision until N8d wires the Advisor; CreatePR/PRStatus not exercised until N8f. Residual
+(documented §4.6): paraphrase exfiltration below the verbatim threshold — backstopped by repoctx
+confinement + repo-scoped tokens + PR review.

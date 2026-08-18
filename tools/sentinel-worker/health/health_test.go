@@ -373,6 +373,70 @@ func TestMetrics_GoldenFormat_WithJobsFamily(t *testing.T) {
 	}
 }
 
+// TestSetReadyDetail_RacesSafelyWithReadyzHandler mimics main.go's production ordering: the health
+// HTTP server starts serving /readyz BEFORE SetReadyDetail is ever called (runPipeline's goroutine
+// assembles settingsStore and calls it later), and /readyz is polled continuously throughout. Must
+// pass under -race -- this is the finding: a bare exported field here previously raced against the
+// handler's read with no synchronization.
+func TestSetReadyDetail_RacesSafelyWithReadyzHandler(t *testing.T) {
+	st := NewStatus()
+	srv := httptest.NewServer(Handler(st))
+	defer srv.Close()
+
+	var readerWG, writerWG sync.WaitGroup
+	stop := make(chan struct{})
+
+	readerWG.Add(1)
+	go func() {
+		defer readerWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			resp, err := srv.Client().Get(srv.URL + "/readyz")
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}
+	}()
+
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; i < 200; i++ {
+			n := i
+			st.SetReadyDetail(func() any { return map[string]int{"n": n} })
+		}
+	}()
+
+	writerWG.Wait() // all SetReadyDetail calls have landed
+	time.Sleep(10 * time.Millisecond)
+	close(stop)
+	readerWG.Wait()
+}
+
+// TestReadyz_EmitsReadyDetailHookResult asserts the wiring end to end: once SetReadyDetail is
+// installed, /readyz's JSON response actually carries its return value under "detail".
+func TestReadyz_EmitsReadyDetailHookResult(t *testing.T) {
+	st := NewStatus()
+	st.SetReadyDetail(func() any { return map[string]string{"marker": "hello-detail"} })
+	srv := httptest.NewServer(Handler(st))
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !contains(string(body), "hello-detail") {
+		t.Fatalf("expected /readyz body to carry the ReadyDetail hook's result, got: %s", body)
+	}
+}
+
 func contains(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

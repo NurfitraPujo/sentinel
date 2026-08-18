@@ -51,6 +51,16 @@ const (
 	// scan so a corrupted durability layer is observable at /metrics, not just in a WARN log line
 	// (validator finding: the count used to be computed and then discarded by every caller).
 	MetricJournalCorruptLines = "journal_corrupt_lines"
+	// MetricRepoConnectionsTotal / MetricRepoConnectionsReady are gauges from
+	// settings.Store.Readiness (plan §4.5, N8c): how many projects carry a repo connection, and how
+	// many of those currently have a usable credential (server-resolved or env fallback) for their
+	// connection's provider.
+	MetricRepoConnectionsTotal = "repo_connections_total"
+	MetricRepoConnectionsReady = "repo_connections_ready"
+	// credentialAvailablePrefix names the per-provider gauge family
+	// "credential_available_<provider>" (1 = usable credential available, 0 = not), built via
+	// CredentialAvailableMetricName so main.go's wiring and any test agree on the name.
+	credentialAvailablePrefix = "credential_available"
 	// jobsTotalPrefix names the counter family for "jobs by kind×outcome" (plan §7). There is no
 	// label support in the hand-rolled exposition format (renderMetrics), so kind and outcome are
 	// folded into the metric name itself via JobsTotalMetricName.
@@ -66,6 +76,13 @@ const (
 // resulting family never produces a line that breaks the whole /metrics scrape.
 func JobsTotalMetricName(kind, outcome string) string {
 	return sanitizeMetricName(jobsTotalPrefix + "_" + kind + "_" + outcome)
+}
+
+// CredentialAvailableMetricName builds the flat gauge name for one provider's credential
+// availability (e.g. credential_available_github). Shared by main.go's wiring and this package's
+// tests, same convention as JobsTotalMetricName.
+func CredentialAvailableMetricName(provider string) string {
+	return sanitizeMetricName(credentialAvailablePrefix + "_" + provider)
 }
 
 // sanitizeMetricName maps a candidate metric name to one that satisfies the Prometheus text
@@ -108,6 +125,20 @@ type Status struct {
 
 	counters sync.Map // map[string]*int64, monotonic (Inc), for /metrics as Prometheus "counter"
 	gauges   sync.Map // map[string]*int64, point-in-time (SetGauge), for /metrics as Prometheus "gauge"
+
+	// readyDetail, when non-nil, is called on every /readyz request and its return value is
+	// embedded under the response's "detail" key. Wired by main.go to settings.Store.Readiness so
+	// per-provider credential availability and repo-connection counts (plan §4.5, N8c) are visible
+	// on the same endpoint operators already poll for readiness -- never affects the ready/not-ready
+	// verdict itself (a provider with no usable credential is reported, not fatal, per C16).
+	//
+	// Held behind an atomic.Pointer, not a bare field, because the health HTTP server starts
+	// serving (main.go's runWorker) before runPipeline's goroutine has assembled settingsStore and
+	// can call SetReadyDetail -- the same ordering hazard main.go already solved for its
+	// *loop.Dispatcher via dispatcherPtr. A bare field here raced under -race: the /readyz handler's
+	// read (readyDetailHook below) and runPipeline's write are on different goroutines with no
+	// synchronization between them.
+	readyDetail atomic.Pointer[func() any]
 }
 
 // NewStatus returns a Status that starts NOT ready (matches plan §6: "invalid config keeps the
@@ -184,6 +215,13 @@ func (s *Status) Ready() (bool, []string) {
 	return ready, reasons
 }
 
+// SetReadyDetail installs (or replaces) the hook /readyz calls to populate its "detail" key.
+// Safe to call concurrently with /readyz requests and with itself -- see the readyDetail field
+// doc comment for why this is atomic.Pointer-backed rather than a bare field.
+func (s *Status) SetReadyDetail(fn func() any) {
+	s.readyDetail.Store(&fn)
+}
+
 // Inc increments a named monotonic counter for /metrics (plan §7's "jobs by kind×outcome",
 // "events consumed", "gate rejections", "bootstrap-skipped", "heartbeats posted", "fix attempts/PRs
 // opened", "LLM tokens by provider" -- anything that only goes up over the process lifetime).
@@ -246,10 +284,15 @@ func Handler(st *Status) http.Handler {
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
+		var detail any
+		if fn := st.readyDetail.Load(); fn != nil {
+			detail = (*fn)()
+		}
 		_ = json.NewEncoder(w).Encode(struct {
 			Ready   bool     `json:"ready"`
 			Reasons []string `json:"reasons,omitempty"`
-		}{Ready: ready, Reasons: reasons})
+			Detail  any      `json:"detail,omitempty"`
+		}{Ready: ready, Reasons: reasons, Detail: detail})
 	})
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {

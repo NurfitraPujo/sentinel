@@ -17,6 +17,7 @@ import (
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/settings"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
 
@@ -126,6 +127,42 @@ func TestLoadConfig_InvalidDurationIsCollectedAsAnError(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_WorkerSettingsRefreshDefaultAndOverride proves WORKER_SETTINGS_REFRESH (plan
+// §4.5, C15/C16: the settings-refresh loop cadence) defaults to 5m and is overridable via the
+// same Go duration notation as every other §5 knob.
+func TestLoadConfig_WorkerSettingsRefreshDefaultAndOverride(t *testing.T) {
+	cfg, errs := LoadConfig(fakeEnv(nil))
+	if len(errs) != 0 {
+		t.Fatalf("expected zero validation errors on an empty environment, got: %v", errs)
+	}
+	if cfg.WorkerSettingsRefresh != 5*time.Minute {
+		t.Errorf("WORKER_SETTINGS_REFRESH default = %s, want 5m", cfg.WorkerSettingsRefresh)
+	}
+
+	cfg, errs = LoadConfig(fakeEnv(map[string]string{"WORKER_SETTINGS_REFRESH": "90s"}))
+	if len(errs) != 0 {
+		t.Fatalf("expected zero validation errors for WORKER_SETTINGS_REFRESH=90s, got: %v", errs)
+	}
+	if cfg.WorkerSettingsRefresh != 90*time.Second {
+		t.Errorf("WORKER_SETTINGS_REFRESH = %s, want 90s", cfg.WorkerSettingsRefresh)
+	}
+}
+
+// TestLoadConfig_WorkerSettingsRefreshMustBePositive proves a non-positive override is rejected,
+// mirroring WORKER_SHUTDOWN_TIMEOUT/WORKER_POLL_INTERVAL's own >0 validation.
+func TestLoadConfig_WorkerSettingsRefreshMustBePositive(t *testing.T) {
+	_, errs := LoadConfig(fakeEnv(map[string]string{"WORKER_SETTINGS_REFRESH": "0s"}))
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "WORKER_SETTINGS_REFRESH") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a WORKER_SETTINGS_REFRESH validation error for 0s, got: %v", errs)
+	}
+}
+
 func TestLoadConfig_Defaults(t *testing.T) {
 	cfg, errs := LoadConfig(fakeEnv(nil))
 	if len(errs) != 0 {
@@ -154,6 +191,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	}
 	if cfg.WorkerFixConfidence != 0.7 {
 		t.Errorf("WORKER_FIX_CONFIDENCE default = %v, want 0.7", cfg.WorkerFixConfidence)
+	}
+	if cfg.WorkerGateMaxVerbatim != 0.25 {
+		t.Errorf("WORKER_GATE_MAX_VERBATIM default = %v, want 0.25", cfg.WorkerGateMaxVerbatim)
 	}
 	if cfg.WorkerClaimHeartbeat != 12*time.Hour {
 		t.Errorf("WORKER_CLAIM_HEARTBEAT default = %s, want 12h", cfg.WorkerClaimHeartbeat)
@@ -806,6 +846,40 @@ func TestLoadConfig_NegativeBudgetKnobsAreRejected(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_WorkerGateMaxVerbatimRangeChecked proves WORKER_GATE_MAX_VERBATIM (guard's
+// exfiltration-coverage threshold, plan §4.6/§5) is range-checked to [0,1]: out-of-range values
+// (negative and >1) are rejected, and the endpoints (0, the strictest legal setting -- guard
+// treats 0 as "zero tolerance", not "disabled") and the default (0.25) are accepted with no error.
+func TestLoadConfig_WorkerGateMaxVerbatimRangeChecked(t *testing.T) {
+	cases := []struct {
+		value     string
+		wantError bool
+	}{
+		{"-0.1", true},
+		{"1.5", true},
+		{"0", false},
+		{"0.25", false},
+		{"1", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			_, errs := LoadConfig(fakeEnv(map[string]string{"WORKER_GATE_MAX_VERBATIM": tc.value}))
+			found := false
+			for _, e := range errs {
+				if strings.Contains(e, "WORKER_GATE_MAX_VERBATIM") {
+					found = true
+				}
+			}
+			if tc.wantError && !found {
+				t.Fatalf("WORKER_GATE_MAX_VERBATIM=%s: expected a validation error, got: %v", tc.value, errs)
+			}
+			if !tc.wantError && found {
+				t.Fatalf("WORKER_GATE_MAX_VERBATIM=%s: did not expect a validation error, got: %v", tc.value, errs)
+			}
+		})
+	}
+}
+
 func TestLoadConfig_ZeroBudgetKnobsAreAccepted(t *testing.T) {
 	// 0 is a legitimate "no budget configured" / "no cap" sentinel for several of these knobs
 	// (e.g. WORKER_DAILY_TOKEN_BUDGET's existing default is 0) -- only negative values are
@@ -1251,4 +1325,126 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+// TestPublishSettingsGauges_PopulatesCredentialAndRepoConnectionGauges drives publishSettingsGauges
+// against a real settings.Store refreshed from an httptest server, asserting /metrics gains
+// repo_connections_{total,ready} and a per-provider credential_available_<provider> gauge -- the
+// wiring the N8c brief asks for and that had zero test coverage before this change.
+func TestPublishSettingsGauges_PopulatesCredentialAndRepoConnectionGauges(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"projects":[
+		  {"id":"p1","name":"Proj One","agentSettings":{"fixEnabled":true,"maxPrsPerDay":null,
+		    "repo":{"provider":"github","owner":"acme","repo":"widgets","defaultBranch":"main","testCmd":"","agentCmd":"","cloneDepth":1}}}
+		]}`))
+	})
+	mux.HandleFunc("/api/agent/repo-credentials", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credentials":[{"id":"c1","provider":"github","label":"default","secret":{"token":"tok"}}]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := sentinel.NewClient(srv.URL, "test-key")
+	store := settings.NewStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := store.Refresh(context.Background(), client, nil, settings.EnvFallback{}, logger); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	st := health.NewStatus()
+	publishSettingsGauges(store, st)
+
+	gauges := st.GaugeSnapshot()
+	if gauges[health.MetricRepoConnectionsTotal] != 1 {
+		t.Errorf("repo_connections_total = %d, want 1", gauges[health.MetricRepoConnectionsTotal])
+	}
+	if gauges[health.MetricRepoConnectionsReady] != 1 {
+		t.Errorf("repo_connections_ready = %d, want 1", gauges[health.MetricRepoConnectionsReady])
+	}
+	if gauges[health.CredentialAvailableMetricName("github")] != 1 {
+		t.Errorf("credential_available_github = %d, want 1", gauges[health.CredentialAvailableMetricName("github")])
+	}
+}
+
+// TestPublishSettingsGauges_NilStatusIsNoop proves the documented "nil st is a no-op" contract
+// doesn't panic.
+func TestPublishSettingsGauges_NilStatusIsNoop(t *testing.T) {
+	store := settings.NewStore()
+	publishSettingsGauges(store, nil) // must not panic
+}
+
+// TestRunPipeline_ReadyzCarriesSettingsReadinessDetail drives runPipeline end to end against an
+// httptest sentinel server and asserts the health server's /readyz response -- reached through
+// runWorker's exact wiring (SetReadyDetail installed from inside runPipeline's goroutine) -- ends
+// up carrying settings.ReadinessDetail's shape, not just that the hook was assigned somewhere.
+func TestRunPipeline_ReadyzCarriesSettingsReadinessDetail(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"projects":[]}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[],"cursor":"","hasMore":false}`))
+	})
+	mux.HandleFunc("/api/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"agent-1"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := Config{
+		WorkerEnabled:         true,
+		SentinelURL:           srv.URL,
+		SentinelAgentKey:      "test-key",
+		WorkerPollInterval:    20 * time.Millisecond,
+		WorkerStateDir:        dir,
+		WorkerSettingsRefresh: 20 * time.Millisecond,
+	}
+
+	st := health.NewStatus()
+	healthSrv := httptest.NewServer(health.Handler(st))
+	defer healthSrv.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runPipeline(ctx, cfg, logger, st, nil)
+		close(done)
+	}()
+
+	// Poll /readyz (through the real health.Handler, exactly as an operator would) until its
+	// "detail" key carries the repo-connection shape runPipeline's SetReadyDetail hook installs --
+	// proves the hook is actually reachable end to end, not just assigned somewhere in memory.
+	deadline := time.Now().Add(3 * time.Second)
+	var body string
+	for {
+		resp, err := healthSrv.Client().Get(healthSrv.URL + "/readyz")
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body = string(b)
+			if strings.Contains(body, "repoConnectionsTotal") || strings.Contains(body, "RepoConnectionsTotal") {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for /readyz to carry settings readiness detail, last body: %s", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runPipeline did not exit within 3s of ctx cancellation")
+	}
 }

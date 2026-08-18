@@ -460,3 +460,21 @@ json tags (two request-breaking mutations stayed green — rewritten to raw-JSON
 malformedJSONError hardcoded "llm/openai:" for all three providers. llm remains a documented
 unwired seam until N8d. Gate green incl. -race + gofmt. Orchestration: Sonnet impl + Opus
 validators (loop now always ENDS on a validation), integration parity validator, Fable holistic.
+
+## 2026-08-18 — N8c: gitprovider + repoctx + guard + settings (branch feat/agent-worker)
+
+Security-heavy phase. gitprovider (GitHub REST v3 + Bitbucket Cloud 2.0 PR create/status; askpass-
+only credential delivery — token never in argv/.git/config/remote/logs; host:port-pinned askpass,
+credential.helper neutralized via GIT_CONFIG_*, per-call scratch HOME; output Redactor with
+error-latching). repoctx (confined read-only clone cache under WORKER_REPO_CACHE_DIR; read_file
+EvalSymlinks-confined + .git denial incl. intermediate-symlink alias; search_code git-grep no-shell;
+release-ref checkout validated ^[A-Za-z0-9._/+-]{1,100}$ after --; per-repo worktree eviction).
+guard (§4.6 delimiting + published-output gate: length caps, secret-value rejection incl. short
+secrets + alnum-filler chunking, verbatim coverage via multi-rune union strip). settings (consumes
+live C15/C16: project agentSettings + repo-credentials, provider→credential label disambiguation,
+403 hint, memory-only creds with String/LogValue/GoString redaction, per-project /readyz detail).
+Adversarial payoff: TWO attack rounds found REAL exploits — url.insteadOf token exfil,
+credential.helper disk persistence, §4.6(c) filler-period-7 verbatim bypass (blocker), secret-check
+floor dilution, slog/%#v credential leak — every one fixed with a red-first exploit-reproduction
+test + mutation proof. gitprovider+settings wired into main; repoctx+guard wired into the Advisor
+toolchain in N8d; CreatePR/PRStatus invoked in N8f. Gate green incl. -race + gofmt.

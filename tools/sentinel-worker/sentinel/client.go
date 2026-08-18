@@ -287,6 +287,16 @@ func (c *Client) GetSelf(ctx context.Context) (*Result, error) {
 	return res, err
 }
 
+// GetRepoCredentials calls GET /api/agent/repo-credentials (C16: gated on the agent's
+// canAccessRepoCredentials flag; 403 without it, 503 without the server encryption key, all
+// active org credentials returned as a list -- the worker disambiguates by provider/label
+// itself). settings.Store is the only consumer; the response is never journaled or persisted
+// (plan §4.5: "credentials live in memory only").
+func (c *Client) GetRepoCredentials(ctx context.Context) (*Result, error) {
+	res, _, err := c.Do(ctx, "GET", "/api/agent/repo-credentials", nil, nil)
+	return res, err
+}
+
 // ClaimConflict is the 409 body shape for a foreign-claimant conflict (C1: "Foreign claimant is
 // still 409 with {claimedBy, claimedAt}").
 type ClaimConflict struct {
