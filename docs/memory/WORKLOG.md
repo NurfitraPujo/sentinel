@@ -441,3 +441,22 @@ loss, flaky panic-victim test, dashboard assignIssue claim_released lacking prev
 build/check/test(shuffled) green; live boot vs compose stack (healthz 200, readyz 503 honest,
 recovery-before-identity, 401 backoff, SIGTERM exit 0). Unwired-by-design seams documented in
 plan §9 note (guard→N8c, keyguard→N8e, batch writers→N8d, runner circuits→N8e).
+
+## 2026-08-18 — N8b: llm package (branch feat/agent-worker)
+
+`tools/sentinel-worker/llm`: provider-neutral Chat interface + factory, tool loop (turn/token/
+wall-clock caps, defensive MaxTurns default, UTF-8-safe truncation, validate-and-re-ask ≤2 then
+Permanent, StopError short-circuit before re-asks, SyncBreaker + fallback-provider handoff,
+per-turn Provider label), DailyBudget/volume counters (UTC resets, race-tested), and three
+adapters — openai (primary: base-URL normalization, json_schema + schema-ignored fallback),
+anthropic (forced-tool-call structured decisions, pinned anthropic-version), gemini
+(thoughtsTokenCount summed into OutputTokens — thinking tokens bill as output but are excluded
+from candidatesTokenCount; missing it under-enforced budgets). Cross-adapter parity table
+(llm/parity_test.go: 11 scenarios × 3 adapters over real wire fixtures) unified: empty-content
+⇒ malformed-retry-then-Permanent everywhere, 3xx ⇒ Transient, ctx-cancel ⇒ wrapped
+context.Canceled, JSONSchemaName normalized neutrally (raw names 400 on two providers).
+Validator catches of note: anthropic/gemini "goldens" originally round-tripped through their own
+json tags (two request-breaking mutations stayed green — rewritten to raw-JSON goldens);
+malformedJSONError hardcoded "llm/openai:" for all three providers. llm remains a documented
+unwired seam until N8d. Gate green incl. -race + gofmt. Orchestration: Sonnet impl + Opus
+validators (loop now always ENDS on a validation), integration parity validator, Fable holistic.

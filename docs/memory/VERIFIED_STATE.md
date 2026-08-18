@@ -1951,3 +1951,12 @@ What runs, with the command that proved it:
 NOT yet verified (deliberate, per plan §9): real-credential dry-run (U40, N8d e2e); guard/
 keyguard/batch-writers/runner-circuits are tested-but-unwired seams — see the plan's §9
 "N8a unwired seams" note before trusting their green suites (B3).
+
+## N8b — llm package (2026-08-18, branch feat/agent-worker, NOT yet merged)
+
+Proved: `cd tools/sentinel-worker && GOWORK=off go build ./... && GOWORK=off go vet ./... &&
+test -z "$(gofmt -l .)" && GOWORK=off go test ./... -count=1 -race` → all packages ok (llm
+suite includes the 11-scenario × 3-adapter parity table over real wire fixtures). NOT verified:
+any call against a real provider (unit/httptest only, by design); llm is tested-but-unwired
+until N8d (documented in plan §9 seams note). Gemini usage parity depends on summing
+thoughtsTokenCount — asserted by golden; re-verify if the Gemini wire schema changes.

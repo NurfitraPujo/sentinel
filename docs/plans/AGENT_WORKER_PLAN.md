@@ -768,6 +768,17 @@ minimum bar for a transient runner failure is narrower: journal a terminal `fail
 <class>)` record and count it via `OnOutcome` so it is never silently stranded at a non-terminal
 state, without yet retrying it in-lane or tripping a circuit.
 
+**N8b adds one more unwired seam**: `tools/sentinel-worker/llm/` (the neutral `Chat`/`Request`/
+`Response` types, `RunLoop` + re-ask, the three `llm/<provider>.go` adapters, and the
+budget/volume caps) is built and unit-tested in N8b but **imported by nothing** — `main.go` does
+not reference it, and `jobs.Advisor` remains `jobs.StubAdvisor` until **N8d** wires `llm.RunLoop`
+into the real TRIAGE/FOLLOW-UP Advisors. The same B3 caveat applies verbatim: a green `llm` suite
+proves the adapters, the tool loop, the schema validator and the caps work in isolation, **not**
+that the running worker ever calls an LLM, honours `WORKER_DAILY_TOKEN_BUDGET`, or enforces the
+re-ask ceiling. `main.go` validating `LLM_PROVIDER`/`LLM_MODEL`/`LLM_BASE_URL` is config
+validation only — no adapter is constructed from it until N8d. Do not read N8b green as evidence
+of any runtime LLM behaviour.
+
 ## 10. Risks & consciously-deferred
 
 - **Residual duplicate window** (shrunk by N9): idempotency keys cover comments/progress/questions

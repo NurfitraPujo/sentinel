@@ -58,9 +58,26 @@ type Config struct {
 	WorkerShutdownTimeout time.Duration
 
 	// LLM
-	LLMProvider         string
-	LLMModel            string
-	LLMAPIKey           string
+	LLMProvider string
+	LLMModel    string
+	LLMAPIKey   string
+	// LLMBaseURL is the provider's API ROOT (matching every OpenAI-compatible SDK's base_url
+	// convention), NOT a bare host. Per-provider examples (LLM_PROVIDER selects which adapter reads
+	// this value):
+	//   - openai:    "https://api.openai.com/v1"; also covers OpenAI-compatible backends like
+	//     "http://localhost:11434/v1" (Ollama), "http://localhost:8000/v1" (vLLM),
+	//     "http://localhost:4000/v1" (LiteLLM), "https://openrouter.ai/api/v1" (OpenRouter), and
+	//     "https://generativelanguage.googleapis.com/v1beta/openai" (Gemini's OpenAI-compat root).
+	//     llm/openai.go (NewOpenAIChat) appends only "/chat/completions" to this value; see its doc
+	//     comment for the full normalization/tolerance rule.
+	//   - anthropic: "https://api.anthropic.com" (Anthropic's own SDK base_url has no "/v1" segment
+	//     — the "/v1" lives in the endpoint path). llm/anthropic.go (resolveAnthropicURL) appends
+	//     "/v1/messages", tolerating (and stripping) a trailing "/v1" if one is supplied anyway.
+	//   - gemini: "https://generativelanguage.googleapis.com" (no "/v1beta" segment — that lives in
+	//     the endpoint path). llm/gemini.go (resolveGeminiBaseURL) appends
+	//     "/v1beta/models/{model}:generateContent", tolerating (and stripping) a trailing "/v1beta"
+	//     if one is supplied anyway.
+	// A trailing slash on any of the above is tolerated. Empty defaults to that provider's own root.
 	LLMBaseURL          string
 	LLMFallbackProvider string
 	LLMFallbackModel    string
