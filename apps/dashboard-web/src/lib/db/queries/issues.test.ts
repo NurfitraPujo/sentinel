@@ -42,7 +42,7 @@ const notifyIssueEventMock = vi.fn(async () => []);
 vi.mock('$lib/server/notify', () => ({ notifyIssueEvent: notifyIssueEventMock }));
 
 // Top-level await import, as alerts.test.ts does, to dodge vi.mock hoisting/TDZ.
-const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISSUE_IDS, RelationCycleError } =
+const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISSUE_IDS, RelationCycleError, AgentAssignmentError } =
 	await import('./issues');
 
 beforeEach(() => {
@@ -95,6 +95,36 @@ describe('batchUpdateIssues', () => {
 		await expect(batchUpdateIssues('proj-1', 'resolve', overCap, {})).rejects.toThrow(/Batch too large/);
 		// No partial work: the cap is checked before the transaction opens.
 		expect(dbMock.transaction).not.toHaveBeenCalled();
+	});
+
+	// CONTEXT.md "Claim": claims are only ever self-acquired — nothing assigns an issue *to* an
+	// agent on its behalf. Guard-deletion red-proof: remove the assigneeType==='agent' check in
+	// batchUpdateIssues and this fails, because the transaction would open and the UPDATE proceed.
+	it('rejects action "assign" with assigneeType "agent" before any database work', async () => {
+		await expect(
+			batchUpdateIssues('proj-1', 'assign', ['issue-a'], {
+				assigneeType: 'agent' as any,
+				assignedTo: 'agent-1',
+				actorType: 'user',
+				actorId: 'admin-1',
+			})
+		).rejects.toBeInstanceOf(AgentAssignmentError);
+		expect(dbMock.transaction).not.toHaveBeenCalled();
+	});
+
+	it('clears claimedAt when assigning a user (an assignment is not a claim)', async () => {
+		txMock.__result = [{ id: 'issue-a' }];
+
+		await batchUpdateIssues('proj-1', 'assign', ['issue-a'], {
+			assigneeType: 'user',
+			assignedTo: 'user-2',
+			actorType: 'user',
+			actorId: 'admin-1',
+		});
+
+		expect(txMock.set).toHaveBeenCalledWith(
+			expect.objectContaining({ assigneeType: 'user', assignedTo: 'user-2', claimedAt: null })
+		);
 	});
 
 	it('accepts a batch exactly at MAX_BATCH_ISSUE_IDS', async () => {

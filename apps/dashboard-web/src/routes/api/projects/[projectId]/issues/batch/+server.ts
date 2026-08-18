@@ -48,6 +48,12 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 		throw error(400, 'assigneeType and assignedTo are required for assign action');
 	}
 
+	// CONTEXT.md "Claim" / DECISIONS.md D24: claims are only ever self-acquired. batchUpdateIssues
+	// throws AgentAssignmentError as a backstop; reject here so the caller gets a 400, not a 500.
+	if (action === 'assign' && assigneeType === 'agent') {
+		throw error(400, 'Issues cannot be assigned to agents. Agents claim issues themselves via POST /api/agent/issues/:id/claim.');
+	}
+
 	const updatedCount = await batchUpdateIssues(
 		projectId,
 		action,

@@ -2,14 +2,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import IssueAssigneePicker from './IssueAssigneePicker.svelte';
 
-// Manual Issues M5 §7: this picker used to hardcode a single fake "AutoFix Agent" (id '2').
-// It now fetches real agent rows for the organization from GET
-// /api/organizations/[orgId]/agents and lists only active ones, with an explicit empty state
-// when there are none.
-function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500) {
-	return { ok, status, json: async () => body } as Response;
-}
-
+// CONTEXT.md "Claim" / DECISIONS.md D24: claims are only ever self-acquired, so this picker must
+// offer NO agent options. The M5 version fetched and listed the org's agents here — that was the
+// UI half of the assign-to-agent defect the server now rejects with 400. An existing agent claim
+// is still displayed, and "Unassigned" remains as the deliberate admin release override.
 afterEach(() => {
 	cleanup();
 	vi.unstubAllGlobals();
@@ -17,67 +13,38 @@ afterEach(() => {
 
 describe('IssueAssigneePicker', () => {
 	it('shows "Unassigned" when there is no assignee', () => {
-		render(IssueAssigneePicker, { organizationId: 'org-1' });
+		render(IssueAssigneePicker, {});
 		expect(screen.getByText('Unassigned')).toBeTruthy();
 	});
 
-	it('shows the current assignee name with the agent emoji for an agent assignee', () => {
+	it('still DISPLAYS an existing agent claim with the agent emoji', () => {
 		render(IssueAssigneePicker, {
 			assignee: { type: 'agent', id: 'agent-1', name: 'AutoFix Agent' },
-			organizationId: 'org-1',
 		});
 		expect(screen.getByText(/AutoFix Agent/)).toBeTruthy();
 	});
 
-	it('fetches and lists real active agents from the org on open, excluding disabled ones', async () => {
-		const fetchMock = vi.fn().mockResolvedValue(
-			jsonResponse({
-				agents: [
-					{ id: 'agent-1', name: 'AutoFix Agent', status: 'active' },
-					{ id: 'agent-2', name: 'Retired Bot', status: 'disabled' },
-				],
-			})
-		);
+	it('offers no agent options and never fetches the org agent list', async () => {
+		const fetchMock = vi.fn();
 		vi.stubGlobal('fetch', fetchMock);
 
-		render(IssueAssigneePicker, { organizationId: 'org-1' });
+		render(IssueAssigneePicker, {});
 		await fireEvent.click(screen.getByText('Unassigned'));
 
-		expect(fetchMock).toHaveBeenCalledWith('/api/organizations/org-1/agents');
-		expect(await screen.findByText(/AutoFix Agent/)).toBeTruthy();
-		expect(screen.queryByText(/Retired Bot/)).toBeNull();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(screen.getByText(/they claim issues themselves/)).toBeTruthy();
 	});
 
-	it('shows an empty state when the org has no agents', async () => {
-		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ agents: [] })));
-
-		render(IssueAssigneePicker, { organizationId: 'org-1' });
-		await fireEvent.click(screen.getByText('Unassigned'));
-
-		expect(await screen.findByText(/No agents in this organization yet/)).toBeTruthy();
-	});
-
-	it('does not hard-error on a 403 (caller without manage_agents) -- degrades to empty state', async () => {
-		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({}, false, 403)));
-
-		render(IssueAssigneePicker, { organizationId: 'org-1' });
-		await fireEvent.click(screen.getByText('Unassigned'));
-
-		expect(await screen.findByText(/No agents in this organization yet/)).toBeTruthy();
-	});
-
-	it('calls onAssign with the picked agent and closes the menu', async () => {
-		vi.stubGlobal(
-			'fetch',
-			vi.fn().mockResolvedValue(jsonResponse({ agents: [{ id: 'agent-1', name: 'AutoFix Agent', status: 'active' }] }))
-		);
+	it('calls onAssign(null) for the Unassigned override and closes the menu', async () => {
 		const onAssign = vi.fn();
 
-		render(IssueAssigneePicker, { organizationId: 'org-1', onAssign });
+		render(IssueAssigneePicker, {
+			assignee: { type: 'agent', id: 'agent-1', name: 'AutoFix Agent' },
+			onAssign,
+		});
+		await fireEvent.click(screen.getByText(/AutoFix Agent/));
 		await fireEvent.click(screen.getByText('Unassigned'));
-		const agentButton = await screen.findByText(/AutoFix Agent/);
-		await fireEvent.click(agentButton);
 
-		expect(onAssign).toHaveBeenCalledWith({ type: 'agent', id: 'agent-1', name: 'AutoFix Agent' });
+		expect(onAssign).toHaveBeenCalledWith(null);
 	});
 });
