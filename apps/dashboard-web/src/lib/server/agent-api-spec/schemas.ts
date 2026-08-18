@@ -349,7 +349,36 @@ export const RelationRemoveResponseSchema = z.object({ success: z.literal(true) 
 // GET /api/agent/projects -- agent-reads.ts's `listAgentProjects`
 // ---------------------------------------------------------------------------
 
-export const AgentProjectSchema = z.object({ id: z.string(), name: z.string(), isInbox: z.boolean() }).strict();
+/** N10 part 1 (DECISIONS.md D23): repo connection, always returned in full to agents -- including
+ * `testCmd`/`agentCmd`, which are server-stored operator-provided commands the worker executes. */
+export const AgentProjectRepoSchema = z
+	.object({
+		provider: z.enum(['github', 'bitbucket']),
+		owner: z.string(),
+		repo: z.string(),
+		defaultBranch: z.string(),
+		testCmd: z.string(),
+		agentCmd: z.string().nullable(),
+		cloneDepth: z.number().int().nullable(),
+	})
+	.strict();
+
+export const AgentProjectAgentSettingsSchema = z
+	.object({
+		fixEnabled: z.boolean(),
+		maxPrsPerDay: z.number().int().nullable(),
+		repo: AgentProjectRepoSchema.nullable(),
+	})
+	.strict();
+
+export const AgentProjectSchema = z
+	.object({
+		id: z.string(),
+		name: z.string(),
+		isInbox: z.boolean(),
+		agentSettings: AgentProjectAgentSettingsSchema,
+	})
+	.strict();
 export const ListProjectsResponseSchema = z.object({ projects: z.array(AgentProjectSchema) }).strict();
 
 // ---------------------------------------------------------------------------

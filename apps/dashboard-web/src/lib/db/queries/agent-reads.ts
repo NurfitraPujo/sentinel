@@ -1,6 +1,7 @@
 import { db } from '$lib/server/db';
 import { issues, projects, manualIssueReports, errorOccurrences } from '$lib/db/schema';
 import { and, desc, eq, lt } from 'drizzle-orm';
+import { getAgentSettingsForProjects, type RepoConnectionRow } from '$lib/db/queries/agent-settings';
 
 /**
  * N1c (agent read endpoints). Own module per FILE OWNERSHIP -- queries backing
@@ -133,13 +134,47 @@ export async function listAgentOccurrences(options: ListAgentOccurrencesOptions)
 	return rows;
 }
 
+export interface AgentProjectRepo {
+	provider: string;
+	owner: string;
+	repo: string;
+	defaultBranch: string;
+	testCmd: string;
+	agentCmd: string | null;
+	cloneDepth: number | null;
+}
+
+export interface AgentProjectAgentSettings {
+	fixEnabled: boolean;
+	maxPrsPerDay: number | null;
+	repo: AgentProjectRepo | null;
+}
+
 export interface AgentProject {
 	id: string;
 	name: string;
 	isInbox: boolean;
+	agentSettings: AgentProjectAgentSettings;
 }
 
-/** Org's projects (B7: `organizationId` MUST come from `AgentAuthContext`, never a request param). */
+function toAgentProjectRepo(row: RepoConnectionRow): AgentProjectRepo {
+	return {
+		provider: row.provider,
+		owner: row.owner,
+		repo: row.repo,
+		defaultBranch: row.defaultBranch,
+		testCmd: row.testCmd,
+		agentCmd: row.agentCmd,
+		cloneDepth: row.cloneDepth,
+	};
+}
+
+/**
+ * Org's projects (B7: `organizationId` MUST come from `AgentAuthContext`, never a request param).
+ * Each project carries its full `agentSettings` (N10 part 1, DECISIONS.md D23), including the
+ * repo connection's `testCmd`/`agentCmd` -- agents get the full connection deliberately (see
+ * D23). Uses the batch read `getAgentSettingsForProjects` to avoid N+1 queries.
+ */
 export async function listAgentProjects(organizationId: string): Promise<AgentProject[]> {
 	const rows = await db
 		.select({
@@ -151,5 +186,17 @@ export async function listAgentProjects(organizationId: string): Promise<AgentPr
 		.where(eq(projects.organizationId, organizationId))
 		.orderBy(projects.name);
 
-	return rows;
+	const settingsMap = await getAgentSettingsForProjects(rows.map((row) => row.id));
+
+	return rows.map((row) => {
+		const settings = settingsMap.get(row.id) ?? { fixEnabled: false, maxPrsPerDay: null, repo: null };
+		return {
+			...row,
+			agentSettings: {
+				fixEnabled: settings.fixEnabled,
+				maxPrsPerDay: settings.maxPrsPerDay,
+				repo: settings.repo ? toAgentProjectRepo(settings.repo) : null,
+			},
+		};
+	});
 }

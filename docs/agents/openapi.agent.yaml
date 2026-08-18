@@ -1909,10 +1909,60 @@ paths:
                           type: string
                         isInbox:
                           type: boolean
+                        agentSettings:
+                          type: object
+                          properties:
+                            fixEnabled:
+                              type: boolean
+                            maxPrsPerDay:
+                              type:
+                                - integer
+                                - "null"
+                            repo:
+                              type:
+                                - object
+                                - "null"
+                              properties:
+                                provider:
+                                  type: string
+                                  enum:
+                                    - github
+                                    - bitbucket
+                                owner:
+                                  type: string
+                                repo:
+                                  type: string
+                                defaultBranch:
+                                  type: string
+                                testCmd:
+                                  type: string
+                                agentCmd:
+                                  type:
+                                    - string
+                                    - "null"
+                                cloneDepth:
+                                  type:
+                                    - integer
+                                    - "null"
+                              required:
+                                - provider
+                                - owner
+                                - repo
+                                - defaultBranch
+                                - testCmd
+                                - agentCmd
+                                - cloneDepth
+                              additionalProperties: false
+                          required:
+                            - fixEnabled
+                            - maxPrsPerDay
+                            - repo
+                          additionalProperties: false
                       required:
                         - id
                         - name
                         - isInbox
+                        - agentSettings
                       additionalProperties: false
                 required:
                   - projects

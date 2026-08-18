@@ -1068,3 +1068,33 @@ Every credential served writes an `audit_logs` row (agent id, credential id, tim
 - The breach blast radius of Sentinel's DB now includes encrypted write-capable git tokens —
   accepted deliberately (plan §10) with flag-scoped delivery + fetch audit as mitigation and env
   tokens (`GIT_GITHUB_TOKEN`/`GIT_BITBUCKET_*`) as the opt-out for deployments that refuse it.
+## D23 | Server-Stored `testCmd` for Per-Project Agent Settings
+
+**Date**: 2026-08-18 · **Status**: accepted · **Detail**: N10 part 1, server-side prerequisite for
+the N8 sentinel-worker (`docs/plans/AGENT_WORKER_PLAN.md` rev 4 §4.5) ·
+**Code**: `apps/dashboard-web/src/lib/db/queries/agent-settings.ts`, `src/lib/db/schema.ts`
+(`projectAgentSettings`, `projectRepoConnections`), migration
+`1724000000_add_project_agent_settings.sql`
+
+### Decision
+
+Per project the dashboard stores `{fixEnabled (default false), maxPrsPerDay?, repo: {provider,
+owner, repo, defaultBranch, testCmd, agentCmd?, cloneDepth?}}`. `testCmd` (and the optional
+`agentCmd`) are server-stored commands that the N8 worker later executes verbatim against the cloned
+repo. This is accepted deliberately, not overlooked: running a cloned repo's own test suite already
+executes repo-controlled code, so `testCmd` does not introduce a new trust boundary — the actual
+boundary is the fix-container sandbox the worker runs everything inside. The controls placed on the
+dashboard side are `manage_agents`-tier RBAC on who may set `testCmd`/`agentCmd`, plus the existing
+audit-log trail, matching the mechanism `routes/[orgSlug]/settings/agents` already uses for
+org-level agent config. One repo connection per project in v1 is enforced by making `project_id` the
+primary key of `project_repo_connections` rather than an app-level uniqueness check.
+
+### Consequences
+
+- No credentials of any kind live in these tables; a sibling task owns the encrypted git-credentials
+  store separately, coordinated only by the `project_agent_*` / `project_repo_*` table-name prefix.
+- `fixEnabled` defaults to `false` at both the column (`DEFAULT false`) and the query-layer input
+  validation (`upsertProjectAgentSettings` rejects a non-boolean `fixEnabled`) — this is the safety
+  switch that gates the entire N8 worker's autonomous PR-opening, so both layers must agree.
+- Route wiring of `GET /api/agent/projects` to actually surface these fields to the worker, and the
+  per-project settings UI, are tracked as follow-on work, not silently assumed done by this decision.

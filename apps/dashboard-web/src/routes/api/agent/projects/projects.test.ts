@@ -33,13 +33,27 @@ describe('GET /api/agent/projects', () => {
 			agentName: 'bot',
 			keyPrefixForAudit: 'abc',
 		});
-		listAgentProjects.mockResolvedValue([{ id: 'p1', name: 'Web', isInbox: false }]);
+		listAgentProjects.mockResolvedValue([
+			{
+				id: 'p1',
+				name: 'Web',
+				isInbox: false,
+				agentSettings: { fixEnabled: false, maxPrsPerDay: null, repo: null },
+			},
+		]);
 
 		const res = await GET(makeEvent());
 		expect(res.status).toBe(200);
 		const body = await res.json();
 
 		expect(listAgentProjects).toHaveBeenCalledWith('org-1');
-		expect(body.projects).toEqual([{ id: 'p1', name: 'Web', isInbox: false }]);
+		expect(body.projects).toEqual([
+			{
+				id: 'p1',
+				name: 'Web',
+				isInbox: false,
+				agentSettings: { fixEnabled: false, maxPrsPerDay: null, repo: null },
+			},
+		]);
 	});
 });
