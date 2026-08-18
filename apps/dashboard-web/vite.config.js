@@ -14,6 +14,13 @@ export default defineConfig(({ mode }) => ({
 	test: {
 		environment: 'jsdom',
 		include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+		// The real-Postgres integration suites (notifications.flow, retention.claims,
+		// retention.tombstones) and the first test to import the AWS SDK graph
+		// (storage.presign-endpoint) legitimately take 2-5s each; under a full parallel run —
+		// especially a shuffled one, where they can all land in the same window — the default 5s
+		// testTimeout flakes on whichever file loses the CPU lottery. Nothing here waits on a
+		// condition, so a generous ceiling costs nothing on green runs.
+		testTimeout: 20000,
 		// Unmounts rendered components between tests — see vitest-setup.ts for why this is not
 		// automatic here.
 		setupFiles: ['./vitest-setup.ts']
