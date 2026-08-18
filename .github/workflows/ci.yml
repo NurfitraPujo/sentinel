@@ -240,6 +240,13 @@ jobs:
       # self-skips when no database answers; this makes an unreachable one a hard failure instead.
       # It seeds and deletes its own org/project/issue, so it needs no pre-existing data.
       SEARCH_INTEGRATION_REQUIRED: "1"
+      # Same idea for src/lib/db/queries/repo-credentials.integration.test.ts (N10): the committed
+      # proof that repo credentials are never stored in plaintext and that a revoked credential is
+      # no longer served. Its probe additionally requires the repo_credentials table (so it skips
+      # on a pre-N10 dev database instead of failing); this makes that skip a hard failure here.
+      N10_CREDENTIALS_INTEGRATION_REQUIRED: "1"
+      # Master key for the same test's real AES-GCM round-trip (base64 of 32 bytes, CI-only value).
+      SENTINEL_ENCRYPTION_KEY: "ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE="
       DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel
     steps:
       - uses: actions/checkout@v4

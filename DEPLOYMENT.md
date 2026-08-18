@@ -64,6 +64,7 @@ Never reuse the dev defaults. Generate strong values:
 openssl rand -hex 32   # AUTH_SECRET  (Auth.js session signing; >= 32 chars)
 openssl rand -hex 16   # SETTINGS_ENCRYPTION_KEY must be EXACTLY 32 chars — use: openssl rand -hex 16
 openssl rand -hex 32   # CRON_SECRET  (guards /api/cron/* retention endpoints)
+openssl rand -base64 32 # SENTINEL_ENCRYPTION_KEY (repo-credentials master key: base64 of EXACTLY 32 bytes)
 openssl rand -base64 24 # POSTGRES_PASSWORD, S3_SECRET_KEY, REDIS_PASSWORD
 ```
 
@@ -74,6 +75,7 @@ openssl rand -base64 24 # POSTGRES_PASSWORD, S3_SECRET_KEY, REDIS_PASSWORD
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | dashboard, minio | real S3/R2 credentials in prod |
 | `AUTH_SECRET` | dashboard | Auth.js; rotating it invalidates all sessions |
 | `SETTINGS_ENCRYPTION_KEY` | dashboard | **exactly 32 chars**; encrypts stored org settings — rotating it makes existing encrypted settings unreadable |
+| `SENTINEL_ENCRYPTION_KEY` | dashboard | **base64 of exactly 32 bytes** (`openssl rand -base64 32`); AES-256-GCM master key for the repo-credentials store (N10). Optional: without it the dashboard runs but refuses (503) to store or serve git credentials, so the fix worker gets none. Every row records its `key_version`, so rotation = introduce a new key version, keep the old one available, re-encrypt (replace) credentials, then retire it |
 | `CRON_SECRET` | dashboard | bearer token for retention cron |
 | `MANUAL_ISSUE_RETENTION_DAYS` | dashboard | not a secret, but read by the same cron; default 365 — see §5 checklist |
 | `CLAIM_STALE_HOURS` | dashboard | not a secret, but read by the same cron; default 24 — see §5 checklist |
@@ -128,6 +130,7 @@ kubectl -n sentinel create secret generic sentinel-app-secrets \
   --from-literal=REDIS_PASSWORD=... \
   --from-literal=S3_ACCESS_KEY=... --from-literal=S3_SECRET_KEY=... \
   --from-literal=AUTH_SECRET=... --from-literal=SETTINGS_ENCRYPTION_KEY=... \
+  --from-literal=SENTINEL_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
   --from-literal=CRON_SECRET=... --from-literal=EMAIL_SERVER=smtp://... \
   --from-literal=GOOGLE_CLIENT_ID= --from-literal=GOOGLE_CLIENT_SECRET=
 
@@ -257,6 +260,27 @@ created by a human, once, through the dashboard:
      non-expiring key. If the old key had no expiry, the new key gets `AGENT_KEY_ROTATION_DEFAULT_DAYS`
      (unset = stays non-expiring). Set that env var to force every rotation of a legacy
      never-expiring key onto a finite schedule from then on.
+
+### 8a. Repository credentials for the fix worker (N10)
+
+Git credentials the fix worker uses to push branches and open PRs are **server-side and
+encrypted** — never worker env in managed deployments (env `GIT_GITHUB_TOKEN`/`GIT_BITBUCKET_*`
+remain a bootstrap/fallback for compose and air-gapped setups):
+
+1. Provision `SENTINEL_ENCRYPTION_KEY` (§1) **before** storing any credential — the dashboard
+   refuses (503) to store or serve credentials without it.
+2. In **Settings → Agents → Repository credentials**, store a credential per provider: GitHub
+   fine-grained PAT, or Bitbucket access token / username+app-password. **Write-only**: the
+   secret is never displayed again — not even once after save; the list shows label + prefix
+   only. Prefer repo-scoped tokens + branch protection so even a leaked token cannot bypass PR
+   review.
+3. Grant the worker's agent the **Repo credential access** toggle on its agent card. Without the
+   flag, `GET /api/agent/repo-credentials` returns 403 even with a valid agent key — possession
+   of a key is deliberately not enough.
+4. Replace (rotates the secret in place, same credential id) or revoke from the same UI. Revoke
+   destroys the stored ciphertext immediately; the next worker fetch no longer includes it.
+5. Every store/replace/revoke/grant and every successful credential fetch (agent id, credential
+   id, timestamp) is written to `audit_logs`.
 
 **Future work (sketch, not built):** an org-owner-mintable one-time provisioning token — owner
 generates a short-lived, single-use token in the dashboard, hands it to whatever is standing up

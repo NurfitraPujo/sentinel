@@ -65,6 +65,8 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: AUTH_SECRET } }
             - name: SETTINGS_ENCRYPTION_KEY
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SETTINGS_ENCRYPTION_KEY } }
+            - name: SENTINEL_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SENTINEL_ENCRYPTION_KEY } }
             - name: CRON_SECRET
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: CRON_SECRET } }
             - name: GOOGLE_CLIENT_ID

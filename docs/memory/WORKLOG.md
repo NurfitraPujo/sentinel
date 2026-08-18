@@ -381,3 +381,22 @@ has no consumer, drain, or dashboard surface yet.
 - **Where to look**: `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`,
   `docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md`, `docs/memory/VERIFIED_STATE.md` → "Agent-automation
   remediation (N7)".
+
+## 2026-08-18 — N10 part 2: encrypted server-side git-credentials store (`feat/n10-repo-credentials`)
+
+- **What**: `repo_credentials` table (AES-256-GCM under `SENTINEL_ENCRYPTION_KEY`, per-row nonce,
+  `key_version`, org-id AAD; migration `1723900000`, replay-proven), write-only management routes +
+  Settings → Agents UI (add/replace/revoke, `manage_agents` RBAC, audited), admin-set
+  `agents.can_access_repo_credentials` flag with a per-agent toggle, and the flag-gated delivery
+  endpoint `GET /api/agent/repo-credentials` (403 without the flag, 503 without the master key,
+  every served credential audited). OpenAPI spec + agent guide + DEPLOYMENT/helm/compose/.env
+  wiring updated. Design recorded as **D22**.
+- **Security proofs**: no-plaintext-at-rest asserted against raw rows (mock-captured inserts AND a
+  real-Postgres integration test), decrypt round-trip, revoked-not-served with ciphertext
+  destruction, and three guard mutations run red-first (flag check, audit write, encryption).
+- **Systemic lesson**: `--sequence.shuffle` on the dashboard suite fails on a CLEAN tree — B13's
+  "order-independence decays silently" is no longer hypothetical. Filed as its own task; plain
+  `pnpm test` remains green.
+- **Where to look**: `apps/dashboard-web/src/lib/server/repo-credential-crypto.ts`,
+  `src/lib/db/queries/repo-credentials.ts`, `src/routes/api/agent/repo-credentials/`,
+  `docs/memory/DECISIONS.md` D22, `docs/memory/VERIFIED_STATE.md` → "N10 part 2".

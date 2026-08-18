@@ -505,3 +505,31 @@ export const KeyRotateResponseSchema = z
 		newKey: z.object({ id: z.string(), prefix: z.string(), secret: z.string() }).strict(),
 	})
 	.strict();
+
+// ---------------------------------------------------------------------------
+// GET /api/agent/repo-credentials -- N10 part 2 (AGENT_WORKER_PLAN.md §4.5)
+// ---------------------------------------------------------------------------
+
+// The decrypted secret: a bare token (github, or a bitbucket access token) or a bitbucket
+// username + app-password pair. This shape exists ONLY in this response, only over TLS, only to
+// agents holding the admin-set can_access_repo_credentials grant; the worker keeps it in memory
+// and never journals it.
+export const RepoCredentialSecretSchema = z.union([
+	z.object({ token: z.string() }).strict(),
+	z.object({ username: z.string(), appPassword: z.string() }).strict(),
+]);
+
+export const RepoCredentialsResponseSchema = z
+	.object({
+		credentials: z.array(
+			z
+				.object({
+					id: z.string(),
+					provider: z.enum(['github', 'bitbucket']),
+					label: z.string(),
+					secret: RepoCredentialSecretSchema,
+				})
+				.strict()
+		),
+	})
+	.strict();
