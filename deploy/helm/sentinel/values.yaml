@@ -55,6 +55,9 @@ secrets:
     # dashboard-only secrets
     AUTH_SECRET: "change-me-auth-secret-min-32-chars-long"
     SETTINGS_ENCRYPTION_KEY: "change-me-settings-key-exactly-32ch"
+    # N10: base64 of exactly 32 random bytes (`openssl rand -base64 32`); repo-credential
+    # endpoints return 503 until it is set to a real value.
+    SENTINEL_ENCRYPTION_KEY: "change-me-base64-of-32-random-bytes"
     CRON_SECRET: "change-me-cron-secret"
     GOOGLE_CLIENT_ID: ""
     GOOGLE_CLIENT_SECRET: ""

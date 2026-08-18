@@ -2337,6 +2337,96 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+  /api/agent/repo-credentials:
+    get:
+      operationId: getRepoCredentials
+      summary: Decrypted git credentials for this org. 403 unless an admin granted this agent can_access_repo_credentials; every served credential is audited. 503 when SENTINEL_ENCRYPTION_KEY is not configured.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  credentials:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        provider:
+                          type: string
+                          enum:
+                            - github
+                            - bitbucket
+                        label:
+                          type: string
+                        secret:
+                          oneOf:
+                            - type: object
+                              properties:
+                                token:
+                                  type: string
+                              required:
+                                - token
+                              additionalProperties: false
+                            - type: object
+                              properties:
+                                username:
+                                  type: string
+                                appPassword:
+                                  type: string
+                              required:
+                                - username
+                                - appPassword
+                              additionalProperties: false
+                      required:
+                        - id
+                        - provider
+                        - label
+                        - secret
+                      additionalProperties: false
+                required:
+                  - credentials
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "503":
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/batch:
     post:
       operationId: runBatch

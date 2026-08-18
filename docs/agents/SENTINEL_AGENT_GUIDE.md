@@ -604,6 +604,33 @@ shape so a future column addition wouldn't be a breaking response-shape change. 
 confirm which agent/org a key resolves to (e.g. at the start of an unattended loop, or after
 rotating — see §2), instead of the old CLI-side reachability probe against `/api/agent/issues`.
 
+## 13a. Repo credentials: `GET /api/agent/repo-credentials` (N10)
+
+Server-held git credentials for the fix worker (push branches, open PRs). Not part of the normal
+triage surface — most agents never call this and never can:
+
+- **403 by default.** A valid agent key is not enough; an org owner/admin must enable **Repo
+  credential access** on your agent card (`agents.can_access_repo_credentials`). Revocation is
+  immediate — the flag is re-read on every request.
+- **503** means the server has no `SENTINEL_ENCRYPTION_KEY` configured and refuses to serve
+  credentials; that is an operator problem, not yours — do not retry-loop it aggressively.
+- The response is the only place the decrypted secret ever appears. `Cache-Control: no-store`;
+  hold it in memory only — never journal, snapshot, or log it.
+- Every credential you fetch is audited (your agent id, the credential id, timestamp).
+
+```json
+{
+  "credentials": [
+    { "id": "...", "provider": "github", "label": "CI fix bot", "secret": { "token": "ghp_..." } },
+    { "id": "...", "provider": "bitbucket", "label": "BB", "secret": { "username": "devbot", "appPassword": "..." } }
+  ]
+}
+```
+
+`secret` is either `{token}` (GitHub PAT or Bitbucket access token) or `{username, appPassword}`
+(Bitbucket app password pair). Revoked credentials disappear from the list; a `401`/empty-list
+transition mid-run means re-fetch before your next push, not "reuse the cached one forever".
+
 ## 14. Raw-curl appendix
 
 Set once:
@@ -619,6 +646,9 @@ curl -s "$SENTINEL_URL/api/agent/self" -H "$AUTH"
 
 # Rotate this key (prints the new secret ONCE — capture it, don't just print-and-discard)
 curl -s -X POST "$SENTINEL_URL/api/agent/key/rotate" -H "$AUTH"
+
+# Repo credentials (403 unless an admin granted your agent repo-credential access — §13a)
+curl -s "$SENTINEL_URL/api/agent/repo-credentials" -H "$AUTH"
 
 # List issues
 curl -s "$SENTINEL_URL/api/agent/issues?type=system_error&claimed=false&waiting=false" -H "$AUTH"

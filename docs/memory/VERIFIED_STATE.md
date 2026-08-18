@@ -166,6 +166,30 @@ current picture of module boundaries.
 
 ## Resolved
 
+### N10 part 2 — encrypted git-credentials store (VERIFIED 2026-08-18, branch `feat/n10-repo-credentials`)
+
+Design in D22 (`DECISIONS.md`); plan §4.5 of `docs/plans/AGENT_WORKER_PLAN.md` (rev 4, on
+`feat/agent-key-expiry`'s worktree — not yet merged to main). What was verified, with the command:
+
+```
+cd apps/dashboard-web && pnpm check                              1871 files, 0 errors, 0 warnings
+cd apps/dashboard-web && pnpm build                              pass
+cd apps/dashboard-web && pnpm test                               101 files: 97+2 passed | skips, 837 passed
+migration 1723900000 replay                                      goose up ×2 per target + raw double-apply
+                                                                 with ON_ERROR_STOP: clean (disposable PG16)
+DATABASE_URL=<disposable> SCHEMA_DRIFT_REQUIRED=1 vitest tests/schema-drift.test.ts   30 passed
+DATABASE_URL=<disposable> N10_CREDENTIALS_INTEGRATION_REQUIRED=1 \
+  vitest src/lib/db/queries/repo-credentials.integration.test.ts                      4 passed
+```
+
+Guard mutations proven red then reverted: (a) flag check replaced with `if (false)` → the
+"plain agent key gets 403" tests fail; (b) audit loop emptied → the audit tests fail; (c)
+encryption bypassed with plaintext-as-ciphertext → the no-plaintext-at-rest tests fail.
+
+Caveat found during this work, NOT caused by it: `pnpm test --sequence.shuffle` fails on a clean
+tree (order-dependent `issues.test.ts` assertions + 5s timeouts in two integration flows). Plain
+`pnpm test` is green. B13's decay warning is now a live fact, filed as a follow-up task.
+
 ### UI parity remediation (D01–D47) — RESOLVED 2026-08-01
 
 **What was wrong.** Five features closed the dashboard/backend parity gaps in `dc359cb`, `5639e64`,

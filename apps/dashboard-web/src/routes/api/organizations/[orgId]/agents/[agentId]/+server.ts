@@ -1,6 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getAgentById, setAgentStatus } from '$lib/db/queries/agents';
+import { getAgentById, setAgentStatus, setAgentRepoCredentialAccess } from '$lib/db/queries/agents';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership } from '../../keys/_shared';
 
@@ -33,6 +33,23 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 	}
 
 	const body = await request.json().catch(() => ({}) as any);
+
+	// N10: the repo-credentials delivery gate is toggled here too, as its own audited mutation.
+	// Exactly one of {status, canAccessRepoCredentials} per request keeps each audit row a single
+	// unambiguous change.
+	if (typeof body?.canAccessRepoCredentials === 'boolean') {
+		if (body.status !== undefined) {
+			throw error(400, 'send either status or canAccessRepoCredentials, not both');
+		}
+		const updated = await setAgentRepoCredentialAccess(
+			session.user.id,
+			orgId!,
+			agentId!,
+			body.canAccessRepoCredentials
+		);
+		return json({ agent: updated });
+	}
+
 	if (!body?.status || !VALID_STATUSES.includes(body.status)) {
 		throw error(400, `status is required and must be one of ${VALID_STATUSES.join(', ')}`);
 	}

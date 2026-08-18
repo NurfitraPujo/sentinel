@@ -126,6 +126,7 @@ function normalizeDrizzleSqlType(sqlType: string): TypeFamily {
 	if (sqlType === 'json') return { family: 'json', length: null };
 	if (sqlType === 'boolean') return { family: 'boolean', length: null };
 	if (sqlType === 'integer') return { family: 'integer', length: null };
+	if (sqlType === 'smallint') return { family: 'integer', length: null };
 	if (sqlType === 'bigint') return { family: 'integer', length: null };
 	if (sqlType.startsWith('timestamp')) return { family: 'timestamp', length: null };
 	// Unknown type: return it verbatim as its own family so the comparison below fails loudly instead of

@@ -22,6 +22,8 @@ export interface AgentRow {
 	status: AgentStatus;
 	createdBy: string;
 	createdAt: Date | null;
+	// N10: admin-set gate for GET /api/agent/repo-credentials (default false).
+	canAccessRepoCredentials: boolean;
 }
 
 export async function listAgents(orgId: string): Promise<AgentRow[]> {
@@ -89,6 +91,38 @@ export async function setAgentStatus(
 		resourceId: agentId,
 		actorId: actorUserId,
 		metadata: { status },
+	});
+
+	return updated as AgentRow;
+}
+
+/**
+ * N10: grant/withdraw the repo-credentials delivery gate. Audited like every agent mutation --
+ * this flag turns a triage identity into one that can fetch write-capable git tokens, so the
+ * audit trail must show who flipped it and when.
+ */
+export async function setAgentRepoCredentialAccess(
+	actorUserId: string,
+	orgId: string,
+	agentId: string,
+	canAccessRepoCredentials: boolean
+): Promise<AgentRow> {
+	const [updated] = await db
+		.update(agents)
+		.set({ canAccessRepoCredentials })
+		.where(and(eq(agents.id, agentId), eq(agents.orgId, orgId)))
+		.returning();
+
+	if (!updated) {
+		throw new Error('Agent not found');
+	}
+
+	await db.insert(auditLogs).values({
+		action: 'agent.repo_credential_access_changed',
+		resourceType: 'agent',
+		resourceId: agentId,
+		actorId: actorUserId,
+		metadata: { canAccessRepoCredentials },
 	});
 
 	return updated as AgentRow;

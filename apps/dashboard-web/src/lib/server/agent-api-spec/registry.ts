@@ -306,6 +306,20 @@ export const agentApiRegistry: RegistryEntry[] = [
 		},
 	},
 	{
+		path: '/api/agent/repo-credentials',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/repo-credentials/+server.ts',
+		operationId: 'getRepoCredentials',
+		summary:
+			'Decrypted git credentials for this org. 403 unless an admin granted this agent can_access_repo_credentials; every served credential is audited. 503 when SENTINEL_ENCRYPTION_KEY is not configured.',
+		responses: {
+			'200': S.RepoCredentialsResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'403': S.MessageErrorSchema,
+			'503': S.MessageErrorSchema,
+		},
+	},
+	{
 		path: '/api/agent/batch',
 		method: 'post',
 		routeFile: 'src/routes/api/agent/batch/+server.ts',

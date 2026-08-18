@@ -10,6 +10,20 @@
 		kind: 'ai' | 'bot';
 		status: 'active' | 'disabled';
 		createdAt: string | null;
+		// N10: admin-set gate for the repo-credentials delivery endpoint.
+		canAccessRepoCredentials?: boolean;
+	}
+
+	// N10 part 2: metadata-only shape -- the server never returns the secret after initial set,
+	// and unlike keys/webhook secrets there is deliberately NO one-time reveal tray for it.
+	interface RepoCredentialRow {
+		id: string;
+		provider: 'github' | 'bitbucket';
+		label: string;
+		secretPrefix: string;
+		status: 'active' | 'revoked';
+		createdAt: string | null;
+		lastFetchedAt: string | null;
 	}
 
 	interface KeyRow {
@@ -62,6 +76,19 @@
 	let creatingWebhookForAgent = $state<string | null>(null);
 	let newlyIssuedWebhookSecret = $state<string | null>(null);
 
+	// N10 part 2: repository credentials (write-only). The secret fields below are cleared the
+	// moment the create/replace call returns, and nothing read back from the server ever
+	// contains them.
+	let repoCredentials = $state<RepoCredentialRow[]>([]);
+	let repoCredentialsLoaded = $state(false);
+	let newCredProvider = $state<'github' | 'bitbucket'>('github');
+	let newCredLabel = $state('');
+	let newCredToken = $state('');
+	let newCredUsername = $state('');
+	let newCredAppPassword = $state('');
+	let savingCredential = $state(false);
+	let replacingCredentialId = $state<string | null>(null);
+
 	function showToast(message: string, type: 'error' | 'success' = 'error') {
 		toastMessage = message;
 		toastType = type;
@@ -106,6 +133,122 @@
 			if (!webhooksLoaded[agent.id]) void loadWebhooks(agent.id);
 		}
 	});
+
+	async function loadRepoCredentials() {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/repo-credentials`);
+			if (!res.ok) return;
+			const body = await res.json();
+			repoCredentials = body.credentials ?? [];
+		} finally {
+			repoCredentialsLoaded = true;
+		}
+	}
+
+	$effect(() => {
+		void loadRepoCredentials();
+	});
+
+	function clearCredentialForm() {
+		newCredLabel = '';
+		newCredToken = '';
+		newCredUsername = '';
+		newCredAppPassword = '';
+	}
+
+	function credentialSecretBody(): Record<string, string> | null {
+		if (newCredProvider === 'github') {
+			if (!newCredToken.trim()) {
+				showToast('A token is required');
+				return null;
+			}
+			return { token: newCredToken.trim() };
+		}
+		if (newCredToken.trim()) return { token: newCredToken.trim() };
+		if (!newCredUsername.trim() || !newCredAppPassword.trim()) {
+			showToast('Bitbucket needs a token, or a username and app password');
+			return null;
+		}
+		return { username: newCredUsername.trim(), appPassword: newCredAppPassword.trim() };
+	}
+
+	async function saveCredential() {
+		const secret = credentialSecretBody();
+		if (!secret) return;
+		const replacing = replacingCredentialId;
+		if (!replacing && !newCredLabel.trim()) {
+			showToast('A label is required');
+			return;
+		}
+		savingCredential = true;
+		try {
+			const res = replacing
+				? await fetch(`/api/organizations/${data.orgId}/repo-credentials/${replacing}`, {
+						method: 'PUT',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ provider: newCredProvider, ...secret }),
+					})
+				: await fetch(`/api/organizations/${data.orgId}/repo-credentials`, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ provider: newCredProvider, label: newCredLabel.trim(), ...secret }),
+					});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to save credential' }));
+				showToast(err.message || `Error ${res.status}: failed to save credential`);
+				return;
+			}
+			const { credential } = await res.json();
+			repoCredentials = replacing
+				? repoCredentials.map((c) => (c.id === replacing ? credential : c))
+				: [credential, ...repoCredentials];
+			replacingCredentialId = null;
+			clearCredentialForm();
+			showToast(replacing ? 'Credential secret replaced' : 'Credential stored (write-only — it cannot be viewed again)', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while saving credential');
+		} finally {
+			savingCredential = false;
+		}
+	}
+
+	async function revokeCredential(credentialId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/repo-credentials/${credentialId}`, {
+				method: 'DELETE',
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke credential' }));
+				showToast(err.message || `Error ${res.status}: failed to revoke credential`);
+				return;
+			}
+			const { credential } = await res.json();
+			repoCredentials = repoCredentials.map((c) => (c.id === credentialId ? credential : c));
+			if (replacingCredentialId === credentialId) replacingCredentialId = null;
+			showToast('Credential revoked', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking credential');
+		}
+	}
+
+	async function setRepoCredentialAccess(agent: AgentRow, allow: boolean) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agent.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ canAccessRepoCredentials: allow }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to update agent' }));
+				showToast(err.message || `Error ${res.status}: failed to update agent`);
+				return;
+			}
+			agents = agents.map((a) => (a.id === agent.id ? { ...a, canAccessRepoCredentials: allow } : a));
+			showToast(allow ? 'Repo credential access granted' : 'Repo credential access withdrawn', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while updating agent');
+		}
+	}
 
 	async function createAgent() {
 		if (!newAgentName.trim()) {
@@ -335,6 +478,14 @@
 							<span class="agent-status" class:is-disabled={agent.status === 'disabled'}>{agent.status}</span>
 						</div>
 						<div class="agent-actions">
+							<label class="repo-access-toggle" title="Allow this agent to fetch decrypted repository credentials from GET /api/agent/repo-credentials">
+								<input
+									type="checkbox"
+									checked={agent.canAccessRepoCredentials ?? false}
+									onchange={(e) => setRepoCredentialAccess(agent, (e.currentTarget as HTMLInputElement).checked)}
+								/>
+								Repo credential access
+							</label>
 							<button type="button" onclick={() => issueKey(agent)} disabled={issuingForAgent === agent.id}>
 								{issuingForAgent === agent.id ? 'Issuing…' : 'Issue key'}
 							</button>
@@ -428,6 +579,79 @@
 			{/each}
 		</ul>
 	{/if}
+
+	<section class="repo-credentials">
+		<header>
+			<h2>Repository credentials</h2>
+			<p class="subtitle">
+				Git tokens the fix worker uses to push branches and open PRs. Stored encrypted, write-only:
+				a secret can be set, replaced, or revoked, but never viewed again. Served only to agents
+				with "Repo credential access" enabled.
+			</p>
+		</header>
+
+		{#if !repoCredentialsLoaded}
+			<p class="empty-state small">Loading credentials…</p>
+		{:else if repoCredentials.length === 0}
+			<p class="empty-state small">No repository credentials stored.</p>
+		{:else}
+			<ul class="credential-list">
+				{#each repoCredentials as cred (cred.id)}
+					<li class="credential-row">
+						<div class="credential-row-main">
+							<span class="credential-label">{cred.label}</span>
+							<code>{cred.provider} · {cred.secretPrefix}…</code>
+							<span class="key-status" class:is-revoked={cred.status === 'revoked'}>{cred.status}</span>
+						</div>
+						<div class="credential-row-meta">
+							<span>{cred.lastFetchedAt ? `last fetched ${new Date(cred.lastFetchedAt).toLocaleString()}` : 'never fetched'}</span>
+						</div>
+						{#if cred.status === 'active'}
+							<div class="webhook-row-actions">
+								<button
+									type="button"
+									class="small"
+									onclick={() => {
+										replacingCredentialId = replacingCredentialId === cred.id ? null : cred.id;
+										newCredProvider = cred.provider;
+										clearCredentialForm();
+									}}
+								>
+									{replacingCredentialId === cred.id ? 'Cancel replace' : 'Replace secret'}
+								</button>
+								<button type="button" class="danger small" onclick={() => revokeCredential(cred.id)}>Revoke</button>
+							</div>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{/if}
+
+		<div class="credential-form">
+			{#if replacingCredentialId}
+				<p class="empty-state small">Replacing the secret of the selected credential ({newCredProvider}).</p>
+			{:else}
+				<select bind:value={newCredProvider}>
+					<option value="github">GitHub</option>
+					<option value="bitbucket">Bitbucket</option>
+				</select>
+				<input type="text" placeholder="Label (e.g. CI fix bot)" bind:value={newCredLabel} maxlength="255" />
+			{/if}
+			<input
+				type="password"
+				placeholder={newCredProvider === 'github' ? 'Fine-grained PAT' : 'Access token (or leave empty for app password)'}
+				bind:value={newCredToken}
+				autocomplete="off"
+			/>
+			{#if newCredProvider === 'bitbucket'}
+				<input type="text" placeholder="Username" bind:value={newCredUsername} autocomplete="off" />
+				<input type="password" placeholder="App password" bind:value={newCredAppPassword} autocomplete="off" />
+			{/if}
+			<button type="button" disabled={savingCredential} onclick={saveCredential}>
+				{savingCredential ? 'Saving…' : replacingCredentialId ? 'Replace secret' : '+ Store credential'}
+			</button>
+		</div>
+	</section>
 </div>
 
 <style>
@@ -748,6 +972,112 @@
 	}
 
 	.webhook-create button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.repo-access-toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		font-size: 0.7rem;
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.repo-credentials {
+		border-top: 1px solid var(--border-color);
+		padding-top: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.repo-credentials h2 {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 700;
+	}
+
+	.credential-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.credential-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.625rem;
+	}
+
+	.credential-row-main {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.credential-label {
+		font-weight: 600;
+	}
+
+	.credential-row-meta {
+		font-size: 0.7rem;
+		opacity: 0.75;
+	}
+
+	.credential-row button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.25rem 0.5rem;
+		font-size: 0.7rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.credential-form {
+		display: flex;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.credential-form input,
+	.credential-form select {
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.credential-form input {
+		flex: 1;
+		min-width: 10rem;
+	}
+
+	.credential-form button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.credential-form button:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
 	}

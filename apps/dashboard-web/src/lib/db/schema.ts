@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, uniqueIndex, integer, boolean } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, uniqueIndex, integer, boolean, smallint } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const organizations = pgTable('organizations', {
@@ -438,8 +438,37 @@ export const agents = pgTable('agents', {
 	status: varchar('status', { length: 20 }).notNull().default('active'),
 	createdBy: varchar('created_by', { length: 255 }).notNull(),
 	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+	// 1723900000_add_repo_credentials.sql (N10): admin-set delivery gate. Only agents explicitly
+	// granted this flag may fetch decrypted repo credentials from GET /api/agent/repo-credentials;
+	// a plain agent key gets 403. Default false, toggled in the agent management UI, audited.
+	canAccessRepoCredentials: boolean('can_access_repo_credentials').notNull().default(false),
 }, (table) => ({
 	idxAgentsOrg: index('idx_agents_org').on(table.orgId),
+}));
+
+// N10 part 2 (docs/plans/AGENT_WORKER_PLAN.md §4.5), source of truth is
+// 1723900000_add_repo_credentials.sql. Org-scoped git credentials for the sentinel-worker's push
+// access. `encryptedSecret` is AES-256-GCM ciphertext under SENTINEL_ENCRYPTION_KEY (see
+// $lib/server/repo-credential-crypto.ts) -- NEVER plaintext, a deliberate divergence from
+// agentWebhooks.secret above: webhook secrets only SIGN, these authorize repository WRITES.
+// The write-only UI shows label + secretPrefix only; the secret is never returned to any
+// dashboard client after initial set. On revoke, encryptedSecret/nonce are overwritten with ''.
+export const repoCredentials = pgTable('repo_credentials', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	provider: varchar('provider', { length: 20 }).notNull(), // 'github' | 'bitbucket'
+	label: varchar('label', { length: 255 }).notNull(),
+	secretPrefix: varchar('secret_prefix', { length: 16 }).notNull(),
+	encryptedSecret: text('encrypted_secret').notNull(),
+	nonce: text('nonce').notNull(),
+	keyVersion: smallint('key_version').notNull().default(1),
+	status: varchar('status', { length: 20 }).notNull().default('active'), // 'active' | 'revoked'
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	revokedAt: timestamp('revoked_at', { withTimezone: true }),
+	lastFetchedAt: timestamp('last_fetched_at', { withTimezone: true }),
+}, (table) => ({
+	idxRepoCredentialsOrg: index('idx_repo_credentials_org').on(table.organizationId),
 }));
 
 // N1a (AI-agent-native Sentinel), source of truth is

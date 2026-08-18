@@ -1025,3 +1025,46 @@ aborts the Postgres transaction and cannot be caught-and-continued.
   back, so the retry re-runs cleanly. The only at-least-once window is the pre-existing one any HTTP
   call has (client never learns the outcome and the server did commit) — which is exactly what the
   key closes on the retry.
+
+## D22 | Repo Credentials Are Encrypted At Rest, Write-Only to the Dashboard, and Flag-Gated to Agents
+
+**Date**: 2026-08-18 | **Feature**: N10 part 2 (docs/plans/AGENT_WORKER_PLAN.md §4.5 "Git
+credentials are server-side too") | **Status**: Active
+
+**Decision**: The `repo_credentials` table stores git tokens (GitHub PAT; Bitbucket access token
+or username+app-password pair, as a JSON envelope) encrypted with **AES-256-GCM** under a
+`SENTINEL_ENCRYPTION_KEY` master key (base64 of exactly 32 bytes) — per-row random 96-bit nonce,
+`key_version` column for master-key rotation, and the **organization id bound as AAD** so a
+ciphertext copied across tenant rows fails to decrypt. There is **no fallback key in code**
+(unlike `SETTINGS_ENCRYPTION_KEY`'s hardcoded default): without the env var, both the store path
+and the serve path fail closed with 503. Implementation:
+`apps/dashboard-web/src/lib/server/repo-credential-crypto.ts`.
+
+Delivery is a dedicated endpoint, `GET /api/agent/repo-credentials`, gated on a new admin-set
+`agents.can_access_repo_credentials` flag (default false, toggled in Settings → Agents, audited):
+a valid agent key alone gets 403. The flag is re-read per request so revocation is immediate.
+Every credential served writes an `audit_logs` row (agent id, credential id, timestamp) and stamps
+`last_fetched_at`.
+
+**Why**:
+- These credentials authorize repository **writes** — deliberately NOT the `agent_webhooks`
+  plaintext pattern (webhook secrets only sign) and NOT the `project_api_keys` hash pattern (the
+  server must return the raw secret to the worker, so a hash is impossible). Encryption-at-rest
+  with a server-held key is the remaining shape.
+- Write-only dashboard contract: after initial set, no API response ever contains the secret —
+  the list projection is a column allowlist (`label` + `secretPrefix` only), enforced in the query
+  layer (`src/lib/db/queries/repo-credentials.ts`), not the UI.
+- GCM over CBC: settings.ts's aes-256-cbc has no integrity; a tampered git credential could point
+  a push at attacker infrastructure. The auth tag makes tampering a decrypt failure.
+
+**Consequences**:
+- Revoke destroys the ciphertext (`encrypted_secret=''`) and keeps the row as an audit tombstone
+  — a later master-key leak cannot recover revoked credentials from the live table. Replace
+  re-encrypts in place so the credential id (referenced by repo connections, N10 part 1 sibling)
+  stays stable.
+- Master-key rotation is by `key_version`: introduce the new key as current, keep the old version
+  decryptable, re-encrypt via replace, retire. Losing the master key orphans every stored
+  credential — they must be re-entered; nothing else in the DB is affected.
+- The breach blast radius of Sentinel's DB now includes encrypted write-capable git tokens —
+  accepted deliberately (plan §10) with flag-scoped delivery + fetch audit as mitigation and env
+  tokens (`GIT_GITHUB_TOKEN`/`GIT_BITBUCKET_*`) as the opt-out for deployments that refuse it.

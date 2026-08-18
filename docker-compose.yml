@@ -309,6 +309,8 @@ services:
             EMAIL_SERVER: smtp://debug
             EMAIL_FROM: noreply@sentinel.local
             SETTINGS_ENCRYPTION_KEY: default-long-and-secure-key-32-chars
+            # N10 dev master key for the git-credentials store: base64("dev-only-32-byte-key-4-sentinel!").
+            SENTINEL_ENCRYPTION_KEY: ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE=
             CRON_SECRET: dev-only-cron-secret-change-me
             DATA_RETENTION_DAYS: "30"
             MANUAL_ISSUE_RETENTION_DAYS: "365"

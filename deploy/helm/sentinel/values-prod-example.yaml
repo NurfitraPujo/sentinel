@@ -15,8 +15,8 @@ images:
   dlqDrainer: { repository: registry.example.com/sentinel/dlq-drainer,  tag: "1.4.0" }
 
 # The Secret must contain: POSTGRES_PASSWORD, REDIS_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY,
-# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-# EMAIL_SERVER.
+# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, SENTINEL_ENCRYPTION_KEY, CRON_SECRET, GOOGLE_CLIENT_ID,
+# GOOGLE_CLIENT_SECRET, EMAIL_SERVER.
 secrets:
   create: false
   existingSecret: sentinel-app-secrets
