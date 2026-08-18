@@ -1098,3 +1098,35 @@ primary key of `project_repo_connections` rather than an app-level uniqueness ch
   switch that gates the entire N8 worker's autonomous PR-opening, so both layers must agree.
 - Route wiring of `GET /api/agent/projects` to actually surface these fields to the worker, and the
   per-project settings UI, are tracked as follow-on work, not silently assumed done by this decision.
+
+## D24 | Agent Ownership Is Only Ever a Self-Acquired Claim; the Dashboard Cannot Assign to Agents
+
+**Date**: 2026-08-18 · **Status**: accepted · **Detail**: enforces CONTEXT.md's "Claim" definition
+("Claims are only ever self-acquired — nothing assigns an issue *to* an Agent on its behalf") ·
+**Code**: `apps/dashboard-web/src/lib/db/queries/issues.ts` (`AgentAssignmentError`,
+`assignIssue`, `batchUpdateIssues`), `routes/api/projects/[projectId]/issues/batch/+server.ts`,
+`src/lib/components/issues/IssueAssigneePicker.svelte`
+
+### Decision
+
+The human/dashboard assign path rejects `assigneeType: 'agent'` (400 at the route, typed
+`AgentAssignmentError` at the query layer as a backstop), and the assignee picker no longer offers
+agents. The ONLY path to agent ownership is the atomic self-claim (`claimIssue` in
+`queries/reports.ts`, `POST /api/agent/issues/:id/claim`), which is what sets `claimed_at`.
+
+The defect this closes: `assignIssue`/`batchUpdateIssues` could write
+`{assigneeType: 'agent', assignedTo}` with `claimed_at` NULL — a claim-like state the agent never
+acquired or journaled (nothing heartbeats or works it) and that the post-N9 events feed would
+present to an agent worker as its own. (`reapStaleClaims` defensively treats NULL `claimed_at` as
+stale-eligible, so such rows would eventually be reaped — but only after the stale window, and the
+reap itself is evidence of the state being illegitimate, not a reason to allow creating it.)
+
+### Consequences
+
+- An assignment is not a claim: `assignIssue` and batch `assign` now always write
+  `claimedAt: null`, including when a user assignee replaces a prior state.
+- Unassign (`assignedTo: null`) stays available as the deliberate admin override for releasing an
+  agent claim; it clears `claimed_at` and is journaled as `claim_released` (matching
+  `releaseClaim`), while unassigning a user still journals `unassigned`.
+- Anything that needs an agent-owned issue in tests/seeds must go through `claimIssue` or write
+  `claimed_at` explicitly — dashboard-assigning an agent is no longer possible.

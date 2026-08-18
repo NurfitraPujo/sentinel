@@ -87,7 +87,7 @@ function queueSubscribersThenMembers(subscribers: unknown[], memberUserIds: stri
 	txMock.then = fn;
 }
 
-const { updateIssueStatus, assignIssue, createIssueRelation } = await import('./issues');
+const { updateIssueStatus, assignIssue, createIssueRelation, AgentAssignmentError } = await import('./issues');
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -161,13 +161,14 @@ describe('assignIssue', () => {
 		);
 	});
 
-	it('does not auto-subscribe an AGENT assignee', async () => {
-		await assignIssue('issue-1', 'agent', 'agent-1', 'user', 'admin-1');
-
-		const subscribeCalls = (txMock.values as any).mock.calls.filter(
-			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
+	// CONTEXT.md "Claim": claims are only ever self-acquired — nothing assigns an issue *to* an
+	// agent on its behalf. Guard-deletion red-proof: remove the assigneeType==='agent' check in
+	// assignIssue and this fails, because the UPDATE would proceed.
+	it('rejects assigning to an AGENT (claims are self-acquired only)', async () => {
+		await expect(assignIssue('issue-1', 'agent', 'agent-1', 'user', 'admin-1')).rejects.toBeInstanceOf(
+			AgentAssignmentError
 		);
-		expect(subscribeCalls).toHaveLength(0);
+		expect(txMock.update).not.toHaveBeenCalled();
 	});
 
 	it('does not auto-subscribe on unassign (assignedTo null)', async () => {
@@ -177,6 +178,39 @@ describe('assignIssue', () => {
 			([arg]: any[]) => arg && typeof arg === 'object' && 'reason' in arg
 		);
 		expect(subscribeCalls).toHaveLength(0);
+	});
+
+	it('unassign clears claimedAt (release path, not a bare field write)', async () => {
+		await assignIssue('issue-1', null, null, 'user', 'admin-1');
+
+		expect(txMock.set).toHaveBeenCalledWith(
+			expect.objectContaining({ assigneeType: null, assignedTo: null, claimedAt: null })
+		);
+	});
+
+	it('unassigning an agent-claimed issue emits claim_released, not unassigned', async () => {
+		// First resolved chain is assignIssue's prior-state SELECT: the issue is agent-claimed.
+		txMock.then = vi
+			.fn()
+			.mockImplementationOnce((resolve: any) => resolve([{ assigneeType: 'agent', assignedTo: 'agent-1' }]))
+			.mockImplementation((resolve: any) => resolve([]));
+
+		await assignIssue('issue-1', null, null, 'user', 'admin-1');
+
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ eventType: 'claim_released', actorType: 'user', actorId: 'admin-1' })
+		);
+	});
+
+	it('unassigning a user-assigned issue still emits unassigned', async () => {
+		txMock.then = vi
+			.fn()
+			.mockImplementationOnce((resolve: any) => resolve([{ assigneeType: 'user', assignedTo: 'user-2' }]))
+			.mockImplementation((resolve: any) => resolve([]));
+
+		await assignIssue('issue-1', null, null, 'user', 'admin-1');
+
+		expect(txMock.values).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'unassigned' }));
 	});
 });
 

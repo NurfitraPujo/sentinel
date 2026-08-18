@@ -87,7 +87,7 @@
       </div>
       <div class="flex items-center space-x-4">
         <IssueStatusBadge status={statusForBadge} />
-        <IssueAssigneePicker assignee={assigneeForPicker} organizationId={data.organizationId} />
+        <IssueAssigneePicker assignee={assigneeForPicker} />
         <SubscriptionToggle issueId={issue.id} />
       </div>
     </div>

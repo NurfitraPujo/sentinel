@@ -138,6 +138,12 @@ export async function batchUpdateIssues(
 		);
 	}
 
+	// CONTEXT.md "Claim" / DECISIONS.md D24: claims are only ever self-acquired — nothing assigns
+	// an issue *to* an agent on its behalf. Checked before the transaction opens, like the cap.
+	if (action === 'assign' && (options.assigneeType as string) === 'agent') {
+		throw new AgentAssignmentError();
+	}
+
 	// NOTE for anyone arriving here to "fix the batch deadlock": there is a deadlock trace in this
 	// repo's review history attributed to this function, and sorting issueIds was proposed as the
 	// fix. It was probed against a real Postgres on 2026-07-31 and does NOT apply to this code:
@@ -179,6 +185,10 @@ export async function batchUpdateIssues(
 			case 'assign':
 				updateData.assigneeType = options.assigneeType;
 				updateData.assignedTo = options.assignedTo;
+				// An assignment is not a claim (CONTEXT.md "Claim"): a claim carries claimed_at and is
+				// only ever written by claimIssue. Leaving a stale claimed_at behind here would make a
+				// dashboard assignment look claim-like to the reaper and the events feed.
+				updateData.claimedAt = null;
 				eventType = options.assignedTo ? 'assigned' : 'unassigned';
 				break;
 		}
@@ -222,6 +232,20 @@ export async function batchUpdateIssues(
 	});
 }
 
+// CONTEXT.md "Claim" / DECISIONS.md D24: a Claim is acquired atomically by the agent ITSELF
+// (claimIssue in queries/reports.ts, POST /api/agent/issues/:id/claim) and carries claimed_at.
+// Nothing assigns an issue *to* an agent on its behalf — a dashboard-assigned agent would produce
+// a claim-like state with claimed_at NULL that the stale-claim reaper can never reap and that the
+// agent never acquired, journaled, or heartbeats.
+export class AgentAssignmentError extends Error {
+	constructor(
+		message = 'Issues cannot be assigned to agents. Agents claim issues themselves via POST /api/agent/issues/:id/claim.'
+	) {
+		super(message);
+		this.name = 'AgentAssignmentError';
+	}
+}
+
 export async function assignIssue(
 	issueId: string,
 	assigneeType: 'user' | 'agent' | null,
@@ -229,12 +253,32 @@ export async function assignIssue(
 	actorType: 'user' | 'agent',
 	actorId: string
 ) {
+	// The 'agent' member of assigneeType's union survives only so callers get this error rather
+	// than a silent type hole — see AgentAssignmentError above.
+	if (assigneeType === 'agent') {
+		throw new AgentAssignmentError();
+	}
+
 	return await db.transaction(async (tx) => {
+		// Unassigning an agent-claimed issue from the dashboard is a deliberate admin override of a
+		// claim — that's the release path, so it must be journaled as claim_released, not a generic
+		// unassigned. Read the prior state to tell the two apart.
+		let priorAgentClaim = false;
+		if (!assignedTo) {
+			const [current] = await tx
+				.select({ assigneeType: issues.assigneeType, assignedTo: issues.assignedTo })
+				.from(issues)
+				.where(eq(issues.id, issueId));
+			priorAgentClaim = current?.assigneeType === 'agent' && current.assignedTo !== null;
+		}
+
+		// claimedAt is always cleared: an assignment is not a claim (only claimIssue sets it), and
+		// an unassign is a release, which clears it the same way releaseClaim does.
 		await tx.update(issues)
-			.set({ assigneeType, assignedTo })
+			.set({ assigneeType, assignedTo, claimedAt: null })
 			.where(eq(issues.id, issueId));
 
-		const eventType = assignedTo ? 'assigned' : 'unassigned';
+		const eventType = assignedTo ? 'assigned' : priorAgentClaim ? 'claim_released' : 'unassigned';
 
 		await tx.insert(issueActivity).values({
 			issueId,

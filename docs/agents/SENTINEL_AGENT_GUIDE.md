@@ -172,6 +172,13 @@ Valid `eventType` values (the full `issue_activity.event_type` set): `status_cha
 `progress_update`, `question_asked`, `question_answered`, `moved`, `attachment_added`,
 `report_edited`, `report_created`, `created`, `occurrence_burst`.
 
+Note on `assigned`/`unassigned` vs `claimed`/`claim_released`: **assignment is user-only.** The
+dashboard cannot assign an issue *to* an agent — the server rejects it with 400 — so
+`assigneeType === "agent"` in the feed always means a real self-acquired claim (CONTEXT.md
+"Claim", DECISIONS.md D24). The only path to agent ownership is your own
+`POST /api/agent/issues/:id/claim`. A dashboard admin unassigning an agent-claimed issue is a
+deliberate release override and appears as `claim_released` with `actorType: "user"`.
+
 **Discovery events (`created` / `occurrence_burst`)** — written by the processor, not by any
 dashboard mutation, so they are the primary signal for finding NEW work without full-table
 polling:
