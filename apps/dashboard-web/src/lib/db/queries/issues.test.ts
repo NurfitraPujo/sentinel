@@ -48,6 +48,10 @@ const { batchUpdateIssues, updateIssueStatus, createIssueRelation, MAX_BATCH_ISS
 beforeEach(() => {
 	vi.clearAllMocks();
 	txMock.__result = [];
+	// clearAllMocks clears CALLS but not implementations, so a test that swaps txMock.then for a
+	// mockImplementation (the caused_by no-reverse-pair test below) would otherwise poison every
+	// test that runs after it — order-dependence that only --sequence.shuffle exposes (B13).
+	txMock.then = vi.fn((resolve: any) => resolve(txMock.__result));
 });
 
 describe('batchUpdateIssues', () => {
