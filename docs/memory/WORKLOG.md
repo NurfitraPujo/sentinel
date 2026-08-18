@@ -5,6 +5,27 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-08-18 - N10 part 1: per-project agent settings + repo connections (server-side worker policy)
+
+- **Why durable**: FIX authorization for the N8 sentinel-worker is now per-project, server-side,
+  default OFF — `project_agent_settings` + `project_repo_connections` (PK-on-project_id = one repo
+  per project v1), managed in the project settings UI under `manage_agents` RBAC with every
+  mutation audited, and delivered to workers on `GET /api/agent/projects` as
+  `agentSettings {fixEnabled, maxPrsPerDay, repo|null}`. Onboarding a repo never requires a worker
+  redeploy; `WORKER_FIX_ENABLED` is only a kill switch. Proofs in VERIFIED_STATE.md "N10 part 1".
+- **Future mistakes prevented**:
+  - `test_cmd`/`agent_cmd` are server-stored commands the worker executes — a DELIBERATE,
+    documented acceptance (DECISIONS.md D23: cloned-repo tests already run repo-controlled code;
+    the fix-container sandbox is the boundary; RBAC + audit are the controls). Do not "fix" this
+    by stripping them from the agent API.
+  - The encrypted git-credentials store is a SEPARATE sibling schema — never add credential
+    columns to `project_repo_connections`.
+  - Cross-worktree podman compose `--force-recreate` can REMOVE dependent services and hang
+    without recreating them (details in VERIFIED_STATE.md N10 entry); recover with `--no-build`
+    plain `up -d` per service.
+
+---
+
 ### 2026-08-14 - Agent-native layer (events feed, webhooks, batch, sentinel CLI) — provider-agnostic
 
 - **Why durable**: Sentinel is now operable by ANY external AI agent (Claude/GPT/Gemini/scripts)

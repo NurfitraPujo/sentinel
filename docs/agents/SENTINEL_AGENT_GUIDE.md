@@ -70,6 +70,47 @@ unattended loop mid-task with the old key cached keeps working until you've had 
 it in. `sentinel key rotate` wraps this and prints the new secret to stdout with a warning to
 stderr.
 
+## 2a. Per-project agent settings (`GET /api/agent/projects`)
+
+Every project in the response carries an `agentSettings` object, set by the dashboard operator
+(`manage_agents` RBAC) and audited on every change:
+
+```json
+{
+  "id": "project-1",
+  "name": "Web",
+  "isInbox": false,
+  "agentSettings": {
+    "fixEnabled": true,
+    "maxPrsPerDay": 5,
+    "repo": {
+      "provider": "github",
+      "owner": "acme",
+      "repo": "widgets",
+      "defaultBranch": "main",
+      "testCmd": "npm test",
+      "agentCmd": "npm run fix",
+      "cloneDepth": 1
+    }
+  }
+}
+```
+
+A project with no settings configured returns `{"fixEnabled": false, "maxPrsPerDay": null, "repo":
+null}` — never a missing field.
+
+**What this means for a worker:**
+- Attempt an actual FIX (open a PR against `repo`) only when **both** `fixEnabled === true` **and**
+  `repo` is non-null. Otherwise, operate propose-only — comment/report findings on the issue but do
+  not clone or push.
+- `maxPrsPerDay`, when set, is a rate cap the worker must enforce itself; `null` means no cap.
+- `testCmd` (always present when `repo` is non-null) and `agentCmd` (optional) are operator-provided
+  shell commands the worker executes verbatim inside its fix-container sandbox to validate/apply a
+  fix — they are trusted operator input, not agent input. See `docs/memory/DECISIONS.md` D23 for why
+  storing and executing an operator-supplied command server-side is an accepted design, and what the
+  actual trust boundary is (the fix container, not the command string).
+- One repo connection per project in v1 — `repo` is a single object, not a list.
+
 ## 3. Work discovery: the events feed
 
 `GET /api/agent/events` is a **seq-cursored, org-scoped feed** over `issue_activity`, joined out to

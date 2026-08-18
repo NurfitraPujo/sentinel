@@ -501,7 +501,26 @@ describe('POST/DELETE /api/agent/issues/{issueId}/relations', () => {
 
 describe('GET /api/agent/projects', () => {
 	it('200: matches ListProjectsResponseSchema', async () => {
-		listAgentProjects.mockResolvedValue([{ id: 'project-1', name: 'Inbox', isInbox: true }]);
+		listAgentProjects.mockResolvedValue([
+			{
+				id: 'project-1',
+				name: 'Inbox',
+				isInbox: true,
+				agentSettings: {
+					fixEnabled: true,
+					maxPrsPerDay: 3,
+					repo: {
+						provider: 'github',
+						owner: 'acme',
+						repo: 'widgets',
+						defaultBranch: 'main',
+						testCmd: 'npm test',
+						agentCmd: 'npm run fix',
+						cloneDepth: 1,
+					},
+				},
+			},
+		]);
 		const res = await projectsRoute.GET(makeEvent('http://localhost/api/agent/projects'));
 		expect(res.status).toBe(200);
 		expect(S.ListProjectsResponseSchema.parse(await res.json())).toBeTruthy();

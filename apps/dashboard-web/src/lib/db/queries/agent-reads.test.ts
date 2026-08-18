@@ -18,6 +18,9 @@ const dbMock: any = makeChainable();
 
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
+const getAgentSettingsForProjects = vi.fn();
+vi.mock('$lib/db/queries/agent-settings', () => ({ getAgentSettingsForProjects }));
+
 vi.mock('$lib/db/schema', () => ({
 	issues: { id: 'id' },
 	projects: { id: 'id', organizationId: 'organizationId', name: 'name', isInbox: 'isInbox' },
@@ -46,6 +49,7 @@ const {
 beforeEach(() => {
 	vi.clearAllMocks();
 	dbMock.__result = [];
+	getAgentSettingsForProjects.mockResolvedValue(new Map());
 });
 
 describe('getAgentIssueDetail', () => {
@@ -109,10 +113,67 @@ describe('listAgentOccurrences', () => {
 });
 
 describe('listAgentProjects', () => {
-	it('scopes to the given organizationId', async () => {
+	it('scopes to the given organizationId and defaults agentSettings when none exist', async () => {
 		dbMock.__result = [{ id: 'p1', name: 'Web', isInbox: false }];
+		getAgentSettingsForProjects.mockResolvedValue(new Map());
 		const result = await listAgentProjects('org-1');
-		expect(result).toEqual([{ id: 'p1', name: 'Web', isInbox: false }]);
+		expect(result).toEqual([
+			{
+				id: 'p1',
+				name: 'Web',
+				isInbox: false,
+				agentSettings: { fixEnabled: false, maxPrsPerDay: null, repo: null },
+			},
+		]);
 		expect(dbMock.where).toHaveBeenCalled();
+		expect(getAgentSettingsForProjects).toHaveBeenCalledWith(['p1']);
+	});
+
+	it('attaches fixEnabled/maxPrsPerDay/repo (including testCmd) when settings exist', async () => {
+		dbMock.__result = [{ id: 'p1', name: 'Web', isInbox: false }];
+		getAgentSettingsForProjects.mockResolvedValue(
+			new Map([
+				[
+					'p1',
+					{
+						fixEnabled: true,
+						maxPrsPerDay: 5,
+						repo: {
+							projectId: 'p1',
+							provider: 'github',
+							owner: 'acme',
+							repo: 'widgets',
+							defaultBranch: 'main',
+							testCmd: 'npm test',
+							agentCmd: 'npm run fix',
+							cloneDepth: 1,
+							createdAt: null,
+							updatedAt: null,
+						},
+					},
+				],
+			])
+		);
+		const result = await listAgentProjects('org-1');
+		expect(result).toEqual([
+			{
+				id: 'p1',
+				name: 'Web',
+				isInbox: false,
+				agentSettings: {
+					fixEnabled: true,
+					maxPrsPerDay: 5,
+					repo: {
+						provider: 'github',
+						owner: 'acme',
+						repo: 'widgets',
+						defaultBranch: 'main',
+						testCmd: 'npm test',
+						agentCmd: 'npm run fix',
+						cloneDepth: 1,
+					},
+				},
+			},
+		]);
 	});
 });

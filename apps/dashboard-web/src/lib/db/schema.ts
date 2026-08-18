@@ -513,3 +513,34 @@ export const agentIdempotencyKeys = pgTable('agent_idempotency_keys', {
 	uniqAgentKey: uniqueIndex('agent_idempotency_keys_agent_key_unique').on(table.agentId, table.idempotencyKey),
 	idxCreatedAt: index('idx_agent_idempotency_keys_created_at').on(table.createdAt),
 }));
+
+// N10 part 1 (docs/plans/AGENT_WORKER_PLAN.md rev 4 SS4.5, DECISIONS.md D23), source of truth is
+// 1724000000_add_project_agent_settings.sql. Dashboard-managed per-project agent switch; the N8
+// worker reads this via getAgentSettingsForProjects. PK on projectId -- there is exactly one row
+// per project (or none, meaning defaults: disabled, no cap).
+export const projectAgentSettings = pgTable('project_agent_settings', {
+	projectId: uuid('project_id').primaryKey().references(() => projects.id, { onDelete: 'cascade' }),
+	fixEnabled: boolean('fix_enabled').notNull().default(false),
+	maxPrsPerDay: integer('max_prs_per_day'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// N10 part 1, source of truth is 1724000000_add_project_agent_settings.sql. One repo connection
+// per project in v1 -- enforced by PK on projectId rather than an app-level uniqueness check.
+// `testCmd` is a server-stored command the N8 worker executes verbatim against the cloned repo;
+// see the migration's comment for why that's an accepted boundary (manage_agents RBAC + audit
+// trail, not this table). No credentials here -- a sibling task owns the encrypted git-credentials
+// store separately.
+export const projectRepoConnections = pgTable('project_repo_connections', {
+	projectId: uuid('project_id').primaryKey().references(() => projects.id, { onDelete: 'cascade' }),
+	provider: text('provider').notNull(),
+	owner: text('owner').notNull(),
+	repo: text('repo').notNull(),
+	defaultBranch: text('default_branch').notNull(),
+	testCmd: text('test_cmd').notNull(),
+	agentCmd: text('agent_cmd'),
+	cloneDepth: integer('clone_depth'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
