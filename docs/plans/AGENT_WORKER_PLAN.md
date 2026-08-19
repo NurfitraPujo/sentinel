@@ -740,6 +740,52 @@ prompt** plus the template version (template-only hashes can't reconstruct "why"
     proof includes "CI run shows U40/U41 as run, not skipped".
 - **CI**: `sentinel-worker` job cloned from the `sentinel-cli` job (GOWORK=off, working-directory,
   go-version-file) for build/vet/test, plus the e2e build step above.
+- **N8f FIX pipeline**: unit/integration coverage is stub-executor-based
+  (`jobs/fix_test.go`, `jobs/fix_workspace_test.go`, `jobs/fix_executor_test.go`,
+  `jobs/fix_validate_test.go`, `jobs/fix_pr_test.go`, `jobs/fix_resume_test.go`, `jobs/fix_caps_test.go`)
+  — a real coding-agent CLI is not CI-installable, so `$FIX_EXECUTOR_CMD` in every automated test is a
+  shell one-liner or a checked-in fake executor script (`ExecutorCmd` field in the tests above), never
+  a real agent. U43 (clone → stub executor → validate → push → PR) is proven at integration level
+  against a local bare git fixture + a fake `gitprovider.Provider`, per `TestRunFix_HappyPath_*` in
+  `jobs/fix_test.go` — see §9's N8f note for why this stayed out of `tests/e2e`.
+  **Manual verification recipe with a real executor (Factory `droid`, DeepSeek BYOK — the first
+  deployment's `$FIX_EXECUTOR_CMD`, §4.4):**
+  1. Install `droid` and configure DeepSeek BYOK per Factory's own docs (out of this repo's scope);
+     confirm `droid exec --help` runs non-interactively before wiring it in.
+  2. Set `FIX_EXECUTOR_CMD` to droid's non-interactive invocation, e.g.
+     `droid exec --auto medium --skip-permissions-unsafe "$(cat "$TASK_MD")"` — consult droid's own
+     flags for the exact non-interactive/no-prompt form; the worker passes `TASK_MD`, `PROGRESS_MD`,
+     and `SENTINEL_FIX_JOB_ID` as env vars (`jobs/fix_executor.go`'s `buildExecutorEnv`) and expects
+     the command to read `$TASK_MD`, not stdin.
+  3. Set `WORKER_FIX_ENABLED=true`, `WORKER_EXECUTE=true`, configure one project's
+     `agentSettings.fixEnabled=true` plus a real repo connection (C15/C16) pointed at a **disposable
+     scratch repo**, never a production one, for the first run.
+  4. Trigger one FIX job (a TRIAGE/FOLLOW-UP decision with `EnqueueFix`, or drive `RunFix` directly
+     in a throwaway harness) and watch: a fresh clone under `WORKER_REPO_CACHE_DIR` (a FIX-only
+     workspace, not the read-only `repoctx` cache), `TASK.md`/`PROGRESS.md` written OUTSIDE the
+     clone, droid running with the restricted env (verify manually with `ps eww` or by having droid
+     itself print its env — it must NOT see `SENTINEL_AGENT_KEY`, any `LLM_*` key, or the git
+     provider token), a `sentinel-fix/*` branch pushed via askpass, and a real PR opened with the
+     harness-templated `PRSpec` body (title/body + issue URL + fenced Fix Brief — never raw droid
+     prose).
+  5. Confirm the pushed diff does not contain TASK.md/PROGRESS.md and that `validation.json` in the
+     artifact bundle (local dir today, `fix-artifacts/<jobId>/` — see the S3 lifecycle note below)
+     records a passing `testCmd` run.
+  6. Kill the worker mid-run once (after TASK.md is written, before the PR opens) and restart it to
+     exercise Resume: it should re-clone, checkout `baseCommit`, `git apply diff.patch` from the
+     saved resume state, and re-invoke droid with a continuation prompt rather than restarting the
+     whole attempt from scratch (a patch-apply failure is the one case that legitimately restarts
+     the attempt clean).
+  - **S3 artifact lifecycle**: `ArtifactSink` (`jobs/fix_resume.go`) is implemented today as
+    `LocalDirArtifactSink` — no S3 client exists anywhere in this module as of N8f (grepped). The
+    plan's "~30 days" retention for `fix-artifacts/<jobId>/*` (resume state) and per-job artifact
+    bundles (agent log, diff, validation result, PRSpec) is a **documented seam**: a future
+    `S3ArtifactSink` implementing the same `ArtifactSink` interface should apply an S3 bucket
+    lifecycle rule (`Expiration.Days: 30`) on the `fix-artifacts/` prefix rather than
+    worker-side deletion logic, so expiry survives worker restarts and requires no code path of its
+    own. Until that lands, the local-dir fallback has no automatic expiry — an operator running FIX
+    in production should either add a cron to prune `WORKER_STATE_DIR`'s artifact directory or treat
+    landing `S3ArtifactSink` as a prerequisite for durable production use, not a nice-to-have.
 
 ## 9. Phasing (per phase: Sonnet implementors + Opus adversarial validators, 3-round fix loops,
 Fable holistic review; green gates + memory sync + commit per phase)
@@ -752,7 +798,7 @@ Fable holistic review; green gates + memory sync + commit per phase)
 | **N8c** | `gitprovider` + `repoctx` confinement + `guard` (delimiting/output gate) + repo-map validation | provider goldens, extended leak test, confinement + injection-golden tests |
 | **N8d** | TRIAGE + FOLLOW-UP Advisors, act() per-op compilation (all dispositions incl. needs_human), sweep (heartbeat/nag/reconcile), C10 coalescing e2e | unit goldens + e2e U40/U41 |
 | **N8e** — DONE 2026-08-19 | keyguard (expiry-driven + null-expiry fallback) + hardening: circuits, tombstone/404 handling, kill -9 replay proofs | keyguard units + both kill -9 e2e assertions + **e2e U42 key rotation** (`TestU42_WorkerKeyRotation`), all green against the live compose stack |
-| **N8f** | FIX engine: workspace (TASK.md outside clone), $FIX_EXECUTOR_CMD, validation gates, askpass push, provider PR flow + PRSpec templates, caps | stub-agent units + manual recipe doc |
+| **N8f** | FIX engine: workspace (TASK.md outside clone), $FIX_EXECUTOR_CMD, validation gates, askpass push, provider PR flow + PRSpec templates, caps | stub-agent units + manual recipe doc — **DONE 2026-08-19**, wired into `loop`/`main.go`, `hasOpenFix` live, worker feature-complete pending N8g deployment |
 | **N8g** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | compose boot green incl. wait-healthy with worker present-but-gated; helm lint; full gate sweep; CI shows U40/U41 run |
 
 **N8a unwired seams — RESOLVED as of N8e** (2026-08-19): `tools/sentinel-worker/guard/` and
@@ -918,6 +964,51 @@ hand-injected `StateQuestioned` record) but unreachable end-to-end — the same 
 reconcile is live as of this fix; fix-PR reconcile (`hasOpenFix`) remains the documented N8f seam**
 — `hasOpenFix` always returns `false` until `jobs/fix.go` starts journaling `KindFix` records, which
 is out of scope here.
+
+**N8f (2026-08-19): the FIX engine is now WIRED — this is the last unwired seam and the worker is
+feature-complete pending N8g deployment.** `jobs/fix.go`'s `FixRunner.RunFix`/`ResumeFix` implement
+the full workspace → executor → validate → PR pipeline (`jobs/fix_workspace.go`,
+`jobs/fix_executor.go`, `jobs/fix_validate.go`, `jobs/fix_pr.go`, `jobs/fix_resume.go`,
+`jobs/fix_caps.go`), and `main.go`'s `buildFixRunner` constructs it from config (settings for
+repo/creds, `gitprovider`, `$FIX_EXECUTOR_CMD`), handed to `RealActor` as `Fixer`. `jobs/actor.go`'s
+`Act` calls `a.Fixer.Dispatch` whenever a compiled decision sets `EnqueueFix` — this is the call
+path from `main()` down to `RunFix`, closing the N8d "journaled enqueue, doesn't run" seam. Gating,
+all independently enforced: `settings.ProjectSettings` `fixEnabled` + a repo connection (C15) — no
+connection means `postProposeOnly` posts the diagnosis comment from the Fix Brief and releases the
+claim, no workspace, no clone; `WORKER_FIX_ENABLED` (deployment kill switch, default true) checked in
+`buildFixRunner`; `WORKER_EXECUTE=true` — dry-run (`WORKER_EXECUTE=false`) never constructs a live
+`Fixer` (see `main.go`'s `Fixer: buildFixRunner(...)` wiring, itself behind the same `WORKER_EXECUTE`
+gate as every other mutating path) so no Fix Executor ever runs. `hasOpenFix`
+(`jobs/sweep.go`) is now LIVE: `JournalFixPROpen` (`jobs/fix_pr.go`) appends a
+`Kind=openFixKind/State=StateActed` record the moment `RunFix` opens a PR, so `ReconcileReaped`'s
+fix-PR arm and the PR-status poll (`ResolveOpenFixPR`) both see real jobs, not just hand-injected
+test records.
+
+Trust boundary (§4.4) is enforced independently at two points: `jobs/fix_executor.go` builds the
+Fix Executor's child-process env from an explicit allowlist (never `os.Environ()`), so
+`SENTINEL_AGENT_KEY`, every `LLM_*` key, every git provider token, and `SENTINEL_ASKPASS_*` cannot
+reach it even if the worker process carries them; `jobs/fix_workspace.go` writes TASK.md/PROGRESS.md
+OUTSIDE the clone so `git add -A` inside the repo can never stage them, and `jobs/fix_validate.go`
+independently re-checks the pushed diff contains neither TASK.md nor any out-of-tree path, on top of
+non-empty-diff, green-testCmd, and `<= WORKER_FIX_MAX_FILES` checks. The push to `sentinel-fix/*`
+happens from the worker via `gitprovider`'s askpass after validation passes — the executor itself
+never pushes, and `CreatePR` renders a harness-templated `PRSpec` (title/body/fenced Fix Brief), never
+raw model prose.
+
+U43 (FIX pipeline: stub executor makes a diff, worker validates and opens a PR) is proven at
+**integration level inside `tools/sentinel-worker/jobs`**, not `tests/e2e`:
+`TestRunFix_HappyPath_OpensPRAndJournalsOpenFix` (`jobs/fix_test.go`) drives `RunFix` against a real
+local bare git fixture repo (`newBareFixtureRepo`) as the clone/push remote and a fake
+`gitprovider.Provider` recording `CreatePR` calls (no real forge, no real network) — it asserts
+exactly one `CreatePR` call, a `JournalFixPROpen` record resolvable via `ResolveOpenFixPR`, and the
+plan §4.4 step-3c artifact bundle written. `TestRunFix_NoRepoConnection_ProposesOnlyAndReleases` and
+`TestRunFix_CapsExhausted_SkipsAndReleasesWithoutCloning` cover the propose-only and cap-exhaustion
+gates the same way. Wiring a fake-forge + local-bare-remote through the actual worker *binary*
+(spawned subprocess, real `WORKER_EXECUTE=true` end-to-end against the live compose stack) was judged
+too complex for `tests/e2e` given `$FIX_EXECUTOR_CMD` needs a real coding-agent CLI that is not
+CI-installable — `tests/e2e` stays scoped to U40/U41/U42 against the live stack, which need no
+external agent. See §8 for the checked-in stub executor script + the manual real-executor (droid)
+verification recipe.
 
 ## 10. Risks & consciously-deferred
 

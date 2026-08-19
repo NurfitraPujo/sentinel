@@ -911,7 +911,7 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	// pipeline's lifetime, exactly like the LLM primaryBreaker buildAdvisors already builds once.
 	sentinelAPIBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
 
-	runner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger, sentinelAPIBreaker)
+	runner, fixRunner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger, sentinelAPIBreaker)
 	if err != nil {
 		// The LLM provider wiring is invalid (bad LLM_PROVIDER/LLM_FALLBACK_PROVIDER) -- fatal to
 		// this run of runPipeline, since nothing downstream can decide a job without it. Log and
@@ -953,9 +953,7 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	} else if len(inFlight) > 0 {
 		logger.Info("recovery: resuming in-flight jobs from a prior run", "count", len(inFlight))
 		for _, job := range inFlight {
-			if err := runner.Resume(ctx, job); err != nil {
-				logger.Error("recovery: resuming in-flight job failed", "jobId", job.JobID, "issueId", job.IssueID, "kind", job.Kind, "state", job.State, "error", err)
-			}
+			resumeInFlightJob(ctx, runner, fixRunner, job, logger)
 		}
 	}
 
@@ -1071,6 +1069,11 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 			Heartbeat: cfg.WorkerClaimHeartbeat,
 			NagAfter:  time.Duration(cfg.WorkerNagDays) * 24 * time.Hour,
 			MyAgentID: agentID,
+			// Plan §4.3's PR-status poll made live (N8f): merged fix-PRs enqueue a FOLLOW-UP
+			// resolve, declined/closed ones get a hand-back comment + release. Wired here (not
+			// left nil) is what makes hasOpenFix/JournalFixPROpen records actually get consulted
+			// in production instead of only from tests.
+			FixPRStatusHook: fixPRStatusHook(journal, client, settingsStore, enqueuer, logger),
 		}
 		// Wire the EVENT-DRIVEN reconcile arm (plan §2.7(c)): loop/queue.go dispatches a
 		// claim_released(previousAssignee=me) event as KindSweepReconcile and calls
@@ -1315,6 +1318,169 @@ func (r settingsRepoResolver) ResolveFollowupContext(ctx context.Context, issueI
 	return jobs.FollowupIssueContext{ProjectID: env.Issue.ProjectID, IssueType: env.Issue.IssueType, Repo: repo}, nil
 }
 
+// fixPRStatusChecker adapts *settings.Store into jobs.FixPRProviderResolver (plan §4.3's PR-status
+// poll): given the RepoRef a FixPRPayload was journaled with, look up the matching git credential
+// the same way settingsRepoResolver does for clones, and build the minimal read-only gitprovider.
+// Provider needed to call PRStatus — no clone URL, no CreatePR, is involved here.
+func fixPRStatusResolver(store *settings.Store) jobs.FixPRProviderResolver {
+	return func(repo gitprovider.RepoRef) (jobs.FixPRStatusChecker, error) {
+		cred, ok := store.CredentialFor(repo.Provider)
+		if !ok || !cred.Secret.Usable() {
+			return nil, fmt.Errorf("main: no usable git credential for provider %q (fix-PR status poll)", repo.Provider)
+		}
+		switch repo.Provider {
+		case "github":
+			if !cred.Secret.IsToken() {
+				return nil, fmt.Errorf("main: github credential is not token-shaped (fix-PR status poll)")
+			}
+			return gitprovider.NewGitHubProvider(cred.Secret.Token), nil
+		case "bitbucket":
+			if cred.Secret.IsToken() {
+				return &gitprovider.BitbucketProvider{Token: cred.Secret.Token}, nil
+			}
+			return &gitprovider.BitbucketProvider{Username: cred.Secret.Username, AppPassword: cred.Secret.AppPassword}, nil
+		default:
+			return nil, fmt.Errorf("main: unsupported git provider %q (fix-PR status poll)", repo.Provider)
+		}
+	}
+}
+
+// fixRepoResolver adapts *settings.Store into jobs.FixRepoResolver (plan §4.4: "no repo connection
+// => propose-only"), reusing the exact provider-construction switch settingsRepoResolver.Resolve
+// and fixPRStatusResolver already use for clones and PR-status polling respectively -- this is the
+// third of that same shape, kept separate because RunFix needs the FULL config (clone URL, default
+// branch, testCmd, cloneDepth) that a repoctx.Repo/FixPRStatusChecker lookup doesn't carry.
+func fixRepoResolver(store *settings.Store) jobs.FixRepoResolver {
+	return func(projectID string) (jobs.FixRepoConfig, bool, error) {
+		ps, ok := store.Project(projectID)
+		if !ok || ps.Repo == nil {
+			return jobs.FixRepoConfig{}, false, nil
+		}
+		conn := ps.Repo
+		cred, ok := store.CredentialFor(conn.Provider)
+		if !ok || !cred.Secret.Usable() {
+			return jobs.FixRepoConfig{}, false, fmt.Errorf("main: no usable git credential for provider %q (project %s)", conn.Provider, projectID)
+		}
+		var provider gitprovider.Provider
+		switch conn.Provider {
+		case "github":
+			if !cred.Secret.IsToken() {
+				return jobs.FixRepoConfig{}, false, fmt.Errorf("main: github credential for project %s is not token-shaped", projectID)
+			}
+			provider = gitprovider.NewGitHubProvider(cred.Secret.Token)
+		case "bitbucket":
+			if cred.Secret.IsToken() {
+				provider = &gitprovider.BitbucketProvider{Token: cred.Secret.Token}
+			} else {
+				provider = &gitprovider.BitbucketProvider{Username: cred.Secret.Username, AppPassword: cred.Secret.AppPassword}
+			}
+		default:
+			return jobs.FixRepoConfig{}, false, fmt.Errorf("main: unsupported git provider %q (project %s)", conn.Provider, projectID)
+		}
+		cloneURL, err := jobs.CloneURL(conn.Provider, conn.Owner, conn.Repo)
+		if err != nil {
+			return jobs.FixRepoConfig{}, false, fmt.Errorf("main: building clone URL for project %s: %w", projectID, err)
+		}
+		return jobs.FixRepoConfig{
+			Provider:      provider,
+			Repo:          gitprovider.RepoRef{Provider: conn.Provider, Owner: conn.Owner, Repo: conn.Repo},
+			CloneURL:      cloneURL,
+			DefaultBranch: conn.DefaultBranch,
+			TestCmd:       conn.TestCmd,
+			CloneDepth:    conn.CloneDepth,
+		}, true, nil
+	}
+}
+
+// buildFixRunner wires jobs.FixRunner (plan §4.4/§9 N8f) from config -- the FIX engine only runs
+// when WORKER_FIX_ENABLED (the deployment kill switch) AND FIX_EXECUTOR_CMD is configured; per-
+// project fixEnabled+repo-connection gating (settings.ProjectSettings.FixReady, C15) happens
+// per-job inside RunFix via fixRepoResolver above, not here. Returns nil (a documented no-op
+// Fixer, per RealActor's own doc) when either deployment-level gate is off -- this is what keeps
+// WORKER_EXECUTE=false/FIX_EXECUTOR_CMD-unset deployments from ever reaching RunFix, matching
+// every other mutating path's "dry-run/unconfigured sends nothing" posture.
+// buildFixRunner returns *jobs.FixRunner (not the narrower jobs.Fixer interface) precisely so
+// runPipeline can also drive it directly for the plan §4.4 step-3b boot-time resume trigger
+// (finding 4) — ResumeFix is not part of the Fixer interface (deliberately: Dispatch is the only
+// thing RealActor.Act needs). A nil *jobs.FixRunner return (deployment-level gate off) is a real
+// nil pointer here, not a non-nil interface wrapping one — callers assigning it to a jobs.Fixer
+// field (see buildRunner) must convert explicitly, or they would reproduce the classic Go
+// "non-nil interface wrapping a nil pointer" trap that this function's OLD jobs.Fixer-typed return
+// was written specifically to avoid.
+func buildFixRunner(cfg Config, client *sentinel.Client, journal *state.Journal, settingsStore *settings.Store, logger *slog.Logger) *jobs.FixRunner {
+	if !cfg.WorkerFixEnabled || !cfg.WorkerExecute || strings.TrimSpace(cfg.FixExecutorCmd) == "" {
+		return nil
+	}
+	sink := jobs.LocalDirArtifactSink{Root: fixArtifactsRootFor(cfg.WorkerWorkspaceDir)}
+	caps := jobs.NewFixCaps(cfg.WorkerMaxFixJobsPerDay, cfg.WorkerMaxPRsPerDay, cfg.WorkerMaxFixAttempts, llm.ClockFunc(time.Now))
+	caps.OnExhausted = func(reason string) {
+		logger.Warn("FIX volume cap exhausted", "reason", reason)
+	}
+	return &jobs.FixRunner{
+		WorkspaceRoot: cfg.WorkerWorkspaceDir,
+		StateDir:      cfg.WorkerStateDir,
+		Journal:       journal,
+		Client:        client,
+		Sink:          sink,
+		Caps:          caps,
+		ResolveRepo:   fixRepoResolver(settingsStore),
+		ExecutorCmd:   cfg.FixExecutorCmd,
+		MaxFiles:      cfg.WorkerFixMaxFiles,
+		Timeout:       cfg.WorkerFixTimeout,
+		KeepFailed:    cfg.WorkerKeepFailedWorkspaces,
+		Secrets:       configuredSecrets(cfg),
+		OnEvent: func(event string, in jobs.FixJobInput, detail string) {
+			logger.Info("FIX job event", "event", event, "jobId", in.JobID, "issueId", in.IssueID, "detail", detail)
+		},
+	}
+}
+
+// fixArtifactsRootFor derives the LocalDirArtifactSink fallback root (plan §4.4 step 3b's
+// documented-seam local-dir fallback, no S3 client exists in this module yet — jobs/fix_resume.go's
+// package doc) as a sibling of the workspace root, so fix-artifacts/ is off WORKER_STATE_DIR (the
+// same trust-boundary reasoning Config.Validate already applies to WORKER_WORKSPACE_DIR itself)
+// without introducing a new required env var for this phase.
+func fixArtifactsRootFor(workspaceRoot string) string {
+	return filepath.Join(filepath.Dir(filepath.Clean(workspaceRoot)), "fix-artifacts")
+}
+
+// fixPRStatusHook builds the Sweep's FixPRStatusHook (plan §4.3: "the sweep's PR-status poll ...
+// becomes live: merged => FOLLOW-UP proposes resolve; declined/closed => comment + release").
+// Called once per held claim during the sweep's heartbeat pass; a no-op for any issue with no open
+// fix-PR journal record (PollFixPRStatus's FixPRStatusNone). Gated by the caller on cfg.WorkerExecute,
+// matching every other mutating sweep path.
+func fixPRStatusHook(journal *state.Journal, client *sentinel.Client, store *settings.Store, enqueue loop.Enqueuer, logger *slog.Logger) func(ctx context.Context, issueID string) {
+	resolveProvider := fixPRStatusResolver(store)
+	return func(ctx context.Context, issueID string) {
+		outcome, payload, err := jobs.PollFixPRStatus(ctx, journal, 0, resolveProvider, issueID)
+		if err != nil {
+			logger.Error("fix-PR status poll failed", "issueId", issueID, "error", err)
+			return
+		}
+		switch outcome {
+		case jobs.FixPRStatusMerged:
+			// Plan §4.3: merged proposes a resolve via the normal FOLLOW-UP Advisor path, rather
+			// than the sweep resolving the issue directly -- the Advisor is what's allowed to
+			// decide resolvedInVersion / post the resolve op (act.go's FOLLOW-UP compile).
+			evt := loop.Event{Issue: &loop.EventIssue{ID: issueID}}
+			if err := enqueue.Enqueue(evt, loop.KindFollowUp); err != nil {
+				logger.Error("fix-PR merged: enqueue FOLLOW-UP failed", "issueId", issueID, "error", err)
+				return
+			}
+			logger.Info("fix-PR merged: enqueued FOLLOW-UP for resolve", "issueId", issueID, "prUrl", payload.PRURL)
+		case jobs.FixPRStatusClosed:
+			jobID := "sweep-fix-pr-closed:" + issueID
+			if _, err := jobs.PostFixPRClosedBatch(ctx, client, jobID, issueID, payload.PRURL); err != nil {
+				logger.Error("fix-PR closed: posting comment+release failed", "issueId", issueID, "error", err)
+				return
+			}
+			logger.Info("fix-PR closed without merging: released claim", "issueId", issueID, "prUrl", payload.PRURL)
+		case jobs.FixPRStatusNone:
+			// still open, or no open fix-PR record for this issue -- nothing to do.
+		}
+	}
+}
+
 // projectFixSettings adapts settings.Store into jobs.ProjectFixSettings for RealActor's FIX-gate
 // lookup (plan §4.2: "fixable + confidence >= WORKER_FIX_CONFIDENCE + FIX enabled").
 type projectFixSettings struct{ Settings *settings.Store }
@@ -1427,19 +1593,27 @@ func publishCircuitStateGauge(ctx context.Context, st *health.Status, breaker *s
 	}
 }
 
-func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger, sentinelAPIBreaker *sentinel.CircuitBreaker) (*loop.Runner, error) {
+// buildRunner also returns the *jobs.FixRunner it wired into the Actor (nil when the FIX engine is
+// not deployment-enabled) so runPipeline can drive its ResumeFix directly from the boot-time
+// recovery scan (plan §4.4 step 3b, finding 4) — the FIX engine's own resume path lives outside
+// loop.Runner.Resume entirely (FIX jobs are not a loop.Kind), so the caller needs this reference,
+// not just what got wired into actor.Fixer's narrower jobs.Fixer interface.
+func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger, sentinelAPIBreaker *sentinel.CircuitBreaker) (*loop.Runner, *jobs.FixRunner, error) {
 	resolver := settingsRepoResolver{Client: client, Settings: settingsStore, Cache: repoCache}
 	triage, followup, err := buildAdvisors(cfg, client, resolver, logger)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	advisor := kindDispatchAdvisor{Triage: triage, Followup: followup}
+	fixRunner := buildFixRunner(cfg, client, journal, settingsStore, logger)
 	actor := jobs.RealActor{
 		Client:        client,
 		Journal:       journal,
 		Fix:           projectFixSettings{Settings: settingsStore},
+		Fixer:         fixerInterface(fixRunner), // nil *jobs.FixRunner -> nil jobs.Fixer, not a typed-nil interface
 		Secrets:       configuredSecrets(cfg),
 		FixConfidence: cfg.WorkerFixConfidence,
+		SentinelURL:   cfg.SentinelURL,
 	}
 	return &loop.Runner{
 		Journal:          journal,
@@ -1452,7 +1626,53 @@ func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, ag
 		Log:              logger,
 		Breaker:          sentinelAPIBreaker,
 		MaxInlaneRetries: cfg.WorkerMaxInlaneRetries,
-	}, nil
+	}, fixRunner, nil
+}
+
+// resumeInFlightJob is the boot-time recovery dispatch point (plan §4.4 step 3b, finding 4): a FIX
+// job's in-flight marker (state.StateFixRunning, journalFixRunning) needs jobs.FixRunner.ResumeFix,
+// NOT loop.Runner.Resume -- FIX is not a loop.Kind (loop.Kind.IsJob() is false for it), so handing a
+// Kind==jobs.FixKind InFlightJob to runner.Resume would just fail loop.Runner's own kind.IsJob()
+// guard, and before this function existed, that failure (or a silent ignore, depending on exactly
+// how RecoveryScan's caller looped) was this repo's whole "a FIX job crash mid-attempt orphans the
+// claim forever" bug: the claim stays held (no release ever runs) and nothing ever resumes the job.
+// Every other in-flight kind (triage/followup) is unaffected and still goes through runner.Resume
+// exactly as before.
+func resumeInFlightJob(ctx context.Context, runner *loop.Runner, fixRunner *jobs.FixRunner, job state.InFlightJob, logger *slog.Logger) {
+	if job.Kind == jobs.FixKind && job.State == state.StateFixRunning {
+		if fixRunner == nil {
+			// The FIX engine is not deployment-enabled on THIS run (WORKER_FIX_ENABLED/
+			// FIX_EXECUTOR_CMD) even though a prior run had it enabled and left a job mid-attempt --
+			// log loudly rather than silently drop it; the claim stays held until an operator
+			// intervenes (matching "exhausted caps mean skip with a metric, never a crash").
+			logger.Error("recovery: in-flight FIX job found but the FIX engine is not wired on this run; leaving it claimed", "jobId", job.JobID, "issueId", job.IssueID)
+			return
+		}
+		payload, err := jobs.DecodeFixRunningPayload(job.Payload)
+		if err != nil {
+			logger.Error("recovery: decoding in-flight FIX payload failed, leaving it claimed", "jobId", job.JobID, "issueId", job.IssueID, "error", err)
+			return
+		}
+		if err := fixRunner.ResumeFix(ctx, payload.Input); err != nil {
+			logger.Error("recovery: resuming in-flight FIX job failed", "jobId", job.JobID, "issueId", job.IssueID, "error", err)
+		}
+		return
+	}
+	if err := runner.Resume(ctx, job); err != nil {
+		logger.Error("recovery: resuming in-flight job failed", "jobId", job.JobID, "issueId", job.IssueID, "kind", job.Kind, "state", job.State, "error", err)
+	}
+}
+
+// fixerInterface converts a possibly-nil *jobs.FixRunner into a jobs.Fixer -- explicitly returning
+// a bare nil interface for a nil pointer, rather than letting Go's normal conversion produce a
+// non-nil interface wrapping a nil pointer (the classic trap: `var fr *jobs.FixRunner; var f
+// jobs.Fixer = fr; f != nil` is true). RealActor.Act's "a.Fixer nil means the FIX engine isn't
+// wired" check depends on this being a REAL nil.
+func fixerInterface(fr *jobs.FixRunner) jobs.Fixer {
+	if fr == nil {
+		return nil
+	}
+	return fr
 }
 
 // kindDispatchAdvisor implements jobs.Advisor by routing to TriageAdvisor or FollowupAdvisor per

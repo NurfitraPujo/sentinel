@@ -28,6 +28,15 @@ const (
 	StateDone       JobState = "done"
 	StateFailed     JobState = "failed"
 	StateSkipped    JobState = "skipped"
+
+	// StateFixRunning marks a FIX job as in-flight for the plan §4.4 step-3b restart-time resume
+	// trigger (N8f functional-minors finding 4): journaled by jobs.FixRunner.RunFix at attempt
+	// start (once a workspace/baseCommit exists), and consulted by main.go's boot-time recovery
+	// pass to distinguish "resume this FIX job via ResumeFix" from every other non-terminal
+	// record RecoveryScan returns (which main.go replays through loop.Runner.Resume instead).
+	// Non-terminal (see terminalStates below): a job left at StateFixRunning by a crash is exactly
+	// what RecoveryScan/RecoveryScan's callers must find and resume, not treat as done.
+	StateFixRunning JobState = "fix_running"
 )
 
 // Terminal states end a job's lifecycle: no further transitions are ever appended for the jobId,

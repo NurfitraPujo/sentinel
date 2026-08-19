@@ -518,3 +518,24 @@ C14 tombstone/404 → skipped(deleted). e2e U42 (rotation) PROVEN GREEN vs live 
 green incl -race; U40 5.56s / U41 4.04s / U42 3.59s all --- PASS. Remaining seam: gitprovider
 CreatePR/PRStatus + FIX runner (N8f). Snapshot-tarball key exclusion is a documented contract with
 no tarball code yet (s3 snapshotter deferred) — enforce when it lands.
+
+## 2026-08-19 — N8f: FIX runner (branch feat/agent-worker) — worker feature-complete
+
+The last unwired seam. jobs/fix_*.go: workspace prep (fresh shallow clone, baseCommit recorded,
+sentinel-fix/<8hex> branch, TASK.md+PROGRESS.md OUTSIDE the clone), Fix Executor invocation
+($FIX_EXECUTOR_CMD=droid default; SANITIZED child env — NO Sentinel/LLM/git secret, process-group
+Setpgid+group-kill so WORKER_FIX_TIMEOUT reaps the whole subtree; stdout→redacted log; PROGRESS.md
+tail→journal+gated progress), independent validation (empty diff / testCmd red / >MAX_FILES /
+TASK.md-in-diff / out-of-tree → fail+release+count attempt), commit-before-push (no empty PRs),
+harness-templated PRSpec (issue URL + fenced gated fixBrief, no raw prose) via gitprovider.CreatePR
+to sentinel-fix/* (NEVER default branch), progress+PR-URL comment, claim kept. Resume WIRED
+end-to-end: StateFixRunning in-flight journal record + boot recovery scan → ResumeFix (fresh clone
+→ checkout baseCommit → apply diff.patch → continuation prompt, no double-count, isolated
+GIT_INDEX_FILE so live saves don't race the executor). Volume caps (jobs/day, PRs/day per-repo+
+total, attempts per-jobId, 30m timeout; AllowAttempt before AllowJobStart). hasOpenFix now live so
+the sweep polls PR status. Gated: fixEnabled(C15)+WORKER_FIX_ENABLED+WORKER_EXECUTE+repo
+connection; no connection→propose-only; dry-run runs no executor. FIX e2e is in-module (stub
+executor + fake forge + local bare remote — real coding CLIs aren't CI-installable), jobs/fix_test.go
+happy-path/propose-only/caps/empty-diff/resume; manual droid recipe in plan §8. Live-stack e2e
+U40/U41/U42 still green after wiring (7.46/3.94/3.92s --- PASS). 12 packages green incl -race.
+WORKER IS FEATURE-COMPLETE pending N8g deployment.

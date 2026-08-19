@@ -3,19 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/settings"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
@@ -472,7 +477,7 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 			cfg := Config{WorkerExecute: tc.workerExecute, LLMProvider: "openai", LLMModel: "gpt-4o-mini"}
 			client := sentinel.NewClient("http://example.invalid", "key")
 			journal := state.OpenJournal(t.TempDir() + "/jobs.journal")
-			runner, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 			if err != nil {
 				t.Fatalf("buildRunner: %v", err)
 			}
@@ -480,6 +485,160 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 				t.Fatalf("WorkerExecute=%v: runner.DryRun = %v, want %v", tc.workerExecute, runner.DryRun, tc.wantDryRun)
 			}
 		})
+	}
+}
+
+// --- resumeInFlightJob: boot-time FIX resume trigger (plan §4.4 step 3b, finding 4) -------------
+
+// mainTestGitRun runs a real git command directly, mirroring jobs/fix_workspace_test.go's own
+// runReal helper (unexported there, so duplicated here rather than exported cross-package purely
+// for a test fixture).
+func mainTestGitRun(t *testing.T, dir, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
+// newMainTestBareFixtureRepo creates a bare "origin" repo plus a work tree pushed to it with one
+// commit on branch main -- the same shape jobs/fix_workspace_test.go's newBareFixtureRepo builds,
+// reimplemented here since that helper is unexported to the jobs package.
+func newMainTestBareFixtureRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	bareRepo := filepath.Join(root, "origin.git")
+	workRepo := filepath.Join(root, "work")
+	mainTestGitRun(t, root, "git", "init", "--bare", "-b", "main", bareRepo)
+	mainTestGitRun(t, root, "git", "init", "-b", "main", workRepo)
+	mainTestGitRun(t, workRepo, "git", "config", "user.email", "test@example.com")
+	mainTestGitRun(t, workRepo, "git", "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(workRepo, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	mainTestGitRun(t, workRepo, "git", "add", ".")
+	mainTestGitRun(t, workRepo, "git", "commit", "-m", "seed")
+	mainTestGitRun(t, workRepo, "git", "remote", "add", "origin", bareRepo)
+	mainTestGitRun(t, workRepo, "git", "push", "origin", "main")
+	return bareRepo
+}
+
+// mainTestFakeProvider is a minimal gitprovider.Provider fake recording every CreatePR call, for
+// asserting a resumed FIX job actually opened a PR (proof that ResumeFix, not merely "some
+// function", ran end to end).
+type mainTestFakeProvider struct {
+	pr      gitprovider.PR
+	created []gitprovider.PRSpec
+}
+
+func (f *mainTestFakeProvider) Auth() gitprovider.GitCredential {
+	return gitprovider.GitHubTokenCredential("")
+}
+func (f *mainTestFakeProvider) CreatePR(_ context.Context, _ gitprovider.RepoRef, spec gitprovider.PRSpec) (gitprovider.PR, error) {
+	f.created = append(f.created, spec)
+	return f.pr, nil
+}
+func (f *mainTestFakeProvider) PRStatus(_ context.Context, _ gitprovider.RepoRef, _ string) (gitprovider.PRState, error) {
+	return gitprovider.PRStateOpen, nil
+}
+
+// mainTestRecordingSender is a minimal jobs.Sender fake, just enough for ResumeFix's own
+// comment/progress/PR batches to have somewhere to land.
+type mainTestRecordingSender struct{ calls []string }
+
+func (s *mainTestRecordingSender) PostQuestion(_ context.Context, issueID string, _ map[string]interface{}, key string) (*sentinel.Result, error) {
+	s.calls = append(s.calls, "question:"+issueID+":"+key)
+	return &sentinel.Result{Status: 201}, nil
+}
+func (s *mainTestRecordingSender) PostBatch(_ context.Context, _ sentinel.BatchRequest) (*sentinel.Result, error) {
+	s.calls = append(s.calls, "batch")
+	return &sentinel.Result{Status: 200}, nil
+}
+
+// TestResumeInFlightJob_FixRunning_DrivesResumeFix is the RED-FIRST, end-to-end proof for finding
+// 4: a journal record left at state.StateFixRunning by a crashed FIX attempt (journalFixRunning,
+// jobs/fix_pr.go) must actually get resumed at boot, not silently orphaned with its claim held
+// forever. It builds a REAL jobs.FixRunner (no fakes standing in for the seam under test) and
+// drives it purely through resumeInFlightJob/RecoveryScan's own InFlightJob shape -- proving the
+// wiring this finding is about, not ResumeFix's own internals (already covered by jobs/fix_test.go).
+//
+// MUTATION-TEST NOTE (per task brief): remove resumeInFlightJob's `if job.Kind == jobs.FixKind &&
+// job.State == state.StateFixRunning` branch (falling through to runner.Resume unconditionally, the
+// pre-fix behaviour) -- this test must go red, because loop.Runner.Resume rejects a non-loop.Kind
+// ("fix") with an error and never reaches CreatePR.
+func TestResumeInFlightJob_FixRunning_DrivesResumeFix(t *testing.T) {
+	bareRepo := newMainTestBareFixtureRepo(t)
+	journal := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	sender := &mainTestRecordingSender{}
+	fp := &mainTestFakeProvider{pr: gitprovider.PR{ID: "1", URL: "https://example/pr/1"}}
+
+	fixRunner := &jobs.FixRunner{
+		WorkspaceRoot: t.TempDir(),
+		Journal:       journal,
+		Client:        sender,
+		Sink:          jobs.LocalDirArtifactSink{Root: t.TempDir()},
+		Caps:          jobs.NewFixCaps(10, 10, 2, nil),
+		ResolveRepo: func(projectID string) (jobs.FixRepoConfig, bool, error) {
+			return jobs.FixRepoConfig{
+				Provider:      fp,
+				Repo:          gitprovider.RepoRef{Provider: "github", Owner: "o", Repo: "r"},
+				CloneURL:      bareRepo,
+				DefaultBranch: "main",
+			}, true, nil
+		},
+		// No prior live resume-state was ever saved for this jobID (ResumeFix falls back to a fresh
+		// RunFix in that case, per its own doc) -- this executor makes that fresh run actually
+		// produce a change to commit and push, so the resumed job reaches CreatePR.
+		ExecutorCmd: `echo "fix applied" >> fixed.txt && echo "applied fix" >> "$PROGRESS_MD"`,
+	}
+
+	in := jobs.FixJobInput{
+		JobID:      "job-recovered",
+		IssueID:    "issue-recovered",
+		ProjectID:  "proj-1",
+		ErrorClass: "NilPointerException",
+		FixBrief:   "dereference guarded now",
+		TriggerSeq: 5,
+	}
+	payload, err := json.Marshal(struct {
+		Input      jobs.FixJobInput `json:"input"`
+		BaseCommit string           `json:"baseCommit"`
+	}{Input: in, BaseCommit: "deadbeef"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	// Exactly what journalFixRunning appends at RunFix attempt start -- hand-built here (rather than
+	// calling journalFixRunning, unexported to this package) to prove resumeInFlightJob reacts to
+	// the RECORD SHAPE the journal actually contains after a crash, not to a test-only shortcut.
+	if err := journal.Append(state.Record{
+		JobID:      in.JobID,
+		IssueID:    in.IssueID,
+		Kind:       jobs.FixKind,
+		TriggerSeq: in.TriggerSeq,
+		State:      state.StateFixRunning,
+		Payload:    payload,
+	}); err != nil {
+		t.Fatalf("journal.Append: %v", err)
+	}
+
+	inFlight, _, err := journal.RecoveryScan()
+	if err != nil {
+		t.Fatalf("RecoveryScan: %v", err)
+	}
+	if len(inFlight) != 1 {
+		t.Fatalf("expected exactly one in-flight job, got %d", len(inFlight))
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	resumeInFlightJob(context.Background(), nil, fixRunner, inFlight[0], logger)
+
+	if len(fp.created) != 1 {
+		t.Fatalf("expected the recovered FIX job to reach CreatePR exactly once, got %d -- the journal's StateFixRunning record was not actually resumed", len(fp.created))
+	}
+	if _, found, err := jobs.ResolveOpenFixPR(journal, "issue-recovered"); err != nil || !found {
+		t.Fatalf("expected the resumed job to journal an open fix-PR: found=%v err=%v", found, err)
 	}
 }
 

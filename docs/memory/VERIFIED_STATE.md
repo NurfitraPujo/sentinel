@@ -1997,3 +1997,16 @@ keyguard PERSIST-BEFORE-USE mutation-proved; secret never in log/journal/snapsho
 opens the sentinel-api circuit (mutation-proved). NOT verified: kubernetes-secret backend against a
 real cluster (httptest fake apiserver only); FIX runner + git PR flow (N8f); snapshot tarball
 key-exclusion (no tarball code until the s3 snapshotter ships).
+
+## N8f — FIX runner (2026-08-19, branch feat/agent-worker, NOT merged) — feature-complete
+
+Proved: full worker gate green incl -race + gofmt (12 packages). FIX pipeline covered in-module
+(jobs/fix_test.go: happy-path clone→executor→validate→commit→push→CreatePR against fake forge +
+local bare remote; propose-only when no connection; caps-exhausted skip; empty-diff never pushes;
+live-resume save). Security proofs (mutation-tested): executor child env carries NO Sentinel/LLM/
+git secret; TASK.md rejected if in the diff; PRSpec no raw prose; push never a default branch;
+timeout reaps the whole process group. Resume wired end-to-end (StateFixRunning + boot scan →
+ResumeFix, no double-count, isolated index). Live-stack e2e U40/U41/U42 re-run green after FIX
+wiring (raw --- PASS 7.46/3.94/3.92s). NOT verified: a REAL coding-agent CLI (droid) — manual
+recipe only (plan §8); a real forge PR (fake forge API in tests); S3 fix-artifact upload against
+real S3 (interface + local fallback tested).

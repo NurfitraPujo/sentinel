@@ -213,6 +213,79 @@ func TestRealActor_Act_NeedsInfo_JournalsStateQuestioned(t *testing.T) {
 	}
 }
 
+// fakeFixer records the FixJobInput Dispatch was called with, standing in for jobs.FixRunner in
+// tests that only care about what RealActor.Act hands the FIX engine, not what the FIX engine
+// itself does with it.
+type fakeFixer struct {
+	dispatched []FixJobInput
+}
+
+func (f *fakeFixer) Dispatch(in FixJobInput) {
+	f.dispatched = append(f.dispatched, in)
+}
+
+// fixReadySettings makes every project report FIX enabled -- the narrow ProjectFixSettings RealActor
+// needs to let CompileFollowup's attemptFix branch set compiled.EnqueueFix.
+type fixReadySettings struct{}
+
+func (fixReadySettings) FixEnabled(string) (bool, bool) { return true, true }
+
+// TestRealActor_Act_EnqueueFix_PopulatesFixJobInputIssueURL is finding 3's proof: before this fix,
+// FixJobInput.IssueURL was never populated by RealActor.Act -- every dispatched FIX job carried an
+// empty IssueURL, so BuildFixPRSpec's PR body/TASK.md fell back to the bare issueID instead of a
+// clickable Sentinel issue link (plan §4.4 step 5). Driving Act through a real attempt_fix FOLLOW-UP
+// decision (high confidence, FIX enabled) with SentinelURL configured must produce a non-empty
+// IssueURL on the dispatched FixJobInput, and that URL must actually render into the PR body
+// BuildFixPRSpec produces.
+func TestRealActor_Act_EnqueueFix_PopulatesFixJobInputIssueURL(t *testing.T) {
+	srv := newActorTestServer(t, "")
+	defer srv.Close()
+	client := sentinel.NewClient(srv.URL, "k")
+
+	j := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	if err := j.Append(state.Record{JobID: "job-fix-1", IssueID: "issue-fix-1", Kind: "followup", TriggerSeq: 3, State: state.StateAdvised}); err != nil {
+		t.Fatalf("journal append: %v", err)
+	}
+
+	fixer := &fakeFixer{}
+	actor := RealActor{
+		Client:      client,
+		Journal:     j,
+		Fix:         fixReadySettings{},
+		Fixer:       fixer,
+		SentinelURL: "https://sentinel.example.com/",
+	}
+	raw, _ := json.Marshal(FollowupDecision{
+		Action:     string(ActionAttemptFix),
+		Body:       "trying a fix",
+		FixBrief:   strp("dereference guarded now"),
+		Confidence: f64p(0.9),
+	})
+	if err := actor.Act(context.Background(), "job-fix-1", Decision{Kind: "followup", Raw: raw}); err != nil {
+		t.Fatalf("Act: %v", err)
+	}
+
+	if len(fixer.dispatched) != 1 {
+		t.Fatalf("expected exactly one Dispatch call, got %d", len(fixer.dispatched))
+	}
+	in := fixer.dispatched[0]
+	if in.IssueID != "issue-fix-1" {
+		t.Fatalf("IssueID = %q, want issue-fix-1", in.IssueID)
+	}
+	wantURL := "https://sentinel.example.com/issues/issue-fix-1"
+	if in.IssueURL != wantURL {
+		t.Fatalf("IssueURL = %q, want %q (finding 3: FixJobInput.IssueURL was never populated)", in.IssueURL, wantURL)
+	}
+
+	spec, err := BuildFixPRSpec(in.IssueID, in.IssueURL, "SomeError", in.FixBrief, "sentinel-fix/deadbeef", "main", nil, nil)
+	if err != nil {
+		t.Fatalf("BuildFixPRSpec: %v", err)
+	}
+	if !strings.Contains(spec.Body, wantURL) {
+		t.Fatalf("PR body does not render the issue URL: %q", spec.Body)
+	}
+}
+
 // TestSweep_ReconcileReaped_UsesRealJournalPopulatedByAct is the MAJOR's live-reconcile proof: it
 // drives Act through a needs_info decision (as above) so the journal's StateQuestioned record is
 // produced by the SAME code path a real deployment runs -- not hand-injected -- and then proves

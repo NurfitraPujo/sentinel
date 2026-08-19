@@ -433,16 +433,18 @@ func (s *Sweep) ReconcileReaped(ctx context.Context, issueID string) (reclaimed 
 	return true, nil
 }
 
-// openFixState is the journal state a FIX-originated job sits in while its PR is out for review —
-// documented here as the N8f seam ReconcileReaped consults; FIX jobs (jobs/fix.go) don't run yet
-// (plan §4.3: "FIX jobs don't yet run"), so hasOpenFix currently always finds none via this path,
-// but the check is wired now so N8f only has to start journaling into StateActed with a
-// recognizable payload, not touch the reconcile logic itself.
+// openFixState is the journal state a FIX-originated job sits in while its PR is out for review.
+// As of N8f, jobs/fix.go's JournalFixPROpen (jobs/fix_pr.go) appends exactly this Kind/State pair
+// once RunFix opens a PR, so this hook is LIVE: ReconcileReaped's fix-PR arm now actually fires off
+// real FIX jobs, not just the hand-injected records fix_pr_test.go/sweep_test.go use to exercise it
+// in isolation.
 const openFixKind = "fix"
 
 // hasOpenFix reports whether issueID has a FIX-kind job whose latest journal record is non-terminal
-// (an in-flight FIX, e.g. workspace prep or PR-out-for-review) — the N8f seam plan §4.3 documents
-// as "stub the hook". Always false until jobs/fix.go (N8f) starts journaling KindFix records.
+// (an in-flight FIX, e.g. workspace prep or PR-out-for-review). Live as of N8f: JournalFixPROpen
+// (jobs/fix_pr.go) appends a Kind=openFixKind/State=StateActed record when RunFix opens a PR, and
+// journalFixPRClosed marks it terminal once the PR is merged/closed — so this reflects real FIX
+// jobs' journal state, not just test fixtures.
 func (s *Sweep) hasOpenFix(issueID string) bool {
 	latest, err := s.Journal.LatestByJobID()
 	if err != nil {

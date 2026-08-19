@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
@@ -35,19 +36,34 @@ type RealActor struct {
 	Client        *sentinel.Client
 	Journal       *state.Journal
 	Fix           ProjectFixSettings // nil is treated as "no project ever has FIX enabled"
+	Fixer         Fixer              // nil is treated as "FIX engine not wired -- EnqueueFix is a no-op"
 	Secrets       []string           // configured secret values to redact (guard.Check's verbatim gate)
 	FixConfidence float64            // WORKER_FIX_CONFIDENCE; <=0 uses DefaultFixConfidence
+
+	// SentinelURL is $SENTINEL_URL (the dashboard's own base URL, the same value the worker's own
+	// API client is built from) -- the only thing Act needs to turn an issueId into the human-facing
+	// Sentinel issue URL a FIX PR body/TASK.md links back to (plan §4.4 step 5: the PR body must
+	// carry the actual issue link, not just the raw id). Empty is a valid, if degraded, config
+	// (FixJobInput.IssueURL is then left empty, exactly as it was before this field existed) --
+	// never fail a FIX dispatch over a missing display URL.
+	SentinelURL string
 }
 
-// actIssueEnvelope decodes just the fields Act needs from GET /api/agent/issues/:id -- issueType
-// (C8's severity gate) and projectId (the FIX-enablement lookup). Deliberately narrower than
-// triageIssueEnvelope, which also needs message/errorClass/report/occurrence for prompt-seeding
-// that Act itself never touches.
+// actIssueEnvelope decodes the fields Act needs from GET /api/agent/issues/:id -- issueType (C8's
+// severity gate), projectId (the FIX-enablement lookup), and errorClass/message/occurrence
+// (fix.go's TaskBrief/PR-title seeding once compiled.EnqueueFix fires). Deliberately narrower than
+// triageIssueEnvelope only in that it doesn't need the report body -- FIX's TASK.md uses
+// errorClass, not the raw report.
 type actIssueEnvelope struct {
 	Issue struct {
-		ProjectID string `json:"projectId"`
-		IssueType string `json:"issueType"`
+		ProjectID  string `json:"projectId"`
+		IssueType  string `json:"issueType"`
+		ErrorClass string `json:"errorClass"`
+		Message    string `json:"message"`
 	} `json:"issue"`
+	LatestOccurrence *struct {
+		Stacktrace json.RawMessage `json:"stacktrace"`
+	} `json:"latestOccurrence"`
 }
 
 // Act implements loop.Actor.
@@ -143,7 +159,64 @@ func (a RealActor) Act(ctx context.Context, jobID string, d Decision) error {
 			return fmt.Errorf("jobs: RealActor: job %s: %w", jobID, walkErr)
 		}
 	}
+	// plan §4.4/§9 N8f: compiled.EnqueueFix was, until this wiring, a seam that only journaled the
+	// decision to enqueue -- nothing ever ran the FIX engine. Everything above this point (the
+	// batch send, the claim-kept-vs-released decision) already succeeded, so dispatching here is
+	// the correct point: a FIX attempt should only ever start once the compiled decision has
+	// actually landed on the issue. a.Fixer nil means the FIX engine isn't wired for this
+	// deployment (e.g. FIX_EXECUTOR_CMD unset) -- EnqueueFix is then a no-op, matching "no repo
+	// connection => propose-only" in spirit: FIX readiness gates whether anything runs, not
+	// whether Act itself succeeds.
+	if compiled.EnqueueFix && a.Fixer != nil {
+		fixBrief := decisionFixBrief(d)
+		occurrences := ""
+		if env.LatestOccurrence != nil && len(env.LatestOccurrence.Stacktrace) > 0 {
+			occurrences = string(env.LatestOccurrence.Stacktrace)
+		}
+		a.Fixer.Dispatch(FixJobInput{
+			JobID:       jobID,
+			IssueID:     issueID,
+			IssueURL:    a.issueURL(issueID),
+			ProjectID:   env.Issue.ProjectID,
+			ErrorClass:  env.Issue.ErrorClass,
+			FixBrief:    fixBrief,
+			Occurrences: occurrences,
+			ToolOutputs: d.ToolOutputs,
+			TriggerSeq:  jobRec.TriggerSeq,
+		})
+	}
 	return nil
+}
+
+// issueURL builds the human-facing Sentinel issue URL from a.SentinelURL + the canonical
+// (org-independent) issue route dashboard-web exposes at /issues/:id -- unlike the
+// /:orgSlug/projects/:projectId/issues/:issueId route, this one needs nothing this envelope
+// doesn't already have (just the bare issueID), so Act never needs a second fetch just to learn an
+// org slug purely to build a link. Returns "" when SentinelURL is unconfigured (finding 3: better
+// to omit the link than to fail or fabricate one).
+func (a RealActor) issueURL(issueID string) string {
+	base := strings.TrimRight(strings.TrimSpace(a.SentinelURL), "/")
+	if base == "" || issueID == "" {
+		return ""
+	}
+	return base + "/issues/" + issueID
+}
+
+// decisionFixBrief extracts the fixBrief string from whichever decision schema d.Kind names --
+// CompileTriage/CompileFollowup already validated its presence whenever EnqueueFix is true (both
+// require a non-empty fixBrief before setting it), so this only ever runs after that check passed.
+func decisionFixBrief(d Decision) string {
+	switch d.Kind {
+	case "triage":
+		if td, err := DecodeTriage(d); err == nil && td.FixBrief != nil {
+			return *td.FixBrief
+		}
+	case "followup":
+		if fd, err := DecodeFollowup(d); err == nil && fd.FixBrief != nil {
+			return *fd.FixBrief
+		}
+	}
+	return ""
 }
 
 // questionedPayload is state.Record.Payload's shape at a StateQuestioned record: the id of the
