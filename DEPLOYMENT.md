@@ -294,7 +294,92 @@ here rather than built because A14's audit finding rated it a nice-to-have (one 
 infrequent) against real implementation cost (a new credential type to reason about token replay
 and expiry). Revisit if agent fleet size makes the manual step a bottleneck.
 
-## 9. Agent key rate limiting
+## 9. Continuous agent worker (`tools/sentinel-worker`, N8)
+
+`sentinel-worker` is a reference implementation of a long-running agent identity: it polls
+`/api/agent/events`, triages/follows-up on issues via an LLM, and — when a project opts in — drafts
+fixes and opens PRs. It is feature-complete (`docs/plans/AGENT_WORKER_PLAN.md` N8a–N8f) and ships
+in this repo as both a Docker image (`scripts/Dockerfile.sentinel-worker`) and, gated off, the
+`sentinel-worker` compose service and the Helm chart's `worker.yaml` template. Everything below is
+about deploying it; the worker's own operation is documented for agent authors in
+`docs/agents/SENTINEL_AGENT_GUIDE.md` §15.
+
+**Provisioning the identity.** The worker is an agent like any other (§8): create it in
+**Settings → Agents**, issue its key, and — only if it will run FIX — grant it the **Repo
+credential access** toggle (C16, §8a) so `GET /api/agent/repo-credentials` will serve it a
+provider credential. Nothing about the worker's own deployment grants that access; it is purely
+the per-agent flag on the agent card.
+
+**Key bootstrap → keyguard handoff.** The worker needs `SENTINEL_URL`/`SENTINEL_AGENT_KEY` to
+become ready (it starts either way — an unset or invalid key keeps the process up with `/readyz`
+failing rather than exiting into a restart loop, plan §6), then hands ongoing custody to
+**keyguard** (`WORKER_KEYSTORE`), which rotates the key unattended before
+`AGENT_KEY_ROTATION_GRACE_HOURS` expires it:
+
+- **Helm**: the chart ships with `secrets.data.SENTINEL_AGENT_KEY: ""` so a stock `helm install`
+  still renders and the pod still starts (the env var and, in `kubernetes-secret` mode, the
+  volume item are both `optional: true`). Before setting `worker.enabled=true` for real, an
+  operator MUST populate that key — either set `secrets.data.SENTINEL_AGENT_KEY` to the issued
+  key (or point `secrets.existingSecret` / `worker.keySecretName` at a Secret that already has
+  it) — or the worker pod comes up but never passes `/readyz`.
+
+- `WORKER_KEYSTORE=file` (compose/VM default): the key lives in a file under `WORKER_STATE_DIR`
+  (`agent-key.json`); keyguard rewrites it in place on rotation. Simple, but the file is only as
+  durable as the volume it's on.
+- `WORKER_KEYSTORE=kubernetes-secret` (Helm default surface, opt-in via `worker.keystore`): the key
+  lives in a Kubernetes Secret, projected into the pod as a read-only volume
+  (`WORKER_KEY_SECRET_MOUNT`) for reads, and rotated by the worker PATCHing that same Secret
+  through the in-cluster API. This needs the **keyguard RBAC** the chart renders alongside the
+  Deployment only in this mode: a dedicated ServiceAccount, and a Role granting `get`/`patch` on
+  Secrets — **resource-name-pinned to the one agent-key Secret** (`resourceNames:`), never a
+  wildcard grant — bound to that ServiceAccount via a RoleBinding. Verify the pin with
+  `helm template ... --set worker.keystore=kubernetes-secret | grep -A2 resourceNames`.
+
+**The enable ladder.** Three independent gates, meant to be flipped in order, each one a strictly
+bigger blast radius than the last:
+
+1. `WORKER_ENABLED=true` — the entrypoint gate (`tools/sentinel-worker/entrypoint.sh`, same
+   pattern as the dlq-drainer/cron services). Left false, the container sleeps forever without
+   ever constructing a client or polling anything.
+2. `WORKER_EXECUTE=true` — dry-run vs. live. With this false, the worker polls, triages, and
+   journals decisions, but never sends a mutating call (no comments, no claims held past a dry
+   run, no FIX workspace ever constructed) — inspect `/readyz` and the journal to confirm behavior
+   before trusting it with write access.
+3. Per-project `agentSettings.fixEnabled` (dashboard, project settings) — even with the two
+   deployment-level gates on and `WORKER_FIX_ENABLED=true`, a project that hasn't opted in gets
+   triage/follow-up only; FIX silently no-ops to `postProposeOnly` (a comment, no workspace, no
+   clone) for that project.
+
+   **Helm vs. compose default for gate 1.** In compose the container always exists (parked), so
+   `WORKER_ENABLED` defaults `false` there. In the Helm chart the pod itself is the top-level
+   toggle (`worker.enabled: false` renders no Deployment), so `worker.values.workerEnabled`
+   defaults `"true"` — setting `worker.enabled=true` runs a live, polling worker by default. Do
+   **not** flip `worker.workerEnabled` back to `"false"` to "park" a rendered pod: the entrypoint
+   would sleep forever while the Deployment's unconditional `livenessProbe` on `/healthz` keeps
+   failing (the health server never binds while parked), and kubelet restarts the container in a
+   loop. If you need a pod that exists but does nothing, remove/disable the `livenessProbe` in
+   `worker.yaml` first — or, simpler, just leave `worker.enabled=false` until you're ready to run it.
+
+**Scaling.** `replicas: 1` and `strategy: Recreate` on the Helm Deployment are load-bearing, not
+incidental — the worker holds a local cursor/journal/claim-heartbeat state that a second replica
+sharing the same identity and volume would corrupt. To run more throughput, deploy **multiple
+independent Deployments**, each with its own agent identity (§8) and its own state volume —
+never scale the same Deployment past 1.
+
+**Durability without a PVC.** Deliberately no PersistentVolumeClaim (`worker.persistence.enabled`
+defaults `false` and should stay that way). State lives on `emptyDir` and is rebuilt from two
+sources on restart: the server itself (re-fetch open claims/events) and periodic S3 snapshots
+(`WORKER_SNAPSHOT_BACKEND=s3`, `WORKER_SNAPSHOT_INTERVAL`, plan §2.8). A worker that loses its
+volume with snapshots configured loses at most one `WORKER_SNAPSHOT_INTERVAL` of journal state,
+not its entire operating history.
+
+**Prerequisite you will forget:** scheduling `POST /api/cron/retention` (§5's `sentinel-cron`
+service / the Helm `retentionCron` CronJob, both already shipped, C11) **is a prerequisite for
+running the worker in any long-lived deployment.** It is what force-releases an agent's stale
+claims (`CLAIM_STALE_HOURS`) after a crash or a slow FIX job — without it, a worker that dies
+mid-claim leaves that issue stuck claimed until someone manually unassigns it.
+
+## 10. Agent key rate limiting
 
 Each agent key enforces its own `project_api_keys.rate_limit_rpm` (default 5000) via a
 **fixed-window** counter (`$lib/rate-limit.ts`, 60s windows) — deliberately not a sliding/token-

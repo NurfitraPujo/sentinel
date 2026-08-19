@@ -749,3 +749,19 @@ curl -s -X POST "$SENTINEL_URL/api/agent/uploads" -H "$AUTH" -F "file=@./screens
 curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
   -H 'Content-Type: application/json' --data-binary @docs/agents/examples/triage-batch.json
 ```
+
+## 15. Running the reference worker (`tools/sentinel-worker`, N8)
+
+This guide documents the `/api/agent/*` contract any agent implementation talks to.
+`tools/sentinel-worker` in this repo is a reference implementation of a long-running agent built
+against that exact contract (polling `/api/agent/events`, claiming, triage/follow-up, optional FIX
+with PR flow, keyguard rotation) — a working example of everything above wired into one process,
+rather than a second source of truth for the API itself.
+
+To run it yourself: provision an agent identity (§13 above covers `GET /api/agent/self`;
+`DEPLOYMENT.md` §8 covers creating the agent + key), then see **`DEPLOYMENT.md` §9, "Continuous
+agent worker"** for the full operator path — key bootstrap and the keyguard handoff (file vs.
+Kubernetes Secret + RBAC), the compose service and Helm chart, the three-gate enable ladder
+(`WORKER_ENABLED` → `WORKER_EXECUTE` → per-project `fixEnabled`), scaling (one identity + one
+state volume per replica), and the S3-snapshot durability story. `docs/plans/AGENT_WORKER_PLAN.md`
+is the design document if you want the full rationale rather than the operator quickstart.

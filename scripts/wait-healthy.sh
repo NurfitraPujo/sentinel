@@ -53,7 +53,11 @@ ONESHOT_SERVICES="nats-init migrate minio-init"
 # and simply reports `running`. Left off this list it would be waited on like any app container — fine
 # while it stays up, but a crash-looping cron image (e.g. a bad CRON_SECRET makes entrypoint exit 1)
 # would then fail the whole gate. It is genuinely optional to stack readiness, so it cannot fail the run.
-OPTIONAL_SERVICES="jaeger cron"
+# worker (N8g, docs/plans/AGENT_WORKER_PLAN.md §6) joins cron for the identical reason: a long-running
+# service with no healthcheck that ships gated OFF (WORKER_ENABLED=false), sitting in `sleep infinity`.
+# HEALTHCHECKED would hang the whole stack gate at the timeout waiting on a container that can never
+# answer a healthcheck while gated off; ONESHOT is also wrong since it never exits.
+OPTIONAL_SERVICES="jaeger cron sentinel-worker"
 
 log() {
   printf '%s\n' "$*" >&2

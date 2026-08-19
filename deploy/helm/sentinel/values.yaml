@@ -36,6 +36,9 @@ images:
   dlqDrainer:
     repository: ghcr.io/nurfitrapujo/sentinel/dlq-drainer
     tag: ""
+  worker:
+    repository: ghcr.io/nurfitrapujo/sentinel/sentinel-worker
+    tag: ""
 
 # -----------------------------------------------------------------------------
 # Secrets. In production set `create: false` and reference a pre-provisioned Secret
@@ -64,6 +67,12 @@ secrets:
     # SMTP DSN for invitation / magic-link email. Without it, invitations cannot be delivered
     # (a deliberate consequence of design decision D06). e.g. smtp://user:pass@smtp.host:587
     EMAIL_SERVER: ""
+    # N8g: the worker's agent identity key. Empty by default so a stock `helm install` still
+    # renders and starts (WORKER_KEYSTORE=file mode mounts this key optionally -- see worker.yaml)
+    # -- the worker pod comes up with /readyz failing rather than crash-looping, per plan §6.
+    # An operator MUST set this (or point secrets.existingSecret / worker.keySecretName at a
+    # Secret that has it) before setting worker.enabled=true, or the worker never becomes ready.
+    SENTINEL_AGENT_KEY: ""
 
 # -----------------------------------------------------------------------------
 # Non-secret shared configuration (rendered into a ConfigMap).
@@ -240,6 +249,96 @@ retentionCron:
   resources:
     requests: { cpu: 10m, memory: 16Mi }
     limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# worker — the continuous agent (N8/AGENT_WORKER_PLAN.md). Ships gated OFF at the pod level
+# (worker.enabled: false -- no Deployment renders at all, mirroring "never started" in compose).
+# Once you flip worker.enabled: true, workerExecute and fixEnabled must still be flipped to "true"
+# (in that order -- see the enable ladder in DEPLOYMENT.md) before it does anything mutating; the
+# pod runs live (workerEnabled defaults "true") rather than parking, because a parked pod with an
+# unconditional livenessProbe would crash-loop (see the note on workerEnabled below). No PVC by
+# default -- S3 snapshots (plan §2.8) are the supported durability path; worker.persistence exists
+# only for the rare disk-cache-preserving case and must stay `enabled: false` in any config this
+# chart considers supported.
+# -----------------------------------------------------------------------------
+worker:
+  enabled: false
+  containerPort: 9090
+  sentinelUrl: "" # e.g. http://sentinel-dashboard:3000 (in-cluster Service DNS)
+  # file: SENTINEL_AGENT_KEY is read from the chart Secret (agentKeySecretKey below).
+  # kubernetes-secret: keyguard reads/rotates the Secret named by keySecretName directly (the
+  # keyguard RBAC below is rendered only for this mode); SENTINEL_AGENT_KEY is NOT set as an env var.
+  keystore: file
+  agentKeySecretKey: SENTINEL_AGENT_KEY
+  keySecretName: "" # kubernetes-secret only; defaults to the chart Secret name when empty
+  keySecretMount: /var/run/secrets/sentinel/agent-key
+  # --- gates ---
+  # NOTE: unlike compose (where the container always exists, parked), in K8s the pod itself is the
+  # top-level gate: `worker.enabled=false` renders no Deployment at all. So workerEnabled defaults to
+  # "true" here -- setting `worker.enabled=true` runs a live worker, matching the ladder's rung 1 by
+  # default, and (critically) avoids the crash-loop trap where a pod parks in `sleep infinity` while
+  # its unconditional livenessProbe on /healthz fails forever because the health server never binds
+  # (plan §6: a gated-off container/pod must never crash-loop). Explicitly set workerEnabled: "false"
+  # only if you want a pod that exists but stays parked -- and if you do, also remove/disable the
+  # livenessProbe in worker.yaml, or it WILL crash-loop.
+  workerEnabled: "true"
+  workerExecute: "false"
+  fixEnabled: "false"
+  # --- dirs (match the image's own ENV defaults; listed for discoverability) ---
+  stateDir: /var/lib/sentinel-worker
+  repoCacheDir: /var/cache/sentinel-worker/repos
+  workspaceDir: /var/cache/sentinel-worker/workspaces
+  # --- loop tuning ---
+  pollInterval: 10s
+  sweepInterval: 1h
+  backfillHours: "24"
+  concurrency: 2
+  eventTypes: "" # comma-separated; empty = all
+  projects: "" # single project filter; empty = all
+  # --- LLM: no default provider ships here -- an operator must supply one before enabling ---
+  llm:
+    provider: ""
+    model: ""
+    apiKeySecretKey: "" # key within the chart Secret holding LLM_API_KEY; empty = env unset
+    baseUrl: ""
+  # --- FIX executor (plan §4.4); empty = FIX never runs even if fixEnabled=true ---
+  fixExecutorCmd: ""
+  # --- snapshots (plan §2.8) ---
+  snapshot:
+    backend: none # none | s3
+    interval: 5m
+    s3:
+      endpoint: "" # defaults to the bundled minio when empty
+      bucket: ""
+      prefix: ""
+      region: ""
+  persistence:
+    enabled: false # keep false; emptyDir + S3 snapshots is the supported durability path
+    size: 5Gi
+    storageClass: ""
+  prometheus:
+    enabled: true
+    path: /metrics
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  # --- escape hatch: plan §5's full env surface (~60 vars) is large; only the deployment-relevant
+  # subset is mirrored as first-class values above. Anything else -- budget/volume caps
+  # (WORKER_DAILY_TOKEN_BUDGET, WORKER_MAX_PRS_PER_DAY, WORKER_MAX_FIX_JOBS_PER_DAY,
+  # WORKER_MAX_TRIAGE_PER_HOUR, WORKER_FIX_CONFIDENCE, WORKER_FIX_MAX_FILES, *_TIMEOUT,
+  # *_MAX_TURNS, MAX_OUTPUT_TOKENS), key-rotation cadence (WORKER_ROTATE_BEFORE_HOURS,
+  # WORKER_ROTATE_EVERY_DAYS), git fallback creds (GIT_GITHUB_TOKEN, GIT_BITBUCKET_TOKEN,
+  # GIT_BITBUCKET_USER, GIT_BITBUCKET_APP_PASSWORD), WORKER_CREDENTIAL_LABELS,
+  # WORKER_KEEP_FAILED_WORKSPACES, WORKER_WORKSPACE_RETENTION_DAYS, WORKER_POLL_JITTER,
+  # WORKER_SETTINGS_REFRESH, LLM_FALLBACK_* -- set as plain key/value pairs here and they are
+  # rendered as literal env vars on the worker container (see the `range` in worker.yaml).
+  # Values containing secrets should NOT go here (this is not a Secret); use a Kubernetes
+  # Secret + a manual `kubectl set env --from` / manifest patch instead for sensitive ones.
+  env: {}
+  # env:
+  #   WORKER_DAILY_TOKEN_BUDGET: "2000000"
+  #   WORKER_MAX_PRS_PER_DAY: "10"
+  #   GIT_GITHUB_TOKEN: "" # prefer a Secret-backed override for real tokens
 
 # -----------------------------------------------------------------------------
 # Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.

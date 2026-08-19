@@ -1,5 +1,7 @@
 #!/bin/sh
-# Entrypoint for the sentinel-worker container (see docs/plans/AGENT_WORKER_PLAN.md §6).
+# Entrypoint for the sentinel-worker container (scripts/Dockerfile.sentinel-worker,
+# docker-compose.yml's `worker` service, deploy/helm/sentinel/templates/worker.yaml).
+# See docs/plans/AGENT_WORKER_PLAN.md §6.
 #
 # Mirrors tools/dlq/entrypoint.sh's dlq-drainer pattern: startup order is load-bearing. This
 # script checks WORKER_ENABLED FIRST, before reading or validating any other configuration — a
@@ -10,7 +12,12 @@
 # Once enabled, the binary itself owns the WORKER_EXECUTE distinction (dry-run vs. live mutation,
 # plan §5) — that gate lives in-process (main.go's Config), not in this shell wrapper, because
 # dry-run still needs the full poll/dispatch/journal pipeline running, just without sending
-# mutating calls.
+# mutating calls. Likewise WORKER_FIX_ENABLED is a deployment kill switch read by the binary, not
+# here.
+#
+# This is THE worker entrypoint (kept in scripts/ alongside the other service entrypoints —
+# scripts/cron-entrypoint.sh, tools/dlq/entrypoint.sh — so the Dockerfile's COPY paths follow the
+# same repo-root build-context convention as its siblings). The Dockerfile COPYs this file.
 set -eu
 
 ENABLED="${WORKER_ENABLED:-false}"

@@ -1,0 +1,279 @@
+{{- /*
+N8g (docs/plans/AGENT_WORKER_PLAN.md §6/§9): the sentinel-worker continuous agent. Cloned from
+dlq-drainer.yaml's Deployment shape (single instance, Recreate strategy, emptyDir state -- no PVC,
+S3 snapshots are the durability story, plan §2.8) plus what dlq-drainer lacks: an HTTP health
+port (9090, /healthz + /readyz, plan §7), Prometheus scrape annotations, and -- only when
+worker.keystore == "kubernetes-secret" -- the keyguard RBAC (ServiceAccount + Role scoped with
+get/patch RESOURCE-NAME-PINNED to the single agent-key Secret + RoleBinding) so K8sKeyStore
+(tools/sentinel-worker/keyguard/keyguard.go) can read the mounted Secret and PATCH it on rotation
+without a cluster-wide Secret grant.
+*/ -}}
+{{- if .Values.worker.enabled }}
+{{- $img := .Values.images.worker -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $fullname := include "sentinel.fullname" . -}}
+{{- $sa := .Values.worker.keystore | eq "kubernetes-secret" | ternary (printf "%s-worker" $fullname) (include "sentinel.serviceAccountName" .) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-worker
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  # Single instance: it holds cursor/journal state on a local volume (plan §2.8 -- S3 snapshots,
+  # not a PVC, are the durability story). Scaling to N replicas requires N distinct
+  # identities/state volumes (one Deployment per replica), never replicas > 1 on this one (plan §6).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      {{- if .Values.worker.prometheus.enabled }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.worker.containerPort | quote }}
+        prometheus.io/path: {{ .Values.worker.prometheus.path | quote }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $sa }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.worker.containerPort }}
+          {{- if eq (.Values.worker.workerEnabled | toString) "true" }}
+          # Probes render ONLY when the worker loop is enabled. A parked pod
+          # (worker.enabled=true but workerEnabled="false") execs `sleep infinity`
+          # and never binds the health port, so an unconditional liveness probe would
+          # CrashLoopBackOff a deliberately-parked deployment — the same gated-off-killed-
+          # by-its-own-healthcheck trap the compose service avoids with healthcheck.disable.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          {{- end }}
+          env:
+            - name: SENTINEL_URL
+              value: {{ .Values.worker.sentinelUrl | quote }}
+            {{- if eq .Values.worker.keystore "file" }}
+            - name: SENTINEL_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: {{ .Values.worker.agentKeySecretKey | quote }}
+                  optional: true
+            {{- end }}
+            # --- gates: all three must be explicitly opted into for the worker to do anything ---
+            - name: WORKER_ENABLED
+              value: {{ .Values.worker.workerEnabled | quote }}
+            - name: WORKER_EXECUTE
+              value: {{ .Values.worker.workerExecute | quote }}
+            - name: WORKER_FIX_ENABLED
+              value: {{ .Values.worker.fixEnabled | quote }}
+            - name: WORKER_STATE_DIR
+              value: {{ .Values.worker.stateDir | quote }}
+            - name: WORKER_REPO_CACHE_DIR
+              value: {{ .Values.worker.repoCacheDir | quote }}
+            - name: WORKER_WORKSPACE_DIR
+              value: {{ .Values.worker.workspaceDir | quote }}
+            - name: WORKER_HEALTH_ADDR
+              value: {{ printf ":%v" .Values.worker.containerPort | quote }}
+            - name: WORKER_POLL_INTERVAL
+              value: {{ .Values.worker.pollInterval | quote }}
+            - name: WORKER_SWEEP_INTERVAL
+              value: {{ .Values.worker.sweepInterval | quote }}
+            - name: WORKER_BACKFILL_HOURS
+              value: {{ .Values.worker.backfillHours | quote }}
+            - name: WORKER_CONCURRENCY
+              value: {{ .Values.worker.concurrency | quote }}
+            {{- with .Values.worker.eventTypes }}
+            - name: WORKER_EVENT_TYPES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.worker.projects }}
+            - name: WORKER_PROJECTS
+              value: {{ . | quote }}
+            {{- end }}
+            # --- LLM: no default provider ships here -- an operator must supply one before enabling ---
+            - name: LLM_PROVIDER
+              value: {{ .Values.worker.llm.provider | quote }}
+            - name: LLM_MODEL
+              value: {{ .Values.worker.llm.model | quote }}
+            {{- if .Values.worker.llm.apiKeySecretKey }}
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: {{ .Values.worker.llm.apiKeySecretKey | quote }}
+            {{- end }}
+            - name: LLM_BASE_URL
+              value: {{ .Values.worker.llm.baseUrl | quote }}
+            # --- keystore (plan §2.5) ---
+            - name: WORKER_KEYSTORE
+              value: {{ .Values.worker.keystore | quote }}
+            {{- if eq .Values.worker.keystore "kubernetes-secret" }}
+            - name: WORKER_KEY_SECRET_NAME
+              value: {{ .Values.worker.keySecretName | default (include "sentinel.secretName" .) | quote }}
+            - name: WORKER_KEY_SECRET_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: WORKER_KEY_SECRET_MOUNT
+              value: {{ .Values.worker.keySecretMount | quote }}
+            {{- end }}
+            # --- FIX executor (plan §4.4) ---
+            - name: FIX_EXECUTOR_CMD
+              value: {{ .Values.worker.fixExecutorCmd | quote }}
+            # --- snapshots (plan §2.8 -- no PVC; S3 is the durability story) ---
+            - name: WORKER_SNAPSHOT_BACKEND
+              value: {{ .Values.worker.snapshot.backend | quote }}
+            - name: WORKER_SNAPSHOT_INTERVAL
+              value: {{ .Values.worker.snapshot.interval | quote }}
+            {{- if eq .Values.worker.snapshot.backend "s3" }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.worker.snapshot.s3.endpoint | default (include "sentinel.s3Endpoint" .) | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.worker.snapshot.s3.bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.worker.snapshot.s3.prefix | quote }}
+            - name: S3_REGION
+              value: {{ .Values.worker.snapshot.s3.region | quote }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: S3_SECRET_KEY
+            {{- end }}
+            # --- escape hatch: any §5 knob not mirrored explicitly above (budget/volume caps,
+            # key-rotation cadence, git fallback creds, WORKER_CREDENTIAL_LABELS, workspace
+            # retention, poll jitter, settings refresh, LLM fallback, ...) is reachable here
+            # without forking the chart. values.yaml documents the full §5 surface as comments. ---
+            {{- range $k, $v := .Values.worker.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.worker.stateDir }}
+            - name: workspace
+              mountPath: {{ .Values.worker.workspaceDir }}
+            - name: repo-cache
+              mountPath: {{ .Values.worker.repoCacheDir }}
+            {{- if eq .Values.worker.keystore "kubernetes-secret" }}
+            - name: agent-key
+              mountPath: {{ dir .Values.worker.keySecretMount }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        # No PVC by design (plan §2.8): state is disposable, rebuilt from the server + S3 snapshots
+        # on restart. worker.persistence is offered only for the rare disk-cache-preserving case and
+        # must default false; the supported durability path is emptyDir + S3 snapshots.
+        {{- if .Values.worker.persistence.enabled }}
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-worker
+        {{- else }}
+        - name: state
+          emptyDir: {}
+        {{- end }}
+        - name: workspace
+          emptyDir: {}
+        - name: repo-cache
+          emptyDir: {}
+        {{- if eq .Values.worker.keystore "kubernetes-secret" }}
+        - name: agent-key
+          secret:
+            secretName: {{ .Values.worker.keySecretName | default (include "sentinel.secretName" .) }}
+            optional: true
+            items:
+              - key: {{ .Values.worker.agentKeySecretKey | quote }}
+                path: {{ base .Values.worker.keySecretMount }}
+        {{- end }}
+{{- if .Values.worker.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-worker
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.worker.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.worker.persistence.size }}
+{{- end }}
+{{- if eq .Values.worker.keystore "kubernetes-secret" }}
+---
+# Keyguard RBAC (plan §2.5): a dedicated ServiceAccount + a Role scoped to get/patch on ONLY the
+# named agent-key Secret (resourceNames-pinned -- never a wildcard grant on Secrets) + the
+# RoleBinding joining them. K8sKeyStore (tools/sentinel-worker/keyguard/keyguard.go) reads the
+# key from the mounted volume and rotates it by PATCHing this same Secret via the in-cluster API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-worker-keyguard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.worker.keySecretName | default (include "sentinel.secretName" .) | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-worker-keyguard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $fullname }}-worker-keyguard
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

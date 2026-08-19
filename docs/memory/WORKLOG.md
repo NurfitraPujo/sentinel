@@ -539,3 +539,18 @@ executor + fake forge + local bare remote — real coding CLIs aren't CI-install
 happy-path/propose-only/caps/empty-diff/resume; manual droid recipe in plan §8. Live-stack e2e
 U40/U41/U42 still green after wiring (7.46/3.94/3.92s --- PASS). 12 packages green incl -race.
 WORKER IS FEATURE-COMPLETE pending N8g deployment.
+
+## 2026-08-19 — N8g: sentinel-worker deployment (branch feat/agent-worker) — N8a-N8g arc DONE
+
+sentinel-worker is now DEPLOYABLE, not just feature-complete: alpine Dockerfile (worker +
+worker-fix targets, in-image `-healthcheck` self-probe), compose service gated off in
+`OPTIONAL_SERVICES` (not HEALTHCHECKED/ONESHOT — would hang/fail the stack gate while parked),
+Helm `worker.yaml` (readinessProbe /readyz, livenessProbe /healthz, prometheus annotations,
+resourceName-pinned keyguard RBAC toggled by `keystore=kubernetes-secret`, emptyDir volumes, zero
+PVC). Verified without touching the live shared compose stack: `docker compose config` parses;
+both Dockerfile targets build in isolation; `helm lint` clean; `helm template` confirms probes/
+RBAC/no-PVC for k8s-secret and zero-RBAC for `keystore=file`; worker module gate green (878
+tests, -race). §5 env cross-check found ~20 low-traffic knobs absent from compose/helm-values/
+.env.example by name but reachable via Helm's `worker.env{}` escape hatch or compose's free-form
+`environment:` map — none silently unrepresentable. Full detail: VERIFIED_STATE.md's N8g section,
+DEPLOYMENT.md §9, AGENT_WORKER_PLAN.md §9 N8g row.

@@ -2010,3 +2010,52 @@ ResumeFix, no double-count, isolated index). Live-stack e2e U40/U41/U42 re-run g
 wiring (raw --- PASS 7.46/3.94/3.92s). NOT verified: a REAL coding-agent CLI (droid) — manual
 recipe only (plan §8); a real forge PR (fake forge API in tests); S3 fix-artifact upload against
 real S3 (interface + local fallback tested).
+
+## N8g — deployment (2026-08-19, branch feat/agent-worker, NOT merged) — worker now DEPLOYABLE
+
+The `sentinel-worker` arc (N8a-N8g) is complete: feature-complete AND deployable. Proved:
+- Worker module gate green: `cd tools/sentinel-worker && GOWORK=off go build ./... && GOWORK=off
+  go vet ./... && test -z "$(gofmt -l .)" && GOWORK=off go test ./... -count=1 -race` → 878 tests,
+  12 packages, no race.
+- `docker compose config` parses (podman-compose); `sentinel-worker` service present, all three
+  gates default `false`, and listed only in `wait-healthy.sh`'s `OPTIONAL_SERVICES` (not
+  `HEALTHCHECKED_SERVICES` or `ONESHOT_SERVICES` — a gated-off long-running service in either of
+  those would hang or fail the whole stack gate).
+- `docker build -f scripts/Dockerfile.sentinel-worker --target worker` and `--target worker-fix`
+  both succeed in isolation (no compose stack touched). The image's `-healthcheck` self-probe
+  (`/app/worker -healthcheck`, invoked with `--entrypoint` override so it bypasses the
+  `WORKER_ENABLED` shell gate) exits non-zero (`connection refused` at `:9090`) when nothing is
+  listening — proves the HEALTHCHECK instruction actually calls a real probe, not a no-op. Running
+  the image normally (no `--entrypoint` override) correctly falls through to
+  `entrypoint.sh`'s `WORKER_ENABLED` gate and parks in `sleep infinity` — confirms the gate is
+  checked before the probe/binary path, not bypassable via CMD override alone.
+- `helm lint deploy/helm/sentinel` clean (default values and `worker.enabled=true
+  worker.keystore=kubernetes-secret`). `helm template ... worker.enabled=true
+  worker.keystore=kubernetes-secret` renders: `readinessProbe`→`/readyz`, `livenessProbe`→
+  `/healthz` on containerPort 9090; `prometheus.io/scrape,port,path` annotations; a `Role`
+  granting `get,patch` on `secrets` pinned via `resourceNames` to the chart Secret, its
+  `RoleBinding`, and a `ServiceAccount`; zero PersistentVolumeClaim for the worker (state/
+  workspace/repo-cache are `emptyDir`; the render's one PVC belongs to `dlq-drainer.yaml`, unrelated).
+  `helm template ... worker.keystore=file` renders zero RBAC objects (Role/RoleBinding absent) —
+  confirms keyguard RBAC is values-toggled, not always-on.
+- §5 env cross-check (main.go's ~59 `os.Getenv` reads for `WORKER_*`/`LLM_*`/`SENTINEL_*`/
+  `FIX_EXECUTOR_CMD` against `docker-compose.yml`, `deploy/helm/sentinel/values.yaml`,
+  `deploy/helm/sentinel/templates/worker.yaml`, `.env.example`): ~39 vars are first-class
+  (documented, with a default) in at least one surface. ~20 low-traffic knobs (budget/volume
+  caps, key-rotation cadence, `*_TIMEOUT`/`*_MAX_TURNS`, `LLM_FALLBACK_*`,
+  `WORKER_CLAIM_HEARTBEAT`, `WORKER_AGENT_LOG_MAX_MB`, `WORKER_GATE_MAX_VERBATIM`,
+  `WORKER_REPO_REFRESH`, `WORKER_REPORT_FAILURES`, `WORKER_SHUTDOWN_TIMEOUT`) are not named
+  anywhere but ARE representable: Helm via the documented `worker.env{}` escape hatch
+  (values.yaml's comment enumerates them), compose via its free-form `environment:` map (any key
+  addable, just not pre-listed there). None are silently unrepresentable.
+- NOT verified (honestly undoable without a real cluster/S3, per plan): an actual K8s Secret
+  PATCH by the rendered keyguard RBAC (RBAC shape checked via `helm template`, not a live
+  `kubectl apply`); a real S3 snapshot round-trip (`WORKER_SNAPSHOT_BACKEND` interface + local
+  fallback only, same caveat as N8f's S3 fix-artifact upload).
+
+**How to go from zero to a running triage worker** (compose path): bring the stack up, set
+`SENTINEL_AGENT_KEY` (an agent key from the dashboard) and an `LLM_PROVIDER`/`LLM_MODEL`/
+`LLM_API_KEY` in `.env`, then flip `WORKER_ENABLED=true` → `WORKER_EXECUTE=true` in that order
+(DEPLOYMENT.md §9's enable ladder) and `docker compose up -d --build sentinel-worker`. Add
+`WORKER_FIX_ENABLED=true` (plus the `worker-fix` image target and an `$FIX_EXECUTOR_CMD`) only
+once TRIAGE/FOLLOW-UP are trusted in dry-run.

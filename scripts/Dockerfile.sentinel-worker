@@ -1,0 +1,90 @@
+# Builds tools/sentinel-worker (docs/plans/AGENT_WORKER_PLAN.md §6). Cloned from
+# scripts/Dockerfile.dlq-drainer: alpine base (NOT scratch — entrypoint.sh needs a shell, the
+# compose/K8s healthcheck uses the binary's own `-healthcheck` self-probe subcommand, and the named
+# state volume needs a mkdir+chown for the non-root UID).
+#
+# Unlike dlq-drainer, tools/sentinel-worker is its OWN Go module (module
+# github.com/NurfitraPujo/sentinel/tools/sentinel-worker, deliberately not in go.work — plan §1:
+# HTTP-only, stdlib, no cross-module imports). The build context is still the repo root (mirrors
+# every other service Dockerfile / docker-compose.yml's `context: .`), so this entrypoint script
+# under scripts/ is reachable too — the `go build` step below only touches the module subdirectory.
+#
+# Two targets (plan §6):
+#   worker      - triage/follow-up only, no fix toolchain, no git binary.
+#   worker-fix  - adds git (FIX workspace prep needs `git clone`/`git push`) and a commented example
+#                 layer showing where an operator adds their own $FIX_EXECUTOR_CMD toolchain (e.g.
+#                 droid). droid itself is NOT bundled here — it is operator-supplied per plan §4.5/§6.
+
+# Stage 1: Build
+FROM docker.io/library/golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /src/tools/sentinel-worker
+
+# Repo-root build context (see header comment); only the module subdirectory is needed for the
+# build itself since tools/sentinel-worker is a standalone module with no cross-module imports.
+COPY tools/sentinel-worker/ .
+
+RUN GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /worker .
+
+# Stage 2: worker (base runtime, shared by both targets)
+FROM docker.io/library/alpine:3.19 AS worker
+
+RUN apk add --no-cache ca-certificates tzdata
+
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
+
+WORKDIR /app
+
+COPY --from=builder /worker /app/worker
+COPY scripts/sentinel-worker-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    mkdir -p /var/lib/sentinel-worker /var/cache/sentinel-worker/repos /var/cache/sentinel-worker/workspaces && \
+    chown -R appuser:appgroup /var/lib/sentinel-worker /var/cache/sentinel-worker /app
+
+USER appuser
+
+# Safe-by-default: the entrypoint gate (WORKER_ENABLED) is checked FIRST, before anything else is
+# read — a gated-off container parks in `sleep infinity` and can never crash-loop (plan §6).
+ENV WORKER_ENABLED=false
+ENV WORKER_EXECUTE=false
+ENV WORKER_FIX_ENABLED=false
+ENV WORKER_STATE_DIR=/var/lib/sentinel-worker
+ENV WORKER_REPO_CACHE_DIR=/var/cache/sentinel-worker/repos
+ENV WORKER_WORKSPACE_DIR=/var/cache/sentinel-worker/workspaces
+ENV WORKER_HEALTH_ADDR=:9090
+
+# In-image self-probe via the binary's own `-healthcheck` subcommand (main.go) — NOT curl/wget,
+# so the alpine image needs nothing beyond the binary itself for this check.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/app/worker", "-healthcheck"]
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Stage 3: worker-fix (adds the FIX toolchain prerequisites)
+FROM worker AS worker-fix
+
+USER root
+
+# git: required by jobs/fix.go's workspace prep (`git clone`/`git push` against the confined
+# repo cache, plan §4.5) — the base `worker` target intentionally omits it since TRIAGE/FOLLOW-UP
+# never touch a working tree.
+RUN apk add --no-cache git
+
+# --- operator extension point --------------------------------------------------------------
+# $FIX_EXECUTOR_CMD (plan §5) is invoked by jobs/fix.go as an external coding-agent subprocess —
+# it is operator-supplied and deliberately NOT bundled in this image (no Anthropic/OpenAI CLI
+# license or binary is redistributed here). To wire one in, derive your own image FROM this
+# `worker-fix` target and add the toolchain, e.g.:
+#
+#   FROM sentinel-worker:worker-fix
+#   # Example only — replace with your actual executor's install steps:
+#   # RUN apk add --no-cache nodejs npm && npm install -g @your-org/droid-cli
+#   # ENV FIX_EXECUTOR_CMD="droid"
+#
+# WORKER_FIX_ENABLED (default false, this image) is a deployment kill switch only — real FIX
+# policy (per-project enablement) is enforced server-side (plan §4.5).
+# ---------------------------------------------------------------------------------------------
+
+USER appuser

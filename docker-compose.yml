@@ -345,8 +345,66 @@ services:
             RETENTION_CRON_TIMEOUT_SECONDS: "30"
         restart: unless-stopped
 
+    # N8g (docs/plans/AGENT_WORKER_PLAN.md §6): the sentinel-worker agent — polls /api/agent/events,
+    # triages/follow-ups (and, with the worker-fix image + WORKER_FIX_ENABLED, drafts fixes). Cloned
+    # from sentinel-dlq-drainer/sentinel-cron above: ships gated OFF (WORKER_ENABLED: "false") so
+    # merely bringing the stack up never starts it, and WORKER_EXECUTE: "false" keeps even an enabled
+    # worker in dry-run (decisions journaled, nothing mutating sent) until an operator opts in to both.
+    #
+    # NOTE (wait-healthy.sh): like `cron`, this is a long-running service that ships gated off — it
+    # belongs in OPTIONAL_SERVICES, NOT HEALTHCHECKED (which would hang the whole stack gate at 180s)
+    # and NOT ONESHOT (it never exits). See the comment block at scripts/wait-healthy.sh:51.
+    #
+    # The image DOES bake a HEALTHCHECK instruction (scripts/Dockerfile.sentinel-worker) for use when
+    # the worker is actually enabled — but while parked (WORKER_ENABLED=false) the entrypoint execs
+    # `sleep infinity` and the health server never binds, so that inherited healthcheck would report
+    # `(unhealthy)` forever. Disable it here; re-enable per-deployment once WORKER_ENABLED=true.
+    sentinel-worker:
+        build:
+            context: .
+            dockerfile: scripts/Dockerfile.sentinel-worker
+            target: worker
+        container_name: sentinel-worker
+        healthcheck:
+            disable: true
+        depends_on:
+            dashboard:
+                condition: service_started
+        environment:
+            # In-cluster address of the dashboard, never a host-mapped port (same convention as
+            # RETENTION_CRON_URL above).
+            SENTINEL_URL: http://dashboard:3000
+            # Dev placeholder only — a real agent key is issued via the dashboard's agent-registration
+            # flow. Left blank here on purpose: SENTINEL_URL/KEY are only validated when
+            # WORKER_ENABLED=true (main.go's LoadConfig), and this service ships gated off.
+            SENTINEL_AGENT_KEY: ""
+            # --- gates: all three must be explicitly opted into for the worker to do anything ---
+            WORKER_ENABLED: "false" # flip to "true" to activate (entrypoint gate, checked first)
+            WORKER_EXECUTE: "false" # flip to "true" to let it send mutating calls; "false" = dry-run, decisions journaled only
+            WORKER_FIX_ENABLED: "false" # deployment kill switch for FIX; real per-project policy is server-side (plan §4.5)
+            # --- state/workspace dirs (match the image's ENV defaults; listed for discoverability) ---
+            WORKER_STATE_DIR: /var/lib/sentinel-worker
+            WORKER_REPO_CACHE_DIR: /var/cache/sentinel-worker/repos
+            WORKER_WORKSPACE_DIR: /var/cache/sentinel-worker/workspaces
+            WORKER_HEALTH_ADDR: ":9090"
+            # --- loop tuning (compose defaults match the code's own fallbacks; listed for discoverability) ---
+            WORKER_POLL_INTERVAL: "10s"
+            WORKER_SWEEP_INTERVAL: "1h"
+            WORKER_BACKFILL_HOURS: "24"
+            # --- LLM: no default provider ships here — an operator must supply one before enabling ---
+            LLM_PROVIDER: ""
+            LLM_MODEL: ""
+            LLM_API_KEY: ""
+            LLM_BASE_URL: ""
+        volumes:
+            - worker_state:/var/lib/sentinel-worker
+            - worker_repo_cache:/var/cache/sentinel-worker/repos
+        restart: unless-stopped
+
 volumes:
     dlq_drainer_state:
+    worker_state:
+    worker_repo_cache:
     postgres_data:
     nats_data:
     redis_data:

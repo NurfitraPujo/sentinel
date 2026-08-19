@@ -799,7 +799,7 @@ Fable holistic review; green gates + memory sync + commit per phase)
 | **N8d** | TRIAGE + FOLLOW-UP Advisors, act() per-op compilation (all dispositions incl. needs_human), sweep (heartbeat/nag/reconcile), C10 coalescing e2e | unit goldens + e2e U40/U41 |
 | **N8e** — DONE 2026-08-19 | keyguard (expiry-driven + null-expiry fallback) + hardening: circuits, tombstone/404 handling, kill -9 replay proofs | keyguard units + both kill -9 e2e assertions + **e2e U42 key rotation** (`TestU42_WorkerKeyRotation`), all green against the live compose stack |
 | **N8f** | FIX engine: workspace (TASK.md outside clone), $FIX_EXECUTOR_CMD, validation gates, askpass push, provider PR flow + PRSpec templates, caps | stub-agent units + manual recipe doc — **DONE 2026-08-19**, wired into `loop`/`main.go`, `hasOpenFix` live, worker feature-complete pending N8g deployment |
-| **N8g** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | compose boot green incl. wait-healthy with worker present-but-gated; helm lint; full gate sweep; CI shows U40/U41 run |
+| **N8g — DONE 2026-08-19** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | `docker compose config` parses, worker present/gated-off/in `OPTIONAL_SERVICES` (not HEALTHCHECKED/ONESHOT); `docker build` both `worker` and `worker-fix` targets green in isolation; `-healthcheck` subcommand confirmed to exit non-zero against an unreachable addr (ENTRYPOINT gate verified separately: overriding CMD without `--entrypoint` correctly falls through to the `WORKER_ENABLED` gate, not the binary); `helm lint` clean; `helm template worker.enabled=true keystore=kubernetes-secret` renders probes (`/readyz`,`/healthz`), prometheus annotations, RBAC pinned via `resourceNames` to the chart Secret, zero worker PVCs (the render's one PVC belongs to dlq-drainer); `helm template keystore=file` renders zero RBAC objects; worker module gate green (`GOWORK=off build/vet/gofmt/test -race`, 878 tests, 12 packages). §5 env cross-check: the ~20 low-traffic knobs (budget/volume caps, key-rotation cadence, `*_TIMEOUT`/`*_MAX_TURNS`, `LLM_FALLBACK_*`, `WORKER_CLAIM_HEARTBEAT`, etc.) aren't first-class in compose/helm values/`.env.example` but ARE representable: Helm via the documented `worker.env{}` escape hatch (values.yaml comment enumerates them by name), compose via its free-form `environment:` map (any key can be added, just undocumented there). See §9 "how to turn it on" pointer and DEPLOYABILITY MATRIX below. **How to actually turn it on**: `docker-compose.yml`'s `sentinel-worker` service ships with all three gates false; flip `WORKER_ENABLED=true` → `WORKER_EXECUTE=true`/`WORKER_FIX_ENABLED=true` in that order per DEPLOYMENT.md's enable ladder, after supplying `SENTINEL_AGENT_KEY` + an `LLM_PROVIDER`/`LLM_MODEL`/`LLM_API_KEY`. |
 
 **N8a unwired seams — RESOLVED as of N8e** (2026-08-19): `tools/sentinel-worker/guard/` and
 `tools/sentinel-worker/keyguard/` were built and unit-tested in N8a. `guard` wired into the
@@ -1084,3 +1084,26 @@ connections — worker matches by provider (+`label` disambiguation, new optiona
 vs. the part-1 commit message (settings=1724000000, credentials=1723900000); server-testCmd
 decision is D23 (D22 = credentials); no ETag/dedicated rate limit on the new endpoints — refresh
 cadence budgets against the shared per-key RPM. Guide §2a/§13a are the normative references.
+
+## 12. Deployability matrix (N8g close-out)
+
+Verified without disrupting the shared dev stack (`docker compose config`, isolated `docker build`,
+`helm lint`/`template`, `kubectl --dry-run`). "cluster-only" = correct-by-construction but not
+runtime-exercised here.
+
+| Property | Compose | Helm |
+|---|---|---|
+| Image builds | `docker build --target worker` + `--target worker-fix` green in isolation | same image; `helm template` references it |
+| Gated-off safe | ships `WORKER_ENABLED/EXECUTE/FIX_ENABLED=false`; `healthcheck.disable:true` so a parked container never reports unhealthy; in `wait-healthy.sh` OPTIONAL_SERVICES (not HEALTHCHECKED/ONESHOT) | `worker.enabled=false` renders nothing; `enabled=true`+`workerEnabled=false` renders a parked pod with **no probes** (probes gated on `workerEnabled=="true"`) so it never CrashLoopBackOffs |
+| Probes / healthcheck | image `-healthcheck` subcommand (self-probe, no curl); disabled while parked | `readinessProbe /readyz` + `livenessProbe /healthz` on :9090, rendered only when enabled |
+| State durability | emptyDir-equivalent named volumes + S3 snapshots (§2.8) — **no PVC** | emptyDir + S3 snapshots — **no PVC** (helm template renders zero worker PVCs) |
+| Key rotation | file keystore (`agent-key.json` on the named volume) | file OR kubernetes-secret keystore; K8s-Secret PATCH is **cluster-only** |
+| RBAC least-privilege | n/a | rendered only for `keystore=kubernetes-secret`; Role `get/patch` **resourceName-pinned** (no wildcard); `keystore=file` renders zero RBAC. Dedicated agent-key Secret recommended in DEPLOYMENT.md |
+| All §5 env representable | free-form `environment:` map (common knobs enumerated; rest addable) | `worker.env{}` escape hatch (values.yaml enumerates the low-traffic knobs by name) |
+
+**Zero-to-running operator arc** (full detail in DEPLOYMENT.md "Continuous agent worker"):
+1. Register an **agent identity** in the dashboard; issue an **agent key** (once-shown).
+2. For FIX: set the identity's **`canAccessRepoCredentials`** flag (C16) and add a **repo connection** + **repo credential** per project (C15/C16), and enable **`fixEnabled`** on that project.
+3. Provision the worker: `SENTINEL_URL` + `SENTINEL_AGENT_KEY` (or the K8s Secret for `keystore=kubernetes-secret`), `LLM_PROVIDER`/`LLM_MODEL`/`LLM_API_KEY`; use the **`worker-fix`** image + `FIX_EXECUTOR_CMD` (droid) if FIX is wanted.
+4. **Schedule `POST /api/cron/retention`** — a hard prerequisite for unattended operation (C11; shipped as the compose `cron` service / Helm CronJob, ships gated off on compose).
+5. Enable in order per DEPLOYMENT.md's ladder: **`WORKER_ENABLED=true`** (loop runs, dry-run) → watch journaled decisions → **`WORKER_EXECUTE=true`** (mutations flow) → **`WORKER_FIX_ENABLED=true`** + per-project `fixEnabled` (FIX drafts PRs). One agent identity + one state volume per replica (`replicas:1`, `Recreate`).
