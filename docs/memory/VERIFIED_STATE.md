@@ -1974,3 +1974,16 @@ host or real credential (httptest + local bare fixtures only); repoctx/guard enf
 live decision until N8d wires the Advisor; CreatePR/PRStatus not exercised until N8f. Residual
 (documented §4.6): paraphrase exfiltration below the verbatim threshold — backstopped by repoctx
 confinement + repo-scoped tokens + PR review.
+
+## N8d — TRIAGE + FOLLOW-UP Advisors (2026-08-19, branch feat/agent-worker, NOT merged)
+
+Proved: full worker gate green incl -race + gofmt (12 packages). E2E RAN (not skipped) against
+the live compose stack: `SENTINEL_E2E=1 INGESTOR_URL=http://localhost:18080
+DASHBOARD_URL=http://localhost:13000 go test -tags=e2e ./tests/e2e/ -run
+'TestU40...|TestU41...' -v` → both PASS (U40 7.87s, U41 4.26s), verified via raw `--- PASS`
+lines. The worker now genuinely decides: triages a real ingested error, gates the summary through
+guard.Check, claims via C1, journals the decision, replays on kill -9 without duplicating. WORKER_
+EXECUTE=true now a supported mode; dry-run still sends nothing (asserted). guard output-gate and
+WrapUntrusted are LIVE on the decision path (mutation-proved). NOT verified: real LLM provider
+(fake in-process Advisor only, by design); FIX enqueue is a seam — no FIX job runs until N8f;
+keyguard rotation not wired until N8e.

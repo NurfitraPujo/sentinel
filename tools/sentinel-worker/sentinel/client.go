@@ -239,6 +239,22 @@ func (c *Client) GetIssue(ctx context.Context, issueID string) (*Result, error) 
 	return res, err
 }
 
+// GetOccurrences calls GET /api/agent/issues/:id/occurrences?limit=&before= — the real paginated
+// occurrence feed (newest-first, up to 50 per page, cursor by ISO timestamp). before is an RFC3339
+// timestamp cursor to page further back; empty means "from the newest". limit<=0 omits the query
+// param and lets the server default (20) apply.
+func (c *Client) GetOccurrences(ctx context.Context, issueID string, limit int, before string) (*Result, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	res, _, err := c.Do(ctx, "GET", "/api/agent/issues/"+url.PathEscape(issueID)+"/occurrences", q, nil)
+	return res, err
+}
+
 // IssuesListOptions is the query surface of GET /api/agent/issues used by the bootstrap sweep
 // (plan §2.1) and the sweep's claimed=me seeding pass: since/sort/limit/cursor/claimed/waiting.
 type IssuesListOptions struct {
@@ -248,6 +264,7 @@ type IssuesListOptions struct {
 	Cursor  string // keyset cursor
 	Claimed string // "me" (C12) — empty omits the filter
 	Waiting bool   // waiting-on-reporter filter
+	Project string // project id — empty omits the filter (scopes list_similar to one project)
 }
 
 // ListIssues calls GET /api/agent/issues with the given filter/pagination options.
@@ -270,6 +287,9 @@ func (c *Client) ListIssues(ctx context.Context, opts IssuesListOptions) (*Resul
 	}
 	if opts.Waiting {
 		q.Set("waiting", "true")
+	}
+	if opts.Project != "" {
+		q.Set("project", opts.Project)
 	}
 	res, _, err := c.Do(ctx, "GET", "/api/agent/issues", q, nil)
 	return res, err
@@ -328,6 +348,18 @@ func (c *Client) ClaimIssue(ctx context.Context, issueID string) (*Result, *Clai
 		}
 	}
 	return res, nil, nil
+}
+
+// GetComments calls GET /api/agent/issues/:id/comments?after= — the FOLLOW-UP Advisor's comment/
+// question thread read (plan §4.3: "Context: issue + full comment/question thread"). after is an
+// RFC3339 timestamp cursor; empty means "from the beginning".
+func (c *Client) GetComments(ctx context.Context, issueID, after string) (*Result, error) {
+	q := url.Values{}
+	if after != "" {
+		q.Set("after", after)
+	}
+	res, _, err := c.Do(ctx, "GET", "/api/agent/issues/"+url.PathEscape(issueID)+"/comments", q, nil)
+	return res, err
 }
 
 // BatchOperation is one entry in a POST /api/agent/batch request (plan §2.3). The server reads

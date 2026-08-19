@@ -22,9 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/loop"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/repoctx"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/settings"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
@@ -359,16 +362,11 @@ func LoadConfig(env envLookup) (Config, []string) {
 	if c.WorkerConcurrency < 1 {
 		errs = append(errs, "WORKER_CONCURRENCY: must be >= 1")
 	}
-	// N8a ships buildRunner wired to jobs.NotImplementedActor{} — there is no real Actor yet (the
-	// FIX/act engine lands in a later phase). WORKER_EXECUTE=true would still pass DryRun=false
-	// into loop.Runner, which claims every triageable issue for real (a genuine, irreversible
-	// mutation) and only THEN fails at NotImplementedActor.Act — net effect, the Agent silently
-	// claims and squats on the org's entire triage backlog until the server's 24h reaper, with no
-	// heartbeat/sweep yet to release it. Reject the flag outright until a real Actor exists; N8a's
-	// only supported/proven mode is dry-run (plan §9).
-	if c.WorkerExecute {
-		errs = append(errs, "WORKER_EXECUTE: must be false — N8a has no real Actor yet (jobs.NotImplementedActor is a stub); setting this to true would claim issues for real and then fail after the claim, per plan §9's dry-run-only scope")
-	}
+	// N8d wires a real Actor (jobs.RealActor, act.go's CompileTriage/CompileFollowup + Act) into
+	// buildRunner, so WORKER_EXECUTE=true is now a supported mode (plan §9's N8d row) — the N8a
+	// rejection above this comment (kept only in history/commit messages) no longer applies.
+	// WORKER_EXECUTE=false remains the safe default: loop.Runner's DryRun gate short-circuits
+	// before ever calling Claims.EnsureClaimed or Act, so dry-run still sends nothing (plan §5).
 	if c.WorkerFixConfidence < 0 || c.WorkerFixConfidence > 1 {
 		errs = append(errs, "WORKER_FIX_CONFIDENCE: must be in [0,1]")
 	}
@@ -733,7 +731,22 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		cursor = nil
 	}
 
-	runner := buildRunner(cfg, client, journal, agentID, logger)
+	repoCache, err := repoctx.NewCache(cfg.WorkerRepoCacheDir, cfg.WorkerRepoRefresh, time.Now)
+	if err != nil {
+		logger.Error("repo cache init failed, TRIAGE/FOLLOW-UP run without repo tools (search_code/read_file unavailable)", "error", err)
+		repoCache = nil
+	}
+
+	runner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger)
+	if err != nil {
+		// The LLM provider wiring is invalid (bad LLM_PROVIDER/LLM_FALLBACK_PROVIDER) -- fatal to
+		// this run of runPipeline, since nothing downstream can decide a job without it. Log and
+		// return rather than os.Exit, consistent with plan §6's "invalid config keeps the process
+		// up (health server still answers, readiness fails)" posture; runWorker's health server
+		// keeps serving even though the pipeline goroutine has stopped.
+		logger.Error("building runner failed, pipeline not started", "error", err)
+		return
+	}
 	// Shared by both the runner (done/failed/skipped_* outcomes from the pipeline) and the
 	// dispatcher (superseded/skipped_* outcomes decided in the queue layer itself, before a job
 	// ever reaches Runner.Run) so plan §7's "jobs by kind×outcome" counts every journaled outcome,
@@ -859,6 +872,72 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		// here to cursorFreshnessMultiple*Interval -- see cursorFreshnessStartupWindow's doc.
 	}
 
+	// Sweep (plan §2.7/§4.3): claim heartbeat, nag, reaped-claim reconcile. It is a dry-run no-op
+	// by construction -- ClientHeldClaims/Sweep.Run only ever call PostProgress/PostQuestion/
+	// PostBatch-shaped writes via s.Client directly, so gate the whole loop behind WORKER_EXECUTE
+	// the same way the claim/act paths above are gated (plan §5: dry-run sends nothing). It runs
+	// on its own ticker, started alongside the poll loop and left to be cancelled by ctx exactly
+	// like every other goroutine runPipeline started above -- there is nothing further to "drain"
+	// beyond ctx cancellation since one sweep pass has no partial-write state of its own to finish
+	// (unlike the dispatcher's per-issue queues, which DO need an explicit Drain, see runWorker).
+	if cfg.WorkerExecute {
+		sweep := &jobs.Sweep{
+			Client:    client,
+			Journal:   journal,
+			Execute:   cfg.WorkerExecute,
+			Heartbeat: cfg.WorkerClaimHeartbeat,
+			NagAfter:  time.Duration(cfg.WorkerNagDays) * 24 * time.Hour,
+			MyAgentID: agentID,
+		}
+		// Wire the EVENT-DRIVEN reconcile arm (plan §2.7(c)): loop/queue.go dispatches a
+		// claim_released(previousAssignee=me) event as KindSweepReconcile and calls
+		// OnSweepReconcile if non-nil -- until this was set, that dispatch silently dropped the
+		// event (validator finding: ReconcileReaped was unit-tested but unreachable from main()).
+		// This is intentionally in addition to, not instead of, sweep.Run's own periodic
+		// held-claims pass (res.Reconciled) below -- this arm reacts immediately to the feed event
+		// rather than waiting up to WorkerSweepInterval, and only re-claims (never re-triages; see
+		// ReconcileReaped's doc comment for why a healthy release must never be reconciled back).
+		// Re-claiming alone is sufficient here: it restores the held claim so the NEXT feed event
+		// for this issue (e.g. question_answered) resumes through ordinary dispatch -- there is no
+		// job to re-enqueue synchronously from the reconcile itself since ReconcileReaped's whole
+		// point is "wait for the real triggering event, just don't lose the claim in the meantime".
+		// Gated behind WORKER_EXECUTE like every other mutating path (dry-run sends nothing).
+		dispatcher.OnSweepReconcile = func(e loop.Event) {
+			issueID, err := e.IssueID()
+			if err != nil {
+				logger.Error("sweep reconcile: event missing issue id", "seq", e.Seq, "error", err)
+				return
+			}
+			reclaimed, err := sweep.ReconcileReaped(ctx, issueID)
+			if err != nil {
+				logger.Error("sweep reconcile failed", "issueId", issueID, "error", err)
+				return
+			}
+			if reclaimed {
+				logger.Info("sweep reconcile: reclaimed reaped issue with open question/fix", "issueId", issueID)
+			}
+		}
+		go func() {
+			ticker := time.NewTicker(cfg.WorkerSweepInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					res := sweep.Run(ctx, jobs.ClientHeldClaims{Client: client, Journal: journal})
+					if len(res.Errors) > 0 {
+						logger.Error("sweep pass completed with errors", "heartbeats", res.Heartbeats, "nags", res.Nags, "releases", res.Releases, "reconciled", res.Reconciled, "errorCount", len(res.Errors), "firstError", res.Errors[0])
+					} else {
+						logger.Info("sweep pass complete", "heartbeats", res.Heartbeats, "nags", res.Nags, "releases", res.Releases, "reconciled", res.Reconciled)
+					}
+				}
+			}
+		}()
+	} else {
+		logger.Info("sweep disabled: WORKER_EXECUTE=false (dry-run sends nothing, plan §5)")
+	}
+
 	logger.Info("starting poll loop",
 		"workerExecute", cfg.WorkerExecute,
 		"pollInterval", cfg.WorkerPollInterval,
@@ -977,20 +1056,216 @@ func journalMaintenanceLoop(ctx context.Context, journal *state.Journal, stateDi
 	}
 }
 
+// settingsRepoResolver adapts settings.Store + a repoctx.Cache into jobs.RepoResolver
+// (TriageAdvisor) and jobs.FollowupContextResolver (FollowupAdvisor): given a projectID (or, for
+// FOLLOW-UP, an issueID it resolves to a projectID itself via GET /api/agent/issues/:id), it looks
+// up the project's repo connection + matching git credential in the settings snapshot and hands
+// the mapping to the shared repoctx.Cache, which owns the actual clone/refresh (plan §4.5).
+type settingsRepoResolver struct {
+	Client   *sentinel.Client
+	Settings *settings.Store
+	Cache    *repoctx.Cache
+}
+
+// Resolve implements jobs.RepoResolver. (nil, nil) means "no repo mapping for this project" —
+// TriageAdvisor/FollowupAdvisor both treat that as "register the read-only issue tools only".
+func (r settingsRepoResolver) Resolve(ctx context.Context, projectID string) (*repoctx.Repo, error) {
+	if r.Cache == nil {
+		return nil, nil
+	}
+	ps, ok := r.Settings.Project(projectID)
+	if !ok || ps.Repo == nil {
+		return nil, nil
+	}
+	conn := ps.Repo
+	cred, ok := r.Settings.CredentialFor(conn.Provider)
+	if !ok || !cred.Secret.Usable() {
+		return nil, fmt.Errorf("main: no usable git credential for provider %q (project %s)", conn.Provider, projectID)
+	}
+	var gitCred gitprovider.GitCredential
+	switch conn.Provider {
+	case "github":
+		if !cred.Secret.IsToken() {
+			return nil, fmt.Errorf("main: github credential for project %s is not token-shaped", projectID)
+		}
+		gitCred = gitprovider.GitHubTokenCredential(cred.Secret.Token)
+	case "bitbucket":
+		if cred.Secret.IsToken() {
+			gitCred = gitprovider.BitbucketTokenCredential(cred.Secret.Token)
+		} else {
+			gitCred = gitprovider.BitbucketBasicCredential(cred.Secret.Username, cred.Secret.AppPassword)
+		}
+	default:
+		return nil, fmt.Errorf("main: unsupported git provider %q (project %s)", conn.Provider, projectID)
+	}
+	cloneURL, err := repoctx.CloneURL(conn.Provider, conn.Owner, conn.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("main: building clone URL for project %s: %w", projectID, err)
+	}
+	key := repoctx.RepoKey{Provider: conn.Provider, Owner: conn.Owner, Repo: conn.Repo, DefaultBranch: conn.DefaultBranch}
+	return r.Cache.Get(ctx, key, cloneURL, gitCred, conn.CloneDepth)
+}
+
+// ResolveFollowupContext implements jobs.FollowupContextResolver: it fetches the issue once to
+// learn its projectId/issueType, then delegates the repo mapping to Resolve above.
+func (r settingsRepoResolver) ResolveFollowupContext(ctx context.Context, issueID string) (jobs.FollowupIssueContext, error) {
+	res, err := r.Client.GetIssue(ctx, issueID)
+	if err != nil {
+		return jobs.FollowupIssueContext{}, fmt.Errorf("main: fetching issue %s: %w", issueID, err)
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return jobs.FollowupIssueContext{}, fmt.Errorf("main: fetching issue %s: status %d: %s", issueID, res.Status, sentinel.ErrorMessage(res.Body))
+	}
+	var env struct {
+		Issue struct {
+			ProjectID string `json:"projectId"`
+			IssueType string `json:"issueType"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(res.Body, &env); err != nil {
+		return jobs.FollowupIssueContext{}, fmt.Errorf("main: decoding issue %s: %w", issueID, err)
+	}
+	repo, err := r.Resolve(ctx, env.Issue.ProjectID)
+	if err != nil {
+		return jobs.FollowupIssueContext{}, err
+	}
+	return jobs.FollowupIssueContext{ProjectID: env.Issue.ProjectID, IssueType: env.Issue.IssueType, Repo: repo}, nil
+}
+
+// projectFixSettings adapts settings.Store into jobs.ProjectFixSettings for RealActor's FIX-gate
+// lookup (plan §4.2: "fixable + confidence >= WORKER_FIX_CONFIDENCE + FIX enabled").
+type projectFixSettings struct{ Settings *settings.Store }
+
+func (p projectFixSettings) FixEnabled(projectID string) (bool, bool) {
+	ps, ok := p.Settings.Project(projectID)
+	if !ok {
+		return false, false
+	}
+	return ps.FixEnabled, true
+}
+
+// configuredSecrets collects every non-empty secret value from cfg that could plausibly leak
+// through a published field (guard.Check's verbatim-exfiltration gate, plan §4.6) — LLM API keys
+// and git credentials. Order/dedup do not matter to guard.Check.
+func configuredSecrets(cfg Config) []string {
+	var out []string
+	for _, s := range []string{
+		cfg.SentinelAgentKey,
+		cfg.LLMAPIKey,
+		cfg.LLMFallbackAPIKey,
+		cfg.GitGitHubToken,
+		cfg.GitBitbucketToken,
+		cfg.GitBitbucketAppPassword,
+	} {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// buildAdvisors constructs the real TRIAGE + FOLLOW-UP Advisors from config (plan §4.1/§4.2/§4.3):
+// llm.New for the primary provider, plus an optional fallback provider/model/key/baseURL (plan
+// §4.1's LLM_FALLBACK_* surface). A per-provider *llm.SyncBreaker is shared across both Advisors'
+// primary calls so circuit state is consistent regardless of which job kind tripped it; the
+// fallback provider (when configured) gets its own breaker, scoped separately, for the same
+// reason. Returns an error only when LLM_PROVIDER (or LLM_FALLBACK_PROVIDER, if set) names an
+// adapter llm.New cannot build — buildRunner's caller treats that as fatal-to-execute-mode, not
+// fatal-to-startup, matching plan §6's "invalid config keeps the process up" posture at the config
+// layer while still failing loudly if the LLM wiring itself is broken.
+func buildAdvisors(cfg Config, client *sentinel.Client, resolver settingsRepoResolver, logger *slog.Logger) (*jobs.TriageAdvisor, *jobs.FollowupAdvisor, error) {
+	primary, err := llm.New(cfg.LLMProvider, llm.Config{Model: cfg.LLMModel, APIKey: cfg.LLMAPIKey, BaseURL: cfg.LLMBaseURL})
+	if err != nil {
+		return nil, nil, fmt.Errorf("main: building primary LLM provider %q: %w", cfg.LLMProvider, err)
+	}
+	primaryBreaker := llm.NewSyncBreaker(sentinel.NewCircuitBreaker(sentinel.ScopeLLM(cfg.LLMProvider)))
+
+	// llm.RunLoop's breaker param gates PRIMARY calls only (fallback is consulted whenever primary
+	// is denied/fails, breaker or no breaker) — so only the primary provider needs a SyncBreaker
+	// here; a fallback-specific breaker would have nothing in RunLoop's signature to plug into.
+	var fallback llm.Chat
+	if cfg.LLMFallbackProvider != "" {
+		fb, err := llm.New(cfg.LLMFallbackProvider, llm.Config{Model: cfg.LLMFallbackModel, APIKey: cfg.LLMFallbackAPIKey, BaseURL: cfg.LLMFallbackBaseURL})
+		if err != nil {
+			return nil, nil, fmt.Errorf("main: building fallback LLM provider %q: %w", cfg.LLMFallbackProvider, err)
+		}
+		fallback = fb
+	}
+
+	triage := &jobs.TriageAdvisor{
+		Client:   client,
+		Primary:  primary,
+		Fallback: fallback,
+		Breaker:  primaryBreaker,
+		Caps: llm.Caps{
+			MaxTurns:        cfg.WorkerTriageMaxTurns,
+			MaxOutputTokens: cfg.WorkerMaxOutputTokens,
+			Timeout:         cfg.WorkerTriageTimeout,
+		},
+		Repos: resolver,
+	}
+	followup := &jobs.FollowupAdvisor{
+		Client:          client,
+		Resolver:        resolver,
+		Primary:         primary,
+		Fallback:        fallback,
+		Breaker:         primaryBreaker,
+		MaxTurns:        cfg.WorkerFollowupMaxTurns,
+		Timeout:         cfg.WorkerFollowupTimeout,
+		MaxOutputTokens: cfg.WorkerMaxOutputTokens,
+	}
+	return triage, followup, nil
+}
+
 // buildRunner assembles a loop.Runner from config and the already-resolved seams (client, journal,
-// agent identity). Extracted from runPipeline so the safety-critical WORKER_EXECUTE -> DryRun gate
-// (plan §5/§6: EXECUTE=false = dry-run, journal decisions, never send mutating calls) can be
-// exercised directly by a unit test without standing up the health server or the poll loop.
-func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, logger *slog.Logger) *loop.Runner {
+// agent identity, settings snapshot, repo cache). Extracted from runPipeline so the
+// safety-critical WORKER_EXECUTE -> DryRun gate (plan §5/§6: EXECUTE=false = dry-run, journal
+// decisions, never send mutating calls) can be exercised directly by a unit test without standing
+// up the health server or the poll loop. Returns an error only when the LLM provider wiring itself
+// is invalid (buildAdvisors) — the caller decides how to treat that (fail startup vs. degrade).
+func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger) (*loop.Runner, error) {
+	resolver := settingsRepoResolver{Client: client, Settings: settingsStore, Cache: repoCache}
+	triage, followup, err := buildAdvisors(cfg, client, resolver, logger)
+	if err != nil {
+		return nil, err
+	}
+	advisor := kindDispatchAdvisor{Triage: triage, Followup: followup}
+	actor := jobs.RealActor{
+		Client:        client,
+		Journal:       journal,
+		Fix:           projectFixSettings{Settings: settingsStore},
+		Secrets:       configuredSecrets(cfg),
+		FixConfidence: cfg.WorkerFixConfidence,
+	}
 	return &loop.Runner{
 		Journal:   journal,
 		Issues:    loop.HTTPIssueReader{Client: client},
 		Claims:    loop.HTTPClaimer{Client: client},
-		Advisor:   jobs.StubAdvisor{}, // real Advisors ship in N8d
-		Act:       jobs.NotImplementedActor{},
+		Advisor:   advisor,
+		Act:       actor,
 		DryRun:    !cfg.WorkerExecute,
 		MyAgentID: agentID,
 		Log:       logger,
+	}, nil
+}
+
+// kindDispatchAdvisor implements jobs.Advisor by routing to TriageAdvisor or FollowupAdvisor per
+// jobs.Input.Kind ("triage" | "followup", plan §9's N8d row: "hand jobs.Advisor to the Runner").
+// loop.Runner only ever constructs an Input with one of those two Kind values (loop/dispatch.go's
+// KindTriage/KindFollowUp are the only job kinds it dispatches).
+type kindDispatchAdvisor struct {
+	Triage   *jobs.TriageAdvisor
+	Followup *jobs.FollowupAdvisor
+}
+
+func (a kindDispatchAdvisor) Decide(ctx context.Context, in jobs.Input) (jobs.Decision, error) {
+	switch in.Kind {
+	case "triage":
+		return a.Triage.Decide(ctx, in)
+	case "followup":
+		return a.Followup.Decide(ctx, in)
+	default:
+		return jobs.Decision{}, fmt.Errorf("main: kindDispatchAdvisor: unknown job kind %q", in.Kind)
 	}
 }
 

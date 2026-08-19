@@ -351,24 +351,17 @@ func TestLoadConfig_NonPositiveSweepIntervalIsRejected(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_WorkerExecuteTrueIsRejected proves the validator's second finding is closed:
-// N8a wires buildRunner to jobs.NotImplementedActor{} (no real Actor exists until a later phase),
-// so WORKER_EXECUTE=true must never reach the running pipeline — it would claim every triageable
-// issue for real (loop/runner.go's ensure-claimed gates only on DryRun) and only then fail at
-// NotImplementedActor.Act, leaving the claims held with no release path. LoadConfig must reject it
-// at validation time rather than let buildRunner silently flip DryRun=false.
-func TestLoadConfig_WorkerExecuteTrueIsRejected(t *testing.T) {
+// TestLoadConfig_WorkerExecuteTrueIsAccepted proves N8d's lift of the N8a WORKER_EXECUTE=true
+// rejection: buildRunner now wires a real Actor (jobs.RealActor, act.go's compiler), so
+// WORKER_EXECUTE=true is a supported config value and must not be rejected at validation time.
+func TestLoadConfig_WorkerExecuteTrueIsAccepted(t *testing.T) {
 	_, errs := LoadConfig(fakeEnv(map[string]string{
 		"WORKER_EXECUTE": "true",
 	}))
-	found := false
 	for _, e := range errs {
 		if strings.Contains(e, "WORKER_EXECUTE") {
-			found = true
+			t.Fatalf("WORKER_EXECUTE=true: unexpected validation error: %v", e)
 		}
-	}
-	if !found {
-		t.Fatalf("expected a WORKER_EXECUTE validation error when WORKER_EXECUTE=true, got: %v", errs)
 	}
 }
 
@@ -401,10 +394,13 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{WorkerExecute: tc.workerExecute}
+			cfg := Config{WorkerExecute: tc.workerExecute, LLMProvider: "openai", LLMModel: "gpt-4o-mini"}
 			client := sentinel.NewClient("http://example.invalid", "key")
 			journal := state.OpenJournal(t.TempDir() + "/jobs.journal")
-			runner := buildRunner(cfg, client, journal, "agent-1", slog.New(slog.NewTextHandler(io.Discard, nil)))
+			runner, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatalf("buildRunner: %v", err)
+			}
 			if runner.DryRun != tc.wantDryRun {
 				t.Fatalf("WorkerExecute=%v: runner.DryRun = %v, want %v", tc.workerExecute, runner.DryRun, tc.wantDryRun)
 			}
@@ -1009,6 +1005,8 @@ func TestRunApp_ReadyzComposition_EndToEnd(t *testing.T) {
 		WorkerHealthAddr:    healthAddr,
 		WorkerStateDir:      t.TempDir(),
 		WorkerBackfillHours: 24,
+		LLMProvider:         "openai",
+		LLMModel:            "test-model",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1134,6 +1132,8 @@ func TestRunApp_ReadyzStaysNotReady_WhenSentinelUnreachable(t *testing.T) {
 		WorkerHealthAddr:    healthAddr,
 		WorkerStateDir:      t.TempDir(),
 		WorkerBackfillHours: 24,
+		LLMProvider:         "openai",
+		LLMModel:            "test-model",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1232,6 +1232,8 @@ func TestRunApp_MetricsWiredEndToEnd(t *testing.T) {
 		WorkerHealthAddr:    healthAddr,
 		WorkerStateDir:      stateDir,
 		WorkerBackfillHours: 24,
+		LLMProvider:         "openai",
+		LLMModel:            "test-model",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1446,5 +1448,83 @@ func TestRunPipeline_ReadyzCarriesSettingsReadinessDetail(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("runPipeline did not exit within 3s of ctx cancellation")
+	}
+}
+
+// --- OnSweepReconcile wiring (validator finding: Sweep.ReconcileReaped was unit-tested in
+// isolation but unreachable from main() -- loop/queue.go dispatches a
+// claim_released(previousAssignee=me) event as KindSweepReconcile and calls
+// Dispatcher.OnSweepReconcile only if non-nil, and runPipeline's dispatcher construction never set
+// that hook) ---
+
+// TestRunPipeline_WiresOnSweepReconcile_ReclaimsIssueWithOpenQuestion drives the REAL runApp
+// (exactly as main() calls it) against a fake sentinel server, feeding one claim_released event
+// for an issue the journal shows an open (unanswered) question for. It proves the fix: the event
+// reaches Sweep.ReconcileReaped and results in a re-claim POST, which was previously impossible
+// because OnSweepReconcile was nil and loop/queue.go silently dropped the dispatch.
+func TestRunPipeline_WiresOnSweepReconcile_ReclaimsIssueWithOpenQuestion(t *testing.T) {
+	const issueID = "iss-reaped-1"
+	var claimHits int32
+	var eventServed int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.CompareAndSwapInt32(&eventServed, 0, 1) {
+			// One claim_released event, previousAssignee == us, reason == stale (§2.7(c)).
+			_, _ = w.Write([]byte(`{"events":[{"seq":1,"eventType":"claim_released","actorId":"system","actorType":"system","createdAt":"2026-08-19T00:00:00Z","issue":{"id":"` + issueID + `","status":"unresolved"},"newValue":{"previousAssignee":"agent-1","reason":"stale"}}],"hasMore":false,"cursor":1}`))
+			return
+		}
+		// Subsequent polls: nothing new.
+		_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":1}`))
+	})
+	mux.HandleFunc("/api/agent/issues/"+issueID+"/claim", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&claimHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"claimed":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	stateDir := t.TempDir()
+
+	// Pre-seed the cursor so runPipeline skips Bootstrap entirely and goes straight to polling
+	// (Bootstrap has its own well-tested path; this test is only about the reconcile wiring).
+	if err := state.SaveCursor(stateDir+"/cursor.json", 0); err != nil {
+		t.Fatalf("SaveCursor: %v", err)
+	}
+	// Pre-seed the journal with an open question for issueID -- ReconcileReaped only re-claims
+	// when the journal shows an open question or open fix (a healthy release must never be
+	// reconciled back, per its doc comment).
+	journal := state.OpenJournal(stateDir + "/jobs.journal")
+	if err := journal.Append(state.Record{JobID: "followup:" + issueID + ":1", IssueID: issueID, Kind: "followup", State: state.StateQuestioned}); err != nil {
+		t.Fatalf("seed journal: %v", err)
+	}
+
+	cfg := Config{
+		WorkerEnabled:        true,
+		WorkerExecute:        true,
+		SentinelURL:          srv.URL,
+		SentinelAgentKey:     "test-key",
+		WorkerPollInterval:   5 * time.Millisecond,
+		WorkerSweepInterval:  time.Hour, // never fires during the test -- only the event-driven arm should
+		WorkerClaimHeartbeat: 12 * time.Hour,
+		WorkerNagDays:        3,
+		WorkerHealthAddr:     "127.0.0.1:0",
+		WorkerStateDir:       stateDir,
+		LLMProvider:          "openai",
+		LLMModel:             "gpt-4o-mini",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	if got := atomic.LoadInt32(&claimHits); got == 0 {
+		t.Fatalf("expected the claim_released event (open question in journal) to reach Sweep.ReconcileReaped and re-claim the issue via OnSweepReconcile, got 0 claim POSTs -- the event-driven reconcile arm is unwired")
 	}
 }

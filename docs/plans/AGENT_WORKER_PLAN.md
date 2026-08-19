@@ -827,6 +827,86 @@ per-job Repo (plan §4.5: "Expose as Advisor ToolFuncs ... the N8d Advisors cons
 `repoctx` suite proves the confinement guards and the tool binding work in isolation, **not** that
 any running-worker code path ever reads a repo file for the model, until N8d lands.
 
+**N8d wiring status (supersedes the N8a/N8b/N8c "unwired seam" notes above for `llm`, `guard`,
+`repoctx`)**: `main.go`'s `buildRunner`/`buildAdvisors` now construct real `jobs.TriageAdvisor` +
+`jobs.FollowupAdvisor` (routed by a small `kindDispatchAdvisor{Triage, Followup}` that implements
+`jobs.Advisor` and switches on `Input.Kind`) and hand them to `loop.Runner` in place of
+`jobs.StubAdvisor{}`. `llm.New(cfg.LLMProvider, ...)` builds the primary Chat (+ optional
+`LLM_FALLBACK_*` fallback), shared across both Advisors via one `*llm.SyncBreaker`
+(`sentinel.ScopeLLM(provider)`). `repoctx.NewCache` is constructed once in `runPipeline` and handed
+to both Advisors through `settingsRepoResolver` (implements `jobs.RepoResolver` for TRIAGE and
+`jobs.FollowupContextResolver` for FOLLOW-UP), which resolves each project's repo mapping +
+matching git credential out of the `settings.Store` snapshot and defers the actual clone/refresh to
+the shared `Cache` — so `search_code`/`read_file` are now live Advisor tools whenever a project has
+a repo connection. `jobs.RealActor` (new: `jobs/actor.go`) is now `loop.Runner.Act`: it resolves
+`jobDID -> issueId` from the journal (the record `Run` just appended), fetches the issue once for
+`issueType`/`projectId`, consults a `projectFixSettings` adapter over `settings.Store` for the C15
+FIX-enablement gate, and calls the already-shipped `CompileTriage`/`CompileFollowup` + `Act`
+(`act.go`) — so `guard.Check`/`guard.WrapUntrusted` now run on every published field before a batch
+is ever sent. `RealActor.Act` walks the batch response's `results[]` itself
+(`checkBatchResults`, `jobs/actor.go`, via `sentinel.ClassifyBatch`/`ClassifyOp` per op's
+`compiled.Ops[i].Op`) — a batch is always HTTP 200 with per-op outcomes (C3), so a non-droppable
+op failure (e.g. a lost `issues.comment`, a permanent `issues.report.severity` rejection) now
+returns an error from `Act` instead of being journaled as full success; only `ClassSuccess` and
+the relation-409 `ClassConflictDroppable` case pass. Unit-proven in `jobs/actor_test.go`
+(`TestCheckBatchResults_*`). `jobs.ClientHeldClaims` (new: `jobs/sweep.go`) implements `jobs.HeldClaimSource`
+over `GET /api/agent/issues?claimed=me` + the journal's per-issue last-activity view, and
+`runPipeline` now starts a `jobs.Sweep` ticker (gated behind `WORKER_EXECUTE`, matching the
+claim/act dry-run posture) alongside the poll loop. `WORKER_EXECUTE=true` is accepted by
+`LoadConfig` as of N8d (the N8a rejection is gone) — `loop.Runner.DryRun` (`!cfg.WorkerExecute`)
+still short-circuits before `Claims.EnsureClaimed`/`Act` are ever called, so `WORKER_EXECUTE=false`
+continues to send nothing. Proven end-to-end: `tests/e2e/agent_worker_test.go`'s U40 (`-tags=e2e`,
+`SENTINEL_E2E=1`, against the live compose stack, `LLM_BASE_URL` pointed at an in-process httptest
+fake OpenAI-compatible Advisor) — ingest a fresh `system_error`, the worker claims it, posts
+exactly one TRIAGE comment, sets no severity (C8), and a `kill -9` mid-job + restart replays the
+journaled decision without a second comment (CONTEXT.md's Replay contract). **U41 (needs_info
+blocking-question flow, `report_created`/user_report severity, FOLLOW-UP reply after a user
+reply) is now WRITTEN** (`TestU41_WorkerFollowupNeedsInfoThenReply`, reusing U40's
+`buildWorkerBinary`/`fakeAdvisorServer`/`startWorker`/`killNow` scaffolding plus a
+`schemaNameOf` helper that keys the fake Advisor's script off the OpenAI
+`response_format.json_schema.name` field — `"triage_decision"` vs. `"followup_decision"` — since
+that is the only signal distinguishing the two Advisors on the wire): a `user_report` fixture
+drives a `needs_info` TRIAGE decision (severity set, C8), `kill -9` timed at the first sighting of
+the blocking question + restart proves the idempotency guard (exactly one blocking question,
+Advisor not re-consulted, claim kept), then a real user reply drives a FOLLOW-UP `reply` decision
+whose comment lands. **U40 and U41 have both been run against the live compose stack** (dashboard
+on :13000, ingestor on :18080) and are green: `SENTINEL_E2E=1 INGESTOR_URL=http://localhost:18080
+DASHBOARD_URL=http://localhost:13000 go test -tags=e2e ./tests/e2e/ -run 'TestU40|TestU41' -v` →
+`--- PASS: TestU40_WorkerTriageSystemErrorAndJournalReplay`, `--- PASS:
+TestU41_WorkerFollowupNeedsInfoThenReply`. (Run this command *without* `GOWORK=off` — `tests/e2e`
+is the root module and needs workspace mode to import `packages/sdk-go`; `GOWORK=off` fails the
+build here, unlike the `go-root`/`go-sdk`/`go-migrations` CI jobs which deliberately pin it off,
+see A2.) U41's severity wait must check for the worker's replayed value (`*severity == "high"`),
+not merely non-nil — the fixture seeds `severity:"medium"` up front (C8), so a non-nil check
+returns on the very first poll before the kill-9/restart replay finishes writing the batch.
+Remaining unwired seams after N8d: `gitprovider.CreatePR`/
+`PRStatus` and the FIX runner (`FIX_EXECUTOR_CMD`, workspaces, PR flow — **N8f**), and `keyguard`
+(expiry-driven rotation — **N8e**). The sweep's event-driven reconcile arm
+(`Sweep.ReconcileReaped`, §2.7(c)) was also unwired as of the first N8d pass — `loop/queue.go`
+dispatches a `claim_released(previousAssignee=me)` event as `KindSweepReconcile` and calls
+`Dispatcher.OnSweepReconcile` if non-nil, but `main.go`'s dispatcher construction never set that
+hook, so the dispatch silently dropped (`ReconcileReaped` was unit-tested in isolation but
+unreachable from `main()` — the B3 pattern). Fixed in the same N8d pass: `runPipeline` now sets
+`dispatcher.OnSweepReconcile` (gated behind `WORKER_EXECUTE`, alongside the periodic held-claims
+pass) to call `ReconcileReaped` for the event's issue and log the outcome; it only re-claims (never
+re-triages), leaving the next real feed event to resume ordinary dispatch. The sweep is now fully
+wired: heartbeat + nag (periodic), reconcile (both periodic via `Sweep.Run` and event-driven via
+this hook).
+
+**Correction (N8d follow-up sweep)**: the paragraph above overclaimed reconcile as fully live. The
+*wiring* (`OnSweepReconcile`, the periodic pass) was live, but `ReconcileReaped`'s open-question
+arm depended on `Journal.HasOpenQuestion`, and nothing ever journaled a `state.StateQuestioned`
+record — `Act` (`jobs/act.go`/`jobs/actor.go`) compiled and sent a blocking `PostQuestion` call but
+never wrote the plan §2.2 "questioned" marker recording its returned `commentId`. `HasOpenQuestion`
+was therefore always `false` against a real journal, so the reconcile path was tested (with a
+hand-injected `StateQuestioned` record) but unreachable end-to-end — the same B3 shape as the
+`OnSweepReconcile` gap just above. Fixed: `RealActor.Act` now appends `state.StateQuestioned`
+(payload `{commentId}`) immediately after a successful `PostQuestion`, so `HasOpenQuestion` and
+`resolveWaitingSince`'s journal fallback are both live off real jobs. Precisely: **questioned-
+reconcile is live as of this fix; fix-PR reconcile (`hasOpenFix`) remains the documented N8f seam**
+— `hasOpenFix` always returns `false` until `jobs/fix.go` starts journaling `KindFix` records, which
+is out of scope here.
+
 ## 10. Risks & consciously-deferred
 
 - **Residual duplicate window** (shrunk by N9): idempotency keys cover comments/progress/questions

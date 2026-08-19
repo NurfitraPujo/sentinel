@@ -478,3 +478,26 @@ credential.helper disk persistence, §4.6(c) filler-period-7 verbatim bypass (bl
 floor dilution, slog/%#v credential leak — every one fixed with a red-first exploit-reproduction
 test + mutation proof. gitprovider+settings wired into main; repoctx+guard wired into the Advisor
 toolchain in N8d; CreatePR/PRStatus invoked in N8f. Gate green incl. -race + gofmt.
+
+## 2026-08-19 — N8d: TRIAGE + FOLLOW-UP Advisors (branch feat/agent-worker)
+
+The phase where the worker FIRST DECIDES. Wired N8b llm + N8c repoctx + N8c guard into real
+Advisors. jobs/toolchain.go: assembles llm read-tools (get_issue/get_occurrences/list_similar/
+get_projects + repoctx search_code/read_file when repo-mapped) over the sentinel client, tracks
+every tool output (ToolOutputRecorder) for guard.Check verbatim measurement, WrapUntrusted's all
+untrusted content into prompts. jobs/act.go: decision→batch compiler — ordered ops (§2.3), C4
+idempotency_key <jobId>:<opIndex>, guard.Check gate on every published field before send, C7 (no
+in_progress) + C8 (severity user_report only) enforced, dry-run journals + sends nothing, unknown
+disposition/action → typed error. TRIAGE Advisor (§4.2 six dispositions incl. needs_human;
+needs_info KEEPS claim; fixable→FIX enqueue seam gated on C15 fixEnabled). FOLLOW-UP Advisor +
+sweep (§2.7 heartbeat/nag/reaped-reconcile, now with Execute dry-run gate + per-op release check +
+per-episode nag keys). RealActor journals StateQuestioned(commentId) after a blocking question
+(§2.2) — was the one major: without it HasOpenQuestion/ReconcileReaped were tested-but-unreachable
+(B3). main.go wires real Advisors + RealActor (StubAdvisor gone), lifts the WORKER_EXECUTE=true
+rejection, starts the sweep with Execute=cfg.WorkerExecute. E2E U40/U41 (tests/e2e/
+agent_worker_test.go, build GOWORK=off, fake OpenAI Advisor in-process, requireStack under
+SENTINEL_E2E=1): PROVEN GREEN against the live compose stack — U40 7.87s (triage a real ingested
+system_error, guarded comment lands, no severity, echo-suppressed, kill -9 → one comment), U41
+4.26s (needs_info → one question, kill -9 between question+batch → no dup, severity set, claim
+kept, user reply → followup reply). 12 worker packages green incl. -race. llm/repoctx/guard now
+WIRED; remaining seams: gitprovider CreatePR/PRStatus + FIX runner (N8f), keyguard (N8e).

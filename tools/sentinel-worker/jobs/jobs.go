@@ -20,6 +20,15 @@ type Decision struct {
 	// the job kind that produced it.
 	Kind string          `json:"kind"`
 	Raw  json.RawMessage `json:"raw"`
+	// ToolOutputs is the FULL corpus of raw read-tool results (read_file/search_code/get_issue/
+	// etc.) gathered while producing this Decision, via toolchain.go's ToolOutputRecorder (plan
+	// §4.6(c)). It is journaled alongside the decision (part of the Advised record's Payload) so
+	// that Act — whether invoked immediately or replayed later from the journal without ever
+	// re-consulting the Advisor (CONTEXT.md's Replay contract) — can hand the SAME corpus to
+	// ActContext.ToolOutputs for guard.Check's verbatim-exfiltration gate. Without this field the
+	// corpus is ephemeral to Decide and the gate downstream runs against an empty slice, making it
+	// a no-op.
+	ToolOutputs []string `json:"toolOutputs,omitempty"`
 }
 
 // Input is what an Advisor needs to produce a Decision: enough job identity for prompt construction
