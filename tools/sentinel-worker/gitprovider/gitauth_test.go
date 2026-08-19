@@ -240,7 +240,20 @@ func TestWriteAskpassHelper_ScriptAnswersFromEnv(t *testing.T) {
 }
 
 func TestRunGit_HelperDirCleanedUp(t *testing.T) {
-	before, _ := os.ReadDir(os.TempDir())
+	// Assert only that OUR RunGit leaves no askpass dir behind — diff after against before, so a
+	// concurrent gitprovider test's in-flight sentinel-askpass-* dir (CI runs package test binaries
+	// in parallel, and this scans the SHARED os.TempDir()) can never be miscounted as our leak.
+	askpassBefore := func() map[string]bool {
+		m := map[string]bool{}
+		entries, _ := os.ReadDir(os.TempDir())
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "sentinel-askpass-") {
+				m[e.Name()] = true
+			}
+		}
+		return m
+	}
+	before := askpassBefore()
 	dir := t.TempDir()
 	var buf bytes.Buffer
 	redactor := NewRedactor(&buf, secretToken)
@@ -251,13 +264,12 @@ func TestRunGit_HelperDirCleanedUp(t *testing.T) {
 	after, _ := os.ReadDir(os.TempDir())
 	leaked := 0
 	for _, e := range after {
-		if strings.HasPrefix(e.Name(), "sentinel-askpass-") {
+		if strings.HasPrefix(e.Name(), "sentinel-askpass-") && !before[e.Name()] {
 			leaked++
 		}
 	}
-	_ = before
 	if leaked != 0 {
-		t.Fatalf("expected sentinel-askpass- temp dirs to be cleaned up, found %d", leaked)
+		t.Fatalf("expected our RunGit's sentinel-askpass- temp dir to be cleaned up, found %d new", leaked)
 	}
 }
 
