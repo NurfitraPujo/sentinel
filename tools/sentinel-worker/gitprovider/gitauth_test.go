@@ -240,20 +240,17 @@ func TestWriteAskpassHelper_ScriptAnswersFromEnv(t *testing.T) {
 }
 
 func TestRunGit_HelperDirCleanedUp(t *testing.T) {
-	// Assert only that OUR RunGit leaves no askpass dir behind — diff after against before, so a
-	// concurrent gitprovider test's in-flight sentinel-askpass-* dir (CI runs package test binaries
-	// in parallel, and this scans the SHARED os.TempDir()) can never be miscounted as our leak.
-	askpassBefore := func() map[string]bool {
-		m := map[string]bool{}
-		entries, _ := os.ReadDir(os.TempDir())
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "sentinel-askpass-") {
-				m[e.Name()] = true
-			}
-		}
-		return m
-	}
-	before := askpassBefore()
+	// Isolate this test's temp namespace so the scan sees ONLY our own RunGit's askpass dir.
+	// RunGit creates its helper dir via os.MkdirTemp("", "sentinel-askpass-"), which resolves the
+	// base from $TMPDIR at call time; pointing TMPDIR at a private dir means no other process can
+	// pollute the scan. This matters because `go test ./...` runs package test binaries in
+	// PARALLEL and jobs/ + repoctx/ also call RunGit — a concurrent sibling process mid-RunGit
+	// otherwise leaves a sentinel-askpass-* dir in the shared os.TempDir() that a global scan
+	// miscounts as our leak (green locally, red in CI). No gitprovider test uses t.Parallel, so
+	// t.Setenv is safe here.
+	isoTmp := t.TempDir()
+	t.Setenv("TMPDIR", isoTmp)
+
 	dir := t.TempDir()
 	var buf bytes.Buffer
 	redactor := NewRedactor(&buf, secretToken)
@@ -261,15 +258,15 @@ func TestRunGit_HelperDirCleanedUp(t *testing.T) {
 	if err := RunGit(context.Background(), dir, GitHubTokenCredential(secretToken), redactor, "init", "-b", "main"); err != nil {
 		t.Fatalf("RunGit init: %v", err)
 	}
-	after, _ := os.ReadDir(os.TempDir())
+	entries, _ := os.ReadDir(isoTmp)
 	leaked := 0
-	for _, e := range after {
-		if strings.HasPrefix(e.Name(), "sentinel-askpass-") && !before[e.Name()] {
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "sentinel-askpass-") {
 			leaked++
 		}
 	}
 	if leaked != 0 {
-		t.Fatalf("expected our RunGit's sentinel-askpass- temp dir to be cleaned up, found %d new", leaked)
+		t.Fatalf("expected our RunGit's sentinel-askpass- temp dir to be cleaned up, found %d", leaked)
 	}
 }
 

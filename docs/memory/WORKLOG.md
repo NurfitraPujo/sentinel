@@ -559,8 +559,10 @@ DEPLOYMENT.md §9, AGENT_WORKER_PLAN.md §9 N8g row.
 
 PR #32 (feat/agent-worker): all jobs green except sentinel-worker on the first run.
 TestRunGit_HelperDirCleanedUp asserted a GLOBAL invariant (zero sentinel-askpass-* dirs anywhere
-in os.TempDir()) — green locally, red in CI because CI runs package test binaries in parallel and
-a sibling test's in-flight askpass dir was miscounted as a leak. Fixed by diffing after-vs-before
-(the captured `before` was being discarded). Lesson: a test that scans a SHARED namespace
+in os.TempDir()) — green locally, red in CI because `go test ./...` runs package test BINARIES in parallel, and jobs/ + repoctx/ also call RunGit, so
+a concurrent sibling PROCESS mid-RunGit left a sentinel-askpass-* dir in the shared os.TempDir()
+that the global scan miscounted. A before/after diff did NOT fix it (the polluter is a separate
+process creating dirs during the window); the real fix isolates TMPDIR (t.Setenv) so the scan sees
+only this test's own RunGit dir. Lesson: a test that scans a SHARED namespace
 (os.TempDir, global ports, a shared DB) and asserts an absolute count is a latent CI flake — scope
 the assertion to what the test itself created.
