@@ -75,6 +75,11 @@ func newTestRunner(t *testing.T, issues IssueReader, claims Claimer, advisor job
 		Act:       act,
 		DryRun:    dryRun,
 		MyAgentID: me,
+		// MaxInlaneRetries: 1 keeps every EXISTING single-shot-fake test's semantics unchanged (one
+		// attempt, no retry, no real backoff sleep) -- tests that specifically exercise N8e's
+		// in-lane retry ladder build their own *Runner directly with a fake SleepCtx instead of
+		// this helper (see TestRunner_InlaneRetry_* below).
+		MaxInlaneRetries: 1,
 	}, j
 }
 
@@ -541,13 +546,16 @@ func TestRunner_TransientIssueReadError_JournalsTerminalFailedAndCountsOutcome(t
 		t.Fatalf("expected terminal state %q, got %q", state.StateFailed, latest.State)
 	}
 
+	// N8e hardening: a 503-classified failure is transient, so the outcome string is
+	// "failed_transient" (not the bare "failed" this test used before the plan §7 transient/
+	// permanent split existed) -- see journalTransientFailure.
 	found := false
 	for _, o := range outcomes {
-		if o == string(KindTriage)+":failed" {
+		if o == string(KindTriage)+":failed_transient" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected OnOutcome(%q, \"failed\") to fire, got %v", KindTriage, outcomes)
+		t.Fatalf("expected OnOutcome(%q, \"failed_transient\") to fire, got %v", KindTriage, outcomes)
 	}
 }

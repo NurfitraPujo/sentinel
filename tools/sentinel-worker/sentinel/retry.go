@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -329,10 +330,16 @@ func ScopeGit(provider string) string { return "git:" + provider }
 
 // CircuitBreaker tracks consecutive-failure state for one dependency scope. NowFunc is injectable
 // so tests can control time without real sleeps; it defaults to time.Now when nil.
+//
+// CircuitBreaker is safe for concurrent use: the dispatcher shares ONE instance per scope across
+// every per-issue runner goroutine (plan §2.4 "SyncBreaker (one shared instance)") plus the gauge
+// publisher's concurrent State() reads, so all four methods take an internal mutex. NowFunc itself
+// must still be safe to call concurrently (time.Now is; injected fakes in tests must be too).
 type CircuitBreaker struct {
 	Scope   string
 	NowFunc func() time.Time
 
+	mu                  sync.Mutex
 	state               CircuitState
 	consecutiveFailures int
 	openedAt            time.Time
@@ -357,6 +364,8 @@ func (b *CircuitBreaker) now() time.Time {
 // has elapsed. This is a pure read (repeated calls don't consume the single probe slot); Allow is
 // what actually grants the probe.
 func (b *CircuitBreaker) State() CircuitState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.state == CircuitOpen && !b.probing && b.now().Sub(b.openedAt) >= halfOpenProbeInterval {
 		return CircuitHalfOpen
 	}
@@ -368,6 +377,8 @@ func (b *CircuitBreaker) State() CircuitState {
 // (marking it the in-flight probe) and blocks any others until that probe resolves via
 // RecordSuccess/RecordFailure.
 func (b *CircuitBreaker) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	switch b.state {
 	case CircuitClosed:
 		return true
@@ -388,6 +399,8 @@ func (b *CircuitBreaker) Allow() bool {
 // RecordSuccess resets failure tracking and closes the circuit — a successful half-open probe
 // closes it, same as any other success.
 func (b *CircuitBreaker) RecordSuccess() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.consecutiveFailures = 0
 	b.state = CircuitClosed
 	b.probing = false
@@ -398,6 +411,8 @@ func (b *CircuitBreaker) RecordSuccess() {
 // consecutive-failure count (the circuit was already open; this is a probe result, not a new
 // streak).
 func (b *CircuitBreaker) RecordFailure() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.state == CircuitOpen && b.probing {
 		b.openedAt = b.now()
 		b.probing = false

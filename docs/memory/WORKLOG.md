@@ -501,3 +501,20 @@ system_error, guarded comment lands, no severity, echo-suppressed, kill -9 → o
 4.26s (needs_info → one question, kill -9 between question+batch → no dup, severity set, claim
 kept, user reply → followup reply). 12 worker packages green incl. -race. llm/repoctx/guard now
 WIRED; remaining seams: gitprovider CreatePR/PRStatus + FIX runner (N8f), keyguard (N8e).
+
+## 2026-08-19 — N8e: keyguard + failure-taxonomy hardening (branch feat/agent-worker)
+
+keyguard: two KeyStore backends (file: agent-key.json 0600 tmp+rename, overrides env bootstrap;
+kubernetes-secret: read mounted volume, rotate via K8s API PATCH with SA token — tested vs
+httptest fake apiserver). Three rotation triggers (C6): expiry-window, null-expiry age via /self
+key.createdAt (C13) with a local-record fallback when server createdAt is null, on-401 once.
+PERSIST-BEFORE-USE (fail the store write → old key still used, mutation-proved); secret never
+logged/journaled/snapshotted; read-only store disables rotation; sidecar goroutine + on-401 hook,
+drained on shutdown; runs regardless of WORKER_EXECUTE. Hardening: in-lane transient retry
+(re-drive through BackoffForAttempt without leaving the per-issue queue, WORKER_MAX_INLANE_RETRIES=5,
+ctx-cancel prompt); 429 honors Retry-After, consumes an attempt, does NOT trip the sentinel-api
+circuit (§2.4 — was a real bug, 5×429 would stall all jobs 2m); sentinel-api circuit gates execution;
+C14 tombstone/404 → skipped(deleted). e2e U42 (rotation) PROVEN GREEN vs live stack. 12 packages
+green incl -race; U40 5.56s / U41 4.04s / U42 3.59s all --- PASS. Remaining seam: gitprovider
+CreatePR/PRStatus + FIX runner (N8f). Snapshot-tarball key exclusion is a documented contract with
+no tarball code yet (s3 snapshotter deferred) — enforce when it lands.

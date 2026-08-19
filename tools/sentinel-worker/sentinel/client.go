@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,7 +62,6 @@ func ClassifyStatus(status int) int {
 // callers decide for themselves how to parse/print the json.RawMessage they get back.
 type Client struct {
 	BaseURL string
-	Key     string
 	HTTP    *http.Client
 
 	// OnAuthStatus, when non-nil, is called after every Do() envelope response with true for a 2xx
@@ -71,15 +71,39 @@ type Client struct {
 	// statuses (403, 404, 5xx, ...) are left alone -- they are not evidence about THIS credential's
 	// validity one way or the other.
 	OnAuthStatus func(ok bool)
+
+	// keyMu guards key. keyguard's Guard sidecar goroutine calls SetKey concurrently with every
+	// other goroutine sharing this Client (poll loop, dispatcher, sweep, settings refresh) calling
+	// Do -- a plain string field here was a data race (proven with -race: concurrent SetKey+Do
+	// produced a torn read of the Authorization header). Do NOT read/write key directly; use
+	// SetKey/getKey so every access goes through the lock.
+	keyMu sync.RWMutex
+	key   string
 }
 
-// NewClient builds a Client. The key is read fresh from Client.Key on every call, not captured at
+// SetKey swaps the bearer credential used by all FUTURE requests. Safe to call concurrently with
+// Do from any goroutine -- this is exactly what keyguard's rotation swap does (plan §2.5,
+// persist-before-use).
+func (c *Client) SetKey(key string) {
+	c.keyMu.Lock()
+	c.key = key
+	c.keyMu.Unlock()
+}
+
+// getKey returns the current bearer credential. Safe to call concurrently with SetKey.
+func (c *Client) getKey() string {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.key
+}
+
+// NewClient builds a Client. The key is read fresh via getKey on every call, not captured at
 // construction time — this lets keyguard (plan §2.5) swap the in-memory key after a rotation
 // without callers needing to rebuild the client.
 func NewClient(baseURL, key string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		Key:     key,
+		key:     key,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -178,7 +202,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("Authorization", "Bearer "+c.getKey())
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -304,6 +328,16 @@ func (c *Client) ListProjects(ctx context.Context) (*Result, error) {
 // GetSelf calls GET /api/agent/self (C13's key.createdAt lives here; keyguard's age fallback).
 func (c *Client) GetSelf(ctx context.Context) (*Result, error) {
 	res, _, err := c.Do(ctx, "GET", "/api/agent/self", nil, nil)
+	return res, err
+}
+
+// RotateKey calls POST /api/agent/key/rotate (plan §2.5, C6). The response body carries the new
+// secret ONCE — the caller (keyguard) MUST durably persist it before swapping it into any live
+// Client.Key (persist-before-use), and MUST NEVER log or journal the raw Result.Body this returns.
+// The old key stays valid for a 24h grace window per C6, so a crash between rotate and persist is
+// recoverable (keyguard re-rotates on restart against the still-valid old key).
+func (c *Client) RotateKey(ctx context.Context) (*Result, error) {
+	res, _, err := c.Do(ctx, "POST", "/api/agent/key/rotate", nil, map[string]interface{}{})
 	return res, err
 }
 
@@ -468,7 +502,7 @@ func (c *Client) UploadFile(ctx context.Context, path string, fileReader io.Read
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("Authorization", "Bearer "+c.getKey())
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
 	resp, err := c.HTTP.Do(req)

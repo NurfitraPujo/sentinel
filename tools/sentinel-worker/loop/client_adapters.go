@@ -84,6 +84,11 @@ func (c HTTPClaimer) EnsureClaimed(ctx context.Context, issueID string) (bool, s
 		}
 		return false, claimedBy, nil
 	default:
-		return false, "", fmt.Errorf("POST /api/agent/issues/%s/claim: %d %s", issueID, res.Status, sentinel.ErrorMessage(res.Body))
+		// Wrapped as *sentinel.StatusError (not a bare fmt.Errorf), same reasoning as
+		// HTTPIssueReader.GetIssue above: a 404 here (issue deleted between the event and the job,
+		// C14) must classify as ClassGone so Runner.Run's in-lane retry/tombstone handling (N8e)
+		// can tell it apart from a genuine transient 5xx instead of retrying (or journaling
+		// `failed`) a deletion forever.
+		return false, "", fmt.Errorf("POST /api/agent/issues/%s/claim: %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
 	}
 }

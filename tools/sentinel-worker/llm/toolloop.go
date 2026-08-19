@@ -108,13 +108,12 @@ func (e *CircuitOpenError) Error() string {
 }
 
 // BreakerGate is the minimal circuit-breaker surface RunLoop needs (Allow/RecordSuccess/
-// RecordFailure). It exists so RunLoop does not take a *sentinel.CircuitBreaker directly:
-// sentinel.CircuitBreaker (sentinel/retry.go) has no internal mutex, and loop/queue.go runs
-// Advisor loops "concurrently across N runners" (WORKER_CONCURRENCY) that share one breaker per
-// provider (per this file's own doc comment on "one breaker per configured provider") — calling
-// Allow/RecordSuccess/RecordFailure on the same *sentinel.CircuitBreaker from multiple goroutines
-// is a data race. Callers MUST share a *SyncBreaker (below), never the raw *sentinel.CircuitBreaker,
-// across concurrent RunLoop calls.
+// RecordFailure). It exists so RunLoop does not take a *sentinel.CircuitBreaker directly: even
+// though sentinel.CircuitBreaker (sentinel/retry.go) is now internally mutex-guarded and safe for
+// concurrent Allow/RecordSuccess/RecordFailure/State calls, BreakerGate additionally needs
+// wasProbe — atomically detecting "this Allow() call consumed the single half-open probe slot" —
+// which the raw type does not expose. Callers share a *SyncBreaker (below) across concurrent
+// RunLoop calls for that reason, not because the raw type would race.
 // BreakerGate.Allow reports whether a call may proceed, and separately whether granting it
 // consumed the breaker's single half-open probe slot. wasProbe matters because
 // sentinel.CircuitBreaker only clears its probing flag via RecordSuccess/RecordFailure (see
@@ -127,12 +126,11 @@ type BreakerGate interface {
 	RecordFailure()
 }
 
-// SyncBreaker wraps a *sentinel.CircuitBreaker with a mutex so every Allow/RecordSuccess/
-// RecordFailure call is serialized, making it safe to share one instance across concurrently
-// running RunLoop calls (loop/queue.go's per-runner goroutines). Build one per configured provider
-// via NewSyncBreaker(sentinel.NewCircuitBreaker(sentinel.ScopeLLM(provider))) and pass the same
-// *SyncBreaker to every RunLoop call for that provider — sharing the underlying
-// *sentinel.CircuitBreaker directly instead is the race this type exists to prevent.
+// SyncBreaker wraps a *sentinel.CircuitBreaker to additionally serialize the State()+Allow() pair
+// SyncBreaker.Allow performs, so the wasProbe detection below is atomic even though the underlying
+// sentinel.CircuitBreaker is itself safe for plain concurrent use. Build one per configured
+// provider via NewSyncBreaker(sentinel.NewCircuitBreaker(sentinel.ScopeLLM(provider))) and pass the
+// same *SyncBreaker to every RunLoop call for that provider.
 type SyncBreaker struct {
 	mu sync.Mutex
 	b  *sentinel.CircuitBreaker
@@ -194,9 +192,10 @@ func (e *TransientError) Unwrap() error { return e.Err }
 // and records primary-call outcomes under its scope. Build it via
 // llm.NewSyncBreaker(sentinel.NewCircuitBreaker(sentinel.ScopeLLM(provider))), one *SyncBreaker per
 // configured provider, and pass the SAME *SyncBreaker to every concurrent RunLoop call for that
-// provider — loop/queue.go runs Advisor loops "concurrently across N runners"
-// (WORKER_CONCURRENCY), and the raw *sentinel.CircuitBreaker has no internal mutex, so sharing it
-// directly across goroutines is a data race; SyncBreaker exists to make sharing safe. Plan §4.1:
+// provider — loop/queue.go runs Advisor loops "concurrently across N runners" (WORKER_CONCURRENCY);
+// SyncBreaker exists so the wasProbe detection stays atomic under that concurrency (the underlying
+// sentinel.CircuitBreaker is itself safe for plain concurrent Allow/RecordSuccess/RecordFailure).
+// Plan §4.1:
 // "on transient-class primary failure after the circuit opens ... the fallback takes over".
 // Concretely: before each Complete, RunLoop asks breaker.Allow(); while the breaker is closed (or
 // half-open, probing primary), the call goes to primary, and a TransientError result is recorded

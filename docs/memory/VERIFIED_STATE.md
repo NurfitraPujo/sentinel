@@ -1987,3 +1987,13 @@ EXECUTE=true now a supported mode; dry-run still sends nothing (asserted). guard
 WrapUntrusted are LIVE on the decision path (mutation-proved). NOT verified: real LLM provider
 (fake in-process Advisor only, by design); FIX enqueue is a seam — no FIX job runs until N8f;
 keyguard rotation not wired until N8e.
+
+## N8e — keyguard + failure hardening (2026-08-19, branch feat/agent-worker, NOT merged)
+
+Proved: full worker gate green incl -race + gofmt (12 packages). E2E RAN vs live compose stack
+(raw --- PASS, not skips): U40 5.56s, U41 4.04s, U42 3.59s (key rotation — worker rotates,
+persists via file backend, operates on new key, old key valid in grace, secret in no emitted log).
+keyguard PERSIST-BEFORE-USE mutation-proved; secret never in log/journal/snapshot. 429 no longer
+opens the sentinel-api circuit (mutation-proved). NOT verified: kubernetes-secret backend against a
+real cluster (httptest fake apiserver only); FIX runner + git PR flow (N8f); snapshot tarball
+key-exclusion (no tarball code until the s3 snapshotter ships).

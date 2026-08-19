@@ -99,7 +99,7 @@ type workerProcess struct {
 // startWorker launches the built binary with a full, WORKER_EXECUTE=true env, pointed at the live
 // compose stack and the fake Advisor. stateDir must be reused across a kill+restart pair for the
 // journal-replay proof (U40's "kill -9 mid-job, restart, exactly one comment").
-func startWorker(t *testing.T, binPath, stateDir, agentKey, fakeAdvisorURL string) *workerProcess {
+func startWorker(t *testing.T, binPath, stateDir, agentKey, fakeAdvisorURL string, extraEnv ...string) *workerProcess {
 	t.Helper()
 	logPath := filepath.Join(t.TempDir(), fmt.Sprintf("worker-%d.log", time.Now().UnixNano()))
 	logFile, err := os.Create(logPath)
@@ -126,6 +126,7 @@ func startWorker(t *testing.T, binPath, stateDir, agentKey, fakeAdvisorURL strin
 		"WORKER_TRIAGE_TIMEOUT=20s",
 		"WORKER_FOLLOWUP_TIMEOUT=20s",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -514,4 +515,145 @@ func TestU41_WorkerFollowupNeedsInfoThenReply(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// TestU42_WorkerKeyRotation is the plan §8/§9 N8e U42 proof: the running worker rotates its own
+// agent key unattended, persists the new secret to the file keystore BEFORE swapping it in memory,
+// keeps polling/claiming successfully afterward, the OLD key still authenticates during the 24h
+// grace window (C6), and the new secret is never written to any log line the worker emitted.
+//
+// This exercises the expiry-near trigger (plan C6(a)): the org key route's expiresInDays (N10)
+// DOES apply to agent-scope keys (POST /api/organizations/{orgId}/keys accepts it regardless of
+// scope), so this seeds the agent key with expiresInDays=1 and sets
+// WORKER_ROTATE_BEFORE_HOURS=48 so "now + 48h is after expiresAt" is true from the worker's very
+// first keyguard tick.
+func TestU42_WorkerKeyRotation(t *testing.T) {
+	requireStack(t)
+	f := newFixture(t)
+	admin := f.newDashboardUser("owner")
+
+	agentRes := dashboardRequest(t, "POST", "/api/organizations/"+f.OrgID+"/agents", admin, map[string]any{
+		"name": "worker-u42",
+		"kind": "ai",
+	})
+	if agentRes.Status != 201 {
+		t.Fatalf("creating agent: got %d, want 201, body=%s", agentRes.Status, agentRes.Body)
+	}
+	var agentResp struct {
+		Agent struct {
+			ID string `json:"id"`
+		} `json:"agent"`
+	}
+	agentRes.JSON(t, &agentResp)
+
+	keyRes := dashboardRequest(t, "POST", "/api/organizations/"+f.OrgID+"/keys", admin, map[string]any{
+		"name":          "agent-key-worker-u42",
+		"scope":         "agent",
+		"agentId":       agentResp.Agent.ID,
+		"expiresInDays": 1,
+	})
+	if keyRes.Status != 201 {
+		t.Fatalf("creating near-expiry agent key: got %d, want 201, body=%s", keyRes.Status, keyRes.Body)
+	}
+	var keyResp struct {
+		Token string `json:"token"`
+	}
+	keyRes.JSON(t, &keyResp)
+	agentKey := keyResp.Token
+	if agentKey == "" {
+		t.Fatalf("agent key creation response had no token: %s", keyRes.Body)
+	}
+
+	binPath := buildWorkerBinary(t)
+
+	fake := newFakeAdvisorServer(t, func(_ map[string]any) string {
+		raw, _ := json.Marshal(map[string]any{
+			"severity":    nil,
+			"disposition": "comment_only",
+			"duplicateOf": nil,
+			"causedBy":    nil,
+			"summary":     "U42 e2e: comment_only.",
+			"question":    nil,
+			"fixBrief":    nil,
+			"confidence":  0.9,
+		})
+		return string(raw)
+	})
+
+	stateDir := t.TempDir()
+	keyPath := filepath.Join(stateDir, "agent-key.json")
+
+	worker := startWorker(t, binPath, stateDir, agentKey, fake.srv.URL,
+		"WORKER_KEYSTORE=file",
+		"WORKER_ROTATE_BEFORE_HOURS=48",
+		"WORKER_ROTATE_EVERY_DAYS=0",
+		"WORKER_KEYGUARD_INTERVAL=500ms",
+	)
+	t.Cleanup(func() { worker.stop(t) })
+
+	// (b) persisted via the file backend: agent-key.json appears and its content changes from the
+	// bootstrap key to something else (the new secret) once rotation fires.
+	{
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			if _, err := os.Stat(keyPath); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for agent-key.json\nworker logs:\n%s", worker.logs(t))
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	var rotatedKey string
+	waitForCondition(t, 20*time.Second, "agent-key.json content differs from the original bootstrap key (rotation persisted)", func() bool {
+		raw, err := os.ReadFile(keyPath)
+		if err != nil {
+			return false
+		}
+		var doc struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return false
+		}
+		if doc.Key == "" || doc.Key == agentKey {
+			return false
+		}
+		rotatedKey = doc.Key
+		return true
+	})
+
+	// (c) the worker keeps operating with the new key: ingest an event and confirm the worker still
+	// claims + comments (proves it swapped the new key into its live sentinel.Client and kept
+	// polling successfully).
+	ev := f.newEvent()
+	res := f.ingest(ev)
+	if res.Status != 202 {
+		t.Fatalf("ingesting system_error: got %d, want 202, body=%s", res.Status, res.Body)
+	}
+	waitFor(t, asyncTimeout, "issue created from ingested system_error", func() (bool, string) {
+		issues := ingestIssueSummaries(t, f)
+		return len(issues) == 1, fmt.Sprintf("%d issues so far", len(issues))
+	})
+	issue := ingestOnlyIssueSummary(t, f)
+
+	waitForCondition(t, 30*time.Second, "worker (post-rotation) posts an agent triage comment using the NEW key", func() bool {
+		comments := agentComments(listAgentComments(t, rotatedKey, issue.ID), "agent")
+		return len(comments) >= 1
+	})
+
+	// (d) the OLD key still authenticates during the 24h grace window (C6) -- a direct GET against
+	// /api/agent/self with the pre-rotation bearer must still succeed.
+	oldKeyRes := agentRequest(t, "GET", "/api/agent/self", agentKey, nil)
+	if oldKeyRes.Status != 200 {
+		t.Fatalf("old (pre-rotation) key expected to still authenticate during grace, got %d: %s", oldKeyRes.Status, oldKeyRes.Body)
+	}
+
+	// (e) the new secret must never appear in any log line the worker emitted.
+	logs := worker.logs(t)
+	if strings.Contains(logs, rotatedKey) {
+		t.Fatalf("worker logs contain the rotated secret verbatim -- secret leaked into logs:\n%s", logs)
+	}
 }

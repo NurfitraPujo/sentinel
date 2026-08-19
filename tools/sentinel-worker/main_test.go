@@ -300,6 +300,81 @@ func TestLoadConfig_KubernetesSecretKeystoreRequiresNameAndNamespace(t *testing.
 	}
 }
 
+// TestBuildKeyStore_WritableStateDir_NotReadOnly proves the common case: a normal, writable
+// WORKER_STATE_DIR (the file backend, the default) produces a KeyStore with rotation ENABLED.
+func TestBuildKeyStore_WritableStateDir_NotReadOnly(t *testing.T) {
+	cfg := Config{WorkerKeystore: "file", WorkerStateDir: t.TempDir()}
+	_, readOnly := buildKeyStore(context.Background(), cfg)
+	if readOnly {
+		t.Fatal("expected a writable state dir to yield readOnly=false")
+	}
+}
+
+// TestBuildKeyStore_ReadOnlyStateDir_DisablesRotation proves the plan §2.5 requirement is actually
+// reachable at runtime: a genuinely non-writable state directory (e.g. a read-only-remounted
+// volume) makes buildKeyStore report readOnly=true for the file backend, which LoadConfig accepts
+// as valid (unlike the kubernetes-secret name/namespace branch, this condition was previously
+// impossible to trigger on any config that reaches runPipeline).
+func TestBuildKeyStore_ReadOnlyStateDir_DisablesRotation(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	cfg := Config{WorkerKeystore: "file", WorkerStateDir: dir}
+	_, errs := LoadConfig(fakeEnv(map[string]string{"WORKER_STATE_DIR": dir}))
+	for _, e := range errs {
+		if strings.Contains(e, "WORKER_STATE_DIR") {
+			t.Fatalf("did not expect a read-only state dir to fail config validation: %v", errs)
+		}
+	}
+
+	_, readOnly := buildKeyStore(context.Background(), cfg)
+	if !readOnly {
+		t.Fatal("expected a read-only state dir to yield readOnly=true (rotation disabled)")
+	}
+}
+
+// TestWritableKeyStore_UsesTheOptionalWritableSeam proves buildKeyStore's readOnly determination
+// (writableKeyStore) is a REAL writability probe delegated to the store -- not merely "was a
+// name/namespace configured" (unreachable at runtime for any config LoadConfig accepts) -- by
+// exercising the seam directly against both a false- and true-reporting store, plus the
+// no-Writable-method fallback used by minimal test doubles like keyguard/guard_test.go's fakeStore.
+// keyguard/store_test.go's TestK8sKeyStore_WritableFalseOnRBACDenial and
+// TestFileKeyStore_WritableFalseForReadOnlyDir cover the two production backends' actual probes
+// (dry-run PATCH / temp-file write) end to end.
+func TestWritableKeyStore_UsesTheOptionalWritableSeam(t *testing.T) {
+	if got := (writableKeyStore(context.Background(), &fakeWritabilityStore{writable: false})); got {
+		t.Fatal("expected writableKeyStore to report false for a store whose Writable() returns false")
+	}
+	if got := (writableKeyStore(context.Background(), &fakeWritabilityStore{writable: true})); !got {
+		t.Fatal("expected writableKeyStore to report true for a store whose Writable() returns true")
+	}
+	if got := writableKeyStore(context.Background(), noopKeyStore{}); !got {
+		t.Fatal("expected a store without the Writable seam to default to writable")
+	}
+}
+
+// fakeWritabilityStore is a minimal keyguard.KeyStore + keyStoreWritabilityChecker test double.
+type fakeWritabilityStore struct {
+	writable bool
+}
+
+func (fakeWritabilityStore) Load(ctx context.Context) (string, bool, error) { return "", false, nil }
+func (fakeWritabilityStore) Persist(ctx context.Context, key string) error  { return nil }
+func (s *fakeWritabilityStore) Writable(ctx context.Context) bool           { return s.writable }
+
+// noopKeyStore implements only the base keyguard.KeyStore interface, with no Writable seam, to
+// prove writableKeyStore's default-writable fallback for test doubles.
+type noopKeyStore struct{}
+
+func (noopKeyStore) Load(ctx context.Context) (string, bool, error) { return "", false, nil }
+func (noopKeyStore) Persist(ctx context.Context, key string) error  { return nil }
+
 func TestLoadConfig_EventTypesAndProjectsListParsing(t *testing.T) {
 	cfg, _ := LoadConfig(fakeEnv(map[string]string{
 		"WORKER_EVENT_TYPES": "created, commented ,question_answered",
@@ -397,7 +472,7 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 			cfg := Config{WorkerExecute: tc.workerExecute, LLMProvider: "openai", LLMModel: "gpt-4o-mini"}
 			client := sentinel.NewClient("http://example.invalid", "key")
 			journal := state.OpenJournal(t.TempDir() + "/jobs.journal")
-			runner, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			runner, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 			if err != nil {
 				t.Fatalf("buildRunner: %v", err)
 			}

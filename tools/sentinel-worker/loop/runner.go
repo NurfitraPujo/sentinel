@@ -6,11 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
+
+// DefaultMaxInlaneRetries is WORKER_MAX_INLANE_RETRIES's default (plan §9 N8e): the bounded number
+// of in-lane retry attempts (re-driving a job through sentinel.BackoffForAttempt without leaving
+// its per-issue queue) before a Transient/RateLimited failure is given up on and journaled
+// failed(transient).
+const DefaultMaxInlaneRetries = 5
+
+// circuitPauseInterval is how often runWithInlaneRetry re-polls an open CircuitBreaker's Allow()
+// while paused (plan §2.4: "while open, the runner pauses job execution ... probes half-open every
+// 2m") -- short enough that a probe succeeding promptly unpauses the job, without hot-spinning.
+const circuitPauseInterval = 2 * time.Second
 
 // SkipReason names why a runner declined to act on a job, for journal payloads and /metrics
 // (plan §8: "runner preconditions (each `skipped` reason)").
@@ -80,6 +92,183 @@ type Runner struct {
 	// kind×outcome" counter reflects reality. Kept as a plain func hook, not a *health.Status
 	// field, so this package stays free of a health import (same reasoning as PollLoop.OnCursorSaved).
 	OnOutcome func(kind, outcome string)
+
+	// Breaker gates the runner's calls to sentinel-api (plan §2.4/§9 N8e: "the sentinel-api
+	// SyncBreaker ... gates the runner/dispatcher"). Nil disables circuit gating entirely (every
+	// call is always Allow()ed) -- tests that don't care about circuits can leave it unset.
+	Breaker *sentinel.CircuitBreaker
+
+	// MaxInlaneRetries bounds in-lane retry attempts for a Transient/RateLimited failure (plan
+	// §9 N8e, WORKER_MAX_INLANE_RETRIES). <= 0 uses DefaultMaxInlaneRetries.
+	MaxInlaneRetries int
+
+	// SleepCtx is the context-aware sleep used for backoff/rate-limit/circuit-pause waits.
+	// Defaults to sentinel.SleepCtx (real time.Sleep, but returns promptly on ctx cancellation).
+	// Overridable in tests to inject a fake clock without a real sleep.
+	SleepCtx sentinel.CtxSleepFunc
+
+	// OnInlaneRetry, when non-nil, is called once per in-lane retry attempt (plan §7: "in-lane
+	// retries counter").
+	OnInlaneRetry func(jobKind string, class sentinel.FailureClass)
+
+	// OnCircuitOpen, when non-nil, is called every time runWithInlaneRetry finds Breaker not
+	// Allow()ing a call (plan §7: "circuit-open events").
+	OnCircuitOpen func(scope string)
+}
+
+// classifyRunnerFailureClass extracts a sentinel.FailureClass from cause: a *sentinel.StatusError
+// classifies via ClassifyEnvelope; any other error (network failure, DNS, timeout -- no HTTP
+// status to classify) is treated as ClassTransient, matching this package's existing convention
+// (classifyRunnerError's "network" bucket was always handled as a transient failure).
+func classifyRunnerFailureClass(cause error) sentinel.FailureClass {
+	var statusErr *sentinel.StatusError
+	if errors.As(cause, &statusErr) {
+		return sentinel.ClassifyEnvelope(statusErr.Status, false, false)
+	}
+	return sentinel.ClassTransient
+}
+
+// retryAfterFromCause reads a Retry-After duration off cause's *sentinel.StatusError.Header when
+// present, defaulting to 60s (plan §2.4's "Rate limited" row), same as sentinel.WaitRateLimitCtx.
+func retryAfterFromCause(cause error) time.Duration {
+	var statusErr *sentinel.StatusError
+	if errors.As(cause, &statusErr) && statusErr.Header != nil {
+		return sentinel.RetryAfter(statusErr.Header, 60*time.Second)
+	}
+	return 60 * time.Second
+}
+
+// runWithInlaneRetry drives op through the plan §2.4/§9 N8e in-lane retry policy WITHOUT the
+// caller leaving its per-issue queue: op is called once; if it fails with a Transient or
+// RateLimited class (classifyRunnerFailureClass), the job is re-driven through
+// sentinel.BackoffForAttempt (or the RateLimited call's own Retry-After) up to r.maxInlaneRetries
+// attempts before giving up and returning the last error. Any other class (Permanent, Gone, Auth,
+// Conflict) returns immediately with no retry, so the caller's own classification/journaling of
+// that error is unaffected -- runWithInlaneRetry only ever changes behavior for the two classes
+// plan §2.4 says to retry.
+//
+// r.Breaker (if non-nil) gates every attempt: a Transient/RateLimited failure records a circuit
+// failure, a success records a circuit success, and while the circuit is open, attempts pause
+// (poll Allow() every circuitPauseInterval, per plan §2.4 "the runner pauses job execution") rather
+// than consuming a retry attempt or a backoff slot -- this is a distinct, unbounded wait, ended
+// only by the breaker's own half-open probe succeeding or by ctx cancellation.
+//
+// ctx cancellation (shutdown) is honored promptly: it is checked before every attempt and returned
+// immediately from any backoff/circuit-pause wait, per plan §9 N8e's "ctx-cancel during a backoff
+// returns promptly (shutdown)".
+// runWithInlaneRetry gates op through r.Breaker (sentinel-api's shared circuit -- see
+// runWithInlaneRetryScoped's doc comment for why this is the right default for calls that hit the
+// sentinel API directly). Call runWithInlaneRetryScoped(ctx, jobKind, nil, op) instead for a call
+// whose failures should NOT be attributed to the sentinel-api circuit (the Advisor call: an LLM
+// timeout/refusal is a llm:<provider> concern with its own breaker inside jobs.TriageAdvisor/
+// FollowupAdvisor, not a sentinel-api outage, so it must not trip or probe THIS breaker) but should
+// still get the backoff/attempt-bound retry ladder.
+func (r *Runner) runWithInlaneRetry(ctx context.Context, jobKind string, op func(ctx context.Context) error) error {
+	return r.runWithInlaneRetryScoped(ctx, jobKind, r.Breaker, op)
+}
+
+// runWithInlaneRetryScoped drives op through the plan §2.4/§9 N8e in-lane retry policy WITHOUT the
+// caller leaving its per-issue queue: op is called once; if it fails with a Transient or
+// RateLimited class (classifyRunnerFailureClass), the job is re-driven through
+// sentinel.BackoffForAttempt (or the RateLimited call's own Retry-After) up to r.MaxInlaneRetries
+// attempts before giving up and returning the last error. Any other class (Permanent, Gone, Auth,
+// Conflict) returns immediately with no retry, so the caller's own classification/journaling of
+// that error is unaffected -- this only ever changes behavior for the two classes plan §2.4 says
+// to retry.
+//
+// breaker (if non-nil) gates every attempt: a Transient/RateLimited failure records a circuit
+// failure, a success records a circuit success, and while the circuit is open, attempts pause
+// (poll Allow() every circuitPauseInterval, per plan §2.4 "the runner pauses job execution") rather
+// than consuming a retry attempt or a backoff slot -- this is a distinct, unbounded wait, ended
+// only by the breaker's own half-open probe succeeding or by ctx cancellation. Passing nil disables
+// circuit gating for this call entirely (still retries on backoff, just never trips or consults any
+// breaker) -- see runWithInlaneRetry's doc comment for when that is the right choice.
+//
+// ctx cancellation (shutdown) is honored promptly: it is checked before every RETRY attempt (and
+// inside any backoff/circuit-pause wait) and returned immediately, per plan §9 N8e's "ctx-cancel
+// during a backoff returns promptly (shutdown)" -- but the FIRST attempt always runs regardless of
+// ctx's state at entry, exactly like every call site's pre-N8e behavior (a caller with an
+// already-cancelled ctx still gets one attempt, whose own op(ctx) is what actually observes and
+// reacts to the cancellation -- e.g. an HTTP client failing the request, or an Advisor honoring
+// ctx.Done() internally). Aborting before ever calling op would silently skip work callers (and
+// this package's own shutdown/debounce tests) expect to still be attempted once.
+func (r *Runner) runWithInlaneRetryScoped(ctx context.Context, jobKind string, breaker *sentinel.CircuitBreaker, op func(ctx context.Context) error) error {
+	maxAttempts := r.MaxInlaneRetries
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultMaxInlaneRetries
+	}
+	sleep := r.SleepCtx
+	if sleep == nil {
+		sleep = sentinel.SleepCtx
+	}
+
+	attempt := 0
+	for {
+		if attempt > 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if breaker != nil {
+			for !breaker.Allow() {
+				if r.OnCircuitOpen != nil {
+					r.OnCircuitOpen(breaker.Scope)
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				sleep(ctx, circuitPauseInterval)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+		}
+
+		err := op(ctx)
+		if err == nil {
+			if breaker != nil {
+				breaker.RecordSuccess()
+			}
+			return nil
+		}
+
+		class := classifyRunnerFailureClass(err)
+		if class != sentinel.ClassTransient && class != sentinel.ClassRateLimited {
+			// Not retryable in-lane (permanent/gone/auth/conflict) -- the breaker only tracks
+			// dependency-availability failures, so a well-formed permanent rejection (e.g. a real
+			// 400/422) must NOT count against it.
+			return err
+		}
+		if breaker != nil && class == sentinel.ClassTransient {
+			// A 429 (ClassRateLimited) must NEVER count against the sentinel-api circuit (plan
+			// §2.4: "Rate limited ... Never counts as a failure"; retry.go's WaitRateLimit doc:
+			// "callers must not feed this path into a CircuitBreaker or backoff attempt counter").
+			// Only a genuine dependency-availability failure (5xx/network -> ClassTransient) may
+			// trip the breaker; a rate limit still consumes an in-lane attempt and honours
+			// Retry-After below, it just never opens the circuit.
+			breaker.RecordFailure()
+		}
+
+		attempt++
+		if attempt >= maxAttempts {
+			return err
+		}
+		if r.OnInlaneRetry != nil {
+			r.OnInlaneRetry(jobKind, class)
+		}
+		var wait time.Duration
+		if class == sentinel.ClassRateLimited {
+			wait = retryAfterFromCause(err)
+		} else {
+			wait = sentinel.BackoffForAttempt(attempt)
+		}
+		sleep(ctx, wait)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 }
 
 // Run executes exactly one job for one event, implementing the pipeline. It is idempotent per the
@@ -124,8 +313,17 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 		return err
 	}
 
-	// resolve issue state (one GET per job, per plan §3)
-	snap, err := r.Issues.GetIssue(ctx, issueID)
+	// resolve issue state (one GET per job, per plan §3). A Transient/RateLimited failure is
+	// re-driven in-lane (plan §2.4/§9 N8e) without leaving this issue's per-issue queue -- the
+	// caller (Dispatch's runIssueWorker) blocks on Run's return exactly as it always has, so a
+	// retry here does not let a later job for this issue jump ahead (single-flight, correct per
+	// §3). ctx cancellation (shutdown) during any retry wait returns promptly.
+	var snap IssueSnapshot
+	err = r.runWithInlaneRetry(ctx, jobKind, func(ctx context.Context) error {
+		var opErr error
+		snap, opErr = r.Issues.GetIssue(ctx, issueID)
+		return opErr
+	})
 	if err != nil {
 		var statusErr *sentinel.StatusError
 		if errors.As(err, &statusErr) && sentinel.ClassifyEnvelope(statusErr.Status, false, false) == sentinel.ClassGone {
@@ -142,14 +340,17 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 			}
 			return r.journalSkip(jobID, issueID, e, jobKind, SkipDeleted)
 		}
-		// Any other error resolving the issue (5xx, 429, network failure) is transient, not gone
-		// -- but leaving the journal record at "queued" (its state as of the Append a few lines
-		// above) would strand this job forever: invisible to /metrics (no terminal outcome ever
-		// fires) and, worse, invisible to crash recovery, since RecoveryScan's in-flight set is
-		// keyed off the SAME non-terminal states this job never advances out of. Full in-lane
-		// retry + circuit wiring is N8e (see plan §9's "N8a unwired seams" note); the N8a-minimum
-		// bar is to resolve to a real terminal outcome here too, just failed rather than skipped,
-		// so nothing is silently stranded or uncounted.
+		if ctx.Err() != nil {
+			// Shutdown mid-retry: leave the job at its current non-terminal state (queued) for
+			// crash recovery to resume, rather than journaling a misleading terminal failure.
+			return ctx.Err()
+		}
+		// Any other error resolving the issue (5xx, 429, network failure, or in-lane retries
+		// exhausted) is transient, not gone -- but leaving the journal record at "queued" (its
+		// state as of the Append a few lines above) would strand this job forever: invisible to
+		// /metrics (no terminal outcome ever fires) and, worse, invisible to crash recovery, since
+		// RecoveryScan's in-flight set is keyed off the SAME non-terminal states this job never
+		// advances out of.
 		return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("resolving issue %s: %w", issueID, err))
 	}
 
@@ -170,8 +371,24 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 			r.Log.Info("dry-run: skipping claim, not sent", "jobId", jobID, "issueId", issueID, "kind", jobKind)
 		}
 	} else {
-		held, claimedBy, err = r.Claims.EnsureClaimed(ctx, issueID)
+		err = r.runWithInlaneRetry(ctx, jobKind, func(ctx context.Context) error {
+			var opErr error
+			held, claimedBy, opErr = r.Claims.EnsureClaimed(ctx, issueID)
+			return opErr
+		})
 		if err != nil {
+			var statusErr *sentinel.StatusError
+			if errors.As(err, &statusErr) && sentinel.ClassifyEnvelope(statusErr.Status, false, false) == sentinel.ClassGone {
+				// The claim route itself 404'd (C14 race, same as the precondition GET above) --
+				// same tombstone handling, not a failure.
+				if r.Log != nil {
+					r.Log.Info("skipping job: issue no longer resolvable (deleted) while claiming", "jobId", jobID, "issueId", issueID, "kind", jobKind, "error", err)
+				}
+				return r.journalSkip(jobID, issueID, e, jobKind, SkipDeleted)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("claiming issue %s: %w", issueID, err))
 		}
 	}
@@ -187,8 +404,28 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 
 	// advisor — never re-invoked once "advised" is journaled; recovery replays that payload
 	// instead. Run() is only reached for a fresh job here, so we always decide once.
+	//
+	// Deliberately NOT run through runWithInlaneRetry: the plan §2.4 in-lane retry ladder is a
+	// sentinel-api dependency-availability concern (this runner's Breaker is
+	// sentinel.ScopeSentinelAPI). The Advisor call is an llm:<provider> concern with its OWN
+	// re-ask/timeout/circuit handling already wired inside jobs.TriageAdvisor/FollowupAdvisor
+	// (llm.RunLoop + the llm:<provider> SyncBreaker, N8b/N8d) -- double-wrapping it here would
+	// misattribute an LLM outage to the sentinel-api breaker (if gated) or, ungated, silently
+	// re-drive a call whose own internal retry policy already decided it was done retrying, adding
+	// an extra unbounded-feeling delay a caller watching for "the advisor either answers or fails
+	// promptly" would not expect.
 	decision, err := r.Advisor.Decide(ctx, jobs.Input{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq})
 	if err != nil {
+		if ctx.Err() != nil {
+			// Cancellation (shutdown OR a tombstone's in-flight cancel, N8e) interrupted the
+			// Advisor call -- leave the journal record at its current non-terminal state (claimed)
+			// rather than journaling a misleading failed: shutdown's caller resumes it via
+			// RecoveryScan on the next start, and the dispatcher's runOne (loop/queue.go) journals
+			// the correct terminal skipped(deleted) itself when the cancellation cause is a
+			// tombstone (errTombstoneCancel), which this package cannot distinguish from ordinary
+			// shutdown at this layer.
+			return ctx.Err()
+		}
 		return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("advisor decision for job %s: %w", jobID, err))
 	}
 	payload, err := json.Marshal(decision)
@@ -211,16 +448,59 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 		return err
 	}
 	if err := r.Act.Act(ctx, jobID, decision); err != nil {
-		_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed})
-		if r.OnOutcome != nil {
-			r.OnOutcome(jobKind, "failed")
-		}
-		return fmt.Errorf("acting on job %s: %w", jobID, err)
+		return r.handleActError(ctx, jobID, issueID, e, jobKind, err)
 	}
 	if err := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateActed}); err != nil {
 		return err
 	}
 	return r.journalDone(jobID, issueID, e, jobKind)
+}
+
+// handleActError implements the plan §2.4/C14/§9 N8e "mid-job 404" hardening: an Act failure that
+// classifies as ClassGone (the issue was deleted between the precondition/ensure-claimed steps and
+// this Act call -- surfaced either as the mid-job GET's own *sentinel.StatusError, per
+// jobs.RealActor.Act, or a single batch op classifying ClassGone, per jobs/actor.go's
+// checkBatchResults) gets the SAME skipped(deleted) treatment as the dispatch-time tombstone and
+// the runner's own precondition-read 404 -- NOT journaled failed. Every other Act error keeps the
+// existing journal failed(...) behavior; Act's own batch/question calls are not currently
+// re-driven in-lane here (they use the plan §2.3 idempotency-key narrow-resend scheme instead, a
+// distinct mechanism from this package's backoff ladder).
+func (r *Runner) handleActError(ctx context.Context, jobID, issueID string, e Event, jobKind string, actErr error) error {
+	var statusErr *sentinel.StatusError
+	if errors.As(actErr, &statusErr) && sentinel.ClassifyEnvelope(statusErr.Status, false, false) == sentinel.ClassGone {
+		if r.Log != nil {
+			r.Log.Info("skipping job: issue no longer resolvable (deleted) mid-act", "jobId", jobID, "issueId", issueID, "kind", jobKind, "error", actErr)
+		}
+		_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateSkipped, Payload: mustMarshalReason(string(SkipDeleted))})
+		if r.OnOutcome != nil {
+			r.OnOutcome(jobKind, "skipped_"+string(SkipDeleted))
+		}
+		return nil
+	}
+	if ctx.Err() != nil {
+		// Cancellation (shutdown OR a tombstone's in-flight cancel) interrupted Act -- same
+		// reasoning as the Advisor call above: leave the journal at its current non-terminal state
+		// (acting) rather than journaling a misleading failed. The dispatcher's runOne journals the
+		// correct terminal skipped(deleted) when the cause is a tombstone.
+		return ctx.Err()
+	}
+	outcome := "failed_permanent"
+	if class := classifyRunnerFailureClass(actErr); class == sentinel.ClassTransient || class == sentinel.ClassRateLimited {
+		outcome = "failed_transient"
+	}
+	_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed})
+	if r.OnOutcome != nil {
+		r.OnOutcome(jobKind, outcome)
+	}
+	return fmt.Errorf("acting on job %s: %w", jobID, actErr)
+}
+
+// mustMarshalReason marshals {"reason": reason} for a skip payload; json.Marshal on this shape
+// cannot fail, so a marshal error is treated as impossible rather than plumbed through as a
+// returned error (matching journalSkip's own established idiom for the identical payload shape).
+func mustMarshalReason(reason string) []byte {
+	b, _ := json.Marshal(map[string]string{"reason": reason})
+	return b
 }
 
 // Resume feeds one journal-recovered in-flight job back through the pipeline, implementing the
@@ -271,29 +551,35 @@ func (r *Runner) Resume(ctx context.Context, job state.InFlightJob) error {
 	}
 }
 
-// journalTransientFailure implements the N8a-minimum fix for a non-Gone error surfacing anywhere
-// in Run's pipeline before a decision has been journaled (resolving the issue, ensure-claimed,
-// the Advisor call): it journals a terminal failed(transient: <class>) record, fires OnOutcome
-// exactly like every other terminal path, and returns cause so the caller (Dispatch's runOne,
-// main's Resume loop) still sees and logs the underlying error. Without this, these three error
-// returns left the job's journal record at whatever non-terminal state Run had already appended
-// (queued/claimed) -- invisible to /metrics (no OnOutcome ever fires) and, worse, invisible to
-// crash recovery too, since RecoveryScan's in-flight set is keyed off the SAME non-terminal
-// states. Full in-lane retry + circuit-breaker wiring (re-driving the job through
-// sentinel.BackoffForAttempt without leaving the per-issue queue) is N8e -- see plan §9's "N8a
-// unwired seams" note; this only guarantees the job resolves to a real, counted terminal outcome.
+// journalTransientFailure implements the pipeline's terminal-failure path for an error surfacing
+// anywhere in Run before a decision has been journaled (resolving the issue, ensure-claimed, the
+// Advisor call) that runWithInlaneRetry has already exhausted retries on (or declined to retry, for
+// a non-Transient/RateLimited class): it journals a terminal failed record, fires OnOutcome with a
+// class-specific outcome string so /metrics can split transient-failed from permanent-failed (plan
+// §7), and returns cause so the caller (Dispatch's runOne, main's Resume loop) still sees and logs
+// the underlying error. Without a terminal record here, these three error returns would leave the
+// job's journal record at whatever non-terminal state Run had already appended (queued/claimed) --
+// invisible to /metrics (no OnOutcome ever fires) and, worse, invisible to crash recovery too,
+// since RecoveryScan's in-flight set is keyed off the SAME non-terminal states.
 func (r *Runner) journalTransientFailure(jobID, issueID string, e Event, jobKind string, cause error) error {
-	payload, _ := json.Marshal(map[string]string{"reason": "transient", "class": classifyRunnerError(cause)})
+	class := classifyRunnerFailureClass(cause)
+	outcome := "failed_permanent"
+	reason := "permanent"
+	if class == sentinel.ClassTransient || class == sentinel.ClassRateLimited {
+		outcome = "failed_transient"
+		reason = "transient"
+	}
+	payload, _ := json.Marshal(map[string]string{"reason": reason, "class": classifyRunnerError(cause)})
 	if appendErr := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed, Payload: payload}); appendErr != nil {
 		// The journal write itself failed -- nothing further we can do to make this terminal;
 		// surface both errors so the operator sees the append failure was not silently swallowed.
 		return fmt.Errorf("%w (also failed to journal transient failure: %v)", cause, appendErr)
 	}
 	if r.OnOutcome != nil {
-		r.OnOutcome(jobKind, "failed")
+		r.OnOutcome(jobKind, outcome)
 	}
 	if r.Log != nil {
-		r.Log.Error("job failed with a transient error, journaled terminal failed", "jobId", jobID, "issueId", issueID, "kind", jobKind, "error", cause)
+		r.Log.Error("job failed, journaled terminal failed", "jobId", jobID, "issueId", issueID, "kind", jobKind, "reason", reason, "error", cause)
 	}
 	return cause
 }
@@ -428,11 +714,7 @@ func (r *Runner) resumeFromAdvised(ctx context.Context, jobID, issueID string, e
 		}
 	}
 	if err := r.Act.Act(ctx, jobID, decision); err != nil {
-		_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed})
-		if r.OnOutcome != nil {
-			r.OnOutcome(jobKind, "failed")
-		}
-		return fmt.Errorf("acting on job %s: %w", jobID, err)
+		return r.handleActError(ctx, jobID, issueID, e, jobKind, err)
 	}
 	if err := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateActed}); err != nil {
 		return err

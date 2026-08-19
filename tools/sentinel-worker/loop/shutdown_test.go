@@ -37,12 +37,13 @@ func newShutdownTestDispatcher(t *testing.T, advisor jobs.Advisor) (*Dispatcher,
 	t.Helper()
 	j := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
 	r := &Runner{
-		Journal:   j,
-		Issues:    fakeIssues{snap: IssueSnapshot{Status: "unresolved", AssigneeType: "agent", AssignedTo: "me"}},
-		Claims:    &fakeClaimer{held: true},
-		Advisor:   advisor,
-		Act:       &countingActor{},
-		MyAgentID: "me",
+		Journal:          j,
+		Issues:           fakeIssues{snap: IssueSnapshot{Status: "unresolved", AssigneeType: "agent", AssignedTo: "me"}},
+		Claims:           &fakeClaimer{held: true},
+		Advisor:          advisor,
+		Act:              &countingActor{},
+		MyAgentID:        "me",
+		MaxInlaneRetries: 1,
 	}
 	return &Dispatcher{Runner: r, Journal: j}, j
 }

@@ -751,29 +751,39 @@ Fable holistic review; green gates + memory sync + commit per phase)
 | **N8b** | `llm` package: interface, toolloop + re-ask, 3 adapters, budgets/volume caps | adapter goldens + scripted-fake loop tests |
 | **N8c** | `gitprovider` + `repoctx` confinement + `guard` (delimiting/output gate) + repo-map validation | provider goldens, extended leak test, confinement + injection-golden tests |
 | **N8d** | TRIAGE + FOLLOW-UP Advisors, act() per-op compilation (all dispositions incl. needs_human), sweep (heartbeat/nag/reconcile), C10 coalescing e2e | unit goldens + e2e U40/U41 |
-| **N8e** | keyguard (expiry-driven + null-expiry fallback) + hardening: circuits, tombstone/404 handling, kill -9 replay proofs | keyguard units + both kill -9 e2e assertions |
+| **N8e** — DONE 2026-08-19 | keyguard (expiry-driven + null-expiry fallback) + hardening: circuits, tombstone/404 handling, kill -9 replay proofs | keyguard units + both kill -9 e2e assertions + **e2e U42 key rotation** (`TestU42_WorkerKeyRotation`), all green against the live compose stack |
 | **N8f** | FIX engine: workspace (TASK.md outside clone), $FIX_EXECUTOR_CMD, validation gates, askpass push, provider PR flow + PRSpec templates, caps | stub-agent units + manual recipe doc |
 | **N8g** | Deployment (alpine Dockerfile + self-probe, compose + OPTIONAL_SERVICES, Helm w/ probes+annotations), DEPLOYMENT.md, guide §15, VERIFIED_STATE/WORKLOG/memory sync; add missing `RETENTION_CRON_*`/`TOMBSTONE_RETENTION_DAYS` entries to `.env.example` (N9 gap) | compose boot green incl. wait-healthy with worker present-but-gated; helm lint; full gate sweep; CI shows U40/U41 run |
 
-**N8a unwired seams**: `tools/sentinel-worker/guard/` and `tools/sentinel-worker/keyguard/` are
-built and unit-tested in N8a but imported by nothing yet — `guard` is IMPLEMENTED and injection-
-golden-tested in N8c but still WIRED in N8d (its consumer, the Advisor output path, does not exist
-until N8d ships the real TRIAGE/FOLLOW-UP Advisors; N8c's `main.go` still constructs
-`jobs.StubAdvisor{}`, and `guard.Check`/`guard.WrapUntrusted` are imported by nothing in the
-running worker as of N8c — verified: no non-test importer). `keyguard` wires into key rotation in
-N8e. Passing tests for either package prove the
-package works in isolation, not that anything in the running worker calls it (B3); don't read
-green `guard`/`keyguard` suites as evidence the harness enforces the output gate or rotates keys
-until N8d/N8e land. The same caveat applies to three more seams built in N8a: `sentinel/retry.go`'s
-`ClassifyBatch`/`ClassifyOp` (per-op batch classification) and `sentinel/client.go`'s
-batch/comment/question/progress writers are unit-tested in isolation but not yet called by
-anything in the running worker — they are wired in by N8d's `act()` compilation step. Runner
-in-lane retry (re-driving a job through the Transient-class backoff ladder without leaving the
-per-issue queue) and the circuit breaker (`sentinel/retry.go`'s `CircuitBreaker`) are likewise
-unit-tested but not yet consulted by `loop.Runner.Run`/`Dispatcher` — full wiring is N8e. N8a's
-minimum bar for a transient runner failure is narrower: journal a terminal `failed(transient:
-<class>)` record and count it via `OnOutcome` so it is never silently stranded at a non-terminal
-state, without yet retrying it in-lane or tripping a circuit.
+**N8a unwired seams — RESOLVED as of N8e** (2026-08-19): `tools/sentinel-worker/guard/` and
+`tools/sentinel-worker/keyguard/` were built and unit-tested in N8a. `guard` wired into the
+running worker in N8d (the TRIAGE/FOLLOW-UP Advisor output path). `keyguard` is now WIRED as of
+**N8e**: `main.go` constructs a `keyguard.Guard` from `buildKeyStore` (file or kubernetes-secret,
+`WORKER_KEYSTORE`) and the live `sentinel.Client` (via `sentinelRotatingClient`), runs it as a
+sidecar goroutine gated only by store writability (never by `WORKER_EXECUTE` — rotation is a
+credential-lifecycle concern independent of dry-run/mutation mode, since even a dry-run worker
+needs valid auth to poll), and wires the on-401-once retry into `client.OnAuthStatus`. Proven live
+end-to-end by e2e U42 (`tests/e2e/agent_worker_test.go`,
+`TestU42_WorkerKeyRotation`): a near-expiry agent key triggers unattended rotation, the new secret
+is persisted to `agent-key.json` via the file keystore BEFORE the in-memory client swaps to it, the
+worker keeps polling/claiming with the new key, the old key still authenticates during the grace
+window (C6), and the rotated secret never appears in a worker log line. Fixed one real B5
+cross-boundary mismatch found while proving this: `POST /api/agent/key/rotate`'s actual response
+nests the new secret at `newKey.secret`
+(`apps/dashboard-web/src/routes/api/agent/key/rotate/+server.ts`), not the top-level `key` field
+the worker's `rotateKeyResponse` previously expected — every rotation attempt was silently failing
+with "empty key in response" until this was caught and fixed. The same caveat applied to three
+more N8a seams, ALL now RESOLVED in N8e: `sentinel/retry.go`'s `ClassifyBatch`/`ClassifyOp` and
+`sentinel/client.go`'s batch/comment/question/progress writers were wired in by N8d's `act()`
+compilation step. Runner in-lane retry (re-driving a job through the Transient-class backoff
+ladder without leaving the per-issue queue, `loop/runner.go`'s `runWithInlaneRetry`/
+`runWithInlaneRetryScoped`) and the circuit breaker (`sentinel/retry.go`'s `CircuitBreaker`) are
+now consulted by `loop.Runner.Run`/`Dispatcher` as of N8e (`tools/sentinel-worker/loop/
+inlane_retry_test.go`, `tombstone_inflight_test.go`); `loop/dispatch.go`'s `issue_deleted`
+tombstone/404 handling (C14) was verified and hardened in the same pass. N8a's original minimum
+bar — journal a terminal `failed(transient: <class>)` record without in-lane retry — is
+superseded; a transient failure now retries in-lane through the backoff ladder before falling back
+to that terminal journal entry.
 
 **N8b adds one more unwired seam**: `tools/sentinel-worker/llm/` (the neutral `Chat`/`Request`/
 `Response` types, `RunLoop` + re-ask, the three `llm/<provider>.go` adapters, and the
@@ -879,9 +889,11 @@ build here, unlike the `go-root`/`go-sdk`/`go-migrations` CI jobs which delibera
 see A2.) U41's severity wait must check for the worker's replayed value (`*severity == "high"`),
 not merely non-nil — the fixture seeds `severity:"medium"` up front (C8), so a non-nil check
 returns on the very first poll before the kill-9/restart replay finishes writing the batch.
-Remaining unwired seams after N8d: `gitprovider.CreatePR`/
-`PRStatus` and the FIX runner (`FIX_EXECUTOR_CMD`, workspaces, PR flow — **N8f**), and `keyguard`
-(expiry-driven rotation — **N8e**). The sweep's event-driven reconcile arm
+Remaining unwired seams after N8e: only `gitprovider.CreatePR`/
+`PRStatus` and the FIX runner (`FIX_EXECUTOR_CMD`, workspaces, PR flow — **N8f**). `keyguard`
+(expiry-driven + null-expiry-fallback rotation) is now WIRED as of **N8e**, proven by e2e U42 —
+see the N8a-unwired-seams paragraph above for the full account, including the `newKey.secret`
+response-shape bug that fix caught. The sweep's event-driven reconcile arm
 (`Sweep.ReconcileReaped`, §2.7(c)) was also unwired as of the first N8d pass — `loop/queue.go`
 dispatches a `claim_released(previousAssignee=me)` event as `KindSweepReconcile` and calls
 `Dispatcher.OnSweepReconcile` if non-nil, but `main.go`'s dispatcher construction never set that

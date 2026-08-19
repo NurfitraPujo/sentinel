@@ -25,6 +25,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/keyguard"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/loop"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/repoctx"
@@ -123,6 +124,13 @@ type Config struct {
 	WorkerKeystore           string // file | kubernetes-secret
 	WorkerKeySecretName      string
 	WorkerKeySecretNamespace string
+	// WorkerKeySecretMount is the kubernetes-secret backend's read path: a Secret volume-mounted
+	// file (WORKER_KEY_SECRET_MOUNT). Unused by the file backend, which instead reads
+	// agent-key.json under WorkerStateDir.
+	WorkerKeySecretMount string
+	// WorkerKeyguardInterval is the sidecar ticker's poll cadence for proactive rotation checks
+	// (plan §2.5), default 1h.
+	WorkerKeyguardInterval time.Duration
 
 	// Git
 	WorkerRepoCacheDir           string
@@ -141,6 +149,8 @@ type Config struct {
 	// Keys
 	WorkerRotateBeforeHours int
 	WorkerRotateEveryDays   int
+	// WorkerMaxInlaneRetries is WORKER_MAX_INLANE_RETRIES (plan §2.4/§9 N8e).
+	WorkerMaxInlaneRetries int
 
 	// Misc
 	WorkerReportFailures  bool
@@ -300,6 +310,8 @@ func LoadConfig(env envLookup) (Config, []string) {
 		WorkerKeystore:           getStr(env, "WORKER_KEYSTORE", "file"),
 		WorkerKeySecretName:      getStr(env, "WORKER_KEY_SECRET_NAME", ""),
 		WorkerKeySecretNamespace: getStr(env, "WORKER_KEY_SECRET_NAMESPACE", ""),
+		WorkerKeySecretMount:     getStr(env, "WORKER_KEY_SECRET_MOUNT", "/var/run/secrets/sentinel/agent-key"),
+		WorkerKeyguardInterval:   getDuration(env, "WORKER_KEYGUARD_INTERVAL", time.Hour, &errs),
 
 		WorkerRepoCacheDir:      getStr(env, "WORKER_REPO_CACHE_DIR", "/var/cache/sentinel-worker/repos"),
 		WorkerRepoRefresh:       getDuration(env, "WORKER_REPO_REFRESH", 15*time.Minute, &errs),
@@ -320,6 +332,11 @@ func LoadConfig(env envLookup) (Config, []string) {
 
 		WorkerRotateBeforeHours: getInt(env, "WORKER_ROTATE_BEFORE_HOURS", 72, &errs),
 		WorkerRotateEveryDays:   getInt(env, "WORKER_ROTATE_EVERY_DAYS", 30, &errs),
+
+		// WorkerMaxInlaneRetries bounds §2.4/§9 N8e's in-lane retry ladder: a Transient/RateLimited
+		// runner failure is re-driven through sentinel.BackoffForAttempt this many times (without
+		// leaving the per-issue queue) before giving up and journaling failed(transient).
+		WorkerMaxInlaneRetries: getInt(env, "WORKER_MAX_INLANE_RETRIES", loop.DefaultMaxInlaneRetries, &errs),
 
 		WorkerReportFailures:  getBool(env, "WORKER_REPORT_FAILURES", false, &errs),
 		WorkerGateMaxVerbatim: getFloat(env, "WORKER_GATE_MAX_VERBATIM", 0.25, &errs),
@@ -429,6 +446,10 @@ func LoadConfig(env envLookup) (Config, []string) {
 	requireNonNegative(&errs, "WORKER_AGENT_LOG_MAX_MB", c.WorkerAgentLogMaxMB)
 	requireNonNegative(&errs, "WORKER_ROTATE_BEFORE_HOURS", c.WorkerRotateBeforeHours)
 	requireNonNegative(&errs, "WORKER_ROTATE_EVERY_DAYS", c.WorkerRotateEveryDays)
+	requirePositive(&errs, "WORKER_MAX_INLANE_RETRIES", c.WorkerMaxInlaneRetries)
+	if c.WorkerKeyguardInterval <= 0 {
+		errs = append(errs, "WORKER_KEYGUARD_INTERVAL: must be > 0")
+	}
 
 	// plan §4.5: Fix Executor workspaces (and the repo clone cache) must never resolve under
 	// WORKER_STATE_DIR -- that directory holds agent-key.json and jobs.journal, and §2.8 tarballs
@@ -449,6 +470,14 @@ func LoadConfig(env envLookup) (Config, []string) {
 func requireNonNegative(errs *[]string, name string, v int) {
 	if v < 0 {
 		*errs = append(*errs, fmt.Sprintf("%s: must be >= 0", name))
+	}
+}
+
+// requirePositive collects a validation error when v <= 0 (WORKER_MAX_INLANE_RETRIES: a bound of
+// 0 would mean "never even try the operation once", which is not a meaningful retry policy).
+func requirePositive(errs *[]string, name string, v int) {
+	if v <= 0 {
+		*errs = append(*errs, fmt.Sprintf("%s: must be > 0", name))
 	}
 }
 
@@ -586,6 +615,117 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 	logger.Info("sentinel-worker stopped")
 }
 
+// keyStoreWritabilityChecker is the optional seam a KeyStore backend implements to report whether
+// it can actually be written to right now (plan §2.5: "read-only key store ... disables rotation
+// and logs loudly at start"). Both production backends implement it; a test double that doesn't
+// is treated as writable by writableKeyStore below.
+type keyStoreWritabilityChecker interface {
+	Writable(ctx context.Context) bool
+}
+
+// buildKeyStore constructs the keyguard.KeyStore named by WORKER_KEYSTORE (LoadConfig has already
+// validated it is "file" or "kubernetes-secret"). readOnly reports whether rotation must be
+// disabled, determined by an ACTUAL writability probe against the constructed store (a temp-file
+// write for the file backend, a dry-run PATCH for the kubernetes-secret backend) -- not merely
+// "was a Secret name/namespace configured", which LoadConfig already requires and so can never be
+// false on any config that reaches runPipeline. A read-only-remounted state volume, or a service
+// account whose RBAC lacks `patch` on the named Secret, are the real-world conditions this must
+// catch (validator finding: "Guard.ReadOnly is never true on any config that actually starts the
+// worker").
+func buildKeyStore(ctx context.Context, cfg Config) (keyguard.KeyStore, bool) {
+	var store keyguard.KeyStore
+	switch cfg.WorkerKeystore {
+	case "kubernetes-secret":
+		if cfg.WorkerKeySecretName == "" || cfg.WorkerKeySecretNamespace == "" {
+			// Defensive: LoadConfig already rejects this combination, so this branch is not
+			// reachable from a valid config, but a direct/test-driven call site is defended too.
+			return keyguard.FileKeyStore{Path: filepath.Join(cfg.WorkerStateDir, "agent-key.json")}, true
+		}
+		store = &keyguard.K8sKeyStore{
+			MountPath:  cfg.WorkerKeySecretMount,
+			SecretName: cfg.WorkerKeySecretName,
+			Namespace:  cfg.WorkerKeySecretNamespace,
+		}
+	default: // "file"
+		store = keyguard.FileKeyStore{Path: filepath.Join(cfg.WorkerStateDir, "agent-key.json")}
+	}
+	readOnly := !writableKeyStore(ctx, store)
+	return store, readOnly
+}
+
+// writableKeyStore probes store's real writability. A store that doesn't implement the optional
+// keyStoreWritabilityChecker seam is assumed writable (defends test doubles that only implement
+// Load/Persist).
+func writableKeyStore(ctx context.Context, store keyguard.KeyStore) bool {
+	checker, ok := store.(keyStoreWritabilityChecker)
+	if !ok {
+		return true
+	}
+	return checker.Writable(ctx)
+}
+
+// sentinelRotatingClient adapts *sentinel.Client to keyguard.RotatingClient, so keyguard stays
+// free of sentinel's wire-shape imports (see keyguard/guard.go's RotatingClient doc comment).
+type sentinelRotatingClient struct {
+	client *sentinel.Client
+}
+
+// keySelfResponse is the subset of GET /api/agent/self's `key` object keyguard needs (C13).
+type keySelfResponse struct {
+	Key struct {
+		CreatedAt *time.Time `json:"createdAt"`
+		ExpiresAt *time.Time `json:"expiresAt"`
+	} `json:"key"`
+}
+
+func (a *sentinelRotatingClient) SelfKeyInfo(ctx context.Context) (keyguard.KeyInfo, error) {
+	res, err := a.client.GetSelf(ctx)
+	if err != nil {
+		return keyguard.KeyInfo{}, err
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return keyguard.KeyInfo{}, fmt.Errorf("GET /api/agent/self: %d %s", res.Status, sentinel.ErrorMessage(res.Body))
+	}
+	var self keySelfResponse
+	if err := json.Unmarshal(res.Body, &self); err != nil {
+		return keyguard.KeyInfo{}, fmt.Errorf("parsing self response for key info: %w", err)
+	}
+	return keyguard.KeyInfo{CreatedAt: self.Key.CreatedAt, ExpiresAt: self.Key.ExpiresAt}, nil
+}
+
+// rotateKeyResponse is POST /api/agent/key/rotate's 200 body (plan §2.5, C6): the new secret,
+// returned exactly once, NEVER logged. Matches
+// apps/dashboard-web/src/routes/api/agent/key/rotate/+server.ts's actual shape -- the secret is
+// nested under newKey.secret, not a top-level `key` (B5: cross-boundary payloads have no compiler
+// checking them; this field name previously diverged from the real dashboard response).
+type rotateKeyResponse struct {
+	NewKey struct {
+		Secret string `json:"secret"`
+	} `json:"newKey"`
+}
+
+func (a *sentinelRotatingClient) Rotate(ctx context.Context) (string, error) {
+	res, err := a.client.RotateKey(ctx)
+	if err != nil {
+		return "", err
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return "", fmt.Errorf("POST /api/agent/key/rotate: %d %s", res.Status, sentinel.ErrorMessage(res.Body))
+	}
+	var rotated rotateKeyResponse
+	if err := json.Unmarshal(res.Body, &rotated); err != nil {
+		return "", fmt.Errorf("parsing rotate response: %w", err)
+	}
+	if rotated.NewKey.Secret == "" {
+		return "", fmt.Errorf("POST /api/agent/key/rotate: empty key in response")
+	}
+	return rotated.NewKey.Secret, nil
+}
+
+func (a *sentinelRotatingClient) SetKey(key string) {
+	a.client.SetKey(key)
+}
+
 // selfResponse is the subset of GET /api/agent/self this worker needs: its own agent id, used for
 // dispatch echo-suppression (loop.Classify) and as the claimant identity for precondition checks.
 type selfResponse struct {
@@ -643,10 +783,38 @@ func cursorFreshnessStartupWindow(pollInterval time.Duration) time.Duration {
 // path can Drain it (finding 1) -- a plain out-param rather than a return value because runPipeline
 // itself never returns except on ctx cancellation, long after the caller needs the dispatcher.
 func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *health.Status, dispatcherOut *atomic.Pointer[loop.Dispatcher]) {
-	client := sentinel.NewClient(cfg.SentinelURL, cfg.SentinelAgentKey)
-	if st != nil {
-		client.OnAuthStatus = st.SetAuthValid
+	keyStore, readOnly := buildKeyStore(ctx, cfg)
+	agentKey := cfg.SentinelAgentKey
+	// The key store OVERRIDES SENTINEL_AGENT_KEY at startup when it already holds a key --
+	// SENTINEL_AGENT_KEY is bootstrap-only (plan §2.5): after the first successful rotation, the
+	// store (not the env var, which the operator cannot update on a running container) is
+	// authoritative.
+	if loaded, ok, err := keyStore.Load(ctx); err != nil {
+		logger.Error("keyguard: loading persisted key, falling back to SENTINEL_AGENT_KEY", "error", err)
+	} else if ok {
+		agentKey = loaded
 	}
+
+	client := sentinel.NewClient(cfg.SentinelURL, agentKey)
+
+	// keyguard runs regardless of WORKER_EXECUTE (plan §2.5): a dry-run worker still polls the
+	// events feed and needs valid auth to do so, and rotation is a credential-lifecycle concern
+	// independent of whether the worker is allowed to mutate issue state.
+	guard := keyguard.NewGuard(keyStore, &sentinelRotatingClient{client: client}, cfg.WorkerRotateBeforeHours, cfg.WorkerRotateEveryDays, cfg.WorkerKeyguardInterval, logger)
+	guard.ReadOnly = readOnly
+	client.OnAuthStatus = func(ok bool) {
+		if st != nil {
+			st.SetAuthValid(ok)
+		}
+		if !ok {
+			guard.TriggerOn401Once(ctx)
+		}
+	}
+	go guard.Run(ctx)
+	go func() {
+		<-ctx.Done()
+		guard.Stop()
+	}()
 
 	// Journal open + maintenance/RecoveryScan need no network at all, so they run BEFORE identity
 	// resolution rather than after it (finding 6): with the old ordering, an API outage at startup
@@ -737,7 +905,13 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		repoCache = nil
 	}
 
-	runner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger)
+	// sentinelAPIBreaker is the ONE shared CircuitBreaker for the sentinel.ScopeSentinelAPI scope
+	// (plan §2.4/§9 N8e: "gates the runner/dispatcher"). Constructed once here (not per-call inside
+	// buildRunner) so its consecutive-failure/open/half-open state persists across the whole
+	// pipeline's lifetime, exactly like the LLM primaryBreaker buildAdvisors already builds once.
+	sentinelAPIBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
+
+	runner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger, sentinelAPIBreaker)
 	if err != nil {
 		// The LLM provider wiring is invalid (bad LLM_PROVIDER/LLM_FALLBACK_PROVIDER) -- fatal to
 		// this run of runPipeline, since nothing downstream can decide a job without it. Log and
@@ -756,6 +930,15 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	if st != nil {
 		onOutcome = func(kind, outcome string) { st.Inc(health.JobsTotalMetricName(kind, outcome), 1) }
 		runner.OnOutcome = onOutcome
+		// plan §7: "in-lane retries counter" and "circuit-open events", plus a live circuit-state
+		// gauge per scope -- all three of N8e's new metrics.
+		runner.OnInlaneRetry = func(kind string, class sentinel.FailureClass) { st.Inc(health.MetricInlaneRetriesTotal, 1) }
+		runner.OnCircuitOpen = func(scope string) { st.Inc(health.CircuitOpenEventsMetricName(scope), 1) }
+		st.SetGauge(health.CircuitStateMetricName(sentinel.ScopeSentinelAPI), int64(sentinelAPIBreaker.State()))
+		// Runs until ctx is cancelled, same "left to be cancelled by ctx" convention as every
+		// other goroutine runPipeline starts (see the sweep ticker below) -- there is no partial
+		// state of its own to drain on shutdown, just a periodic gauge refresh.
+		go publishCircuitStateGauge(ctx, st, sentinelAPIBreaker, cfg.WorkerPollInterval)
 	}
 
 	// Journal-driven resume (CONTEXT.md's Recovery contract, plan §2.2/§8's required proof): every
@@ -1223,7 +1406,28 @@ func buildAdvisors(cfg Config, client *sentinel.Client, resolver settingsRepoRes
 // decisions, never send mutating calls) can be exercised directly by a unit test without standing
 // up the health server or the poll loop. Returns an error only when the LLM provider wiring itself
 // is invalid (buildAdvisors) — the caller decides how to treat that (fail startup vs. degrade).
-func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger) (*loop.Runner, error) {
+// publishCircuitStateGauge periodically refreshes breaker's plan §7 "circuit state gauge per
+// scope" (health.CircuitStateMetricName) at cfg.WorkerPollInterval, so an operator scraping
+// /metrics observes an Open circuit resolving to HalfOpen (and then Closed) as the 2m probe
+// interval elapses, not just the state at the moment it first opened. Returns once ctx is done.
+func publishCircuitStateGauge(ctx context.Context, st *health.Status, breaker *sentinel.CircuitBreaker, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	name := health.CircuitStateMetricName(breaker.Scope)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			st.SetGauge(name, int64(breaker.State()))
+		}
+	}
+}
+
+func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger, sentinelAPIBreaker *sentinel.CircuitBreaker) (*loop.Runner, error) {
 	resolver := settingsRepoResolver{Client: client, Settings: settingsStore, Cache: repoCache}
 	triage, followup, err := buildAdvisors(cfg, client, resolver, logger)
 	if err != nil {
@@ -1238,14 +1442,16 @@ func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, ag
 		FixConfidence: cfg.WorkerFixConfidence,
 	}
 	return &loop.Runner{
-		Journal:   journal,
-		Issues:    loop.HTTPIssueReader{Client: client},
-		Claims:    loop.HTTPClaimer{Client: client},
-		Advisor:   advisor,
-		Act:       actor,
-		DryRun:    !cfg.WorkerExecute,
-		MyAgentID: agentID,
-		Log:       logger,
+		Journal:          journal,
+		Issues:           loop.HTTPIssueReader{Client: client},
+		Claims:           loop.HTTPClaimer{Client: client},
+		Advisor:          advisor,
+		Act:              actor,
+		DryRun:           !cfg.WorkerExecute,
+		MyAgentID:        agentID,
+		Log:              logger,
+		Breaker:          sentinelAPIBreaker,
+		MaxInlaneRetries: cfg.WorkerMaxInlaneRetries,
 	}, nil
 }
 

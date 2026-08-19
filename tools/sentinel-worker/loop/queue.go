@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -82,6 +83,15 @@ type issueQueue struct {
 	pending map[Kind]*pendingJob // kind -> latest not-yet-started job of that kind
 	order   []Kind               // insertion order of kinds currently pending (FIFO across kinds)
 	started bool                 // a worker goroutine is currently draining this queue
+
+	// runningCancel, when non-nil, cancels the context the CURRENTLY EXECUTING job (runOne) was
+	// handed -- set by runIssueWorker just before calling runOne, cleared right after. This is
+	// what lets a tombstone (issue_deleted, C14) reach a job already in flight, not merely queued:
+	// cancelPending's SkipDeleted case calls this in addition to dropping not-yet-started pending
+	// jobs, per plan §9 N8e: "A tombstone for an issue with an in-flight job must cancel it." A
+	// CancelCauseFunc (not a plain CancelFunc) so cancelPending can tag the cancellation with
+	// errTombstoneCancel, letting runOne distinguish it from an ordinary shutdown cancellation.
+	runningCancel context.CancelCauseFunc
 }
 
 type pendingJob struct {
@@ -273,11 +283,20 @@ func (d *Dispatcher) Dispatch(ctx context.Context, e Event, kind Kind) {
 	}
 }
 
+// errTombstoneCancel is the context.Cause a tombstone-driven cancelPending(SkipDeleted) sets on an
+// in-flight job's context (via runningCancel, a context.CancelCauseFunc), so runOne can tell this
+// cancellation apart from ordinary shutdown (SIGTERM's ctx.Done()) and journal skipped(deleted)
+// instead of leaving the job stranded non-terminal or journaling a misleading failed.
+var errTombstoneCancel = errors.New("loop: issue deleted mid-job (tombstone)")
+
 // cancelPending drops any not-yet-started queued job for issueID and journals it `skipped` with
-// reason (plan §3: status_changed->resolved / issue_deleted both "cancel queued jobs"). A job
-// that is already RUNNING is not interrupted here — Runner.Run's own precondition re-check (which
-// re-reads issue state) is what stops it from acting, per plan §3's "runner precondition
-// (re-checked)" column.
+// reason (plan §3: status_changed->resolved / issue_deleted both "cancel queued jobs"). For
+// SkipDeleted specifically (issue_deleted, C14), it ALSO cancels a job already RUNNING for this
+// issue (plan §9 N8e: "A tombstone for an issue with an in-flight job must cancel it") via
+// runningCancel, tagged with errTombstoneCancel so runOne journals skipped(deleted) rather than a
+// misleading failed. Other reasons (status_changed->resolved) leave an in-flight job to Runner.Run's
+// own precondition re-check, per plan §3's "runner precondition (re-checked)" column -- unlike a
+// deletion, a resolved issue's in-flight job finishing its current step is harmless.
 func (d *Dispatcher) cancelPending(issueID string, reason SkipReason) {
 	d.mu.Lock()
 	q, ok := d.queues[issueID]
@@ -292,6 +311,9 @@ func (d *Dispatcher) cancelPending(issueID string, reason SkipReason) {
 		delete(q.pending, kind)
 	}
 	q.order = q.order[:0]
+	if reason == SkipDeleted && q.runningCancel != nil {
+		q.runningCancel(errTombstoneCancel)
+	}
 }
 
 func (d *Dispatcher) journalSuperseded(issueID string, kind Kind, e Event) {
@@ -364,7 +386,22 @@ func (d *Dispatcher) runIssueWorker(issueID string, q *issueQueue) {
 			q.mu.Unlock()
 		}
 
-		d.runOne(job.ctx, job.event, kind)
+		// Derive a per-job cancellable context so a tombstone landing WHILE this job is running
+		// (cancelPending's SkipDeleted case) can reach it -- runningCancel is published under
+		// q.mu before the run starts and cleared right after, so cancelPending never races a call
+		// against a stale/nil job. Kind.IsJob() (Triage/FollowUp) is the only thing ever queued
+		// here, matching cancelPending's scope (plan §9 N8e).
+		runCtx, cancel := context.WithCancelCause(job.ctx)
+		q.mu.Lock()
+		q.runningCancel = cancel
+		q.mu.Unlock()
+
+		d.runOne(runCtx, job.event, kind)
+
+		q.mu.Lock()
+		q.runningCancel = nil
+		q.mu.Unlock()
+		cancel(nil) // release resources even when runOne returned without the cause ever firing
 	}
 }
 
@@ -397,7 +434,38 @@ func (d *Dispatcher) runOne(ctx context.Context, e Event, kind Kind) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := d.Runner.Run(ctx, e, kind); err != nil && d.Log != nil {
+	err := d.Runner.Run(ctx, e, kind)
+	if err == nil {
+		return
+	}
+	if errors.Is(context.Cause(ctx), errTombstoneCancel) {
+		// A tombstone (issue_deleted, C14) cancelled this job while it was in flight
+		// (cancelPending's SkipDeleted case) -- Runner.Run returned early (most of its own
+		// internal error paths already stop promptly on ctx.Err(), leaving the job's journal
+		// record at whatever non-terminal state it last reached) without ever reaching its own
+		// terminal skipped(deleted) path, since the cancellation can land at any step. Journal the
+		// terminal record here so the job is never left stranded non-terminal (invisible to
+		// /metrics and to crash recovery, same reasoning as journalTransientFailure) -- unless
+		// Run() already got there itself (e.g. it was mid-retry on the precondition GET and the
+		// SAME tombstone's 404 raced it there first), in which case this is a race-safe no-op:
+		// Journal.Append de-duplicates by appending a second terminal record for an
+		// already-terminal jobId, which LatestByJobID naturally overwrites with itself.
+		issueID, idErr := e.IssueID()
+		if idErr == nil && d.Journal != nil {
+			jobID := state.JobID(string(kind), issueID, e.Seq)
+			latest, latestErr := d.Journal.LatestByJobID()
+			if latestErr == nil {
+				if rec, ok := latest[jobID]; !ok || !rec.State.IsTerminal() {
+					d.journalCancelled(issueID, kind, e, SkipDeleted)
+				}
+			}
+		}
+		if d.Log != nil {
+			d.Log.Info("dispatcher: job cancelled mid-run by tombstone", "kind", kind, "error", err)
+		}
+		return
+	}
+	if d.Log != nil {
 		d.Log.Error("dispatcher: job run failed", "kind", kind, "error", err)
 	}
 }

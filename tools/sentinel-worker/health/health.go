@@ -65,7 +65,32 @@ const (
 	// label support in the hand-rolled exposition format (renderMetrics), so kind and outcome are
 	// folded into the metric name itself via JobsTotalMetricName.
 	jobsTotalPrefix = "jobs_total"
+	// MetricInlaneRetriesTotal counts every in-lane retry the runner drives a job through (plan
+	// §2.4/§9 N8e: a Transient/RateLimited failure re-driven through sentinel.BackoffForAttempt
+	// without leaving the per-issue queue) -- incremented once per retry attempt, not once per job.
+	MetricInlaneRetriesTotal = "inlane_retries_total"
+	// circuitOpenEventsPrefix names the per-scope counter family "circuit_open_events_<scope>"
+	// (plan §7 "circuit-open events"), incremented each time a CircuitBreaker transitions from
+	// closed to open for that scope. Built via CircuitOpenEventsMetricName.
+	circuitOpenEventsPrefix = "circuit_open_events"
+	// circuitStatePrefix names the per-scope gauge family "circuit_state_<scope>" (plan §7 "circuit
+	// state gauge per scope"): 0=closed, 1=open, 2=half-open (sentinel.CircuitState's own values).
+	// Built via CircuitStateMetricName.
+	circuitStatePrefix = "circuit_state"
 )
+
+// CircuitOpenEventsMetricName builds the flat counter name for one dependency scope's circuit-open
+// event count (e.g. circuit_open_events_sentinel_api), same sanitize-then-flatten convention as
+// JobsTotalMetricName/CredentialAvailableMetricName.
+func CircuitOpenEventsMetricName(scope string) string {
+	return sanitizeMetricName(circuitOpenEventsPrefix + "_" + scope)
+}
+
+// CircuitStateMetricName builds the flat gauge name for one dependency scope's current
+// sentinel.CircuitState (e.g. circuit_state_sentinel_api).
+func CircuitStateMetricName(scope string) string {
+	return sanitizeMetricName(circuitStatePrefix + "_" + scope)
+}
 
 // JobsTotalMetricName builds the flat counter name for one (kind, outcome) pair of plan §7's
 // "jobs by kind×outcome" (e.g. jobs_total_triage_done, jobs_total_followup_skipped_foreign_claim).

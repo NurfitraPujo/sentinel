@@ -3,8 +3,10 @@ package sentinel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -324,7 +326,7 @@ func TestClient_KeyIsReadFreshOnEachCall(t *testing.T) {
 		t.Fatalf("expected key-1, got %q", lastAuth)
 	}
 
-	c.Key = "key-2" // simulate keyguard rotation swap
+	c.SetKey("key-2") // simulate keyguard rotation swap
 	if _, _, err := c.Do(context.Background(), "GET", "/x", nil, nil); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -403,6 +405,59 @@ func TestClient_Do_AuthRecoversAfterSuccessFollowing401(t *testing.T) {
 	if len(states) != 2 || states[0] != false || states[1] != true {
 		t.Fatalf("expected [false true], got %v", states)
 	}
+}
+
+// TestClient_ConcurrentSetKeyAndDo_NoRace proves the keyguard rotation-swap contract is race-free:
+// keyguard's Guard sidecar calls SetKey from its own goroutine while the poll loop, dispatcher,
+// sweep, and settings-refresh goroutines all call Do concurrently on the SAME shared *Client. This
+// gate is meant to fail under `-race` if Client.key is ever read/written outside the keyMu lock
+// again.
+func TestClient_ConcurrentSetKeyAndDo_NoRace(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "key-0")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: simulates keyguard's rotation swap firing repeatedly.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				i++
+				c.SetKey(fmt.Sprintf("key-%d", i))
+			}
+		}
+	}()
+
+	// Readers: simulate the poll loop / dispatcher / sweep / settings-refresh goroutines all
+	// sharing this one Client.
+	for n := 0; n < 4; n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if _, _, err := c.Do(context.Background(), "GET", "/x", nil, nil); err != nil {
+					t.Errorf("Do: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Let the readers run their fixed iteration count, then stop the writer.
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestErrorMessage_PrefersErrorFieldThenMessageThenBody(t *testing.T) {

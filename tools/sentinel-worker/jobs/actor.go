@@ -70,7 +70,13 @@ func (a RealActor) Act(ctx context.Context, jobID string, d Decision) error {
 		return fmt.Errorf("jobs: RealActor: fetching issue %s for job %s: %w", issueID, jobID, err)
 	}
 	if res.Status < 200 || res.Status >= 300 {
-		return fmt.Errorf("jobs: RealActor: GET issue %s: status %d: %s", issueID, res.Status, sentinel.ErrorMessage(res.Body))
+		// Wrapped as *sentinel.StatusError (not a bare fmt.Errorf), matching
+		// loop.HTTPIssueReader.GetIssue's own reasoning: this is the runner's Act-time re-read of
+		// the issue (mid-job, after the precondition GET already succeeded once), so a 404 here is
+		// the same "issue deleted between the event landing and this job running" race (C14) --
+		// hardening N8e's tombstone/404 handling means the runner must be able to classify THIS
+		// 404 as ClassGone too, not just the earlier precondition-read 404.
+		return fmt.Errorf("jobs: RealActor: GET issue %s: %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
 	}
 	var env actIssueEnvelope
 	if err := json.Unmarshal(res.Body, &env); err != nil {
@@ -199,6 +205,17 @@ func checkBatchResults(compiled Compiled, bRes *sentinel.Result) error {
 		switch c {
 		case sentinel.ClassSuccess, sentinel.ClassConflictDroppable:
 			continue
+		case sentinel.ClassGone:
+			// A 404 on an individual batch op (race: the issue was deleted between the precondition
+			// read and this batch landing, C14) must be distinguishable from every other batch
+			// failure so the runner can journal skipped(deleted) instead of failed (N8e hardening,
+			// matching the mid-job GET's own *sentinel.StatusError wrapping above). Status 404 here
+			// stands for "this op's own result was Gone", not a literal envelope status.
+			opName := "?"
+			if i < len(compiled.Ops) {
+				opName = compiled.Ops[i].Op
+			}
+			return fmt.Errorf("batch op %d (%s) is gone: %w", i, opName, &sentinel.StatusError{Status: 404})
 		default:
 			opName := "?"
 			if i < len(compiled.Ops) {
