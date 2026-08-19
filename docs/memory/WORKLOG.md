@@ -566,3 +566,15 @@ process creating dirs during the window); the real fix isolates TMPDIR (t.Setenv
 only this test's own RunGit dir. Lesson: a test that scans a SHARED namespace
 (os.TempDir, global ports, a shared DB) and asserts an absolute count is a latent CI flake — scope
 the assertion to what the test itself created.
+
+## 2026-08-19 — N8 PR #32: timing-fragile tests under -race on loaded CI runners
+
+After the askpass-isolation fix, two main_test.go integration tests flaked in the push run while
+the PR run of the SAME commit passed (both runs share GitHub's runner pool, doubling load). Root
+cause: wall-clock-timing assertions calibrated for fast execution break under -race (~10x slower)
+on a contended runner. TestWorkerEnabledGate checked hits after a fixed 150ms ctx (runApp startup
+can exceed that under load) -> now waits for the first hit with a 15s deadline.
+TestRunApp_ReadyzComposition used pollInterval=15ms (freshness window only 90ms, which a -race'd
+poll cycle exceeds -> cursor goes stale -> 503) -> bumped to 100ms (600ms window). Lesson: any test
+asserting a fixed-duration timing property is a latent -race/CI-load flake; wait-for-condition with
+a generous deadline, and size freshness/poll windows well above a -race'd cycle.

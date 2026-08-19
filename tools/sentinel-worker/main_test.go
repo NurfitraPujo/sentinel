@@ -907,9 +907,18 @@ func TestWorkerEnabledGate_PipelineDoesNotStart(t *testing.T) {
 // discriminating on WorkerEnabled and not on some other reason requests never arrive (e.g. a
 // broken test server or a ctx that never lets the pipeline run at all).
 func TestWorkerEnabledGate_PipelineStartsWhenEnabled(t *testing.T) {
+	// Wait for the FIRST request rather than checking hits after a fixed sleep: under -race on a
+	// loaded CI runner, runApp's startup (health bind, journal open, recovery, bootstrap) can take
+	// far longer than any fixed window before it reaches the first GET /api/agent/self, so a
+	// fixed-duration ctx made this flake. Signal on first hit, wait up to a generous deadline.
+	firstHit := make(chan struct{}, 1)
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
+		select {
+		case firstHit <- struct{}{}:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"agentId":"agent-1"}`))
 	}))
@@ -923,14 +932,24 @@ func TestWorkerEnabledGate_PipelineStartsWhenEnabled(t *testing.T) {
 		WorkerHealthAddr:   "127.0.0.1:0",
 		WorkerStateDir:     t.TempDir(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	appDone := make(chan struct{})
+	go func() {
+		runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		close(appDone)
+	}()
 
-	runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-
-	if got := atomic.LoadInt32(&hits); got == 0 {
-		t.Fatalf("expected at least one request to reach the sentinel API while WORKER_ENABLED=true, got 0 -- the gate test proves nothing if this control case can't start the pipeline either")
+	select {
+	case <-firstHit:
+		// Success: the enabled pipeline drove at least one request. Tear down.
+	case <-time.After(15 * time.Second):
+		cancel()
+		<-appDone
+		t.Fatalf("expected at least one request to reach the sentinel API while WORKER_ENABLED=true within 15s, got %d -- the gate test proves nothing if this control case can't start the pipeline either", atomic.LoadInt32(&hits))
 	}
+	cancel()
+	<-appDone
 }
 
 // --- WORKER_WORKSPACE_DIR trust boundary (finding 2) ---
@@ -1229,7 +1248,11 @@ func TestRunApp_ReadyzComposition_EndToEnd(t *testing.T) {
 	healthAddr := ln.Addr().String()
 	ln.Close()
 
-	const pollInterval = 15 * time.Millisecond
+	// 100ms (not 15ms) so the cursor-freshness window (cursorFreshnessMultiple*pollInterval = 600ms)
+	// comfortably exceeds a single poll cycle even under -race on a loaded CI runner. At 15ms the
+	// window was only 90ms, which a -race'd cycle (HTTP round-trip + journal fsync) could exceed,
+	// letting the cursor go stale mid-test and flaking the "stays 200" assertion below.
+	const pollInterval = 100 * time.Millisecond
 	cfg := Config{
 		WorkerEnabled:       true,
 		WorkerExecute:       false,
