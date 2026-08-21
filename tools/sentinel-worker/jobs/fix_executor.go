@@ -49,6 +49,14 @@ var forbiddenExecutorEnvPrefixes = []string{
 // isForbiddenExecutorEnvKey reports whether key is one this package must never let into the Fix
 // Executor's child environment, matched by exact name or by a "PREFIX_" style prefix from the list
 // above (covers e.g. a future LLM_FALLBACK_API_KEY_2 without needing a new literal entry).
+// IsForbiddenExecutorEnvKey is the exported form of isForbiddenExecutorEnvKey (finding 4,
+// fix-lifecycle remediation round 2): main.go's LoadConfig uses it to reject a WORKER_FIX_EXECUTOR_ENV
+// entry naming a forbidden key at config-validation time, in addition to (not instead of)
+// buildExecutorEnv's own runtime guard below -- an operator gets a startup validation error
+// (plan §6: invalid config keeps the process up with /readyz failing) rather than discovering the
+// misconfiguration only when the first FIX attempt's executor invocation fails.
+func IsForbiddenExecutorEnvKey(key string) bool { return isForbiddenExecutorEnvKey(key) }
+
 func isForbiddenExecutorEnvKey(key string) bool {
 	for _, p := range forbiddenExecutorEnvPrefixes {
 		if key == p || strings.HasPrefix(key, p) {

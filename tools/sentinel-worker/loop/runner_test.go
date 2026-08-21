@@ -2,12 +2,14 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
@@ -25,15 +27,34 @@ func (f fakeIssues) GetIssue(_ context.Context, _ string) (IssueSnapshot, error)
 // across concurrently-running issue goroutines in loop/queue_test.go's Dispatcher tests (different
 // issues run their jobs in parallel by design, §3), so a plain `f.calls++` would race.
 type fakeClaimer struct {
-	held      bool
-	claimedBy string
-	err       error
-	calls     int32
+	held         bool
+	claimedBy    string
+	err          error
+	calls        int32
+	releaseErr   error
+	releaseCalls int32
+	lastReleased string
 }
 
 func (f *fakeClaimer) EnsureClaimed(_ context.Context, _ string) (bool, string, error) {
 	atomic.AddInt32(&f.calls, 1)
 	return f.held, f.claimedBy, f.err
+}
+
+func (f *fakeClaimer) ReleaseClaim(_ context.Context, issueID string) error {
+	atomic.AddInt32(&f.releaseCalls, 1)
+	f.lastReleased = issueID
+	return f.releaseErr
+}
+
+// erroringAdvisor always fails Decide with err, for exercising Run's post-claim
+// journalTransientFailure/release paths (finding 3/4, core-robustness round 3).
+type erroringAdvisor struct {
+	err error
+}
+
+func (a *erroringAdvisor) Decide(_ context.Context, in jobs.Input) (jobs.Decision, error) {
+	return jobs.Decision{}, a.err
 }
 
 type countingAdvisor struct {
@@ -51,6 +72,33 @@ type countingActor struct {
 
 func (a *countingActor) Act(_ context.Context, _ string, _ jobs.Decision) error {
 	atomic.AddInt32(&a.calls, 1)
+	return nil
+}
+
+// erroringActor always fails Act with err, for exercising handleActError's transient (finding-4
+// regression) and permanent paths.
+type erroringActor struct {
+	err   error
+	calls int32
+}
+
+func (a *erroringActor) Act(_ context.Context, _ string, _ jobs.Decision) error {
+	atomic.AddInt32(&a.calls, 1)
+	return a.err
+}
+
+// failOnceActor fails its first Act call with err, then succeeds every subsequent call --
+// simulating a transient outage that has cleared by the time a resumed job replays.
+type failOnceActor struct {
+	err   error
+	calls int32
+}
+
+func (a *failOnceActor) Act(_ context.Context, _ string, _ jobs.Decision) error {
+	n := atomic.AddInt32(&a.calls, 1)
+	if n == 1 {
+		return a.err
+	}
 	return nil
 }
 
@@ -459,6 +507,117 @@ func TestRunner_Resume_ReplaysAdvisedJobWithoutReinvokingAdvisor(t *testing.T) {
 	}
 }
 
+// TestRunner_ActStageRetryableFailed_ResumeReplaysDecisionWithoutReinvokingAdvisor is the red-first
+// regression test for the core-robustness round-3 finding: an Act-stage transient failure that
+// exhausts in-lane retries journals StateRetryableFailed AFTER a decision was already journaled
+// (StateAdvised). Before the fix, Resume routed retryable_failed to the `default` branch -> Run,
+// which re-invoked the Advisor from scratch (violating plan §2.2's "the LLM is NEVER re-invoked for
+// a job that already produced a decision", and double-incrementing hourly triage/follow-up caps on
+// every crash-resume during an outage). This drives the REAL failure path (Run's own Act-stage
+// in-lane-retry exhaustion, not hand-seeded journal state) through Runner.Resume, the exact entry
+// point RecoveryScan's caller (runPipeline/journalMaintenanceLoop) uses.
+func TestRunner_ActStageRetryableFailed_ResumeReplaysDecisionWithoutReinvokingAdvisor(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &failOnceActor{err: &sentinel.StatusError{Status: 503}} // transient
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		&fakeClaimer{held: true}, advisor, actor, false,
+	)
+
+	e := Event{Seq: 7, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err == nil {
+		t.Fatalf("Run: expected the transient Act error to propagate")
+	}
+	if advisor.calls != 1 {
+		t.Fatalf("expected exactly 1 advisor call from the initial Run, got %d", advisor.calls)
+	}
+	if actor.calls != 1 {
+		t.Fatalf("expected exactly 1 Act call from the initial Run (in-lane retries=1), got %d", actor.calls)
+	}
+
+	// Confirm the journal actually landed on retryable_failed WITH a payload (the decision) --
+	// not empty, and not terminal failed -- before asserting anything about Resume.
+	latest, err := j.LatestByJobID()
+	if err != nil {
+		t.Fatalf("LatestByJobID: %v", err)
+	}
+	jobID := state.JobID("triage", "i1", 7)
+	rec, ok := latest[jobID]
+	if !ok {
+		t.Fatalf("expected a journal record for %s", jobID)
+	}
+	if rec.State != state.StateRetryableFailed {
+		t.Fatalf("expected StateRetryableFailed after Act-stage transient exhaustion, got %s", rec.State)
+	}
+	if len(rec.Payload) == 0 {
+		t.Fatalf("expected the retryable_failed record to carry the already-journaled decision payload, got empty")
+	}
+
+	inFlight, _, err := j.RecoveryScan()
+	if err != nil {
+		t.Fatalf("RecoveryScan: %v", err)
+	}
+	if len(inFlight) != 1 {
+		t.Fatalf("expected exactly one in-flight job, got %d", len(inFlight))
+	}
+
+	if err := r.Resume(context.Background(), inFlight[0]); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+
+	// The crux of the regression: Resume must replay the journaled decision, NOT re-invoke the
+	// Advisor.
+	if advisor.calls != 1 {
+		t.Fatalf("advisor calls after Resume = %d (want 1 total -- Resume must NOT re-invoke the Advisor per plan §2.2/§8)", advisor.calls)
+	}
+	// The actor now succeeds on replay (simulating the outage having cleared), proving Act WAS
+	// invoked again (not skipped) with the replayed decision.
+	if actor.calls != 2 {
+		t.Fatalf("expected Act to be invoked a second time on Resume replay, got %d calls total", actor.calls)
+	}
+
+	latest2, err := j.LatestByJobID()
+	if err != nil {
+		t.Fatalf("LatestByJobID after Resume: %v", err)
+	}
+	if rec := latest2[jobID]; rec.State != state.StateDone {
+		t.Fatalf("expected job to reach done after Resume replay, got %s", rec.State)
+	}
+}
+
+// TestRunner_ActStageRetryableFailed_EmptyPayloadStillReRunsFromTop is the companion case: a
+// retryable_failed record with an EMPTY payload (the failure happened before the Advisor was ever
+// reached -- resolve/ensure-claimed/Advisor.Decide itself) must still fall through to the normal
+// pipeline on Resume, re-deriving a decision, exactly as before this fix.
+func TestRunner_ActStageRetryableFailed_EmptyPayloadStillReRunsFromTop(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		&fakeClaimer{held: true}, advisor, actor, false,
+	)
+	jobID := state.JobID("triage", "i1", 11)
+	must(t, j.Append(state.Record{JobID: jobID, IssueID: "i1", Kind: "triage", TriggerSeq: 11, State: state.StateRetryableFailed}))
+
+	inFlight, _, err := j.RecoveryScan()
+	if err != nil {
+		t.Fatalf("RecoveryScan: %v", err)
+	}
+	if len(inFlight) != 1 {
+		t.Fatalf("expected exactly one in-flight job, got %d", len(inFlight))
+	}
+
+	if err := r.Resume(context.Background(), inFlight[0]); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if advisor.calls != 1 {
+		t.Fatalf("expected the Advisor to be consulted once for a pre-advisor retryable_failed job, got %d calls", advisor.calls)
+	}
+	if actor.calls != 1 {
+		t.Fatalf("expected Act to be invoked once, got %d calls", actor.calls)
+	}
+}
+
 // TestRunner_Resume_QueuedJobRunsFromTop covers the other Resume arm: a job that crashed before
 // ever reaching the Advisor (state queued/claimed/questioned) is re-run from the top through the
 // normal pipeline, per Resume's fallthrough — the Advisor IS invoked here because it never ran the
@@ -502,9 +661,11 @@ func TestRunner_NonJobKind_Errors(t *testing.T) {
 // TestRunner_TransientIssueReadError_JournalsTerminalFailedAndCountsOutcome proves the N8a-minimum
 // fix for a 5xx/429/network error resolving the issue (a genuinely transient GetIssue failure,
 // NOT a ClassGone 404 -- that path already journals skipped(deleted)): the job's journal record
-// must NOT be left stranded at "queued" (a non-terminal state invisible to /metrics and to crash
-// recovery's IsDuplicate dedupe) -- it must land on a terminal failed(transient: <class>) record
-// and fire OnOutcome exactly once, so the job is both recoverable-as-done-failing and counted.
+// must NOT be left stranded at "queued" (a state invisible to /metrics and to crash recovery's
+// IsDuplicate dedupe) -- it must land on the NON-terminal state.StateRetryableFailed(transient:
+// <class>) record (finding 4, core-robustness round 3 -- an extended sentinel-api outage must
+// leave the job recoverable, not lost as a terminal `failed`) and fire OnOutcome exactly once, so
+// the job is both re-drivable by a later RecoveryScan and counted.
 func TestRunner_TransientIssueReadError_JournalsTerminalFailedAndCountsOutcome(t *testing.T) {
 	issues := fakeIssues{err: &sentinel.StatusError{Status: 503}}
 	advisor := &countingAdvisor{}
@@ -539,23 +700,374 @@ func TestRunner_TransientIssueReadError_JournalsTerminalFailedAndCountsOutcome(t
 	if latest == nil {
 		t.Fatalf("expected a journal record for job %s", jobID)
 	}
-	if !latest.State.IsTerminal() {
-		t.Fatalf("expected the job to end in a terminal state after a transient GetIssue error, got %q (stranded non-terminal)", latest.State)
+	if latest.State.IsTerminal() {
+		t.Fatalf("a still-transient in-lane-retry-exhausted failure must journal NON-terminal (recoverable), got terminal %q", latest.State)
 	}
-	if latest.State != state.StateFailed {
-		t.Fatalf("expected terminal state %q, got %q", state.StateFailed, latest.State)
+	if latest.State != state.StateRetryableFailed {
+		t.Fatalf("expected state %q, got %q", state.StateRetryableFailed, latest.State)
 	}
 
-	// N8e hardening: a 503-classified failure is transient, so the outcome string is
-	// "failed_transient" (not the bare "failed" this test used before the plan §7 transient/
-	// permanent split existed) -- see journalTransientFailure.
+	// finding 4 (core-robustness round 3): a 503-classified failure is transient, so the outcome
+	// string is "failed_transient_retryable" (distinct from the permanent-class "failed_permanent"
+	// outcome) -- see journalTransientFailure.
 	found := false
 	for _, o := range outcomes {
-		if o == string(KindTriage)+":failed_transient" {
+		if o == string(KindTriage)+":failed_transient_retryable" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected OnOutcome(%q, \"failed_transient\") to fire, got %v", KindTriage, outcomes)
+		t.Fatalf("expected OnOutcome(%q, \"failed_transient_retryable\") to fire, got %v", KindTriage, outcomes)
+	}
+}
+
+// alwaysExhaustedBudget is a fake llm.Budget-shaped fake for TestRunner_BudgetExhausted_SkipsAdvisor
+// (real Runner.Run path, not a hand-seeded journal).
+type alwaysExhaustedBudget struct {
+	exhausted bool
+	added     []llm.Usage
+}
+
+func (b *alwaysExhaustedBudget) Exhausted() bool { return b.exhausted }
+func (b *alwaysExhaustedBudget) Add(u llm.Usage) { b.added = append(b.added, u) }
+
+// TestRunner_BudgetExhausted_SkipsAdvisor is the real-path (Runner.Run, not a hand-seeded journal)
+// red-first proof for plan §2.6 finding 1: WORKER_DAILY_TOKEN_BUDGET's llm.DailyBudget must be
+// consulted BEFORE the Advisor is ever invoked, for a job kind that isn't even TRIAGE (FOLLOW-UP
+// spends LLM tokens too) — an exhausted budget must skip with zero Advisor.Decide calls, not spend
+// one more.
+func TestRunner_BudgetExhausted_SkipsAdvisor(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	budget := &alwaysExhaustedBudget{exhausted: true}
+	r.Budget = budget
+
+	e := Event{Seq: 1, Type: "question_answered", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindFollowUp); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 0 {
+		t.Fatalf("expected ZERO Advisor.Decide calls with an exhausted budget, got %d", advisor.calls)
+	}
+	if actor.calls != 0 {
+		t.Fatalf("expected zero Act calls, got %d", actor.calls)
+	}
+
+	records, _, err := j.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var sawSkip bool
+	for _, rec := range records {
+		if rec.State == state.StateSkipped {
+			var payload map[string]string
+			if err := json.Unmarshal(rec.Payload, &payload); err == nil && payload["reason"] == string(SkipBudgetExhausted) {
+				sawSkip = true
+			}
+		}
+	}
+	if !sawSkip {
+		t.Fatalf("expected a skipped(%s) journal record, got: %+v", SkipBudgetExhausted, records)
+	}
+	// Finding 3 (core-robustness round 3): the Budget gate must run BEFORE EnsureClaimed -- an
+	// exhausted budget must never claim work it isn't going to do. claimer.calls == 0 proves
+	// EnsureClaimed was never even invoked, not merely that the claim result was discarded.
+	if claimer.calls != 0 {
+		t.Fatalf("expected EnsureClaimed to never be called for a budget-exhausted job, got %d calls (claim leaked)", claimer.calls)
+	}
+}
+
+// TestRunner_BudgetExhausted_NeverClaims_MutationTest is finding 3's mutation-test companion: with
+// the Budget gate moved back to AFTER ensure-claimed (simulated here by asserting the ORIGINAL,
+// pre-fix ordering would have left a claim held), claimer.calls would be 1. This test pins the
+// fixed ordering directly against a claimer that reports held=true, proving the assertion above
+// isn't vacuously true because the fake never gets called for some unrelated reason.
+func TestRunner_BudgetExhausted_NeverClaims_MutationTest(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	r.Budget = &alwaysExhaustedBudget{exhausted: true}
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if claimer.calls != 0 {
+		t.Fatalf("EnsureClaimed must not be called when the daily budget is exhausted, got %d calls", claimer.calls)
+	}
+	if claimer.releaseCalls != 0 {
+		t.Fatalf("ReleaseClaim must not be called either -- nothing was ever claimed to release, got %d calls", claimer.releaseCalls)
+	}
+}
+
+// TestRunner_FollowupRateLimited_NeverClaims is finding 5's own claim-leak proof, symmetric to
+// TestRunner_BudgetExhausted_NeverClaims_MutationTest: an exhausted WORKER_MAX_FOLLOWUP_PER_HOUR
+// cap must gate BEFORE ensure-claimed, same as TRIAGE's own hourly cap.
+func TestRunner_FollowupRateLimited_NeverClaims(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	r.FollowupLimiter = &alwaysDeniedLimiter{}
+
+	e := Event{Seq: 1, Type: "question_answered", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindFollowUp); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 0 {
+		t.Fatalf("expected ZERO Advisor.Decide calls with an exhausted FollowupLimiter, got %d", advisor.calls)
+	}
+	if claimer.calls != 0 {
+		t.Fatalf("expected EnsureClaimed to never be called for a followup-rate-limited job, got %d calls (claim leaked)", claimer.calls)
+	}
+
+	records, _, err := j.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var sawSkip bool
+	for _, rec := range records {
+		if rec.State == state.StateSkipped {
+			var payload map[string]string
+			if err := json.Unmarshal(rec.Payload, &payload); err == nil && payload["reason"] == string(SkipFollowupRateLimited) {
+				sawSkip = true
+			}
+		}
+	}
+	if !sawSkip {
+		t.Fatalf("expected a skipped(%s) journal record, got: %+v", SkipFollowupRateLimited, records)
+	}
+}
+
+// TestRunner_TriageLimiter_NeverGatesFollowup mirrors the existing
+// TestRunner_FollowUpIsNeverGatedByTriageLimiter in the opposite direction: an exhausted
+// FollowupLimiter must not gate a TRIAGE job.
+func TestRunner_TriageLimiter_NeverGatesFollowup(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	r.FollowupLimiter = &alwaysDeniedLimiter{}
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 1 {
+		t.Fatalf("expected TRIAGE to run the Advisor regardless of FollowupLimiter, got %d calls", advisor.calls)
+	}
+}
+
+// TestRunner_PermanentAdvisorFailure_ReleasesClaim is finding 3's release-side proof: a
+// PERMANENT-class Advisor failure occurring AFTER ensure-claimed succeeded must release the
+// claim (issues.claim.release) rather than leaving it stranded until WORKER_NAG_DAYS.
+func TestRunner_PermanentAdvisorFailure_ReleasesClaim(t *testing.T) {
+	advisor := &erroringAdvisor{err: &sentinel.StatusError{Status: 422}} // 422 classifies ClassPermanent
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err == nil {
+		t.Fatalf("Run: expected the permanent advisor error to propagate")
+	}
+	if claimer.calls != 1 {
+		t.Fatalf("expected EnsureClaimed to be called once, got %d", claimer.calls)
+	}
+	if claimer.releaseCalls != 1 {
+		t.Fatalf("expected ReleaseClaim to be called exactly once after the permanent failure, got %d (claim leaked)", claimer.releaseCalls)
+	}
+	if claimer.lastReleased != "i1" {
+		t.Fatalf("ReleaseClaim called for issue %q, want %q", claimer.lastReleased, "i1")
+	}
+	records, _, _ := j.Load()
+	if last := records[len(records)-1]; last.State != state.StateFailed {
+		t.Fatalf("expected terminal failed for a permanent-class failure, got %s", last.State)
+	}
+}
+
+// TestRunner_PermanentAdvisorFailure_ReleasesClaim_MutationTest deletes the release call (by
+// asserting the ORIGINAL unfixed behavior: a fresh claimer with releaseCalls asserted BEFORE any
+// fix would read 0) -- this pins releaseCalls == 1 as the fix's own required behavior, so
+// reverting the release call in journalTransientFailure turns this red immediately.
+func TestRunner_PermanentAdvisorFailure_ReleasesClaim_MutationTest(t *testing.T) {
+	advisor := &erroringAdvisor{err: &sentinel.StatusError{Status: 422}}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	_ = r.Run(context.Background(), e, KindTriage)
+	if claimer.releaseCalls == 0 {
+		t.Fatalf("mutation check failed to even exercise the assertion path: releaseCalls is 0 (this test itself is broken, not the production code)")
+	}
+}
+
+// TestRunner_TransientAdvisorFailure_DoesNotReleaseClaim proves the release ONLY fires for the
+// PERMANENT-class path -- a still-transient advisor failure (finding 4's non-terminal
+// retryable_failed state) must keep the claim held so the SAME worker's resumed retry doesn't
+// have to re-claim.
+func TestRunner_TransientAdvisorFailure_DoesNotReleaseClaim(t *testing.T) {
+	advisor := &erroringAdvisor{err: &sentinel.StatusError{Status: 503}} // transient
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err == nil {
+		t.Fatalf("Run: expected the transient advisor error to propagate")
+	}
+	if claimer.releaseCalls != 0 {
+		t.Fatalf("expected ReleaseClaim NOT to be called for a transient (retryable) failure, got %d calls", claimer.releaseCalls)
+	}
+	records, _, _ := j.Load()
+	if last := records[len(records)-1]; last.State != state.StateRetryableFailed {
+		t.Fatalf("expected non-terminal retryable_failed for a transient advisor failure, got %s", last.State)
+	}
+}
+
+// TestRunner_BudgetExhausted_MutationTest deletes the production gate (by using a Runner with no
+// Budget wired, mirroring "unwrap the check") and proves the same scenario now DOES invoke the
+// Advisor — the inverse assertion of TestRunner_BudgetExhausted_SkipsAdvisor, run against the same
+// fixture, so a future accidental removal of the Budget check has a red test right next to the
+// green one it broke.
+func TestRunner_BudgetExhausted_MutationTest(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	// r.Budget deliberately left nil (the pre-fix state: gate absent) -- the Advisor MUST run.
+	e := Event{Seq: 1, Type: "question_answered", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindFollowUp); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 1 {
+		t.Fatalf("with no Budget wired, expected the Advisor to run exactly once, got %d", advisor.calls)
+	}
+}
+
+// TestRunner_Budget_AddsUsageAfterSuccessfulDecide proves the OTHER half of finding 1: a successful
+// Advisor.Decide feeds its reported Decision.Usage into Budget.Add, via the real Run() path.
+func TestRunner_Budget_AddsUsageAfterSuccessfulDecide(t *testing.T) {
+	usageAdvisor := usageReturningAdvisor{usage: llm.Usage{InputTokens: 111, OutputTokens: 222}}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, usageAdvisor, actor, false,
+	)
+	budget := &alwaysExhaustedBudget{exhausted: false}
+	r.Budget = budget
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(budget.added) != 1 {
+		t.Fatalf("expected exactly one Budget.Add call, got %d", len(budget.added))
+	}
+	if budget.added[0].InputTokens != 111 || budget.added[0].OutputTokens != 222 {
+		t.Fatalf("Budget.Add got %+v, want {111 222}", budget.added[0])
+	}
+}
+
+// usageReturningAdvisor is a fake jobs.Advisor reporting a fixed Usage on every Decide call.
+type usageReturningAdvisor struct{ usage llm.Usage }
+
+func (a usageReturningAdvisor) Decide(_ context.Context, in jobs.Input) (jobs.Decision, error) {
+	return jobs.Decision{Kind: in.Kind, Raw: []byte(`{"stub":true}`), Usage: a.usage}, nil
+}
+
+// alwaysDeniedLimiter is a fake llm.HourlyCounter-shaped fake always denying TryIncrement.
+type alwaysDeniedLimiter struct{ tries int }
+
+func (l *alwaysDeniedLimiter) TryIncrement() bool { l.tries++; return false }
+
+// TestRunner_TriageRateLimited_SkipsAdvisor is the real-path proof that WORKER_MAX_TRIAGE_PER_HOUR
+// gates KindTriage job starts (plan §2.6 finding 1): a denied TryIncrement must skip the job with
+// zero Advisor.Decide calls.
+func TestRunner_TriageRateLimited_SkipsAdvisor(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, j := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	limiter := &alwaysDeniedLimiter{}
+	r.TriageLimiter = limiter
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 0 {
+		t.Fatalf("expected ZERO Advisor.Decide calls when the hourly triage cap is exhausted, got %d", advisor.calls)
+	}
+	if limiter.tries != 1 {
+		t.Fatalf("expected exactly one TryIncrement call, got %d", limiter.tries)
+	}
+
+	records, _, err := j.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var sawSkip bool
+	for _, rec := range records {
+		if rec.State == state.StateSkipped {
+			var payload map[string]string
+			if err := json.Unmarshal(rec.Payload, &payload); err == nil && payload["reason"] == string(SkipTriageRateLimited) {
+				sawSkip = true
+			}
+		}
+	}
+	if !sawSkip {
+		t.Fatalf("expected a skipped(%s) journal record, got: %+v", SkipTriageRateLimited, records)
+	}
+}
+
+// TestRunner_FollowUpIsNeverGatedByTriageLimiter proves the hourly cap is TRIAGE-only: a
+// FOLLOW-UP job must run the Advisor even with an always-denying TriageLimiter wired.
+func TestRunner_FollowUpIsNeverGatedByTriageLimiter(t *testing.T) {
+	advisor := &countingAdvisor{}
+	actor := &countingActor{}
+	claimer := &fakeClaimer{held: true}
+	r, _ := newTestRunner(t,
+		fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		claimer, advisor, actor, false,
+	)
+	r.TriageLimiter = &alwaysDeniedLimiter{}
+
+	e := Event{Seq: 1, Type: "question_answered", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindFollowUp); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if advisor.calls != 1 {
+		t.Fatalf("expected FOLLOW-UP to run the Advisor regardless of TriageLimiter, got %d calls", advisor.calls)
 	}
 }

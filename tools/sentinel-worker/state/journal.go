@@ -37,7 +37,26 @@ const (
 	// Non-terminal (see terminalStates below): a job left at StateFixRunning by a crash is exactly
 	// what RecoveryScan/RecoveryScan's callers must find and resume, not treat as done.
 	StateFixRunning JobState = "fix_running"
+
+	// StateRetryableFailed marks a job whose in-lane retry budget was exhausted while the
+	// underlying cause was STILL classifying Transient/RateLimited (core-robustness round 3,
+	// finding 4) -- e.g. a sentinel-api write outage that outlasts WORKER_MAX_INLANE_RETRIES.
+	// Deliberately non-terminal (see terminalStates below): journaling this as StateFailed would
+	// tell RecoveryScan the job is done, permanently losing it (tenet 1) for the rest of the
+	// outage. Left non-terminal, RecoveryScan's in-flight scan keeps finding it and main.go's
+	// startup Resume pass (and any later restart) re-drives it through the normal pipeline once
+	// the circuit/API recovers -- exactly the "recoverable, not lost" contract this state exists
+	// to satisfy. A job that reaches this state and later fails for a PERMANENT reason still ends
+	// up at StateFailed on the next attempt, same as any fresh failure.
+	StateRetryableFailed JobState = "retryable_failed"
 )
+
+// FixKind is the journal Record.Kind every FIX-originated record uses. Defined here (rather than
+// only in jobs/fix_pr.go, which aliases this) so loop.Classify's dispatch table (loop/dispatch.go,
+// loop/poll.go) can consult HasOpenKind(issueID, state.FixKind) for the "skip if FIX in flight"
+// rule (fix-lifecycle remediation round 2, finding 3) without loop importing jobs -- jobs already
+// imports loop (loop/runner.go), so the reverse import would cycle.
+const FixKind = "fix"
 
 // Terminal states end a job's lifecycle: no further transitions are ever appended for the jobId,
 // and a re-delivered event that maps to it is dropped as a duplicate (plan §2.2 "Dedupe").
@@ -50,6 +69,44 @@ var terminalStates = map[JobState]bool{
 
 // IsTerminal reports whether s is one of the journal's terminal states.
 func (s JobState) IsTerminal() bool { return terminalStates[s] }
+
+// jobStateAdvanced marks the non-terminal states that mean "an Advisor decision already exists (or
+// this job has progressed into/past Act) for this jobId" -- Advised, Acting, and Acted. Once a
+// jobId's latest record is one of these, Append refuses a later record for the SAME jobId whose
+// state is in jobStateEarly (finding 5, plan §2.2).
+//
+// Why this matters: Dispatcher.Enqueue's dedupe only checks IsTerminal() before appending a fresh
+// StateQueued record for a re-delivered event's jobId (kind+issueId+triggerSeq are IDENTICAL on
+// redelivery, so the jobId is too). A job already advanced past "queued" -- e.g. sitting at
+// "advised" because the Advisor already ran -- is NOT terminal, so without this guard a re-
+// delivered event's StateQueued append would win, regressing the journal's latest-per-jobId view
+// back to "queued" and masking the fact that a decision already exists. A crash in that exact
+// window would leave RecoveryScan seeing "queued" and Resume falling through to the normal
+// pipeline, RE-INVOKING THE ADVISOR for a job whose decision was already journaled -- exactly what
+// CONTEXT.md's Replay contract ("the LLM is NEVER re-invoked for a job that already produced a
+// decision") forbids. Guarding this centrally in Append (rather than only in Enqueue) protects
+// every caller that appends by jobId, matching the terminal-guard's own "belt-and-braces" framing.
+//
+// This is deliberately NARROWER than a total lifecycle ordering: StateQuestioned is intentionally
+// left out of jobStateAdvanced. loop.Runner.Run's own dedupe check treats "queued/claimed/
+// questioned" as a single "has not yet reached the Advisor" bucket that legitimately falls through
+// to a fresh Queued->Claimed->Advised re-run on Resume (see runner.go's Run/Resume doc comments and
+// state/journal_test.go's TestJournal_HasOpenQuestion, which asserts a job moving from Questioned
+// back to Advised is a REAL, expected transition, not a regression to guard against). Guarding only
+// {Advised, Acting, Acted} -> {Queued, Claimed} keeps this fix scoped to the exact bug finding 5
+// describes without breaking that already-established, tested resume path.
+var jobStateAdvanced = map[JobState]bool{
+	StateAdvised: true,
+	StateActing:  true,
+	StateActed:   true,
+}
+
+// jobStateEarly marks the pre-Advisor lifecycle states a redelivered/Resume-restarted event
+// re-appends; see jobStateAdvanced's doc comment.
+var jobStateEarly = map[JobState]bool{
+	StateQueued:  true,
+	StateClaimed: true,
+}
 
 // Record is one line of jobs.journal: `{jobId, issueId, kind, triggerSeq, state, at, payload?}`
 // (plan §2.2). Payload carries the Advisor's decision JSON + compiled batch body once state
@@ -194,18 +251,90 @@ func (j *Journal) IsDuplicate(jobID string) (bool, error) {
 	return r.State.IsTerminal(), nil
 }
 
-// HasOpenQuestion reports whether issueID has any job whose LATEST journal record is
-// StateQuestioned — a blocking question we asked that has not yet been resolved forward (the
+// HasOpenQuestion reports whether issueID has an unresolved blocking question we asked (the
 // question_answered dispatch OR-arm, plan §3: "FOLLOW-UP if assignedTo == me OR journal shows my
-// open question"). "Latest" matters: once the FOLLOW-UP job that consumes the answer advances
-// past questioned (to advised/acting/done/...), the question is no longer open.
+// open question").
+//
+// This deliberately does NOT check "latest record per jobId" (that was the finding-2 bug): the
+// SAME job that journals StateQuestioned (jobs/actor.go's RealActor.Act) is immediately driven on
+// by loop.Runner to StateActed then StateDone for that identical jobID right after Act returns
+// (see runner.go's post-Act journaling) — asking the question is that job's terminal action, not
+// a pause. Using "latest state == Questioned" therefore made this ALWAYS false in the real
+// pipeline: the terminal Done record for the SAME job always overwrites it. It only ever passed
+// against a hand-seeded journal that stopped at Questioned and never appended the Acted/Done
+// records the real runner always adds.
+//
+// The correct rule: scan the full ordered journal for issueID. A StateQuestioned record opens a
+// pending question. It is superseded (closed) by either of two later records for the same issue:
+//
+//   - StateAdvised, for ANY jobID (same or different) — the decision pipeline advanced past just
+//     asking a question, either because a FOLLOW-UP job re-consulted the Advisor with the answer,
+//     or because a crash-recovery Resume re-ran the same jobID's pipeline from the top (Resume's
+//     "queued/claimed/questioned falls through to the normal Advisor pipeline" path, runner.go).
+//   - StateDone (successful completion), specifically, for a DIFFERENT jobID — a FOLLOW-UP job
+//     spawned by question_answered actually completing.
+//
+// It is NOT closed by the SAME jobID's own StateActed/StateDone tail with no intervening
+// StateAdvised — that is just jobs/actor.go's RealActor.Act finishing the triage/followup job
+// right after it posted the question (loop.Runner journals Acted then Done for that identical
+// jobID immediately after Act returns), not a real resolution.
+//
+// It is deliberately NOT closed by a Failed/Skipped/Superseded terminal record for a different
+// jobID, either. A crash-recovery Resume of the ORIGINAL questioned job re-derives a fresh jobID
+// (loop.Runner.Resume's fallthrough for queued/claimed/questioned calls Run, which derives JobID
+// from kind+issueID+triggerSeq — a different hash than whatever literal/derived id the original
+// record carried) and, if the issue is no longer resolvable at resume time (e.g. deleted, or any
+// other resolve-step failure), journals a terminal StateSkipped/StateFailed record under that new
+// jobID for the SAME issue. That is a resume artifact, not a genuine answer to the question, and
+// must never silently close it — doing so is exactly the bug that left the reaped-claim
+// question-recovery arm dead against the real pipeline (Resume runs before the poll loop in
+// runPipeline, so this record is always written before any real question_answered event could
+// ever arrive).
 func (j *Journal) HasOpenQuestion(issueID string) (bool, error) {
+	records, _, err := j.Load()
+	if err != nil {
+		return false, err
+	}
+	open := false
+	var openJobID string
+	for _, r := range records {
+		if r.IssueID != issueID {
+			continue
+		}
+		if r.State == StateQuestioned {
+			open = true
+			openJobID = r.JobID
+			continue
+		}
+		if !open {
+			continue
+		}
+		if r.State == StateAdvised {
+			open = false
+			openJobID = ""
+			continue
+		}
+		if r.JobID != openJobID && r.State == StateDone {
+			open = false
+			openJobID = ""
+		}
+	}
+	return open, nil
+}
+
+// HasOpenKind reports whether issueID has a Kind==kind journal record whose latest state is
+// non-terminal -- the generic form of jobs/sweep.go's hasOpenFix (kind="fix"), lifted into this
+// package (fix-lifecycle remediation round 2, finding 3) so loop.Classify's dispatch table can
+// consult it directly without loop importing jobs (jobs already imports loop's caller-side runner
+// package, so the reverse import would cycle). "Latest state per jobID" mirrors LatestByJobID's own
+// per-jobID-latest semantics exactly (jobs/sweep.go's hasOpenFix scans the same map the same way).
+func (j *Journal) HasOpenKind(issueID, kind string) (bool, error) {
 	latest, err := j.LatestByJobID()
 	if err != nil {
 		return false, err
 	}
 	for _, r := range latest {
-		if r.IssueID == issueID && r.State == StateQuestioned {
+		if r.IssueID == issueID && r.Kind == kind && !r.State.IsTerminal() {
 			return true, nil
 		}
 	}
@@ -348,8 +477,17 @@ func (j *Journal) Append(r Record) error {
 	// we haven't audited) from silently regressing a completed job's terminal record back to a
 	// live one, which would blind IsTerminal()/IsDuplicate() to the fact that the job already ran.
 	if j.index != nil {
-		if existing, ok := j.index[r.JobID]; ok && existing.State.IsTerminal() && !r.State.IsTerminal() {
-			return nil
+		if existing, ok := j.index[r.JobID]; ok {
+			if existing.State.IsTerminal() && !r.State.IsTerminal() {
+				return nil
+			}
+			// finding 5: refuse to regress a job already at Advised/Acting/Acted back to
+			// Queued/Claimed (see jobStateAdvanced's doc comment) -- this is what stops a
+			// redelivered event's Enqueue-time StateQueued append from masking an already-
+			// "advised" (or later) record.
+			if jobStateAdvanced[existing.State] && jobStateEarly[r.State] {
+				return nil
+			}
 		}
 	}
 

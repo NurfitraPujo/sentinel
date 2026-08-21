@@ -91,6 +91,23 @@ func WriteAskpassHelper(dir string) (string, error) {
 // interactive prompt (which would also risk the secret going to a real terminal instead of this
 // controlled path).
 func RunGit(ctx context.Context, dir string, cred GitCredential, out *Redactor, args ...string) error {
+	return runGit(ctx, dir, cred, out, deriveExpectedHost(args), args...)
+}
+
+// RunGitWithHost is RunGit but pins SENTINEL_ASKPASS_HOST to the caller-supplied expectedHost
+// instead of deriving it from args (finding 1: `git push -u origin <branch>` carries no URL in
+// args at all, so deriveExpectedHost(args) returns "" and the askpass pin is disabled --
+// answering a credential prompt for ANY host, including one a repo-local
+// `url.<attacker>.insteadOf` rewrite of origin substitutes in). Callers performing any
+// authenticated git operation whose target host is NOT necessarily present in args (chiefly
+// `push` to a bare remote name) MUST derive expectedHost themselves from the operation's own
+// known-good clone URL (never from the repo's current, attacker-writable remote config) and pass
+// it here so the pin is always active for a credentialed request.
+func RunGitWithHost(ctx context.Context, dir string, cred GitCredential, out *Redactor, expectedHost string, args ...string) error {
+	return runGit(ctx, dir, cred, out, expectedHost, args...)
+}
+
+func runGit(ctx context.Context, dir string, cred GitCredential, out *Redactor, expectedHost string, args ...string) error {
 	if out == nil {
 		out = NewRedactor(io.Discard, cred.username, cred.password)
 	}
@@ -132,7 +149,7 @@ func RunGit(ctx context.Context, dir string, cred GitCredential, out *Redactor, 
 	// repo's behalf (core.sshCommand, core.pager, filter.*.process, credential.helper, ... — all
 	// attacker-controlled once a coding agent can write .git/config in this workspace, N8f). Only
 	// the minimal set git itself needs, plus the askpass wiring, is passed through.
-	cmd.Env = minimalGitEnv(helperPath, cred, deriveExpectedHost(args), scratchHome)
+	cmd.Env = minimalGitEnv(helperPath, cred, expectedHost, scratchHome)
 
 	// buf captures raw (unredacted) output ONLY in memory, to build an error message — it is never
 	// written to a log or the journal directly. It is redacted via out.Redact before being placed

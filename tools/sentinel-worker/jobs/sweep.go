@@ -101,6 +101,12 @@ type Sweep struct {
 	// pass so a later phase can slot in PR-status polling for FIX-originated claims without
 	// touching this file's control flow again. nil is a valid no-op.
 	FixPRStatusHook func(ctx context.Context, issueID string)
+
+	// OnHeartbeatPosted, when non-nil, is called once per issue immediately after heartbeatOne
+	// successfully POSTs its heartbeat (plan §7 "heartbeats_posted"). Wired from main.go to
+	// health.Status.Inc(health.MetricHeartbeatsPosted, 1). nil is a no-op, matching this repo's
+	// "nil seam disables the feature" convention (Runner.OnOutcome/OnCircuitOpen etc.).
+	OnHeartbeatPosted func(issueID string)
 }
 
 func (s *Sweep) heartbeat() time.Duration {
@@ -212,6 +218,9 @@ func (s *Sweep) heartbeatOne(ctx context.Context, c heldClaim) error {
 	}
 	if res.Status < 200 || res.Status >= 300 {
 		return fmt.Errorf("jobs: sweep: heartbeat for issue %s: status %d: %s", c.IssueID, res.Status, sentinel.ErrorMessage(res.Body))
+	}
+	if s.OnHeartbeatPosted != nil {
+		s.OnHeartbeatPosted(c.IssueID)
 	}
 	return nil
 }
@@ -438,7 +447,7 @@ func (s *Sweep) ReconcileReaped(ctx context.Context, issueID string) (reclaimed 
 // once RunFix opens a PR, so this hook is LIVE: ReconcileReaped's fix-PR arm now actually fires off
 // real FIX jobs, not just the hand-injected records fix_pr_test.go/sweep_test.go use to exercise it
 // in isolation.
-const openFixKind = "fix"
+const openFixKind = state.FixKind
 
 // hasOpenFix reports whether issueID has a FIX-kind job whose latest journal record is non-terminal
 // (an in-flight FIX, e.g. workspace prep or PR-out-for-review). Live as of N8f: JournalFixPROpen
@@ -446,14 +455,9 @@ const openFixKind = "fix"
 // journalFixPRClosed marks it terminal once the PR is merged/closed — so this reflects real FIX
 // jobs' journal state, not just test fixtures.
 func (s *Sweep) hasOpenFix(issueID string) bool {
-	latest, err := s.Journal.LatestByJobID()
+	open, err := s.Journal.HasOpenKind(issueID, openFixKind)
 	if err != nil {
 		return false
 	}
-	for _, r := range latest {
-		if r.IssueID == issueID && r.Kind == openFixKind && !r.State.IsTerminal() {
-			return true
-		}
-	}
-	return false
+	return open
 }

@@ -578,3 +578,137 @@ TestRunApp_ReadyzComposition used pollInterval=15ms (freshness window only 90ms,
 poll cycle exceeds -> cursor goes stale -> 503) -> bumped to 100ms (600ms window). Lesson: any test
 asserting a fixed-duration timing property is a latent -race/CI-load flake; wait-for-condition with
 a generous deadline, and size freshness/poll windows well above a -race'd cycle.
+
+## 2026-08-21 — N8h: sentinel-worker holistic-review remediation (branch feat/agent-worker)
+
+The Fable holistic review of `tools/sentinel-worker` produced 22 findings across four groups
+(FIX-subsystem, git-security, advisor-spend-input, durability-startup). Every one was this repo's
+characteristic B3 failure: config/subsystem **read + validated + unit-tested but never consumed by
+the running pipeline**, or **tested only on hand-seeded state the real path never produces** — and
+several were seams N8a–N8g's own phase notes had implicitly treated as live. All 22 fixed and
+re-wired from `main()`, each mutation-tested on the REAL `runApp`/`runPipeline`/`buildRunner` path.
+
+- **Why durable**: the §2.8 S3 snapshot lifecycle (restore-on-empty-startup, periodic, post-
+  compaction, SIGTERM-upload) is now actually wired — at N8g only the interface + local fallback
+  existed, yet the deployability matrix already listed "S3 snapshots" as a durability story. Budgets
+  (`WORKER_DAILY_TOKEN_BUDGET`/`WORKER_MAX_TRIAGE_PER_HOUR`) now gate every Advisor call inside
+  `loop.Runner`, journal-seeded so "per day" survives a restart. The FIX job now gets a distinct
+  `state.JobID(FixKind,…)` (BLOCKER — reusing the parent jobID meant the journal terminal-guard
+  silently dropped every FIX record). Tool results are `guard.WrapUntrusted`-fenced mid-loop (only
+  the system prompt was fenced before). Askpass host-pin includes the port. Plus per-project PR cap,
+  C16 credential re-fetch on git-auth failure, `HasOpenQuestion` surviving a triage job's own
+  terminal tail, a startup free-disk guard that flips readiness, `WORKER_EVENT_TYPES` validation, the
+  workspace orphan-sweep + retention reaper, and the full §7 metric set.
+- **Proof**: worker module gate green incl. `-race`+`gofmt` (925 test cases, 12 packages); e2e
+  U40/U41/U42 re-run against the live compose stack (`:13000`/`:18080`) → all PASS, zero skips under
+  `SENTINEL_E2E=1`, U41 unchanged. Full detail + the reachability table in VERIFIED_STATE.md's "N8h"
+  section; plan §9 gains an N8h row + prose seams note and §12's durability cell is corrected.
+- **Gotcha**: the `tests/e2e` suite compiles in WORKSPACE mode (it imports `packages/sdk-go`) — do
+  NOT pass `GOWORK=off` to `go test` there (that only applies to the worker binary `buildWorkerBinary`
+  builds internally). And the default `DASHBOARD_URL`/`INGESTOR_URL` are `:3000`/`:8080`; a live
+  worktree stack on `:13000`/`:18080` needs those overrides or U40 404s at agent creation.
+- **Still deferred (unchanged, not a regression)**: a real cluster/minio S3 round-trip and a real
+  K8s-Secret PATCH stay interface-and-fake-proven; U43 (FIX binary end-to-end) stays a `jobs`-level
+  integration test because `$FIX_EXECUTOR_CMD` needs a non-CI-installable coding CLI.
+
+## 2026-08-21 — N8i: sentinel-worker holistic-review remediation round 2 (branch feat/agent-worker)
+
+A **second** Fable holistic pass found a deeper tier of the same B3 family — **including two
+regressions the N8h changes themselves introduced**. Landed in three groups (act-phase honesty;
+dispatch/journal durability; startup/config/seed), all re-wired from `main()` and mutation-tested on
+the real `runApp`/`runPipeline`/`buildRunner`/`Runner.Run`/`RealActor.Act`/`FixRunner`/`PollLoop` path.
+
+- **The two regressions** (both N8h-introduced, both fixed): (1) N8h's `resumeInFlightJob` ran
+  `ResumeFix` **synchronously** on `runPipeline`'s long-lived ctx before the poll loop started, so one
+  in-flight/stale FIX attempt blocked the worker from ever polling or serving `/readyz` — now async via
+  `FixRunner.DispatchResume` (own goroutine, FIX-timeout-bounded, drained by `FixRunner.Wait` at
+  shutdown). (2) N8h made the poll loop and the runner **share one `CircuitBreaker`** (to show its state
+  on a gauge); the side effect was the poll loop's frequent `RecordSuccess` resetting the runner's
+  consecutive-failure streak, so the write-path circuit could never open — now two separate
+  breakers/scopes (`ScopeSentinelAPI`/`ScopeSentinelAPIPoll`), each still published to its own
+  `circuit_state_<scope>` gauge (N8h's real goal preserved).
+- **Other closes**: batch **envelope** classification in `checkBatchResults` (a 401/429/5xx batch
+  envelope was silently read as an empty-but-successful per-op walk, losing the whole decision);
+  act-phase in-lane retry + **verbatim** narrow re-send (replays the journaled `StateActing` batch,
+  Advisor never re-consulted); `journalQuestioned`→`StateQuestioned` making `HasOpenQuestion`
+  satisfiable end-to-end; redelivery dedupe in `Dispatcher.Enqueue` (drop terminal-jobId redelivery
+  before the queued record is appended); `skip-if-fix-in-flight` (`Classify.hasOpenFix` ←
+  `PollLoop.hasOpenFix`); **FIX terminal journaling on ALL exit paths** (`releaseWithComment`→
+  `journalFixTerminal` — propose-only/caps/resolve-error/no-repo previously left the job non-terminal so
+  `RecoveryScan` re-failed the identical dead job every restart); `WORKER_MAX_TRIAGE_PER_HOUR`'s
+  `HourlyCounter` **journal-seeded** (`SumTriageStarts`) like Budget/FixCaps already were; whole-cycle
+  `cursor_lag` gauge; repoctx periodic `git fetch` host-pin via `RunGitWithHost`/`expectedRefreshHost`
+  (a bare `git fetch origin` had the askpass pin DISABLED).
+- **New env `WORKER_FIX_EXECUTOR_ENV`** (finding 4): the previously-missing channel feeding
+  `FixRunner.ExecutorEnv` — without it `$FIX_EXECUTOR_CMD` (droid) got NO credentials (the forbidden-key
+  guard was guarding a field nothing populated). Forbidden-key-validated at config load; documented in
+  plan §5/§8/§12 and `.env.example`.
+- **Proof**: worker module gate green incl. `-race`+`gofmt` (12 packages); reachability sweep confirms
+  **all 14** remediated capabilities reachable from `main()`, none tested-but-unwired (full table in
+  VERIFIED_STATE.md's "N8i" section). e2e U40/U41/U42 re-run against the live stack (`:13000`/`:18080`,
+  not restarted) → all PASS (6.34s/4.66s/4.06s), zero skips under `SENTINEL_E2E=1`. **U41 unchanged** —
+  it already exercises the needs_info/question kill-9 replay path (exactly-1 blocking question, Advisor
+  call count unchanged, severity replays, claim kept, `waiting_on='reporter'`, reply drives FOLLOW-UP).
+- **Gotcha (same as N8h, re-affirmed)**: `tests/e2e` compiles in WORKSPACE mode (imports
+  `packages/sdk-go`; a `GOWORK=off` run fails to build at `sdk_test.go`'s `APIKey` field) — `GOWORK=off`
+  is only for the worker binary `buildWorkerBinary` builds internally; and `:13000`/`:18080` overrides
+  are mandatory against a live worktree stack.
+- **Still deferred (unchanged, not a regression)**: real cluster/minio S3 round-trip + real K8s-Secret
+  PATCH stay interface-and-fake-proven; U43 (FIX binary end-to-end) stays a `jobs`-level integration
+  test because `$FIX_EXECUTOR_CMD` needs a non-CI-installable coding CLI.
+
+## 2026-08-21 — N8j: sentinel-worker holistic-review remediation round 3 (branch feat/agent-worker)
+
+Third and final Fable-review round. Blocker count across the three rounds converged **4 → 2 → 0**;
+N8j carries **0 blockers** — it closes the round-3 majors/minors, again all instances of the repo's
+B3 "config/field read-and-validated but never consumed on the real pipeline path" family. Landed in
+two groups; **no new regressions** (each group's gate + the cross-group gate run green, and the
+sibling group's landed edits were verified present-and-unreverted before the second group started).
+
+- **Group 1 — core robustness (loop/act):** (1) `StateRetryableFailed` with a **non-empty** payload
+  now routes to `resumeFromAdvised` in BOTH `Run`'s replay guard and `Resume`'s switch — the journaled
+  Advisor decision is **replayed verbatim, Advisor never re-invoked** (empty-payload retryable_failed
+  still falls through to a full re-run). Guarded by
+  `TestRunner_ActStageRetryableFailed_ResumeReplaysDecisionWithoutReinvokingAdvisor`. (2)
+  `checkBatchResults`' per-op default branch now wraps `&sentinel.StatusError{Status: statusForOpClass(c)}`
+  (new helper maps `FailureClass`→representative HTTP status: RateLimited→429, Transient→503,
+  AuthFailure→401, Conflict→409, Permanent/default→400) so a **permanent per-op failure journals
+  `failed_permanent` instead of being retried 5× as transient**. Guarded by
+  `TestCheckBatchResults_PerOpPermanentIsNotTransient`. Group 1 also landed FIX-subsystem findings the
+  round-3 review filed under FIX but which live on shared paths: `issues.progress` uses `message_md`
+  (not `body_md`) so the server no longer 400s every PR; PROGRESS.md tail lines are forwarded as
+  `issues.progress` + journaled; per-connection `AgentCmd` (C15) overrides the global
+  `$FIX_EXECUTOR_CMD`; `repoctx.CheckoutRelease`'s fetch uses `RunGitWithHost` (askpass host-pin was
+  silently off on that path).
+- **Group 2 — FIX subsystem (all gated OFF by default; real bugs when enabled):** (4) `journalFixRunning`
+  moved to `RunFix`/`ResumeFix` **entry — before `PrepareFixWorkspace`/`ResumeFixWorkspace`** — so a
+  crash during workspace prep leaves a recoverable `StateFixRunning` record instead of a silently-held
+  claim (`TestRunFix_JournalsFixRunningBeforeWorkspacePrep`). (5) `journalFixRunning` gained a
+  `resumed bool` (→ `FixRunningPayload.Resumed`); `FixCaps.SeedToday` only increments attempt/issue
+  counters when `!Resumed`, so **`WORKER_MAX_FIX_ATTEMPTS` no longer over-counts crash-resumes**
+  (`TestFixCaps_SeedToday_ResumedRecordDoesNotDoubleCountAttempt`). (6) `cfg.WorkerFixExecutorEnv`
+  values are now fed into the log redactor's `configuredSecrets`, so the **Fix Executor's own BYOK
+  credential is masked** in logs and the saved agent log
+  (`TestFixRunner_ExecutorEnvSecret_RedactedInAgentLog`, mutation-noted). (7) `FixCaps.AllowPR` takes
+  `*int` — an **explicit `MaxPRsPerDay == 0` now blocks unconditionally** (zero PRs allowed); only a
+  `nil` pointer means "server reported no per-project limit → use the global cap"
+  (`TestFixCaps_AllowPR_ExplicitZeroProjectLimitBlocksUnconditionally`). (8) the **per-issue FIX attempt
+  cap now resets at UTC midnight** like the daily counters (`resetIssueAttemptsIfNewDay`,
+  `TestFixCaps_IssueAttempts_ResetsAtUTCMidnight`). (10) §7 volume caps gained `Remaining()` gauges —
+  `fix_jobs_remaining`, `prs_remaining`, `triage_per_hour_remaining`, `followup_per_hour_remaining`
+  (the last wired to N8i's `WORKER_MAX_FOLLOWUP_PER_HOUR` counter) — published at `buildFixRunner`/
+  `buildRunner` baseline and refreshed on `attempt-started`/`pr-opened`/`OnUsage`.
+- **Verification (independent, not agent-trusted)**: worker module gate green
+  (`GOWORK=off gofmt -l . && go build ./... && go vet ./... && go test -race ./...` — 12 packages,
+  all pass, gofmt/vet clean). e2e U40/U41/U42 re-run against the live compose stack
+  (`SENTINEL_E2E=1 DASHBOARD_URL=http://localhost:13000 INGESTOR_URL=http://localhost:18080 NATS_URL=nats://localhost:4222`)
+  → **3 PASS, 0 skips** (7.03s/5.19s/5.11s). Reachability sweep: `buildFixRunner`/`buildRunner` are
+  reached from `runPipeline`; the wired-from-main tests `TestRunPipeline_...FixRunner...` (fails if
+  `buildFixRunner` is unreachable) and the finding-6 executor-env mutation test confirm none of the
+  N8j gauges/redaction are tested-but-unwired.
+- **Merge posture**: N8j is the final remediation round — no round 4. The live-proven TRIAGE/FOLLOW-UP
+  core is production-ready; the FIX subsystem should ship **gated experimental** until exercised with a
+  real coding CLI (`$FIX_EXECUTOR_CMD`), which CI cannot install (U43 stays a `jobs`-level integration
+  test, not `tests/e2e`).
+- **Still deferred (unchanged, not a regression)**: real cluster/minio S3 round-trip + real K8s-Secret
+  PATCH stay interface-and-fake-proven; U43 (FIX binary end-to-end) needs a non-CI-installable coding CLI.

@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/guard"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
@@ -91,6 +93,13 @@ type ActContext struct {
 	FixEnabled  bool
 	// FixConfidence is the WORKER_FIX_CONFIDENCE threshold; <=0 uses DefaultFixConfidence.
 	FixConfidence float64
+	// MaxVerbatim is WORKER_GATE_MAX_VERBATIM, threaded through to guard.CheckWithConfig (plan
+	// §4.6/§5 finding 3); <=0 uses guard.DefaultMaxVerbatim. main.go's cfg.WorkerGateMaxVerbatim
+	// already defaults to 0.25 and is validated to [0,1], so in production this is always a real
+	// configured value — the <=0 fallback only matters for callers (tests, or a zero-valued
+	// ActContext) that never set it, and preserves this gate's pre-existing default behavior for
+	// them exactly as DefaultFixConfidence does for FixConfidence above.
+	MaxVerbatim float64
 }
 
 func (a ActContext) fixConfidence() float64 {
@@ -98,6 +107,13 @@ func (a ActContext) fixConfidence() float64 {
 		return a.FixConfidence
 	}
 	return DefaultFixConfidence
+}
+
+func (a ActContext) maxVerbatim() float64 {
+	if a.MaxVerbatim > 0 {
+		return a.MaxVerbatim
+	}
+	return guard.DefaultMaxVerbatim
 }
 
 func (a ActContext) isUserReport() bool { return a.IssueType == issueTypeUserReport }
@@ -133,7 +149,8 @@ func (e *UnknownDecisionValueError) Error() string {
 
 // gate runs guard.Check for one published field and wraps a rejection as *GateRejectedError.
 func gate(actx ActContext, field guard.PublishedField, text string) error {
-	if err := guard.Check(field, text, actx.ToolOutputs, actx.Secrets); err != nil {
+	cfg := guard.Config{SecretValues: actx.Secrets, MaxVerbatim: actx.maxVerbatim()}
+	if err := guard.CheckWithConfig(field, text, actx.ToolOutputs, cfg); err != nil {
 		return &GateRejectedError{Field: field, Err: err}
 	}
 	return nil
@@ -314,6 +331,41 @@ func CompileTriage(actx ActContext, d TriageDecision) (Compiled, error) {
 
 // --- FOLLOW-UP compile (plan §4.3) --------------------------------------------------------------
 
+// resolvedInVersionPattern is the conservative allowlist resolvedInVersionForPublish restricts
+// resolved_in_version to (finding 6, core-robustness round 3): letters, digits, and the
+// punctuation real version strings use (dots/dashes/underscores/plus/tilde -- semver's own
+// pre-release/build-metadata charset, plus common "v1.2.3", "2026.08.20-rc1" style variants).
+// Everything else is dropped, same posture as fix_pr.go's titleCharsetPattern for errorClass.
+var resolvedInVersionPattern = regexp.MustCompile(`[^A-Za-z0-9.+_~-]`)
+
+// resolvedInVersionForPublish sanitizes a model-authored resolved_in_version value before it is
+// ever published (finding 6, core-robustness round 3): unlike every other model-authored field
+// CompileFollowup/CompileTriage publish, resolved_in_version was passed through to the
+// issues.status batch op completely unconstrained -- no guard.Check, no charset/length limit --
+// despite being just as attacker-influenced (it flows from the Advisor's JSON decision, which in
+// turn is shaped by event/tool-output data an external error report can influence). This collapses
+// whitespace, restricts the result to resolvedInVersionPattern's charset, and caps length so a
+// pathological or injection-y value (script tags, markdown, control characters, a multi-KB blob)
+// cannot ride along in a field that is not sized or gated like a prose field. A result that
+// contains a configured secret value verbatim (guard.Check's SecretValues gate, same protection
+// every other published field gets) is rejected outright via *GateRejectedError rather than
+// silently stripped, matching gate's own all-or-nothing compile contract.
+func resolvedInVersionForPublish(actx ActContext, raw string) (string, error) {
+	s := strings.Join(strings.Fields(raw), " ")
+	s = resolvedInVersionPattern.ReplaceAllString(s, "")
+	const maxLen = 64
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	if s == "" {
+		return "", nil
+	}
+	if err := gate(actx, guard.FieldReplyBody, s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
 // CompileFollowup gates every published field of d through guard.Check, then compiles it into the
 // plan §4.3 batch. Same compile pattern as CompileTriage: gate first, build ops after, nothing
 // partially compiles on rejection.
@@ -349,7 +401,17 @@ func CompileFollowup(actx ActContext, d FollowupDecision) (Compiled, error) {
 	if action == ActionResolve {
 		params := map[string]interface{}{"status": StatusResolved}
 		if d.ResolvedInVersion != nil && *d.ResolvedInVersion != "" {
-			params["resolved_in_version"] = *d.ResolvedInVersion
+			// Finding 6 (core-robustness round 3): resolved_in_version used to be published
+			// verbatim, the one model-authored field in this file that never went through any
+			// guard -- constrain it to a version charset + length cap and run it through
+			// guard.Check's secret-leak gate, like every other published field.
+			sanitized, err := resolvedInVersionForPublish(actx, *d.ResolvedInVersion)
+			if err != nil {
+				return Compiled{}, err
+			}
+			if sanitized != "" {
+				params["resolved_in_version"] = sanitized
+			}
 		}
 		b.add("issues.status", actx.IssueID, params)
 	}
@@ -435,6 +497,17 @@ func Act(ctx context.Context, client Sender, compiled Compiled, execute bool) (A
 		res, err := client.PostQuestion(ctx, compiled.Question.IssueID, params, compiled.Question.IdempotencyKey)
 		if err != nil {
 			return ActOutcome{Sent: false, Compiled: compiled}, nil, nil, err
+		}
+		if res.Status < 200 || res.Status >= 300 {
+			// MAJOR (finding 3): PostQuestion returns a non-2xx status in Result.Status with
+			// err == nil (a transport-layer success carrying an application-level failure) -- a
+			// 400/403/409/5xx question response must not be treated as "asked". Before this check,
+			// the caller (RealActor.Act) journaled StateQuestioned with an empty commentId
+			// regardless, stranding the claim (never actually asking the reporter) with no way to
+			// ever close the question. Wrapped as *sentinel.StatusError so the runner classifies
+			// 429/5xx as transient (retry) and 401/403 as auth, matching checkBatchResults' own
+			// envelope-failure wrapping above.
+			return ActOutcome{Sent: false, Compiled: compiled}, res, nil, fmt.Errorf("posting question for issue %s: status=%d: %w", compiled.Question.IssueID, res.Status, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
 		}
 		qRes = res
 	}

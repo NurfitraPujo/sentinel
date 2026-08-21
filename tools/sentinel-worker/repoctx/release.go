@@ -28,8 +28,18 @@ func (c *Cache) CheckoutRelease(ctx context.Context, repo *Repo, cred gitprovide
 		return nil, err
 	}
 
+	// finding 9: this fetch used to run via a bare RunGit call, which carries no http(s) URL argv
+	// for gitprovider's own deriveExpectedHost to find, so it ran with the askpass host pin
+	// DISABLED (unlike refreshLocked, fixed in N8i for the identical reason). Derive the pin from
+	// repo.CloneURL — the entry's own known-good clone URL — never from re-reading origin's URL out
+	// of the checked-out repo's own (attacker-writable) .git/config.
+	expectedHost, err := expectedRefreshHost(repo.CloneURL)
+	if err != nil {
+		return nil, fmt.Errorf("repoctx: fetch release ref %q: %w", ref, err)
+	}
+
 	fetchArgs := []string{"fetch", "--depth", "1", "origin", "--", ref}
-	if err := gitprovider.RunGit(ctx, repo.Root, cred, nil, fetchArgs...); err != nil {
+	if err := gitprovider.RunGitWithHost(ctx, repo.Root, cred, nil, expectedHost, fetchArgs...); err != nil {
 		return nil, fmt.Errorf("repoctx: fetch release ref %q: %w", ref, err)
 	}
 

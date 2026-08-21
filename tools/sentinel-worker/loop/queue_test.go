@@ -598,3 +598,88 @@ func TestDispatcher_OnOutcome_CountsSupersededAndCancelledAndFailed(t *testing.T
 		t.Fatalf("expected exactly 1 cancelled/skipped_resolved outcome counted, got %d (counts=%v)", cancelled, counts)
 	}
 }
+
+// blockingActor lets a test hold Act "running" until released, so a redelivery test can inspect
+// the journal's state deterministically between Enqueue returning and the async per-issue worker
+// finishing its resumed run.
+type blockingActor struct {
+	release chan struct{}
+	calls   int32
+}
+
+func (a *blockingActor) Act(_ context.Context, _ string, _ jobs.Decision) error {
+	atomic.AddInt32(&a.calls, 1)
+	<-a.release
+	return nil
+}
+
+// TestDispatcher_EnqueueRedeliveryDoesNotRegressAdvisedToQueued is finding 5's red-first proof,
+// driven through the REAL Dispatcher.Enqueue path (not a hand-called Journal.Append): a job whose
+// jobId already sits at StateAdvised (the Advisor already produced a decision) must not have that
+// masked back to StateQueued by a redelivered event for the identical (kind, issueId, seq) --
+// which, per state.JobID, always derives the SAME jobId. Before the fix, Enqueue's dedupe only
+// checked IsTerminal() (Advised is not terminal), so the redelivered event's StateQueued append won
+// outright, and a crash right after would have RecoveryScan see "queued" and Resume re-invoke the
+// Advisor for a job that already has a decision -- exactly what CONTEXT.md's Replay contract
+// forbids ("the LLM is NEVER re-invoked for a job that already produced a decision").
+//
+// Mutation check: reverting state/journal.go's Append regression guard (jobStateAdvanced/
+// jobStateEarly) makes this test fail, because the second Enqueue's StateQueued append would then
+// win and the assertion on the journal's latest-per-jobId state goes red.
+func TestDispatcher_EnqueueRedeliveryDoesNotRegressAdvisedToQueued(t *testing.T) {
+	advisor := &countingAdvisor{}
+	d, j := newQueueTestDispatcher(t, advisor)
+	actor := &blockingActor{release: make(chan struct{})}
+	d.Runner.Act = actor
+
+	const seq = int64(42)
+	issueID := "issue-redelivery"
+	jobID := state.JobID(string(KindTriage), issueID, seq)
+
+	// Simulate the job having already been advised (the Advisor already ran and produced a
+	// decision), exactly as loop.Runner.Run journals it -- BEFORE any redelivered event ever
+	// reaches Enqueue.
+	must(t, j.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: string(KindTriage), TriggerSeq: seq, State: state.StateAdvised, Payload: []byte(`{"stub":true}`)}))
+
+	// Redeliver the IDENTICAL event (same seq, same issue -- the exact scenario a duplicate NATS/
+	// webhook delivery produces). Enqueue's own journal write (the part finding 5 is about) is
+	// synchronous and completes before Enqueue returns; Dispatch's async worker (which will call
+	// the blocked Act) races with nothing here since Enqueue itself already decided whether to
+	// (mis)write StateQueued.
+	e := ev(seq, issueID)
+	if err := d.Enqueue(e, KindTriage); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	latest, err := j.LatestByJobID()
+	if err != nil {
+		t.Fatalf("LatestByJobID: %v", err)
+	}
+	rec, ok := latest[jobID]
+	if !ok {
+		t.Fatalf("no journal record for job %s after redelivered Enqueue", jobID)
+	}
+	if rec.State == state.StateQueued {
+		t.Fatalf("FINDING 5: redelivered Enqueue regressed job %s from StateAdvised back to StateQueued -- a crash here would re-invoke the Advisor on restart", jobID)
+	}
+	if rec.State != state.StateAdvised {
+		t.Fatalf("job %s latest state = %v, want it to remain StateAdvised", jobID, rec.State)
+	}
+	if got := atomic.LoadInt32(&advisor.calls); got != 0 {
+		t.Fatalf("FINDING 5: the Advisor was invoked (%d calls) before the resumed Act was even released", got)
+	}
+
+	// Now let the resumed run (correctly, resumeFromAdvised -- NOT the Advisor) proceed to
+	// completion and confirm the Advisor is STILL never invoked.
+	close(actor.release)
+	drainCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	d.Drain(drainCtx)
+
+	if got := atomic.LoadInt32(&advisor.calls); got != 0 {
+		t.Fatalf("FINDING 5: the Advisor was invoked (%d calls) for a job that already had a journaled decision", got)
+	}
+	if got := atomic.LoadInt32(&actor.calls); got != 1 {
+		t.Fatalf("expected resumeFromAdvised to call Act exactly once, got %d", got)
+	}
+}

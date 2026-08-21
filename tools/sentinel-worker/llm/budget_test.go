@@ -227,6 +227,46 @@ func TestHourlyCounter_ResetOnHourBoundary(t *testing.T) {
 	}
 }
 
+// TestHourlyCounter_SeedCount is circuit-config-sec finding 3's proof for HourlyCounter.SeedCount
+// (0% before this fix -- the method did not exist, and WORKER_MAX_TRIAGE_PER_HOUR reset to zero on
+// every restart within the same UTC hour). Mirrors DailyCounter.SeedCount's contract: only ever
+// raises the count, never lowers it, and a stale hour's leftover count is reset first.
+func TestHourlyCounter_SeedCount(t *testing.T) {
+	clock := &fakeClock{now: mustParse(t, "2026-08-18T10:00:00Z")}
+	c := NewHourlyCounter(5, clock)
+
+	c.SeedCount(3)
+	if got := c.Count(); got != 3 {
+		t.Fatalf("Count() after SeedCount(3) = %d, want 3", got)
+	}
+
+	// Real-path proof: seeding to at/above the limit must actually block a subsequent TryIncrement
+	// in the same hour, exactly as if those slots had been consumed by real TryIncrement calls
+	// before a crash.
+	c.SeedCount(5)
+	if c.TryIncrement() {
+		t.Fatal("TryIncrement after SeedCount(5) at limit 5 must be denied")
+	}
+
+	// SeedCount must never lower an existing count.
+	c2 := NewHourlyCounter(10, clock)
+	c2.SeedCount(4)
+	c2.SeedCount(2)
+	if got := c2.Count(); got != 4 {
+		t.Fatalf("SeedCount(2) after SeedCount(4) lowered the count to %d, want 4 (must only ever raise)", got)
+	}
+
+	// A stale hour's leftover count must not leak into the new hour's seed.
+	c3 := NewHourlyCounter(10, clock)
+	c3.TryIncrement()
+	c3.TryIncrement()
+	clock.Set(mustParse(t, "2026-08-18T11:00:00Z"))
+	c3.SeedCount(1)
+	if got := c3.Count(); got != 1 {
+		t.Fatalf("SeedCount(1) in a new hour = %d, want 1 (must not add onto the prior hour's stale count)", got)
+	}
+}
+
 func TestHourlyCounter_ConcurrentRace(t *testing.T) {
 	clock := &fakeClock{now: mustParse(t, "2026-08-18T10:00:00Z")}
 	c := NewHourlyCounter(20, clock)
@@ -248,5 +288,62 @@ func TestHourlyCounter_ConcurrentRace(t *testing.T) {
 	wg.Wait()
 	if allowed != 20 {
 		t.Fatalf("allowed = %d, want exactly 20", allowed)
+	}
+}
+
+// TestDailyCounter_Remaining is finding 10's RED-FIRST proof: DailyCounter needs a Remaining()
+// method (mirroring DailyBudget.Remaining's own contract) before main.go can expose a
+// fix_jobs_remaining / prs_remaining gauge for it -- before this fix, DailyCounter had no such
+// method at all (a compile error, not just a wrong value).
+func TestDailyCounter_Remaining(t *testing.T) {
+	clock := &fakeClock{now: mustParse(t, "2026-08-18T10:00:00Z")}
+	c := NewDailyCounter(3, clock)
+	if got := c.Remaining(); got != 3 {
+		t.Fatalf("Remaining() before any increment = %d, want 3", got)
+	}
+	c.TryIncrement()
+	if got := c.Remaining(); got != 2 {
+		t.Fatalf("Remaining() after one increment = %d, want 2", got)
+	}
+	c.TryIncrement()
+	c.TryIncrement()
+	if got := c.Remaining(); got != 0 {
+		t.Fatalf("Remaining() at the limit = %d, want 0", got)
+	}
+
+	clock.Set(mustParse(t, "2026-08-19T00:00:00Z"))
+	if got := c.Remaining(); got != 3 {
+		t.Fatalf("Remaining() after UTC-day reset = %d, want 3", got)
+	}
+
+	unlimited := NewDailyCounter(0, clock)
+	if got := unlimited.Remaining(); got != -1 {
+		t.Fatalf("Remaining() for a non-positive limit = %d, want -1 (unlimited)", got)
+	}
+}
+
+// TestHourlyCounter_Remaining is finding 10's RED-FIRST proof for the hourly caps
+// (WORKER_MAX_TRIAGE_PER_HOUR / WORKER_MAX_FOLLOWUP_PER_HOUR) needing the same gauge-friendly
+// Remaining() method, resetting on the UTC hour boundary rather than the day boundary.
+func TestHourlyCounter_Remaining(t *testing.T) {
+	clock := &fakeClock{now: mustParse(t, "2026-08-18T10:00:00Z")}
+	c := NewHourlyCounter(2, clock)
+	if got := c.Remaining(); got != 2 {
+		t.Fatalf("Remaining() before any increment = %d, want 2", got)
+	}
+	c.TryIncrement()
+	c.TryIncrement()
+	if got := c.Remaining(); got != 0 {
+		t.Fatalf("Remaining() at the limit = %d, want 0", got)
+	}
+
+	clock.Set(mustParse(t, "2026-08-18T11:00:00Z"))
+	if got := c.Remaining(); got != 2 {
+		t.Fatalf("Remaining() after UTC-hour reset = %d, want 2", got)
+	}
+
+	unlimited := NewHourlyCounter(0, clock)
+	if got := unlimited.Remaining(); got != -1 {
+		t.Fatalf("Remaining() for a non-positive limit = %d, want -1 (unlimited)", got)
 	}
 }

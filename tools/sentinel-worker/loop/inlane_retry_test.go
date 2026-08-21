@@ -9,12 +9,14 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
@@ -145,6 +147,115 @@ func TestRunner_InlaneRetry_TransientThenSucceeds(t *testing.T) {
 	}
 }
 
+// seqActor returns errs[i] on the i-th Act call (0-indexed); once errs is exhausted (or the entry
+// is nil), it returns nil (success). Safe for concurrent use.
+type seqActor struct {
+	mu    sync.Mutex
+	calls int
+	errs  []error
+}
+
+func (s *seqActor) Act(_ context.Context, _ string, _ jobs.Decision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.calls
+	s.calls++
+	if i < len(s.errs) && s.errs[i] != nil {
+		return s.errs[i]
+	}
+	return nil
+}
+
+func (s *seqActor) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestRunner_InlaneRetry_ActTransientThenSucceeds is finding 2's (MAJOR) red-first proof: an
+// Act-phase transient failure (a 503, exactly what checkBatchResults now surfaces per finding 1)
+// must be retried in-lane -- not journaled failed on its first hiccup -- and the job must still
+// reach StateDone once a later attempt succeeds. Before the fix, runner.go called r.Act.Act
+// directly (not through runWithInlaneRetry), so a single transient batch failure was terminal.
+func TestRunner_InlaneRetry_ActTransientThenSucceeds(t *testing.T) {
+	act := &seqActor{errs: []error{
+		fmt.Errorf("batch envelope failed: %w", &sentinel.StatusError{Status: 503}),
+		fmt.Errorf("batch envelope failed: %w", &sentinel.StatusError{Status: 503}),
+	}}
+	j := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	clock := &fakeInlaneClock{}
+	r := &Runner{
+		Journal:          j,
+		Issues:           fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		Claims:           &fakeClaimer{held: true},
+		Advisor:          &countingAdvisor{},
+		Act:              act,
+		DryRun:           false,
+		MyAgentID:        me,
+		MaxInlaneRetries: 5,
+		SleepCtx:         clock.sleep,
+	}
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err != nil {
+		t.Fatalf("Run: expected eventual success after 2 transient Act retries, got: %v", err)
+	}
+	if got := act.callCount(); got != 3 {
+		t.Fatalf("FINDING 2: expected Act to be called 3 times (2 transient failures + 1 success), got %d -- Act must be retried in-lane, not terminal on the first failure", got)
+	}
+	records, _, err := j.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	last := records[len(records)-1]
+	if last.State != state.StateDone {
+		t.Fatalf("expected final state done, got %s", last.State)
+	}
+	for _, rec := range records {
+		if rec.State == state.StateFailed {
+			t.Fatalf("FINDING 2: job was journaled failed on a transient Act error that should have been retried in-lane: %+v", rec)
+		}
+	}
+}
+
+// TestRunner_InlaneRetry_ActPermanentJournalsFailed proves the OTHER half of finding 2's fix
+// doesn't over-retry: a permanent (401/400-class) Act failure must still journal failed on the
+// FIRST attempt, exactly as before -- only Transient/RateLimited get the retry ladder.
+func TestRunner_InlaneRetry_ActPermanentJournalsFailed(t *testing.T) {
+	act := &seqActor{errs: []error{
+		fmt.Errorf("posting question for issue i1: %w", &sentinel.StatusError{Status: 401}),
+	}}
+	j := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	clock := &fakeInlaneClock{}
+	r := &Runner{
+		Journal:          j,
+		Issues:           fakeIssues{snap: IssueSnapshot{ID: "i1", Status: "unresolved"}},
+		Claims:           &fakeClaimer{held: true},
+		Advisor:          &countingAdvisor{},
+		Act:              act,
+		DryRun:           false,
+		MyAgentID:        me,
+		MaxInlaneRetries: 5,
+		SleepCtx:         clock.sleep,
+	}
+
+	e := Event{Seq: 1, Type: "created", Issue: &EventIssue{ID: "i1"}}
+	if err := r.Run(context.Background(), e, KindTriage); err == nil {
+		t.Fatal("Run: expected an error for a permanent (401) Act failure")
+	}
+	if got := act.callCount(); got != 1 {
+		t.Fatalf("expected Act to be called exactly once (permanent failures are not retried), got %d", got)
+	}
+	records, _, err := j.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	last := records[len(records)-1]
+	if last.State != state.StateFailed {
+		t.Fatalf("expected final state failed, got %s", last.State)
+	}
+}
+
 // TestRunner_InlaneRetry_RateLimitedHonoursRetryAfter proves a 429 in-lane retry sleeps exactly
 // the Retry-After duration (plan §2.4's "Rate limited" row), not the generic backoff ladder.
 func TestRunner_InlaneRetry_RateLimitedHonoursRetryAfter(t *testing.T) {
@@ -210,8 +321,9 @@ func TestRunner_InlaneRetry_PermanentNeverRetries(t *testing.T) {
 }
 
 // TestRunner_InlaneRetry_ExhaustsMaxAttemptsThenFails proves the retry ladder is bounded: after
-// MaxInlaneRetries attempts, a still-transient failure gives up and journals failed(transient),
-// rather than retrying forever.
+// MaxInlaneRetries attempts, a still-transient failure gives up and journals the NON-terminal
+// state.StateRetryableFailed (finding 4, core-robustness round 3) -- recoverable once the outage
+// clears, rather than retrying forever OR being lost as a terminal `failed`.
 func TestRunner_InlaneRetry_ExhaustsMaxAttemptsThenFails(t *testing.T) {
 	issues := &seqIssues{
 		errs: []error{
@@ -235,8 +347,11 @@ func TestRunner_InlaneRetry_ExhaustsMaxAttemptsThenFails(t *testing.T) {
 		t.Fatalf("expected 2 retries (3 attempts - 1), got %d", len(*retries))
 	}
 	records, _, _ := j.Load()
-	if last := records[len(records)-1]; last.State != state.StateFailed {
-		t.Fatalf("expected terminal failed after exhausting retries, got %s", last.State)
+	if last := records[len(records)-1]; last.State != state.StateRetryableFailed {
+		t.Fatalf("expected non-terminal retryable_failed after exhausting retries, got %s", last.State)
+	}
+	if last := records[len(records)-1]; last.State.IsTerminal() {
+		t.Fatalf("state.StateRetryableFailed must not be terminal (RecoveryScan must still find it)")
 	}
 }
 
@@ -467,4 +582,76 @@ func TestCircuitBreaker_ConcurrentRunnersAndGaugeReader_NoRace(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("concurrent breaker test did not finish in time (possible deadlock)")
 	}
+}
+
+// TestSeparateBreakers_RunnerOpensWhileConcurrentPollLoopKeepsSucceeding is circuit-config-sec
+// finding 1's red-first regression proof: N8h Group D's "share the breaker" instruction had main.go
+// hand ONE sentinel.CircuitBreaker to both the poll loop and the runner. The poll loop calls
+// RecordSuccess on every successful ~10s GetEvents poll; if that success shares the SAME breaker
+// instance as the runner's RecordFailure calls, it resets the runner's consecutive-failure streak
+// to 0 before 5 straight runner failures can ever accumulate -- so the write-path circuit can
+// effectively never open, exactly while the dependency it guards is actually down.
+//
+// This test drives that exact interleaving -- a PollLoop succeeding repeatedly, concurrently with a
+// Runner failing 5 straight jobs -- twice: once with ONE shared breaker (the N8h bug, kept here as
+// a control proving this test would actually catch a regression) and once with the CURRENT
+// production wiring shape (two separate breakers, one per loop.Runner/loop.PollLoop, as main.go now
+// constructs them). Only the separate-breakers case may open.
+func TestSeparateBreakers_RunnerOpensWhileConcurrentPollLoopKeepsSucceeding(t *testing.T) {
+	runFiveFailuresWhilePolling := func(t *testing.T, runnerBreaker, pollBreaker *sentinel.CircuitBreaker) {
+		t.Helper()
+		clock := &fakeInlaneClock{}
+
+		poller := &PollLoop{
+			Client:     &fakeEventsClient{}, // empty pages, no error -> every PollOnce succeeds
+			MyAgentID:  me,
+			Enqueue:    &recordingEnqueuer{},
+			Breaker:    pollBreaker,
+			RetrySleep: clock.sleep,
+		}
+
+		// Interleave: one successful poll cycle, then one failed runner job, repeated 5 times -- the
+		// exact "poll succeeds every cycle while the runner is failing" shape the finding describes.
+		// PollOnce itself never touches the breaker (only PollLoop.Run's outer loop does, on a
+		// successful PollOnce, exactly as production wiring drives it) -- reproduced directly here so
+		// this test isn't also exercising Run's sleep/backoff machinery, which
+		// TestPollLoop_Run_SharedBreakerOpensOnRepeatedFailure already covers.
+		for i := 0; i < 5; i++ {
+			if _, err := poller.PollOnce(context.Background()); err != nil {
+				t.Fatalf("poll %d: unexpected error: %v", i, err)
+			}
+			poller.breaker().RecordSuccess()
+
+			issues := &seqIssues{
+				errs: []error{&sentinel.StatusError{Status: 503}},
+				snap: IssueSnapshot{ID: "i1", Status: "unresolved"},
+			}
+			r, _, _ := newInlaneTestRunner(t, issues, &fakeClaimer{held: true}, runnerBreaker, 1, clock.sleep)
+			e := Event{Seq: int64(i + 1), Type: "created", Issue: &EventIssue{ID: "i1"}}
+			if err := r.Run(context.Background(), e, KindTriage); err == nil {
+				t.Fatalf("job %d: expected the transient runner failure to propagate", i)
+			}
+		}
+	}
+
+	t.Run("shared breaker (N8h bug) never opens", func(t *testing.T) {
+		shared := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
+		runFiveFailuresWhilePolling(t, shared, shared)
+		if shared.State() == sentinel.CircuitOpen {
+			t.Fatalf("this is the control case demonstrating the N8h bug: with ONE shared breaker, the poll loop's RecordSuccess should have reset the runner's failure streak on every cycle, so it should NOT have opened -- got %v (if this now opens, the interleaving no longer reproduces the regression this test exists to guard against)", shared.State())
+		}
+	})
+
+	t.Run("separate breakers (current production wiring) — runner opens", func(t *testing.T) {
+		runnerBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
+		pollBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPIPoll)
+		runFiveFailuresWhilePolling(t, runnerBreaker, pollBreaker)
+
+		if runnerBreaker.State() != sentinel.CircuitOpen {
+			t.Fatalf("expected the runner's OWN breaker to open after 5 consecutive runner failures despite the concurrent poll loop's successes, got %v", runnerBreaker.State())
+		}
+		if pollBreaker.State() != sentinel.CircuitClosed {
+			t.Fatalf("expected the poll loop's OWN breaker to remain Closed (it only ever saw successes), got %v", pollBreaker.State())
+		}
+	})
 }

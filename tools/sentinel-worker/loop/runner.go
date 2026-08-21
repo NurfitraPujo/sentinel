@@ -9,9 +9,26 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
 )
+
+// Budget gates and accounts LLM spend against WORKER_DAILY_TOKEN_BUDGET (plan §2.6 finding 1),
+// satisfied by *llm.DailyBudget. Runner checks Exhausted() before invoking the Advisor for ANY
+// job kind (triage or followup — both spend LLM tokens) and feeds every successful Decision's
+// reported Usage into Add so the running total stays current across the whole process, not just
+// one job kind. Nil disables the gate entirely (every job proceeds, nothing is ever added).
+type Budget interface {
+	Exhausted() bool
+	Add(u llm.Usage)
+}
+
+// TriageRateLimiter gates TRIAGE job starts against WORKER_MAX_TRIAGE_PER_HOUR (plan §2.6 finding
+// 1), satisfied by *llm.HourlyCounter. Nil disables the gate entirely.
+type TriageRateLimiter interface {
+	TryIncrement() bool
+}
 
 // DefaultMaxInlaneRetries is WORKER_MAX_INLANE_RETRIES's default (plan §9 N8e): the bounded number
 // of in-lane retry attempts (re-driving a job through sentinel.BackoffForAttempt without leaving
@@ -38,6 +55,18 @@ const (
 	// on its own, not merged into an unrelated status).
 	SkipIgnored           SkipReason = "ignored"
 	SkipNotPreconditioned SkipReason = "precondition-failed"
+	// SkipBudgetExhausted is journaled when Runner.Budget.Exhausted() is true immediately before
+	// the Advisor would have been invoked (plan §2.6 finding 1): the job is skipped, not failed —
+	// a later delivery of the same event is a fresh jobId (different TriggerSeq) that gets its own
+	// chance once the daily window rolls over or an operator raises the cap.
+	SkipBudgetExhausted SkipReason = "daily-budget-exhausted"
+	// SkipTriageRateLimited is journaled when Runner.TriageLimiter.TryIncrement() denies a
+	// KindTriage job immediately before the Advisor would have been invoked (plan §2.6 finding 1).
+	SkipTriageRateLimited SkipReason = "triage-rate-limited"
+	// SkipFollowupRateLimited is journaled when Runner.FollowupLimiter.TryIncrement() denies a
+	// KindFollowUp job immediately before the Advisor would have been invoked (finding 5,
+	// core-robustness round 3: WORKER_MAX_FOLLOWUP_PER_HOUR, symmetric to TRIAGE's own cap).
+	SkipFollowupRateLimited SkipReason = "followup-rate-limited"
 )
 
 // IssueSnapshot is the runner's one-GET-per-job precondition read (plan §3: "the runner still
@@ -64,6 +93,13 @@ type Claimer interface {
 	// ({claimedBy, claimedAt}) when the implementation can supply one -- empty if not (e.g. a fake
 	// in tests, or a body that failed to parse).
 	EnsureClaimed(ctx context.Context, issueID string) (ok bool, claimedBy string, err error)
+
+	// ReleaseClaim releases a claim this worker holds on issueID (finding 3, core-robustness round
+	// 3): every post-claim path that ends the job in a PERMANENT terminal outcome (skip or
+	// failure) must call this so the claim does not sit stranded until WORKER_NAG_DAYS. Best-effort
+	// from the caller's perspective -- a release failure is logged, never allowed to block the
+	// terminal journal write it accompanies.
+	ReleaseClaim(ctx context.Context, issueID string) error
 }
 
 // Actor is the seam for §2.3's act(): compiles a journaled Decision into the actual batch/question
@@ -114,6 +150,28 @@ type Runner struct {
 	// OnCircuitOpen, when non-nil, is called every time runWithInlaneRetry finds Breaker not
 	// Allow()ing a call (plan §7: "circuit-open events").
 	OnCircuitOpen func(scope string)
+
+	// Budget gates every Advisor invocation (triage AND followup) on WORKER_DAILY_TOKEN_BUDGET
+	// (plan §2.6 finding 1). Nil disables the gate — every job proceeds regardless of spend, and
+	// Decision.Usage is silently never accounted anywhere (matching this package's existing
+	// "nil seam disables the feature" convention for Breaker/OnOutcome/etc.).
+	Budget Budget
+
+	// OnUsage, when non-nil, is called once per Advisor decision immediately after Budget.Add,
+	// with the provider label the Advisor's llm.RunLoop reported ("primary"/"fallback") and the
+	// Usage it billed against the budget (plan §7: "llm_tokens by provider", "budget_remaining").
+	// Same "nil seam disables the feature" convention as OnOutcome/OnCircuitOpen.
+	OnUsage func(provider string, usage llm.Usage)
+
+	// TriageLimiter gates KindTriage job starts on WORKER_MAX_TRIAGE_PER_HOUR (plan §2.6 finding
+	// 1). Nil disables the gate. Only consulted for kind == KindTriage.
+	TriageLimiter TriageRateLimiter
+
+	// FollowupLimiter gates KindFollowUp job starts on WORKER_MAX_FOLLOWUP_PER_HOUR (finding 5,
+	// core-robustness round 3): WORKER_DAILY_TOKEN_BUDGET defaults to 0 (unlimited) and, without
+	// this, FOLLOW-UP had no per-hour cap symmetric to TRIAGE's -- an effectively unbounded LLM
+	// spend path by default. Nil disables the gate. Only consulted for kind == KindFollowUp.
+	FollowupLimiter TriageRateLimiter
 }
 
 // classifyRunnerFailureClass extracts a sentinel.FailureClass from cause: a *sentinel.StatusError
@@ -296,12 +354,19 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 			// Already terminal (done/failed/skipped/superseded from a prior delivery) — dedupe drop.
 			return nil
 		}
-		if rec.State == state.StateAdvised || rec.State == state.StateActing {
+		if rec.State == state.StateAdvised || rec.State == state.StateActing ||
+			(rec.State == state.StateRetryableFailed && len(rec.Payload) > 0) {
 			// A crash/restart between "advised" (or "acting") and the terminal record must NOT
 			// re-invoke the Advisor (plan §2.2: "the LLM is NEVER re-invoked for a job that
 			// already produced a decision", plan §8's required proof). Replay the journaled
 			// decision straight into the act step instead of falling through to resolve/
-			// precondition/ensure-claimed/Advisor.Decide below.
+			// precondition/ensure-claimed/Advisor.Decide below. A StateRetryableFailed record
+			// WITH a payload means the Act stage itself exhausted in-lane retries after a
+			// decision was already journaled (finding 4 regression, core-robustness round 3) --
+			// it must replay that decision too, not just advised/acting. A StateRetryableFailed
+			// record with an EMPTY payload means the failure happened before the Advisor was
+			// ever reached (resolve/ensure-claimed/Advisor.Decide itself), so falling through to
+			// the normal pipeline below to re-derive a decision remains correct for that case.
 			return r.resumeFromAdvised(ctx, jobID, issueID, e, jobKind, rec)
 		}
 		// Any other non-terminal state (queued/claimed/questioned) has not yet reached the
@@ -351,12 +416,40 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 		// /metrics (no terminal outcome ever fires) and, worse, invisible to crash recovery, since
 		// RecoveryScan's in-flight set is keyed off the SAME non-terminal states this job never
 		// advances out of.
-		return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("resolving issue %s: %w", issueID, err))
+		// Not claim-held here: this fires before EnsureClaimed is ever attempted.
+		return r.journalTransientFailure(ctx, jobID, issueID, e, jobKind, fmt.Errorf("resolving issue %s: %w", issueID, err), false)
 	}
 
 	// preconditions
 	if reason, skip := r.precondition(kind, e.Type, snap); skip {
 		return r.journalSkip(jobID, issueID, e, jobKind, reason)
+	}
+
+	// Budget/TriageLimiter/FollowupLimiter gate BEFORE EnsureClaimed (finding 3, core-robustness
+	// round 3 -- moved from after the claim, where it used to sit). An exhausted gate must never
+	// spend another LLM call NOR claim work it isn't going to do: claiming an issue then
+	// immediately skipping it here leaked the claim permanently (only ever released by
+	// WORKER_NAG_DAYS's sweep reaper, never by this path). Skip-with-metric (via journalSkip's
+	// existing OnOutcome wiring), never a crash, matching CLAUDE.md's "Exhausted caps mean the
+	// caller queues/skips the job with a metric, never a crash" convention already established for
+	// jobs.FixCaps.
+	if r.Budget != nil && r.Budget.Exhausted() {
+		if r.Log != nil {
+			r.Log.Warn("skipping job: daily LLM token budget exhausted", "jobId", jobID, "issueId", issueID, "kind", jobKind)
+		}
+		return r.journalSkip(jobID, issueID, e, jobKind, SkipBudgetExhausted)
+	}
+	if kind == KindTriage && r.TriageLimiter != nil && !r.TriageLimiter.TryIncrement() {
+		if r.Log != nil {
+			r.Log.Warn("skipping job: hourly TRIAGE cap exhausted", "jobId", jobID, "issueId", issueID, "kind", jobKind)
+		}
+		return r.journalSkip(jobID, issueID, e, jobKind, SkipTriageRateLimited)
+	}
+	if kind == KindFollowUp && r.FollowupLimiter != nil && !r.FollowupLimiter.TryIncrement() {
+		if r.Log != nil {
+			r.Log.Warn("skipping job: hourly FOLLOW-UP cap exhausted", "jobId", jobID, "issueId", issueID, "kind", jobKind)
+		}
+		return r.journalSkip(jobID, issueID, e, jobKind, SkipFollowupRateLimited)
 	}
 
 	// ensure-claimed (C1). Dry-run must not perform this mutating call either (plan §5: "every
@@ -389,7 +482,8 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("claiming issue %s: %w", issueID, err))
+			// Not claim-held here: EnsureClaimed itself is what failed, so no release is owed.
+			return r.journalTransientFailure(ctx, jobID, issueID, e, jobKind, fmt.Errorf("claiming issue %s: %w", issueID, err), false)
 		}
 	}
 	if !held {
@@ -426,7 +520,19 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 			// shutdown at this layer.
 			return ctx.Err()
 		}
-		return r.journalTransientFailure(jobID, issueID, e, jobKind, fmt.Errorf("advisor decision for job %s: %w", jobID, err))
+		// Claim IS held here (EnsureClaimed succeeded above): a PERMANENT-class outcome must
+		// release it rather than leave it stranded until WORKER_NAG_DAYS (finding 3).
+		return r.journalTransientFailure(ctx, jobID, issueID, e, jobKind, fmt.Errorf("advisor decision for job %s: %w", jobID, err), true)
+	}
+	if r.Budget != nil {
+		// Feeds the RunLoop's adapter-reported spend into today's running total (plan §2.6 finding
+		// 1) — decision.Usage is ALSO journaled as part of the advised Payload below, so a restart
+		// reconstructs the same total via jobs.SumAdvisedTokenUsage without ever double-counting
+		// (SeedSpent only ever runs once, at boot, before any Add call).
+		r.Budget.Add(decision.Usage)
+	}
+	if r.OnUsage != nil {
+		r.OnUsage(decision.Provider, decision.Usage)
 	}
 	payload, err := json.Marshal(decision)
 	if err != nil {
@@ -447,8 +553,19 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 	if err := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateActing}); err != nil {
 		return err
 	}
-	if err := r.Act.Act(ctx, jobID, decision); err != nil {
-		return r.handleActError(ctx, jobID, issueID, e, jobKind, err)
+	// MAJOR (finding 2): Act's batch/question calls must be re-driven in-lane (plan §2.4/§9 N8e),
+	// same as the resolve/ensure-claimed calls above -- a transient 429/5xx must not terminally
+	// fail the whole job on its first hiccup. This is safe to resend whole (rather than only the
+	// narrow retryOps set) because every op/question carries its own idempotency key derived from
+	// jobID -- a resend lands on the SAME keys and the server dedupes anything that already landed
+	// (plan §2.3). RealActor.Act itself is idempotent to re-invoke: it journals the compiled batch
+	// body once (finding 4) and every subsequent call for this jobID replays that SAME journaled
+	// body rather than recompiling.
+	err = r.runWithInlaneRetry(ctx, jobKind, func(ctx context.Context) error {
+		return r.Act.Act(ctx, jobID, decision)
+	})
+	if err != nil {
+		return r.handleActError(ctx, jobID, issueID, e, jobKind, err, payload)
 	}
 	if err := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateActed}); err != nil {
 		return err
@@ -462,10 +579,10 @@ func (r *Runner) Run(ctx context.Context, e Event, kind Kind) error {
 // jobs.RealActor.Act, or a single batch op classifying ClassGone, per jobs/actor.go's
 // checkBatchResults) gets the SAME skipped(deleted) treatment as the dispatch-time tombstone and
 // the runner's own precondition-read 404 -- NOT journaled failed. Every other Act error keeps the
-// existing journal failed(...) behavior; Act's own batch/question calls are not currently
-// re-driven in-lane here (they use the plan §2.3 idempotency-key narrow-resend scheme instead, a
-// distinct mechanism from this package's backoff ladder).
-func (r *Runner) handleActError(ctx context.Context, jobID, issueID string, e Event, jobKind string, actErr error) error {
+// existing journal failed(...) behavior. This is called only once runWithInlaneRetry has already
+// given up (exhausted attempts, or the failure classified as non-retryable), so a Transient/
+// RateLimited class here means "still transient after every in-lane retry", not "never retried".
+func (r *Runner) handleActError(ctx context.Context, jobID, issueID string, e Event, jobKind string, actErr error, decisionPayload []byte) error {
 	var statusErr *sentinel.StatusError
 	if errors.As(actErr, &statusErr) && sentinel.ClassifyEnvelope(statusErr.Status, false, false) == sentinel.ClassGone {
 		if r.Log != nil {
@@ -484,13 +601,31 @@ func (r *Runner) handleActError(ctx context.Context, jobID, issueID string, e Ev
 		// correct terminal skipped(deleted) when the cause is a tombstone.
 		return ctx.Err()
 	}
-	outcome := "failed_permanent"
 	if class := classifyRunnerFailureClass(actErr); class == sentinel.ClassTransient || class == sentinel.ClassRateLimited {
-		outcome = "failed_transient"
+		// Same finding-4 reasoning as journalTransientFailure: an in-lane-retry-exhausted
+		// Transient/RateLimited Act failure must stay NON-terminal so RecoveryScan re-drives it
+		// once the outage clears, rather than losing the job as a permanent "failed". The record
+		// MUST carry the already-journaled decisionPayload (regression fix, core-robustness round
+		// 3, finding "Act-stage retryable_failed re-invokes Advisor"): without it, Run's replay
+		// guard and Resume have no way to tell this retryable_failed apart from one that failed
+		// BEFORE a decision was ever produced, and would re-derive a fresh decision on resume --
+		// re-spending LLM tokens and double-incrementing the hourly triage/follow-up caps (finding
+		// 5) on every crash-resume during an outage. Carrying the payload here lets both routes
+		// treat "retryable_failed with a payload" exactly like "advised/acting": replay verbatim,
+		// never re-invoke the Advisor.
+		_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateRetryableFailed, Payload: decisionPayload})
+		if r.OnOutcome != nil {
+			r.OnOutcome(jobKind, "failed_transient_retryable")
+		}
+		return fmt.Errorf("acting on job %s: %w", jobID, actErr)
 	}
 	_ = r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed})
+	// Claim is held throughout Act (ensure-claimed already succeeded, and Act itself never
+	// released -- it failed) -- a permanent Act failure must release it (finding 3) rather than
+	// strand it until WORKER_NAG_DAYS.
+	r.releaseClaimBestEffort(ctx, jobID, issueID, jobKind)
 	if r.OnOutcome != nil {
-		r.OnOutcome(jobKind, outcome)
+		r.OnOutcome(jobKind, "failed_permanent")
 	}
 	return fmt.Errorf("acting on job %s: %w", jobID, actErr)
 }
@@ -531,8 +666,17 @@ func (r *Runner) Resume(ctx context.Context, job state.InFlightJob) error {
 		Issue: &EventIssue{ID: job.IssueID},
 	}
 
-	switch job.State {
-	case state.StateAdvised, state.StateActing:
+	switch {
+	case job.State == state.StateAdvised || job.State == state.StateActing ||
+		(job.State == state.StateRetryableFailed && len(job.Payload) > 0):
+		// StateRetryableFailed WITH a payload means the Act stage exhausted in-lane retries
+		// AFTER a decision was already journaled (finding 4 regression, core-robustness round
+		// 3) -- it must replay that decision verbatim, exactly like advised/acting, and must
+		// NOT fall through to Run where the Advisor would be re-invoked (re-spending tokens and
+		// double-incrementing the hourly triage/follow-up caps on every crash-resume during an
+		// outage). A StateRetryableFailed record with an EMPTY payload (pre-advisor failure --
+		// resolve/ensure-claimed/Advisor.Decide itself never completed) falls to the default
+		// case below, where re-deriving a decision via Run is correct.
 		rec := state.Record{
 			JobID:      job.JobID,
 			IssueID:    job.IssueID,
@@ -543,45 +687,78 @@ func (r *Runner) Resume(ctx context.Context, job state.InFlightJob) error {
 		}
 		return r.resumeFromAdvised(ctx, job.JobID, job.IssueID, e, job.Kind, rec)
 	default:
-		// queued / claimed / questioned: Run's own dedupe check will see this job's latest
-		// journal record is non-terminal and not advised/acting, and fall through to the normal
+		// queued / claimed / questioned / retryable_failed-with-empty-payload: Run's own dedupe
+		// check will see this job's latest journal record is non-terminal and not
+		// advised/acting/retryable_failed-with-payload, and fall through to the normal
 		// resolve -> preconditions -> ensure-claimed -> Advisor pipeline, exactly as if this were a
 		// fresh delivery.
 		return r.Run(ctx, e, kind)
 	}
 }
 
-// journalTransientFailure implements the pipeline's terminal-failure path for an error surfacing
-// anywhere in Run before a decision has been journaled (resolving the issue, ensure-claimed, the
-// Advisor call) that runWithInlaneRetry has already exhausted retries on (or declined to retry, for
-// a non-Transient/RateLimited class): it journals a terminal failed record, fires OnOutcome with a
-// class-specific outcome string so /metrics can split transient-failed from permanent-failed (plan
-// §7), and returns cause so the caller (Dispatch's runOne, main's Resume loop) still sees and logs
-// the underlying error. Without a terminal record here, these three error returns would leave the
-// job's journal record at whatever non-terminal state Run had already appended (queued/claimed) --
-// invisible to /metrics (no OnOutcome ever fires) and, worse, invisible to crash recovery too,
-// since RecoveryScan's in-flight set is keyed off the SAME non-terminal states.
-func (r *Runner) journalTransientFailure(jobID, issueID string, e Event, jobKind string, cause error) error {
+// journalTransientFailure implements the pipeline's failure path for an error surfacing anywhere
+// in Run before a decision has been journaled (resolving the issue, ensure-claimed, the Advisor
+// call) that runWithInlaneRetry has already exhausted retries on (or declined to retry, for a
+// non-Transient/RateLimited class). A PERMANENT-class cause journals a genuinely terminal `failed`
+// record (fires OnOutcome "failed_permanent", releases the claim if claimHeld -- finding 3). A
+// Transient/RateLimited-class cause -- e.g. a sentinel-api write outage that outlasted
+// WORKER_MAX_INLANE_RETRIES -- journals the deliberately NON-terminal state.StateRetryableFailed
+// instead (finding 4, core-robustness round 3): journaling it `failed` here would tell
+// RecoveryScan the job is done and permanently lose it (tenet 1) for the rest of the outage,
+// whereas StateRetryableFailed keeps it in RecoveryScan's in-flight set so a later restart's
+// Resume pass (or any future periodic re-scan) re-drives it once the circuit/API recovers. Either
+// way this returns cause so the caller (Dispatch's runOne, main's Resume loop) still sees and logs
+// the underlying error. Without SOME non-dedupe-able record here, these error returns would leave
+// the job's journal record at whatever state Run had already appended (queued/claimed) --
+// indistinguishable from a job that never even started retrying.
+func (r *Runner) journalTransientFailure(ctx context.Context, jobID, issueID string, e Event, jobKind string, cause error, claimHeld bool) error {
 	class := classifyRunnerFailureClass(cause)
-	outcome := "failed_permanent"
-	reason := "permanent"
 	if class == sentinel.ClassTransient || class == sentinel.ClassRateLimited {
-		outcome = "failed_transient"
-		reason = "transient"
+		payload, _ := json.Marshal(map[string]string{"reason": "transient", "class": classifyRunnerError(cause)})
+		if appendErr := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateRetryableFailed, Payload: payload}); appendErr != nil {
+			return fmt.Errorf("%w (also failed to journal retryable failure: %v)", cause, appendErr)
+		}
+		if r.OnOutcome != nil {
+			r.OnOutcome(jobKind, "failed_transient_retryable")
+		}
+		if r.Log != nil {
+			r.Log.Error("job hit exhausted in-lane retries on a transient cause, journaled retryable (non-terminal) for later re-drive", "jobId", jobID, "issueId", issueID, "kind", jobKind, "error", cause)
+		}
+		return cause
 	}
-	payload, _ := json.Marshal(map[string]string{"reason": reason, "class": classifyRunnerError(cause)})
+	payload, _ := json.Marshal(map[string]string{"reason": "permanent", "class": classifyRunnerError(cause)})
 	if appendErr := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateFailed, Payload: payload}); appendErr != nil {
 		// The journal write itself failed -- nothing further we can do to make this terminal;
 		// surface both errors so the operator sees the append failure was not silently swallowed.
-		return fmt.Errorf("%w (also failed to journal transient failure: %v)", cause, appendErr)
+		return fmt.Errorf("%w (also failed to journal permanent failure: %v)", cause, appendErr)
+	}
+	if claimHeld {
+		r.releaseClaimBestEffort(ctx, jobID, issueID, jobKind)
 	}
 	if r.OnOutcome != nil {
-		r.OnOutcome(jobKind, outcome)
+		r.OnOutcome(jobKind, "failed_permanent")
 	}
 	if r.Log != nil {
-		r.Log.Error("job failed, journaled terminal failed", "jobId", jobID, "issueId", issueID, "kind", jobKind, "reason", reason, "error", cause)
+		r.Log.Error("job failed, journaled terminal failed", "jobId", jobID, "issueId", issueID, "kind", jobKind, "reason", "permanent", "error", cause)
 	}
 	return cause
+}
+
+// releaseClaimBestEffort calls r.Claims.ReleaseClaim(issueID), logging (not propagating) any
+// error: the caller is already in the middle of journaling a terminal outcome for jobID and must
+// not let a release failure block that write -- a leaked claim recoverable by WORKER_NAG_DAYS's
+// sweep reaper is a strictly better outcome than a terminal journal record that never landed.
+// No-ops when r.Claims is nil (dry-run/test seams that don't wire a Claimer) or DryRun is set
+// (the claim was never actually taken for real, per Run's own ensure-claimed DryRun branch).
+func (r *Runner) releaseClaimBestEffort(ctx context.Context, jobID, issueID, jobKind string) {
+	if r.Claims == nil || r.DryRun {
+		return
+	}
+	if err := r.Claims.ReleaseClaim(ctx, issueID); err != nil {
+		if r.Log != nil {
+			r.Log.Error("failed to release claim after terminal outcome", "jobId", jobID, "issueId", issueID, "kind", jobKind, "error", err)
+		}
+	}
 }
 
 // classifyRunnerError labels cause for journalTransientFailure's payload, per plan §2.4's failure
@@ -713,8 +890,14 @@ func (r *Runner) resumeFromAdvised(ctx context.Context, jobID, issueID string, e
 			return err
 		}
 	}
-	if err := r.Act.Act(ctx, jobID, decision); err != nil {
-		return r.handleActError(ctx, jobID, issueID, e, jobKind, err)
+	// Same in-lane retry ladder as Run's own Act call (finding 2) -- a resumed job's transient
+	// batch/question failure must be retried here too, not left to fail on the very first replay
+	// attempt.
+	actErr := r.runWithInlaneRetry(ctx, jobKind, func(ctx context.Context) error {
+		return r.Act.Act(ctx, jobID, decision)
+	})
+	if actErr != nil {
+		return r.handleActError(ctx, jobID, issueID, e, jobKind, actErr, decisionPayload)
 	}
 	if err := r.Journal.Append(state.Record{JobID: jobID, IssueID: issueID, Kind: jobKind, TriggerSeq: e.Seq, State: state.StateActed}); err != nil {
 		return err

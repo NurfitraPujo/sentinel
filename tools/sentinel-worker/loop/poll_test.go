@@ -449,3 +449,108 @@ func splitAmp(s string) []string {
 	out = append(out, s[start:])
 	return out
 }
+
+// TestPollLoop_Run_SharedBreakerOpensOnRepeatedFailure is finding 5's fast, backoff-independent
+// proof (durability-startup remediation): main.go constructs ONE sentinelAPIBreaker and must pass
+// it into both loop.Runner (whose activity publishCircuitStateGauge reads) and
+// loop.PollLoop.Breaker -- before the fix, PollLoop.Breaker was left nil and poll.go's breaker()
+// helper lazily built a SEPARATE CircuitBreaker instance, so a poll-only outage never showed up on
+// the shared /metrics gauge. This drives Run() with a real externally-owned CircuitBreaker (the
+// same object a caller like main.go would hand to both PollLoop and the gauge publisher) through 5
+// real consecutive failures and asserts THAT SAME instance opened. Sleep/RetrySleep are no-ops so
+// the test doesn't pay the real backoff ladder's cost -- this is loop.PollLoop's own mechanism
+// under test, not sentinel.BackoffForAttempt's timing. Passing a fresh, un-shared breaker to
+// PollLoop.Breaker (i.e. reverting to "nil => own breaker") would still pass THIS test in
+// isolation, which is exactly why finding 5's real defect (main.go never wiring the shared
+// instance in) is additionally proven by inspection of runPipeline's poller construction, not by a
+// test in this package alone -- see the `Breaker: sentinelAPIBreaker` line in main.go.
+func TestPollLoop_Run_SharedBreakerOpensOnRepeatedFailure(t *testing.T) {
+	shared := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
+	if shared.State() != sentinel.CircuitClosed {
+		t.Fatalf("fresh breaker state = %v, want Closed", shared.State())
+	}
+
+	p := &PollLoop{
+		Client:     alwaysFailEventsClient{},
+		MyAgentID:  "agent-me",
+		Enqueue:    &recordingEnqueuer{},
+		Interval:   time.Millisecond,
+		Breaker:    shared,
+		Sleep:      func(ctx context.Context, _ time.Duration) {},
+		RetrySleep: func(context.Context, time.Duration) {},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for shared.State() == sentinel.CircuitClosed {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("shared breaker never opened after repeated poll failures -- PollLoop is not driving the caller-supplied Breaker")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	if shared.State() != sentinel.CircuitOpen {
+		t.Fatalf("shared breaker state = %v, want Open", shared.State())
+	}
+}
+
+// TestPollLoop_HasOpenFixSuppressesOccurrenceBurst is the wired end-to-end proof for finding 3
+// (fix-lifecycle remediation round 2): PollLoop.PollOnce, against a REAL *state.Journal carrying a
+// non-terminal Kind=state.FixKind record for an issue (exactly what jobs.journalFixRunning/
+// JournalFixPROpen append), must classify that issue's occurrence_burst event as KindNone -- not
+// merely Classify in isolation (dispatch_test.go covers that), but PollLoop's own hasOpenFix hook
+// actually consulting the journal via p.hasOpenFix -> Journal.HasOpenKind.
+//
+// MUTATION-TEST NOTE: drop `p.hasOpenFix` from PollOnce's `Classify(e, p.MyAgentID,
+// p.hasOpenQuestion, p.hasOpenFix)` call (its pre-fix shape) and this test goes red -- the
+// occurrence_burst event classifies KindTriage despite the open FIX record.
+func TestPollLoop_HasOpenFixSuppressesOccurrenceBurst(t *testing.T) {
+	journal := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	if err := journal.Append(state.Record{
+		JobID:   "fix-job-1",
+		IssueID: "issue-with-open-fix",
+		Kind:    state.FixKind,
+		State:   state.StateActed, // JournalFixPROpen's own State -- non-terminal, PR out for review
+	}); err != nil {
+		t.Fatalf("journal.Append: %v", err)
+	}
+
+	client := &fakeEventsClient{
+		pages: map[int64]EventsPage{
+			0: {
+				Events: []Event{
+					{Seq: 1, Type: "occurrence_burst", ActorID: "someone-else", Issue: &EventIssue{ID: "issue-with-open-fix"}},
+					{Seq: 2, Type: "occurrence_burst", ActorID: "someone-else", Issue: &EventIssue{ID: "issue-no-fix"}},
+				},
+				HasMore: false,
+			},
+		},
+	}
+	var kinds []Kind
+	enq := enqueueFunc(func(e Event, k Kind) { kinds = append(kinds, k) })
+	p := &PollLoop{Client: client, MyAgentID: "agent-me", Enqueue: enq, Journal: journal}
+
+	if _, err := p.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if len(kinds) != 2 {
+		t.Fatalf("expected 2 enqueue calls, got %d", len(kinds))
+	}
+	if kinds[0] != KindNone {
+		t.Errorf("issue with an open FIX: got %q, want KindNone", kinds[0])
+	}
+	if kinds[1] != KindTriage {
+		t.Errorf("issue with no open FIX: got %q, want KindTriage", kinds[1])
+	}
+}

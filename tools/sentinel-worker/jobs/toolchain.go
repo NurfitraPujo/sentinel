@@ -69,7 +69,19 @@ func (r *ToolOutputRecorder) All() []string {
 // the model as a success result and must be tracked identically) is captured into rec before it is
 // returned. This is the ONE place every tool result — repoctx's and the sentinel-backed ones alike
 // — funnels through, so BuildToolchain's caller never has to remember to record anywhere else.
-func recording(rec *ToolOutputRecorder, fn llm.ToolFunc) llm.ToolFunc {
+//
+// Every SUCCESS result is additionally fenced through guard.WrapUntrusted(label, ...) before it is
+// handed back to RunLoop (plan §4.6 finding 2): get_issue/get_occurrences/list_similar/get_projects
+// (and, when a repo mapping exists, search_code/read_file) all return attacker-influenced content
+// — a stacktrace, an issue message, a comment, source code the reporter's own repo — that section
+// 4.6's original delimiting only fenced when it was pre-loaded into the SYSTEM prompt; anything a
+// tool call fetched mid-loop reached the model completely unfenced. rec still records the RAW
+// (unwrapped) output — guard.Check's verbatim-coverage corpus must be the actual tool content, not
+// noise from the fence markers wrapping it. The recorded error text on a failure path is NOT
+// wrapped: runTool (llm/toolloop.go) only ever surfaces err.Error() to the model on that path
+// (ignoring whatever this func returns as its string value), so wrapping it here would be dead
+// code — the fence would never reach the model.
+func recording(rec *ToolOutputRecorder, label string, fn llm.ToolFunc) llm.ToolFunc {
 	return func(ctx context.Context, arguments string) (string, error) {
 		out, err := fn(ctx, arguments)
 		if err != nil {
@@ -77,7 +89,7 @@ func recording(rec *ToolOutputRecorder, fn llm.ToolFunc) llm.ToolFunc {
 			return out, err
 		}
 		rec.Record(out)
-		return out, nil
+		return guard.WrapUntrusted(label, out), nil
 	}
 }
 
@@ -148,11 +160,11 @@ func BuildToolchain(client *sentinel.Client, repo *repoctx.Repo, issueID string,
 	}
 
 	funcs := map[string]llm.ToolFunc{
-		ToolGetIssue: recording(rec, func(ctx context.Context, _ string) (string, error) {
+		ToolGetIssue: recording(rec, ToolGetIssue, func(ctx context.Context, _ string) (string, error) {
 			res, err := client.GetIssue(ctx, issueID)
 			return resultToToolOutput(res, err)
 		}),
-		ToolGetOccurrences: recording(rec, func(ctx context.Context, arguments string) (string, error) {
+		ToolGetOccurrences: recording(rec, ToolGetOccurrences, func(ctx context.Context, arguments string) (string, error) {
 			var args occurrencesArgs
 			if arguments != "" {
 				if err := json.Unmarshal([]byte(arguments), &args); err != nil {
@@ -162,11 +174,11 @@ func BuildToolchain(client *sentinel.Client, repo *repoctx.Repo, issueID string,
 			res, err := client.GetOccurrences(ctx, issueID, args.Limit, args.Before)
 			return resultToToolOutput(res, err)
 		}),
-		ToolListSimilar: recording(rec, func(ctx context.Context, _ string) (string, error) {
+		ToolListSimilar: recording(rec, ToolListSimilar, func(ctx context.Context, _ string) (string, error) {
 			res, err := client.ListIssues(ctx, sentinel.IssuesListOptions{Sort: "lastSeen", Limit: 20, Project: projectID})
 			return resultToToolOutput(res, err)
 		}),
-		ToolGetProjects: recording(rec, func(ctx context.Context, _ string) (string, error) {
+		ToolGetProjects: recording(rec, ToolGetProjects, func(ctx context.Context, _ string) (string, error) {
 			res, err := client.ListProjects(ctx)
 			return resultToToolOutput(res, err)
 		}),
@@ -175,7 +187,7 @@ func BuildToolchain(client *sentinel.Client, repo *repoctx.Repo, issueID string,
 	if repo != nil {
 		defs = append(defs, repoctx.ToolDefs()...)
 		for name, fn := range repoctx.Tools(repo) {
-			funcs[name] = recording(rec, fn)
+			funcs[name] = recording(rec, name, fn)
 		}
 	}
 

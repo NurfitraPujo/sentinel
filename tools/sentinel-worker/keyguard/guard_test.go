@@ -218,6 +218,67 @@ func TestGuard_ProactiveRotate_OrphanedKeyDoesNotBlindLoop(t *testing.T) {
 	}
 }
 
+// TestGuard_OrphanedKeyRetriesEvenWhenTriggerGoesNone is finding 7's (core-robustness round 3)
+// red-first proof: once a tick mints a key server-side, fails to persist it, and latches
+// g.orphanedKey, a LATER tick whose SelfKeyInfo/Evaluate call legitimately returns TriggerNone
+// (e.g. the freshly-minted key's own createdAt/expiresAt isn't itself due for rotation) must still
+// retry the pending persist. Before this fix, evaluateAndRotate's `if trigger == TriggerNone {
+// return }` early return sat BEFORE the orphaned-key check, so this scenario made the retry path
+// permanently unreachable for the rest of the process's life -- a durably-lost rotated key stayed
+// orphaned until restart, discovered only by luck if some LATER trigger happened to fire again.
+func TestGuard_OrphanedKeyRetriesEvenWhenTriggerGoesNone(t *testing.T) {
+	var buf bytes.Buffer
+	now := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
+	// First tick: expiresAt just inside the rotate-before-hours window, so Evaluate fires a real
+	// trigger and rotate() mints a new key -- Persist then fails, latching orphanedKey.
+	almostExpired := now.Add(1 * time.Hour)
+	store := &fakeStore{persistErr: errors.New("secret patch RBAC denied")}
+	client := &fakeClient{info: KeyInfo{ExpiresAt: &almostExpired}, nextKey: "new-key-orphan", liveKey: "old-key"}
+	g := NewGuard(store, client, 72, 30, time.Hour, newTestLogger(&buf))
+	g.Clock = func() time.Time { return now }
+
+	g.evaluateAndRotate(context.Background())
+	if client.rotateCalls != 1 {
+		t.Fatalf("expected 1 rotate call after the first tick, got %d", client.rotateCalls)
+	}
+	store.mu.Lock()
+	persistCallsAfterFirstTick := store.persistCalls
+	store.mu.Unlock()
+	if persistCallsAfterFirstTick != 1 {
+		t.Fatalf("expected 1 failed persist attempt after the first tick, got %d", persistCallsAfterFirstTick)
+	}
+
+	// Second tick: SelfKeyInfo now reports the info an operator would actually see for the
+	// (server-side, already-minted) new key -- far from expiry, so Evaluate legitimately returns
+	// TriggerNone. Persist is STILL failing. The pending orphaned key must still be retried.
+	farFromExpiry := now.Add(1000 * time.Hour)
+	client.mu.Lock()
+	client.info = KeyInfo{ExpiresAt: &farFromExpiry}
+	client.mu.Unlock()
+
+	g.evaluateAndRotate(context.Background())
+
+	store.mu.Lock()
+	persistCallsAfterSecondTick := store.persistCalls
+	store.mu.Unlock()
+	if persistCallsAfterSecondTick <= persistCallsAfterFirstTick {
+		t.Fatalf("expected Store.Persist to be retried on a TriggerNone tick while a key is orphaned (got %d calls total, same as after tick 1) -- the retry path is unreachable", persistCallsAfterSecondTick)
+	}
+	if client.rotateCalls != 1 {
+		t.Fatalf("expected Client.Rotate to still NOT be called again (retry-persist-only), got %d rotate calls", client.rotateCalls)
+	}
+
+	// Once persist starts succeeding, the SAME TriggerNone-reporting tick must still finish
+	// delivering the orphaned key live -- proving the retry path, once reached, works end to end.
+	store.mu.Lock()
+	store.persistErr = nil
+	store.mu.Unlock()
+	g.evaluateAndRotate(context.Background())
+	if client.liveKey != "new-key-orphan" {
+		t.Fatalf("expected the orphaned key to go live once persist succeeded even under TriggerNone, got %q", client.liveKey)
+	}
+}
+
 // TestGuard_TriggerOn401Once_RotatesOnce proves rule (c): the first 401 rotates, a second 401
 // after that does NOT rotate again, and logs a WARN instead.
 func TestGuard_TriggerOn401Once_RotatesOnce(t *testing.T) {

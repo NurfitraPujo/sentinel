@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
@@ -50,20 +52,68 @@ type PushFixBranchInput struct {
 	DefaultBranch string
 	Cred          gitprovider.GitCredential
 	Redactor      *gitprovider.Redactor
+
+	// CloneURL is the repo connection's own known-good clone URL (settings.ProjectSettings /
+	// FixRepoConfig.CloneURL — never read back out of the repo's own, attacker-writable
+	// .git/config) that this push is meant to reach. It is REQUIRED: PushFixBranch derives the
+	// askpass host-pin from it, not from argv, because `git push -u origin <branch>` carries no
+	// URL in its own args for deriveExpectedHost to find (finding 1). Without a pin here, a
+	// repo-local `url.<attacker>.insteadOf` rewrite of origin (or a plain `git remote set-url`)
+	// written by the untrusted FIX executor before this push runs would silently redirect the
+	// authenticated request -- and the git credential with it -- to an attacker-controlled host.
+	CloneURL string
 }
 
 // PushFixBranch pushes in.Branch to origin (askpass-authed, plan §4.5) after AssertFixBranchSafe.
 // This is the ONLY place in this package that ever runs `git push` — the Fix Executor itself
 // never pushes (plan §4.4 trust boundary: "Push happens from the WORKER after validation ...
 // not by the executor").
+//
+// The askpass host pin (finding 1) is derived from in.CloneURL -- the repo connection's own
+// known-good clone URL -- NOT from argv (there is none to derive from in a `push -u origin
+// <branch>` invocation) and NOT from re-reading origin's URL out of .git/config (which is exactly
+// what an attacker with executor-level write access to the workspace could have rewritten,
+// e.g. via a repo-local `url.<attacker>.insteadOf` or `git remote set-url`, BEFORE this push
+// runs). Pinning to the caller-supplied CloneURL means that rewrite still authenticates against
+// the real host, or not at all -- never against the attacker's.
 func PushFixBranch(ctx context.Context, in PushFixBranchInput) error {
 	if err := AssertFixBranchSafe(in.Branch, in.DefaultBranch); err != nil {
 		return err
 	}
-	if err := gitprovider.RunGit(ctx, in.RepoDir, in.Cred, in.Redactor, "push", "-u", "origin", in.Branch); err != nil {
+	if in.CloneURL == "" {
+		return fmt.Errorf("jobs: fix pr: push %s: CloneURL is required to pin the askpass host", in.Branch)
+	}
+	expectedHost, err := expectedPushHost(in.CloneURL)
+	if err != nil {
+		return fmt.Errorf("jobs: fix pr: push %s: %w", in.Branch, err)
+	}
+	if err := gitprovider.RunGitWithHost(ctx, in.RepoDir, in.Cred, in.Redactor, expectedHost, "push", "-u", "origin", in.Branch); err != nil {
 		return fmt.Errorf("jobs: fix pr: push %s: %w", in.Branch, err)
 	}
 	return nil
+}
+
+// expectedPushHost parses cloneURL (production always supplies plan §4.5's "remotes always
+// tokenless" http(s) clone URL, e.g. "https://github.com/owner/repo.git") into the host:port
+// SENTINEL_ASKPASS_HOST pin PushFixBranch passes to RunGitWithHost. A malformed http(s) URL (a
+// parse error, or an http(s) scheme with no host) is refused outright — an empty pin there would
+// defeat the point of pinning (see gitauth.go's deriveExpectedHost doc: an EMPTY pin disables the
+// askpass check entirely). A cloneURL with a non-http(s) scheme, or no scheme at all (a plain
+// local filesystem path, the shape test fixtures use for a local bare-repo remote), returns ""
+// deliberately: that transport never carries HTTPS Basic auth over the wire in the first place, so
+// there is no credential-bearing request for a host pin to protect.
+func expectedPushHost(cloneURL string) (string, error) {
+	u, err := url.Parse(cloneURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing clone URL for askpass host pin: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", nil
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("clone URL %q has an http(s) scheme but no host; refusing to push with a disabled askpass pin", cloneURL)
+	}
+	return u.Host, nil
 }
 
 // prBodyTemplate is the plan §4.4 step-5 harness-templated PR body: fixed prose plus the Sentinel
@@ -114,12 +164,34 @@ func fenceFixBrief(content string) string {
 	return fence + "\n" + content + "\n" + fence
 }
 
+// titleCharsetPattern is the conservative allowlist errorClassForTitle restricts a PR title's
+// error-class segment to (circuit-config-sec finding 7): letters, digits, and a small set of
+// punctuation common in real error-class names (dots/colons/slashes/underscores/hyphens, plus
+// space and basic sentence punctuation). Everything else -- control characters, and markdown-
+// significant runes that could break out of the title's plain-text context or render as
+// unintended formatting/links in a GitHub PR title/notification (“ ` “, `*`, `_` doubled up as
+// emphasis, `[`, `]`, `(`, `)` forming a markdown link, `<`, `>` opening HTML/autolinks, `#`
+// looking like a heading or issue reference, `\`, `|`, `"`, `@` risking an accidental mention) --
+// is dropped outright rather than passed through.
+var titleCharsetPattern = regexp.MustCompile(`[^A-Za-z0-9 ,.:/_+=~-]`)
+
 // errorClassForTitle sanitizes an error-class string for inclusion in a PR title: collapses all
 // whitespace runs (including embedded newlines a stacktrace-derived errorClass might carry) to a
-// single space and caps length, so a pathological or attacker-influenced errorClass cannot blow
-// up or break the single-line PR title.
+// single space, restricts the result to titleCharsetPattern's conservative charset, and caps
+// length, so a pathological or attacker-influenced errorClass cannot blow up, break the
+// single-line PR title, or inject markdown/HTML the title's rendering context would interpret.
+//
+// circuit-config-sec finding 7: errorClass is attacker-controlled (it flows from event data an
+// external error report can shape) and, before this fix, only had whitespace collapsed -- it was
+// interpolated into the PR title without ever going through guard.Check or WrapUntrusted, unlike
+// every other model-authored/untrusted field this package publishes. A charset restriction (rather
+// than routing it through guard.Check, which is sized for multi-KB prose fields, not an ~80-byte
+// title fragment) is the proportionate fix here: it cannot inject formatting or control sequences
+// into the title no matter what bytes errorClass carries.
 func errorClassForTitle(errorClass string) string {
 	s := strings.Join(strings.Fields(errorClass), " ")
+	s = titleCharsetPattern.ReplaceAllString(s, "")
+	s = strings.Join(strings.Fields(s), " ") // collapse any double spaces left by a dropped char
 	const maxLen = 80
 	if len(s) > maxLen {
 		s = s[:maxLen]
@@ -132,13 +204,18 @@ func errorClassForTitle(errorClass string) string {
 
 // BuildFixPRSpec renders the plan §4.4 step-5 harness-templated PRSpec: title
 // "fix: <error class> (sentinel <short id>)", body = the fixed template above with the issue URL
-// and the GATED Fix Brief interpolated. fixBrief is run through guard.Check(guard.FieldFixBrief,
+// and the GATED Fix Brief interpolated. fixBrief is run through guard.CheckWithConfig(guard.FieldFixBrief,
 // ...) BEFORE it is interpolated into anything — the only guard call between an Advisor's raw
 // fixBrief text and what ends up in a PR body (CLAUDE.md: "gated through guard.Check").
-// toolOutputs/secrets are threaded straight through to guard.Check as-is; see guard.Check's own
-// doc for their meaning.
-func BuildFixPRSpec(issueID, issueURL, errorClass, fixBrief, headBranch, baseBranch string, toolOutputs, secrets []string) (gitprovider.PRSpec, error) {
-	if err := guard.Check(guard.FieldFixBrief, fixBrief, toolOutputs, secrets); err != nil {
+// toolOutputs/secrets are threaded straight through to the gate as-is; see guard.CheckWithConfig's
+// own doc for their meaning. maxVerbatim is WORKER_GATE_MAX_VERBATIM (plan §5 finding 3); <=0 uses
+// guard.DefaultMaxVerbatim, same convention as jobs.ActContext.maxVerbatim.
+func BuildFixPRSpec(issueID, issueURL, errorClass, fixBrief, headBranch, baseBranch string, toolOutputs, secrets []string, maxVerbatim float64) (gitprovider.PRSpec, error) {
+	if maxVerbatim <= 0 {
+		maxVerbatim = guard.DefaultMaxVerbatim
+	}
+	cfg := guard.Config{SecretValues: secrets, MaxVerbatim: maxVerbatim}
+	if err := guard.CheckWithConfig(guard.FieldFixBrief, fixBrief, toolOutputs, cfg); err != nil {
 		return gitprovider.PRSpec{}, err
 	}
 	title := fmt.Sprintf("fix: %s (sentinel %s)", errorClassForTitle(errorClass), first8Hex(issueID))
@@ -173,14 +250,31 @@ func CreateFixPR(ctx context.Context, provider gitprovider.Provider, repo gitpro
 // status; claim + progress ARE the in-flight signal — and NO issues.claim.release: the claim
 // stays held while the PR is out for review (the sweep's PR-status poll, wired via
 // ResolveOpenFixPR below, is what eventually resolves/releases it).
+//
+// The issues.progress op is keyed "message_md" (finding 1): the server (agent-ops.ts:408) throws
+// a 400 requiring exactly that param name -- NOT "body_md", which is what issues.comment/
+// issues.claim.release use. Before this fix every PostFixPRBatch call 400'd on its progress op on
+// every single PR (mirror client.PostProgress's own "message_md" convention, sentinel/client.go).
+//
+// checkBatchResults (the SAME per-op classifier RealActor.Act/sweep.go's releaseWithHandback use)
+// walks results[] after the call: an envelope-level failure or ANY op that did not classify as
+// success/droppable-conflict is now surfaced as an error rather than silently discarded -- before
+// this fix, callers (fix.go's executeValidatePublish) never inspected the batch response body at
+// all, so a 400'd progress op was swallowed and the PR-opened notification silently never landed.
 func PostFixPRBatch(ctx context.Context, client Sender, jobID, issueID string, pr gitprovider.PR) (*sentinel.Result, error) {
 	b := newOpBuilder(jobID)
 	body := fmt.Sprintf("Opened a fix pull request: %s", pr.URL)
-	b.add("issues.progress", issueID, map[string]interface{}{"body_md": body})
+	b.add("issues.progress", issueID, map[string]interface{}{"message_md": body})
 	b.add("issues.comment", issueID, map[string]interface{}{"body_md": body})
 	res, err := client.PostBatch(ctx, sentinel.BatchRequest{Operations: b.ops, StopOnError: false})
 	if err != nil {
 		return nil, fmt.Errorf("jobs: fix pr: posting PR-opened batch for job %s: %w", jobID, err)
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return res, fmt.Errorf("jobs: fix pr: posting PR-opened batch for job %s: status %d: %s", jobID, res.Status, sentinel.ErrorMessage(res.Body))
+	}
+	if err := checkBatchResults(Compiled{Ops: b.ops}, res); err != nil {
+		return res, fmt.Errorf("jobs: fix pr: posting PR-opened batch for job %s: %w", jobID, err)
 	}
 	return res, nil
 }
@@ -220,6 +314,15 @@ const FixKind = openFixKind
 type FixRunningPayload struct {
 	Input      FixJobInput `json:"input"`
 	BaseCommit string      `json:"baseCommit"`
+	// Resumed distinguishes a crash-RESUME's own in-flight marker from a FRESH attempt's (finding
+	// 5): FixCaps.SeedToday must count only fresh (Resumed==false) records toward
+	// WORKER_MAX_FIX_JOBS_PER_DAY/WORKER_MAX_FIX_ATTEMPTS -- a resumed attempt continuing the SAME
+	// job after a worker restart is not "one more job" (CLAUDE.md: "a crash-resume of the same job
+	// does NOT count again"). Before this field existed, journalFixRunning was called again for
+	// every resume (via executeValidatePublish's shared tail), and SeedToday counted every such
+	// record unconditionally -- a job that crashed and resumed twice in one day silently consumed
+	// three attempt-budget slots instead of one.
+	Resumed bool `json:"resumed"`
 }
 
 // journalFixRunning appends the plan §4.4 step-3b in-flight FIX marker: Kind=FixKind,
@@ -230,8 +333,8 @@ type FixRunningPayload struct {
 // distinguished an in-flight FIX job from any other non-terminal journal state, so
 // state.Journal.RecoveryScan's callers either silently ignored it or would have mis-driven it
 // through loop.Runner.Resume, which only understands TRIAGE/FOLLOW-UP kinds).
-func journalFixRunning(j *state.Journal, in FixJobInput, baseCommit string) error {
-	payload, err := json.Marshal(FixRunningPayload{Input: in, BaseCommit: baseCommit})
+func journalFixRunning(j *state.Journal, in FixJobInput, baseCommit string, resumed bool) error {
+	payload, err := json.Marshal(FixRunningPayload{Input: in, BaseCommit: baseCommit, Resumed: resumed})
 	if err != nil {
 		return fmt.Errorf("jobs: fix pr: marshaling FixRunningPayload for job %s: %w", in.JobID, err)
 	}
@@ -241,6 +344,36 @@ func journalFixRunning(j *state.Journal, in FixJobInput, baseCommit string) erro
 		Kind:       FixKind,
 		TriggerSeq: in.TriggerSeq,
 		State:      state.StateFixRunning,
+		Payload:    payload,
+	})
+}
+
+// journalFixTerminal appends a terminal record (state.StateFailed or state.StateSkipped -- never
+// state.StateDone, which a FIX job only reaches via the pr-open/merge-handoff path journaled by
+// JournalFixPROpen/journalFixPRClosed) for in.JobID -- the fix-lifecycle remediation round 2
+// finding-1 BLOCKER fix. Every RunFix/ResumeFix exit path that does NOT open a PR (executor error,
+// validation fail, empty diff, commit fail, PR-spec-build fail, cap hits, workspace prep fail,
+// no-repo-connection propose-only) used to return via releaseWithComment WITHOUT ever appending a
+// terminal record for this jobID: journalFixRunning (above) had already written a non-terminal
+// state.StateFixRunning record for it (or, for the pre-workspace gates below, no record at all),
+// and nothing closed it out. state.Journal.RecoveryScan surfaces the LATEST record per jobID that
+// is non-terminal -- so a FIX job that failed validation, or exhausted its attempt cap, kept
+// looking exactly like a crashed in-flight attempt on every subsequent boot, and
+// resumeInFlightJob (main.go) drove it straight back into FixRunner.ResumeFix forever, re-running
+// (and re-failing) the identical dead job on every restart. Called from releaseWithComment, the
+// shared tail of every one of those exit paths, so this is wired from every real caller, not just
+// a helper nothing invokes.
+func journalFixTerminal(j *state.Journal, in FixJobInput, st state.JobState) error {
+	payload, err := json.Marshal(FixRunningPayload{Input: in})
+	if err != nil {
+		return fmt.Errorf("jobs: fix pr: marshaling terminal FIX payload for job %s: %w", in.JobID, err)
+	}
+	return j.Append(state.Record{
+		JobID:      in.JobID,
+		IssueID:    in.IssueID,
+		Kind:       FixKind,
+		TriggerSeq: in.TriggerSeq,
+		State:      st,
 		Payload:    payload,
 	})
 }

@@ -241,6 +241,54 @@ func TestJournal_HasOpenQuestion(t *testing.T) {
 	}
 }
 
+// TestJournal_HasOpenQuestion_NotClosedByDifferentJobSkippedOrFailed proves the durability-startup
+// remediation fix (finding 2): a terminal StateSkipped or StateFailed record for a DIFFERENT jobID
+// on the SAME issue must NOT close an open question. This is exactly what a crash-recovery Resume
+// of the original questioned job produces when the issue is no longer resolvable at resume time
+// (Resume re-derives a fresh jobID via Run, and a resolve-step failure journals a terminal
+// Skipped/Failed record under that new id) -- it is a resume artifact, not a real answer, and
+// must never silently defeat the reaped-claim question-recovery arm. Only a StateDone record for
+// a different jobID (a genuine FOLLOW-UP completing) may close the question.
+func TestJournal_HasOpenQuestion_NotClosedByDifferentJobSkippedOrFailed(t *testing.T) {
+	j := OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	must(t, j.Append(Record{JobID: "q1", IssueID: "i1", Kind: "followup", State: StateQuestioned}))
+	// A resume of a DIFFERENT re-derived jobID for the same issue goes terminal (skipped): must
+	// NOT close the question.
+	must(t, j.Append(Record{JobID: "q1-resume-hash", IssueID: "i1", Kind: "followup", State: StateSkipped}))
+
+	got, err := j.HasOpenQuestion("i1")
+	if err != nil {
+		t.Fatalf("HasOpenQuestion(i1): %v", err)
+	}
+	if !got {
+		t.Fatalf("HasOpenQuestion(i1) = false, want true (a different-jobID Skipped record is a resume artifact, not a real answer)")
+	}
+
+	// Failed behaves the same way.
+	j2 := OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	must(t, j2.Append(Record{JobID: "q2", IssueID: "i2", Kind: "followup", State: StateQuestioned}))
+	must(t, j2.Append(Record{JobID: "q2-resume-hash", IssueID: "i2", Kind: "followup", State: StateFailed}))
+	got, err = j2.HasOpenQuestion("i2")
+	if err != nil {
+		t.Fatalf("HasOpenQuestion(i2): %v", err)
+	}
+	if !got {
+		t.Fatalf("HasOpenQuestion(i2) = false, want true (a different-jobID Failed record must not close the question either)")
+	}
+
+	// A genuine FOLLOW-UP completion (StateDone) for a different jobID DOES close it.
+	j3 := OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	must(t, j3.Append(Record{JobID: "q3", IssueID: "i3", Kind: "followup", State: StateQuestioned}))
+	must(t, j3.Append(Record{JobID: "q3-followup", IssueID: "i3", Kind: "followup", State: StateDone}))
+	got, err = j3.HasOpenQuestion("i3")
+	if err != nil {
+		t.Fatalf("HasOpenQuestion(i3): %v", err)
+	}
+	if got {
+		t.Fatalf("HasOpenQuestion(i3) = true, want false (a different-jobID StateDone record is a genuine resolution)")
+	}
+}
+
 // TestJournal_DecisionForJob proves the resume-from-acting seam (plan §2.2, loop/runner.go's
 // resumeFromAdvised): a job's most recent StateAdvised payload is retrievable independent of any
 // later record (e.g. "acting"), which carries its own, different payload (batchBodyHash) rather

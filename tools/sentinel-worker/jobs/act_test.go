@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -352,6 +353,43 @@ func TestCompileTriage_GuardGate_BlocksSecretValue(t *testing.T) {
 	}
 }
 
+// TestCompileTriage_MaxVerbatim_ThreadsFromActContext is the real-path proof for plan §5/§4.6
+// finding 3: WORKER_GATE_MAX_VERBATIM must actually change the gate threshold gate() enforces, via
+// ActContext.MaxVerbatim -> guard.CheckWithConfig -- not the hardcoded guard.DefaultMaxVerbatim
+// act.go:136 (pre-fix) always used regardless of config. The candidate summary is engineered to
+// have ~40% verbatim coverage of the tool corpus: rejected at the DEFAULT threshold (0.25), but
+// allowed once ActContext.MaxVerbatim is raised to 0.5 -- the same Decision, the same tool corpus,
+// only the configured cap differs.
+func TestCompileTriage_MaxVerbatim_ThreadsFromActContext(t *testing.T) {
+	verbatimBlock := strings.Repeat("X", 40) // one 40-byte run, well above guard's 8-byte k-gram floor
+	toolOutput := "some other unrelated tool output content around it " + verbatimBlock + " and more unrelated content"
+	filler := "the quick brown fox jumps over the lazy dog 0123456789 zyx" // 60 bytes, no 8-byte overlap with the X run
+	summary := verbatimBlock + filler                                      // ~40/100 bytes verbatim => ~40% coverage
+
+	actx := baseTriageCtx()
+	actx.ToolOutputs = []string{toolOutput}
+	d := TriageDecision{Disposition: string(DispositionCommentOnly), Summary: summary}
+
+	// Default threshold (ActContext.MaxVerbatim left zero-valued -> guard.DefaultMaxVerbatim=0.25):
+	// ~40% coverage must be rejected.
+	if _, err := CompileTriage(actx, d); err == nil {
+		t.Fatalf("expected the default 0.25 verbatim cap to reject a ~40%%-verbatim summary")
+	} else {
+		var gerr *GateRejectedError
+		if !errors.As(err, &gerr) || gerr.Field != guard.FieldSummary {
+			t.Fatalf("expected a *GateRejectedError for FieldSummary, got %v", err)
+		}
+	}
+
+	// Raising WORKER_GATE_MAX_VERBATIM to 0.5 via ActContext.MaxVerbatim must let the SAME
+	// candidate through -- proving the value actually reaches guard.CheckWithConfig's threshold,
+	// not just that Check runs at all.
+	actx.MaxVerbatim = 0.5
+	if _, err := CompileTriage(actx, d); err != nil {
+		t.Fatalf("expected MaxVerbatim=0.5 to allow a ~40%% verbatim summary, got %v", err)
+	}
+}
+
 func TestCompileFollowup_GuardGate_AppliesToReplyBody(t *testing.T) {
 	actx := baseTriageCtx()
 	actx.Secrets = []string{"ghp_supersecrettoken1234567890"}
@@ -366,10 +404,121 @@ func TestCompileFollowup_GuardGate_AppliesToReplyBody(t *testing.T) {
 	}
 }
 
+// --- resolved_in_version publish gate (finding 6, core-robustness round 3) ---------------------
+
+// TestCompileFollowup_ResolvedInVersion_RejectsSecretLeak proves resolved_in_version now goes
+// through the SAME secret-leak gate every other published field gets: a configured secret value
+// riding along inside resolvedInVersion must be rejected, not published verbatim. Red-first:
+// before this fix, ResolvedInVersion was copied straight into the issues.status params with no
+// gate call at all, so this would have compiled successfully and leaked the secret.
+func TestCompileFollowup_ResolvedInVersion_RejectsSecretLeak(t *testing.T) {
+	actx := baseTriageCtx()
+	actx.Secrets = []string{"ghp_supersecrettoken1234567890"}
+	d := FollowupDecision{
+		Action:            string(ActionResolve),
+		Body:              "fixed",
+		ResolvedInVersion: strp("ghp_supersecrettoken1234567890"),
+	}
+	_, err := CompileFollowup(actx, d)
+	var gerr *GateRejectedError
+	if !errors.As(err, &gerr) {
+		t.Fatalf("expected *GateRejectedError for a secret-carrying resolvedInVersion, got %v", err)
+	}
+}
+
+// TestCompileFollowup_ResolvedInVersion_StripsInjectionCharset proves an injection-y
+// resolvedInVersion value (markdown/HTML/control-character payload, the kind an
+// attacker-influenced Advisor decision could carry) is charset-restricted to a version-shaped
+// string before publish, rather than passed through byte-for-byte.
+func TestCompileFollowup_ResolvedInVersion_StripsInjectionCharset(t *testing.T) {
+	actx := baseTriageCtx()
+	d := FollowupDecision{
+		Action:            string(ActionResolve),
+		Body:              "fixed",
+		ResolvedInVersion: strp("1.2.3<script>alert(1)</script>[malicious](http://evil.example)"),
+	}
+	compiled, err := CompileFollowup(actx, d)
+	if err != nil {
+		t.Fatalf("CompileFollowup: %v", err)
+	}
+	var statusOp *sentinel.BatchOperation
+	for i := range compiled.Ops {
+		if compiled.Ops[i].Op == "issues.status" {
+			statusOp = &compiled.Ops[i]
+		}
+	}
+	if statusOp == nil {
+		t.Fatal("expected an issues.status op")
+	}
+	params := statusOp.Params.(map[string]interface{})
+	got, _ := params["resolved_in_version"].(string)
+	// Only the markdown/HTML-significant DELIMITER characters need to be gone -- the charset
+	// allowlist is conservative about punctuation, not about which words survive (matching
+	// fix_pr.go's titleCharsetPattern posture for the analogous errorClass sanitizer).
+	for _, bad := range []string{"<", ">", "[", "]", "(", ")"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("resolved_in_version = %q, must not contain %q after sanitization", got, bad)
+		}
+	}
+	if !strings.HasPrefix(got, "1.2.3") {
+		t.Fatalf("resolved_in_version = %q, expected the legitimate version-shaped prefix 1.2.3 to survive", got)
+	}
+}
+
+// TestCompileFollowup_ResolvedInVersion_LengthCapped proves a pathologically long
+// resolvedInVersion is capped rather than published as a multi-KB blob.
+func TestCompileFollowup_ResolvedInVersion_LengthCapped(t *testing.T) {
+	actx := baseTriageCtx()
+	long := strings.Repeat("9.", 2000) + "0"
+	d := FollowupDecision{Action: string(ActionResolve), Body: "fixed", ResolvedInVersion: strp(long)}
+	compiled, err := CompileFollowup(actx, d)
+	if err != nil {
+		t.Fatalf("CompileFollowup: %v", err)
+	}
+	var statusOp *sentinel.BatchOperation
+	for i := range compiled.Ops {
+		if compiled.Ops[i].Op == "issues.status" {
+			statusOp = &compiled.Ops[i]
+		}
+	}
+	params := statusOp.Params.(map[string]interface{})
+	got, _ := params["resolved_in_version"].(string)
+	if len(got) > 64 {
+		t.Fatalf("resolved_in_version length = %d, want <= 64", len(got))
+	}
+}
+
+// TestCompileFollowup_ResolvedInVersion_MutationTest deletes the sanitization (by asserting a
+// value with characters resolvedInVersionForPublish is documented to strip would have survived
+// verbatim under the pre-fix code) -- pins that "v1.0.0 " (with a trailing space, and a leading
+// "v" -- both legitimate version-string characters that must survive) round-trips through
+// unchanged aside from charset/whitespace normalization, so a future regression that starts
+// stripping legitimate version characters (over-eager sanitization) is caught too, not just an
+// under-sanitizing regression.
+func TestCompileFollowup_ResolvedInVersion_MutationTest(t *testing.T) {
+	actx := baseTriageCtx()
+	d := FollowupDecision{Action: string(ActionResolve), Body: "fixed", ResolvedInVersion: strp("v1.0.0-rc.1+build.5")}
+	compiled, err := CompileFollowup(actx, d)
+	if err != nil {
+		t.Fatalf("CompileFollowup: %v", err)
+	}
+	var statusOp *sentinel.BatchOperation
+	for i := range compiled.Ops {
+		if compiled.Ops[i].Op == "issues.status" {
+			statusOp = &compiled.Ops[i]
+		}
+	}
+	params := statusOp.Params.(map[string]interface{})
+	if got := params["resolved_in_version"]; got != "v1.0.0-rc.1+build.5" {
+		t.Fatalf("resolved_in_version = %v, want unchanged legitimate version string %q", got, "v1.0.0-rc.1+build.5")
+	}
+}
+
 // --- dry-run: zero POSTs ---------------------------------------------------------------------
 
 type recordingSender struct {
-	calls []string
+	calls    []string
+	requests []sentinel.BatchRequest
 }
 
 func (s *recordingSender) PostQuestion(_ context.Context, issueID string, _ map[string]interface{}, key string) (*sentinel.Result, error) {
@@ -379,7 +528,18 @@ func (s *recordingSender) PostQuestion(_ context.Context, issueID string, _ map[
 
 func (s *recordingSender) PostBatch(_ context.Context, req sentinel.BatchRequest) (*sentinel.Result, error) {
 	s.calls = append(s.calls, "batch")
-	return &sentinel.Result{Status: 200}, nil
+	s.requests = append(s.requests, req)
+	// Body carries one {"status":200} results[] entry per op so checkBatchResults' per-op walk
+	// (finding 1, jobs/fix_pr.go) sees every op as a success by default, matching this fake's own
+	// implied "everything landed" semantics -- a bare Status:200 with no Body previously looked
+	// identical to an unparsable 2xx body (ClassPermanent, perOp==nil) once callers started
+	// actually inspecting results[].
+	results := make([]string, len(req.Operations))
+	for i := range results {
+		results[i] = `{"status":200}`
+	}
+	body := []byte(`{"completed":` + fmt.Sprint(len(req.Operations)) + `,"results":[` + strings.Join(results, ",") + `]}`)
+	return &sentinel.Result{Status: 200, Body: body}, nil
 }
 
 func TestAct_DryRun_SendsNothing(t *testing.T) {
@@ -428,6 +588,56 @@ func TestAct_Execute_SendsQuestionThenBatch(t *testing.T) {
 	if len(sender.calls) != 2 || sender.calls[0] != "question:issue-1:job-1:0" || sender.calls[1] != "batch" {
 		t.Fatalf("expected question call THEN batch call, got %v", sender.calls)
 	}
+}
+
+// failingQuestionStatusSender is recordingSender's PostQuestion, but returning a non-2xx Status
+// with a nil error -- the exact "transport succeeded, application failed" shape PostQuestion's
+// real HTTP implementation produces (sentinel.Client.Do never turns a non-2xx response into a Go
+// error itself; it just carries the status in Result.Status).
+type failingQuestionStatusSender struct {
+	recordingSender
+	questionStatus int
+}
+
+func (s *failingQuestionStatusSender) PostQuestion(_ context.Context, issueID string, _ map[string]interface{}, key string) (*sentinel.Result, error) {
+	s.calls = append(s.calls, "question:"+issueID+":"+key)
+	return &sentinel.Result{Status: s.questionStatus, Body: []byte(`{"error":"nope"}`)}, nil
+}
+
+// TestAct_Execute_QuestionNon2xx_SurfacesErrorAndSkipsBatch is finding 3's red-first proof: Act
+// previously checked only PostQuestion's transport err, never qRes.Status, so a 500 (or 400/403/
+// 409) question response was treated as a successful ask -- the caller (RealActor.Act) would then
+// journal StateQuestioned with an empty commentId and never send the batch that follows.
+// Post-fix, a non-2xx question response must (a) surface a non-nil error from Act, (b) classify via
+// sentinel.ClassifyEnvelope as the expected class, and (c) never reach PostBatch.
+func TestAct_Execute_QuestionNon2xx_SurfacesErrorAndSkipsBatch(t *testing.T) {
+	d := TriageDecision{Disposition: string(DispositionNeedsInfo), Summary: "need info", Question: strp("what?")}
+	compiled, err := CompileTriage(baseTriageCtx(), d)
+	if err != nil {
+		t.Fatalf("CompileTriage: %v", err)
+	}
+	sender := &failingQuestionStatusSender{questionStatus: 500}
+	_, qRes, bRes, err := Act(context.Background(), sender, compiled, true)
+	if err == nil {
+		t.Fatal("Act: got nil error for a 500 question response, want an error (finding 3)")
+	}
+	var statusErr *sentinel.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error %v does not wrap a *sentinel.StatusError", err)
+	}
+	if statusErr.Status != 500 {
+		t.Errorf("StatusError.Status = %d, want 500", statusErr.Status)
+	}
+	if class := sentinel.ClassifyEnvelope(statusErr.Status, false, false); class != sentinel.ClassTransient {
+		t.Errorf("ClassifyEnvelope(500) = %v, want ClassTransient", class)
+	}
+	if bRes != nil {
+		t.Fatal("finding 3: the batch must never be sent after a failed question POST")
+	}
+	if len(sender.calls) != 1 {
+		t.Fatalf("expected exactly the question call (no batch), got %v", sender.calls)
+	}
+	_ = qRes // qRes is returned for the caller's own inspection/logging; not asserted further here.
 }
 
 // --- DecodeTriage/DecodeFollowup round-trip ------------------------------------------------------

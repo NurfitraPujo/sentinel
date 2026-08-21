@@ -75,8 +75,14 @@ func TestBuildToolchain_GetOccurrences_HitsPaginatedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_occurrences returned error: %v", err)
 	}
-	if out != `{"occurrences":[]}` {
-		t.Errorf("unexpected tool output: %q", out)
+	// The raw body must be present but fenced (plan §4.6 finding 2: every tool result reaching the
+	// model mid-loop is wrapped via guard.WrapUntrusted, not handed back raw) — assert both the
+	// fence markers and the underlying content, not a bare equality check against the raw JSON.
+	if !strings.Contains(out, `{"occurrences":[]}`) {
+		t.Errorf("tool output missing underlying body: %q", out)
+	}
+	if !strings.Contains(out, "<<<untrusted:get_occurrences:") || !strings.Contains(out, "<<<end:") {
+		t.Errorf("tool output not fenced via guard.WrapUntrusted: %q", out)
 	}
 	wantPath := "/api/agent/issues/issue-1/occurrences"
 	if gotPath != wantPath {

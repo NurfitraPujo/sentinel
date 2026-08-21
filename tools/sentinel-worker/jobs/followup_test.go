@@ -144,6 +144,60 @@ func TestFollowupAdvisor_Decide_IssueFetchFailurePropagates(t *testing.T) {
 	}
 }
 
+// TestFollowupAdvisor_Decide_JournalsPromptHash is the FOLLOW-UP counterpart to
+// jobs/triage_test.go's TestTriageAdvisor_Decide_JournalsPromptHash: followup.go:242-249 sets
+// PromptSHA256/PromptVersion on the returned Decision, but nothing previously asserted a non-empty
+// hash reaches the advised journal record for a FOLLOW-UP job specifically (only the TRIAGE path
+// had coverage).
+func TestFollowupAdvisor_Decide_JournalsPromptHash(t *testing.T) {
+	srv := newFollowupTestServer(t,
+		`{"issue":{"message":"boom","errorClass":"NPE","status":"unresolved","issueType":"user_report","projectId":"proj-1"}}`,
+		`{"comments":[{"authorType":"user","bodyMd":"still broken"}]}`,
+		200, 200,
+	)
+	defer srv.Close()
+
+	client := sentinel.NewClient(srv.URL, "test-key")
+	decisionJSON := `{"action":"reply","body":"Thanks, looking into it."}`
+	chat := &fakeChat{responses: []llm.Response{
+		{Text: decisionJSON, StopReason: llm.StopEndTurn},
+	}}
+
+	adv := &FollowupAdvisor{
+		Client:   client,
+		Resolver: fakeResolver{ctx: FollowupIssueContext{ProjectID: "proj-1", IssueType: "user_report"}},
+		Primary:  chat,
+	}
+
+	dec, err := adv.Decide(context.Background(), Input{JobID: "job-1", IssueID: "issue-1", Kind: "followup", TriggerSeq: 1})
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if dec.PromptSHA256 == "" {
+		t.Fatal("Decision.PromptSHA256 is empty -- prompt identity was never computed")
+	}
+	if len(dec.PromptSHA256) != 64 {
+		t.Fatalf("Decision.PromptSHA256 = %q, want a 64-char hex sha256", dec.PromptSHA256)
+	}
+	if dec.PromptVersion != followupPromptVersion {
+		t.Fatalf("Decision.PromptVersion = %q, want %q", dec.PromptVersion, followupPromptVersion)
+	}
+
+	// Re-marshal/unmarshal through the SAME path loop/runner.go uses to journal "advised" (a plain
+	// json.Marshal(decision)) and confirm the hash survives.
+	payload, err := json.Marshal(dec)
+	if err != nil {
+		t.Fatalf("marshaling decision: %v", err)
+	}
+	var round Decision
+	if err := json.Unmarshal(payload, &round); err != nil {
+		t.Fatalf("unmarshaling decision: %v", err)
+	}
+	if round.PromptSHA256 != dec.PromptSHA256 {
+		t.Fatalf("prompt hash did not survive journal round-trip: got %q, want %q", round.PromptSHA256, dec.PromptSHA256)
+	}
+}
+
 // errorsAsPermanent is a tiny local errors.As wrapper so the test file doesn't need to import
 // "errors" just for this one assertion given the package already imports several others.
 func errorsAsPermanent(err error, target **llm.PermanentError) bool {

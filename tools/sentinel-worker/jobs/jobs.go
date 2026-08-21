@@ -7,8 +7,26 @@ package jobs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
 )
+
+// PromptHash computes a hex sha256 over the fully rendered system prompt plus every user message
+// (in order), for Decision.PromptSHA256 (plan §7 finding 4). A NUL byte separates system from each
+// user message so no crafted content can make two different (system, messages) pairs hash
+// identically by shifting a boundary.
+func PromptHash(system string, userMessages ...string) string {
+	h := sha256.New()
+	h.Write([]byte(system))
+	for _, m := range userMessages {
+		h.Write([]byte{0})
+		h.Write([]byte(m))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // Decision is the structured output an Advisor produces for one job — the harness executes it,
 // the Advisor never mutates anything itself (per CONTEXT.md's Advisor definition). N8a keeps this
@@ -29,6 +47,29 @@ type Decision struct {
 	// corpus is ephemeral to Decide and the gate downstream runs against an empty slice, making it
 	// a no-op.
 	ToolOutputs []string `json:"toolOutputs,omitempty"`
+
+	// Usage is the adapter-reported token accounting for the RunLoop that produced this Decision
+	// (plan §2.6 finding 1). Journaled as part of the "advised" record so main.go's boot-time
+	// llm.DailyBudget.SeedSpent reconstruction (SumAdvisedTokenUsage) can recover today's spend
+	// from the journal alone, exactly like FixCaps.SeedToday reconstructs its own counters —
+	// without this field the running total is invisible to a restart and WORKER_DAILY_TOKEN_BUDGET
+	// silently resets on every crash/redeploy.
+	Usage llm.Usage `json:"usage,omitempty"`
+
+	// Provider is the llm.Result.Provider that actually produced this Decision ("primary" or
+	// "fallback" per llm.RunLoop's own labeling) — plan §7's "llm_tokens by provider" needs to
+	// know which provider's spend to attribute Usage to. Not journaled as part of any
+	// budget-affecting decision (Usage already carries the number that matters for the budget
+	// itself); this is purely an observability label.
+	Provider string `json:"provider,omitempty"`
+
+	// PromptSHA256/PromptVersion identify exactly which rendered prompt produced this Decision
+	// (plan §7 finding 4): a hex sha256 of the fully rendered system+user prompt, and the base
+	// prompt's version tag (triagePromptVersion/followupPromptVersion). Journaled alongside the
+	// decision so an operator (or an incident review) can tell, after the fact, precisely what
+	// text the model saw for this job without re-deriving it from live code.
+	PromptSHA256  string `json:"promptSha256,omitempty"`
+	PromptVersion string `json:"promptVersion,omitempty"`
 }
 
 // Input is what an Advisor needs to produce a Decision: enough job identity for prompt construction

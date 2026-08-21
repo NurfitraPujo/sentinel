@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -19,8 +20,11 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
+	guardpkg "github.com/NurfitraPujo/sentinel/tools/sentinel-worker/guard"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/llm"
+	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/loop"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/settings"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/state"
@@ -260,6 +264,67 @@ func TestLoadConfig_CollectsMultipleErrors(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RejectsUnknownEventType is finding 3's red-first proof: a typo'd
+// WORKER_EVENT_TYPES entry must be caught at config load, not discovered only once the server
+// starts 400-ing every poll forever (ClassPermanent -> backoff -> circuit wedge).
+func TestLoadConfig_RejectsUnknownEventType(t *testing.T) {
+	_, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_EVENT_TYPES": "created,ocurrence_burst", // typo: missing 'c'
+	}))
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "WORKER_EVENT_TYPES") && strings.Contains(e, "ocurrence_burst") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a WORKER_EVENT_TYPES validation error naming the unknown type, got: %v", errs)
+	}
+}
+
+// TestLoadConfig_AcceptsAllKnownEventTypes proves the full known vocabulary (loop/dispatch.go's
+// Classify switch) round-trips with zero WORKER_EVENT_TYPES errors -- a mutation that narrows
+// knownEventTypes would turn this red.
+func TestLoadConfig_AcceptsAllKnownEventTypes(t *testing.T) {
+	cfg, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_EVENT_TYPES": "created,report_created,occurrence_burst,regressed,question_answered,commented,claim_released,status_changed,issue_deleted",
+	}))
+	for _, e := range errs {
+		if strings.Contains(e, "WORKER_EVENT_TYPES") {
+			t.Fatalf("unexpected WORKER_EVENT_TYPES error for a fully valid list: %v", e)
+		}
+	}
+	if len(cfg.WorkerEventTypes) != 9 {
+		t.Fatalf("WorkerEventTypes = %v, want 9 entries parsed", cfg.WorkerEventTypes)
+	}
+}
+
+// TestWarnIfEventTypeFilterOmitsControlPlane is finding 3's second half: a narrow-but-valid
+// allowlist that omits a control-plane event type (status_changed/claim_released/issue_deleted)
+// must warn, since the dispatcher silently loses that behavior otherwise. An empty filter (no
+// restriction configured) must never warn.
+func TestWarnIfEventTypeFilterOmitsControlPlane(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	warnIfEventTypeFilterOmitsControlPlane([]string{"created", "commented"}, logger)
+	got := buf.String()
+	if !strings.Contains(got, "status_changed") || !strings.Contains(got, "claim_released") || !strings.Contains(got, "issue_deleted") {
+		t.Fatalf("expected a warning naming all three omitted control-plane types, got log:\n%s", got)
+	}
+
+	buf.Reset()
+	warnIfEventTypeFilterOmitsControlPlane(nil, logger)
+	if buf.Len() != 0 {
+		t.Fatalf("expected no warning for an empty (unrestricted) filter, got:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	warnIfEventTypeFilterOmitsControlPlane([]string{"created", "status_changed", "claim_released", "issue_deleted"}, logger)
+	if buf.Len() != 0 {
+		t.Fatalf("expected no warning when all control-plane types are present, got:\n%s", buf.String())
+	}
+}
+
 func TestLoadConfig_ClaimHeartbeatMustBeBelowStaleHours(t *testing.T) {
 	_, errs := LoadConfig(fakeEnv(map[string]string{
 		"WORKER_CLAIM_HEARTBEAT": "90000", // 25h > server's 24h CLAIM_STALE_HOURS
@@ -477,7 +542,7 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 			cfg := Config{WorkerExecute: tc.workerExecute, LLMProvider: "openai", LLMModel: "gpt-4o-mini"}
 			client := sentinel.NewClient("http://example.invalid", "key")
 			journal := state.OpenJournal(t.TempDir() + "/jobs.journal")
-			runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 			if err != nil {
 				t.Fatalf("buildRunner: %v", err)
 			}
@@ -485,6 +550,235 @@ func TestBuildRunner_DryRunGate(t *testing.T) {
 				t.Fatalf("WorkerExecute=%v: runner.DryRun = %v, want %v", tc.workerExecute, runner.DryRun, tc.wantDryRun)
 			}
 		})
+	}
+}
+
+// TestBuildRunner_WiresDailyBudgetAndTriageLimiterFromConfig is the wired-from-main proof for plan
+// §2.6 finding 1: WORKER_DAILY_TOKEN_BUDGET and WORKER_MAX_TRIAGE_PER_HOUR previously had ZERO
+// production callers (llm.NewDailyBudget/llm.NewHourlyCounter were only ever exercised by their own
+// package's unit tests) — this drives the REAL buildRunner main.go's runPipeline calls, with a
+// journal carrying a real "advised" record (not a hand-seeded budget struct), and asserts the
+// returned *loop.Runner's Budget/TriageLimiter are non-nil, correctly seeded from that journal, and
+// obey the configured limits.
+func TestBuildRunner_WiresDailyBudgetAndTriageLimiterFromConfig(t *testing.T) {
+	cfg := Config{
+		WorkerExecute:          false,
+		LLMProvider:            "openai",
+		LLMModel:               "gpt-4o-mini",
+		WorkerDailyTokenBudget: 1000,
+		WorkerMaxTriagePerHour: 2,
+	}
+	client := sentinel.NewClient("http://example.invalid", "key")
+	journalPath := filepath.Join(t.TempDir(), "jobs.journal")
+	journal := state.OpenJournal(journalPath)
+
+	// Seed the journal with a REAL advised record (jobs.Decision, journaled exactly as
+	// loop.Runner.Run journals it) reporting 400 tokens spent today -- not a hand-constructed
+	// llm.DailyBudget the real boot path never produces.
+	dec := jobs.Decision{Kind: "triage", Raw: []byte(`{"stub":true}`), Usage: llm.Usage{InputTokens: 300, OutputTokens: 100}}
+	payload, err := json.Marshal(dec)
+	if err != nil {
+		t.Fatalf("marshal decision: %v", err)
+	}
+	must(t, journal.Append(state.Record{
+		JobID: "seed-job-1", IssueID: "issue-1", Kind: "triage", TriggerSeq: 1,
+		State: state.StateAdvised, At: time.Now(), Payload: payload,
+	}))
+	// A terminal record for the SAME jobId so it isn't mistaken for an in-flight job by anything
+	// else touching this journal during the test.
+	must(t, journal.Append(state.Record{
+		JobID: "seed-job-1", IssueID: "issue-1", Kind: "triage", TriggerSeq: 1,
+		State: state.StateDone, At: time.Now(),
+	}))
+
+	runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	if err != nil {
+		t.Fatalf("buildRunner: %v", err)
+	}
+
+	if runner.Budget == nil {
+		t.Fatalf("runner.Budget is nil -- WORKER_DAILY_TOKEN_BUDGET is dead config again")
+	}
+	budget, ok := runner.Budget.(*llm.DailyBudget)
+	if !ok {
+		t.Fatalf("runner.Budget is a %T, want *llm.DailyBudget", runner.Budget)
+	}
+	if got := budget.Spent(); got != 400 {
+		t.Fatalf("budget.Spent() = %d, want 400 (seeded from the journal's advised record)", got)
+	}
+	if budget.Exhausted() {
+		t.Fatalf("budget with 400/1000 spent must not report Exhausted")
+	}
+
+	if runner.TriageLimiter == nil {
+		t.Fatalf("runner.TriageLimiter is nil -- WORKER_MAX_TRIAGE_PER_HOUR is dead config again")
+	}
+	limiter, ok := runner.TriageLimiter.(*llm.HourlyCounter)
+	if !ok {
+		t.Fatalf("runner.TriageLimiter is a %T, want *llm.HourlyCounter", runner.TriageLimiter)
+	}
+	// WORKER_MAX_TRIAGE_PER_HOUR=2: two increments allowed, the third denied.
+	if !limiter.TryIncrement() || !limiter.TryIncrement() {
+		t.Fatalf("expected the first two TryIncrement calls to succeed against a cap of 2")
+	}
+	if limiter.TryIncrement() {
+		t.Fatalf("expected the third TryIncrement call to be denied against a cap of 2")
+	}
+}
+
+// TestBuildRunner_SeedsTriageLimiterFromJournaledClaimedRecords is circuit-config-sec finding 3's
+// wired-from-main proof: buildRunner must seed runner.TriageLimiter from real state.StateClaimed
+// TRIAGE journal records for the CURRENT UTC hour (jobs.SumTriageStarts), not start every process
+// at zero, so a crash-loop within the same hour cannot let a caller triage past
+// WORKER_MAX_TRIAGE_PER_HOUR by just restarting. Red-first: before this fix buildRunner never
+// called SeedCount at all, so this test would see all 2 slots still available despite 2 already
+// having been consumed and journaled.
+func TestBuildRunner_SeedsTriageLimiterFromJournaledClaimedRecords(t *testing.T) {
+	cfg := Config{
+		WorkerExecute:          false,
+		LLMProvider:            "openai",
+		LLMModel:               "gpt-4o-mini",
+		WorkerMaxTriagePerHour: 2,
+	}
+	client := sentinel.NewClient("http://example.invalid", "key")
+	journalPath := filepath.Join(t.TempDir(), "jobs.journal")
+	journal := state.OpenJournal(journalPath)
+
+	now := time.Now().UTC()
+	// Two real TRIAGE jobs that reached StateClaimed (and beyond) THIS hour -- exactly what a
+	// crashed process would have left behind after consuming both of its 2 hourly slots.
+	must(t, journal.Append(state.Record{JobID: "seed-triage-1", IssueID: "issue-1", Kind: "triage", TriggerSeq: 1, State: state.StateClaimed, At: now}))
+	must(t, journal.Append(state.Record{JobID: "seed-triage-1", IssueID: "issue-1", Kind: "triage", TriggerSeq: 1, State: state.StateAdvised, At: now}))
+	must(t, journal.Append(state.Record{JobID: "seed-triage-2", IssueID: "issue-2", Kind: "triage", TriggerSeq: 2, State: state.StateClaimed, At: now}))
+	must(t, journal.Append(state.Record{JobID: "seed-triage-2", IssueID: "issue-2", Kind: "triage", TriggerSeq: 2, State: state.StateFailed, At: now}))
+
+	runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	if err != nil {
+		t.Fatalf("buildRunner: %v", err)
+	}
+
+	limiter, ok := runner.TriageLimiter.(*llm.HourlyCounter)
+	if !ok {
+		t.Fatalf("runner.TriageLimiter is a %T, want *llm.HourlyCounter", runner.TriageLimiter)
+	}
+	if got := limiter.Count(); got != 2 {
+		t.Fatalf("limiter.Count() after boot = %d, want 2 (seeded from the 2 journaled claimed-this-hour TRIAGE records)", got)
+	}
+	if limiter.TryIncrement() {
+		t.Fatal("expected a 3rd TryIncrement to be denied -- the cap of 2 was already consumed before this process even started")
+	}
+}
+
+// TestBuildRunner_WiresAndSeedsFollowupLimiterFromConfig is finding 5's (core-robustness round 3)
+// wired-from-main proof: buildRunner must construct runner.FollowupLimiter from
+// WORKER_MAX_FOLLOWUP_PER_HOUR and seed it from real state.StateClaimed FOLLOW-UP journal records
+// for the current UTC hour (jobs.SumFollowupStarts), symmetric to TRIAGE's own wiring proven above.
+// Red-first: before this fix, runner.FollowupLimiter did not exist at all -- FOLLOW-UP had no
+// hourly cap, and WORKER_DAILY_TOKEN_BUDGET defaults to 0 (unlimited), leaving FOLLOW-UP spend
+// effectively unbounded by default.
+func TestBuildRunner_WiresAndSeedsFollowupLimiterFromConfig(t *testing.T) {
+	cfg := Config{
+		WorkerExecute:            false,
+		LLMProvider:              "openai",
+		LLMModel:                 "gpt-4o-mini",
+		WorkerMaxFollowupPerHour: 2,
+	}
+	client := sentinel.NewClient("http://example.invalid", "key")
+	journalPath := filepath.Join(t.TempDir(), "jobs.journal")
+	journal := state.OpenJournal(journalPath)
+
+	now := time.Now().UTC()
+	must(t, journal.Append(state.Record{JobID: "seed-followup-1", IssueID: "issue-1", Kind: "followup", TriggerSeq: 1, State: state.StateClaimed, At: now}))
+	must(t, journal.Append(state.Record{JobID: "seed-followup-1", IssueID: "issue-1", Kind: "followup", TriggerSeq: 1, State: state.StateDone, At: now}))
+
+	runner, _, err := buildRunner(cfg, client, journal, "agent-1", settings.NewStore(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	if err != nil {
+		t.Fatalf("buildRunner: %v", err)
+	}
+
+	if runner.FollowupLimiter == nil {
+		t.Fatalf("runner.FollowupLimiter is nil -- WORKER_MAX_FOLLOWUP_PER_HOUR is dead config")
+	}
+	limiter, ok := runner.FollowupLimiter.(*llm.HourlyCounter)
+	if !ok {
+		t.Fatalf("runner.FollowupLimiter is a %T, want *llm.HourlyCounter", runner.FollowupLimiter)
+	}
+	if got := limiter.Count(); got != 1 {
+		t.Fatalf("limiter.Count() after boot = %d, want 1 (seeded from the 1 journaled claimed-this-hour FOLLOW-UP record)", got)
+	}
+	if !limiter.TryIncrement() {
+		t.Fatalf("expected the 2nd TryIncrement to succeed against a cap of 2 (1 already seeded)")
+	}
+	if limiter.TryIncrement() {
+		t.Fatalf("expected the 3rd TryIncrement to be denied against a cap of 2")
+	}
+}
+
+// fakeSeedableSnapshotter is a minimal state.Snapshotter + s3GenerationSeeder double for
+// TestSnapshotManager_SeedRemoteGeneration below -- a real state.S3Snapshotter would need an
+// httptest server; this proves seedRemoteGeneration's wiring/dispatch logic directly.
+type fakeSeedableSnapshotter struct {
+	seedGen int64
+	seedErr error
+	calls   int
+}
+
+func (f *fakeSeedableSnapshotter) Upload(ctx context.Context, generation int64, tarball []byte) error {
+	return nil
+}
+func (f *fakeSeedableSnapshotter) RestoreLatest(ctx context.Context) ([]byte, int64, bool, error) {
+	return nil, 0, false, nil
+}
+func (f *fakeSeedableSnapshotter) SeedGeneration(ctx context.Context) (int64, error) {
+	f.calls++
+	return f.seedGen, f.seedErr
+}
+
+// TestSnapshotManager_SeedRemoteGeneration_RaisesNextGen is finding 2's (core-robustness round 3)
+// proof for snapshotManager.seedRemoteGeneration: when the underlying Snapshotter is an
+// s3GenerationSeeder and reports a generation higher than nextGen's current value (as happens
+// when local state SURVIVED a restart -- restoreIfEmpty's restore-on-empty trigger never fires --
+// but another writer has since pushed S3's latest generation higher), nextGen must be raised to
+// match so the next upload cannot collide with what's already on S3. Red-first: before this fix,
+// main.go never called seedRemoteGeneration at all, so nextGen would still read its pre-seed
+// value (0) here.
+func TestSnapshotManager_SeedRemoteGeneration_RaisesNextGen(t *testing.T) {
+	fake := &fakeSeedableSnapshotter{seedGen: 99}
+	mgr := newSnapshotManager(fake, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	mgr.seedRemoteGeneration(context.Background())
+
+	if fake.calls != 1 {
+		t.Fatalf("expected SeedGeneration to be called exactly once, got %d", fake.calls)
+	}
+	if got := mgr.nextGen.Load(); got != 99 {
+		t.Fatalf("nextGen after seedRemoteGeneration = %d, want 99", got)
+	}
+}
+
+// TestSnapshotManager_SeedRemoteGeneration_NeverLowersNextGen proves seedRemoteGeneration only
+// ever RAISES nextGen: a restore that already set nextGen higher than S3's seedGen report (e.g. a
+// stale/lagging replica's `latest` pointer) must not be regressed by this call.
+func TestSnapshotManager_SeedRemoteGeneration_NeverLowersNextGen(t *testing.T) {
+	fake := &fakeSeedableSnapshotter{seedGen: 3}
+	mgr := newSnapshotManager(fake, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mgr.nextGen.Store(50)
+
+	mgr.seedRemoteGeneration(context.Background())
+
+	if got := mgr.nextGen.Load(); got != 50 {
+		t.Fatalf("nextGen after seedRemoteGeneration = %d, want unchanged 50 (must never lower)", got)
+	}
+}
+
+// TestSnapshotManager_SeedRemoteGeneration_NoopForNoneBackend proves seedRemoteGeneration is a
+// harmless no-op when the wired Snapshotter (state.NoneSnapshotter, WORKER_SNAPSHOT_BACKEND=none)
+// does not implement s3GenerationSeeder at all -- must not panic via a failed type assertion.
+func TestSnapshotManager_SeedRemoteGeneration_NoopForNoneBackend(t *testing.T) {
+	mgr := newSnapshotManager(state.NoneSnapshotter{}, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mgr.seedRemoteGeneration(context.Background()) // must not panic
+	if got := mgr.nextGen.Load(); got != 0 {
+		t.Fatalf("nextGen = %d, want 0 (untouched for a non-seedable backend)", got)
 	}
 }
 
@@ -634,6 +928,15 @@ func TestResumeInFlightJob_FixRunning_DrivesResumeFix(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	resumeInFlightJob(context.Background(), nil, fixRunner, inFlight[0], logger)
 
+	// Finding 2 (fix-lifecycle remediation round 2): resumeInFlightJob's FIX branch now runs
+	// ResumeFix via DispatchResume -- its own goroutine, tracked by fixRunner's WaitGroup -- rather
+	// than calling ResumeFix synchronously (the pre-fix behaviour this test used to assert on
+	// directly). Wait for it to finish exactly the way runWorker's graceful-shutdown path does,
+	// bounded generously since this is a real (if tiny) git clone+commit+push, not a network call.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer waitCancel()
+	fixRunner.Wait(waitCtx)
+
 	if len(fp.created) != 1 {
 		t.Fatalf("expected the recovered FIX job to reach CreatePR exactly once, got %d -- the journal's StateFixRunning record was not actually resumed", len(fp.created))
 	}
@@ -668,7 +971,7 @@ func TestRunJournalMaintenance_CompactsStaleAndSurfacesInFlight(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	runJournalMaintenance(journal, dir, 10, logger, nil)
+	runJournalMaintenance(journal, dir, 10, logger, nil, nil)
 
 	// Compact must have dropped the stale terminal job's records.
 	records, _, err := journal.Load()
@@ -715,7 +1018,7 @@ func TestRunJournalMaintenance_SurfacesCorruptLinesToMetrics(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	st := health.NewStatus()
 
-	runJournalMaintenance(journal, dir, 10, logger, st)
+	runJournalMaintenance(journal, dir, 10, logger, st, nil)
 
 	logged := logBuf.String()
 	if !strings.Contains(logged, "corrupt") {
@@ -1036,6 +1339,60 @@ func TestLoadConfig_LLMFallbackProviderEnumChecked(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected an LLM_FALLBACK_PROVIDER validation error, got: %v", errs)
+	}
+}
+
+// TestLoadConfig_WorkerEnabledRequiresLLMModel is circuit-config-sec finding 2's red-first proof:
+// before this fix, WORKER_ENABLED=true with LLM_MODEL unset (and LLM_API_KEY unset) passed
+// validation, started the pipeline, and reported ready — every TRIAGE/FOLLOW-UP job then failed at
+// the first llm.New/RunLoop call, discoverable only from job outcomes, not from startup.
+func TestLoadConfig_WorkerEnabledRequiresLLMModel(t *testing.T) {
+	_, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_ENABLED":     "true",
+		"SENTINEL_URL":       "http://sentinel.example",
+		"SENTINEL_AGENT_KEY": "k",
+		"LLM_MODEL":          "",
+		"LLM_API_KEY":        "",
+	}))
+	foundModel, foundKey := false, false
+	for _, e := range errs {
+		if strings.Contains(e, "LLM_MODEL") {
+			foundModel = true
+		}
+		if strings.Contains(e, "LLM_API_KEY") {
+			foundKey = true
+		}
+	}
+	if !foundModel || !foundKey {
+		t.Fatalf("expected both LLM_MODEL and LLM_API_KEY validation errors when WORKER_ENABLED=true, got: %v", errs)
+	}
+}
+
+// TestLoadConfig_WorkerEnabledWithLLMModelAndKeyIsAccepted proves the guard above is specific to
+// the missing-value case — a fully configured WORKER_ENABLED=true environment must not trip it.
+func TestLoadConfig_WorkerEnabledWithLLMModelAndKeyIsAccepted(t *testing.T) {
+	_, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_ENABLED":     "true",
+		"SENTINEL_URL":       "http://sentinel.example",
+		"SENTINEL_AGENT_KEY": "k",
+		"LLM_MODEL":          "gpt-4o",
+		"LLM_API_KEY":        "sk-test",
+	}))
+	for _, e := range errs {
+		if strings.Contains(e, "LLM_MODEL") || strings.Contains(e, "LLM_API_KEY") {
+			t.Fatalf("unexpected LLM validation error with both set: %v", errs)
+		}
+	}
+}
+
+// TestLoadConfig_WorkerDisabledDoesNotRequireLLMModel proves the new checks are gated on
+// WORKER_ENABLED, matching every other cross-field check in this block (SENTINEL_URL/KEY above).
+func TestLoadConfig_WorkerDisabledDoesNotRequireLLMModel(t *testing.T) {
+	_, errs := LoadConfig(fakeEnv(nil))
+	for _, e := range errs {
+		if strings.Contains(e, "LLM_MODEL") || strings.Contains(e, "LLM_API_KEY") {
+			t.Fatalf("did not expect an LLM_MODEL/LLM_API_KEY error when WORKER_ENABLED is unset: %v", errs)
+		}
 	}
 }
 
@@ -1527,6 +1884,163 @@ func TestRunApp_MetricsWiredEndToEnd(t *testing.T) {
 	t.Fatalf("expected /metrics to expose sentinel_worker_events_consumed and a sentinel_worker_jobs_total_* counter within 2s of a real event flowing through the pipeline, last body:\n%s", lastBody)
 }
 
+// TestRunApp_CursorLagReflectsWholeCycleBacklogNotLastPage is circuit-config-sec finding 4's
+// wired-from-main, red-first proof (round 2): a genuine backlog is served as TWO pages of
+// loop.EventsMaxLimit (200) events each, chained by hasMore=true then hasMore=false, followed by
+// a genuinely empty poll. The gauge must report a CUMULATIVE total across the whole drain cycle
+// that exceeds EventsMaxLimit while draining a real backlog -- something a single page's count
+// (the round-1 fix's behavior, which this test would have failed under: a single page tops out at
+// 200, never "> 200") cannot produce -- and only settle back to 0 once the feed genuinely goes
+// empty.
+func TestRunApp_CursorLagReflectsWholeCycleBacklogNotLastPage(t *testing.T) {
+	var pageIdx int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		idx := atomic.AddInt32(&pageIdx, 1)
+		switch idx {
+		case 1:
+			// Page 1 of a real backlog: a full 200-event page with hasMore=true, chaining to page 2.
+			var b strings.Builder
+			b.WriteString(`{"events":[`)
+			for i := 0; i < 200; i++ {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"seq":%d,"eventType":"created","issue":{"id":"iss-%d","status":"unresolved","projectId":"p1"}}`, i+1, i+1)
+			}
+			b.WriteString(`],"hasMore":true,"cursor":200}`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(b.String()))
+			return
+		case 2:
+			// Page 2: the tail of the same backlog, hasMore=false. Cumulative-cycle total is now
+			// 202, which exceeds EventsMaxLimit (200) -- a single page's count never could.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"events":[` +
+				`{"seq":201,"eventType":"created","issue":{"id":"iss-201","status":"unresolved","projectId":"p1"}},` +
+				`{"seq":202,"eventType":"created","issue":{"id":"iss-202","status":"unresolved","projectId":"p1"}}` +
+				`],"hasMore":false,"cursor":202}`))
+			return
+		default:
+			// Every subsequent poll is genuinely empty -- the gauge must settle back to 0 here.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":202}`))
+		}
+	})
+	mux.HandleFunc("/api/agent/issues/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"issue":{"id":"iss-1","status":"unresolved"}}`))
+	})
+	mux.HandleFunc("/api/agent/issues", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"issues":[],"nextCursor":null}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	healthAddr := healthLn.Addr().String()
+	healthLn.Close()
+
+	stateDir := t.TempDir()
+	if err := state.SaveCursor(stateDir+"/cursor.json", 0); err != nil {
+		t.Fatalf("seeding cursor.json: %v", err)
+	}
+
+	const pollInterval = 10 * time.Millisecond
+	cfg := Config{
+		WorkerEnabled:       true,
+		WorkerExecute:       false,
+		SentinelURL:         srv.URL,
+		SentinelAgentKey:    "test-key",
+		WorkerPollInterval:  pollInterval,
+		WorkerHealthAddr:    healthAddr,
+		WorkerStateDir:      stateDir,
+		WorkerBackfillHours: 24,
+		LLMProvider:         "openai",
+		LLMModel:            "test-model",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		close(done)
+	}()
+
+	readCursorLag := func() (int64, string, bool) {
+		resp, err := http.Get(metricsURLFor(healthAddr))
+		if err != nil {
+			return 0, "", false
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		body := string(b)
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, "sentinel_worker_cursor_lag ") {
+				var v int64
+				if _, err := fmt.Sscanf(line, "sentinel_worker_cursor_lag %d", &v); err == nil {
+					return v, body, true
+				}
+			}
+		}
+		return 0, body, false
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastBody string
+	sawBacklogAboveLimit := false
+	for time.Now().Before(deadline) {
+		if v, body, ok := readCursorLag(); ok {
+			lastBody = body
+			if v > loop.EventsMaxLimit {
+				sawBacklogAboveLimit = true
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawBacklogAboveLimit {
+		t.Fatalf("expected sentinel_worker_cursor_lag to exceed EventsMaxLimit (%d) while draining the real 202-event, 2-page backlog -- a cumulative-cycle total is required to show this, since no single page in this test exceeds 200. last /metrics body:\n%s", loop.EventsMaxLimit, lastBody)
+	}
+
+	// After the backlog fully drains, every subsequent poll is genuinely empty -- the gauge must
+	// settle back to 0, not get stuck at the last cycle's total.
+	settledDeadline := time.Now().Add(2 * time.Second)
+	sawSettleToZero := false
+	for time.Now().Before(settledDeadline) {
+		if v, body, ok := readCursorLag(); ok {
+			lastBody = body
+			if v == 0 {
+				sawSettleToZero = true
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runApp did not return after context cancellation")
+	}
+	if !sawSettleToZero {
+		t.Fatalf("expected sentinel_worker_cursor_lag to settle back to 0 once the feed genuinely emptied out, but it never did. last /metrics body:\n%s", lastBody)
+	}
+}
+
+func metricsURLFor(healthAddr string) string {
+	return "http://" + healthAddr + "/metrics"
+}
+
 // --- startup ordering: journal maintenance/RecoveryScan must not wait on identity (finding 6) ---
 
 // TestRunPipeline_JournalMaintenanceRunsEvenWhenIdentityEndpointIsDown proves runPipeline no
@@ -1559,7 +2073,7 @@ func TestRunPipeline_JournalMaintenanceRunsEvenWhenIdentityEndpointIsDown(t *tes
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	runPipeline(ctx, cfg, logger, nil, nil)
+	runPipeline(ctx, cfg, logger, nil, nil, nil, nil)
 
 	logMu.Lock()
 	logged := logBuf.String()
@@ -1649,9 +2163,9 @@ func TestRunPipeline_ReadyzCarriesSettingsReadinessDetail(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"events":[],"cursor":"","hasMore":false}`))
 	})
-	mux.HandleFunc("/api/agent/me", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"agent-1"}`))
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -1675,7 +2189,7 @@ func TestRunPipeline_ReadyzCarriesSettingsReadinessDetail(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runPipeline(ctx, cfg, logger, st, nil)
+		runPipeline(ctx, cfg, logger, st, nil, nil, nil)
 		close(done)
 	}()
 
@@ -1783,5 +2297,957 @@ func TestRunPipeline_WiresOnSweepReconcile_ReclaimsIssueWithOpenQuestion(t *test
 
 	if got := atomic.LoadInt32(&claimHits); got == 0 {
 		t.Fatalf("expected the claim_released event (open question in journal) to reach Sweep.ReconcileReaped and re-claim the issue via OnSweepReconcile, got 0 claim POSTs -- the event-driven reconcile arm is unwired")
+	}
+}
+
+// --- durability-startup remediation: finding 4 (startup free-disk guard) -----------------------
+
+// TestCheckStateDirFreeDisk_RefusesBelowMinimum proves the plan §6 guard with a stubbed statfs
+// (no real near-full filesystem needed): below the 100MB minimum it errors; at/above it, it does
+// not.
+func TestCheckStateDirFreeDisk_RefusesBelowMinimum(t *testing.T) {
+	dir := t.TempDir()
+
+	lowFree := func(string) (uint64, error) { return 50 * 1024 * 1024, nil }
+	if err := checkStateDirFreeDisk(dir, lowFree); err == nil {
+		t.Fatalf("expected an error when available disk (50MB) is below the 100MB minimum")
+	}
+
+	highFree := func(string) (uint64, error) { return 500 * 1024 * 1024, nil }
+	if err := checkStateDirFreeDisk(dir, highFree); err != nil {
+		t.Fatalf("expected no error when available disk (500MB) is above the minimum, got: %v", err)
+	}
+
+	exactFree := func(string) (uint64, error) { return minStateDirFreeBytes, nil }
+	if err := checkStateDirFreeDisk(dir, exactFree); err != nil {
+		t.Fatalf("expected no error when available disk exactly equals the minimum, got: %v", err)
+	}
+}
+
+// TestRunWorker_LowDiskFlipsReadinessUnhealthy drives the REAL runWorker (exactly as runApp calls
+// it) with statfsFree stubbed to report a near-full filesystem, and asserts /readyz reports
+// unhealthy -- proving the guard is actually wired into runWorker's startup path, not merely a
+// standalone function nothing calls.
+func TestRunWorker_LowDiskFlipsReadinessUnhealthy(t *testing.T) {
+	origStatfsFree := statfsFree
+	statfsFree = func(string) (uint64, error) { return 1024, nil } // 1KB -- deliberately far below the minimum
+	defer func() { statfsFree = origStatfsFree }()
+
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	healthAddr := healthLn.Addr().String()
+	healthLn.Close()
+
+	cfg := Config{
+		WorkerEnabled:    false, // parks immediately -- this test is only about the readiness flip, not the pipeline
+		WorkerHealthAddr: healthAddr,
+		WorkerStateDir:   t.TempDir(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runWorker(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), true)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastBody string
+	var lastStatus int
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + healthAddr + "/readyz")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastBody = string(body)
+			lastStatus = resp.StatusCode
+			if resp.StatusCode != http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if lastStatus == http.StatusOK {
+		t.Fatalf("expected /readyz to report NOT ready (non-200) once the free-disk guard sees a near-full filesystem, got 200: %s", lastBody)
+	}
+}
+
+// --- durability-startup remediation: finding 1 (S3 state-snapshot durability) wired from main() --
+
+// fakeS3Objects is a minimal in-memory S3 double shared by the two test servers below: PUT stores
+// the body under its request path, GET returns it (404 if absent).
+type fakeS3Objects struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newFakeS3Server(t *testing.T) (*httptest.Server, *fakeS3Objects) {
+	t.Helper()
+	f := &fakeS3Objects{objects: make(map[string][]byte)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			data, _ := io.ReadAll(r.Body)
+			f.mu.Lock()
+			f.objects[r.URL.Path] = data
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			f.mu.Lock()
+			data, ok := f.objects[r.URL.Path]
+			f.mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, f
+}
+
+// TestRunApp_S3SnapshotBackend_UploadsOnSIGTERMBeforeExit drives the REAL runApp (exactly as
+// main() calls it) with WORKER_SNAPSHOT_BACKEND=s3 against a fake S3 server, cancels ctx
+// (simulating SIGTERM, exactly like signal.NotifyContext does in main()), and asserts a snapshot
+// was uploaded before runApp returned -- proving the S3 snapshotter is actually wired into
+// runPipeline/runWorker's shutdown path, not merely constructed and never called.
+func TestRunApp_S3SnapshotBackend_UploadsOnSIGTERMBeforeExit(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s3srv, fakeS3 := newFakeS3Server(t)
+	stateDir := t.TempDir()
+	// Seed the cursor so runPipeline skips Bootstrap and gets straight to a state dir with content
+	// worth snapshotting.
+	if err := state.SaveCursor(stateDir+"/cursor.json", 0); err != nil {
+		t.Fatalf("SaveCursor: %v", err)
+	}
+
+	cfg := Config{
+		WorkerEnabled:          true,
+		WorkerExecute:          true,
+		SentinelURL:            srv.URL,
+		SentinelAgentKey:       "test-key",
+		WorkerPollInterval:     5 * time.Millisecond,
+		WorkerSweepInterval:    time.Hour,
+		WorkerClaimHeartbeat:   12 * time.Hour,
+		WorkerNagDays:          3,
+		WorkerHealthAddr:       "127.0.0.1:0",
+		WorkerStateDir:         stateDir,
+		WorkerShutdownTimeout:  time.Second,
+		WorkerSnapshotBackend:  "s3",
+		WorkerSnapshotInterval: time.Hour, // never fires during the test -- only the SIGTERM upload should
+		S3Endpoint:             s3srv.URL,
+		S3Bucket:               "test-bucket",
+		S3Prefix:               "worker",
+		S3AccessKey:            "AKIAEXAMPLE",
+		S3SecretKey:            "secretkeyexample",
+		LLMProvider:            "openai",
+		LLMModel:               "gpt-4o-mini",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	fakeS3.mu.Lock()
+	_, gotLatest := fakeS3.objects["/test-bucket/worker/latest"]
+	numObjects := len(fakeS3.objects)
+	fakeS3.mu.Unlock()
+
+	if !gotLatest {
+		t.Fatalf("expected a `latest` pointer object to have been uploaded to S3 on shutdown (SIGTERM-before-exit), got none of %d objects", numObjects)
+	}
+}
+
+// TestRunApp_S3SnapshotBackend_RestoresOnEmptyStateDirStartup proves the startup half of the
+// wiring: a worker started with WORKER_SNAPSHOT_BACKEND=s3 against an EMPTY state dir restores
+// the newest snapshot uploaded by a prior run before it ever reaches the poll loop.
+func TestRunApp_S3SnapshotBackend_RestoresOnEmptyStateDirStartup(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s3srv, _ := newFakeS3Server(t)
+
+	// Pre-seed S3 directly (simulating a prior run's upload) via the same client the production
+	// code uses, rather than hand-writing bytes into the fake -- this keeps the test bound to the
+	// real Upload/RestoreLatest contract instead of the fake server's internals.
+	snap := state.NewS3Snapshotter(state.S3Config{
+		Endpoint:  s3srv.URL,
+		Bucket:    "test-bucket",
+		Prefix:    "worker",
+		AccessKey: "AKIAEXAMPLE",
+		SecretKey: "secretkeyexample",
+	}, s3srv.Client())
+	seedDir := t.TempDir()
+	if err := state.SaveCursor(seedDir+"/cursor.json", 99); err != nil {
+		t.Fatalf("seed SaveCursor: %v", err)
+	}
+	tarball, err := state.BuildStateTarball(seedDir)
+	if err != nil {
+		t.Fatalf("BuildStateTarball: %v", err)
+	}
+	if err := snap.Upload(context.Background(), 1, tarball); err != nil {
+		t.Fatalf("seed Upload: %v", err)
+	}
+
+	stateDir := t.TempDir() // EMPTY -- nothing local, exactly the emptyDir-after-reschedule case.
+	cfg := Config{
+		WorkerEnabled:          true,
+		WorkerExecute:          true,
+		SentinelURL:            srv.URL,
+		SentinelAgentKey:       "test-key",
+		WorkerPollInterval:     5 * time.Millisecond,
+		WorkerSweepInterval:    time.Hour,
+		WorkerClaimHeartbeat:   12 * time.Hour,
+		WorkerNagDays:          3,
+		WorkerHealthAddr:       "127.0.0.1:0",
+		WorkerStateDir:         stateDir,
+		WorkerShutdownTimeout:  time.Second,
+		WorkerSnapshotBackend:  "s3",
+		WorkerSnapshotInterval: time.Hour,
+		S3Endpoint:             s3srv.URL,
+		S3Bucket:               "test-bucket",
+		S3Prefix:               "worker",
+		S3AccessKey:            "AKIAEXAMPLE",
+		S3SecretKey:            "secretkeyexample",
+		LLMProvider:            "openai",
+		LLMModel:               "gpt-4o-mini",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	restoredCursor, err := state.LoadCursor(stateDir + "/cursor.json")
+	if err != nil {
+		t.Fatalf("LoadCursor after startup: %v", err)
+	}
+	if restoredCursor == nil {
+		t.Fatalf("expected cursor.json to have been restored from the S3 snapshot into the empty state dir, found none")
+	}
+	if restoredCursor.Seq != 99 {
+		t.Fatalf("restored cursor.Seq = %d, want 99 (the seeded snapshot's value)", restoredCursor.Seq)
+	}
+}
+
+// --- durability-startup remediation: finding 6 (5 missing /metrics families) wired from main() --
+
+// TestRunApp_HeartbeatMetric_AppearsAtMetricsEndpoint drives the REAL runApp (exactly as main()
+// calls it) with a held claim (GET /api/agent/issues?claimed=me returns one issue, with an empty
+// journal so LastActivity is the zero Time -- trivially stale) and a short WORKER_SWEEP_INTERVAL,
+// then scrapes the real /metrics endpoint over HTTP and asserts heartbeats_posted appears with a
+// positive value -- proving jobs.Sweep.OnHeartbeatPosted is actually wired from main(), not merely
+// constructed and never called (finding 6).
+func TestRunApp_HeartbeatMetric_AppearsAtMetricsEndpoint(t *testing.T) {
+	var heartbeatHits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":1}`))
+	})
+	mux.HandleFunc("/api/agent/issues", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issues":[{"id":"iss-heartbeat-1"}]}`))
+	})
+	mux.HandleFunc("/api/agent/issues/iss-heartbeat-1/progress", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&heartbeatHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	stateDir := t.TempDir()
+	if err := state.SaveCursor(stateDir+"/cursor.json", 0); err != nil {
+		t.Fatalf("SaveCursor: %v", err)
+	}
+
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	healthAddr := healthLn.Addr().String()
+	healthLn.Close()
+
+	cfg := Config{
+		WorkerEnabled:         true,
+		WorkerExecute:         true,
+		SentinelURL:           srv.URL,
+		SentinelAgentKey:      "test-key",
+		WorkerPollInterval:    5 * time.Millisecond,
+		WorkerSweepInterval:   10 * time.Millisecond, // fire fast -- this test is about the sweep
+		WorkerClaimHeartbeat:  0,                     // 0 duration: any LastActivity age is "stale", heartbeat fires immediately
+		WorkerNagDays:         3,
+		WorkerHealthAddr:      healthAddr,
+		WorkerStateDir:        stateDir,
+		WorkerShutdownTimeout: time.Second,
+		LLMProvider:           "openai",
+		LLMModel:              "gpt-4o-mini",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		close(done)
+	}()
+
+	// Poll /metrics until heartbeats_posted appears (or the test's own timeout below fires) --
+	// avoids a fixed sleep racing the sweep ticker.
+	deadline := time.Now().Add(2 * time.Second)
+	var metricsBody string
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + healthAddr + "/metrics")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			metricsBody = string(body)
+			if strings.Contains(metricsBody, "sentinel_worker_heartbeats_posted") {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	<-done
+
+	if atomic.LoadInt32(&heartbeatHits) == 0 {
+		t.Fatalf("expected at least one POST /api/agent/issues/:id/progress heartbeat, got none")
+	}
+	if !strings.Contains(metricsBody, "sentinel_worker_heartbeats_posted") {
+		t.Fatalf("expected /metrics to expose sentinel_worker_heartbeats_posted after a real heartbeat POST, got:\n%s", metricsBody)
+	}
+}
+
+// TestRunApp_LLMUsage_UpdatesTokenCounterAndBudgetGauge is the wired-from-main proof for the
+// OnUsage closure main.go builds around line 2031: once a real Advisor decision flows through
+// loop.Runner.Run (a real TriageAdvisor talking to a fake OpenAI-compatible LLM server that
+// returns a usage-bearing response), sentinel_worker_llm_tokens_primary and
+// sentinel_worker_budget_remaining must appear at /metrics with the expected values. Modeled on
+// TestRunApp_HeartbeatMetric_AppearsAtMetricsEndpoint's poll-until-present pattern. Mutation-proof:
+// neutering main.go's OnUsage body (~2031-2034) to a no-op makes both assertions below go red.
+func TestRunApp_LLMUsage_UpdatesTokenCounterAndBudgetGauge(t *testing.T) {
+	var eventsServed int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.CompareAndSwapInt32(&eventsServed, 0, 1) {
+			_, _ = w.Write([]byte(`{"events":[{"seq":1,"eventType":"created","issue":{"id":"iss-usage-1","status":"unresolved","projectId":"proj-1"}}],"hasMore":false,"cursor":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"events":[],"hasMore":false,"cursor":1}`))
+	})
+	mux.HandleFunc("/api/agent/issues/iss-usage-1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"issue": {"id":"iss-usage-1","projectId":"proj-1","message":"boom","errorClass":"Err","issueType":"user_report","status":"unresolved"},
+			"report": {"bodyMd":"it broke"},
+			"latestOccurrence": null
+		}`))
+	})
+	mux.HandleFunc("/api/agent/issues", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issues":[],"nextCursor":null}`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// A minimal OpenAI-compatible chat/completions server: one final (non-tool-call) response
+	// carrying a schema-valid TriageDecision plus a known, non-zero token usage.
+	llmMux := http.NewServeMux()
+	llmMux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices": [{
+				"message": {"content": "{\"severity\":\"low\",\"disposition\":\"comment_only\",\"duplicateOf\":null,\"causedBy\":null,\"summary\":\"benign\",\"question\":null,\"fixBrief\":null,\"confidence\":0.5}"},
+				"finish_reason": "stop"
+			}],
+			"usage": {"prompt_tokens": 30, "completion_tokens": 20}
+		}`))
+	})
+	llmSrv := httptest.NewServer(llmMux)
+	defer llmSrv.Close()
+
+	stateDir := t.TempDir()
+	if err := state.SaveCursor(stateDir+"/cursor.json", 0); err != nil {
+		t.Fatalf("SaveCursor: %v", err)
+	}
+
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	healthAddr := healthLn.Addr().String()
+	healthLn.Close()
+
+	cfg := Config{
+		WorkerEnabled:          true,
+		WorkerExecute:          false, // dry-run: OnUsage fires right after Decide, before Act
+		SentinelURL:            srv.URL,
+		SentinelAgentKey:       "test-key",
+		WorkerPollInterval:     5 * time.Millisecond,
+		WorkerHealthAddr:       healthAddr,
+		WorkerStateDir:         stateDir,
+		WorkerBackfillHours:    24,
+		WorkerShutdownTimeout:  time.Second,
+		WorkerDailyTokenBudget: 1000,
+		LLMProvider:            "openai",
+		LLMModel:               "test-model",
+		LLMAPIKey:              "test-key",
+		LLMBaseURL:             llmSrv.URL,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		close(done)
+	}()
+
+	metricsURL := "http://" + healthAddr + "/metrics"
+	deadline := time.Now().Add(2 * time.Second)
+	var metricsBody string
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(metricsURL)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			metricsBody = string(body)
+			if strings.Contains(metricsBody, "sentinel_worker_llm_tokens_primary") {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if !strings.Contains(metricsBody, "sentinel_worker_llm_tokens_primary 50") {
+		t.Fatalf("expected /metrics to expose sentinel_worker_llm_tokens_primary 50 (30+20 tokens) after a real Advisor decision, got:\n%s", metricsBody)
+	}
+	if !strings.Contains(metricsBody, "sentinel_worker_budget_remaining 950") {
+		t.Fatalf("expected /metrics to expose sentinel_worker_budget_remaining 950 (1000 - 50 spent), got:\n%s", metricsBody)
+	}
+}
+
+// TestGuard_OnRejectionHook_FiresOnRealCheckRejection proves finding 6's gate_rejections seam:
+// guardpkg.OnRejection fires exactly when guardpkg.Check/CheckWithConfig actually rejects a
+// candidate (driven through the REAL Check entry point, not a hand-constructed Violation), and
+// does not fire on an accepted candidate. main.go wires this package-level hook to
+// health.Status.Inc(health.MetricGateRejections, 1) in runPipeline.
+func TestGuard_OnRejectionHook_FiresOnRealCheckRejection(t *testing.T) {
+	origHook := guardpkg.OnRejection
+	defer func() { guardpkg.OnRejection = origHook }()
+
+	var fired int32
+	var lastField guardpkg.PublishedField
+	guardpkg.OnRejection = func(field guardpkg.PublishedField, reason guardpkg.ViolationReason) {
+		atomic.AddInt32(&fired, 1)
+		lastField = field
+	}
+
+	// A too-long candidate for the "comment" field triggers the length check -- driven through the
+	// REAL guardpkg.Check entry point, exactly as jobs/act.go calls it.
+	longText := strings.Repeat("x", 100000)
+	if err := guardpkg.Check(guardpkg.FieldSummary, longText, nil, nil); err == nil {
+		t.Fatalf("expected guardpkg.Check to reject an oversized candidate")
+	}
+	if atomic.LoadInt32(&fired) == 0 {
+		t.Fatalf("expected guardpkg.OnRejection to fire on a real rejection, got 0 calls")
+	}
+	if lastField != guardpkg.FieldSummary {
+		t.Fatalf("OnRejection field = %v, want %v", lastField, guardpkg.FieldSummary)
+	}
+
+	atomic.StoreInt32(&fired, 0)
+	if err := guardpkg.Check(guardpkg.FieldSummary, "a short, fine comment", nil, nil); err != nil {
+		t.Fatalf("expected a short candidate to pass: %v", err)
+	}
+	if atomic.LoadInt32(&fired) != 0 {
+		t.Fatalf("OnRejection must NOT fire on an accepted candidate, got %d calls", fired)
+	}
+}
+
+// --- FIX-subsystem remediation: findings 2/3/6 wired from main() -------------------------------
+
+// fixMinimalMux returns an httptest mux answering the minimal sentinel API surface runPipeline
+// needs to get all the way through buildFixRunner: /api/agent/self, /api/agent/projects (one
+// project with a repo connection so buildRunner's settingsStore has FIX-ready data),
+// /api/agent/repo-credentials, and an empty /api/agent/events feed so the poll loop idles quietly.
+func fixMinimalMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"agentId":"agent-1"}`))
+	})
+	mux.HandleFunc("/api/agent/projects", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"projects":[{"id":"proj-1","name":"P1","agentSettings":{"fixEnabled":true,"repo":{"provider":"github","owner":"o","repo":"r","defaultBranch":"main"}}}]}`))
+	})
+	mux.HandleFunc("/api/agent/repo-credentials", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credentials":[{"id":"c1","provider":"github","label":"default","secret":{"token":"tok"}}]}`))
+	})
+	mux.HandleFunc("/api/agent/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[],"cursor":"","hasMore":false}`))
+	})
+	return mux
+}
+
+// TestRunPipeline_WiresFixRunnerAndSeedsCapsFromJournal is findings 1/2's wired-from-main proof:
+// runPipeline is driven end to end (exactly as runWorker calls it) against a real journal file
+// pre-seeded, via the SAME journal record shapes RunFix itself writes, with today's FIX activity.
+// It asserts (a) buildFixRunner's *jobs.FixRunner is actually published through fixRunnerOut (the
+// call path runWorker's shutdown reads to find it) and (b) that FixRunner's Caps already reflect
+// the seeded journal counts -- proving SeedToday ran as part of runPipeline's boot, not merely
+// existing as an unused method.
+func TestRunPipeline_WiresFixRunnerAndSeedsCapsFromJournal(t *testing.T) {
+	srv := httptest.NewServer(fixMinimalMux())
+	defer srv.Close()
+
+	dir := t.TempDir()
+	journalPath := filepath.Join(dir, "jobs.journal")
+	j := state.OpenJournal(journalPath)
+	today := time.Now().UTC()
+
+	// Seed TWO distinct FIX job starts for today via the exact journal shape journalFixRunning
+	// writes (Kind=jobs.FixKind, State fix_running), through the exported FixJobInput/JournalFixPROpen
+	// surface this package can reach.
+	for _, jobID := range []string{"seed-job-1", "seed-job-2"} {
+		payload, err := json.Marshal(struct {
+			Input      jobs.FixJobInput `json:"input"`
+			BaseCommit string           `json:"baseCommit"`
+		}{
+			Input:      jobs.FixJobInput{JobID: jobID, IssueID: "issue-" + jobID, ProjectID: "proj-1"},
+			BaseCommit: "deadbeef",
+		})
+		if err != nil {
+			t.Fatalf("marshal seed payload: %v", err)
+		}
+		if err := j.Append(state.Record{
+			JobID: jobID, IssueID: "issue-" + jobID, Kind: jobs.FixKind, State: state.StateFixRunning,
+			At: today, Payload: payload,
+		}); err != nil {
+			t.Fatalf("seeding journal: %v", err)
+		}
+	}
+
+	cfg := Config{
+		WorkerEnabled:          true,
+		WorkerExecute:          true,
+		WorkerFixEnabled:       true,
+		SentinelURL:            srv.URL,
+		SentinelAgentKey:       "test-key",
+		WorkerPollInterval:     20 * time.Millisecond,
+		WorkerStateDir:         dir,
+		WorkerWorkspaceDir:     filepath.Join(dir, "workspaces"),
+		FixExecutorCmd:         "true",
+		WorkerMaxFixJobsPerDay: 2, // exactly the 2 jobs seeded above -- a 3rd must be refused if seeding worked
+		WorkerMaxPRsPerDay:     10,
+		WorkerMaxFixAttempts:   2,
+		LLMProvider:            "openai",
+		LLMModel:               "gpt-4o-mini",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var fixRunnerPtr atomic.Pointer[jobs.FixRunner]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runPipeline(ctx, cfg, logger, nil, nil, &fixRunnerPtr, nil)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var fr *jobs.FixRunner
+	for time.Now().Before(deadline) {
+		if fr = fixRunnerPtr.Load(); fr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fr == nil {
+		t.Fatal("runPipeline never published a *jobs.FixRunner through fixRunnerOut -- buildFixRunner is unreachable from runPipeline's real wiring")
+	}
+	if fr.Caps == nil {
+		t.Fatal("published FixRunner has no Caps")
+	}
+	if fr.Caps.AllowJobStart() {
+		t.Fatal("WORKER_MAX_FIX_JOBS_PER_DAY=2 should already be exhausted by the 2 fix_running records seeded in the journal BEFORE runPipeline started -- SeedToday did not run at boot")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runPipeline did not exit within 3s of ctx cancellation")
+	}
+}
+
+// TestRunPipeline_SweepsOrphanFixWorkspaceAtStartup is finding 6's wired-from-main proof: a
+// leftover workspace directory (no journal record at all -- an "unknown" orphan) sitting under
+// WORKER_WORKSPACE_DIR before runPipeline ever starts must be gone once buildFixRunner's startup
+// sweep has run, and a directory whose jobId IS still in-flight per the journal must survive.
+func TestRunPipeline_SweepsOrphanFixWorkspaceAtStartup(t *testing.T) {
+	srv := httptest.NewServer(fixMinimalMux())
+	defer srv.Close()
+
+	dir := t.TempDir()
+	workspaceDir := filepath.Join(dir, "workspaces")
+	if err := os.MkdirAll(filepath.Join(workspaceDir, "orphan-job"), 0o755); err != nil {
+		t.Fatalf("mkdir orphan: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspaceDir, "inflight-job"), 0o755); err != nil {
+		t.Fatalf("mkdir inflight: %v", err)
+	}
+
+	journalPath := filepath.Join(dir, "jobs.journal")
+	j := state.OpenJournal(journalPath)
+	payload, _ := json.Marshal(struct {
+		Input      jobs.FixJobInput `json:"input"`
+		BaseCommit string           `json:"baseCommit"`
+	}{Input: jobs.FixJobInput{JobID: "inflight-job", IssueID: "issue-inflight", ProjectID: "proj-1"}, BaseCommit: "x"})
+	if err := j.Append(state.Record{
+		JobID: "inflight-job", IssueID: "issue-inflight", Kind: jobs.FixKind, State: state.StateFixRunning,
+		At: time.Now().UTC(), Payload: payload,
+	}); err != nil {
+		t.Fatalf("seeding journal: %v", err)
+	}
+
+	cfg := Config{
+		WorkerEnabled:                true,
+		WorkerExecute:                true,
+		WorkerFixEnabled:             true,
+		SentinelURL:                  srv.URL,
+		SentinelAgentKey:             "test-key",
+		WorkerPollInterval:           20 * time.Millisecond,
+		WorkerStateDir:               dir,
+		WorkerWorkspaceDir:           workspaceDir,
+		FixExecutorCmd:               "true",
+		WorkerMaxFixJobsPerDay:       10,
+		WorkerMaxPRsPerDay:           10,
+		WorkerMaxFixAttempts:         2,
+		WorkerWorkspaceRetentionDays: 3,
+		LLMProvider:                  "openai",
+		LLMModel:                     "gpt-4o-mini",
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Finding 2 (fix-lifecycle remediation round 2): boot-time FIX recovery now runs via
+	// DispatchResume, off runPipeline's own goroutine, tracked by fixRunner's WaitGroup -- capture
+	// it via fixRunnerOut so this test can wait for that resume attempt to actually finish before
+	// asserting on (and before t.TempDir() cleans up) the workspace it touches, instead of racing
+	// runPipeline's own ctx-cancellation exit against a still-running background goroutine.
+	var fixRunnerOut atomic.Pointer[jobs.FixRunner]
+	done := make(chan struct{})
+	go func() {
+		runPipeline(ctx, cfg, logger, nil, nil, &fixRunnerOut, nil)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(workspaceDir, "orphan-job")); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runPipeline did not exit within 3s of ctx cancellation")
+	}
+
+	if fr := fixRunnerOut.Load(); fr != nil {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer waitCancel()
+		fr.Wait(waitCtx)
+	}
+
+	if _, err := os.Stat(filepath.Join(workspaceDir, "orphan-job")); !os.IsNotExist(err) {
+		t.Fatalf("orphan-job workspace should have been removed by the startup sweep, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceDir, "inflight-job")); err != nil {
+		t.Fatalf("inflight-job workspace (non-terminal journal record) should have survived the startup sweep: %v", err)
+	}
+}
+
+// --- Fix-lifecycle remediation round 2, finding 4: WORKER_FIX_EXECUTOR_ENV --------------------
+
+// TestLoadConfig_WorkerFixExecutorEnv_ParsesKeyValueAndBareKeyEntries proves the comma/newline
+// KEY=VALUE-or-bare-KEY parsing: a literal KEY=VALUE entry is taken verbatim; a bare KEY entry is
+// passed through from the worker's own process environment (via the env lookup LoadConfig itself
+// uses) if set, and silently omitted if not.
+func TestLoadConfig_WorkerFixExecutorEnv_ParsesKeyValueAndBareKeyEntries(t *testing.T) {
+	cfg, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_ENABLED":          "false",
+		"WORKER_FIX_EXECUTOR_ENV": "DEEPSEEK_API_KEY=sk-abc123,\nMODEL_NAME\nUNSET_PASSTHROUGH_KEY",
+		"MODEL_NAME":              "deepseek-coder",
+		// UNSET_PASSTHROUGH_KEY is deliberately NOT set in this env.
+	}))
+	if len(errs) != 0 {
+		t.Fatalf("expected zero validation errors, got: %v", errs)
+	}
+	if got := cfg.WorkerFixExecutorEnv["DEEPSEEK_API_KEY"]; got != "sk-abc123" {
+		t.Errorf("DEEPSEEK_API_KEY = %q, want sk-abc123", got)
+	}
+	if got := cfg.WorkerFixExecutorEnv["MODEL_NAME"]; got != "deepseek-coder" {
+		t.Errorf("MODEL_NAME (bare-key passthrough) = %q, want deepseek-coder", got)
+	}
+	if _, ok := cfg.WorkerFixExecutorEnv["UNSET_PASSTHROUGH_KEY"]; ok {
+		t.Errorf("UNSET_PASSTHROUGH_KEY should have been silently omitted (not set in env), but was present")
+	}
+}
+
+// TestLoadConfig_WorkerFixExecutorEnv_RejectsForbiddenKey is the RED-FIRST proof that
+// WORKER_FIX_EXECUTOR_ENV cannot be used to smuggle the worker's own secrets to the Fix Executor --
+// a config-time validation error, not a silent drop or a runtime-only rejection.
+//
+// MUTATION-TEST NOTE: remove the jobs.IsForbiddenExecutorEnvKey check from parseFixExecutorEnv and
+// this test goes red -- errs comes back empty and cfg.WorkerFixExecutorEnv["SENTINEL_AGENT_KEY"]
+// carries the leaked value.
+func TestLoadConfig_WorkerFixExecutorEnv_RejectsForbiddenKey(t *testing.T) {
+	cfg, errs := LoadConfig(fakeEnv(map[string]string{
+		"WORKER_ENABLED":          "false",
+		"WORKER_FIX_EXECUTOR_ENV": "SENTINEL_AGENT_KEY=leaked-value",
+	}))
+	if len(errs) == 0 {
+		t.Fatal("expected a validation error for a forbidden WORKER_FIX_EXECUTOR_ENV key, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "WORKER_FIX_EXECUTOR_ENV") && strings.Contains(e, "SENTINEL_AGENT_KEY") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a WORKER_FIX_EXECUTOR_ENV/SENTINEL_AGENT_KEY validation error, got: %v", errs)
+	}
+	if _, ok := cfg.WorkerFixExecutorEnv["SENTINEL_AGENT_KEY"]; ok {
+		t.Fatal("SENTINEL_AGENT_KEY must never be present in the parsed WorkerFixExecutorEnv map")
+	}
+}
+
+// TestConfiguredSecrets_IncludesFixExecutorEnvValues is finding 6's RED-FIRST proof: the Fix
+// Executor's own credential env (WORKER_FIX_EXECUTOR_ENV, Config.WorkerFixExecutorEnv) must be
+// included in configuredSecrets's output -- before this fix, only LLM/git credentials were
+// collected, so a coding-agent API key configured this way never reached FixRunner.Secrets and
+// never got masked by any redactor built from jobSecrets in jobs.FixRunner.RunFix/ResumeFix.
+//
+// MUTATION-TEST NOTE: delete the WorkerFixExecutorEnv loop from configuredSecrets and this test
+// goes red -- the returned slice no longer contains the executor secret value.
+func TestConfiguredSecrets_IncludesFixExecutorEnvValues(t *testing.T) {
+	cfg := Config{
+		WorkerFixExecutorEnv: map[string]string{
+			"DEEPSEEK_API_KEY": "sk-fix-executor-super-secret-token",
+			"EMPTY_VALUE_KEY":  "",
+		},
+	}
+	secrets := configuredSecrets(cfg)
+	found := false
+	for _, s := range secrets {
+		if s == "sk-fix-executor-super-secret-token" {
+			found = true
+		}
+		if s == "" {
+			t.Fatal("configuredSecrets must never include an empty string, even for an empty-valued executor env entry")
+		}
+	}
+	if !found {
+		t.Fatalf("expected configuredSecrets to include the Fix Executor's own env secret, got %v", secrets)
+	}
+}
+
+// TestBuildFixRunner_ExecutorEnvReachesTheRealExecutorChild is the wired-end-to-end proof for
+// finding 4 (BLOCKER-adjacent, plan §4.4): before this fix, FixRunner.ExecutorEnv was NEVER
+// populated by main.go's real wiring -- buildFixRunner's returned *jobs.FixRunner always had a nil
+// ExecutorEnv, so jobs/fix_executor_test.go's forbidden-key guard test was exercising a dead field
+// (nothing in production ever called RunFixExecutor with a non-nil ExtraEnv). This drives
+// buildFixRunner (the REAL main.go wiring, not a hand-built jobs.FixRunner) with
+// WORKER_FIX_EXECUTOR_ENV configured, then runs an actual FIX attempt through it whose
+// $FIX_EXECUTOR_CMD script asserts the configured var is present in ITS OWN environment.
+//
+// MUTATION-TEST NOTE: remove `ExecutorEnv: cfg.WorkerFixExecutorEnv,` from buildFixRunner's struct
+// literal and this test goes red -- the script's `test -n "$DEEPSEEK_API_KEY"` check fails, causing
+// execResult.Err != nil and the attempt to release-with-comment instead of reaching CreatePR.
+func TestBuildFixRunner_ExecutorEnvReachesTheRealExecutorChild(t *testing.T) {
+	bareRepo := newMainTestBareFixtureRepo(t)
+	journalPath := filepath.Join(t.TempDir(), "jobs.journal")
+	journal := state.OpenJournal(journalPath)
+	fp := &mainTestFakeProvider{pr: gitprovider.PR{ID: "1", URL: "https://example/pr/1"}}
+	sender := &mainTestRecordingSender{}
+
+	cfg := Config{
+		WorkerFixEnabled:       true,
+		WorkerExecute:          true,
+		FixExecutorCmd:         `if [ "$DEEPSEEK_API_KEY" != "sk-real-value" ]; then echo "missing executor env" >&2; exit 1; fi; echo "fix applied" >> fixed.txt`,
+		WorkerFixExecutorEnv:   map[string]string{"DEEPSEEK_API_KEY": "sk-real-value"},
+		WorkerWorkspaceDir:     t.TempDir(),
+		WorkerStateDir:         t.TempDir(),
+		WorkerMaxFixJobsPerDay: 10,
+		WorkerMaxPRsPerDay:     10,
+		WorkerMaxFixAttempts:   2,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fixRunner := buildFixRunner(cfg, nil, journal, nil, logger, nil)
+	if fixRunner == nil {
+		t.Fatal("buildFixRunner returned nil despite WorkerFixEnabled+WorkerExecute+FixExecutorCmd all set")
+	}
+	fixRunner.Client = sender
+	fixRunner.ResolveRepo = func(projectID string) (jobs.FixRepoConfig, bool, error) {
+		return jobs.FixRepoConfig{
+			Provider:      fp,
+			Repo:          gitprovider.RepoRef{Provider: "github", Owner: "o", Repo: "r"},
+			CloneURL:      bareRepo,
+			DefaultBranch: "main",
+		}, true, nil
+	}
+
+	in := jobs.FixJobInput{JobID: "job-execenv", IssueID: "issue-execenv", ProjectID: "proj-1", FixBrief: "x", TriggerSeq: 1}
+	if err := fixRunner.RunFix(context.Background(), in); err != nil {
+		t.Fatalf("RunFix: %v", err)
+	}
+	if len(fp.created) != 1 {
+		t.Fatalf("expected exactly one CreatePR call (the executor's own env-presence check must have passed), got %d", len(fp.created))
+	}
+}
+
+// TestResumeInFlightJob_SlowFixRunsAsyncAndDoesNotBlockCaller is the RED-FIRST proof for finding 2
+// (MAJOR, fix-lifecycle remediation round 2): before this fix, resumeInFlightJob's FIX branch
+// called fixRunner.ResumeFix SYNCHRONOUSLY -- so main.go's boot-time recovery loop (runPipeline,
+// which calls resumeInFlightJob for every in-flight job BEFORE the poll loop starts) blocked on the
+// full duration of a slow/in-progress FIX attempt before ever reaching the poll loop. This drives
+// resumeInFlightJob directly (the exact call site runPipeline's recovery loop uses) against a REAL
+// jobs.FixRunner whose Fix Executor deliberately sleeps for a multi-second duration, and asserts
+// resumeInFlightJob itself returns near-instantly -- proving the caller (runPipeline, and by
+// extension the poll loop it starts immediately afterward) is never blocked on the attempt's own
+// duration. fixRunner.Wait (the shutdown-time drain path) is used afterward to prove the resumed
+// attempt actually did run to completion in the background, not that it was dropped.
+//
+// MUTATION-TEST NOTE: change resumeInFlightJob's FIX branch back to `if err :=
+// fixRunner.ResumeFix(ctx, payload.Input); err != nil { ... }` (its pre-fix, synchronous shape) and
+// this test goes red -- resumeInFlightJob does not return until the multi-second sleep completes,
+// blowing the generous-but-bounded "returned promptly" deadline this test asserts against.
+func TestResumeInFlightJob_SlowFixRunsAsyncAndDoesNotBlockCaller(t *testing.T) {
+	bareRepo := newMainTestBareFixtureRepo(t)
+	journal := state.OpenJournal(filepath.Join(t.TempDir(), "jobs.journal"))
+	sender := &mainTestRecordingSender{}
+	fp := &mainTestFakeProvider{pr: gitprovider.PR{ID: "1", URL: "https://example/pr/1"}}
+
+	const sleepSeconds = 3
+	fixRunner := &jobs.FixRunner{
+		WorkspaceRoot: t.TempDir(),
+		Journal:       journal,
+		Client:        sender,
+		Sink:          jobs.LocalDirArtifactSink{Root: t.TempDir()},
+		Caps:          jobs.NewFixCaps(10, 10, 2, nil),
+		Timeout:       10 * time.Second,
+		ResolveRepo: func(projectID string) (jobs.FixRepoConfig, bool, error) {
+			return jobs.FixRepoConfig{
+				Provider:      fp,
+				Repo:          gitprovider.RepoRef{Provider: "github", Owner: "o", Repo: "r"},
+				CloneURL:      bareRepo,
+				DefaultBranch: "main",
+			}, true, nil
+		},
+		// Deliberately slow: a real coding-agent CLI invocation would take at least this long, and
+		// nothing about resumeInFlightJob (the RED-FIRST assertion below) should have to wait for it.
+		ExecutorCmd: fmt.Sprintf(`sleep %d && echo "fix applied" >> fixed.txt && echo "applied fix" >> "$PROGRESS_MD"`, sleepSeconds),
+	}
+
+	in := jobs.FixJobInput{JobID: "slow-job", IssueID: "issue-slow", ProjectID: "proj-1", FixBrief: "x", TriggerSeq: 1}
+	payload, err := json.Marshal(struct {
+		Input      jobs.FixJobInput `json:"input"`
+		BaseCommit string           `json:"baseCommit"`
+	}{Input: in, BaseCommit: "deadbeef"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := journal.Append(state.Record{
+		JobID: in.JobID, IssueID: in.IssueID, Kind: jobs.FixKind, TriggerSeq: in.TriggerSeq,
+		State: state.StateFixRunning, Payload: payload,
+	}); err != nil {
+		t.Fatalf("journal.Append: %v", err)
+	}
+
+	inFlight, _, err := journal.RecoveryScan()
+	if err != nil {
+		t.Fatalf("RecoveryScan: %v", err)
+	}
+	if len(inFlight) != 1 {
+		t.Fatalf("expected exactly one in-flight job, got %d", len(inFlight))
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	start := time.Now()
+	resumeInFlightJob(context.Background(), nil, fixRunner, inFlight[0], logger)
+	elapsed := time.Since(start)
+
+	// A generous bound (well under sleepSeconds) that only a SYNCHRONOUS ResumeFix call could ever
+	// blow: DispatchResume's own goroutine/timeout/wg bookkeeping is essentially free.
+	if elapsed >= (sleepSeconds/2)*time.Second {
+		t.Fatalf("resumeInFlightJob took %s to return -- it must return promptly (before the FIX attempt itself finishes), not block on ResumeFix's own duration", elapsed)
+	}
+
+	// Prove the resumed attempt genuinely ran to completion in the background (not silently
+	// dropped): wait for it, bounded, then assert it reached CreatePR.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer waitCancel()
+	fixRunner.Wait(waitCtx)
+
+	if len(fp.created) != 1 {
+		t.Fatalf("expected the resumed FIX job to have reached CreatePR exactly once in the background, got %d", len(fp.created))
 	}
 }

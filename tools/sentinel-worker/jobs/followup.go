@@ -31,6 +31,11 @@ const (
 // decision (plan §4.1: "OpenAI's response_format json_schema.name is mandatory in strict mode").
 const followupSchemaName = "followup_decision"
 
+// followupPromptVersion tags the FOLLOW-UP system prompt so journaled decisions (plan §7 finding
+// 4's Decision.PromptVersion) can be correlated to the prompt revision that produced them, exactly
+// like triage.go's triagePromptVersion.
+const followupPromptVersion = "followup-v1"
+
 // followupDecisionSchema is the plan §4.3 FOLLOW-UP decision JSON schema, enforced by
 // llm/toolloop.go's validate-and-re-ask loop regardless of provider-side schema support.
 var followupDecisionSchema = llm.Schema{
@@ -211,16 +216,18 @@ func (a *FollowupAdvisor) Decide(ctx context.Context, in Input) (Decision, error
 		Comments: comments,
 	}
 	systemPrompt := BuildSystemPrompt(followupBasePrompt, untrusted)
+	userMsg := "Decide the FOLLOW-UP action for this job and respond with the JSON decision only."
 
 	req := llm.Request{
 		System: systemPrompt,
 		Messages: []llm.Msg{
-			{Role: llm.RoleUser, Text: "Decide the FOLLOW-UP action for this job and respond with the JSON decision only."},
+			{Role: llm.RoleUser, Text: userMsg},
 		},
 		Tools:          toolchain.Defs,
 		JSONSchema:     &followupDecisionSchema,
 		JSONSchemaName: followupSchemaName,
 	}
+	promptHash := PromptHash(systemPrompt, userMsg)
 
 	result, err := llm.RunLoop(ctx, a.Primary, a.Fallback, req, toolchain.Funcs, a.caps(), a.Breaker)
 	if err != nil {
@@ -235,5 +242,13 @@ func (a *FollowupAdvisor) Decide(ctx context.Context, in Input) (Decision, error
 		return Decision{}, fmt.Errorf("jobs: followup: decision failed to decode after schema validation: %w", err)
 	}
 
-	return Decision{Kind: "followup", Raw: json.RawMessage(result.Text), ToolOutputs: rec.All()}, nil
+	return Decision{
+		Kind:          "followup",
+		Raw:           json.RawMessage(result.Text),
+		ToolOutputs:   rec.All(),
+		Usage:         result.Usage,
+		Provider:      result.Provider,
+		PromptSHA256:  promptHash,
+		PromptVersion: followupPromptVersion,
+	}, nil
 }

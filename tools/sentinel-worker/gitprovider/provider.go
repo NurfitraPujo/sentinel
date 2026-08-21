@@ -13,6 +13,7 @@ package gitprovider
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
 )
 
@@ -126,6 +127,32 @@ func (c GitCredential) secrets() []string {
 	}
 	return out
 }
+
+// Secrets is the exported form of secrets: the credential's own secret material (token, or
+// username+app-password), for callers outside this package that must add the RUNTIME
+// server-managed repo credential to their own redactors and to guard.Check's secret list —
+// e.g. jobs.RunFix threading the credential ResolveRepo/repo.Provider.Auth() returns into the
+// per-job redactors and BuildFixPRSpec, alongside the static env-derived secret list (finding 8,
+// C16 primary credential path). It intentionally excludes non-secret identifiers such as
+// Bitbucket's plain account username or its "x-token-auth" constant, same as secrets().
+func (c GitCredential) Secrets() []string {
+	return c.secrets()
+}
+
+// String implements fmt.Stringer (git-security finding 2) so a bare %v/%s of a GitCredential (or
+// a struct embedding one — e.g. a future debug dump, an fmt.Errorf that captures %v of an
+// argument by mistake) never prints username/password in the clear, matching
+// settings.CredentialSecret's existing redaction discipline.
+func (c GitCredential) String() string { return "gitprovider.GitCredential{[REDACTED]}" }
+
+// GoString implements fmt.GoStringer so the "%#v" verb — which reflects over a struct's fields
+// directly and is NOT intercepted by String()/LogValue(), only by GoStringer — also never prints
+// the plaintext username/password.
+func (c GitCredential) GoString() string { return "gitprovider.GitCredential{[REDACTED]}" }
+
+// LogValue implements slog.LogValuer so a bare slog attribute holding a GitCredential never emits
+// the plaintext secret either.
+func (c GitCredential) LogValue() slog.Value { return slog.StringValue("[REDACTED]") }
 
 // Provider is the per-forge implementation the worker's FIX flow (N8f) drives: authenticate git
 // operations via Auth(), then open and poll a pull request via CreatePR/PRStatus.

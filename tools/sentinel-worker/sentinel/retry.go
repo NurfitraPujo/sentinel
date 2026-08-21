@@ -320,6 +320,18 @@ const (
 // git:<provider> are built by the caller per configured provider via ScopeLLM/ScopeGit.
 const ScopeSentinelAPI = "sentinel-api"
 
+// ScopeSentinelAPIPoll is the poll loop's OWN sentinel-api circuit scope, separate from
+// ScopeSentinelAPI (used by the runner/dispatcher's write-path calls). N8h's "share the breaker"
+// remediation collapsed these into one instance so the runner's RecordFailure streak and the poll
+// loop's RecordSuccess streak fed the same counter -- the poll loop succeeds roughly every
+// WorkerPollInterval (~10s) even while every runner call is failing, so its RecordSuccess reset the
+// runner's consecutive-failure count to 0 before it could ever reach consecutiveFailuresToOpen (5).
+// That made the write-path circuit effectively unable to open. Restoring separate accumulators (one
+// per scope) fixes the regression; both breakers still publish to the /metrics circuit_state gauge
+// (main.go's publishCircuitStateGauge, once per scope) so the gauge-visibility goal N8h was chasing
+// is preserved without recreating the shared-streak bug.
+const ScopeSentinelAPIPoll = "sentinel-api-poll"
+
 // ScopeLLM builds the "llm:<provider>" circuit scope (plan §2.4: "pauses brain jobs; fallback
 // provider takes over if configured").
 func ScopeLLM(provider string) string { return "llm:" + provider }

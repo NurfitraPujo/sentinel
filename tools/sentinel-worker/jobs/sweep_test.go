@@ -63,7 +63,7 @@ func (s *recordingSweepServer) server() *httptest.Server {
 			}
 		case r.URL.Path == "/api/agent/batch":
 			w.WriteHeader(200)
-			w.Write([]byte(`{"completed":true,"results":[{"status":200},{"status":200}]}`))
+			w.Write([]byte(`{"completed":2,"results":[{"status":200},{"status":200}]}`))
 		default:
 			w.WriteHeader(200)
 			w.Write([]byte(`{}`))

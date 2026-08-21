@@ -135,10 +135,15 @@ func (g *Guard) evaluateAndRotate(ctx context.Context) {
 	}
 	now := g.now()
 	trigger := Evaluate(info, now, g.RotateBeforeHours, g.RotateEveryDays)
-	if trigger == TriggerNone {
-		return
-	}
 
+	// Finding 7 (core-robustness round 3): the orphaned-key persist retry MUST be checked before
+	// the TriggerNone early return below, not after. A prior tick can mint a key server-side, fail
+	// to persist it, and latch g.orphanedKey -- but by the time the NEXT tick runs, the server-side
+	// rotation already happened, so Evaluate(info, ...) against the freshly-rotated key's own
+	// createdAt/expiresAt legitimately returns TriggerNone (the just-minted key isn't due for
+	// rotation itself). With the pending check previously sitting AFTER the TriggerNone return,
+	// every subsequent tick took that return and the retry branch below was unreachable for the
+	// rest of this process's life -- a durably-lost rotated key stayed orphaned until restart.
 	g.mu.Lock()
 	pending := g.orphanedKey
 	g.mu.Unlock()
@@ -151,6 +156,10 @@ func (g *Guard) evaluateAndRotate(ctx context.Context) {
 				g.Log.Warn("keyguard: a prior rotation minted a new key but failed to persist it (orphaned key); still not durably stored, not calling rotate again until a persist succeeds or the process restarts", "trigger", trigger, "error", err)
 			}
 		}
+		return
+	}
+
+	if trigger == TriggerNone {
 		return
 	}
 

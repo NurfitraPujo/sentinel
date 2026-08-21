@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 )
@@ -91,4 +92,26 @@ func (c HTTPClaimer) EnsureClaimed(ctx context.Context, issueID string) (bool, s
 		// `failed`) a deletion forever.
 		return false, "", fmt.Errorf("POST /api/agent/issues/%s/claim: %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
 	}
+}
+
+// ReleaseClaim implements Claimer.ReleaseClaim (finding 3, core-robustness round 3): posts a
+// single-op `issues.claim.release` batch, the same op jobs/act.go's opBuilder.addRelease and
+// jobs/fix.go's releaseWithComment already send for a successful disposition's release path. This
+// is a best-effort, standalone release with no accompanying comment -- the caller (Runner) is
+// releasing after a PERMANENT terminal failure/skip that already journaled its own reason, not a
+// normal disposition-driven release, so there is no decision-authored body to post alongside it.
+// The idempotency key is derived from issueID plus a nanosecond timestamp rather than a jobID
+// (this seam is not job-scoped) -- ReleaseClaim is called at most once per failure by its callers
+// (never itself retried), so key collision across calls is not a concern.
+func (c HTTPClaimer) ReleaseClaim(ctx context.Context, issueID string) error {
+	key := fmt.Sprintf("runner-release:%s:%d", issueID, time.Now().UnixNano())
+	op := sentinel.NewBatchOperation("issues.claim.release", issueID, nil, key)
+	res, err := c.Client.PostBatch(ctx, sentinel.BatchRequest{Operations: []sentinel.BatchOperation{op}, StopOnError: false})
+	if err != nil {
+		return fmt.Errorf("releasing claim on issue %s: %w", issueID, err)
+	}
+	if res.Status < 200 || res.Status >= 300 {
+		return fmt.Errorf("POST /api/agent/batch (release issue %s): %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
+	}
+	return nil
 }

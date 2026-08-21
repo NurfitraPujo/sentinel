@@ -25,11 +25,21 @@ const (
 	// MetricEventsConsumed counts every feed event the poll loop drains and hands to the
 	// dispatcher (loop.PollLoop.OnEvent), regardless of job kind or outcome.
 	MetricEventsConsumed = "events_consumed"
-	// MetricCursorLag is a point-in-time backlog signal set from loop.PollLoop.OnPageDrained: 0
-	// once a poll cycle has fully drained the feed (hasMore=false), otherwise the size of the last
-	// still-pending page. GET /api/agent/events never reports the feed's true head seq (only the
-	// cursor of the page just returned -- see events.ts's listOrgActivity), so this is a "still
-	// catching up, roughly this many more in flight" signal, not an exact head-minus-cursor count.
+	// MetricCursorLag is a backlog signal set from loop.PollLoop.OnPageDrained: the CUMULATIVE
+	// event count across every page fetched during the most recent whole PollOnce drain cycle
+	// (multiple pages chained by hasMore==true count together), not just the last page's count.
+	// GET /api/agent/events never reports the feed's true head seq (only the cursor of the page
+	// just returned -- see events.ts's listOrgActivity), so this is a "roughly this many events
+	// were in flight across the last drain" signal, not an exact head-minus-cursor count. A real
+	// multi-page backlog can therefore report a total exceeding EventsMaxLimit (200) while
+	// draining. It settles to 0 only once a genuinely empty page starts (and, alone, ends) a
+	// cycle, which is what "caught up" actually looks like against this feed.
+	//
+	// circuit-config-sec finding 4 (round 2): an earlier fix reported only the TAIL page's event
+	// count, which cannot distinguish a real multi-page backlog from a small burst on an
+	// otherwise-caught-up feed -- both settle to the same small per-page number. Accumulating
+	// across the whole cycle instead makes backlog size and burst size distinguishable: only a
+	// genuine backlog can push the total above a single page's ceiling.
 	MetricCursorLag = "cursor_lag"
 	// MetricBootstrapEnqueued counts synthetic TRIAGE jobs a bootstrap sweep actually enqueued
 	// (backfilled instead of being (re)discovered via feed replay). Kept distinct from
@@ -77,7 +87,57 @@ const (
 	// state gauge per scope"): 0=closed, 1=open, 2=half-open (sentinel.CircuitState's own values).
 	// Built via CircuitStateMetricName.
 	circuitStatePrefix = "circuit_state"
+
+	// MetricHeartbeatsPosted counts every claim-heartbeat issues.progress update the periodic
+	// Sweep pass (jobs.Sweep.heartbeatOne) actually POSTs (plan §7 "heartbeats_posted"). Wired
+	// from main.go via jobs.Sweep.OnHeartbeatPosted.
+	MetricHeartbeatsPosted = "heartbeats_posted"
+
+	// MetricFixAttempts counts every genuine FIX attempt jobs.FixRunner.RunFix starts -- past the
+	// no-repo-connection and attempts/day-cap gates, i.e. an attempt that actually runs the
+	// executor (plan §7 "fix_attempts"). Wired from main.go via FixRunner.OnEvent's
+	// "attempt-started" event.
+	MetricFixAttempts = "fix_attempts"
+
+	// MetricPRsOpened counts every FIX-originated pull request actually opened (plan §7
+	// "prs_opened"). Wired from main.go via FixRunner.OnEvent's "pr-opened" event.
+	MetricPRsOpened = "prs_opened"
+
+	// llmTokensPrefix names the per-provider counter family "llm_tokens_<provider>" (plan §7
+	// "llm_tokens by provider"), where provider is the label llm.RunLoop itself reports
+	// ("primary"/"fallback"). Built via LLMTokensMetricName.
+	llmTokensPrefix = "llm_tokens"
+
+	// MetricBudgetRemaining is the plan §7 "budget_remaining" gauge: tokens left in
+	// WORKER_DAILY_TOKEN_BUDGET's current UTC day (llm.DailyBudget.Remaining()). Wired from
+	// main.go via loop.Runner.OnUsage.
+	MetricBudgetRemaining = "budget_remaining"
+
+	// Finding 10: the §7 "cap remaining" family previously exposed ONLY the LLM token budget
+	// (MetricBudgetRemaining above) -- none of the FIX engine's own volume caps
+	// (WORKER_MAX_FIX_JOBS_PER_DAY, WORKER_MAX_PRS_PER_DAY) or the TRIAGE/FOLLOW-UP hourly caps
+	// (WORKER_MAX_TRIAGE_PER_HOUR, WORKER_MAX_FOLLOWUP_PER_HOUR) had a Remaining() gauge at all, so
+	// an operator watching /metrics could see budget_remaining drop to zero but had no equivalent
+	// signal for "about to hit the daily FIX-job cap" or "about to hit the hourly TRIAGE cap." These
+	// four mirror MetricBudgetRemaining's own -1-means-unlimited convention (jobs.FixCaps/
+	// llm.DailyCounter/llm.HourlyCounter's Remaining() methods all follow it too).
+	MetricFixJobsRemaining         = "fix_jobs_remaining"
+	MetricPRsRemaining             = "prs_remaining"
+	MetricTriagePerHourRemaining   = "triage_per_hour_remaining"
+	MetricFollowupPerHourRemaining = "followup_per_hour_remaining"
+
+	// MetricGateRejections counts every candidate the plan §4.6 published-field gate
+	// (guard.Check/CheckWithConfig) rejected -- length, secret-containment, or verbatim-coverage
+	// (plan §7 "gate_rejections"). Wired from main.go via guard.OnRejection.
+	MetricGateRejections = "gate_rejections"
 )
+
+// LLMTokensMetricName builds the flat counter name for one provider label's token spend (e.g.
+// llm_tokens_primary, llm_tokens_fallback), same sanitize-then-flatten convention as
+// JobsTotalMetricName/CredentialAvailableMetricName.
+func LLMTokensMetricName(provider string) string {
+	return sanitizeMetricName(llmTokensPrefix + "_" + provider)
+}
 
 // CircuitOpenEventsMetricName builds the flat counter name for one dependency scope's circuit-open
 // event count (e.g. circuit_open_events_sentinel_api), same sanitize-then-flatten convention as

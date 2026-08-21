@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/gitprovider"
+	guardpkg "github.com/NurfitraPujo/sentinel/tools/sentinel-worker/guard"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/health"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/jobs"
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/keyguard"
@@ -105,8 +106,12 @@ type Config struct {
 	WorkerMaxFixJobsPerDay int
 	WorkerMaxPRsPerDay     int
 	WorkerMaxTriagePerHour int
-	WorkerFixConfidence    float64
-	WorkerFixMaxFiles      int
+	// WorkerMaxFollowupPerHour caps FOLLOW-UP job starts per hour (finding 5, core-robustness
+	// round 3), symmetric to WorkerMaxTriagePerHour -- WORKER_DAILY_TOKEN_BUDGET defaults to 0
+	// (unlimited), so without this cap FOLLOW-UP spend had no effective ceiling by default.
+	WorkerMaxFollowupPerHour int
+	WorkerFixConfidence      float64
+	WorkerFixMaxFiles        int
 
 	// Claims
 	WorkerClaimHeartbeat time.Duration
@@ -133,13 +138,23 @@ type Config struct {
 	WorkerKeyguardInterval time.Duration
 
 	// Git
-	WorkerRepoCacheDir           string
-	WorkerRepoRefresh            time.Duration
-	GitGitHubToken               string
-	GitBitbucketToken            string
-	GitBitbucketUser             string
-	GitBitbucketAppPassword      string
-	FixExecutorCmd               string
+	WorkerRepoCacheDir      string
+	WorkerRepoRefresh       time.Duration
+	GitGitHubToken          string
+	GitBitbucketToken       string
+	GitBitbucketUser        string
+	GitBitbucketAppPassword string
+	FixExecutorCmd          string
+	// WorkerFixExecutorEnv is WORKER_FIX_EXECUTOR_ENV parsed (finding 4, fix-lifecycle remediation
+	// round 2): a comma/newline-separated list of KEY=VALUE (literal passthrough value) or bare KEY
+	// (passed through from the worker's own process environment, if set) entries that feed
+	// jobs.FixRunner.ExecutorEnv -- the ONLY channel through which the Fix Executor ($FIX_EXECUTOR_CMD,
+	// e.g. droid) receives ITS OWN credentials (its DeepSeek/model API key), since the worker's own
+	// process environment is never inherited into the executor's child (jobs/fix_executor.go's trust
+	// boundary). Every key is still validated against jobs.IsForbiddenExecutorEnvKey below, at
+	// config-load time -- an operator cannot use this to smuggle the worker's own SENTINEL_AGENT_KEY/
+	// LLM_API_KEY/git tokens to the executor.
+	WorkerFixExecutorEnv         map[string]string
 	WorkerWorkspaceDir           string
 	WorkerKeepFailedWorkspaces   bool
 	WorkerWorkspaceRetentionDays int
@@ -246,6 +261,57 @@ func getList(env envLookup, key string) []string {
 	return out
 }
 
+// parseFixExecutorEnv parses WORKER_FIX_EXECUTOR_ENV (finding 4, fix-lifecycle remediation round
+// 2): a comma-and/or-newline-separated list of entries, each either "KEY=VALUE" (a literal value
+// to hand the Fix Executor verbatim -- e.g. a DeepSeek API key) or a bare "KEY" (passed through
+// from the WORKER's own process environment via env, if set; silently omitted if unset -- an
+// operator listing a defensive/optional key should not fail config validation over it not being
+// present). Every resulting key is checked against jobs.IsForbiddenExecutorEnvKey -- a forbidden
+// key (SENTINEL_AGENT_KEY, any LLM_*_API_KEY, any git provider token) is a collected validation
+// error, not silently dropped or silently applied, matching every other WORKER_* validation error's
+// posture (plan §6: invalid config keeps the process up with /readyz failing). An empty key on
+// either side of "=" ("=VALUE", "KEY=", or a blank entry from a stray delimiter) is also a
+// validation error.
+func parseFixExecutorEnv(env envLookup, raw string, errs *[]string) map[string]string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, line := range strings.Split(raw, "\n") {
+		for _, entry := range strings.Split(line, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			var key, value string
+			if idx := strings.Index(entry, "="); idx >= 0 {
+				key = strings.TrimSpace(entry[:idx])
+				value = entry[idx+1:]
+			} else {
+				key = entry
+				v, ok := env(key)
+				if !ok {
+					continue // bare KEY not set in the worker's own env -- silently omitted, not an error
+				}
+				value = v
+			}
+			if key == "" {
+				*errs = append(*errs, fmt.Sprintf("WORKER_FIX_EXECUTOR_ENV: entry %q has an empty key", entry))
+				continue
+			}
+			if jobs.IsForbiddenExecutorEnvKey(key) {
+				*errs = append(*errs, fmt.Sprintf("WORKER_FIX_EXECUTOR_ENV: key %q is forbidden -- the Fix Executor must never receive Sentinel/LLM/git-token secrets", key))
+				continue
+			}
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // LoadConfig reads the full §5 surface from env, applying every documented default and collecting
 // every validation error (never fatal-on-first). The second return value is nil when config is
 // valid; a non-nil, non-empty slice means the caller should NOT exit but should keep the process
@@ -282,19 +348,20 @@ func LoadConfig(env envLookup) (Config, []string) {
 		LLMFallbackAPIKey:   getStr(env, "LLM_FALLBACK_API_KEY", ""),
 		LLMFallbackBaseURL:  getStr(env, "LLM_FALLBACK_BASE_URL", ""),
 
-		WorkerDailyTokenBudget: getInt(env, "WORKER_DAILY_TOKEN_BUDGET", 0, &errs),
-		WorkerTriageMaxTurns:   getInt(env, "WORKER_TRIAGE_MAX_TURNS", 6, &errs),
-		WorkerFollowupMaxTurns: getInt(env, "WORKER_FOLLOWUP_MAX_TURNS", 4, &errs),
-		WorkerMaxOutputTokens:  getInt(env, "WORKER_MAX_OUTPUT_TOKENS", 0, &errs),
-		WorkerTriageTimeout:    getDuration(env, "WORKER_TRIAGE_TIMEOUT", 3*time.Minute, &errs),
-		WorkerFollowupTimeout:  getDuration(env, "WORKER_FOLLOWUP_TIMEOUT", 2*time.Minute, &errs),
-		WorkerFixTimeout:       getDuration(env, "WORKER_FIX_TIMEOUT", 30*time.Minute, &errs),
-		WorkerMaxFixAttempts:   getInt(env, "WORKER_MAX_FIX_ATTEMPTS", 2, &errs),
-		WorkerMaxFixJobsPerDay: getInt(env, "WORKER_MAX_FIX_JOBS_PER_DAY", 10, &errs),
-		WorkerMaxPRsPerDay:     getInt(env, "WORKER_MAX_PRS_PER_DAY", 10, &errs),
-		WorkerMaxTriagePerHour: getInt(env, "WORKER_MAX_TRIAGE_PER_HOUR", 60, &errs),
-		WorkerFixConfidence:    getFloat(env, "WORKER_FIX_CONFIDENCE", 0.7, &errs),
-		WorkerFixMaxFiles:      getInt(env, "WORKER_FIX_MAX_FILES", 20, &errs),
+		WorkerDailyTokenBudget:   getInt(env, "WORKER_DAILY_TOKEN_BUDGET", 0, &errs),
+		WorkerTriageMaxTurns:     getInt(env, "WORKER_TRIAGE_MAX_TURNS", 6, &errs),
+		WorkerFollowupMaxTurns:   getInt(env, "WORKER_FOLLOWUP_MAX_TURNS", 4, &errs),
+		WorkerMaxOutputTokens:    getInt(env, "WORKER_MAX_OUTPUT_TOKENS", 0, &errs),
+		WorkerTriageTimeout:      getDuration(env, "WORKER_TRIAGE_TIMEOUT", 3*time.Minute, &errs),
+		WorkerFollowupTimeout:    getDuration(env, "WORKER_FOLLOWUP_TIMEOUT", 2*time.Minute, &errs),
+		WorkerFixTimeout:         getDuration(env, "WORKER_FIX_TIMEOUT", 30*time.Minute, &errs),
+		WorkerMaxFixAttempts:     getInt(env, "WORKER_MAX_FIX_ATTEMPTS", 2, &errs),
+		WorkerMaxFixJobsPerDay:   getInt(env, "WORKER_MAX_FIX_JOBS_PER_DAY", 10, &errs),
+		WorkerMaxPRsPerDay:       getInt(env, "WORKER_MAX_PRS_PER_DAY", 10, &errs),
+		WorkerMaxTriagePerHour:   getInt(env, "WORKER_MAX_TRIAGE_PER_HOUR", 60, &errs),
+		WorkerMaxFollowupPerHour: getInt(env, "WORKER_MAX_FOLLOWUP_PER_HOUR", 60, &errs),
+		WorkerFixConfidence:      getFloat(env, "WORKER_FIX_CONFIDENCE", 0.7, &errs),
+		WorkerFixMaxFiles:        getInt(env, "WORKER_FIX_MAX_FILES", 20, &errs),
 
 		WorkerClaimHeartbeat: getDuration(env, "WORKER_CLAIM_HEARTBEAT", 12*time.Hour, &errs),
 		WorkerNagDays:        getInt(env, "WORKER_NAG_DAYS", 3, &errs),
@@ -320,6 +387,7 @@ func LoadConfig(env envLookup) (Config, []string) {
 		GitBitbucketUser:        getStr(env, "GIT_BITBUCKET_USER", ""),
 		GitBitbucketAppPassword: getStr(env, "GIT_BITBUCKET_APP_PASSWORD", ""),
 		FixExecutorCmd:          getStr(env, "FIX_EXECUTOR_CMD", ""),
+		WorkerFixExecutorEnv:    parseFixExecutorEnv(env, getStr(env, "WORKER_FIX_EXECUTOR_ENV", ""), &errs),
 		// plan §4.5: Fix Executor workspaces are a trust boundary -- an external coding CLI runs
 		// arbitrary repo code there -- and must NEVER be co-located under WORKER_STATE_DIR (that
 		// would also drag every clone into §2.8's periodic state-dir snapshot tarball). Default
@@ -353,6 +421,19 @@ func LoadConfig(env envLookup) (Config, []string) {
 		}
 		if c.SentinelAgentKey == "" {
 			errs = append(errs, "SENTINEL_AGENT_KEY: required when WORKER_ENABLED=true (or a keystore must provide one)")
+		}
+		// circuit-config-sec finding 2: an empty LLM_MODEL (or, for a non-local provider, an empty
+		// LLM_API_KEY) with WORKER_ENABLED=true previously passed validation, started the pipeline,
+		// and reported ready -- every TRIAGE/FOLLOW-UP job then failed at the first llm.New/RunLoop
+		// call instead of at startup, where an operator would actually see it. "local" is reserved
+		// for a future in-process provider that needs no credential (none exists yet, so this arm is
+		// currently unreachable, but the check is written to already do the right thing when one
+		// lands rather than needing a second fix then).
+		if c.LLMModel == "" {
+			errs = append(errs, "LLM_MODEL: required when WORKER_ENABLED=true")
+		}
+		if c.LLMAPIKey == "" && c.LLMProvider != "local" {
+			errs = append(errs, "LLM_API_KEY: required when WORKER_ENABLED=true (unless LLM_PROVIDER=local)")
 		}
 	}
 	if c.WorkerPollJitter < 0 || c.WorkerPollJitter > 1 {
@@ -440,6 +521,7 @@ func LoadConfig(env envLookup) (Config, []string) {
 	requireNonNegative(&errs, "WORKER_MAX_FIX_JOBS_PER_DAY", c.WorkerMaxFixJobsPerDay)
 	requireNonNegative(&errs, "WORKER_MAX_PRS_PER_DAY", c.WorkerMaxPRsPerDay)
 	requireNonNegative(&errs, "WORKER_MAX_TRIAGE_PER_HOUR", c.WorkerMaxTriagePerHour)
+	requireNonNegative(&errs, "WORKER_MAX_FOLLOWUP_PER_HOUR", c.WorkerMaxFollowupPerHour)
 	requireNonNegative(&errs, "WORKER_FIX_MAX_FILES", c.WorkerFixMaxFiles)
 	requireNonNegative(&errs, "WORKER_NAG_DAYS", c.WorkerNagDays)
 	requireNonNegative(&errs, "WORKER_WORKSPACE_RETENTION_DAYS", c.WorkerWorkspaceRetentionDays)
@@ -462,7 +544,67 @@ func LoadConfig(env envLookup) (Config, []string) {
 		errs = append(errs, "WORKER_REPO_CACHE_DIR: must not be under WORKER_STATE_DIR (plan §4.5)")
 	}
 
+	// finding 3 (durability-startup remediation): WORKER_EVENT_TYPES was previously passed straight
+	// to loop.NewEventsClient unvalidated. A typo (e.g. "ocurrence_burst") produces a server-side
+	// 400 on every /api/agent/events poll forever -- ClassPermanent, so it backs off and never
+	// recovers, wedging the circuit. Reject any entry that isn't one of the event types
+	// loop/dispatch.go's Classify actually understands.
+	for _, t := range c.WorkerEventTypes {
+		if !knownEventTypes[t] {
+			errs = append(errs, fmt.Sprintf("WORKER_EVENT_TYPES: unknown event type %q (known: created, report_created, occurrence_burst, regressed, question_answered, commented, claim_released, status_changed, issue_deleted)", t))
+		}
+	}
+
 	return c, errs
+}
+
+// knownEventTypes is the server event-type vocabulary loop/dispatch.go's Classify switches on.
+// Kept in main.go (rather than imported from loop) so LoadConfig's validation has no dependency on
+// loop's Event/Kind types -- this is deliberately just the set of literal strings Classify's switch
+// cases match, kept in sync with it by hand (grep loop/dispatch.go's `case "..."` lines when adding
+// a new event type).
+var knownEventTypes = map[string]bool{
+	"created":           true,
+	"report_created":    true,
+	"occurrence_burst":  true,
+	"regressed":         true,
+	"question_answered": true,
+	"commented":         true,
+	"claim_released":    true,
+	"status_changed":    true,
+	"issue_deleted":     true,
+}
+
+// controlPlaneEventTypes is the subset of knownEventTypes the dispatcher needs regardless of what
+// an operator is trying to filter FOR (plan §5's WORKER_EVENT_TYPES is meant to narrow which
+// content-trigger events cause new triage/followup work, not to silently disable reaped-claim
+// reconciliation, resolved-issue cancellation, or deletion tombstoning). Finding 3 (minor): a
+// narrow-but-valid allowlist that omits these silently drops control-plane events the dispatcher
+// depends on.
+var controlPlaneEventTypes = []string{"status_changed", "claim_released", "issue_deleted"}
+
+// warnIfEventTypeFilterOmitsControlPlane logs (does not error -- a non-empty filter omitting these
+// is a valid, if unusual, choice) when a configured WORKER_EVENT_TYPES filter would silently drop
+// one of the control-plane event types the dispatcher relies on. An empty filter (no restriction)
+// never warns.
+func warnIfEventTypeFilterOmitsControlPlane(types []string, logger *slog.Logger) {
+	if len(types) == 0 || logger == nil {
+		return
+	}
+	allowed := make(map[string]bool, len(types))
+	for _, t := range types {
+		allowed[t] = true
+	}
+	var missing []string
+	for _, t := range controlPlaneEventTypes {
+		if !allowed[t] {
+			missing = append(missing, t)
+		}
+	}
+	if len(missing) > 0 {
+		logger.Warn("WORKER_EVENT_TYPES omits control-plane event types the dispatcher needs for reaped-claim reconcile, resolved-issue cancellation, and deletion tombstoning -- this is only safe if that's deliberate",
+			"omitted", missing, "configured", types)
+	}
 }
 
 // requireNonNegative collects a validation error when v < 0 (plan §2.6's budget/volume-cap knobs
@@ -513,6 +655,7 @@ func main() {
 	for _, e := range errs {
 		logger.Error("config validation error", "detail", e)
 	}
+	warnIfEventTypeFilterOmitsControlPlane(cfg.WorkerEventTypes, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -559,6 +702,21 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 		st.SetReady(false, "invalid configuration")
 	}
 
+	// Finding 4 (durability-startup remediation, plan §6): a startup free-disk guard on
+	// WORKER_STATE_DIR. The corruption mode this prevents is cursor.go/journal.go's tmp-file +
+	// os.Rename atomic-write pattern silently failing (or worse, partially succeeding) when the
+	// volume is nearly full -- a torn write that Append's own self-healing (see journal.go's doc
+	// comment) cannot fully protect against once the filesystem itself has no room left to even
+	// write the healing leading '\n'. Runs only when config is valid (a garbage WORKER_STATE_DIR
+	// path from an invalid config would make Statfs itself meaningless) and after SetReady above,
+	// so a low-disk condition additionally flips readiness rather than merely being logged.
+	if configValid {
+		if err := checkStateDirFreeDisk(cfg.WorkerStateDir, statfsFree); err != nil {
+			logger.Error("startup free-disk guard failed on WORKER_STATE_DIR; refusing readiness", "stateDir", cfg.WorkerStateDir, "error", err)
+			st.SetReady(false, err.Error())
+		}
+	}
+
 	srv := &http.Server{Addr: cfg.WorkerHealthAddr, Handler: health.Handler(st)}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -571,6 +729,14 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 	// rather than a plain field: runPipeline's goroutine writes it once, runWorker's goroutine reads
 	// it after ctx is cancelled -- concurrent by construction.
 	var dispatcherPtr atomic.Pointer[loop.Dispatcher]
+	// fixRunnerPtr is the same publish-once/read-after-cancel pattern as dispatcherPtr, for finding
+	// 3: runWorker's shutdown path calls FixRunner.Wait (bounded by WORKER_SHUTDOWN_TIMEOUT) so a
+	// SIGTERM waits for in-flight FIX goroutines' resume-save, not just the dispatcher's own queues.
+	var fixRunnerPtr atomic.Pointer[jobs.FixRunner]
+	// snapshotPtr is the same publish-once/read-after-cancel pattern, for finding 1 (plan §2.8):
+	// runWorker's shutdown path uploads one final snapshot before exit ("upload ... on SIGTERM
+	// before exit"), using whatever snapshotManager runPipeline assembled.
+	var snapshotPtr atomic.Pointer[snapshotManager]
 
 	if configValid {
 		// The cursor-freshness window MUST be armed here, before runPipeline's goroutine even
@@ -589,7 +755,7 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 		// legitimately still starting up; a genuinely wedged pipeline still trips it well before
 		// an operator would otherwise notice.
 		st.SetCursorFreshnessWindow(cursorFreshnessStartupWindow(cfg.WorkerPollInterval))
-		go runPipeline(ctx, cfg, logger, st, &dispatcherPtr)
+		go runPipeline(ctx, cfg, logger, st, &dispatcherPtr, &fixRunnerPtr, &snapshotPtr)
 	} else {
 		logger.Error("skipping poll/dispatch pipeline: invalid configuration, /readyz will report not-ready")
 	}
@@ -612,6 +778,28 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 		logger.Info("draining in-flight jobs before exit", "timeout", cfg.WorkerShutdownTimeout)
 		d.Drain(drainCtx)
 	}
+	// Finding 3: wait for any in-flight FIX goroutine (jobs.FixRunner.Dispatch) to actually finish
+	// -- including its live resume-save -- bounded by the SAME WORKER_SHUTDOWN_TIMEOUT the
+	// dispatcher drain above uses. fixRunnerPtr is nil until buildFixRunner has run (deployment-
+	// disabled FIX engine, or a very-early SIGTERM racing runPipeline's setup) -- FixRunner.Wait is
+	// safe to call on a nil receiver regardless, so no separate nil check is needed here either.
+	if fr := fixRunnerPtr.Load(); fr != nil {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), cfg.WorkerShutdownTimeout)
+		defer waitCancel()
+		logger.Info("waiting for in-flight FIX goroutines before exit", "timeout", cfg.WorkerShutdownTimeout)
+		fr.Wait(waitCtx)
+	}
+	// Finding 1 (plan §2.8): "upload on SIGTERM before exit" -- one final snapshot upload using a
+	// fresh (not the already-cancelled shutdown ctx) bounded context, so a graceful
+	// reschedule/drain/rollout never loses journal+cursor state even on the emptyDir-only primary
+	// deployment target. snapshotPtr is nil until runPipeline has assembled it, which can race a
+	// very-early SIGTERM -- nothing to upload in that case.
+	if sm := snapshotPtr.Load(); sm != nil {
+		snapCtx, snapCancel := context.WithTimeout(context.Background(), cfg.WorkerShutdownTimeout)
+		logger.Info("uploading final state snapshot before exit")
+		sm.upload(snapCtx)
+		snapCancel()
+	}
 	logger.Info("sentinel-worker stopped")
 }
 
@@ -621,6 +809,186 @@ func runWorker(ctx context.Context, cfg Config, logger *slog.Logger, configValid
 // is treated as writable by writableKeyStore below.
 type keyStoreWritabilityChecker interface {
 	Writable(ctx context.Context) bool
+}
+
+// minStateDirFreeBytes is the plan §6 startup free-disk threshold: below this many available
+// bytes on WORKER_STATE_DIR, the worker refuses readiness rather than risk a torn tmp+rename write
+// (cursor.go/journal.go's durability contract) on an almost-full volume.
+const minStateDirFreeBytes = 100 * 1024 * 1024 // 100MB
+
+// statfsFree reports the available bytes (not just free -- unprivileged-usable, i.e. Bavail) on
+// the filesystem containing path, via syscall.Statfs. A var (not a plain func call) so tests can
+// stub it without needing an actual near-full filesystem to reproduce the guard.
+var statfsFree = func(path string) (uint64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return uint64(stat.Bavail) * uint64(stat.Bsize), nil
+}
+
+// checkStateDirFreeDisk implements the plan §6 startup guard: refuses (returns an error) when
+// statfsFree reports fewer than minStateDirFreeBytes available on stateDir. stateDir is created
+// first if missing (a fresh emptyDir mount may not exist yet at the instant this runs) so Statfs
+// has something to measure; a failure to create it is itself reported as the guard's error, since
+// the pipeline could not write there either way.
+func checkStateDirFreeDisk(stateDir string, free func(path string) (uint64, error)) error {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("state dir free-disk guard: creating %s: %w", stateDir, err)
+	}
+	available, err := free(stateDir)
+	if err != nil {
+		return fmt.Errorf("state dir free-disk guard: statfs %s: %w", stateDir, err)
+	}
+	if available < minStateDirFreeBytes {
+		return fmt.Errorf("state dir free-disk guard: %s has only %d bytes available, below the %d-byte minimum (plan §6: refuses to start rather than risk a torn tmp+rename write)", stateDir, available, minStateDirFreeBytes)
+	}
+	return nil
+}
+
+// buildSnapshotter constructs the plan §2.8 state.Snapshotter named by WORKER_SNAPSHOT_BACKEND
+// (LoadConfig has already validated it is "none" or "s3", and that S3_BUCKET/S3_ENDPOINT are set
+// when "s3"). "none" (the default) yields state.NoneSnapshotter{}, matching the rev-4 k8s
+// emptyDir-with-no-PVC deployment decision when an operator hasn't opted into durability.
+func buildSnapshotter(cfg Config) state.Snapshotter {
+	if cfg.WorkerSnapshotBackend != "s3" {
+		return state.NoneSnapshotter{}
+	}
+	return state.NewS3Snapshotter(state.S3Config{
+		Endpoint:  cfg.S3Endpoint,
+		Bucket:    cfg.S3Bucket,
+		Prefix:    cfg.S3Prefix,
+		Region:    cfg.S3Region,
+		AccessKey: cfg.S3AccessKey,
+		SecretKey: cfg.S3SecretKey,
+	}, nil)
+}
+
+// snapshotManager wires the plan §2.8 state-snapshot lifecycle around a state.Snapshotter:
+// restore-on-empty-startup, periodic upload every WORKER_SNAPSHOT_INTERVAL, upload on SIGTERM
+// before exit, and upload after journal compaction. It owns the monotonic generation counter
+// Upload's stale-writer guard requires -- seeded from whatever generation RestoreLatest reports
+// (0 if nothing was restored), and advanced by one on every subsequent upload attempt (even a
+// failed one: a failed upload must not retry the SAME generation number next time, since we can't
+// tell whether the object landed before the failure was observed).
+type snapshotManager struct {
+	snap     state.Snapshotter
+	stateDir string
+	logger   *slog.Logger
+	nextGen  atomic.Int64
+}
+
+func newSnapshotManager(snap state.Snapshotter, stateDir string, logger *slog.Logger) *snapshotManager {
+	return &snapshotManager{snap: snap, stateDir: stateDir, logger: logger}
+}
+
+// restoreIfEmpty restores the newest snapshot into stateDir when the local state (cursor.json AND
+// jobs.journal) is entirely absent -- the plan §2.8 "on startup, restore the newest snapshot when
+// the local dir is empty" trigger. A state dir that already has either file (a normal restart
+// against a surviving emptyDir, or a re-run against a populated t.TempDir() in tests) is left
+// alone: local state is always authoritative over a snapshot when both exist, since the snapshot
+// can only be as fresh as the last WORKER_SNAPSHOT_INTERVAL tick.
+func (m *snapshotManager) restoreIfEmpty(ctx context.Context) {
+	cursorPath := filepath.Join(m.stateDir, "cursor.json")
+	journalPath := filepath.Join(m.stateDir, "jobs.journal")
+	if fileExists(cursorPath) || fileExists(journalPath) {
+		return
+	}
+	tarball, generation, found, err := m.snap.RestoreLatest(ctx)
+	if err != nil {
+		m.logger.Error("snapshot: RestoreLatest failed, starting with empty state", "error", err)
+		return
+	}
+	if !found {
+		m.logger.Info("snapshot: no prior snapshot found, starting with empty state")
+		return
+	}
+	if err := state.ExtractStateTarball(m.stateDir, tarball); err != nil {
+		m.logger.Error("snapshot: extracting restored tarball failed, starting with empty state", "error", err, "generation", generation)
+		return
+	}
+	m.nextGen.Store(generation)
+	m.logger.Info("snapshot: restored prior state", "generation", generation)
+}
+
+// s3GenerationSeeder is implemented by state.S3Snapshotter (via SeedGeneration) but not by
+// state.NoneSnapshotter, so seedRemoteGeneration can no-op for the "none" backend without an
+// import cycle or type-switch on a concrete package type.
+type s3GenerationSeeder interface {
+	SeedGeneration(ctx context.Context) (int64, error)
+}
+
+// seedRemoteGeneration is finding #2 (core-robustness round 3): a restart whose local state dir
+// SURVIVED (so restoreIfEmpty's restore-on-empty trigger never fires and nextGen starts at 0)
+// must still learn the S3 "latest" generation, or this process's first upload can collide with a
+// generation another writer already committed to S3. Called unconditionally after
+// restoreIfEmpty, regardless of whether a restore happened -- the two are independent: a restore
+// already advances nextGen to the restored generation, and this call only raises nextGen further
+// if S3's latest is even higher (e.g. another replica uploaded since this snapshot was taken).
+func (m *snapshotManager) seedRemoteGeneration(ctx context.Context) {
+	seeder, ok := m.snap.(s3GenerationSeeder)
+	if !ok {
+		return
+	}
+	remoteGen, err := seeder.SeedGeneration(ctx)
+	if err != nil {
+		m.logger.Error("snapshot: seeding generation from S3 latest failed, keeping local counter", "error", err)
+		return
+	}
+	if remoteGen == 0 {
+		return
+	}
+	for {
+		cur := m.nextGen.Load()
+		if remoteGen <= cur {
+			return
+		}
+		if m.nextGen.CompareAndSwap(cur, remoteGen) {
+			m.logger.Info("snapshot: seeded generation counter from S3 latest", "generation", remoteGen)
+			return
+		}
+	}
+}
+
+// upload tars the CURRENT on-disk state dir and uploads it as the next generation. Errors are
+// logged, not returned to panic/crash the caller -- a snapshot failure must never take down the
+// pipeline it's protecting (plan §2.8's whole point is best-effort durability on top of, not
+// instead of, the local journal).
+func (m *snapshotManager) upload(ctx context.Context) {
+	gen := m.nextGen.Add(1)
+	tarball, err := state.BuildStateTarball(m.stateDir)
+	if err != nil {
+		m.logger.Error("snapshot: building state tarball failed", "error", err, "generation", gen)
+		return
+	}
+	if err := m.snap.Upload(ctx, gen, tarball); err != nil {
+		m.logger.Error("snapshot: upload failed", "error", err, "generation", gen)
+		return
+	}
+	m.logger.Info("snapshot: uploaded", "generation", gen)
+}
+
+// runPeriodic uploads every interval until ctx is cancelled (plan §2.8: "every
+// WORKER_SNAPSHOT_INTERVAL"). Callers run this on its own goroutine.
+func (m *snapshotManager) runPeriodic(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.upload(ctx)
+		}
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // buildKeyStore constructs the keyguard.KeyStore named by WORKER_KEYSTORE (LoadConfig has already
@@ -782,7 +1150,19 @@ func cursorFreshnessStartupWindow(pollInterval time.Duration) time.Duration {
 // non-nil, receives the assembled *loop.Dispatcher the moment it exists, so runWorker's shutdown
 // path can Drain it (finding 1) -- a plain out-param rather than a return value because runPipeline
 // itself never returns except on ctx cancellation, long after the caller needs the dispatcher.
-func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *health.Status, dispatcherOut *atomic.Pointer[loop.Dispatcher]) {
+func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *health.Status, dispatcherOut *atomic.Pointer[loop.Dispatcher], fixRunnerOut *atomic.Pointer[jobs.FixRunner], snapshotOut *atomic.Pointer[snapshotManager]) {
+	// Finding 6 (durability-startup remediation, plan §7 "gate_rejections"): guardpkg.OnRejection
+	// is a process-global hook (guard.Check/CheckWithConfig is called from jobs/act.go and
+	// jobs/fix_pr.go, each constructing its own Config), so it is wired once here rather than
+	// threaded through every guard.Check call site. (Aliased import "guardpkg" -- this function's
+	// local `guard` variable, a few lines down, is a *keyguard.Guard and would otherwise shadow
+	// the package name.)
+	guardpkg.OnRejection = func(field guardpkg.PublishedField, reason guardpkg.ViolationReason) {
+		if st != nil {
+			st.Inc(health.MetricGateRejections, 1)
+		}
+	}
+
 	keyStore, readOnly := buildKeyStore(ctx, cfg)
 	agentKey := cfg.SentinelAgentKey
 	// The key store OVERRIDES SENTINEL_AGENT_KEY at startup when it already holds a key --
@@ -823,6 +1203,21 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	// nothing about recovery until the outage cleared. Resume's actual replay (below) still has to
 	// wait for identity, since it needs an authenticated client to re-drive ensure-claimed/Act --
 	// but the journal has been opened, compacted, and its in-flight set logged well before that.
+	// Finding 1 (durability-startup remediation, S3 state-snapshot durability, plan §2.8): build
+	// the Snapshotter named by WORKER_SNAPSHOT_BACKEND and, if the local state dir is empty (a
+	// fresh emptyDir after a reschedule -- the plan's PRIMARY target, no PVC), restore the newest
+	// uploaded snapshot into it BEFORE the journal is ever opened, so OpenJournal/RecoveryScan see
+	// the restored cursor.json/jobs.journal rather than a fresh install. snapshotOut publishes the
+	// manager to runWorker (same atomic.Pointer publish-once/read-after-cancel convention as
+	// dispatcherOut/fixRunnerOut) so SIGTERM shutdown can upload one final snapshot.
+	snapMgr := newSnapshotManager(buildSnapshotter(cfg), cfg.WorkerStateDir, logger)
+	snapMgr.restoreIfEmpty(ctx)
+	snapMgr.seedRemoteGeneration(ctx)
+	if snapshotOut != nil {
+		snapshotOut.Store(snapMgr)
+	}
+	go snapMgr.runPeriodic(ctx, cfg.WorkerSnapshotInterval)
+
 	journalPath := filepath.Join(cfg.WorkerStateDir, "jobs.journal")
 	journal := state.OpenJournal(journalPath)
 
@@ -830,8 +1225,8 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 	// journal, then replay or resume each in-flight job") and cleanup (plan §6: "Cleanup is the
 	// worker's own job — nothing external prunes for it") both run before the poll loop starts, and
 	// cleanup keeps running daily for the life of the process.
-	runJournalMaintenance(journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st)
-	go journalMaintenanceLoop(ctx, journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st)
+	runJournalMaintenance(journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st, snapMgr)
+	go journalMaintenanceLoop(ctx, journal, cfg.WorkerStateDir, cfg.WorkerAgentLogMaxMB, logger, st, snapMgr)
 
 	// Settings store (plan §4.5, C15/C16): first Refresh runs synchronously below so a snapshot is
 	// available before the poll loop starts routing jobs (same convention as the other startup
@@ -905,13 +1300,23 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		repoCache = nil
 	}
 
-	// sentinelAPIBreaker is the ONE shared CircuitBreaker for the sentinel.ScopeSentinelAPI scope
-	// (plan §2.4/§9 N8e: "gates the runner/dispatcher"). Constructed once here (not per-call inside
-	// buildRunner) so its consecutive-failure/open/half-open state persists across the whole
-	// pipeline's lifetime, exactly like the LLM primaryBreaker buildAdvisors already builds once.
+	// sentinelAPIBreaker gates the runner/dispatcher's sentinel-api write-path calls (plan §2.4/§9
+	// N8e). Constructed once here (not per-call inside buildRunner) so its consecutive-failure/
+	// open/half-open state persists across the whole pipeline's lifetime, exactly like the LLM
+	// primaryBreaker buildAdvisors already builds once.
+	//
+	// pollBreaker is a SEPARATE accumulator for the poll loop's read-path GetEvents calls (circuit-
+	// config-sec finding 1, reverting N8h Group D's "share the breaker" instruction). Sharing one
+	// breaker between the two meant the poll loop's frequent RecordSuccess (every successful ~10s
+	// poll) reset the runner's consecutive-failure streak to 0 before 5 straight runner failures
+	// could ever accumulate, so the write-path circuit could effectively never open -- see
+	// sentinel.ScopeSentinelAPIPoll's doc comment. Both breakers still publish their own
+	// circuit_state_<scope> gauge below (that gauge visibility was the only real motivation behind
+	// N8h's sharing), so nothing here regresses N8h's actual goal.
 	sentinelAPIBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPI)
+	pollBreaker := sentinel.NewCircuitBreaker(sentinel.ScopeSentinelAPIPoll)
 
-	runner, fixRunner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger, sentinelAPIBreaker)
+	runner, fixRunner, err := buildRunner(cfg, client, journal, agentID, settingsStore, repoCache, logger, sentinelAPIBreaker, st)
 	if err != nil {
 		// The LLM provider wiring is invalid (bad LLM_PROVIDER/LLM_FALLBACK_PROVIDER) -- fatal to
 		// this run of runPipeline, since nothing downstream can decide a job without it. Log and
@@ -920,6 +1325,38 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		// keeps serving even though the pipeline goroutine has stopped.
 		logger.Error("building runner failed, pipeline not started", "error", err)
 		return
+	}
+
+	if fixRunnerOut != nil {
+		fixRunnerOut.Store(fixRunner) // nil when the FIX engine is deployment-disabled -- Wait/atomic.Pointer both handle that
+	}
+
+	// Finding 6: a startup orphan sweep for FIX workspaces, plus a periodic reaper honoring
+	// WORKER_WORKSPACE_RETENTION_DAYS for kept-failed ones (FixRunner.KeepFailed leaves those on
+	// disk indefinitely otherwise). Gated on the FIX engine actually being enabled -- with it off,
+	// WORKER_WORKSPACE_DIR may not even exist, and there is nothing to reap.
+	if fixRunner != nil {
+		if removed, err := jobs.SweepOrphanWorkspaces(cfg.WorkerWorkspaceDir, journal); err != nil {
+			logger.Error("startup FIX workspace orphan sweep failed", "error", err)
+		} else if len(removed) > 0 {
+			logger.Info("startup FIX workspace orphan sweep removed stale workspaces", "count", len(removed))
+		}
+		go func() {
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if removed, err := jobs.ReapRetainedWorkspaces(cfg.WorkerWorkspaceDir, cfg.WorkerWorkspaceRetentionDays, time.Now()); err != nil {
+						logger.Error("periodic FIX workspace reaper failed", "error", err)
+					} else if len(removed) > 0 {
+						logger.Info("periodic FIX workspace reaper removed retained workspaces", "count", len(removed))
+					}
+				}
+			}
+		}()
 	}
 	// Shared by both the runner (done/failed/skipped_* outcomes from the pipeline) and the
 	// dispatcher (superseded/skipped_* outcomes decided in the queue layer itself, before a job
@@ -935,10 +1372,14 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		runner.OnInlaneRetry = func(kind string, class sentinel.FailureClass) { st.Inc(health.MetricInlaneRetriesTotal, 1) }
 		runner.OnCircuitOpen = func(scope string) { st.Inc(health.CircuitOpenEventsMetricName(scope), 1) }
 		st.SetGauge(health.CircuitStateMetricName(sentinel.ScopeSentinelAPI), int64(sentinelAPIBreaker.State()))
+		st.SetGauge(health.CircuitStateMetricName(sentinel.ScopeSentinelAPIPoll), int64(pollBreaker.State()))
 		// Runs until ctx is cancelled, same "left to be cancelled by ctx" convention as every
 		// other goroutine runPipeline starts (see the sweep ticker below) -- there is no partial
-		// state of its own to drain on shutdown, just a periodic gauge refresh.
+		// state of its own to drain on shutdown, just a periodic gauge refresh. Both breakers get
+		// their own refresher (circuit-config-sec finding 1): they are separate accumulators now,
+		// so a single goroutine can no longer cover both.
 		go publishCircuitStateGauge(ctx, st, sentinelAPIBreaker, cfg.WorkerPollInterval)
+		go publishCircuitStateGauge(ctx, st, pollBreaker, cfg.WorkerPollInterval)
 	}
 
 	// Journal-driven resume (CONTEXT.md's Recovery contract, plan §2.2/§8's required proof): every
@@ -1037,16 +1478,42 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 		Interval:   cfg.WorkerPollInterval,
 		Jitter:     cfg.WorkerPollJitter,
 		Log:        logger,
+		Breaker:    pollBreaker,
+		// circuit-config-sec finding 1 (reverts N8h Group D's "share the breaker" instruction): the
+		// poll loop gets its OWN CircuitBreaker (pollBreaker, sentinel.ScopeSentinelAPIPoll),
+		// separate from the runner's sentinelAPIBreaker. N8h had these share one instance so its
+		// state would be visible on the /metrics gauge; the side effect was that the poll loop's
+		// frequent RecordSuccess reset the runner's consecutive-failure streak to 0 on every
+		// successful ~10s poll, so the write-path circuit could never accumulate 5 failures and
+		// open. Both breakers are still published to their own circuit_state_<scope> gauge above,
+		// so N8h's actual goal (gauge visibility) is preserved.
 	}
 	poller.SetCursor(startCursor)
 	if st != nil {
 		poller.OnCursorSaved = st.NoteCursorSaved
 		poller.OnEvent = func(loop.Event, loop.Kind) { st.Inc(health.MetricEventsConsumed, 1) }
+		// circuit-config-sec finding 4 (round 2 -- the round-1 fix only reported the TAIL page's
+		// event count, which is indistinguishable from a caught-up feed getting a small burst):
+		// accumulate every page's event count across a WHOLE PollOnce drain cycle (multiple pages
+		// when hasMore==true chains them) and report that cumulative total as the gauge. A real
+		// multi-page backlog therefore reports a total that can exceed EventsMaxLimit (200) while
+		// draining -- something a single page's count never could -- and the gauge only returns to
+		// 0 once a genuinely empty page (pageEvents==0) starts (and, being alone, ends) a cycle,
+		// which is what "caught up" actually looks like against this feed. cycleTotal resets at the
+		// START of each new cycle (detected via cycleOpen) rather than at the end, so the gauge
+		// keeps showing the last cycle's real total across the sleep between /metrics scrapes
+		// instead of racing back to 0 the instant the drain finishes.
+		var cycleTotal int64
+		cycleOpen := false
 		poller.OnPageDrained = func(pageEvents int, hasMore bool) {
-			if hasMore {
-				st.SetGauge(health.MetricCursorLag, int64(pageEvents))
-			} else {
-				st.SetGauge(health.MetricCursorLag, 0)
+			if !cycleOpen {
+				cycleTotal = 0
+				cycleOpen = true
+			}
+			cycleTotal += int64(pageEvents)
+			st.SetGauge(health.MetricCursorLag, cycleTotal)
+			if !hasMore {
+				cycleOpen = false
 			}
 		}
 		// The startup window (runWorker) is intentionally left in place rather than re-narrowed
@@ -1074,6 +1541,12 @@ func runPipeline(ctx context.Context, cfg Config, logger *slog.Logger, st *healt
 			// left nil) is what makes hasOpenFix/JournalFixPROpen records actually get consulted
 			// in production instead of only from tests.
 			FixPRStatusHook: fixPRStatusHook(journal, client, settingsStore, enqueuer, logger),
+			// Finding 6 (durability-startup remediation, plan §7 "heartbeats_posted"):
+			OnHeartbeatPosted: func(issueID string) {
+				if st != nil {
+					st.Inc(health.MetricHeartbeatsPosted, 1)
+				}
+			},
 		}
 		// Wire the EVENT-DRIVEN reconcile arm (plan §2.7(c)): loop/queue.go dispatches a
 		// claim_released(previousAssignee=me) event as KindSweepReconcile and calls
@@ -1168,7 +1641,7 @@ const journalMaintenanceInterval = 24 * time.Hour
 // reaps/truncates agent-logs for terminal jobs using the SAME "terminal view" both operations need
 // (Journal.LatestByJobID), so a job's terminal-ness and its terminal-at time are computed once and
 // used consistently by both Compact and ReapAgentLogs.
-func runJournalMaintenance(journal *state.Journal, stateDir string, agentLogMaxMB int, logger *slog.Logger, st *health.Status) {
+func runJournalMaintenance(journal *state.Journal, stateDir string, agentLogMaxMB int, logger *slog.Logger, st *health.Status, snapMgr *snapshotManager) {
 	// Both RecoveryScan and Compact below run their own Load over the SAME on-disk file within
 	// this one maintenance pass, so they observe the same corrupt lines. The health counter is
 	// incremented once, from Compact's count, at the point those lines are actually erased by the
@@ -1205,6 +1678,13 @@ func runJournalMaintenance(journal *state.Journal, stateDir string, agentLogMaxM
 		}
 	}
 
+	// Finding 1 (plan §2.8): upload a fresh snapshot after journal compaction -- the journal file
+	// on disk just changed shape (terminal records dropped), so the durability backend's copy
+	// should reflect that rather than wait for the next periodic tick.
+	if snapMgr != nil {
+		snapMgr.upload(context.Background())
+	}
+
 	latest, err := journal.LatestByJobID()
 	if err != nil {
 		logger.Error("reading journal for agent-log reaping failed", "error", err)
@@ -1229,7 +1709,7 @@ func runJournalMaintenance(journal *state.Journal, stateDir string, agentLogMaxM
 // journalMaintenanceLoop re-runs runJournalMaintenance on journalMaintenanceInterval until ctx is
 // cancelled (plan §2.2: "on start and daily"). The startup pass is run by the caller before this
 // loop starts, so this loop only fires the SUBSEQUENT daily passes.
-func journalMaintenanceLoop(ctx context.Context, journal *state.Journal, stateDir string, agentLogMaxMB int, logger *slog.Logger, st *health.Status) {
+func journalMaintenanceLoop(ctx context.Context, journal *state.Journal, stateDir string, agentLogMaxMB int, logger *slog.Logger, st *health.Status, snapMgr *snapshotManager) {
 	ticker := time.NewTicker(journalMaintenanceInterval)
 	defer ticker.Stop()
 	for {
@@ -1237,7 +1717,7 @@ func journalMaintenanceLoop(ctx context.Context, journal *state.Journal, stateDi
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runJournalMaintenance(journal, stateDir, agentLogMaxMB, logger, st)
+			runJournalMaintenance(journal, stateDir, agentLogMaxMB, logger, st, snapMgr)
 		}
 	}
 }
@@ -1388,6 +1868,14 @@ func fixRepoResolver(store *settings.Store) jobs.FixRepoResolver {
 			DefaultBranch: conn.DefaultBranch,
 			TestCmd:       conn.TestCmd,
 			CloneDepth:    conn.CloneDepth,
+			// MaxPRsPerDay threads C15's per-project PR cap into FixCaps.AllowPR (finding 4) --
+			// ps.MaxPRsPerDay is nil when the server reported null ("no self-enforced cap"), which
+			// AllowPR's own fallback then reads as "use the global WORKER_MAX_PRS_PER_DAY".
+			MaxPRsPerDay: ps.MaxPRsPerDay,
+			// AgentCmd threads C15's per-connection executor override (finding 3) into
+			// FixRunner.executorCmdFor -- empty means "use the global FIX_EXECUTOR_CMD", matching
+			// the dashboard UI's own documented default.
+			AgentCmd: conn.AgentCmd,
 		}, true, nil
 	}
 }
@@ -1407,7 +1895,7 @@ func fixRepoResolver(store *settings.Store) jobs.FixRepoResolver {
 // field (see buildRunner) must convert explicitly, or they would reproduce the classic Go
 // "non-nil interface wrapping a nil pointer" trap that this function's OLD jobs.Fixer-typed return
 // was written specifically to avoid.
-func buildFixRunner(cfg Config, client *sentinel.Client, journal *state.Journal, settingsStore *settings.Store, logger *slog.Logger) *jobs.FixRunner {
+func buildFixRunner(cfg Config, client *sentinel.Client, journal *state.Journal, settingsStore *settings.Store, logger *slog.Logger, st *health.Status) *jobs.FixRunner {
 	if !cfg.WorkerFixEnabled || !cfg.WorkerExecute || strings.TrimSpace(cfg.FixExecutorCmd) == "" {
 		return nil
 	}
@@ -1416,6 +1904,33 @@ func buildFixRunner(cfg Config, client *sentinel.Client, journal *state.Journal,
 	caps.OnExhausted = func(reason string) {
 		logger.Warn("FIX volume cap exhausted", "reason", reason)
 	}
+
+	// Finding 2: reconstruct today's fix-job/PR/attempt counts from the journal BEFORE this
+	// FixCaps is ever consulted -- otherwise a restart resets every counter to zero, and "per day"
+	// becomes "per process life" (WORKER_MAX_FIX_ATTEMPTS in particular resetting on a crash-loop).
+	if journal != nil {
+		if records, _, err := journal.Load(); err != nil {
+			logger.Error("failed to load journal for FIX caps reconstruction; caps start at zero for this process", "error", err)
+		} else {
+			caps.SeedToday(records, time.Now())
+		}
+	}
+
+	settingsEnv := settings.EnvFallback{
+		GitHubToken:          cfg.GitGitHubToken,
+		BitbucketToken:       cfg.GitBitbucketToken,
+		BitbucketUser:        cfg.GitBitbucketUser,
+		BitbucketAppPassword: cfg.GitBitbucketAppPassword,
+	}
+
+	// Finding 10: publish an initial baseline for the fix-jobs/PRs "cap remaining" gauges right
+	// after caps.SeedToday above, so /metrics reports a real value from process start rather than
+	// waiting for the first "attempt-started"/"pr-opened" event (which may be minutes or hours away).
+	if st != nil {
+		st.SetGauge(health.MetricFixJobsRemaining, int64(caps.FixJobsRemaining()))
+		st.SetGauge(health.MetricPRsRemaining, int64(caps.PRsRemaining()))
+	}
+
 	return &jobs.FixRunner{
 		WorkspaceRoot: cfg.WorkerWorkspaceDir,
 		StateDir:      cfg.WorkerStateDir,
@@ -1425,12 +1940,48 @@ func buildFixRunner(cfg Config, client *sentinel.Client, journal *state.Journal,
 		Caps:          caps,
 		ResolveRepo:   fixRepoResolver(settingsStore),
 		ExecutorCmd:   cfg.FixExecutorCmd,
-		MaxFiles:      cfg.WorkerFixMaxFiles,
-		Timeout:       cfg.WorkerFixTimeout,
-		KeepFailed:    cfg.WorkerKeepFailedWorkspaces,
-		Secrets:       configuredSecrets(cfg),
+		// Finding 4 (fix-lifecycle remediation round 2): WORKER_FIX_EXECUTOR_ENV is the previously
+		// missing channel feeding FixRunner.ExecutorEnv -- without it, the Fix Executor
+		// ($FIX_EXECUTOR_CMD, e.g. droid) got no credentials at all (the forbidden-key guard test in
+		// jobs/fix_executor_test.go was guarding a field nothing ever populated), so an operator could
+		// not hand it a DeepSeek/model API key.
+		ExecutorEnv: cfg.WorkerFixExecutorEnv,
+		MaxFiles:    cfg.WorkerFixMaxFiles,
+		Timeout:     cfg.WorkerFixTimeout,
+		KeepFailed:  cfg.WorkerKeepFailedWorkspaces,
+		Secrets:     configuredSecrets(cfg),
+		MaxVerbatim: cfg.WorkerGateMaxVerbatim,
 		OnEvent: func(event string, in jobs.FixJobInput, detail string) {
 			logger.Info("FIX job event", "event", event, "jobId", in.JobID, "issueId", in.IssueID, "detail", detail)
+			// Finding 6 (durability-startup remediation, plan §7 "fix_attempts"/"prs_opened"):
+			if st != nil {
+				switch event {
+				case "attempt-started":
+					st.Inc(health.MetricFixAttempts, 1)
+					// Finding 10 (§7 "cap remaining" gauge family): refresh right after the
+					// AllowJobStart/RecordAttempt call this event fires alongside (jobs/fix.go's
+					// RunFix), so the gauge reflects THIS attempt's consumption, not the prior one's.
+					st.SetGauge(health.MetricFixJobsRemaining, int64(caps.FixJobsRemaining()))
+				case "pr-opened":
+					st.Inc(health.MetricPRsOpened, 1)
+					st.SetGauge(health.MetricPRsRemaining, int64(caps.PRsRemaining()))
+				}
+			}
+		},
+		// Finding 5 (C16): a git-auth failure invalidates the current in-memory credential by
+		// forcing an immediate settings Refresh (rather than waiting up to WORKER_SETTINGS_REFRESH,
+		// default 5m, for the periodic loop) so the NEXT resolve re-fetches. Runs on its own
+		// goroutine with a bounded timeout so a slow/hanging settings refresh never blocks the FIX
+		// job's own release-with-comment tail.
+		OnAuthFailure: func(provider string) {
+			logger.Warn("FIX job hit a git-auth failure; forcing an immediate settings refresh", "provider", provider)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := settingsStore.Refresh(ctx, client, cfg.WorkerCredentialLabels, settingsEnv, logger); err != nil {
+					logger.Error("settings refresh after git-auth failure failed", "provider", provider, "error", err)
+				}
+			}()
 		},
 	}
 }
@@ -1508,6 +2059,19 @@ func configuredSecrets(cfg Config) []string {
 	} {
 		if s != "" {
 			out = append(out, s)
+		}
+	}
+	// Finding 6: cfg.WorkerFixExecutorEnv (WORKER_FIX_EXECUTOR_ENV) is the Fix Executor's OWN
+	// credential env -- the coding-agent CLI's model/API key, handed to it via FixRunner.ExecutorEnv
+	// -- and was excluded from this list entirely, so it never reached FixRunner.Secrets and never
+	// got added to any gitprovider.Redactor (jobSecrets in jobs/fix.go's RunFix/ResumeFix is built
+	// from r.Secrets plus the runtime repo credential; without this, the executor's own configured
+	// secret was the one credential this package handed to an external coding-agent process that
+	// went unmasked in the agent log / FixBrief-derived PR body). Values only -- the env var NAMES
+	// are not secret and are not what guard.Check/gitprovider.Redactor need to match against.
+	for _, v := range cfg.WorkerFixExecutorEnv {
+		if v != "" {
+			out = append(out, v)
 		}
 	}
 	return out
@@ -1598,14 +2162,14 @@ func publishCircuitStateGauge(ctx context.Context, st *health.Status, breaker *s
 // recovery scan (plan §4.4 step 3b, finding 4) — the FIX engine's own resume path lives outside
 // loop.Runner.Resume entirely (FIX jobs are not a loop.Kind), so the caller needs this reference,
 // not just what got wired into actor.Fixer's narrower jobs.Fixer interface.
-func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger, sentinelAPIBreaker *sentinel.CircuitBreaker) (*loop.Runner, *jobs.FixRunner, error) {
+func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, agentID string, settingsStore *settings.Store, repoCache *repoctx.Cache, logger *slog.Logger, sentinelAPIBreaker *sentinel.CircuitBreaker, st *health.Status) (*loop.Runner, *jobs.FixRunner, error) {
 	resolver := settingsRepoResolver{Client: client, Settings: settingsStore, Cache: repoCache}
 	triage, followup, err := buildAdvisors(cfg, client, resolver, logger)
 	if err != nil {
 		return nil, nil, err
 	}
 	advisor := kindDispatchAdvisor{Triage: triage, Followup: followup}
-	fixRunner := buildFixRunner(cfg, client, journal, settingsStore, logger)
+	fixRunner := buildFixRunner(cfg, client, journal, settingsStore, logger, st)
 	actor := jobs.RealActor{
 		Client:        client,
 		Journal:       journal,
@@ -1613,8 +2177,45 @@ func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, ag
 		Fixer:         fixerInterface(fixRunner), // nil *jobs.FixRunner -> nil jobs.Fixer, not a typed-nil interface
 		Secrets:       configuredSecrets(cfg),
 		FixConfidence: cfg.WorkerFixConfidence,
+		MaxVerbatim:   cfg.WorkerGateMaxVerbatim,
 		SentinelURL:   cfg.SentinelURL,
 	}
+
+	// WORKER_DAILY_TOKEN_BUDGET / WORKER_MAX_TRIAGE_PER_HOUR (plan §2.6 finding 1): both were read
+	// and validated by loadConfig but had zero production callers before this wiring -- constructed
+	// here (not deeper inside jobs/llm) so the SAME instances persist for the pipeline's whole
+	// lifetime and are shared across every job Runner.Run dispatches, exactly like
+	// sentinelAPIBreaker above. Seeded from the journal BEFORE any job can observe/Add into them,
+	// same convention as buildFixRunner's caps.SeedToday a few lines up the call stack.
+	budget := llm.NewDailyBudget(cfg.WorkerDailyTokenBudget, llm.ClockFunc(time.Now))
+	triageLimiter := llm.NewHourlyCounter(cfg.WorkerMaxTriagePerHour, llm.ClockFunc(time.Now))
+	// Finding 5 (core-robustness round 3): FOLLOW-UP had no hourly cap symmetric to TRIAGE's, so
+	// with WORKER_DAILY_TOKEN_BUDGET left at its default 0 (unlimited), FOLLOW-UP spend had no
+	// effective ceiling at all. WORKER_MAX_FOLLOWUP_PER_HOUR/followupLimiter mirror
+	// WORKER_MAX_TRIAGE_PER_HOUR/triageLimiter exactly, including journal-seeding.
+	followupLimiter := llm.NewHourlyCounter(cfg.WorkerMaxFollowupPerHour, llm.ClockFunc(time.Now))
+	if journal != nil {
+		if records, _, err := journal.Load(); err != nil {
+			logger.Error("failed to load journal for daily LLM token budget / hourly TRIAGE+FOLLOW-UP cap reconstruction; all start at zero for this process", "error", err)
+		} else {
+			budget.SeedSpent(jobs.SumAdvisedTokenUsage(records, time.Now()))
+			// circuit-config-sec finding 3: WORKER_MAX_TRIAGE_PER_HOUR's HourlyCounter was, unlike
+			// DailyBudget/FixCaps above/below, never seeded from the journal at all -- a crash-loop
+			// within the same UTC hour reset the hourly cap to zero every restart, letting a caller
+			// triage arbitrarily past the configured hourly limit by just restarting the process.
+			// Same "seed before any TryIncrement call" ordering as budget.SeedSpent above.
+			triageLimiter.SeedCount(jobs.SumTriageStarts(records, time.Now()))
+			followupLimiter.SeedCount(jobs.SumFollowupStarts(records, time.Now()))
+		}
+	}
+	// Finding 10 (§7 "cap remaining" gauge family): baseline gauge from process start, mirroring
+	// buildFixRunner's identical initial-publish comment -- these two hourly caps had NO Remaining()
+	// gauge at all before this, unlike WORKER_DAILY_TOKEN_BUDGET's budget_remaining.
+	if st != nil {
+		st.SetGauge(health.MetricTriagePerHourRemaining, int64(triageLimiter.Remaining()))
+		st.SetGauge(health.MetricFollowupPerHourRemaining, int64(followupLimiter.Remaining()))
+	}
+
 	return &loop.Runner{
 		Journal:          journal,
 		Issues:           loop.HTTPIssueReader{Client: client},
@@ -1626,6 +2227,26 @@ func buildRunner(cfg Config, client *sentinel.Client, journal *state.Journal, ag
 		Log:              logger,
 		Breaker:          sentinelAPIBreaker,
 		MaxInlaneRetries: cfg.WorkerMaxInlaneRetries,
+		Budget:           budget,
+		TriageLimiter:    triageLimiter,
+		FollowupLimiter:  followupLimiter,
+		// Finding 6 (durability-startup remediation, plan §7 "llm_tokens by provider" /
+		// "budget_remaining"): fires once per Advisor decision, right after Budget.Add already
+		// accounted decision.Usage against today's spend.
+		OnUsage: func(provider string, usage llm.Usage) {
+			if st == nil {
+				return
+			}
+			if provider != "" {
+				st.Inc(health.LLMTokensMetricName(provider), int64(usage.InputTokens+usage.OutputTokens))
+			}
+			st.SetGauge(health.MetricBudgetRemaining, int64(budget.Remaining()))
+			// Finding 10: OnUsage fires once per Advisor decision (TRIAGE or FOLLOW-UP) without
+			// telling us which -- refreshing both gauges unconditionally here is cheap (two mutex
+			// locks, no I/O) and keeps them current after every decision regardless of kind.
+			st.SetGauge(health.MetricTriagePerHourRemaining, int64(triageLimiter.Remaining()))
+			st.SetGauge(health.MetricFollowupPerHourRemaining, int64(followupLimiter.Remaining()))
+		},
 	}, fixRunner, nil
 }
 
@@ -1653,9 +2274,15 @@ func resumeInFlightJob(ctx context.Context, runner *loop.Runner, fixRunner *jobs
 			logger.Error("recovery: decoding in-flight FIX payload failed, leaving it claimed", "jobId", job.JobID, "issueId", job.IssueID, "error", err)
 			return
 		}
-		if err := fixRunner.ResumeFix(ctx, payload.Input); err != nil {
-			logger.Error("recovery: resuming in-flight FIX job failed", "jobId", job.JobID, "issueId", job.IssueID, "error", err)
-		}
+		// Finding 2 (MAJOR, fix-lifecycle remediation round 2): DispatchResume runs ResumeFix on its
+		// own goroutine, bounded by the FIX timeout and tracked by fixRunner's own WaitGroup --
+		// calling ResumeFix directly here, synchronously, on runPipeline's own long-lived ctx BEFORE
+		// the poll loop ever starts, let one in-flight (or, via finding 1, forever-stale) FIX attempt
+		// block the worker from ever polling or serving /readyz. This is now the SAME non-blocking
+		// shape as the normal Dispatch path RealActor.Act drives -- the caller (runPipeline) moves on
+		// immediately; runWorker's shutdown-time fixRunner.Wait (bounded by WORKER_SHUTDOWN_TIMEOUT)
+		// still drains it like any other in-flight FIX goroutine.
+		fixRunner.DispatchResume(payload.Input)
 		return
 	}
 	if err := runner.Resume(ctx, job); err != nil {

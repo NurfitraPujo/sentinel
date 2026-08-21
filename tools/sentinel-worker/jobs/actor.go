@@ -39,6 +39,7 @@ type RealActor struct {
 	Fixer         Fixer              // nil is treated as "FIX engine not wired -- EnqueueFix is a no-op"
 	Secrets       []string           // configured secret values to redact (guard.Check's verbatim gate)
 	FixConfidence float64            // WORKER_FIX_CONFIDENCE; <=0 uses DefaultFixConfidence
+	MaxVerbatim   float64            // WORKER_GATE_MAX_VERBATIM; <=0 uses guard.DefaultMaxVerbatim
 
 	// SentinelURL is $SENTINEL_URL (the dashboard's own base URL, the same value the worker's own
 	// API client is built from) -- the only thing Act needs to turn an issueId into the human-facing
@@ -66,6 +67,24 @@ type actIssueEnvelope struct {
 	} `json:"latestOccurrence"`
 }
 
+// actingPayload is what RealActor.Act journals into the StateActing record the FIRST time it
+// compiles a job's decision (finding 4, plan §2.2): the compiled batch body verbatim (Compiled),
+// plus the handful of GET-issue-derived fields (ProjectID/ErrorClass/Occurrences) a FIX dispatch
+// needs, so a REPLAY (resumeFromAdvised driving the SAME jobID back through Act -- whether via an
+// in-lane retry after a transient batch/question failure, or a crash-restart Resume) can re-send
+// the ORIGINAL compiled ops/question byte-for-byte instead of recompiling from a fresh issue fetch.
+// Recompiling is risky because a compile can be issue-state-dependent (e.g. the severity op is
+// only built when actx.isUserReport()) -- if the issue's state visibly changed between the first
+// attempt and the replay, a fresh compile could silently diverge from what was actually already
+// (partially) sent, and the idempotency-key dedupe on the server only fires when the replayed body
+// matches the original.
+type actingPayload struct {
+	Compiled
+	ProjectID   string `json:"projectId,omitempty"`
+	ErrorClass  string `json:"errorClass,omitempty"`
+	Occurrences string `json:"occurrences,omitempty"`
+}
+
 // Act implements loop.Actor.
 func (a RealActor) Act(ctx context.Context, jobID string, d Decision) error {
 	if a.Client == nil {
@@ -81,62 +100,95 @@ func (a RealActor) Act(ctx context.Context, jobID string, d Decision) error {
 	}
 	issueID := jobRec.IssueID
 
-	res, err := a.Client.GetIssue(ctx, issueID)
-	if err != nil {
-		return fmt.Errorf("jobs: RealActor: fetching issue %s for job %s: %w", issueID, jobID, err)
-	}
-	if res.Status < 200 || res.Status >= 300 {
-		// Wrapped as *sentinel.StatusError (not a bare fmt.Errorf), matching
-		// loop.HTTPIssueReader.GetIssue's own reasoning: this is the runner's Act-time re-read of
-		// the issue (mid-job, after the precondition GET already succeeded once), so a 404 here is
-		// the same "issue deleted between the event landing and this job running" race (C14) --
-		// hardening N8e's tombstone/404 handling means the runner must be able to classify THIS
-		// 404 as ClassGone too, not just the earlier precondition-read 404.
-		return fmt.Errorf("jobs: RealActor: GET issue %s: %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
-	}
-	var env actIssueEnvelope
-	if err := json.Unmarshal(res.Body, &env); err != nil {
-		return fmt.Errorf("jobs: RealActor: decoding issue %s: %w", issueID, err)
-	}
+	var ap actingPayload
+	if jobRec.State == state.StateActing && len(jobRec.Payload) > 0 {
+		// Replay (§2.2, finding 4): a prior attempt for this SAME jobID already compiled and
+		// journaled the batch body -- re-send it verbatim rather than re-fetching the issue and
+		// recompiling, which the LLM/Advisor is never re-consulted for and must not silently
+		// diverge from what was already (partially) sent.
+		if err := json.Unmarshal(jobRec.Payload, &ap); err != nil {
+			return fmt.Errorf("jobs: RealActor: unmarshaling journaled compiled batch for job %s: %w", jobID, err)
+		}
+	} else {
+		res, err := a.Client.GetIssue(ctx, issueID)
+		if err != nil {
+			return fmt.Errorf("jobs: RealActor: fetching issue %s for job %s: %w", issueID, jobID, err)
+		}
+		if res.Status < 200 || res.Status >= 300 {
+			// Wrapped as *sentinel.StatusError (not a bare fmt.Errorf), matching
+			// loop.HTTPIssueReader.GetIssue's own reasoning: this is the runner's Act-time re-read of
+			// the issue (mid-job, after the precondition GET already succeeded once), so a 404 here is
+			// the same "issue deleted between the event landing and this job running" race (C14) --
+			// hardening N8e's tombstone/404 handling means the runner must be able to classify THIS
+			// 404 as ClassGone too, not just the earlier precondition-read 404.
+			return fmt.Errorf("jobs: RealActor: GET issue %s: %w", issueID, &sentinel.StatusError{Status: res.Status, Header: res.Header, Body: res.Body})
+		}
+		var env actIssueEnvelope
+		if err := json.Unmarshal(res.Body, &env); err != nil {
+			return fmt.Errorf("jobs: RealActor: decoding issue %s: %w", issueID, err)
+		}
 
-	fixEnabled := false
-	if a.Fix != nil {
-		fixEnabled, _ = a.Fix.FixEnabled(env.Issue.ProjectID)
-	}
+		fixEnabled := false
+		if a.Fix != nil {
+			fixEnabled, _ = a.Fix.FixEnabled(env.Issue.ProjectID)
+		}
 
-	actx := ActContext{
-		JobID:         jobID,
-		IssueID:       issueID,
-		IssueType:     env.Issue.IssueType,
-		ToolOutputs:   d.ToolOutputs,
-		Secrets:       a.Secrets,
-		FixEnabled:    fixEnabled,
-		FixConfidence: a.FixConfidence,
-	}
+		actx := ActContext{
+			JobID:         jobID,
+			IssueID:       issueID,
+			IssueType:     env.Issue.IssueType,
+			ToolOutputs:   d.ToolOutputs,
+			Secrets:       a.Secrets,
+			FixEnabled:    fixEnabled,
+			FixConfidence: a.FixConfidence,
+			MaxVerbatim:   a.MaxVerbatim,
+		}
 
-	var compiled Compiled
-	switch d.Kind {
-	case "triage":
-		td, err := DecodeTriage(d)
-		if err != nil {
-			return fmt.Errorf("jobs: RealActor: decoding triage decision for job %s: %w", jobID, err)
+		var compiled Compiled
+		switch d.Kind {
+		case "triage":
+			td, err := DecodeTriage(d)
+			if err != nil {
+				return fmt.Errorf("jobs: RealActor: decoding triage decision for job %s: %w", jobID, err)
+			}
+			compiled, err = CompileTriage(actx, td)
+			if err != nil {
+				return err
+			}
+		case "followup":
+			fd, err := DecodeFollowup(d)
+			if err != nil {
+				return fmt.Errorf("jobs: RealActor: decoding followup decision for job %s: %w", jobID, err)
+			}
+			compiled, err = CompileFollowup(actx, fd)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("jobs: RealActor: unknown decision kind %q for job %s", d.Kind, jobID)
 		}
-		compiled, err = CompileTriage(actx, td)
-		if err != nil {
-			return err
+
+		ap = actingPayload{Compiled: compiled, ProjectID: env.Issue.ProjectID, ErrorClass: env.Issue.ErrorClass}
+		if env.LatestOccurrence != nil && len(env.LatestOccurrence.Stacktrace) > 0 {
+			ap.Occurrences = string(env.LatestOccurrence.Stacktrace)
 		}
-	case "followup":
-		fd, err := DecodeFollowup(d)
+
+		payload, err := json.Marshal(ap)
 		if err != nil {
-			return fmt.Errorf("jobs: RealActor: decoding followup decision for job %s: %w", jobID, err)
+			return fmt.Errorf("jobs: RealActor: marshaling compiled batch for job %s: %w", jobID, err)
 		}
-		compiled, err = CompileFollowup(actx, fd)
-		if err != nil {
-			return err
+		if err := a.Journal.Append(state.Record{
+			JobID:      jobID,
+			IssueID:    issueID,
+			Kind:       jobRec.Kind,
+			TriggerSeq: jobRec.TriggerSeq,
+			State:      state.StateActing,
+			Payload:    payload,
+		}); err != nil {
+			return fmt.Errorf("jobs: RealActor: journaling compiled batch for job %s: %w", jobID, err)
 		}
-	default:
-		return fmt.Errorf("jobs: RealActor: unknown decision kind %q for job %s", d.Kind, jobID)
 	}
+	compiled := ap.Compiled
 
 	_, qRes, bRes, err := Act(ctx, a.Client, compiled, true)
 	if err != nil {
@@ -169,18 +221,23 @@ func (a RealActor) Act(ctx context.Context, jobID string, d Decision) error {
 	// whether Act itself succeeds.
 	if compiled.EnqueueFix && a.Fixer != nil {
 		fixBrief := decisionFixBrief(d)
-		occurrences := ""
-		if env.LatestOccurrence != nil && len(env.LatestOccurrence.Stacktrace) > 0 {
-			occurrences = string(env.LatestOccurrence.Stacktrace)
-		}
+		// finding 1 (BLOCKER): the FIX job MUST NOT reuse the parent triage/followup jobID. The
+		// runner drives that jobID to a terminal state (StateDone) immediately after Act returns,
+		// and Journal.Append's terminal-guard (state/journal.go) silently drops any further
+		// non-terminal record for an already-terminal jobId -- so journalFixRunning/
+		// JournalFixPROpen would never persist, and every FIX batch idempotency key
+		// (jobID:opIndex) would collide with the parent Act's own ops 0/1. Derive a distinct,
+		// stable-per-trigger jobId the same way every other job kind does (state.JobID), so the
+		// FIX job has its own independent lifecycle and idempotency-key namespace.
+		fixJobID := state.JobID(FixKind, issueID, jobRec.TriggerSeq)
 		a.Fixer.Dispatch(FixJobInput{
-			JobID:       jobID,
+			JobID:       fixJobID,
 			IssueID:     issueID,
 			IssueURL:    a.issueURL(issueID),
-			ProjectID:   env.Issue.ProjectID,
-			ErrorClass:  env.Issue.ErrorClass,
+			ProjectID:   ap.ProjectID,
+			ErrorClass:  ap.ErrorClass,
 			FixBrief:    fixBrief,
-			Occurrences: occurrences,
+			Occurrences: ap.Occurrences,
 			ToolOutputs: d.ToolOutputs,
 			TriggerSeq:  jobRec.TriggerSeq,
 		})
@@ -273,7 +330,19 @@ func checkBatchResults(compiled Compiled, bRes *sentinel.Result) error {
 			IsSeverityOp: op.Op == "issues.report.severity",
 		}
 	}
-	_, perOp, _ := sentinel.ClassifyBatch(bRes.Status, bRes.Body, meta)
+	overall, perOp, _ := sentinel.ClassifyBatch(bRes.Status, bRes.Body, meta)
+	if perOp == nil {
+		// BLOCKER (finding 1): a non-2xx batch ENVELOPE (401/429/5xx) short-circuits
+		// ClassifyBatch to (envelope's own class, nil, nil) before it ever walks results[] --
+		// perOp being nil here means the failure is at the envelope level (or, for a 2xx envelope
+		// with an unparsable body, ClassPermanent), NOT "every op succeeded". Discarding `overall`
+		// and only looping over `perOp` (as this used to) made a 401/429/5xx batch response look
+		// like an empty-but-successful per-op walk -- the whole decision was lost and never
+		// retried/journaled failed. Wrap overall's status as a *sentinel.StatusError so the runner
+		// (loop.classifyRunnerFailureClass) classifies 429/5xx as transient (retry) and 401 as auth
+		// (terminal), exactly like every other envelope-level failure this package surfaces.
+		return fmt.Errorf("batch envelope failed: status=%d class=%v: %w", bRes.Status, overall, &sentinel.StatusError{Status: bRes.Status, Header: bRes.Header, Body: bRes.Body})
+	}
 	for i, c := range perOp {
 		switch c {
 		case sentinel.ClassSuccess, sentinel.ClassConflictDroppable:
@@ -294,10 +363,35 @@ func checkBatchResults(compiled Compiled, bRes *sentinel.Result) error {
 			if i < len(compiled.Ops) {
 				opName = compiled.Ops[i].Op
 			}
-			return fmt.Errorf("batch op %d (%s) did not succeed: class=%v", i, opName, c)
+			// Wrap a *sentinel.StatusError carrying a status representative of this op's class, so
+			// the runner (classifyRunnerFailureClass) journals a PERMANENT per-op rejection
+			// (400/401/409) as failed_permanent — NOT retried MaxInlaneRetries times — while a
+			// genuinely transient/rate-limited op stays retryable. A bare error defaults to
+			// ClassTransient, which would spin a permanent 400/422 through 5 pointless resends.
+			return fmt.Errorf("batch op %d (%s) did not succeed: class=%v: %w",
+				i, opName, c, &sentinel.StatusError{Status: statusForOpClass(c)})
 		}
 	}
 	return nil
+}
+
+// statusForOpClass maps a per-op FailureClass to a representative HTTP status whose
+// ClassifyEnvelope round-trips to the same retry disposition, so a per-op result classified in
+// checkBatchResults' default branch is retried (transient/rate-limited) or terminal
+// (permanent/auth/conflict) consistently with envelope-level failures.
+func statusForOpClass(c sentinel.FailureClass) int {
+	switch c {
+	case sentinel.ClassRateLimited:
+		return 429
+	case sentinel.ClassTransient:
+		return 503
+	case sentinel.ClassAuthFailure:
+		return 401
+	case sentinel.ClassConflictForeign, sentinel.ClassConflictKeyMismatch:
+		return 409
+	default: // ClassPermanent and anything else terminal
+		return 400
+	}
 }
 
 // resolveJobRecord looks up jobID's latest journal record -- the same record loop.Runner just

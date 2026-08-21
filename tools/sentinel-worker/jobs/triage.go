@@ -167,15 +167,17 @@ func (a *TriageAdvisor) Decide(ctx context.Context, in Input) (Decision, error) 
 
 	system := BuildSystemPrompt(triageBasePrompt, untrusted)
 	schema := triageDecisionSchema
+	userMsg := fmt.Sprintf("Triage issue %s (%s).", in.IssueID, triagePromptVersion)
 	req := llm.Request{
 		System: system,
 		Messages: []llm.Msg{
-			{Role: llm.RoleUser, Text: fmt.Sprintf("Triage issue %s (%s).", in.IssueID, triagePromptVersion)},
+			{Role: llm.RoleUser, Text: userMsg},
 		},
 		Tools:          toolchain.Defs,
 		JSONSchema:     &schema,
 		JSONSchemaName: "triage_decision",
 	}
+	promptHash := PromptHash(system, userMsg)
 
 	result, err := llm.RunLoop(ctx, a.Primary, a.Fallback, req, toolchain.Funcs, a.Caps, a.Breaker)
 	if err != nil {
@@ -190,5 +192,13 @@ func (a *TriageAdvisor) Decide(ctx context.Context, in Input) (Decision, error) 
 		return Decision{}, fmt.Errorf("jobs: triage: decoding validated decision for job %s: %w", in.JobID, err)
 	}
 
-	return Decision{Kind: in.Kind, Raw: json.RawMessage(result.Text), ToolOutputs: rec.All()}, nil
+	return Decision{
+		Kind:          in.Kind,
+		Raw:           json.RawMessage(result.Text),
+		ToolOutputs:   rec.All(),
+		Usage:         result.Usage,
+		Provider:      result.Provider,
+		PromptSHA256:  promptHash,
+		PromptVersion: triagePromptVersion,
+	}, nil
 }

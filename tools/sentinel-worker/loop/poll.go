@@ -205,6 +205,22 @@ func (p *PollLoop) hasOpenQuestion(issueID string) bool {
 	return ok
 }
 
+// hasOpenFix adapts p.Journal to Classify's hasOpenFix seam (finding 3, fix-lifecycle remediation
+// round 2: the plan-mandated "skip if FIX in flight per journal" rule for occurrence_burst/
+// regressed). Same fail-open-to-false posture as hasOpenQuestion above, for the same reason: this
+// is a best-effort dispatch hint, not a durability-bearing read, and a nil Journal/read error must
+// never block classification -- worst case a duplicate FIX PR gets opened, not a stuck pipeline.
+func (p *PollLoop) hasOpenFix(issueID string) bool {
+	if p.Journal == nil {
+		return false
+	}
+	ok, err := p.Journal.HasOpenKind(issueID, state.FixKind)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
 // SetCursor seeds the in-memory cursor (used after LoadCursor or a bootstrap sweep at startup).
 func (p *PollLoop) SetCursor(seq int64) { p.cursor = seq }
 
@@ -229,7 +245,7 @@ func (p *PollLoop) PollOnce(ctx context.Context) (int, error) {
 		}
 		pageCursor := p.cursor
 		for _, e := range page.Events {
-			kind := Classify(e, p.MyAgentID, p.hasOpenQuestion)
+			kind := Classify(e, p.MyAgentID, p.hasOpenQuestion, p.hasOpenFix)
 			if err := p.Enqueue.Enqueue(e, kind); err != nil {
 				// Abort the page WITHOUT advancing or persisting the cursor: re-polling from the
 				// last persisted cursor will re-deliver this event (and any already-enqueued

@@ -69,6 +69,36 @@ func (b *DailyBudget) Spent() int {
 	return b.spent
 }
 
+// SeedSpent adds n directly to today's spend, WITHOUT going through Add's normal per-call
+// accounting — used by boot-time reconstruction (main.go, reading jobs.SumAdvisedTokenUsage over
+// the journal) so a restart does not reset WORKER_DAILY_TOKEN_BUDGET's spend to zero mid-day
+// (mirrors DailyCounter.SeedCount's rationale). Must be called before any Add/Exhausted call
+// observes today's spend, same convention as FixCaps.SeedToday.
+func (b *DailyBudget) SeedSpent(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resetIfNewDay()
+	b.spent += n
+}
+
+// Remaining returns the tokens left in today's budget (limit - spent), for the plan §7
+// "budget_remaining" gauge. A non-positive limit (unlimited) reports -1 so callers/metrics can
+// distinguish "unlimited" from "exhausted" (which would otherwise both render as a huge or zero
+// number depending on how the caller chose to represent "no limit").
+func (b *DailyBudget) Remaining() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit <= 0 {
+		return -1
+	}
+	b.resetIfNewDay()
+	remaining := b.limit - b.spent
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
 // Exhausted reports whether today's spend has reached or exceeded the configured limit — the
 // gate jobs/fix.go and the dispatcher (plan §2.6) check before starting a new Advisor loop. A
 // non-positive limit means unlimited (never exhausted).
@@ -144,6 +174,38 @@ func (c *DailyCounter) Count() int {
 	return c.count
 }
 
+// Remaining returns the slots left today (limit - count), mirroring DailyBudget.Remaining's
+// contract: a non-positive limit (unlimited) reports -1 so a metrics gauge can distinguish
+// "unlimited" from "exhausted" rather than rendering both as the same number.
+func (c *DailyCounter) Remaining() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limit <= 0 {
+		return -1
+	}
+	c.resetIfNewDay()
+	remaining := c.limit - c.count
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+// SeedCount sets today's count directly, WITHOUT going through TryIncrement's limit check —
+// used by boot-time reconstruction (jobs.FixCaps.SeedToday, N8f finding 2) to restore a count
+// observed in a durable log, which may legitimately already be >= limit (e.g. the process crashed
+// exactly at the cap). resetIfNewDay runs first so a seed call after a stale day's leftover count
+// does not silently add onto it. n is only ever raised, never lowered, so seeding twice (or
+// seeding after a real TryIncrement already happened) can never regress the count downward.
+func (c *DailyCounter) SeedCount(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resetIfNewDay()
+	if n > c.count {
+		c.count = n
+	}
+}
+
 // HourlyCounter is the same shape as DailyCounter but keyed by UTC hour, for
 // WORKER_MAX_TRIAGE_PER_HOUR (plan §2.6's one hourly-window cap).
 type HourlyCounter struct {
@@ -201,4 +263,36 @@ func (c *HourlyCounter) Count() int {
 	defer c.mu.Unlock()
 	c.resetIfNewHour()
 	return c.count
+}
+
+// Remaining returns the slots left this UTC hour (limit - count), mirroring
+// DailyCounter.Remaining/DailyBudget.Remaining's contract (-1 for an unlimited/non-positive limit).
+func (c *HourlyCounter) Remaining() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limit <= 0 {
+		return -1
+	}
+	c.resetIfNewHour()
+	remaining := c.limit - c.count
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+// SeedCount sets the current UTC hour's count directly, WITHOUT going through TryIncrement's
+// limit check — same rationale and same "only ever raised, never lowered" contract as
+// DailyCounter.SeedCount (circuit-config-sec finding 3): boot-time reconstruction from the
+// journal's triage-start records for the current hour, so a crash-loop restart cannot reset the
+// WORKER_MAX_TRIAGE_PER_HOUR cap and let a caller triage past it across a restart within the same
+// hour. resetIfNewHour runs first so seeding after a stale hour's leftover count does not silently
+// add onto it.
+func (c *HourlyCounter) SeedCount(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resetIfNewHour()
+	if n > c.count {
+		c.count = n
+	}
 }

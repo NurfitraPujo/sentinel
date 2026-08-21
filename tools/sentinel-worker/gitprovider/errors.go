@@ -1,8 +1,10 @@
 package gitprovider
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/NurfitraPujo/sentinel/tools/sentinel-worker/sentinel"
 )
@@ -66,4 +68,28 @@ func classifyStatus(status int) sentinel.FailureClass {
 // newError builds a classified *Error for a non-2xx forge response.
 func newError(provider, op string, status int, body string) *Error {
 	return &Error{Provider: provider, Op: op, Status: status, Body: body, Class: classifyStatus(status)}
+}
+
+// IsAuthFailure reports whether err represents a git-auth failure (C16, finding 5): either a
+// classified *Error from CreatePR/PRStatus whose Class is sentinel.ClassAuthFailure (a REST
+// 401/403), or a plain error from RunGit (clone/push have no HTTP status to classify — the git CLI
+// only ever returns exit-status + stderr text) whose message contains git's own
+// "Authentication failed" / "could not read Username"/"invalid credentials" phrasing. The text
+// heuristic is deliberately narrow (git's own wording is stable across versions/providers) rather
+// than matching on any non-zero git exit, so a transient network failure or a merge conflict is
+// never misclassified as an auth failure.
+func IsAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var gerr *Error
+	if errors.As(err, &gerr) {
+		return gerr.Class == sentinel.ClassAuthFailure
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "could not read username") ||
+		strings.Contains(msg, "invalid credentials") ||
+		strings.Contains(msg, "http basic: access denied") ||
+		strings.Contains(msg, "403") && strings.Contains(msg, "forbidden")
 }

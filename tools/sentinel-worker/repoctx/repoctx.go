@@ -14,6 +14,7 @@ package repoctx
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -134,6 +135,11 @@ func CloneURL(provider, owner, repo string) (string, error) {
 type Repo struct {
 	Key  RepoKey
 	Root string // absolute path to the clone's working tree root
+	// CloneURL is the entry's own known-good clone URL (see entry.cloneURL) carried through so
+	// CheckoutRelease can pin its release-ref fetch's askpass host against it, the same way
+	// refreshLocked pins its periodic fetch — never by re-reading origin's URL out of the clone's
+	// own (attacker-writable) .git/config (finding 9, mirrors circuit-config-sec finding 5).
+	CloneURL string
 }
 
 // entry is the cache's per-repo bookkeeping. Its own mutex serializes clone/fetch operations for
@@ -144,6 +150,12 @@ type entry struct {
 	mu        sync.Mutex
 	dir       string
 	lastFetch time.Time
+	// cloneURL is the tokenless clone URL Get was called with when this entry was first cloned
+	// (circuit-config-sec finding 5), kept ONLY so refreshLocked's periodic `git fetch` can derive
+	// an askpass host pin from it -- never from re-reading origin's URL out of .git/config, which a
+	// workspace-writing attacker could have rewritten (same rationale as jobs.PushFixBranch's
+	// CloneURL-derived pin, gitprovider.RunGitWithHost's doc).
+	cloneURL string
 }
 
 // Cache is the confined, shallow-clone read cache described in plan §4.5. All clones live under
@@ -219,6 +231,12 @@ func (c *Cache) Get(ctx context.Context, key RepoKey, cloneURL string, cred gitp
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Recorded unconditionally (not only on a fresh clone) so an entry whose on-disk clone already
+	// existed when this process started (entryFor's in-memory entry is fresh, but the directory on
+	// disk survived a restart) still gets a cloneURL to pin refreshLocked's fetch against --
+	// otherwise the very first refresh after a restart would run with an empty pin (finding 5).
+	e.cloneURL = cloneURL
+
 	depth := c.cloneDepth(cloneDepth)
 	branchArgs := []string{}
 	if key.DefaultBranch != "" {
@@ -240,7 +258,7 @@ func (c *Cache) Get(ctx context.Context, key RepoKey, cloneURL string, cred gitp
 			return nil, fmt.Errorf("repoctx: clone %s/%s: %w", key.Owner, key.Repo, err)
 		}
 		e.lastFetch = c.now()
-		return &Repo{Key: key, Root: e.dir}, nil
+		return &Repo{Key: key, Root: e.dir, CloneURL: e.cloneURL}, nil
 	}
 
 	if c.now().Sub(e.lastFetch) >= c.refresh {
@@ -248,7 +266,7 @@ func (c *Cache) Get(ctx context.Context, key RepoKey, cloneURL string, cred gitp
 			return nil, err
 		}
 	}
-	return &Repo{Key: key, Root: e.dir}, nil
+	return &Repo{Key: key, Root: e.dir, CloneURL: e.cloneURL}, nil
 }
 
 // refreshLocked runs the throttled `git fetch --depth 1` + hard reset. Caller must hold e.mu.
@@ -257,7 +275,18 @@ func (c *Cache) refreshLocked(ctx context.Context, e *entry, key RepoKey, cred g
 	if key.DefaultBranch != "" {
 		fetchArgs = append(fetchArgs, "--", key.DefaultBranch)
 	}
-	if err := gitprovider.RunGit(ctx, e.dir, cred, nil, fetchArgs...); err != nil {
+	// circuit-config-sec finding 5: `git fetch origin` (bare remote name, no URL) carries no http(s)
+	// URL argument for gitprovider.RunGit's own deriveExpectedHost to find, so a plain RunGit call
+	// here runs with the askpass host pin DISABLED -- the same attack shape jobs.PushFixBranch's
+	// finding 1 fixed on the write path (a repo-local `url.<attacker>.insteadOf` rewrite of origin
+	// could otherwise receive a credential prompt answer meant for the real host). Pin explicitly to
+	// e.cloneURL's host (the known-good clone URL this entry was Get'd with, never re-read from
+	// origin's current, attacker-writable .git/config) via RunGitWithHost instead.
+	expectedHost, err := expectedRefreshHost(e.cloneURL)
+	if err != nil {
+		return fmt.Errorf("repoctx: refresh fetch %s/%s: %w", key.Owner, key.Repo, err)
+	}
+	if err := gitprovider.RunGitWithHost(ctx, e.dir, cred, nil, expectedHost, fetchArgs...); err != nil {
 		return fmt.Errorf("repoctx: refresh fetch %s/%s: %w", key.Owner, key.Repo, err)
 	}
 	if err := gitprovider.RunGit(ctx, e.dir, cred, nil, "reset", "--hard", "FETCH_HEAD"); err != nil {
@@ -268,6 +297,32 @@ func (c *Cache) refreshLocked(ctx context.Context, e *entry, key RepoKey, cred g
 	}
 	e.lastFetch = c.now()
 	return nil
+}
+
+// expectedRefreshHost parses cloneURL into the host:port refreshLocked's periodic `git fetch`
+// pins SENTINEL_ASKPASS_HOST to, same contract as jobs.expectedPushHost (kept independent rather
+// than shared/exported across an already-narrow package boundary): a malformed http(s) URL is
+// refused outright (an empty pin would defeat the point of pinning), while a non-http(s) or
+// schemeless cloneURL (a local filesystem path, the shape test fixtures use for a local bare-repo
+// remote) deliberately returns "" — that transport never carries HTTPS Basic auth over the wire,
+// so there is no credential-bearing request for a host pin to protect. An entirely empty cloneURL
+// (an entry that somehow never recorded one) is also refused, matching PushFixBranch's own refusal
+// of an empty CloneURL rather than silently disabling the pin.
+func expectedRefreshHost(cloneURL string) (string, error) {
+	if cloneURL == "" {
+		return "", fmt.Errorf("repoctx: refresh: missing clone URL, refusing to fetch with a disabled askpass pin")
+	}
+	u, err := url.Parse(cloneURL)
+	if err != nil {
+		return "", fmt.Errorf("repoctx: refresh: parsing clone URL for askpass host pin: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", nil
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("repoctx: refresh: clone URL %q has an http(s) scheme but no host; refusing to fetch with a disabled askpass pin", cloneURL)
+	}
+	return u.Host, nil
 }
 
 // Evict removes every cached clone whose RepoKey is not present in mapped — plan §4.5's "cache

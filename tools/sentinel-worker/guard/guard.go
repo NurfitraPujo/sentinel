@@ -46,6 +46,7 @@ package guard
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -313,7 +314,33 @@ const DefaultMaxVerbatim = 0.25
 // threshold, via Config. Check is the convenience entry point most callers use (secrets +
 // default verbatim threshold, default length cap); main.go's wiring and tests needing a
 // non-default MaxVerbatim or MaxLens call this directly.
+// OnRejection, when non-nil, is called once for every candidate CheckWithConfig (and, via it,
+// Check) rejects, naming the field and the Violation.Reason that fired. This is the plan §7
+// "gate_rejections" metric's seam — wired in main.go to health.Status.Inc(health.MetricGateRejections)
+// so the prompt-injection/secret-exfiltration gate's rejections are observable at /metrics, not
+// just as a *Violation the caller happens to log. Deliberately a package-level var, not a Config
+// field: Check/CheckWithConfig are called from several packages (jobs/act.go, jobs/fix_pr.go) each
+// constructing their own Config, and this hook is a single process-wide metrics sink, not a
+// per-call policy knob. nil (the zero value) is a no-op, matching this repo's "nil seam disables
+// the feature" convention.
+var OnRejection func(field PublishedField, reason ViolationReason)
+
 func CheckWithConfig(field PublishedField, text string, toolOutputs []string, cfg Config) error {
+	if err := checkWithConfig(field, text, toolOutputs, cfg); err != nil {
+		if OnRejection != nil {
+			var v *Violation
+			if errors.As(err, &v) {
+				OnRejection(field, v.Reason)
+			} else {
+				OnRejection(field, ReasonLength)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func checkWithConfig(field PublishedField, text string, toolOutputs []string, cfg Config) error {
 	maxLen := cfg.maxLenFor(field)
 	if len(text) > maxLen {
 		return &Violation{

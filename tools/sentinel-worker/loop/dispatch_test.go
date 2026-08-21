@@ -210,3 +210,35 @@ func TestKind_IsJob(t *testing.T) {
 		t.Errorf("non-triage/followup kinds must not be jobs")
 	}
 }
+
+// TestClassify_OccurrenceBurstSuppressedByOpenFix is the RED-FIRST proof for finding 3
+// (fix-lifecycle remediation round 2): an occurrence_burst/regressed event on an issue that
+// already has an open FIX must classify KindNone, not KindTriage -- re-triaging a fixable issue
+// while its FIX PR is out for review would re-decide fixable and dispatch a SECOND, duplicate FIX
+// PR (a fresh trigger seq mints a distinct jobID, so the per-jobID journal dedup never catches it).
+//
+// MUTATION-TEST NOTE: delete the `if hasOpenFix != nil { ... }` arm from Classify's
+// occurrence_burst/regressed case (its pre-fix shape) and this test goes red -- both cases would
+// classify KindTriage regardless of hasOpenFix's answer.
+func TestClassify_OccurrenceBurstSuppressedByOpenFix(t *testing.T) {
+	mine := &EventIssue{ID: "issue-1", AssigneeType: strp("agent"), AssignedTo: strp(me)}
+	for _, typ := range []string{"occurrence_burst", "regressed"} {
+		e := Event{Type: typ, ActorID: "someone-else", Issue: mine, Seq: 1}
+
+		hasOpenFixTrue := func(issueID string) bool { return true }
+		if got := Classify(e, me, nil, hasOpenFixTrue); got != KindNone {
+			t.Errorf("%s: with an open FIX, got %q, want KindNone", typ, got)
+		}
+
+		hasOpenFixFalse := func(issueID string) bool { return false }
+		if got := Classify(e, me, nil, hasOpenFixFalse); got != KindTriage {
+			t.Errorf("%s: with no open FIX, got %q, want KindTriage", typ, got)
+		}
+
+		// Omitted hasOpenFix hook (2-arg call, every pre-finding-3 call site) must keep behaving
+		// exactly as before -- KindTriage, never blocked by a hook that was never wired.
+		if got := Classify(e, me); got != KindTriage {
+			t.Errorf("%s: with no hasOpenFix hook at all, got %q, want KindTriage", typ, got)
+		}
+	}
+}

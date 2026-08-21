@@ -111,11 +111,33 @@ type claimReleasedValue struct {
 // current-claim-state fields (no read per event) — myAgentID is the Agent identity this worker
 // runs under, used both for echo suppression and for "assignedTo == me" checks.
 //
-// hasOpenQuestion is an optional (variadic so existing 2-arg call sites keep compiling) journal
-// query implementing the "OR the journal shows my open question" arm of the question_answered
-// rule (plan §3): PollLoop wires it to Journal.HasOpenQuestion. Omitted or nil, that OR-arm never
-// fires — callers that don't care about it (most tests) can ignore this parameter entirely.
-func Classify(e Event, myAgentID string, hasOpenQuestion ...func(issueID string) bool) Kind {
+// hooks is Classify's optional-callback seam: hasOpenQuestion and hasOpenFix. Kept as a variadic
+// []func(string) bool (rather than two named parameters) so every existing 2-arg call site
+// (Classify(e, myAgentID)) and the pre-finding-3 3-arg call site (Classify(e, myAgentID,
+// hasOpenQuestion)) both keep compiling unchanged — position 0 is always hasOpenQuestion, position
+// 1 is always hasOpenFix (finding 3, fix-lifecycle remediation round 2); a caller that only wants
+// hasOpenFix must still pass a (possibly nil) hasOpenQuestion in position 0.
+//
+// hasOpenQuestion implements the "OR the journal shows my open question" arm of the
+// question_answered rule (plan §3): PollLoop wires it to Journal.HasOpenQuestion.
+//
+// hasOpenFix implements the plan-mandated "skip if FIX in flight per journal" rule for
+// occurrence_burst/regressed (finding 3): without it, an issue that keeps erroring while its FIX
+// PR is out for review gets re-triaged on every burst/regression, and a fixable re-decision
+// dispatches a SECOND, duplicate FIX PR (a fresh trigger seq mints a distinct jobID, so the
+// existing per-jobID dedup never catches it). PollLoop wires this to Journal.HasOpenKind(issueID,
+// jobs.FixKind) — the SAME non-terminal-fix-record scan jobs/sweep.go's hasOpenFix already
+// performs for ReconcileReaped, reused rather than re-implemented (CLAUDE.md B3: a second,
+// diverging copy of "is there an open fix" is exactly how these dedup checks rot).
+func Classify(e Event, myAgentID string, hooks ...func(issueID string) bool) Kind {
+	var hasOpenQuestion, hasOpenFix func(issueID string) bool
+	if len(hooks) > 0 {
+		hasOpenQuestion = hooks[0]
+	}
+	if len(hooks) > 1 {
+		hasOpenFix = hooks[1]
+	}
+
 	// Echo suppression: our own writes echo on the feed and must never re-dispatch (plan §3).
 	if e.ActorID != "" && e.ActorID == myAgentID {
 		return KindNone
@@ -125,10 +147,15 @@ func Classify(e Event, myAgentID string, hasOpenQuestion ...func(issueID string)
 	case "created", "report_created":
 		return KindTriage
 	case "occurrence_burst", "regressed":
-		if unclaimedOrMine(e.Issue, myAgentID) {
-			return KindTriage
+		if !unclaimedOrMine(e.Issue, myAgentID) {
+			return KindNone
 		}
-		return KindNone
+		if hasOpenFix != nil {
+			if issueID, err := e.IssueID(); err == nil && hasOpenFix(issueID) {
+				return KindNone
+			}
+		}
+		return KindTriage
 	case "question_answered":
 		if assignedToMe(e.Issue, myAgentID) {
 			return KindFollowUp
@@ -137,8 +164,8 @@ func Classify(e Event, myAgentID string, hasOpenQuestion ...func(issueID string)
 		// longer reads "me", but the journal still shows an unresolved question we asked on this
 		// issue. Without this arm, a reaped claim permanently orphans that question thread: the
 		// answer arrives and nobody ever follows up on it.
-		if len(hasOpenQuestion) > 0 && hasOpenQuestion[0] != nil {
-			if issueID, err := e.IssueID(); err == nil && hasOpenQuestion[0](issueID) {
+		if hasOpenQuestion != nil {
+			if issueID, err := e.IssueID(); err == nil && hasOpenQuestion(issueID) {
 				return KindFollowUp
 			}
 		}
