@@ -1,14 +1,14 @@
 # Architecture
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-08-24
 
 ## System Overview
 Sentinel follows a decoupled, event-driven architecture using NATS as the central message broker. Data flows from source to the Ingestor, through NATS, into the Processor, and finally to PostgreSQL.
 
 ## Major Components
 - **Ingestor-go**: Handles incoming traffic, authentication, and initial validation. Acts as a producer for NATS.
-- **Processor-go**: Consumes events from NATS, performs heavy lifting (masking, normalization, fingerprinting), and stores results in the database.
-- **Dashboard-web**: Frontend for visualization and management of ingested events.
+- **Processor-go**: Consumes events from NATS, performs heavy lifting (masking, normalization, fingerprinting), and stores results in the database. Also runs the outbound agent-webhook dispatcher (see "Agent subsystem" below).
+- **Dashboard-web**: Frontend for visualization and management of ingested events. Also exposes the `/api/agent/*` HTTP API that registered agents use to triage issues (see below) — this is not a separate service, it's routes in the same SvelteKit app, authenticated differently from the session-based dashboard UI.
 - **NATS**: Distributed message broker for service decoupling.
 - **PostgreSQL**: Primary data store for processed events and metadata.
 
@@ -361,3 +361,116 @@ zero rows written there. `docs/memory/VERIFIED_STATE.md` S6; `docs/memory/BUGS.m
 **Where to look next**
 `apps/ingestor-go/main.go`, `apps/ingestor-go/auth/apikey.go`, `apps/ingestor-go/auth/context.go`,
 `packages/db-migrations/migrations/1721800000_add_organization_layer.sql`.
+
+---
+
+### 2026-08-18 - Agent Subsystem: Registered Agents Triage Issues via `/api/agent/*`, Claims Are Advisory
+
+**Status**
+Active
+
+**Why this is durable**
+This is a second, structurally different trust boundary layered onto the dashboard: `/api/agent/*` is
+bearer-token-authenticated HTTP API surface (no session, no browser), sharing the same `issues`/`projects`
+tables and org/tenant model as the session-authenticated dashboard UI. Getting agent auth, claim semantics,
+or the assignment boundary wrong reopens the same class of cross-tenant/cross-actor bugs the ingestor's
+tenancy model above exists to prevent — and D24 (below) is exactly one such near-miss, already found and
+fixed once.
+
+**Decision (as-built)**
+1. **Component map.** Dashboard-side: `apps/dashboard-web/src/lib/server/agent-auth.ts` (auth + rate limit),
+   `agent-ops.ts` (single op registry shared by every single-issue route *and* the batch endpoint —
+   guarantees identical behavior between the two call shapes, enforced by CI drift tests
+   `openapi-drift.test.ts`/`completeness.test.ts`), `agent-audit.ts` (compliance trail), `agent-events.ts`
+   (seq-cursored feed), `agent-issue-scope.ts` (cross-org guard). Routes live under
+   `apps/dashboard-web/src/routes/api/agent/**` (self, key rotation, projects, repo-credentials, events,
+   issues list/detail/claim/occurrences/comments/progress/questions/status/relations/report-severity,
+   uploads, batch). Processor-side: `apps/processor-go/webhooks/dispatcher.go` — an outbound push
+   alternative to polling `GET /api/agent/events`. `docs/agents/openapi.agent.yaml` is **generated**, never
+   hand-edited, from `apps/dashboard-web/src/lib/server/agent-api-spec/`; CI fails if it drifts from either
+   the registry or the actual routes.
+2. **Auth is bearer-token, not session.** `Authorization: Bearer sent_agent_<64 hex>`; the token is hashed
+   (sha256, same scheme as `createApiKey`) and matched against `project_api_keys.key_hash` where
+   `scope='agent'`. The row must be active/unexpired/unrevoked and its linked `agents` row (new
+   org-scoped table, `1722900000_add_agents.sql`) must be `status='active'`; `organizationId` on both rows
+   is cross-checked. **All auth failure modes return an identical `401`** — deliberately indistinguishable,
+   same anti-enumeration rule as the tenancy model above. Tenant scope is derived only from the
+   authenticated key/agent row, never from the URL or body (same B7 invariant).
+3. **Claim model is an atomic conditional UPDATE, not a lock or a unique constraint.**
+   `claimIssue` (`apps/dashboard-web/src/lib/db/queries/reports.ts`) does
+   `UPDATE issues SET ... WHERE id=$1 AND assigned_to IS NULL RETURNING *`; zero rows updated means someone
+   else holds it (`ClaimConflictError` → 409), unless the current claimant is the caller itself (idempotent
+   `alreadyClaimed: true`, since N9). `releaseClaim` mirrors this with an ownership-scoped `WHERE`, also
+   idempotent (since N7d). A stale-claim reaper (`retention.ts`) force-releases agent claims (never human
+   claims) idle past `CLAIM_STALE_HOURS` (default 24), journaled with `actor_type: 'system'`.
+4. **Claims are advisory, not enforced (A11 — deliberate, accepted, not planned to change).** Any active
+   agent can comment/change status/add relations on an issue it does not hold the claim on; a non-claimant
+   mutation only emits a server-side warning log (`agent.mutated_claimed_issue`). Enforcing claim ownership
+   was rejected because it would break automation that mutates without claiming first.
+5. **Assignment guard (D24).** `assignIssue` (`apps/dashboard-web/src/lib/db/queries/issues.ts`) throws
+   `AgentAssignmentError` if `assigneeType==='agent'` — **agents cannot be dashboard-assigned**, only
+   self-claimed via `POST /api/agent/issues/:id/claim`, enforced identically in the batch-assign route
+   (400). Reason (in code): a dashboard-assigned agent would produce a claim-shaped state with
+   `claimed_at NULL` that the stale-claim reaper could never reap and the agent never actually
+   acquired/journaled. Unassigning an agent-held issue from the dashboard is treated as a deliberate
+   claim release (journaled `claim_released`, actor `user`), not a plain `unassigned` event — `claimedAt`
+   is always cleared either way.
+6. **Provenance is actor-typed, not a separate flag.** There is no `created_by_agent`/`source` column.
+   `issue_activity.actor_type` (`user|agent|system`), `audit_logs.actorId`, and `issues.assigneeType`
+   (`user|agent`, nullable) are how agent- vs human-originated rows are distinguished, reusing the same
+   columns the rest of the product already has rather than adding a parallel provenance model.
+7. **Idempotency and rate limiting are per-agent-key, not global.** Optional `idempotency_key` in mutation
+   bodies is backed by `agent_idempotency_keys` (`UNIQUE(agent_id, idempotency_key)`, 7-day reap) and
+   replays the original result on repeat. Rate limiting (`checkRateLimitWithLimit`) is a **fixed 60-second
+   window** keyed on `agent-key:<keyId>` — accepted trade-off, can legitimately burst ~2x across a window
+   boundary (A10, documented, not planned to change); `POST /api/agent/batch` (up to 20 ops) counts as one
+   request regardless of op count.
+8. **Webhooks sign with a plaintext-stored secret, deliberately.** `agent_webhooks.secret` is stored
+   unencrypted because the dispatcher must HMAC-sign each delivery with the raw secret at send time
+   (`X-Sentinel-Signature: t=<unix>,v1=<hmac-sha256 hex>`) — unlike API keys, which are only ever
+   hash-verified and never need the raw value again after creation. A webhook auto-disables
+   (`status='failed'`) after `WEBHOOK_FAILURE_THRESHOLD` (default 20) consecutive delivery failures.
+9. **Feature gating is per-capability, not a single build-time flag.** The `/api/agent/*` routes are
+   always present in the running app; access is entirely via per-key `scope='agent'` auth. The
+   `manage_agents` RBAC permission (owner/admin only) gates agent CRUD, webhook registration, and
+   project agent-settings in the dashboard UI. `project_agent_settings.fix_enabled` (default `false`,
+   per-project) separately gates whether a worker may open a PR vs. propose-only — an operator switch, not
+   a deploy-time flag.
+
+**Tradeoffs**
+- **Gained**: agents get a stable, versioned, machine-first API (generated OpenAPI spec, drift-tested)
+  fully decoupled from session/CSRF-oriented dashboard routes, while sharing the same tenancy and
+  audit primitives the rest of the product already trusts.
+- **Made harder**: two independent actor models (session user, bearer-token agent) now both write the same
+  `issues`/`issue_activity` tables, so every new mutation path has to decide, explicitly, what each actor
+  type is and isn't allowed to do — D24 is the record of what happens when that decision is skipped for
+  one path (dashboard assignment) and only caught later.
+- **Reconsider**: A11 (advisory-only claims) and A10 (fixed-window rate limiting) are both accepted
+  trade-offs per the automation remediation audit, not oversights — do not "fix" either without reading
+  `docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md` and `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`
+  first, since both were deliberately left as-is against known alternatives.
+
+**Future mistake prevented**
+1. Wiring a new mutation route without threading it through `agent-ops.ts`'s shared registry — that is
+   exactly what keeps the batch endpoint and single-issue routes from silently diverging.
+2. Treating a held claim as a lock that blocks other agents' mutations — it explicitly isn't (point 4);
+   code that assumes otherwise will be surprised in production, not in tests.
+3. Assigning an issue to an agent from the dashboard "just this once" — the query layer rejects it by
+   design (D24), and working around the guard reintroduces the un-reapable claim-shaped state it exists to
+   prevent.
+4. Hand-editing `docs/agents/openapi.agent.yaml` — it's generated output; edit `agent-api-spec/` and
+   regenerate, or CI's drift tests will fail.
+
+**Evidence**
+`apps/dashboard-web/src/lib/server/agent-auth.ts`, `agent-ops.ts`, `agent-audit.ts`, `agent-events.ts`,
+`agent-issue-scope.ts`; `apps/dashboard-web/src/lib/db/queries/reports.ts` (`claimIssue`, `releaseClaim`),
+`apps/dashboard-web/src/lib/db/queries/issues.ts` (`assignIssue`, `AgentAssignmentError`);
+`apps/processor-go/webhooks/dispatcher.go`; migrations `1722900000_add_agents.sql`,
+`1723300000_add_agent_webhooks.sql`, `1723800000_add_agent_idempotency_keys.sql`,
+`1724000000_add_project_agent_settings.sql`; `docs/agents/SENTINEL_AGENT_GUIDE.md`,
+`docs/agents/openapi.agent.yaml`, `docs/plans/AGENT_WORKER_PLAN.md`,
+`docs/audits/AGENT_AUTOMATION_AUDIT_2026-08-14.md`, `docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md`.
+
+**Where to look next**
+`apps/dashboard-web/src/routes/api/agent/**`, `apps/dashboard-web/src/lib/server/agent-ops.ts`,
+`apps/processor-go/webhooks/dispatcher.go`, `docs/agents/SENTINEL_AGENT_GUIDE.md`.

@@ -15,16 +15,17 @@ occurrences, organizations, and alerting configuration.
 > [docs/memory/VERIFIED_STATE.md](docs/memory/VERIFIED_STATE.md) — it records what has actually been proven
 > to run, and with which command.
 >
-> As of **2026-08-01** (`b895df1` on `main`): all 32 rows of the
-> [E2E recovery plan](docs/plans/E2E_RECOVERY_PLAN.md)'s use-case matrix are green
-> (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **76 passed, 0 skipped**), covering key management,
-> rate limiting, alerting, observability (structured logs, `/metrics`, a distributed trace joining
-> ingestor → NATS → processor), and idempotent event writes. **CI is green on `main` — all 9 check runs** — for
-> the first time in this repository's history; the previous baseline `b9e2018` was red.
+> As of **2026-08-01** (`b895df1` on `main`), all 32 rows of the
+> [E2E recovery plan](docs/plans/E2E_RECOVERY_PLAN.md)'s use-case matrix were green, covering key
+> management, rate limiting, alerting, observability (structured logs, `/metrics`, a distributed trace
+> joining ingestor → NATS → processor), and idempotent event writes, and **CI was green on `main` — all 9
+> check runs** — for the first time in this repository's history; the previous baseline `b9e2018` was red.
+> The suite has grown since (agent API e2e coverage, see below): as of **2026-08-17**
+> (`SENTINEL_E2E=1 go test -tags=e2e ./tests/e2e/` → **81 passed, 0 skipped**, per `CLAUDE.md`).
 >
-> That last point is the whole caveat this banner exists for. The dashboard features shipped before it
-> (org-wide alerts, invitation acceptance, issue relations, API-key management, member management) each
-> merged with their own tests passing, and **three of the five did not execute at runtime** until the
+> The dashboard features shipped before the 2026-08-01 milestone (org-wide alerts, invitation acceptance,
+> issue relations, API-key management, member management) each merged with their own tests passing, and
+> **three of the five did not execute at runtime** until the
 > [UI parity remediation](docs/plans/UI_PARITY_REMEDIATION_PLAN.md) (47 findings, all closed). "Merged"
 > and "reviewed" are not evidence here; a named command with an observed result is.
 >
@@ -38,13 +39,16 @@ occurrences, organizations, and alerting configuration.
 
 - `apps/ingestor-go` — auth, rate limiting, validation, publish to NATS. The only externally exposed service.
 - `apps/processor-go` — consumes NATS, normalizes/masks/fingerprints events, writes to PostgreSQL.
-- `apps/dashboard-web` — SvelteKit UI and JSON API, reads the same database.
+- `apps/dashboard-web` — SvelteKit UI and JSON API, reads the same database. Also exposes an `/api/agent/*`
+  surface for registered agents to triage issues (claim/comment/status/relations) — see
+  [docs/agents/SENTINEL_AGENT_GUIDE.md](docs/agents/SENTINEL_AGENT_GUIDE.md) and
+  [docs/agents/openapi.agent.yaml](docs/agents/openapi.agent.yaml).
 - `packages/shared-go` — shared Postgres pool, NATS pub/sub, and Redis client code.
 - `packages/proto` + `gen/` — the `ErrorEvent` wire contract (buf + protovalidate).
 - `packages/db-migrations` — goose-based SQL migrations, one flat directory for every target
   (see `docs/memory/ARCHITECTURE.md`).
 - `packages/sdk-go` — the public Go client SDK.
-- `tests/{unit,integration,load}` — root-module tests; integration tests use testcontainers.
+- `tests/{unit,integration,contract,e2e,load}` — root-module tests; integration tests use testcontainers.
 
 The root module, `packages/sdk-go`, and `packages/db-migrations` are three separate Go modules joined by a
 committed `go.work` for local development (`GOWORK=off` is still used in CI-equivalent checks to exercise the
@@ -119,8 +123,9 @@ cp .env.example .env
 # Edit .env only if you need to change ports/credentials; defaults work for local dev.
 
 # 2. Start infrastructure + build and boot the app containers
-#    (postgres, redis, nats, a one-shot `migrate` container that applies schema, then
-#    ingestor/processor/dashboard, which wait for `migrate` to succeed before starting)
+#    (postgres, redis, nats, minio (attachment storage), a one-shot `migrate` container that applies
+#    schema, then ingestor/processor/dashboard, which wait for `migrate` to succeed before starting.
+#    jaeger (tracing) and a retention `cron` container also come up but are inert unless enabled.)
 task infra-up
 # or: docker compose up -d
 
@@ -268,5 +273,10 @@ pre-v0.2.0 client, move your secret into `APIKey`.
 - [docs/memory/BUGS.md](docs/memory/BUGS.md) — known defects and their root causes.
 - [docs/plans/E2E_RECOVERY_PLAN.md](docs/plans/E2E_RECOVERY_PLAN.md) — the active plan to make every feature
   work end-to-end and add CI.
+- [docs/plans/MANUAL_ISSUES_DESIGN.md](docs/plans/MANUAL_ISSUES_DESIGN.md) and
+  [docs/plans/AGENT_WORKER_PLAN.md](docs/plans/AGENT_WORKER_PLAN.md) — design and rollout of the manual
+  issues feature and the registered-agent triage API (`/api/agent/*`).
+- [docs/agents/SENTINEL_AGENT_GUIDE.md](docs/agents/SENTINEL_AGENT_GUIDE.md) — how a registered agent
+  discovers, claims, and works Sentinel issues via the API.
 - [packages/db-migrations/README.md](packages/db-migrations/README.md) — migration recovery procedures.
 - `CLAUDE.md` — repo conventions for AI coding agents (also useful background for humans).
