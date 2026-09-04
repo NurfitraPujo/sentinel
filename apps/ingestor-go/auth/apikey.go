@@ -30,10 +30,52 @@ type APIKeyAuthenticator struct {
 	db    *pgxpool.Pool
 	redis *libredis.Client
 	sub   *nats.Subscriber
+
+	// lookup resolves a key hash to its row. Always a.getAPIKeyData in production; it exists as a
+	// field so the scope allowlist below can be exercised by a unit test without a Postgres, which
+	// is what the contract's per-route allowlist (§2) has to be proven on.
+	lookup func(ctx context.Context, hashStr string) (*APIKeyData, error)
 }
+
+// ScopeSet is an allowlist of project_api_keys.scope values that one middleware chain admits.
+//
+// It is a set per CHAIN, not one set for the process, because the scopes are not
+// interchangeable: contract §2 (sentinel-user-report-issue) requires that a `report`-scoped key
+// still cannot POST /ingest after `report` is added to the CHECK constraint. Widening the single
+// allowlist this file used to hold would have done exactly that.
+type ScopeSet []string
+
+// Allows reports whether scope is on this allowlist. An empty set allows nothing and an empty
+// scope is never allowed -- an allowlist that fails open on a zero value is not an allowlist.
+func (s ScopeSet) Allows(scope string) bool {
+	if scope == "" {
+		return false
+	}
+	for _, allowed := range s {
+		if allowed == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// The two allowlists this repo mounts today. specs/008-api-key-management/spec.md FR-003 defines
+// `ingest` (ingestion endpoints only), `read` (dashboard/query APIs only, never ingestion) and
+// `admin` (full access); docs/plans/MANUAL_ISSUES_DESIGN.md §7 adds `agent`; contract §4.6 adds
+// `report`. Only `admin` appears on both lists.
+var (
+	// ScopesIngest guards /ingest and /ingest/batch.
+	ScopesIngest = ScopeSet{"ingest", "admin"}
+	// ScopesReport guards the user-report intake routes (§4.1, §4.5). Under contract OQ-1 variant
+	// (b) those routes are hosted by apps/dashboard-web, so nothing in this process mounts this
+	// set today -- it lives here because it is the ingestor half of the same fail-closed rule and
+	// because a future ingestor-side report route must not have to re-derive it.
+	ScopesReport = ScopeSet{"report", "admin"}
+)
 
 func NewAPIKeyAuthenticator(db *pgxpool.Pool, redis *libredis.Client, sub *nats.Subscriber) *APIKeyAuthenticator {
 	auth := &APIKeyAuthenticator{db: db, redis: redis, sub: sub}
+	auth.lookup = auth.getAPIKeyData
 	if sub != nil {
 		go func() {
 			_ = sub.Subscribe(context.Background(), func(ctx context.Context, msg []byte, headers nats.Header) error {
@@ -63,7 +105,11 @@ func NewAPIKeyAuthenticator(db *pgxpool.Pool, redis *libredis.Client, sub *nats.
 	return auth
 }
 
-func (a *APIKeyAuthenticator) Middleware(next http.Handler) http.Handler {
+// Middleware authenticates X-API-Key and admits only the scopes on `allowed`.
+//
+// `allowed` is a required parameter and not a package-level default on purpose: every mount site
+// must name the allowlist it wants, so adding a route can never silently inherit /ingest's.
+func (a *APIKeyAuthenticator) Middleware(allowed ScopeSet, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiKey := r.Header.Get("X-API-Key")
 		if apiKey == "" {
@@ -74,21 +120,20 @@ func (a *APIKeyAuthenticator) Middleware(next http.Handler) http.Handler {
 		hash := sha256.Sum256([]byte(apiKey))
 		hashStr := hex.EncodeToString(hash[:])
 
-		data, err := a.getAPIKeyData(r.Context(), hashStr)
+		data, err := a.lookup(r.Context(), hashStr)
 		if err != nil {
 			http.Error(w, "Invalid API key", http.StatusUnauthorized)
 			return
 		}
 
-		// Allowlist, not a denylist. specs/008-api-key-management/spec.md FR-003 defines
-		// exactly three scopes: `ingest` (ingestion endpoints only), `read` (dashboard/query
-		// APIs only, never ingestion), `admin` (full access, including ingestion). This
-		// handler only ever serves /ingest and /ingest/batch, so only `ingest` and `admin`
-		// may pass. The previous form (`if data.Scope == "read" { 403 }`) happened to allow
-		// the same two scopes today only because those are the only other values that exist —
-		// it fails open for any future scope value instead of rejecting it, which is exactly
-		// backwards for an auth check.
-		if data.Scope != "ingest" && data.Scope != "admin" {
+		// Allowlist, not a denylist, and PER CHAIN rather than per process. The previous form
+		// (`if data.Scope == "read" { 403 }`) failed open for any scope value that did not exist
+		// yet; the form after that (`!= "ingest" && != "admin"`) failed closed but was a single
+		// list shared by every mount site, so admitting a new scope anywhere admitted it to
+		// /ingest too. Contract §2 (sentinel-user-report-issue, OQ-3) turns that into the concrete
+		// requirement this parameter satisfies: `report` must reach the report routes and must NOT
+		// reach /ingest. An unknown scope is still rejected by every list.
+		if !allowed.Allows(data.Scope) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}

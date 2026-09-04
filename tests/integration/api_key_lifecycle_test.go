@@ -15,7 +15,7 @@ func TestAPIKeyLifecycleAndRateLimitingE2E(t *testing.T) {
 	rateLimiter := middleware.NewRateLimiter(nil)
 	authenticator := auth.NewAPIKeyAuthenticator(nil, nil, nil)
 
-	handler := authenticator.Middleware(rateLimiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authenticator.Middleware(auth.ScopesIngest, rateLimiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(`{"status":"accepted"}`))
 	})))

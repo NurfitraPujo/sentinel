@@ -282,6 +282,18 @@ services:
             # deployment set this to the public S3/MinIO URL (e.g. https://uploads.example.com).
             S3_PUBLIC_ENDPOINT: "http://localhost:${MINIO_HOST_PORT:-9000}"
             S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            # sentinel-user-report-issue §4.5 / §8: the intake upload knobs. REPORT_UPLOAD_RPM is the
+            # per-key per-minute throttle for POST /api/report/attachments only;
+            # REPORT_UPLOAD_BYTES_PER_DAY is the rolling-24h byte ceiling summed in Postgres over
+            # this org's uploader_type='external_reporter' rows (SR-5). Both are passthrough so a
+            # local run can lower them without editing this file.
+            REPORT_UPLOAD_RPM: "${REPORT_UPLOAD_RPM:-10}"
+            REPORT_UPLOAD_BYTES_PER_DAY: "${REPORT_UPLOAD_BYTES_PER_DAY:-262144000}"
+            # adapter-node caps a request body at 512 kB by default, which is below MAX_UPLOAD_BYTES
+            # and therefore below what every upload route in this app already advertises. Raised to
+            # the 25 MB cap plus multipart envelope headroom so the cap enforced by the application
+            # is the one the caller actually meets.
+            BODY_SIZE_LIMIT: "${BODY_SIZE_LIMIT:-27M}"
             S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
             S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
             POSTGRES_HOST: postgres

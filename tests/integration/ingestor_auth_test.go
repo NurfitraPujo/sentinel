@@ -94,7 +94,7 @@ func TestAPIKeyAuthenticator_MissingKey(t *testing.T) {
 	authn := auth.NewAPIKeyAuthenticator(pool, nil, nil)
 
 	called := false
-	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authn.Middleware(auth.ScopesIngest, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -124,7 +124,7 @@ func TestAPIKeyAuthenticator_InvalidKey(t *testing.T) {
 	authn := auth.NewAPIKeyAuthenticator(pool, nil, nil)
 
 	called := false
-	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authn.Middleware(auth.ScopesIngest, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -156,7 +156,7 @@ func TestAPIKeyAuthenticator_ValidKey(t *testing.T) {
 		observedKey any
 		wasCalled   bool
 	)
-	handler := authn.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authn.Middleware(auth.ScopesIngest, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read via the typed accessor, never a string literal. auth switched to a private ctxKey
 		// type; context.Value compares the dynamic type too, so Value("project_key") silently
 		// returns nil forever. That exact mismatch disabled rate limiting on 100% of requests
