@@ -8,9 +8,11 @@ import {
 	issueTombstones,
 	projects,
 	agentIdempotencyKeys,
+	reportIdempotencyKeys,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
 import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency';
+import { REPORT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/report-idempotency';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
 
@@ -256,6 +258,31 @@ export async function reapExpiredIdempotencyKeys(
 		.delete(agentIdempotencyKeys)
 		.where(lt(agentIdempotencyKeys.createdAt, cutoff))
 		.returning({ id: agentIdempotencyKeys.id });
+
+	return deleted.length;
+}
+
+/**
+ * sentinel-user-report-issue §8: the same sweep for `report_idempotency_keys`, whose window is
+ * also 7 days ("matching the existing reaper's cutoff"). A separate function rather than a
+ * parameter on the one above because the two tables are two different key spaces -- the agent's
+ * and the calling API key row's -- and collapsing them would make one retention knob mean two
+ * things. `idx_report_idempotency_keys_created_at` keeps this off a full scan.
+ *
+ * Past the window a stored key no longer deduplicates: `POST /api/report` deletes an expired row
+ * itself when a repeat arrives (see `deleteExpiredReportIdempotency`), so this sweep is about
+ * table bloat, not about correctness. Returns the count deleted.
+ */
+export async function reapExpiredReportIdempotencyKeys(
+	retentionDays: number = REPORT_IDEMPOTENCY_RETENTION_DAYS
+): Promise<number> {
+	const cutoff = new Date();
+	cutoff.setDate(cutoff.getDate() - retentionDays);
+
+	const deleted = await db
+		.delete(reportIdempotencyKeys)
+		.where(lt(reportIdempotencyKeys.createdAt, cutoff))
+		.returning({ id: reportIdempotencyKeys.id });
 
 	return deleted.length;
 }

@@ -8,10 +8,12 @@ import {
 	users,
 	attachments,
 	issueComments,
+	externalIssueReports,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { insertReportIdempotency } from '$lib/server/report-idempotency';
 
 /**
  * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
@@ -20,6 +22,15 @@ import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
  */
 
 export type ReportSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * The `attachments_uploader_type_check` vocabulary. `'external_reporter'` is
+ * sentinel-user-report-issue §4.6's third value, added by
+ * `1724100000_add_user_report_intake_and_oncall.sql` with the same catalog-guarded CHECK swap the
+ * rest of that migration uses. It exists here so `claimDraftAttachmentsOnto`'s uploader-type match
+ * (R10) stays exhaustive rather than being widened by a cast at one call site.
+ */
+export type AttachmentUploaderType = 'user' | 'agent' | 'external_reporter';
 
 /**
  * §2, Q12: find-or-create the per-org Triage inbox project, lazily, on first use. No backfill
@@ -214,6 +225,172 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 }
 
 /**
+ * Thrown by `createExternalIssueReport` when an id in §4.1's `attachments` array is unknown,
+ * already claimed, uploaded by a different reporter, or belongs to another organization.
+ *
+ * §4.1 is explicit that this is all-or-nothing: "Each must be a draft attachment in this key's
+ * organization or the whole request is `400 attachment_not_found` and **nothing is created**" --
+ * which is the opposite of `claimDraftAttachments`' own contract, where a stale id is silently
+ * skipped so a browser form does not lose a whole report over one expired draft. Both are right
+ * for their caller, so the strictness lives here rather than being pushed down into the shared
+ * helper and changing behaviour for `/reports/new`.
+ *
+ * Thrown, never returned: D18 -- returning early from inside a `db.transaction` callback COMMITS
+ * whatever the callback already did, which here would be a report with half its screenshots.
+ */
+export class ReportAttachmentNotFoundError extends Error {
+	constructor() {
+		super('One or more attachment ids are unknown, already claimed, or not in this organization');
+		this.name = 'ReportAttachmentNotFoundError';
+	}
+}
+
+export interface CreateExternalIssueReportInput {
+	/** From the credential, never the body (B7). Used for the attachment tenancy check. */
+	organizationId: string;
+	/** Always known: the key fixes it, or `X-Project-Key`/`project_key` resolved inside the org. */
+	projectId: string;
+	/** `external_reporters.id`, already upserted for `(project_id, external_id)`. */
+	externalReporterId: string;
+	/** Supplied by the caller, or derived by §4.5a. `issues.message` is NOT NULL either way. */
+	title: string;
+	/** §4.1's `text`, stored as Markdown -- sanitised at render, never trusted (design §3). */
+	bodyMd: string;
+	severity: ReportSeverity;
+	/** §4.1's `context` verbatim, unknown keys kept. */
+	context: Record<string, unknown>;
+	/** Stored on the companion row for provenance; the dedupe itself is `idempotency` below. */
+	idempotencyKey: string | null;
+	/** §4.5 draft attachment ids, at most 5, all-or-nothing (see the error above). */
+	attachmentIds: string[];
+	/**
+	 * When present, `report_idempotency_keys` gets its row in THIS transaction. A duplicate key
+	 * therefore fails the whole transaction and creates nothing -- see `report-idempotency.ts`'s
+	 * header for why reserving the key in a separate earlier statement would not deduplicate
+	 * concurrent requests at all.
+	 */
+	idempotency?: { apiKeyId: string; idempotencyKey: string; requestHash: string } | null;
+}
+
+/**
+ * sentinel-user-report-issue §4.1 + §4.6 (OQ-6): creates one externally-submitted report.
+ *
+ * An `issues` row (`issue_type='user_report'`, `source_channel='user_report_api'`) plus its 1:1
+ * `external_issue_reports` companion -- **`manual_issue_reports` is not written**, which is the
+ * decision OQ-6 records and §1's "the org-member report path is not widened" promises. The two
+ * companions are siblings, never alternatives to each other on the same row.
+ *
+ * Deliberately NOT `createManualIssue` with a different `sourceChannel`: that function writes
+ * `manual_issue_reports`, subscribes `reporterId` as a `users` row, and can lazily provision the
+ * Triage inbox project. An external reporter is not a Sentinel user, has no subscription, and its
+ * project is fixed by the credential -- three things that would have had to become conditional
+ * inside a shipped path this feature promises not to touch.
+ *
+ * D18 throughout: every failure throws so the transaction rolls back. Nothing here returns early.
+ */
+export async function createExternalIssueReport(input: CreateExternalIssueReportInput) {
+	const title = input.title.trim();
+	if (title.length === 0) {
+		// Unreachable through the endpoint -- §4.5a's derivation is total and falls back to
+		// "User report" -- but `issues.message` is NOT NULL and a caller of this function directly
+		// must not be able to write an empty one.
+		throw new Error('title must not be empty');
+	}
+
+	return await db.transaction(async (tx) => {
+		// Manual issues are never deduped by fingerprint; only UNIQUE(project_id, fingerprint) needs
+		// satisfying. Same rule for external ones -- §4.1's dedupe is `idempotency_key`, and a
+		// content fingerprint would silently merge two users reporting the same wording.
+		const fingerprint = crypto.randomBytes(16).toString('hex');
+
+		const [issue] = await tx
+			.insert(issues)
+			.values({
+				projectId: input.projectId,
+				fingerprint,
+				message: title,
+				errorClass: 'user_report',
+				issueType: 'user_report',
+				// OQ-8's new `issues_source_channel_check` value. This is what the /reports filter and
+				// badge separate on, and what tells every existing reader of `user_report` rows that
+				// this one came from an untrusted external caller.
+				sourceChannel: 'user_report_api',
+			})
+			.returning();
+
+		if (!issue) {
+			throw new Error('Failed to create issue row for external report');
+		}
+
+		const [report] = await tx
+			.insert(externalIssueReports)
+			.values({
+				issueId: issue.id,
+				externalReporterId: input.externalReporterId,
+				bodyMd: input.bodyMd,
+				severity: input.severity,
+				context: input.context,
+				idempotencyKey: input.idempotencyKey,
+			})
+			.returning();
+
+		if (!report) {
+			throw new Error('Failed to create external_issue_reports row');
+		}
+
+		// The same `report_created` entry the org-member path writes, so an external report's
+		// timeline is not empty. `actor_type` is 'system' because the CHECK admits only
+		// user|agent|system and an external reporter is none of the three -- it is DATA, never a
+		// Sentinel principal (§2). Who it was is in `new_value.externalReporterId`, not in
+		// `actor_id`, so nothing downstream can mistake a reporter id for a user id.
+		await tx.insert(issueActivity).values({
+			issueId: issue.id,
+			eventType: 'report_created',
+			actorType: 'system',
+			actorId: 'user_report_api',
+			newValue: {
+				action: 'created',
+				source: 'user_report_api',
+				externalReporterId: input.externalReporterId,
+				severity: input.severity,
+				projectId: input.projectId,
+			},
+		});
+
+		// §4.5's draft-then-claim handoff, in the SAME transaction as creation (the item names
+		// `reports.ts:225` for exactly this). All-or-nothing, unlike the org-member path.
+		if (input.attachmentIds.length > 0) {
+			const claimed = await claimDraftAttachments(
+				tx,
+				input.attachmentIds,
+				issue.id,
+				input.externalReporterId,
+				input.organizationId,
+				'external_reporter'
+			);
+
+			if (claimed.length !== input.attachmentIds.length) {
+				throw new ReportAttachmentNotFoundError();
+			}
+
+			await tx.insert(issueActivity).values({
+				issueId: issue.id,
+				eventType: 'attachment_added',
+				actorType: 'system',
+				actorId: 'user_report_api',
+				newValue: { attachmentIds: claimed.map((a) => a.id) },
+			});
+		}
+
+		if (input.idempotency) {
+			await insertReportIdempotency(tx, { ...input.idempotency, issueId: issue.id });
+		}
+
+		return { issue, report };
+	});
+}
+
+/**
  * §4 linking: claims DRAFT attachments (issue_id/comment_id both NULL) onto `issueId`. Each
  * candidate id is verified to (a) exist, (b) still be a draft, (c) belong to `organizationId`
  * (B7: tenant scope from the caller's already-established org, never re-derived from the
@@ -228,7 +405,7 @@ export async function claimDraftAttachments(
 	issueId: string,
 	uploaderId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId, uploaderType);
 }
@@ -246,7 +423,7 @@ export async function claimDraftAttachmentsForComment(
 	commentId: string,
 	authorId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId, uploaderType);
 }
@@ -262,7 +439,7 @@ async function claimDraftAttachmentsOnto(
 	target: { issueId: string } | { commentId: string },
 	uploaderId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	if (attachmentIds.length === 0) {
 		return [];
