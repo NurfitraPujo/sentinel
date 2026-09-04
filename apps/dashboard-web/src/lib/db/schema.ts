@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, uniqueIndex, integer, boolean, smallint } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, bigint, jsonb, index, uniqueIndex, integer, boolean, smallint, time, primaryKey } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const organizations = pgTable('organizations', {
@@ -294,6 +294,10 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	createdAt: timestamp('created_at').defaultNow(),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),
+	// sentinel-user-report-issue §4.3/§4.6 (1724100000_add_user_report_intake_and_oncall.sql): the triage
+	// matcher scans a candidate issue's recent occurrences newest-first inside
+	// REPORT_MATCH_WINDOW_MINUTES of the report. The release-keyed index above cannot serve that scan.
+	idxOccurrencesIssueCreated: index('idx_occurrences_issue_created').on(table.issueId, table.createdAt),
 }));
 
 export const errorSearchIndex = pgTable('error_search_index', {
@@ -544,3 +548,135 @@ export const projectRepoConnections = pgTable('project_repo_connections', {
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+// ---------------------------------------------------------------------------------------------
+// sentinel-user-report-issue §4.6 (contract 05b5a109). Source of truth for everything below is
+// packages/db-migrations/migrations/1724100000_add_user_report_intake_and_oncall.sql — this file
+// is a hand-maintained mirror and has drifted from the real schema before (see the alertConfigs
+// and issueRelations comments above), so every table here names that migration.
+// ---------------------------------------------------------------------------------------------
+
+// §4.6, Decisions taken OQ-6: the external reporter is a SEPARATE table with its own FK, not a
+// nullable reporter on manual_issue_reports (which is not touched) and not a synthesised "user"
+// row. organizationId is denormalised NOT NULL for the reason attachments.orgId gives: a tenancy
+// check must never depend on walking a join. UNIQUE (projectId, externalId) is the identity rule
+// and the thing that makes intake an upsert. `email` is stored and NEVER used to send anything
+// (MANUAL_ISSUES_DESIGN §0 Q1 — email is never a reply channel).
+export const externalReporters = pgTable('external_reporters', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	externalId: varchar('external_id', { length: 255 }).notNull(),
+	displayName: varchar('display_name', { length: 255 }),
+	email: varchar('email', { length: 320 }),
+	firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+	lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	uniqProjectExternalId: uniqueIndex('external_reporters_project_external_id_unique').on(table.projectId, table.externalId),
+	idxOrg: index('idx_external_reporters_org').on(table.organizationId),
+	idxOrgLastSeen: index('idx_external_reporters_org_last_seen').on(table.organizationId, table.lastSeenAt),
+}));
+
+// §4.6: the 1:1 companion to an `issues` row, parallel to manualIssueReports. A separate table
+// rather than seven more columns on manual_issue_reports: an org-member report has no page, no
+// release and no brand. `severity` mirrors manualIssueReports' CHECK ('low'|'medium'|'high'|
+// 'critical'). `context` is §4.1's context object verbatim, unknown keys kept; no GIN index on it
+// in v1. `idempotencyKey` is nullable — absent means no dedupe.
+export const externalIssueReports = pgTable('external_issue_reports', {
+	issueId: uuid('issue_id').primaryKey().references(() => issues.id, { onDelete: 'cascade' }),
+	externalReporterId: uuid('external_reporter_id').notNull().references(() => externalReporters.id),
+	bodyMd: text('body_md').notNull(),
+	severity: varchar('severity', { length: 20 }).notNull().default('medium'), // 'low' | 'medium' | 'high' | 'critical'
+	context: jsonb('context').notNull().default({}),
+	idempotencyKey: varchar('idempotency_key', { length: 128 }),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	idxReporter: index('idx_external_issue_reports_reporter').on(table.externalReporterId),
+}));
+
+// §4.1: POST /report's dedupe store. Deliberately NOT agentIdempotencyKeys — that table's key
+// space is the calling AGENT's, this endpoint's is the calling API KEY ROW's id, and widening the
+// existing unique constraint would make it mean two things. `requestHash` is what makes §7's
+// `409 idempotency_conflict` ("same key, different body") detectable at all; `issueId` is the
+// original result replayed on a hit and carries no FK, for the reason agentIdempotencyKeys.
+// commentId gives — a retry must not resurrect a deleted issue. Aged out at 7 days (§8).
+export const reportIdempotencyKeys = pgTable('report_idempotency_keys', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	apiKeyId: uuid('api_key_id').notNull().references(() => projectApiKeys.id, { onDelete: 'cascade' }),
+	idempotencyKey: varchar('idempotency_key', { length: 128 }).notNull(),
+	requestHash: varchar('request_hash', { length: 64 }).notNull(),
+	issueId: uuid('issue_id'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	uniqApiKeyKey: uniqueIndex('report_idempotency_keys_key_unique').on(table.apiKeyId, table.idempotencyKey),
+	idxCreatedAt: index('idx_report_idempotency_keys_created_at').on(table.createdAt),
+}));
+
+// §4.4/§4.6: the on-call schedule. An organization has AT MOST ONE ACTIVE schedule, enforced by
+// the partial unique index idx_oncall_schedules_one_active (organization_id) WHERE active —
+// by the database, not by a handler. `timezone` is an IANA zone name; handoff is wall-clock in it,
+// so a DST handoff day is 23 or 25 hours long, deliberately. `kind` CHECK allows 'daily'|'weekly';
+// `handoffWeekday` is null unless weekly, enforced by the multi-column
+// oncall_schedules_handoff_weekday_check.
+export const oncallSchedules = pgTable('oncall_schedules', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+	name: varchar('name', { length: 255 }).notNull(),
+	timezone: varchar('timezone', { length: 64 }).notNull().default('UTC'),
+	kind: varchar('kind', { length: 20 }).notNull(), // 'daily' | 'weekly'
+	handoffTime: time('handoff_time').notNull(),
+	handoffWeekday: smallint('handoff_weekday'), // 0-6, null unless kind = 'weekly'
+	active: boolean('active').notNull().default(true),
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// §4.4: the ordered member list. Eligibility is NOT a column — a member whose org role later drops
+// below ISSUE_WRITE_ROLES is skipped at resolve time, never silently removed, so it is a live join
+// against organization_members. The composite primary key is §4.6's UNIQUE (scheduleId, userId);
+// idx_oncall_schedule_members_position is the second uniqueness rule.
+export const oncallScheduleMembers = pgTable('oncall_schedule_members', {
+	scheduleId: uuid('schedule_id').notNull().references(() => oncallSchedules.id, { onDelete: 'cascade' }),
+	userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+	position: smallint('position').notNull(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.scheduleId, table.userId] }),
+	uniqPosition: uniqueIndex('idx_oncall_schedule_members_position').on(table.scheduleId, table.position),
+}));
+
+// §4.4: overrides, in absolute UTC. An override wins over the rotation for its interval — without
+// one, escalation assigns to whoever the arithmetic says is on duty even when that person is on
+// holiday. oncall_overrides_window_check enforces endsAt > startsAt in the database.
+export const oncallOverrides = pgTable('oncall_overrides', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	scheduleId: uuid('schedule_id').notNull().references(() => oncallSchedules.id, { onDelete: 'cascade' }),
+	userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+	startsAt: timestamp('starts_at', { withTimezone: true }).notNull(),
+	endsAt: timestamp('ends_at', { withTimezone: true }).notNull(),
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	idxSchedule: index('idx_oncall_overrides_schedule').on(table.scheduleId, table.startsAt),
+}));
+
+// §4.4: one row per escalation hop on a report. hop 1 is written at intake; §4.4b's every-minute
+// sweep adds one row per reassignment and stops at ESCALATION_MAX_HOPS with `exhausted` true.
+// UNIQUE (issueId, hop) is what makes "escalation at intake is idempotent per report" true in the
+// database rather than in a handler. idx_issue_escalations_due is the sweep's partial index
+// (ack_deadline_at) WHERE acknowledged_at IS NULL AND NOT exhausted.
+export const issueEscalations = pgTable('issue_escalations', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	scheduleId: uuid('schedule_id').notNull().references(() => oncallSchedules.id, { onDelete: 'cascade' }),
+	assigneeId: text('assignee_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+	hop: smallint('hop').notNull(),
+	escalatedAt: timestamp('escalated_at', { withTimezone: true }).notNull().defaultNow(),
+	ackDeadlineAt: timestamp('ack_deadline_at', { withTimezone: true }).notNull(),
+	acknowledgedAt: timestamp('acknowledged_at', { withTimezone: true }),
+	exhausted: boolean('exhausted').notNull().default(false),
+}, (table) => ({
+	uniqIssueHop: uniqueIndex('issue_escalations_issue_hop_unique').on(table.issueId, table.hop),
+	idxDue: index('idx_issue_escalations_due').on(table.ackDeadlineAt),
+}));
