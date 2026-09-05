@@ -10,28 +10,32 @@
 --
 -- 1. handoff_weekday is ISO 8601 -- 1 = Monday .. 7 = Sunday. 1724100000 declared the CHECK as
 --    BETWEEN 0 AND 6, which cannot store Sunday under the encoding SR-4 settles. Any pre-existing
---    row is migrated 0 -> 7 BEFORE the CHECK is swapped, so the new constraint can never fail on
---    data written under the old one.
+--    row is migrated 0 -> 7 WHILE NO CHECK IS IN FORCE -- see ORDERING below.
 -- 2. rotation_anchor_at is the explicit anchor SR-4 requires: the rotation index is the count of
 --    wall-clock handoff boundaries at or before T since the FIRST boundary at or after this
 --    column. It is deliberately NOT created_at, because §4.4a's PUT is create-or-replace and
 --    saving the editor to fix a typo must not re-phase every future handoff.
 --
+-- ORDERING (BUG-01). The re-encode must sit BETWEEN the DROP and the ADD, not before the DO block.
+-- The constraint that judges `SET handoff_weekday = 7` is the one in force AT THE MOMENT OF THE
+-- WRITE, and that is the OLD one -- 1724100000's `BETWEEN 0 AND 6`, which forbids 7. An earlier
+-- revision of this file ran the UPDATE first and asserted the opposite in a comment; on
+-- postgres:15-alpine it aborts with `new row for relation "oncall_schedules" violates check
+-- constraint "oncall_schedules_handoff_weekday_check"`. The Down direction had the mirror-image
+-- bug (writing 0 under this file's own 1-7 CHECK). Both now re-encode inside the DO block, in the
+-- window where the table carries no weekday CHECK at all.
+--
 -- IDEMPOTENCY (A1): one flat migration directory serves several goose ledgers against the SAME
 -- physical database, so this file is replayed per target. ADD COLUMN IF NOT EXISTS; a
 -- pg_constraint catalog guard around the CHECK swap, in the same shape 1724100000 copied from
--- 1722900000_add_agents.sql:35-47 (unconditional DROP inside the guard, then ADD).
+-- 1722900000_add_agents.sql:35-47 (unconditional DROP inside the guard, then ADD). The UPDATE is
+-- idempotent by its own WHERE clause -- after the first run no row matches.
 
 -- SR-4's explicit anchor column. NOT NULL DEFAULT NOW() so an existing schedule keeps resolving:
 -- backfilled rows anchor at the moment of the migration, which is the only defensible answer for
 -- a rotation that had no recorded phase.
 ALTER TABLE oncall_schedules
   ADD COLUMN IF NOT EXISTS rotation_anchor_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
--- Re-encode any row written while the CHECK was 0-6. Under that encoding 0 meant Sunday; under
--- ISO Sunday is 7. Every other value (1-6, Monday-Saturday) means the same day in both, so only
--- 0 moves. Runs before the swap deliberately -- see the note above.
-UPDATE oncall_schedules SET handoff_weekday = 7 WHERE handoff_weekday = 0;
 
 DO $$
 BEGIN
@@ -41,6 +45,11 @@ BEGIN
   ) THEN
     ALTER TABLE oncall_schedules DROP CONSTRAINT oncall_schedules_handoff_weekday_check;
   END IF;
+
+  -- Re-encode any row written while the CHECK was 0-6, now that no weekday CHECK is in force.
+  -- Under that encoding 0 meant Sunday; under ISO Sunday is 7. Every other value (1-6,
+  -- Monday-Saturday) means the same day in both, so only 0 moves.
+  UPDATE oncall_schedules SET handoff_weekday = 7 WHERE handoff_weekday = 0;
 
   -- ISO 8601 weekday: 1 = Monday .. 7 = Sunday. Null unless kind = 'weekly' (§4.6).
   ALTER TABLE oncall_schedules ADD CONSTRAINT oncall_schedules_handoff_weekday_check CHECK (
@@ -52,10 +61,8 @@ END $$;
 
 -- +goose Down
 -- +goose StatementBegin
--- Reverse of the above, in reverse order: restore 1724100000's 0-6 CHECK, re-encode Sunday back
--- to 0 first so the restored constraint does not fail on ISO data, then drop the anchor column.
-UPDATE oncall_schedules SET handoff_weekday = 0 WHERE handoff_weekday = 7;
-
+-- Reverse of the above: restore 1724100000's 0-6 CHECK with Sunday re-encoded back to 0 in the
+-- same no-constraint window (BUG-01, see ORDERING above), then drop the anchor column.
 DO $$
 BEGIN
   IF EXISTS (
@@ -64,6 +71,8 @@ BEGIN
   ) THEN
     ALTER TABLE oncall_schedules DROP CONSTRAINT oncall_schedules_handoff_weekday_check;
   END IF;
+
+  UPDATE oncall_schedules SET handoff_weekday = 0 WHERE handoff_weekday = 7;
 
   ALTER TABLE oncall_schedules ADD CONSTRAINT oncall_schedules_handoff_weekday_check CHECK (
     (kind = 'weekly' AND handoff_weekday IS NOT NULL AND handoff_weekday BETWEEN 0 AND 6)
