@@ -42,6 +42,13 @@ const issueQueries = {
 };
 vi.mock('$lib/db/queries/issues', () => issueQueries);
 
+// sentinel-user-report-issue §4.4: a status change BY THE ASSIGNEE is an implicit acknowledgement
+// and stops the escalation clock. Mocked rather than added to the `$lib/db/schema` stub above:
+// what the stamp writes is a database claim, proved in
+// `src/lib/server/escalation.sweep.integration.test.ts`; what this route owns is calling it.
+const acknowledgeEscalationQuietly = vi.fn();
+vi.mock('$lib/server/escalation', () => ({ acknowledgeEscalationQuietly }));
+
 const { PATCH } = await import('./[issueId]/status/+server');
 
 function locals(session: { id: string } | null) {
@@ -231,5 +238,36 @@ describe('PATCH /api/issues/:id/status', () => {
 			'user',
 			'user-1'
 		);
+	});
+
+	describe('§4.4 implicit acknowledgement', () => {
+		/** An org admin resolving `issue-1`, which is the shortest path through the access gate above. */
+		function resolveAsAdmin() {
+			dbMock.then
+				.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
+				.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])); // org role
+			return PATCH({
+				params: { issueId: 'issue-1' },
+				request: patchRequest({ status: 'resolved' }),
+				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
+			} as any);
+		}
+
+		it('stamps the escalation when the caller changes the status, after the mutation committed', async () => {
+			// §4.4: "the assignee claims, comments on, or changes the status of that issue … Someone
+			// who is already working on it must not be reassigned for not pressing a button." Whether
+			// the caller IS the assignee is decided inside `acknowledgeEscalation`'s own conditional
+			// UPDATE, so this route hands it the acting user and decides nothing itself.
+			issueQueries.updateIssueStatus.mockResolvedValueOnce({ changed: true, notified: [] });
+			await resolveAsAdmin();
+			expect(acknowledgeEscalationQuietly).toHaveBeenCalledWith('issue-1', 'user-1');
+		});
+
+		it('does not stamp when the status did not actually change', async () => {
+			issueQueries.updateIssueStatus.mockResolvedValueOnce({ changed: false, notified: [] });
+			await resolveAsAdmin();
+			expect(acknowledgeEscalationQuietly).not.toHaveBeenCalled();
+		});
 	});
 });

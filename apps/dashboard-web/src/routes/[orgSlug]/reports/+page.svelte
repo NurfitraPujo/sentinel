@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ReportSourceBadge from '$lib/components/issues/ReportSourceBadge.svelte';
 	import type { PageData } from './$types';
 
 	// Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §10): tabs All / My reports / Claimed by
@@ -17,8 +18,27 @@
 		{ id: 'triage', label: 'Triage' },
 	];
 
+	// sentinel-user-report-issue OQ-8 / fe.md rows L3-L4. Orthogonal to TABS, not a seventh tab:
+	// its own control, its own parameter, and every href below carries BOTH so switching one never
+	// silently drops the other. `all` is written out too rather than omitted, so the URL states
+	// what is selected instead of leaving it to be inferred from an absence.
+	const SOURCES: Array<{ id: string; label: string }> = [
+		{ id: 'all', label: 'All' },
+		{ id: 'external', label: 'External' },
+		{ id: 'org-members', label: 'Org members' },
+	];
+
+	function listHref(tabId: string, sourceId: string): string {
+		const query = new URLSearchParams({ tab: tabId, source: sourceId });
+		return `/${data.orgSlug}/reports?${query}`;
+	}
+
 	function tabHref(tabId: string): string {
-		return `/${data.orgSlug}/reports?tab=${tabId}`;
+		return listHref(tabId, data.source);
+	}
+
+	function sourceHref(sourceId: string): string {
+		return listHref(data.tab, sourceId);
 	}
 
 	function formatDate(value: string | Date | null): string {
@@ -71,6 +91,21 @@
 		{/each}
 	</nav>
 
+	<div class="source-filter" data-testid="source-filter" role="group" aria-label="Report source">
+		<span class="source-filter-label">Source</span>
+		{#each SOURCES as s}
+			<a
+				href={sourceHref(s.id)}
+				class="source-option"
+				class:active={data.source === s.id}
+				data-testid="source-option-{s.id}"
+				aria-current={data.source === s.id ? 'true' : undefined}
+			>
+				{s.label}
+			</a>
+		{/each}
+	</div>
+
 	<div class="reports-table-wrap">
 		<table class="reports-table">
 			<thead>
@@ -93,6 +128,7 @@
 							<a href="/{data.orgSlug}/reports/{row.issue.id}" class="report-title-link">
 								{row.issue.message}
 							</a>
+							<ReportSourceBadge sourceChannel={row.issue.sourceChannel} />
 							<div class="report-meta">{formatDate(row.issue.firstSeen)}</div>
 						</td>
 						<td>
@@ -101,8 +137,11 @@
 								<span class="inbox-tag">Triage</span>
 							{/if}
 						</td>
-						<td>{row.reporterName ?? row.reporterEmail ?? 'unknown'}</td>
-						<td><span class="severity-tag severity-{row.report.severity}">{row.report.severity}</span></td>
+						<td>{row.reporterDisplayName ?? row.reporterName ?? row.reporterEmail ?? 'unknown'}</td>
+						<!-- §4.2's correction, on the list: an externally-submitted report has no
+						     `manual_issue_reports` row, so `row.report` is null for it. `severity` is the
+						     unified field `listReports` returns for either companion. -->
+						<td><span class="severity-tag severity-{row.severity}">{row.severity}</span></td>
 						<td>
 							<span class="claimant" title={claimantLabel(row)}>
 								<span aria-hidden="true">{claimantIcon(row)}</span>
@@ -199,6 +238,45 @@
 	.tab.active {
 		color: var(--text-primary);
 		border-bottom-color: var(--color-primary);
+	}
+
+	/* Deliberately not styled as a tab: pills on a labelled row, so it does not read as one more
+	   entry in the tab strip above it (fe.md rows L3-L4). */
+	.source-filter {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		margin-bottom: 1rem;
+		flex-wrap: wrap;
+	}
+
+	.source-filter-label {
+		font-size: 0.6875rem;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--text-subtle);
+		font-weight: 600;
+		margin-right: 0.125rem;
+	}
+
+	.source-option {
+		text-decoration: none;
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		border: 1px solid var(--border-color);
+		border-radius: 999px;
+		padding: 0.1875rem 0.625rem;
+	}
+
+	.source-option:hover {
+		color: var(--text-primary);
+	}
+
+	.source-option.active {
+		color: var(--text-primary);
+		border-color: var(--color-primary);
+		background: var(--bg-surface);
+		font-weight: 600;
 	}
 
 	.reports-table-wrap {

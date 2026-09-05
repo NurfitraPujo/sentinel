@@ -1,0 +1,67 @@
+{{- if .Values.oncallCron.enabled }}
+{{- $secret := include "sentinel.secretName" . -}}
+# sentinel-user-report-issue §4.4b / §12: schedules POST /api/cron/oncall-escalation.
+#
+# A SEPARATE CronJob from retention-cronjob.yaml, not a piggyback on it, and the contract says why:
+# retention runs hourly, and a 15-minute acknowledgement deadline swept hourly is a 75-minute
+# deadline. This one runs every minute.
+#
+# Modelled on retention-cronjob.yaml statement for statement — same curlimages/curl Job, same
+# CRON_SECRET from the chart Secret, same in-cluster Service target — because §4.4b says to follow
+# the shipped pattern rather than invent one. `concurrencyPolicy: Forbid` is the contract's, and it
+# is belt-and-braces rather than the safety property: the sweep claims each due row with a
+# conditional UPDATE, so even two overlapping runs cannot double-reassign.
+#
+# Ships OFF (`oncallCron.enabled: false`), per this chart's convention for scheduled jobs. §12 names
+# the consequence: an operator who deploys and forgets gets escalation-at-intake but no
+# reassignment, and the exhausted / unassigned-age alerts in prometheusrule.yaml are the backstop.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "sentinel.fullname" . }}-oncall-escalation
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oncall-escalation-cron
+spec:
+  schedule: {{ .Values.oncallCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.oncallCron.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.oncallCron.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.oncallCron.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.oncallCron.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.oncallCron.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sentinel.labels" . | nindent 12 }}
+            app.kubernetes.io/component: oncall-escalation-cron
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: oncall-escalation-cron
+              image: "{{ .Values.oncallCron.image.repository }}:{{ .Values.oncallCron.image.tag }}"
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              env:
+                - name: CRON_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: CRON_SECRET
+              command: ["/bin/sh", "-c"]
+              args:
+                # -sS quiet-but-loud-on-error, -f so a non-2xx fails the Job (backoffLimit retries),
+                # --max-time bounds a hung dashboard. activeDeadlineSeconds is kept BELOW the
+                # one-minute period so a wedged run cannot sit in the way of the next one.
+                - >-
+                  curl -sS -f --max-time {{ .Values.oncallCron.timeoutSeconds }}
+                  -X POST
+                  -H "x-cron-secret: ${CRON_SECRET}"
+                  {{ include "sentinel.fullname" . }}-dashboard:{{ .Values.dashboard.service.port }}/api/cron/oncall-escalation
+              resources:
+                {{- toYaml .Values.oncallCron.resources | nindent 16 }}
+{{- end }}

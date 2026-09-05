@@ -8,10 +8,13 @@ import {
 	users,
 	attachments,
 	issueComments,
+	externalIssueReports,
+	externalReporters,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { insertReportIdempotency } from '$lib/server/report-idempotency';
 
 /**
  * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
@@ -20,6 +23,15 @@ import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
  */
 
 export type ReportSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * The `attachments_uploader_type_check` vocabulary. `'external_reporter'` is
+ * sentinel-user-report-issue §4.6's third value, added by
+ * `1724100000_add_user_report_intake_and_oncall.sql` with the same catalog-guarded CHECK swap the
+ * rest of that migration uses. It exists here so `claimDraftAttachmentsOnto`'s uploader-type match
+ * (R10) stays exhaustive rather than being widened by a cast at one call site.
+ */
+export type AttachmentUploaderType = 'user' | 'agent' | 'external_reporter';
 
 /**
  * §2, Q12: find-or-create the per-org Triage inbox project, lazily, on first use. No backfill
@@ -214,6 +226,172 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 }
 
 /**
+ * Thrown by `createExternalIssueReport` when an id in §4.1's `attachments` array is unknown,
+ * already claimed, uploaded by a different reporter, or belongs to another organization.
+ *
+ * §4.1 is explicit that this is all-or-nothing: "Each must be a draft attachment in this key's
+ * organization or the whole request is `400 attachment_not_found` and **nothing is created**" --
+ * which is the opposite of `claimDraftAttachments`' own contract, where a stale id is silently
+ * skipped so a browser form does not lose a whole report over one expired draft. Both are right
+ * for their caller, so the strictness lives here rather than being pushed down into the shared
+ * helper and changing behaviour for `/reports/new`.
+ *
+ * Thrown, never returned: D18 -- returning early from inside a `db.transaction` callback COMMITS
+ * whatever the callback already did, which here would be a report with half its screenshots.
+ */
+export class ReportAttachmentNotFoundError extends Error {
+	constructor() {
+		super('One or more attachment ids are unknown, already claimed, or not in this organization');
+		this.name = 'ReportAttachmentNotFoundError';
+	}
+}
+
+export interface CreateExternalIssueReportInput {
+	/** From the credential, never the body (B7). Used for the attachment tenancy check. */
+	organizationId: string;
+	/** Always known: the key fixes it, or `X-Project-Key`/`project_key` resolved inside the org. */
+	projectId: string;
+	/** `external_reporters.id`, already upserted for `(project_id, external_id)`. */
+	externalReporterId: string;
+	/** Supplied by the caller, or derived by §4.5a. `issues.message` is NOT NULL either way. */
+	title: string;
+	/** §4.1's `text`, stored as Markdown -- sanitised at render, never trusted (design §3). */
+	bodyMd: string;
+	severity: ReportSeverity;
+	/** §4.1's `context` verbatim, unknown keys kept. */
+	context: Record<string, unknown>;
+	/** Stored on the companion row for provenance; the dedupe itself is `idempotency` below. */
+	idempotencyKey: string | null;
+	/** §4.5 draft attachment ids, at most 5, all-or-nothing (see the error above). */
+	attachmentIds: string[];
+	/**
+	 * When present, `report_idempotency_keys` gets its row in THIS transaction. A duplicate key
+	 * therefore fails the whole transaction and creates nothing -- see `report-idempotency.ts`'s
+	 * header for why reserving the key in a separate earlier statement would not deduplicate
+	 * concurrent requests at all.
+	 */
+	idempotency?: { apiKeyId: string; idempotencyKey: string; requestHash: string } | null;
+}
+
+/**
+ * sentinel-user-report-issue §4.1 + §4.6 (OQ-6): creates one externally-submitted report.
+ *
+ * An `issues` row (`issue_type='user_report'`, `source_channel='user_report_api'`) plus its 1:1
+ * `external_issue_reports` companion -- **`manual_issue_reports` is not written**, which is the
+ * decision OQ-6 records and §1's "the org-member report path is not widened" promises. The two
+ * companions are siblings, never alternatives to each other on the same row.
+ *
+ * Deliberately NOT `createManualIssue` with a different `sourceChannel`: that function writes
+ * `manual_issue_reports`, subscribes `reporterId` as a `users` row, and can lazily provision the
+ * Triage inbox project. An external reporter is not a Sentinel user, has no subscription, and its
+ * project is fixed by the credential -- three things that would have had to become conditional
+ * inside a shipped path this feature promises not to touch.
+ *
+ * D18 throughout: every failure throws so the transaction rolls back. Nothing here returns early.
+ */
+export async function createExternalIssueReport(input: CreateExternalIssueReportInput) {
+	const title = input.title.trim();
+	if (title.length === 0) {
+		// Unreachable through the endpoint -- §4.5a's derivation is total and falls back to
+		// "User report" -- but `issues.message` is NOT NULL and a caller of this function directly
+		// must not be able to write an empty one.
+		throw new Error('title must not be empty');
+	}
+
+	return await db.transaction(async (tx) => {
+		// Manual issues are never deduped by fingerprint; only UNIQUE(project_id, fingerprint) needs
+		// satisfying. Same rule for external ones -- §4.1's dedupe is `idempotency_key`, and a
+		// content fingerprint would silently merge two users reporting the same wording.
+		const fingerprint = crypto.randomBytes(16).toString('hex');
+
+		const [issue] = await tx
+			.insert(issues)
+			.values({
+				projectId: input.projectId,
+				fingerprint,
+				message: title,
+				errorClass: 'user_report',
+				issueType: 'user_report',
+				// OQ-8's new `issues_source_channel_check` value. This is what the /reports filter and
+				// badge separate on, and what tells every existing reader of `user_report` rows that
+				// this one came from an untrusted external caller.
+				sourceChannel: 'user_report_api',
+			})
+			.returning();
+
+		if (!issue) {
+			throw new Error('Failed to create issue row for external report');
+		}
+
+		const [report] = await tx
+			.insert(externalIssueReports)
+			.values({
+				issueId: issue.id,
+				externalReporterId: input.externalReporterId,
+				bodyMd: input.bodyMd,
+				severity: input.severity,
+				context: input.context,
+				idempotencyKey: input.idempotencyKey,
+			})
+			.returning();
+
+		if (!report) {
+			throw new Error('Failed to create external_issue_reports row');
+		}
+
+		// The same `report_created` entry the org-member path writes, so an external report's
+		// timeline is not empty. `actor_type` is 'system' because the CHECK admits only
+		// user|agent|system and an external reporter is none of the three -- it is DATA, never a
+		// Sentinel principal (§2). Who it was is in `new_value.externalReporterId`, not in
+		// `actor_id`, so nothing downstream can mistake a reporter id for a user id.
+		await tx.insert(issueActivity).values({
+			issueId: issue.id,
+			eventType: 'report_created',
+			actorType: 'system',
+			actorId: 'user_report_api',
+			newValue: {
+				action: 'created',
+				source: 'user_report_api',
+				externalReporterId: input.externalReporterId,
+				severity: input.severity,
+				projectId: input.projectId,
+			},
+		});
+
+		// §4.5's draft-then-claim handoff, in the SAME transaction as creation (the item names
+		// `reports.ts:225` for exactly this). All-or-nothing, unlike the org-member path.
+		if (input.attachmentIds.length > 0) {
+			const claimed = await claimDraftAttachments(
+				tx,
+				input.attachmentIds,
+				issue.id,
+				input.externalReporterId,
+				input.organizationId,
+				'external_reporter'
+			);
+
+			if (claimed.length !== input.attachmentIds.length) {
+				throw new ReportAttachmentNotFoundError();
+			}
+
+			await tx.insert(issueActivity).values({
+				issueId: issue.id,
+				eventType: 'attachment_added',
+				actorType: 'system',
+				actorId: 'user_report_api',
+				newValue: { attachmentIds: claimed.map((a) => a.id) },
+			});
+		}
+
+		if (input.idempotency) {
+			await insertReportIdempotency(tx, { ...input.idempotency, issueId: issue.id });
+		}
+
+		return { issue, report };
+	});
+}
+
+/**
  * §4 linking: claims DRAFT attachments (issue_id/comment_id both NULL) onto `issueId`. Each
  * candidate id is verified to (a) exist, (b) still be a draft, (c) belong to `organizationId`
  * (B7: tenant scope from the caller's already-established org, never re-derived from the
@@ -228,7 +406,7 @@ export async function claimDraftAttachments(
 	issueId: string,
 	uploaderId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId, uploaderType);
 }
@@ -246,7 +424,7 @@ export async function claimDraftAttachmentsForComment(
 	commentId: string,
 	authorId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId, uploaderType);
 }
@@ -262,7 +440,7 @@ async function claimDraftAttachmentsOnto(
 	target: { issueId: string } | { commentId: string },
 	uploaderId: string,
 	organizationId: string,
-	uploaderType: 'user' | 'agent' = 'user'
+	uploaderType: AttachmentUploaderType = 'user'
 ): Promise<{ id: string }[]> {
 	if (attachmentIds.length === 0) {
 		return [];
@@ -348,12 +526,23 @@ export async function listIssueAttachments(issueId: string) {
 
 export type ReportTab = 'all' | 'mine' | 'claimed-by-me' | 'unclaimed' | 'needs-input' | 'triage';
 
+/**
+ * sentinel-user-report-issue *Decisions taken*, OQ-8: the separation between an org-member report
+ * and an externally-submitted one is `issues.source_channel` plus a filter and a badge -- not the
+ * `is_inbox` Triage project, and not nothing. This is the filter half; the badge is fe.md's.
+ */
+export const REPORT_SOURCE_CHANNELS = ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'] as const;
+
+export type ReportSourceChannel = (typeof REPORT_SOURCE_CHANNELS)[number];
+
 export interface ListReportsOptions {
 	organizationId: string;
 	tab: ReportTab;
 	userId: string;
 	/** Restrict to a set of project ids the caller may see (viewer scoping mirrors issues.ts). */
 	accessibleProjectIds?: Set<string> | null;
+	/** OQ-8's `source` filter. Omitted = every source, which is the pre-existing behaviour. */
+	source?: ReportSourceChannel;
 }
 
 /**
@@ -361,7 +550,7 @@ export interface ListReportsOptions {
  * scoped to `issue_type='user_report'` (§9 strict separation is the whole point of this table
  * existing alongside issues.ts's error-dashboard queries, not a shared listing).
  */
-export async function listReports({ organizationId, tab, userId, accessibleProjectIds }: ListReportsOptions) {
+export async function listReports({ organizationId, tab, userId, accessibleProjectIds, source }: ListReportsOptions) {
 	const conditions = [eq(projects.organizationId, organizationId), eq(issues.issueType, 'user_report')];
 
 	switch (tab) {
@@ -400,10 +589,24 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 		)})`);
 	}
 
-	return await db
+	if (source) {
+		conditions.push(eq(issues.sourceChannel, source));
+	}
+
+	// §4.2's correction, applied to the list: a `user_report` issue has EXACTLY ONE companion, and
+	// which table it lives in depends on which door it came through. Requiring one of the two keeps
+	// this query's original guarantee (never surface a `system_error` row through the reports list)
+	// while no longer silently dropping every report this feature creates.
+	conditions.push(
+		sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+	);
+
+	const rows = await db
 		.select({
 			issue: issues,
 			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
 			projectName: projects.name,
 			projectIsInbox: projects.isInbox,
 			reporterName: users.name,
@@ -414,11 +617,59 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
-		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		// §4.2's correction: LEFT, not INNER. An externally-submitted report has no
+		// `manual_issue_reports` row and no `"user"` row (Decisions taken, OQ-6), so the INNER join
+		// this used to carry returned nothing for every report this feature creates.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
 		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
 		.where(and(...conditions))
 		.orderBy(desc(issues.firstSeen));
+
+	return rows.map(withUnifiedReportFields);
+}
+
+/**
+ * The two companions, reduced to the fields every reader of a report needs regardless of which
+ * door it came through. Added, never substituted: `report`, `reporterName` and `reporterEmail`
+ * keep exactly the values they had before this feature for an org-member report, so §6's "no
+ * field removed, no type or nullability changed" holds for the existing `fe` consumer.
+ */
+function withUnifiedReportFields<
+	T extends {
+		report: typeof manualIssueReports.$inferSelect | null;
+		externalReport: typeof externalIssueReports.$inferSelect | null;
+		externalReporter: typeof externalReporters.$inferSelect | null;
+		reporterName: string | null;
+		reporterEmail: string | null;
+	}
+>(row: T) {
+	const isExternal = row.externalReport !== null;
+	return {
+		...row,
+		/** §4.2 `reporter.kind`. */
+		reporterKind: (isExternal ? 'external' : 'org_member') as 'external' | 'org_member',
+		// Both queries that call this require one companion or the other in their WHERE, so exactly
+		// one of the two is present and these are `string`, not `string | null`. The `!` is that
+		// predicate restated for the type checker -- delete the predicate and this becomes a lie.
+		/** The report text, from whichever companion holds it. */
+		bodyMd: row.report ? row.report.bodyMd : row.externalReport!.bodyMd,
+		/** The severity, from whichever companion holds it. */
+		severity: row.report ? row.report.severity : row.externalReport!.severity,
+		/** §4.2 `reporter.displayName`. */
+		reporterDisplayName: isExternal ? (row.externalReporter?.displayName ?? null) : row.reporterName,
+		/** §4.2 `reporter.email`. The UI must not render an external reporter's address as a mailto
+		 *  link -- there is no reply channel (§1). */
+		reporterEmailAddress: isExternal ? (row.externalReporter?.email ?? null) : row.reporterEmail,
+		/** §4.2 `reporter.externalId`. `null` for an org member. */
+		reporterExternalId: isExternal ? (row.externalReporter?.externalId ?? null) : null,
+		/** §4.2 `reporter.firstSeenAt`. `null` for an org member. */
+		reporterFirstSeenAt: isExternal ? (row.externalReporter?.firstSeenAt ?? null) : null,
+		/** §4.2 `context`, verbatim, or `null` for an org-member report. */
+		context: (row.externalReport?.context ?? null) as Record<string, unknown> | null,
+	};
 }
 
 /**
@@ -431,6 +682,8 @@ export async function getReportDetail(issueId: string) {
 		.select({
 			issue: issues,
 			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
 			projectId: projects.id,
 			projectName: projects.name,
 			projectIsInbox: projects.isInbox,
@@ -441,12 +694,25 @@ export async function getReportDetail(issueId: string) {
 			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
-		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		// §4.2's correction, and the reason this endpoint 404'd for every externally-submitted
+		// report: LEFT, not INNER, on both the org-member companion and the `"user"` row, plus the
+		// external companion and its reporter. The guard that made the INNER join safe -- "never
+		// leak a `system_error` issue through this path" -- is now the explicit predicate below.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
 		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
-		.where(and(eq(issues.id, issueId), eq(issues.issueType, 'user_report')));
+		.where(
+			and(
+				eq(issues.id, issueId),
+				eq(issues.issueType, 'user_report'),
+				sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+			)
+		);
 
-	return rows[0] ?? null;
+	const row = rows[0];
+	return row ? withUnifiedReportFields(row) : null;
 }
 
 /**
@@ -530,10 +796,24 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			throw new Error(`Issue ${input.issueId} not found`);
 		}
 
-		const [existingReport] = await tx
+		// §4.2's correction reaches this write too: a `user_report` issue has exactly one companion
+		// and it may be the external one. Looking only at `manual_issue_reports` made the agent
+		// severity op (agent-ops.ts, A09) throw "Report not found" -- a 500 -- for every report this
+		// feature creates. `companion` names which table the rest of this function updates.
+		const [existingManualReport] = await tx
 			.select({ bodyMd: manualIssueReports.bodyMd, severity: manualIssueReports.severity })
 			.from(manualIssueReports)
 			.where(eq(manualIssueReports.issueId, input.issueId));
+
+		const [existingExternalReport] = existingManualReport
+			? []
+			: await tx
+					.select({ bodyMd: externalIssueReports.bodyMd, severity: externalIssueReports.severity })
+					.from(externalIssueReports)
+					.where(eq(externalIssueReports.issueId, input.issueId));
+
+		const existingReport = existingManualReport ?? existingExternalReport;
+		const companion = existingManualReport ? manualIssueReports : externalIssueReports;
 
 		if (!existingReport) {
 			throw new Error(`Report ${input.issueId} not found`);
@@ -548,7 +828,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			await tx.update(issues).set({ message: input.title }).where(eq(issues.id, input.issueId));
 		}
 
-		const reportUpdate: Partial<typeof manualIssueReports.$inferInsert> = {};
+		const reportUpdate: { bodyMd?: string; severity?: string } = {};
 		if (input.bodyMd !== undefined && input.bodyMd !== existingReport.bodyMd) {
 			oldValue.bodyMd = existingReport.bodyMd;
 			newValue.bodyMd = input.bodyMd;
@@ -560,7 +840,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			reportUpdate.severity = input.severity;
 		}
 		if (Object.keys(reportUpdate).length > 0) {
-			await tx.update(manualIssueReports).set(reportUpdate).where(eq(manualIssueReports.issueId, input.issueId));
+			await tx.update(companion).set(reportUpdate).where(eq(companion.issueId, input.issueId));
 		}
 
 		if (Object.keys(newValue).length > 0) {
@@ -577,8 +857,8 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 		const [updatedIssue] = await tx.select().from(issues).where(eq(issues.id, input.issueId));
 		const [updatedReport] = await tx
 			.select()
-			.from(manualIssueReports)
-			.where(eq(manualIssueReports.issueId, input.issueId));
+			.from(companion)
+			.where(eq(companion.issueId, input.issueId));
 
 		return { issue: updatedIssue, report: updatedReport };
 	});

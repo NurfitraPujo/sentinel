@@ -8,6 +8,7 @@ import {
 } from '$lib/db/queries/comments';
 import { requireCommentReadAccess, requireCommentWriteAccess } from '$lib/server/comment-access';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
+import { acknowledgeEscalationQuietly } from '$lib/server/escalation';
 
 // Manual Issues M3 (design §5, §9, §10). Manual-validation style (allowlists + throw
 // error(status)), matching uploads/reports. Works on BOTH issue types -- see comment-access.ts's
@@ -101,6 +102,12 @@ export const POST: RequestHandler = async ({ params, request, locals, url }) => 
 			attachmentIds,
 		});
 		await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
+
+		// §4.4's implicit acknowledgement: "the assignee claims, comments on, or changes the status
+		// of that issue … Someone who is already working on it must not be reassigned for not
+		// pressing a button." Post-commit and never throwing — a failed stamp costs one extra
+		// reassignment, which the chain is bounded against, and must not fail this request.
+		await acknowledgeEscalationQuietly(issueId, userId);
 
 		return json({ comment }, { status: 201 });
 	} catch (err) {

@@ -5,7 +5,9 @@ import {
 	listAgentIssues,
 	decodeAgentIssuesCursor,
 	AGENT_ISSUES_MAX_LIMIT,
+	AGENT_ISSUE_SOURCES,
 	type AgentIssuesSort,
+	type AgentIssueSource,
 } from '$lib/db/queries/agent-work';
 
 // Manual Issues M5 stage 2 (design §7 step 1). GET /api/agent/issues?type=&claimed=&project=&waiting=
@@ -44,6 +46,19 @@ export const GET: RequestHandler = async ({ request, url }) => {
 	}
 
 	const projectId = url.searchParams.get('project') || undefined;
+
+	// sentinel-user-report-issue SR-6 / OQ-8: `?source=` narrows on `issues.source_channel`, so an
+	// agent can separate externally-submitted reports from org-member ones. §6's mitigation for the
+	// volume change external intake brings is a dashboard filter and a badge -- neither reaches this
+	// API, hence its own parameter. Absent = every source, byte-identical to the previous behaviour.
+	const sourceParam = url.searchParams.get('source');
+	let source: AgentIssueSource | undefined;
+	if (sourceParam !== null) {
+		if (!(AGENT_ISSUE_SOURCES as readonly string[]).includes(sourceParam)) {
+			return json({ error: `source must be one of: ${AGENT_ISSUE_SOURCES.join(', ')}` }, { status: 400 });
+		}
+		source = sourceParam as AgentIssueSource;
+	}
 
 	const waitingParam = url.searchParams.get('waiting');
 	let waiting: boolean | undefined;
@@ -98,6 +113,7 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		claimedByAgentId,
 		projectId,
 		waiting,
+		source,
 		since,
 		sort,
 		limit,

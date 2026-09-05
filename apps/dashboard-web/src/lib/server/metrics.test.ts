@@ -1,0 +1,191 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+	REPORT_OUTCOME,
+	recordReportReceived,
+	renderMetrics,
+	metricsRegistry,
+	resetMetricsForTest,
+	ESCALATION_OUTCOME,
+	recordEscalation,
+	recordEscalationExhausted,
+	recordOncallScheduleUnresolved,
+} from './metrics';
+
+/**
+ * sentinel-user-report-issue SR-3 / §12 — the metrics surface this item stands up.
+ *
+ * What is asserted is what §12's alert table actually depends on: the metric NAME, the single
+ * fixed `outcome` label, that every value in the closed set exists as a series from process start
+ * (a ratio alert over an absent series does not evaluate), and that nothing caller-controlled can
+ * become a label. The last one is the unbounded-cardinality rule `procmetrics`' doc comment
+ * states, and it is enforced by the type of `recordReportReceived`, so the test asserts the
+ * rendered output carries no other label rather than trying to call it with a bad value.
+ */
+
+function parse(body: string): Map<string, number> {
+	const out = new Map<string, number>();
+	for (const line of body.split('\n')) {
+		if (!line || line.startsWith('#')) continue;
+		const match = line.match(/^(\S+)\s+(\S+)$/);
+		if (match) out.set(match[1], Number(match[2]));
+	}
+	return out;
+}
+
+describe('SR-3 sentinel_reports_received_total', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('exposes the metric under its §12 name', async () => {
+		const { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_reports_received_total counter');
+	});
+
+	it('initialises EVERY outcome to zero, so an alert on outcome="error" evaluates from t=0', async () => {
+		const series = parse((await renderMetrics()).body);
+		for (const outcome of Object.values(REPORT_OUTCOME)) {
+			expect(series.get(`sentinel_reports_received_total{outcome="${outcome}"}`)).toBe(0);
+		}
+	});
+
+	it('carries the closed set of outcomes and nothing else', () => {
+		expect(Object.values(REPORT_OUTCOME).sort()).toEqual([
+			'conflict',
+			'created',
+			'deduplicated',
+			'error',
+			'forbidden',
+			'ratelimited',
+			'rejected',
+			'unauthorized',
+		]);
+	});
+
+	it('increments the named series and leaves the others alone', async () => {
+		recordReportReceived(REPORT_OUTCOME.Created);
+		recordReportReceived(REPORT_OUTCOME.Created);
+		recordReportReceived(REPORT_OUTCOME.Error);
+
+		const series = parse((await renderMetrics()).body);
+		expect(series.get('sentinel_reports_received_total{outcome="created"}')).toBe(2);
+		expect(series.get('sentinel_reports_received_total{outcome="error"}')).toBe(1);
+		expect(series.get('sentinel_reports_received_total{outcome="rejected"}')).toBe(0);
+	});
+
+	it('carries `outcome` as its ONLY label — no org, project, key or reporter may reach a label', async () => {
+		recordReportReceived(REPORT_OUTCOME.Rejected);
+		const { body } = await renderMetrics();
+		for (const line of body.split('\n')) {
+			if (!line.startsWith('sentinel_reports_received_total{')) continue;
+			const labels = line.slice(line.indexOf('{') + 1, line.indexOf('}'));
+			expect(labels).toMatch(/^outcome="[a-z]+"$/);
+		}
+	});
+
+	it('renders the Prometheus text exposition content type a scraper expects', async () => {
+		const { contentType } = await renderMetrics();
+		expect(contentType).toContain('text/plain');
+		expect(contentType).toContain('version=0.0.4');
+	});
+
+	it('registers the metric exactly once, so a module re-evaluation cannot throw or double-count', async () => {
+		// The HMR hazard the global singleton exists for: a second `state()` must reuse the registry.
+		const first = metricsRegistry();
+		recordReportReceived(REPORT_OUTCOME.Created);
+		expect(metricsRegistry()).toBe(first);
+		const series = parse((await renderMetrics()).body);
+		expect(series.get('sentinel_reports_received_total{outcome="created"}')).toBe(1);
+	});
+
+	it('never throws, whatever it is handed at runtime', () => {
+		// Values are typed, but the recording helper is on the response path of an endpoint that
+		// must not 500 because of a counter (`procmetrics`' nil guard, ported).
+		expect(() => recordReportReceived('created')).not.toThrow();
+		expect(() => recordReportReceived('not-an-outcome' as never)).not.toThrow();
+	});
+
+	it('DROPS an outcome outside the closed set instead of minting a new time series', async () => {
+		recordReportReceived('u_8f3c41' as never);
+		const { body } = await renderMetrics();
+		expect(body).not.toContain('u_8f3c41');
+		const series = [...parse(body).keys()].filter((k) =>
+			k.startsWith('sentinel_reports_received_total')
+		);
+		expect(series).toHaveLength(Object.values(REPORT_OUTCOME).length);
+	});
+});
+
+/**
+ * The escalation half of §12's table. Same three properties as above, and the third one matters
+ * more here than anywhere: `sentinel_report_escalations_exhausted_total` and
+ * `sentinel_oncall_schedule_unresolved_total` are the ONLY things that notice two states §4.4
+ * designs to be silent, so an alert on `> 0` that cannot evaluate because the series does not
+ * exist yet is the same as no alert at all.
+ */
+describe('§12 escalation metrics', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('exposes all three under their §12 names', async () => {
+		const { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_report_escalations_total counter');
+		expect(body).toContain('# TYPE sentinel_report_escalations_exhausted_total counter');
+		expect(body).toContain('# TYPE sentinel_oncall_schedule_unresolved_total counter');
+	});
+
+	it('initialises every series to zero, so a "> 0" alert evaluates from t=0', async () => {
+		const series = parse((await renderMetrics()).body);
+		for (const outcome of Object.values(ESCALATION_OUTCOME)) {
+			expect(series.get(`sentinel_report_escalations_total{outcome="${outcome}"}`)).toBe(0);
+		}
+		expect(series.get('sentinel_report_escalations_exhausted_total')).toBe(0);
+		expect(series.get('sentinel_oncall_schedule_unresolved_total')).toBe(0);
+	});
+
+	it('carries the closed set of escalation outcomes and nothing else', () => {
+		expect(Object.values(ESCALATION_OUTCOME).sort()).toEqual([
+			'assigned',
+			'failed',
+			'reassigned',
+		]);
+	});
+
+	it('counts each signal on its own counter', async () => {
+		recordEscalation(ESCALATION_OUTCOME.Assigned);
+		recordEscalation(ESCALATION_OUTCOME.Assigned);
+		recordEscalation(ESCALATION_OUTCOME.Reassigned);
+		recordEscalationExhausted();
+		recordOncallScheduleUnresolved();
+		recordOncallScheduleUnresolved();
+
+		const series = parse((await renderMetrics()).body);
+		expect(series.get('sentinel_report_escalations_total{outcome="assigned"}')).toBe(2);
+		expect(series.get('sentinel_report_escalations_total{outcome="reassigned"}')).toBe(1);
+		expect(series.get('sentinel_report_escalations_total{outcome="failed"}')).toBe(0);
+		expect(series.get('sentinel_report_escalations_exhausted_total')).toBe(1);
+		expect(series.get('sentinel_oncall_schedule_unresolved_total')).toBe(2);
+	});
+
+	it('drops an outcome outside the closed set rather than minting a series', async () => {
+		// The unbounded-cardinality rule at runtime, not only in the type system: an organization
+		// id reaching a label is exactly the failure §12's "fixed label constants" forbids.
+		expect(() => recordEscalation('11111111-1111-4111-8111-111111111111' as never)).not.toThrow();
+		const body = (await renderMetrics()).body;
+		expect(body).not.toContain('11111111-1111-4111-8111-111111111111');
+	});
+
+	it('never emits a label other than outcome', async () => {
+		recordEscalation(ESCALATION_OUTCOME.Failed);
+		const body = (await renderMetrics()).body;
+		for (const line of body.split('\n')) {
+			if (!line.startsWith('sentinel_report_escalations_total{')) continue;
+			expect(line).toMatch(/^sentinel_report_escalations_total\{outcome="[a-z]+"\} \d+$/);
+		}
+		// The two unlabelled counters must stay unlabelled — there is nothing to break either down
+		// by that is not tenant-identifying.
+		expect(body).not.toMatch(/sentinel_report_escalations_exhausted_total\{/);
+		expect(body).not.toMatch(/sentinel_oncall_schedule_unresolved_total\{/);
+	});
+});

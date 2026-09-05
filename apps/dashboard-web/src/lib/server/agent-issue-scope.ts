@@ -1,7 +1,8 @@
 import { error } from '@sveltejs/kit';
 import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { issues, projects, manualIssueReports } from '$lib/db/schema';
+import { issues, projects } from '$lib/db/schema';
+import { getReporterId, type IssueReporter } from '$lib/server/report-access';
 
 /**
  * Manual Issues M5 stage 2 (design §7): resolves an issue for an agent-authenticated request and
@@ -56,11 +57,21 @@ export async function resolveAgentIssueScope(issueId: string, organizationId: st
 	return row as AgentIssueScope;
 }
 
-/** Reporter id for a `user_report` issue, or null if it isn't one -- used to resolve `audience: 'reporter'`. */
-export async function getIssueReporterId(issueId: string): Promise<string | null> {
-	const rows = await db
-		.select({ reporterId: manualIssueReports.reporterId })
-		.from(manualIssueReports)
-		.where(eq(manualIssueReports.issueId, issueId));
-	return rows[0]?.reporterId ?? null;
+/**
+ * Reporter for a `user_report` issue, or null if it isn't one -- used to resolve
+ * `audience: 'reporter'`.
+ *
+ * sentinel-user-report-issue SR-6: this read `manual_issue_reports` alone and so returned `null`
+ * for every externally-submitted report, which is the same answer it gives for "this is not a
+ * report at all". It now returns the reporter, tagged with its kind, and delegates to
+ * `report-access.ts`'s `getReporterId` rather than growing a second copy of the two-companion
+ * lookup -- the two were the same query with the same defect and must not drift back apart.
+ *
+ * An `audience: 'reporter'` fan-out still reaches nobody for an external report, and deliberately:
+ * §1 fixes that there is no reply channel to an external reporter and §2 that they are never a
+ * Sentinel principal. The difference this makes is that a caller can now SEE that, instead of
+ * reading a `null` that means "no such report".
+ */
+export async function getIssueReporterId(issueId: string): Promise<IssueReporter | null> {
+	return await getReporterId(issueId);
 }

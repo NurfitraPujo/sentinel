@@ -1,6 +1,11 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { json } from '@sveltejs/kit';
-import { cleanupRetainedData, reapStaleClaims, reapExpiredIdempotencyKeys } from '$lib/server/retention';
+import {
+	cleanupRetainedData,
+	reapStaleClaims,
+	reapExpiredIdempotencyKeys,
+	reapExpiredReportIdempotencyKeys,
+} from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
 import { env } from '$env/dynamic/private';
@@ -61,11 +66,16 @@ export const POST: RequestHandler = async ({ request }) => {
 		// N9 (D21): and once more -- age out idempotency keys past their 7-day dedupe window.
 		const reapedIdempotencyKeys = await reapExpiredIdempotencyKeys();
 
+		// sentinel-user-report-issue §8: and the intake endpoint's own 7-day key space, which is the
+		// calling API key row's rather than an agent's.
+		const reapedReportIdempotencyKeys = await reapExpiredReportIdempotencyKeys();
+
 		log.info('retention_cron.completed', {
 			reapedInvitations,
 			reapedAttachments,
 			releasedClaims: claimReap.releasedClaims,
 			reapedIdempotencyKeys,
+			reapedReportIdempotencyKeys,
 			deletedOccurrences: result.deletedOccurrences,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			tombstonesWritten: result.tombstonesWritten,
@@ -80,6 +90,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				reapedAttachments,
 				releasedClaims: claimReap.releasedClaims,
 				reapedIdempotencyKeys,
+				reapedReportIdempotencyKeys,
 				deletedOccurrences: result.deletedOccurrences,
 					deletedOrphanedIssues: result.deletedOrphanedIssues,
 				tombstonesWritten: result.tombstonesWritten,

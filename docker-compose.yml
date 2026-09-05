@@ -282,6 +282,18 @@ services:
             # deployment set this to the public S3/MinIO URL (e.g. https://uploads.example.com).
             S3_PUBLIC_ENDPOINT: "http://localhost:${MINIO_HOST_PORT:-9000}"
             S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            # sentinel-user-report-issue §4.5 / §8: the intake upload knobs. REPORT_UPLOAD_RPM is the
+            # per-key per-minute throttle for POST /api/report/attachments only;
+            # REPORT_UPLOAD_BYTES_PER_DAY is the rolling-24h byte ceiling summed in Postgres over
+            # this org's uploader_type='external_reporter' rows (SR-5). Both are passthrough so a
+            # local run can lower them without editing this file.
+            REPORT_UPLOAD_RPM: "${REPORT_UPLOAD_RPM:-10}"
+            REPORT_UPLOAD_BYTES_PER_DAY: "${REPORT_UPLOAD_BYTES_PER_DAY:-262144000}"
+            # adapter-node caps a request body at 512 kB by default, which is below MAX_UPLOAD_BYTES
+            # and therefore below what every upload route in this app already advertises. Raised to
+            # the 25 MB cap plus multipart envelope headroom so the cap enforced by the application
+            # is the one the caller actually meets.
+            BODY_SIZE_LIMIT: "${BODY_SIZE_LIMIT:-27M}"
             S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
             S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
             POSTGRES_HOST: postgres
@@ -316,12 +328,25 @@ services:
             MANUAL_ISSUE_RETENTION_DAYS: "365"
             CLAIM_STALE_HOURS: "24"
             AGENT_KEY_ROTATION_GRACE_HOURS: "24"
+            # sentinel-user-report-issue §8's remaining config knobs, with the contract's defaults.
+            # REPORT_MATCH_WINDOW_MINUTES bounds §4.3's candidate query; ESCALATION_ACK_MINUTES is
+            # §4.4's acknowledgement deadline and ESCALATION_MAX_HOPS its bound. There is no feature
+            # flag beside them and that is the decision, not an omission (OQ-3): the `report` key
+            # scope IS the switch.
+            REPORT_MATCH_WINDOW_MINUTES: "${REPORT_MATCH_WINDOW_MINUTES:-30}"
+            ESCALATION_ACK_MINUTES: "${ESCALATION_ACK_MINUTES:-15}"
+            ESCALATION_MAX_HOPS: "${ESCALATION_MAX_HOPS:-3}"
 
     # N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11): schedules the retention endpoint.
     # Without this NOTHING invoked POST /api/cron/retention in the reference stack, so reapStaleClaims
     # never ran — a crashed agent's claim was never force-released and the claim_released(reason=stale)
     # event path was untestable. Wraps a curl of that endpoint in a sleep-loop (scripts/cron-entrypoint.sh),
     # the same "wrap it in a sleep-loop" pattern the dlq-drainer uses.
+    #
+    # sentinel-user-report-issue §4.4b: this one service now runs TWO independent loops — retention
+    # hourly and the escalation sweep every minute — each with its own gate, so enabling one never
+    # enables the other. Both ship OFF, matching the Helm chart's `retentionCron`/`oncallCron` and
+    # §12's "both schedulers ship off".
     #
     # NOTE (wait-healthy.sh): this is a long-running service with no healthcheck, so it MUST also be listed
     # in that script's OPTIONAL_SERVICES — enumerating `docker compose config --services` otherwise makes
@@ -340,9 +365,17 @@ services:
             # Must match the dashboard's CRON_SECRET above, or every call is rejected 401.
             CRON_SECRET: dev-only-cron-secret-change-me
             # Gate: ships OFF per repo convention. Flip to "true" to activate the schedule.
-            RETENTION_CRON_ENABLED: "false"
+            RETENTION_CRON_ENABLED: "${RETENTION_CRON_ENABLED:-false}"
             RETENTION_CRON_INTERVAL_SECONDS: "3600" # how often it POSTs the endpoint (1h)
             RETENTION_CRON_TIMEOUT_SECONDS: "30"
+            # sentinel-user-report-issue §4.4b: the escalation sweep. Its own URL, gate and
+            # interval — 60s, because a 15-minute ESCALATION_ACK_MINUTES swept hourly would be a
+            # 75-minute deadline, which is the contract's stated reason this is not a piggyback on
+            # the retention loop above. Also ships OFF; flip ONCALL_CRON_ENABLED to "true".
+            ONCALL_CRON_URL: http://dashboard:3000/api/cron/oncall-escalation
+            ONCALL_CRON_ENABLED: "${ONCALL_CRON_ENABLED:-false}"
+            ONCALL_CRON_INTERVAL_SECONDS: "${ONCALL_CRON_INTERVAL_SECONDS:-60}"
+            ONCALL_CRON_TIMEOUT_SECONDS: "20"
         restart: unless-stopped
 
 volumes:

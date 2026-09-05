@@ -22,6 +22,19 @@
 		return contentType.startsWith('image/');
 	}
 
+	// sentinel-user-report-issue fe.md task 5 (row S13): a thumbnail whose bytes cannot be fetched
+	// -- an expired object, a MinIO outage, a file that is no longer there -- must fall back to the
+	// filename, not to the browser's broken-image glyph. The reporter's screenshot is often the most
+	// useful thing on the page, and "there was an image called screen.png and it did not load" is
+	// strictly more informative than a torn-paper icon.
+	let failedIds = $state<string[]>([]);
+
+	function markFailed(id: string) {
+		if (!failedIds.includes(id)) {
+			failedIds = [...failedIds, id];
+		}
+	}
+
 	function formatBytes(bytes: number): string {
 		if (bytes < 1024) return `${bytes} B`;
 		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -32,7 +45,7 @@
 {#if attachments.length > 0}
 	<div class="attachment-list" data-testid="attachment-list">
 		{#each attachments as attachment (attachment.id)}
-			{#if isImage(attachment.contentType)}
+			{#if isImage(attachment.contentType) && !failedIds.includes(attachment.id)}
 				<a
 					class="attachment-thumb"
 					href={`/api/attachments/${attachment.id}`}
@@ -40,7 +53,12 @@
 					rel="noopener noreferrer"
 					title={attachment.filename}
 				>
-					<img src={`/api/attachments/${attachment.id}`} alt={attachment.filename} loading="lazy" />
+					<img
+						src={`/api/attachments/${attachment.id}`}
+						alt={attachment.filename}
+						loading="lazy"
+						onerror={() => markFailed(attachment.id)}
+					/>
 					<span class="thumb-caption">{attachment.filename}</span>
 				</a>
 			{:else}

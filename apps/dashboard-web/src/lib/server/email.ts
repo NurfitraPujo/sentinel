@@ -83,7 +83,12 @@ export type IssueNotificationKind =
   | 'claimed'
   | 'status_changed'
   | 'resolved'
-  | 'question_asked';
+  | 'question_asked'
+  // sentinel-user-report-issue SR-2: escalation's `notifications` row is emailable, because a
+  // 15-minute acknowledgement deadline cannot be met by an in-app badge out of hours. See
+  // notify.ts's EMAILABLE_KINDS comment for the full rationale; the consequence here is that
+  // EMAIL_SERVER is load-bearing for §4.4's chain, not merely nice to have.
+  | 'escalated';
 
 const NOTIFICATION_SUBJECTS: Record<IssueNotificationKind, string> = {
   commented: 'New comment on',
@@ -91,6 +96,9 @@ const NOTIFICATION_SUBJECTS: Record<IssueNotificationKind, string> = {
   status_changed: 'Status changed:',
   resolved: 'Resolved:',
   question_asked: 'Question needs your input:',
+  // Names the action taken TO the recipient, not a state change they are observing -- this is the
+  // one subject line in this map that is a page.
+  escalated: 'You are on call for:',
 };
 
 /**

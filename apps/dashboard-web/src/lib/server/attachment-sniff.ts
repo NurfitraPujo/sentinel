@@ -36,6 +36,28 @@ export const ALLOWED_CONTENT_TYPES: readonly AllowedContentType[] = [
 	'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ];
 
+/**
+ * The narrower allowlist that the EXTERNAL-REPORTER upload path (`POST /api/report/attachments`,
+ * sentinel-user-report-issue §4.5) admits: images and PDF only.
+ *
+ * §4.5 as drafted made `ALLOWED_CONTENT_TYPES` the rule, which admits `application/zip`,
+ * `application/msword`, DOCX, `video/*` and `text/plain`. The operator narrowed it on 2026-09-04
+ * through §10: that endpoint is a near-unauthenticated binary intake — the key belongs to a
+ * service and the person on the other end of it is a stranger — and the design source attaches a
+ * screenshot, not an archive. An archive or an OLE document accepted from that caller is a
+ * malware-distribution surface wearing Sentinel's domain, and no §4.5 requirement needs it.
+ *
+ * This is a SUBSET of `ALLOWED_CONTENT_TYPES`, never a superset: the session and agent upload
+ * routes keep the wider list, and nothing here widens what the sniffer will return.
+ */
+export const REPORT_ALLOWED_CONTENT_TYPES: readonly AllowedContentType[] = [
+	'image/png',
+	'image/jpeg',
+	'image/gif',
+	'image/webp',
+	'application/pdf',
+];
+
 function startsWith(buf: Uint8Array, bytes: number[], offset = 0): boolean {
 	if (buf.length < offset + bytes.length) return false;
 	for (let i = 0; i < bytes.length; i++) {

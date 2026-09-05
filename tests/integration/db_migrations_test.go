@@ -287,3 +287,199 @@ func TestBaselineCommand(t *testing.T) {
 	err = dbmigrations.GetStatus(context.Background(), db, opts)
 	require.NoError(t, err)
 }
+
+// TestOncallHandoffWeekdayReEncodeReplay is BUG-01's regression test
+// (sentinel-user-report-issue/BUG-01).
+//
+// 1724200000_add_oncall_rotation_anchor.sql re-encodes the pre-existing `handoff_weekday = 0`
+// (old encoding: Sunday) to ISO 7, and swaps 1724100000's `BETWEEN 0 AND 6` CHECK for
+// `BETWEEN 1 AND 7`. Its first revision ran that UPDATE BEFORE the swap in both directions, which
+// is exactly backwards: the constraint that judges a write is the one in force at the moment of
+// the write, i.e. the OLD one. Up wrote 7 under `BETWEEN 0 AND 6`; Down wrote 0 under
+// `BETWEEN 1 AND 7`. Both aborted with
+// `new row for relation "oncall_schedules" violates check constraint
+// "oncall_schedules_handoff_weekday_check"`, and nothing in the repo replayed the file over
+// non-empty data, so it went unnoticed.
+//
+// This test seeds one kind='weekly' schedule at EACH weekday value the old encoding allows and
+// then replays the file up/down/up. Delete the UPDATE from either direction of the migration, or
+// move it back outside the DO block, and this test goes red.
+func TestOncallHandoffWeekdayReEncodeReplay(t *testing.T) {
+	db := migTestDB(t, "weekday")
+	ctx := context.Background()
+
+	absDir, err := filepath.Abs("../../packages/db-migrations/migrations")
+	require.NoError(t, err)
+
+	opts := dbmigrations.MigrationOptions{
+		TableName: "weekday_replay_migrations",
+		Directory: absDir,
+	}
+
+	// BaselineVersion is goose's UpTo. Stopping one migration short of the file under test also
+	// puts the physical schema back on the old encoding whatever the clone template applied:
+	// 1724100000's CHECK swap is an unconditional DROP + ADD of `BETWEEN 0 AND 6`.
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, 1724100000, opts),
+		"could not migrate up to 1724100000")
+
+	// One weekly schedule per old-encoding weekday. Seven organizations, because
+	// idx_oncall_schedules_one_active allows at most one ACTIVE schedule per organization.
+	for wd := 0; wd <= 6; wd++ {
+		var orgID string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id`,
+			fmt.Sprintf("bug01 org %d", wd),
+			fmt.Sprintf("bug01-org-%d-%d", wd, time.Now().UnixNano()),
+		).Scan(&orgID))
+
+		_, insErr := db.ExecContext(ctx,
+			`INSERT INTO oncall_schedules (organization_id, name, kind, handoff_time, handoff_weekday, created_by)
+			 VALUES ($1, $2, 'weekly', '09:00', $3, 'bug01')`,
+			orgID, fmt.Sprintf("bug01-weekly-%d", wd), wd)
+		require.NoError(t, insErr, "seeding handoff_weekday=%d under the 0-6 CHECK", wd)
+	}
+
+	weekdays := func() []int {
+		rows, qErr := db.QueryContext(ctx,
+			`SELECT handoff_weekday FROM oncall_schedules WHERE created_by = 'bug01' ORDER BY handoff_weekday`)
+		require.NoError(t, qErr)
+		defer rows.Close()
+		var out []int
+		for rows.Next() {
+			var wd int
+			require.NoError(t, rows.Scan(&wd))
+			out = append(out, wd)
+		}
+		require.NoError(t, rows.Err())
+		return out
+	}
+
+	hasAnchorColumn := func() bool {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM information_schema.columns
+			 WHERE table_name = 'oncall_schedules' AND column_name = 'rotation_anchor_at'`).Scan(&n))
+		return n > 0
+	}
+
+	require.Equal(t, []int{0, 1, 2, 3, 4, 5, 6}, weekdays(), "seed did not land as written")
+
+	// UP: the statement that used to abort. Only 0 moves; 1-6 mean the same day in both encodings.
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, 1724200000, opts),
+		"up over seeded rows must not violate the outgoing 0-6 CHECK")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7}, weekdays())
+	assert.True(t, hasAnchorColumn(), "up must add rotation_anchor_at")
+
+	// DOWN: the mirror-image statement, which used to abort against this file's own 1-7 CHECK.
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "down", opts),
+		"down over ISO rows must not violate the outgoing 1-7 CHECK")
+	assert.Equal(t, []int{0, 1, 2, 3, 4, 5, 6}, weekdays())
+	assert.False(t, hasAnchorColumn(), "down must drop rotation_anchor_at")
+
+	// UP again: the replay the A1 flat-directory ledgers make routine.
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, 1724200000, opts),
+		"replaying up must be as safe as the first up")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7}, weekdays())
+	assert.True(t, hasAnchorColumn(), "replayed up must re-add rotation_anchor_at")
+}
+
+// TestOncallWeekdayCheckReplayOverIsoRow is BUG-03's regression test
+// (sentinel-user-report-issue/BUG-03).
+//
+// BUG-01 (TestOncallHandoffWeekdayReEncodeReplay above) proved 1724200000's own two directions
+// against rows seeded under the OLD 0-6 encoding. It could not see the rest of the finding,
+// because it never replays 1724100000 over a row in the NEW encoding.
+//
+// A1: one flat migration directory serves several goose ledgers against the SAME physical
+// database, and 1724100000's header promises "every statement below is a no-op on a schema that
+// already has it applied". Its weekday CHECK swap was not: an unconditional DROP + ADD of
+// `BETWEEN 0 AND 6`, replayed by a second target after 1724200000 had re-encoded Sunday to ISO 7,
+// re-narrows a constraint 1724200000 already superseded, and Postgres validates ADD CONSTRAINT
+// against existing rows -- `check constraint "oncall_schedules_handoff_weekday_check" of relation
+// "oncall_schedules" is violated by some row`. The offending row is not hypothetical: the
+// dashboard's PUT /oncall validates with isIsoWeekday (1..7) and writes 7 for Sunday.
+//
+// So this test seeds the row an operator creates through the shipped UI -- kind='weekly',
+// handoff_weekday=7 -- and then replays the whole directory under a fresh ledger, exactly as a
+// second migration target does. Restore `BETWEEN 0 AND 6` in 1724100000 and this test goes red on
+// the first replay.
+func TestOncallWeekdayCheckReplayOverIsoRow(t *testing.T) {
+	db := migTestDB(t, "bug03weekday")
+	ctx := context.Background()
+
+	absDir, err := filepath.Abs("../../packages/db-migrations/migrations")
+	require.NoError(t, err)
+
+	// A ledger of its own, against a database the template already migrated to head under
+	// migtest_template_migrations. That is the A1 situation verbatim: a second target replaying
+	// every file over a schema another ledger already applied.
+	opts := dbmigrations.MigrationOptions{
+		TableName: "bug03_replay_migrations",
+		Directory: absDir,
+	}
+
+	var orgID string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id`,
+		"bug03 org", fmt.Sprintf("bug03-org-%d", time.Now().UnixNano()),
+	).Scan(&orgID))
+
+	// The row the shipped UI writes for Sunday. It must be accepted by the constraint in force at
+	// head -- if this INSERT fails, the ISO swap itself never happened.
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO oncall_schedules (organization_id, name, kind, handoff_time, handoff_weekday, created_by)
+		 VALUES ($1, 'bug03-sunday', 'weekly', '09:00', 7, 'bug03')`, orgID)
+	require.NoError(t, err, "handoff_weekday=7 must be storable at head; that is the ISO encoding SR-4 settles")
+
+	weekday := func() int {
+		var wd int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT handoff_weekday FROM oncall_schedules WHERE created_by = 'bug03'`).Scan(&wd))
+		return wd
+	}
+
+	// rejectsZero reports whether the live constraint still refuses the OLD encoding's Sunday.
+	// The fix widens 1724100000's swap; it must not leave the SCHEMA widened, because 1724200000
+	// runs after it in the same directory and narrows it back to ISO 1-7.
+	rejectsZero := func() bool {
+		var probeOrg string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id`,
+			"bug03 probe", fmt.Sprintf("bug03-probe-%d", time.Now().UnixNano()),
+		).Scan(&probeOrg))
+		_, insErr := db.ExecContext(ctx,
+			`INSERT INTO oncall_schedules (organization_id, name, kind, handoff_time, handoff_weekday, created_by)
+			 VALUES ($1, 'bug03-probe', 'weekly', '09:00', 0, 'bug03probe')`, probeOrg)
+		if insErr == nil {
+			_, _ = db.ExecContext(ctx, `DELETE FROM oncall_schedules WHERE created_by = 'bug03probe'`)
+			return false
+		}
+		return strings.Contains(insErr.Error(), "oncall_schedules_handoff_weekday_check")
+	}
+
+	require.Equal(t, 7, weekday(), "seed did not land as written")
+
+	// REPLAY. This is the statement that used to abort with "is violated by some row".
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "up", opts),
+		"replaying the directory under a second ledger must not re-narrow the weekday CHECK onto a live ISO row")
+	assert.Equal(t, 7, weekday(), "the replay must leave the ISO row untouched")
+	assert.True(t, rejectsZero(), "after the replay the live CHECK must still be ISO 1-7, not the widened union")
+
+	// DOWN then UP, over the same ISO row -- the up/down/up the item asks for, on data rather than
+	// on an empty table. Down rolls back 1724200000 alone (goose down is one step): Sunday goes
+	// back to 0 and the anchor column goes away.
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "down", opts),
+		"down over an ISO row must not violate the outgoing 1-7 CHECK")
+	assert.Equal(t, 0, weekday(), "down must re-encode ISO Sunday back to 0")
+
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "up", opts),
+		"up again must re-encode 0 back to ISO 7")
+	assert.Equal(t, 7, weekday())
+	assert.True(t, rejectsZero(), "the replayed up must reinstate the ISO 1-7 CHECK")
+
+	var anchorCols int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_name = 'oncall_schedules' AND column_name = 'rotation_anchor_at'`).Scan(&anchorCols))
+	assert.Equal(t, 1, anchorCols, "up must leave rotation_anchor_at in place")
+}

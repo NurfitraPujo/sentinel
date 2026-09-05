@@ -26,7 +26,12 @@ export type NotificationKind =
 	| 'resolved'
 	| 'linked'
 	| 'progress_update'
-	| 'question_asked';
+	| 'question_asked'
+	// sentinel-user-report-issue §4.4 / §4.6: the value that migration added to
+	// `notifications_kind_check`. Written directly by `$lib/server/escalation.ts` for the ONE
+	// assignee, not fanned out through `notifyIssueEvent` -- §4.4 says "one `notifications` row
+	// for the assignee", and a fan-out would tell every subscriber they had been put on the issue.
+	| 'escalated';
 
 export interface NotifyIssueEventInput {
 	issueId: string;
@@ -115,7 +120,21 @@ export async function notifyIssueEvent(
 
 // §8/Q7: only these kinds ever produce an email. 'linked' and 'progress_update' are in-app only
 // -- deliberately not in this set, even though they DO get a `notifications` row above.
-const EMAILABLE_KINDS = new Set<NotificationKind>(['commented', 'claimed', 'status_changed', 'resolved']);
+//
+// SR-2 (sentinel-user-report-issue) adds 'escalated', and the rationale is the whole point of
+// §4.4's on-call rota: OQ-5 bought a schedule, a timezone model and a bounded chain in order to
+// enforce a 15-minute acknowledgement deadline, and an in-app badge cannot meet that deadline out
+// of hours. An engineer paged at 02:00 by a badge alone walks all three hops in 45 minutes and
+// terminates at `exhausted`. **This makes EMAIL_SERVER load-bearing for escalation**: with no
+// transport configured, `sendIssueNotificationEmail` logs `issue_notification_skipped` and the
+// only remaining signal is the in-app row.
+const EMAILABLE_KINDS = new Set<NotificationKind>([
+	'commented',
+	'claimed',
+	'status_changed',
+	'resolved',
+	'escalated',
+]);
 
 // Q11: a blocking question always bypasses the per-issue-per-user throttle -- it is checked
 // separately below rather than folded into EMAILABLE_KINDS, since its bypass behavior is
@@ -189,8 +208,10 @@ export interface SendNotificationEmailsContext {
  * §8 post-commit email step. For each `(userId, kind)` `notifyIssueEvent` returned:
  *   - `question_asked` ALWAYS emails, bypassing the throttle (Q11 -- a direct question deserves
  *     immediate email).
- *   - `commented` / `claimed` / `status_changed` / `resolved` email, subject to the 15-minute
- *     per-(user, issue) throttle (Q7).
+ *   - `commented` / `claimed` / `status_changed` / `resolved` / `escalated` email, subject to the
+ *     15-minute per-(user, issue) throttle (Q7). `escalated` is throttled like the rest and that
+ *     is safe by construction: §4.4 reassigns to a DIFFERENT engineer at each hop, so two hops on
+ *     one report never contend for the same (user, issue) window.
  *   - everything else (`linked`, `progress_update`) never emails.
  *
  * Best-effort, like the invitation pattern (email.ts) -- a failed lookup or send for one user

@@ -49,10 +49,15 @@ ONESHOT_SERVICES="nats-init migrate minio-init"
 #
 # Listed services are still waited for and still reported; they just cannot fail the run.
 # sentinel-cron (N9) joins jaeger here for a different but related reason: it is a long-running service
-# with no healthcheck that ships gated OFF (RETENTION_CRON_ENABLED=false), so it sits in `sleep infinity`
-# and simply reports `running`. Left off this list it would be waited on like any app container — fine
-# while it stays up, but a crash-looping cron image (e.g. a bad CRON_SECRET makes entrypoint exit 1)
-# would then fail the whole gate. It is genuinely optional to stack readiness, so it cannot fail the run.
+# with no healthcheck that ships gated OFF, so it sits in `sleep infinity` and simply reports `running`.
+# Left off this list it would be waited on like any app container — fine while it stays up, but a
+# crash-looping cron image (e.g. a bad CRON_SECRET makes entrypoint exit 1) would then fail the whole
+# gate. It is genuinely optional to stack readiness, so it cannot fail the run.
+#
+# sentinel-user-report-issue §4.4b: that service now runs TWO gated loops (RETENTION_CRON_ENABLED and
+# ONCALL_CRON_ENABLED), and it MUST stay on this list for the same reason — with both gates off it
+# still only sleeps, and with either on it is still a container whose failure is not a stack-readiness
+# failure. Enabling the escalation sweep does not change its standing here.
 OPTIONAL_SERVICES="jaeger cron"
 
 log() {

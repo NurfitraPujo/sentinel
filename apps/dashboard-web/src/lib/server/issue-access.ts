@@ -16,6 +16,58 @@ function isIssueWriteRole(role: string): role is IssueWriteRole {
 	return (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
 }
 
+/**
+ * sentinel-user-report-issue §2/§4.4a: who may WRITE an on-call schedule — its rotation, its
+ * timezone or its overrides.
+ *
+ * **Deliberately narrower than `ISSUE_WRITE_ROLES` above**, and it lives beside it so the gap is
+ * visible rather than discovered. The contract states the reason: a rota that any `engineer` can
+ * rewrite is a rota that decides who gets woken up, edited by the person who does not want to be.
+ *
+ * READ is the other half of the split and is NOT this list — §4.4a puts it at any recognised org
+ * member, i.e. `requireReportAccess(userId, orgId, 'read')`, viewers included.
+ */
+export const ONCALL_WRITE_ROLES = ['owner', 'admin'] as const;
+type OncallWriteRole = (typeof ONCALL_WRITE_ROLES)[number];
+
+export function isOncallWriteRole(role: string): role is OncallWriteRole {
+	return (ONCALL_WRITE_ROLES as readonly string[]).includes(role);
+}
+
+/**
+ * Throws unless `userId` holds an `ONCALL_WRITE_ROLES` role in `organizationId`.
+ *
+ * A non-member and a member below the bar are told apart deliberately: the first is "you have no
+ * access to this organization" (the message every other org route uses), the second names the
+ * roles, because an `engineer` who is refused here has to be able to tell "I am in the wrong org"
+ * from "this is above my role" without guessing.
+ */
+export async function requireOncallWriteAccess(
+	userId: string,
+	organizationId: string
+): Promise<{ organizationId: string; role: string }> {
+	const memberRows = await db
+		.select({ role: organizationMembers.role })
+		.from(organizationMembers)
+		.where(
+			and(
+				eq(organizationMembers.userId, userId),
+				eq(organizationMembers.organizationId, organizationId)
+			)
+		);
+
+	if (memberRows.length === 0) {
+		throw error(403, 'Forbidden: You do not have access to this organization');
+	}
+
+	const role = memberRows[0].role;
+	if (!isOncallWriteRole(role)) {
+		throw error(403, 'Forbidden: Only an org owner or admin may change the on-call schedule');
+	}
+
+	return { organizationId, role };
+}
+
 export type IssuePermission = 'read' | 'write';
 
 export interface IssueAccessContext {

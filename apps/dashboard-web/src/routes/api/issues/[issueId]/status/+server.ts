@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import { updateIssueStatus } from '$lib/db/queries/issues';
 import { requireIssueAccess, validateResolvedInVersion } from '$lib/server/issue-access';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
+import { acknowledgeEscalationQuietly } from '$lib/server/escalation';
 
 const VALID_STATUSES = ['unresolved', 'resolved', 'ignored'] as const;
 type IssueStatus = (typeof VALID_STATUSES)[number];
@@ -43,6 +44,12 @@ export const PATCH: RequestHandler = async ({ request, params, locals, url }) =>
 	);
 	if (changed) {
 		await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
+
+		// §4.4's implicit acknowledgement: "the assignee claims, comments on, or changes the status
+		// of that issue … Someone who is already working on it must not be reassigned for not
+		// pressing a button." Post-commit and never throwing — a failed stamp costs one extra
+		// reassignment, which the chain is bounded against, and must not fail this request.
+		await acknowledgeEscalationQuietly(issueId, userId);
 	}
 
 	return json({ success: true, status, changed });

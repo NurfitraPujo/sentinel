@@ -6,6 +6,10 @@
 	import CommentThread from '$lib/components/issues/CommentThread.svelte';
 	import SubscriptionToggle from '$lib/components/notifications/SubscriptionToggle.svelte';
 	import MarkdownToolbar from '$lib/components/issues/MarkdownToolbar.svelte';
+	import ReportReporter from '$lib/components/issues/ReportReporter.svelte';
+	import ReportSourceBadge from '$lib/components/issues/ReportSourceBadge.svelte';
+	import TriagePanel from '$lib/components/issues/TriagePanel.svelte';
+	import EscalationStrip from '$lib/components/issues/EscalationStrip.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
@@ -32,10 +36,33 @@
 	let deleting = $state(false);
 	let deleteError = $state<string | null>(null);
 
+	// BUG-02. SvelteKit reuses this component across an `[issueId]` param change, so nothing above
+	// is reset by a client-side navigation from one report to another — and §4.4's `escalated`
+	// notification links straight here (`NotificationBell.svelte`), so that navigation is on the
+	// feature's critical path. Two halves, because they leak in two different places:
+	//
+	//  1. The `{#key data.detail.issue.id}` below re-creates every child, which is what resets
+	//     state owned by a child — `EscalationStrip`'s local acknowledgement among them.
+	//  2. `{#key}` does NOT touch state declared in THIS script; a block only re-creates the
+	//     markup inside it. So the page's own per-report transients are reset here, or an open
+	//     edit of report A would PATCH report B with A's draft.
+	$effect(() => {
+		data.detail.issue.id;
+		editing = false;
+		editTitle = '';
+		editBodyMd = '';
+		editSeverity = 'low';
+		saveError = null;
+		deleteError = null;
+		claimError = null;
+		moveProjectId = '';
+		moveError = null;
+	});
+
 	function startEdit() {
 		editTitle = data.detail.issue.message;
-		editBodyMd = data.detail.report.bodyMd;
-		editSeverity = data.detail.report.severity;
+		editBodyMd = data.detail.bodyMd;
+		editSeverity = data.detail.severity;
 		saveError = null;
 		editing = true;
 	}
@@ -146,18 +173,29 @@
 	}
 </script>
 
+{#key data.detail.issue.id}
 <div class="report-detail-page">
 	<div class="report-header">
 		<div>
 			<h1 class="report-title">{data.detail.issue.message}</h1>
-			<p class="report-meta">
-				Reported by {data.detail.reporterName ?? data.detail.reporterEmail ?? 'unknown'} in
-				<strong>{data.detail.projectName}</strong>
-				{#if data.detail.projectIsInbox}<span class="inbox-tag">Triage</span>{/if}
-			</p>
+			<ReportReporter
+				reporter={{
+					kind: data.detail.reporterKind,
+					displayName: data.detail.reporterDisplayName,
+					email: data.detail.reporterEmailAddress,
+					externalId: data.detail.reporterExternalId,
+					firstSeenAt: data.detail.reporterFirstSeenAt
+						? new Date(data.detail.reporterFirstSeenAt).toISOString()
+						: null,
+				}}
+				projectName={data.detail.projectName}
+				projectIsInbox={data.detail.projectIsInbox}
+				reportedAt={data.detail.issue.firstSeen}
+			/>
 		</div>
 		<div class="header-badges">
-			<span class="severity-tag severity-{data.detail.report.severity}">{data.detail.report.severity}</span>
+			<ReportSourceBadge sourceChannel={data.detail.issue.sourceChannel} />
+			<span class="severity-tag severity-{data.detail.severity}">{data.detail.severity}</span>
 			<span class="status-tag status-{data.detail.issue.status}">{data.detail.issue.status}</span>
 			{#if data.detail.issue.waitingOn}
 				<span class="waiting-badge">waiting on {data.detail.issue.waitingOn}</span>
@@ -180,6 +218,16 @@
 	{#if deleteError}
 		<div class="error-banner" role="alert">{deleteError}</div>
 	{/if}
+
+	<!-- §4.4 / fe.md rows S8-S12. Renders nothing when `escalation` is null, which is the state
+	     "never escalated" -- distinct from an escalation object, per §4.2. -->
+	<EscalationStrip
+		issueId={data.detail.issue.id}
+		escalation={data.escalation}
+		currentUserId={data.userId}
+		waitingOn={data.detail.issue.waitingOn}
+		reporterIsExternal={data.detail.reporterKind === 'external'}
+	/>
 
 	<div class="claim-box">
 		{#if data.detail.issue.assignedTo}
@@ -237,9 +285,18 @@
 		</div>
 	{:else}
 		<div class="report-body-panel">
-			<Markdown source={data.detail.report.bodyMd} />
+			<Markdown source={data.detail.bodyMd} />
 		</div>
 	{/if}
+
+	<!-- §4.2 / §4.3, fe.md rows S2/S3/S4/S6. `data.triage` is null in all three of the ways §4.2
+	     says it can be, and the panel renders that as its own state rather than as an empty list. -->
+	<TriagePanel
+		issueId={data.detail.issue.id}
+		triage={data.triage}
+		canWrite={data.canWrite}
+		onconfirm={() => window.location.reload()}
+	/>
 
 	<div class="attachments-panel">
 		<h2 class="section-heading">Attachments</h2>
@@ -289,6 +346,7 @@
 		<IssueTimeline activity={data.activity} />
 	{/if}
 </div>
+{/key}
 
 <style>
 	.report-detail-page {

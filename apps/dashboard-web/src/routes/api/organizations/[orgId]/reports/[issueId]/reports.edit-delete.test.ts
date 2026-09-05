@@ -14,15 +14,21 @@ const getReporterId = vi.fn();
 const getOrgRole = vi.fn();
 const bestEffortDeleteObjects = vi.fn();
 
+const listIssueAttachments = vi.fn(async () => []);
+const requireReportAccess = vi.fn(async () => ({ organizationId: 'org-1', role: 'engineer' }));
+const readTriage = vi.fn();
+
 vi.mock('$lib/db/queries/reports', () => ({
 	getReportDetail,
 	updateManualIssueReport,
 	deleteManualIssue,
+	listIssueAttachments,
 }));
-vi.mock('$lib/server/report-access', () => ({ getReporterId, getOrgRole }));
+vi.mock('$lib/server/report-access', () => ({ getReporterId, getOrgRole, requireReportAccess }));
+vi.mock('$lib/server/triage', () => ({ readTriage }));
 vi.mock('$lib/server/retention', () => ({ bestEffortDeleteObjects }));
 
-const { PATCH, DELETE } = await import('./+server');
+const { GET, PATCH, DELETE } = await import('./+server');
 
 function makeEvent(userId: string, body?: unknown) {
 	return {
@@ -47,7 +53,7 @@ beforeEach(() => {
 describe('PATCH /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 	it('the author can edit their unresolved report', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 		updateManualIssueReport.mockResolvedValue({ issue: {}, report: {} });
 
 		const res = await PATCH(makeEvent('author-1', { bodyMd: 'new body' }));
@@ -60,7 +66,7 @@ describe('PATCH /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 	it('a non-author cannot edit the report, even a write-role member', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 
 		await expect(PATCH(makeEvent('someone-else', { bodyMd: 'x' }))).rejects.toMatchObject({ status: 403 });
 		expect(updateManualIssueReport).not.toHaveBeenCalled();
@@ -68,7 +74,7 @@ describe('PATCH /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 	it('the author cannot edit once the report is resolved', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('resolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 
 		await expect(PATCH(makeEvent('author-1', { bodyMd: 'x' }))).rejects.toMatchObject({ status: 403 });
 		expect(updateManualIssueReport).not.toHaveBeenCalled();
@@ -84,7 +90,7 @@ describe('PATCH /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 describe('DELETE /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 	it('the author can delete their own unresolved report', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 		getOrgRole.mockResolvedValue('viewer');
 		deleteManualIssue.mockResolvedValue({ storageKeys: ['k1'] });
 
@@ -97,7 +103,7 @@ describe('DELETE /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 	it('the author CANNOT delete their own report once resolved', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('resolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 		getOrgRole.mockResolvedValue('viewer');
 
 		await expect(DELETE(makeEvent('author-1'))).rejects.toMatchObject({ status: 403 });
@@ -106,7 +112,7 @@ describe('DELETE /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 	it('an org owner can delete ANY report, even resolved and not their own', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('resolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 		getOrgRole.mockResolvedValue('owner');
 		deleteManualIssue.mockResolvedValue({ storageKeys: [] });
 
@@ -118,7 +124,7 @@ describe('DELETE /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 	it('a non-author, non-owner/admin member cannot delete the report', async () => {
 		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
-		getReporterId.mockResolvedValue('author-1');
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
 		getOrgRole.mockResolvedValue('engineer');
 
 		await expect(DELETE(makeEvent('engineer-1'))).rejects.toMatchObject({ status: 403 });

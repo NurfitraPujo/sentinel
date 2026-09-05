@@ -1,6 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { attachments } from '$lib/db/schema';
 import {
@@ -11,7 +11,13 @@ import {
 	getObjectRangeBytes,
 	deleteObject,
 } from '$lib/server/storage';
-import { sniffContentType, resolveContentType, isAllowedContentType } from '$lib/server/attachment-sniff';
+import {
+	sniffContentType,
+	resolveContentType,
+	isAllowedContentType,
+	ALLOWED_CONTENT_TYPES,
+	type AllowedContentType,
+} from '$lib/server/attachment-sniff';
 import { reapOrgOrphanAttachments } from '$lib/server/attachment-reaper';
 import { log } from '$lib/server/observability/log';
 
@@ -26,11 +32,31 @@ import { log } from '$lib/server/observability/log';
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB cap (§4/Q4)
 
+/**
+ * `attachments.uploader_type`. `'external_reporter'` is added by the §4.6 migration's
+ * catalog-guarded swap of `attachments_uploader_type_check`; the union here is the TypeScript
+ * mirror of that CHECK, so a caller cannot invent a fourth value that the database would reject at
+ * INSERT time.
+ */
+export type UploaderType = 'user' | 'agent' | 'external_reporter';
+
 export interface UploadCoreInput {
 	organizationId: string;
 	formData: FormData;
-	uploaderType: 'user' | 'agent';
+	uploaderType: UploaderType;
 	uploaderId: string;
+	/**
+	 * The content types this CALLER admits, defaulting to the full `ALLOWED_CONTENT_TYPES`.
+	 *
+	 * It is a per-caller parameter for the same reason the ingestor's scope allowlist became a
+	 * per-chain one (contract §2): the session and agent upload routes and the external-reporter
+	 * one do not have the same threat model, and one shared list means narrowing it for the
+	 * stranger narrows it for the org member too. `POST /api/report/attachments` passes
+	 * `REPORT_ALLOWED_CONTENT_TYPES` (images + PDF); everything else passes nothing and keeps the
+	 * wider list. A value here can only ever REMOVE types — the sniffer is still the only thing
+	 * that decides what the bytes are.
+	 */
+	allowedContentTypes?: readonly AllowedContentType[];
 }
 
 export interface UploadCoreResult {
@@ -64,6 +90,14 @@ export async function handleAttachmentUpload(input: UploadCoreInput): Promise<Up
 	const detected = sniffContentType(buffer);
 	const resolved = resolveContentType(detected, file.type || undefined);
 	if (!resolved) {
+		throw error(415, 'File content is not an allowed type (or does not match its declared type)');
+	}
+
+	// The caller's own narrowing, applied AFTER the sniff so a declared type can never reach it.
+	// A `.png` whose bytes are a ZIP header resolves to `application/zip` above and is rejected
+	// here for the report route, which is exactly the case §4.5's abuse table is about.
+	const allowed = input.allowedContentTypes ?? ALLOWED_CONTENT_TYPES;
+	if (!allowed.includes(resolved)) {
 		throw error(415, 'File content is not an allowed type (or does not match its declared type)');
 	}
 
@@ -136,6 +170,112 @@ export function checkDeclaredLength(request: Request): void {
 	if (parsed > MAX_UPLOAD_BYTES) {
 		throw error(413, `File exceeds the ${MAX_UPLOAD_BYTES} byte cap`);
 	}
+}
+
+/**
+ * sentinel-user-report-issue contract §4.5 + SR-5: the per-organization daily byte budget for
+ * external-reporter uploads.
+ *
+ * Enforced in POSTGRES, not Redis, and that is the whole point of it. The Redis limiter fails open
+ * (VERIFIED_STATE.md S10) and this feature does not fix it (§1), so a budget that evaporates when
+ * Redis does is not a budget. SR-5 settles the three readings §4.5's table cell allowed:
+ *
+ *   - the sum is over `org_id`, because `attachments` has no API-key column and §4.6 adds none,
+ *     so a literal "per key" sum is not computable;
+ *   - it is filtered to `uploader_type = 'external_reporter'`, so an org member's own screenshot
+ *     through `/api/uploads` and an agent's through `/api/agent/uploads` do NOT consume any of the
+ *     external reporters' allowance -- otherwise a busy dashboard team could start returning 429
+ *     to a service that had uploaded nothing;
+ *   - the window is a ROLLING 24 hours, not a calendar day, so no timezone question arises.
+ *
+ * The query is `(org_id, created_at)` + a filter, which is the shape `idx_attachments_org_created`
+ * exists for.
+ */
+export const DEFAULT_REPORT_UPLOAD_BYTES_PER_DAY = 250 * 1024 * 1024; // 250 MB (§4.5)
+export const REPORT_UPLOAD_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const EXTERNAL_REPORTER_UPLOADER_TYPE = 'external_reporter';
+
+/**
+ * Resolves `REPORT_UPLOAD_BYTES_PER_DAY`. An unset, unparseable or negative value falls back to
+ * the contract default rather than to "unlimited" -- a misconfigured ceiling must not become an
+ * absent one. `0` is honoured as a real value (upload disabled), since that is a deliberate
+ * setting and not a parse failure.
+ */
+export function resolveReportUploadBytesPerDay(raw: string | undefined): number {
+	if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_UPLOAD_BYTES_PER_DAY;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_REPORT_UPLOAD_BYTES_PER_DAY;
+	return Math.floor(parsed);
+}
+
+export interface ReportUploadBudgetUsage {
+	/** Bytes already stored for this org by external reporters inside the window. */
+	usedBytes: number;
+	/** `created_at` of the oldest counted row, or null when nothing is counted. */
+	oldestCreatedAt: Date | null;
+}
+
+/** The rolling-window sum SR-5 specifies. Exported so a test can assert the filter, not just the total. */
+export async function sumExternalReporterUploadBytes(
+	organizationId: string,
+	windowStart: Date
+): Promise<ReportUploadBudgetUsage> {
+	const [row] = await db
+		.select({
+			total: sql<string>`coalesce(sum(${attachments.sizeBytes}), 0)`,
+			oldest: sql<Date | null>`min(${attachments.createdAt})`,
+		})
+		.from(attachments)
+		.where(
+			and(
+				eq(attachments.orgId, organizationId),
+				eq(attachments.uploaderType, EXTERNAL_REPORTER_UPLOADER_TYPE),
+				gte(attachments.createdAt, windowStart)
+			)
+		);
+
+	return {
+		usedBytes: Number(row?.total ?? 0),
+		oldestCreatedAt: row?.oldest ? new Date(row.oldest) : null,
+	};
+}
+
+export interface ReportUploadBudgetVerdict {
+	allowed: boolean;
+	usedBytes: number;
+	budgetBytes: number;
+	/** Seconds until enough of the window ages out for a retry to have a chance. */
+	retryAfter: number;
+}
+
+/**
+ * Decides whether `incomingBytes` fits under the budget. The incoming file is counted: "over the
+ * ceiling" has to include the request being decided, or a single 25 MB upload would always pass a
+ * 1 MB budget exactly once.
+ *
+ * `retryAfter` is derived from when the OLDEST counted row leaves the rolling window, which is the
+ * first moment the sum can actually drop -- not a made-up constant.
+ */
+export async function checkReportUploadBudget(
+	organizationId: string,
+	incomingBytes: number,
+	budgetBytes: number,
+	now: Date = new Date()
+): Promise<ReportUploadBudgetVerdict> {
+	const windowStart = new Date(now.getTime() - REPORT_UPLOAD_WINDOW_MS);
+	const { usedBytes, oldestCreatedAt } = await sumExternalReporterUploadBytes(organizationId, windowStart);
+
+	const allowed = usedBytes + incomingBytes <= budgetBytes;
+	const retryAfterMs = oldestCreatedAt
+		? oldestCreatedAt.getTime() + REPORT_UPLOAD_WINDOW_MS - now.getTime()
+		: REPORT_UPLOAD_WINDOW_MS;
+
+	return {
+		allowed,
+		usedBytes,
+		budgetBytes,
+		retryAfter: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+	};
 }
 
 /**

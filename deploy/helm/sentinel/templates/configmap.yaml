@@ -20,3 +20,10 @@ data:
   AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
   EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}
   DATA_RETENTION_DAYS: {{ .Values.config.dashboard.dataRetentionDays | quote }}
+  # sentinel-user-report-issue §8's config knobs. Non-secret, so they belong here and not in the
+  # Secret; read by apps/dashboard-web through `$env/dynamic/private`.
+  REPORT_MATCH_WINDOW_MINUTES: {{ .Values.config.dashboard.reportMatchWindowMinutes | quote }}
+  ESCALATION_ACK_MINUTES: {{ .Values.config.dashboard.escalationAckMinutes | quote }}
+  ESCALATION_MAX_HOPS: {{ .Values.config.dashboard.escalationMaxHops | quote }}
+  REPORT_UPLOAD_RPM: {{ .Values.config.dashboard.reportUploadRpm | quote }}
+  REPORT_UPLOAD_BYTES_PER_DAY: {{ .Values.config.dashboard.reportUploadBytesPerDay | quote }}

@@ -5,12 +5,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 function makeChainable() {
 	const m: any = {};
-	const methods = ['select', 'from', 'where', 'orderBy', 'limit'];
+	const methods = ['select', 'from', 'where', 'orderBy', 'limit', 'innerJoin', 'leftJoin'];
 	for (const name of methods) {
 		m[name] = vi.fn(() => m);
 	}
 	m.__result = [];
-	m.then = vi.fn((resolve: any) => resolve(m.__result));
+	// sentinel-user-report-issue SR-6: `getAgentReportDetail` issues TWO queries -- the org-member
+	// companion first, then the external one -- so a single `__result` cannot express "no manual
+	// row, but an external one". `__queue`, when non-empty, answers successive awaits in order;
+	// `__result` stays the answer for every single-query case in this file.
+	m.__queue = [] as unknown[][];
+	m.then = vi.fn((resolve: any) => resolve(m.__queue.length > 0 ? m.__queue.shift() : m.__result));
 	return m;
 }
 
@@ -25,6 +30,20 @@ vi.mock('$lib/db/schema', () => ({
 	issues: { id: 'id' },
 	projects: { id: 'id', organizationId: 'organizationId', name: 'name', isInbox: 'isInbox' },
 	manualIssueReports: { issueId: 'issueId', bodyMd: 'bodyMd', severity: 'severity', reporterId: 'reporterId' },
+	// sentinel-user-report-issue SR-6: getAgentReportDetail reads BOTH companions now.
+	externalIssueReports: {
+		issueId: 'issueId',
+		bodyMd: 'bodyMd',
+		severity: 'severity',
+		context: 'context',
+		externalReporterId: 'externalReporterId',
+	},
+	externalReporters: {
+		id: 'id',
+		displayName: 'displayName',
+		email: 'email',
+		externalId: 'externalId',
+	},
 	errorOccurrences: {
 		id: 'id',
 		issueId: 'issueId',
@@ -49,6 +68,7 @@ const {
 beforeEach(() => {
 	vi.clearAllMocks();
 	dbMock.__result = [];
+	dbMock.__queue = [];
 	getAgentSettingsForProjects.mockResolvedValue(new Map());
 });
 
@@ -72,7 +92,56 @@ describe('getAgentReportDetail', () => {
 
 	it('returns bodyMd/severity/reporterId for a user_report issue', async () => {
 		dbMock.__result = [{ bodyMd: 'body', severity: 'high', reporterId: 'user-1' }];
-		expect(await getAgentReportDetail('issue-1')).toEqual({ bodyMd: 'body', severity: 'high', reporterId: 'user-1' });
+		expect(await getAgentReportDetail('issue-1')).toEqual({
+			bodyMd: 'body',
+			severity: 'high',
+			reporterId: 'user-1',
+			reporterKind: 'org_member',
+			externalReporterId: null,
+			reporterDisplayName: null,
+			reporterEmail: null,
+			reporterExternalId: null,
+			context: null,
+		});
+	});
+
+	// sentinel-user-report-issue SR-6 / §4.2's correction. This is the case the function got wrong:
+	// an externally-submitted report has NO `manual_issue_reports` row, so the old single-table read
+	// returned null and an agent saw a title and nothing else.
+	it('returns the EXTERNAL companion when there is no org-member one', async () => {
+		dbMock.__queue = [
+			[],
+			[
+				{
+					bodyMd: 'the save button spins forever',
+					severity: 'high',
+					context: { page: 'Visits', release: 'v31.70' },
+					externalReporterId: 'ext-1',
+					displayName: 'Sarah K.',
+					email: null,
+					externalId: 'u_8f3c41',
+				},
+			],
+		];
+
+		expect(await getAgentReportDetail('issue-1')).toEqual({
+			bodyMd: 'the save button spins forever',
+			severity: 'high',
+			// An external reporter is DATA, never a Sentinel principal (§2), so `reporterId` -- a
+			// `"user".id` -- stays null and the external id lives in its own field.
+			reporterId: null,
+			reporterKind: 'external',
+			externalReporterId: 'ext-1',
+			reporterDisplayName: 'Sarah K.',
+			reporterEmail: null,
+			reporterExternalId: 'u_8f3c41',
+			context: { page: 'Visits', release: 'v31.70' },
+		});
+	});
+
+	it('returns null when NEITHER companion exists (a system_error issue)', async () => {
+		dbMock.__queue = [[], []];
+		expect(await getAgentReportDetail('issue-1')).toBeNull();
 	});
 });
 

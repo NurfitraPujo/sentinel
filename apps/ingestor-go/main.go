@@ -214,7 +214,7 @@ func main() {
 	}
 
 	ingestChain := observeMiddleware(ingestRequestCounter,
-		authenticator.Middleware(
+		authenticator.Middleware(auth.ScopesIngest,
 			rateLimiter.Middleware(
 				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					handleIngest(ingestService, db, logger).ServeHTTP(w, r)
@@ -223,7 +223,7 @@ func main() {
 		),
 	)
 	batchChain := observeMiddleware(ingestRequestCounter,
-		authenticator.Middleware(
+		authenticator.Middleware(auth.ScopesIngest,
 			rateLimiter.Middleware(
 				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					handleBatchIngest(ingestService, db, logger).ServeHTTP(w, r)

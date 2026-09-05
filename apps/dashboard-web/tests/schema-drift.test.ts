@@ -129,6 +129,12 @@ function normalizeDrizzleSqlType(sqlType: string): TypeFamily {
 	if (sqlType === 'smallint') return { family: 'integer', length: null };
 	if (sqlType === 'bigint') return { family: 'integer', length: null };
 	if (sqlType.startsWith('timestamp')) return { family: 'timestamp', length: null };
+	// Must come AFTER the timestamp branch: 'timestamp with time zone'.startsWith('time') is also true.
+	// oncall_schedules.handoff_time (sentinel-user-report-issue §4.6) is the first `time` column in this
+	// schema; information_schema reports it as 'time without time zone', hence its own family below.
+	if (sqlType === 'time' || sqlType.startsWith('time(') || sqlType.startsWith('time ')) {
+		return { family: 'time', length: null };
+	}
 	// Unknown type: return it verbatim as its own family so the comparison below fails loudly instead of
 	// silently passing — a new column type added to schema.ts must extend this map, not be ignored by it.
 	return { family: `unknown:${sqlType}`, length: null };
@@ -154,6 +160,9 @@ function normalizePgDataType(dataType: string, maxLength: number | null): TypeFa
 		case 'timestamp without time zone':
 		case 'timestamp with time zone':
 			return { family: 'timestamp', length: null };
+		case 'time without time zone':
+		case 'time with time zone':
+			return { family: 'time', length: null };
 		case 'ARRAY':
 			return { family: 'array', length: null };
 		default:

@@ -63,3 +63,35 @@ export function checkRateLimitWithLimit(
 export function resetRateLimitKey(key: string): void {
 	rateLimitStore.delete(key);
 }
+/**
+ * sentinel-user-report-issue contract §4.5: a dedicated per-minute ceiling for
+ * `POST /api/report/attachments`, on top of (not instead of) the key's own `rate_limit_rpm`.
+ * The key's limit is sized for a service's normal traffic; a binary upload endpoint whose caller
+ * is, in effect, a stranger with a service's credential needs a much tighter one, and the contract
+ * fixes the default at 10/min.
+ *
+ * Keyed by `project_api_keys.id` -- never the raw secret, never anything the request supplies
+ * (B7). SR-1: this stays the shipped in-process limiter, so it is per replica rather than per
+ * cluster; the feature's durable abuse ceiling is the Postgres byte budget in `upload-core.ts`,
+ * which is host- and replica-independent.
+ */
+export const DEFAULT_REPORT_UPLOAD_RPM = 10;
+
+/**
+ * Resolves `REPORT_UPLOAD_RPM`. An unset, unparseable or non-positive value falls back to the
+ * contract default rather than to "no limit" -- a misconfigured throttle must not become an open
+ * one.
+ */
+export function resolveReportUploadRpm(raw: string | undefined): number {
+	if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_UPLOAD_RPM;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REPORT_UPLOAD_RPM;
+	return Math.floor(parsed);
+}
+
+export function checkReportUploadRateLimit(
+	keyId: string,
+	rpm: number
+): { allowed: boolean; retryAfter?: number } {
+	return checkRateLimitWithLimit(`report-upload:${keyId}`, rpm);
+}
