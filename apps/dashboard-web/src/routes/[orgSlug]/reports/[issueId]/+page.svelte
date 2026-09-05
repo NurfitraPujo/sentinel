@@ -6,6 +6,10 @@
 	import CommentThread from '$lib/components/issues/CommentThread.svelte';
 	import SubscriptionToggle from '$lib/components/notifications/SubscriptionToggle.svelte';
 	import MarkdownToolbar from '$lib/components/issues/MarkdownToolbar.svelte';
+	import ReportReporter from '$lib/components/issues/ReportReporter.svelte';
+	import ReportSourceBadge from '$lib/components/issues/ReportSourceBadge.svelte';
+	import TriagePanel from '$lib/components/issues/TriagePanel.svelte';
+	import EscalationStrip from '$lib/components/issues/EscalationStrip.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 	import type { PageData } from './$types';
 
@@ -150,13 +154,23 @@
 	<div class="report-header">
 		<div>
 			<h1 class="report-title">{data.detail.issue.message}</h1>
-			<p class="report-meta">
-				Reported by {data.detail.reporterName ?? data.detail.reporterEmail ?? 'unknown'} in
-				<strong>{data.detail.projectName}</strong>
-				{#if data.detail.projectIsInbox}<span class="inbox-tag">Triage</span>{/if}
-			</p>
+			<ReportReporter
+				reporter={{
+					kind: data.detail.reporterKind,
+					displayName: data.detail.reporterDisplayName,
+					email: data.detail.reporterEmailAddress,
+					externalId: data.detail.reporterExternalId,
+					firstSeenAt: data.detail.reporterFirstSeenAt
+						? new Date(data.detail.reporterFirstSeenAt).toISOString()
+						: null,
+				}}
+				projectName={data.detail.projectName}
+				projectIsInbox={data.detail.projectIsInbox}
+				reportedAt={data.detail.issue.firstSeen}
+			/>
 		</div>
 		<div class="header-badges">
+			<ReportSourceBadge sourceChannel={data.detail.issue.sourceChannel} />
 			<span class="severity-tag severity-{data.detail.severity}">{data.detail.severity}</span>
 			<span class="status-tag status-{data.detail.issue.status}">{data.detail.issue.status}</span>
 			{#if data.detail.issue.waitingOn}
@@ -180,6 +194,16 @@
 	{#if deleteError}
 		<div class="error-banner" role="alert">{deleteError}</div>
 	{/if}
+
+	<!-- §4.4 / fe.md rows S8-S12. Renders nothing when `escalation` is null, which is the state
+	     "never escalated" -- distinct from an escalation object, per §4.2. -->
+	<EscalationStrip
+		issueId={data.detail.issue.id}
+		escalation={data.escalation}
+		currentUserId={data.userId}
+		waitingOn={data.detail.issue.waitingOn}
+		reporterIsExternal={data.detail.reporterKind === 'external'}
+	/>
 
 	<div class="claim-box">
 		{#if data.detail.issue.assignedTo}
@@ -240,6 +264,15 @@
 			<Markdown source={data.detail.bodyMd} />
 		</div>
 	{/if}
+
+	<!-- §4.2 / §4.3, fe.md rows S2/S3/S4/S6. `data.triage` is null in all three of the ways §4.2
+	     says it can be, and the panel renders that as its own state rather than as an empty list. -->
+	<TriagePanel
+		issueId={data.detail.issue.id}
+		triage={data.triage}
+		canWrite={data.canWrite}
+		onconfirm={() => window.location.reload()}
+	/>
 
 	<div class="attachments-panel">
 		<h2 class="section-heading">Attachments</h2>

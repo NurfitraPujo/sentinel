@@ -7,12 +7,13 @@ import { getReportDetail, getIssueActivity, listIssueAttachments } from '$lib/db
 import { getIssueRelations } from '$lib/db/queries/issues';
 import { requireReportAccessForIssue } from '$lib/server/report-access';
 import { ISSUE_WRITE_ROLES } from '$lib/server/issue-access';
+import type { Escalation, Triage } from '$lib/types/report-detail';
 
 // Manual Issues M1 (design §10): imitates the project-issue detail loader pattern at
 // [orgSlug]/projects/[projectId]/issues/[issueId]/+page.server.ts -- verify the issue belongs to
 // this org (report-access.ts's requireReportAccessForIssue does both the 404-for-wrong-type and
 // the org-membership check in one call, see B7/§9), then load everything the page renders.
-export const load: PageServerLoad = async ({ params, locals }) => {
+export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
@@ -52,6 +53,15 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 
 	const canWrite = (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
 
+	// sentinel-user-report-issue §4.2's `triage` and `escalation`, fetched from the API route that
+	// already computes them rather than recomputed here. That route owns the window derivation, the
+	// `linked` read-back and the degrade-to-null rules; a second implementation in this loader is
+	// exactly the drift §4.2 warns about, and the two would disagree the first time either changed.
+	//
+	// A failure here is `null` for both, not a 500: `null` is a state the page already renders, and
+	// a report is worth showing even when the matcher or the escalation lookup could not answer.
+	const { triage, escalation } = await loadTriageAndEscalation(fetch, organizationId, issueId);
+
 	// R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md, §9): the author may edit/delete their own
 	// report until it is resolved; an org owner/admin may delete (not edit -- PATCH is strictly
 	// author-only) any report at any time. Computed here, not just re-derived client-side, since
@@ -81,5 +91,31 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		activity,
 		attachments,
 		projects: orgProjects,
+		triage,
+		escalation,
 	};
 };
+
+/**
+ * §4.2's two computed objects, read back through `GET /api/organizations/{orgId}/reports/{issueId}`.
+ *
+ * SvelteKit's server-side `fetch` forwards this request's cookies, so the endpoint re-runs its own
+ * `requireReportAccess` gate against the same session -- this loader is not widening anything it
+ * has not already checked above.
+ */
+async function loadTriageAndEscalation(
+	fetch: typeof globalThis.fetch,
+	organizationId: string,
+	issueId: string
+): Promise<{ triage: Triage | null; escalation: Escalation | null }> {
+	try {
+		const res = await fetch(`/api/organizations/${organizationId}/reports/${issueId}`);
+		if (!res.ok) {
+			return { triage: null, escalation: null };
+		}
+		const body = await res.json();
+		return { triage: body.triage ?? null, escalation: body.escalation ?? null };
+	} catch {
+		return { triage: null, escalation: null };
+	}
+}
