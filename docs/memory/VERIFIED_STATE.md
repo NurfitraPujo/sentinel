@@ -166,6 +166,66 @@ current picture of module boundaries.
 
 ## Resolved
 
+### `sentinel-user-report-issue` FE — every `run`/`shot` row walked against a live stack (VERIFIED 2026-09-05, branch `NurfitraPujo/sentinel-user-report-issue-be`)
+
+TASK-08, the INTEGRATE-AND-VERIFY half of `prd/sentinel-user-report-issue/fe.md`. TASK-07 shipped the
+surfaces against the contract's printed examples and explicitly did **not** claim they ran; this entry
+is the claim, and it is what the entry exists for — three of the last five dashboard features passed
+review while not executing at all (see the UI-parity entry below).
+
+**The rig, because "it renders" is only a fact about a specific stack.** Nothing here touched the
+operator's dev database or its ports. A disposable PostgreSQL 16 on `55432` and a MinIO on `59000`,
+`packages/db-migrations` `up -target dashboard` against it, then `vite dev --port 5199` with
+`ESCALATION_ACK_MINUTES=1` and `CRON_SECRET` set. Sessions were three rows in `session` (Auth.js runs
+the DATABASE strategy, see `auth-config.ts`), so `owner`, `engineer` and the engineer who is the
+assignee are three real cookies, not one login pretending. Every report was created through the real
+`POST /api/report` with a `report`-scoped key; the attachment through the real `POST
+/api/report/attachments`. Chromium via Playwright, screenshots kept out of the repo.
+
+| Row | What was observed |
+| --- | --- |
+| S1 | `Reported by Sarah K. EXTERNAL in Web` / `id u_8f3c41` / `first report from this person`; **zero** `mailto:` links in the DOM |
+| S2 | `window_release · 2 candidates`, `rank 0.80` (`window release environment`) and `rank 0.40` (`window`) |
+| S3 vs S4 | one frame, two live pages: solid panel `No matching service errors` + a triage timestamp, against a dashed panel `Not triaged yet` |
+| S6 | `SUGGESTION — NOT LINKED` + `Confirm link`; after confirming, the activity row is `u_eng1 linked an issue`, beside the system's own `window_release linked an issue` |
+| S8 | `Assigned to u_eng1 by the on-call rotation — nobody clicked Claim`, `escalated 1 of 3`, `13s left` |
+| S9 | after Acknowledge: `u_eng1 acknowledged at …`; the control and the countdown are both gone |
+| S10 | as another org member on the same report, `Acknowledge` appears **0** times in `page.content()` — absent, not disabled |
+| S11 | three real `POST /api/cron/oncall-escalation` sweeps: `u_eng1` → `u_eng2` (`escalated 2 of 3`) → `u_eng3` (`3 of 3`), each with a live countdown. No row was hand-edited; the clock was moved by `ESCALATION_ACK_MINUTES=1` |
+| S12 | fourth sweep returns `exhausted: 1`; the strip becomes `NOBODY ACKNOWLEDGED … will not move again on its own` |
+| S13 | the strip's `<img>` resolves `/api/attachments/{id}` to `naturalWidth 240 × 120` — the uploaded PNG, decoded |
+| L1/L2 | two external rows badged `EXTERNAL`, the org-member row unbadged, in one frame |
+| L3 | `?tab=unclaimed&source=external` survives a reload with both controls still active |
+| L4 | narrows on both axes at once: unclaimed+all → 2 rows, unclaimed+external → 1, all+external → 2 |
+| O1 | the empty state explains what a schedule does, and says **"Without one, none of that runs"**, before offering Create |
+| O2 | as `engineer`: `0` inputs, `0` selects and only the shell's own buttons in the DOM; `PUT …/oncall` → `403 Only an org owner or admin may change the on-call schedule` |
+| O3 | `Asia/Jakarta` → `now Sat 09:29 there` |
+| O4 | reorder persists across a reload; a member dropped to `viewer` renders `skipped — their organization role no longer allows issue write access`, still in position |
+| O5 | `Hands over every Monday at 09:00 Asia/Jakarta.` |
+| O6 | `Devni K. VIA ROTATION`, and `Andrew C. VIA OVERRIDE` while an override is in force |
+| O8 | the overlap is refused as a sentence: `That range overlaps the existing override for Andrew C., 9/5/2026, 8:37:00 AM → 9/7/2026, 9:37:00 AM. Remove or shorten that one first.` |
+| O10 | the confirmation says what stops — new reports unassigned, nobody notified, the deadline stops moving reports |
+
+Gates at `57cc024`, diffed against `b768e5b`: `pnpm build` pass, `pnpm check` `1955 FILES 0 ERRORS 0
+WARNINGS`, `pnpm test --sequence.shuffle` `117 passed | 15 skipped (132)` / `1303 passed | 74 skipped`.
+Note against B13: shuffle is green here, which the N10 entry below records as failing in August.
+
+**One contract deviation, proved and NOT fixed** (contract `05b5a109` §4.4a). `PUT
+/api/organizations/{orgId}/oncall` answers `400 memberIds entry u_eng3 is not an organization member
+with an issue-write role`, while the same section's `GET` requires an `eligible: false` member be
+"shown, skipped, never silently deleted". A client that renders the `GET` faithfully and PUTs the list
+back therefore cannot save **any** change — not a rename, not a reorder — while the rotation carries
+one dropped member; the only way through is to remove that person first, which is the thing the same
+paragraph says must not happen quietly. The editor does surface the `400` in its save-error banner
+rather than failing silently, so this is a gap in the contract's own two halves, not a defect in either
+side's implementation of it. Reported through §10; the resolution is upstream.
+
+**One thing worth knowing, not a defect of this feature.** The escalation strip prints the raw
+`assigneeId` (`u_eng1`) because §4.2's `escalation` object carries no name — the report page's
+pre-existing claim box does the same, so the page is at least internally consistent. Unrelated and also
+pre-existing: `GET /favicon.png` answers `403` under `orgHandle`, which reads the relative favicon href
+as an org slug.
+
 ### N10 part 2 — encrypted git-credentials store (VERIFIED 2026-08-18, branch `feat/n10-repo-credentials`)
 
 Design in D22 (`DECISIONS.md`); plan §4.5 of `docs/plans/AGENT_WORKER_PLAN.md` (rev 4, on
