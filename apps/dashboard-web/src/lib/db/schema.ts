@@ -618,7 +618,8 @@ export const reportIdempotencyKeys = pgTable('report_idempotency_keys', {
 // by the database, not by a handler. `timezone` is an IANA zone name; handoff is wall-clock in it,
 // so a DST handoff day is 23 or 25 hours long, deliberately. `kind` CHECK allows 'daily'|'weekly';
 // `handoffWeekday` is null unless weekly, enforced by the multi-column
-// oncall_schedules_handoff_weekday_check.
+// oncall_schedules_handoff_weekday_check — which 1724200000_add_oncall_rotation_anchor.sql
+// re-encodes to ISO 8601 (1 = Monday .. 7 = Sunday) per SR-4.
 export const oncallSchedules = pgTable('oncall_schedules', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	organizationId: uuid('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
@@ -626,7 +627,11 @@ export const oncallSchedules = pgTable('oncall_schedules', {
 	timezone: varchar('timezone', { length: 64 }).notNull().default('UTC'),
 	kind: varchar('kind', { length: 20 }).notNull(), // 'daily' | 'weekly'
 	handoffTime: time('handoff_time').notNull(),
-	handoffWeekday: smallint('handoff_weekday'), // 0-6, null unless kind = 'weekly'
+	handoffWeekday: smallint('handoff_weekday'), // ISO 1-7 (1 = Monday), null unless kind = 'weekly'
+	// SR-4's explicit anchor (1724200000): the rotation index counts wall-clock handoff boundaries
+	// at or before T since the first boundary at or after THIS column — deliberately not createdAt,
+	// because §4.4a's PUT is create-or-replace and an edit must not re-phase future handoffs.
+	rotationAnchorAt: timestamp('rotation_anchor_at', { withTimezone: true }).notNull().defaultNow(),
 	active: boolean('active').notNull().default(true),
 	createdBy: varchar('created_by', { length: 255 }).notNull(),
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
