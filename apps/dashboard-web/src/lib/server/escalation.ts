@@ -28,8 +28,9 @@ import { env } from '$env/dynamic/private';
  *      acknowledgements (§4.4: the assignee claims, comments on, or changes the status of the
  *      issue). Stamps `acknowledged_at` and stops the clock.
  *   3. `sweepEscalations` — §4.4b's sweep, run every minute. Reassigns an unacknowledged deadline
- *      to the next untried member, terminates at `ESCALATION_MAX_HOPS`, and writes NOTHING when a
- *      human has taken the issue.
+ *      to the next untried member, terminates at `ESCALATION_MAX_HOPS` — and terminates equally
+ *      when the org's schedule is gone or has been replaced, because a chain that cannot move is
+ *      over — and writes NOTHING when a human has taken the issue.
  *
  * **Escalation never fails a report.** §4.4 and §12 both say so: a failure here costs an
  * assignment and a metric, never the `201`. Every entry point below therefore absorbs its own
@@ -417,7 +418,20 @@ export interface SweepResult {
 	exhausted: number;
 	/** Past deadline but a human has taken the issue — §4.4: the timer writes nothing. */
 	stoppedByReassignment: number;
-	/** Due, but the organization's schedule is gone or has been replaced. Nothing written. */
+	/**
+	 * Due, but the organization's schedule is gone or has been replaced. The row is TERMINATED —
+	 * `exhausted = true` through the same compare-and-set a `max_hops` termination uses — and
+	 * counted here rather than under `exhausted`, because "the schedule was deactivated" is a
+	 * different operator story from §12's "nobody answered".
+	 *
+	 * It is a terminal write and not a no-op on purpose. A row left untouched keeps its past
+	 * `ack_deadline_at`, its `acknowledged_at IS NULL` and its `exhausted = false`, so it matches
+	 * the due predicate again every minute forever: the report is never reassigned, never
+	 * exhausted, and — because the due set is `ORDER BY ack_deadline_at ASC LIMIT
+	 * DEFAULT_SWEEP_LIMIT` and these rows carry the oldest deadlines in the table — it sorts ahead
+	 * of every actionable row and eats the whole bounded budget. The budget is only ever spent on
+	 * rows the sweep can act on.
+	 */
 	skipped: number;
 	/** Lost the claim race with a concurrent sweep, or failed. Nothing written by this run. */
 	contended: number;
@@ -521,8 +535,14 @@ export async function sweepEscalations(options?: {
 				});
 			} else {
 				result.skipped += 1;
-				log.info('escalation.skipped', {
+				// §12's `sentinel_oncall_schedule_unresolved_total`, not the exhausted counter: this
+				// chain ended because the org's schedule no longer resolves it, which is the state
+				// that counter already names. Counting it as "nobody answered" would fire §4.4's
+				// alert at an operator who deliberately deleted a rota.
+				recordOncallScheduleUnresolved();
+				log.warn('escalation.terminated_stale_schedule', {
 					issueId: row.issueId,
+					assigneeId: row.assigneeId,
 					hop: row.hop,
 					reason: outcome.reason,
 				});
@@ -546,7 +566,7 @@ export async function sweepEscalations(options?: {
 type SweepOutcome =
 	| { kind: 'reassigned'; assigneeId: string; hop: number }
 	| { kind: 'exhausted'; reason: 'max_hops' | 'no_untried_member' }
-	| { kind: 'skipped'; reason: 'no_active_schedule' | 'schedule_replaced' };
+	| { kind: 'staleSchedule'; reason: 'no_active_schedule' | 'schedule_replaced' };
 
 /**
  * One due row, in one transaction.
@@ -566,19 +586,27 @@ async function sweepOne(
 		return { kind: 'exhausted', reason: 'max_hops' };
 	}
 
+	// Every branch below is a chain the sweep can never move again, so each one TERMINATES the row
+	// instead of leaving it. `markExhausted` is the same claimed write `max_hops` uses, so a
+	// concurrent sweep cannot count the same termination twice, and the row stops matching the due
+	// predicate — which is what keeps it out of the next minute's bounded budget.
 	if (!row.organizationId) {
-		return { kind: 'skipped', reason: 'no_active_schedule' };
+		await markExhausted(row, config.now);
+		return { kind: 'staleSchedule', reason: 'no_active_schedule' };
 	}
 
 	const schedule = await getActiveSchedule(row.organizationId);
 	if (!schedule) {
 		// §4.4a's `DELETE /oncall`: "Escalation then stops running for this org and says so."
-		return { kind: 'skipped', reason: 'no_active_schedule' };
+		await markExhausted(row, config.now);
+		return { kind: 'staleSchedule', reason: 'no_active_schedule' };
 	}
 	if (schedule.id !== row.scheduleId) {
 		// A different schedule is active than the one that opened this chain. Walking a rota the
-		// chain was never phased against would move the pager somewhere nobody agreed to.
-		return { kind: 'skipped', reason: 'schedule_replaced' };
+		// chain was never phased against would move the pager somewhere nobody agreed to — but the
+		// chain is still over, so it ends here rather than being re-read every minute forever.
+		await markExhausted(row, config.now);
+		return { kind: 'staleSchedule', reason: 'schedule_replaced' };
 	}
 
 	const tried = await db

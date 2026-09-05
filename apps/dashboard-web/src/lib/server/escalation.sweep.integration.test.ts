@@ -605,6 +605,175 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))(
 				expect(new Set(chain.map((r) => r.assignee_id)).size).toBe(3);
 				expect(chain[2].exhausted).toBe(true);
 			});
+
+			/**
+			 * The review finding at `escalation.ts:570`, made falsifiable.
+			 *
+			 * A due row whose schedule is gone or has been replaced used to return
+			 * `{kind:'skipped'}` and write NOTHING. Nothing else in the repo drains
+			 * `issue_escalations` — `retention.ts` does not touch it — so the row kept its past
+			 * `ack_deadline_at`, its `acknowledged_at IS NULL` and its `exhausted = false`, matched
+			 * the due predicate again on the next minute, and did so forever. Two consequences, and
+			 * a test for each: per report the chain never reaches a terminal state at all, and
+			 * globally these rows carry the OLDEST deadlines in the table, so `ORDER BY
+			 * ack_deadline_at ASC LIMIT` sorts them first and they eat the whole bounded budget
+			 * before an actionable row is reached.
+			 *
+			 * Its own organization, project and schedules on purpose: the suite's shared schedule is
+			 * what every other test in this file walks, and deactivating it would make those tests
+			 * depend on ORDER — which `--sequence.shuffle` randomises (B13).
+			 */
+			describe('a chain whose schedule is gone or replaced (§4.4a)', () => {
+				const staleOrgId = randomUUID();
+				const staleProjectId = randomUUID();
+				/** The schedule the chain was opened against. */
+				const openedScheduleId = randomUUID();
+				/** A second schedule, for the "replaced" half. */
+				const replacementScheduleId = randomUUID();
+
+				beforeAll(async () => {
+					await sql`insert into organizations (id, name, slug) values (${staleOrgId}, ${'stale-' + suffix}, ${'stale-' + suffix})`;
+					await sql`
+						insert into projects (id, name, organization_id, api_key, api_key_hash)
+						values (${staleProjectId}, ${'stale-p-' + suffix}, ${staleOrgId}, ${'pk3_' + suffix}, ${'hash3_' + suffix})
+					`;
+					for (const scheduleIdToSeed of [openedScheduleId, replacementScheduleId]) {
+						await sql`
+							insert into oncall_schedules
+								(id, organization_id, name, timezone, kind, handoff_time, active, created_by, rotation_anchor_at)
+							values (${scheduleIdToSeed}, ${staleOrgId}, ${'S-' + scheduleIdToSeed.slice(0, 4)}, ${'UTC'},
+							        ${'daily'}, ${'09:00'}, false, ${ENGINEERS[0]},
+							        ${new Date(T0.getTime() - 7 * 24 * 60 * 60 * 1000)})
+						`;
+						for (let i = 0; i < ENGINEERS.length; i++) {
+							await sql`
+								insert into oncall_schedule_members (schedule_id, user_id, position)
+								values (${scheduleIdToSeed}, ${ENGINEERS[i]}, ${i})
+							`;
+						}
+					}
+				});
+
+				afterAll(async () => {
+					await sql`delete from issues where project_id = ${staleProjectId}`;
+					await sql`delete from oncall_schedules where organization_id = ${staleOrgId}`;
+					await sql`delete from organizations where id = ${staleOrgId}`;
+				});
+
+				beforeEach(async () => {
+					// Both schedules start inactive; each test activates exactly what it needs.
+					await sql`update oncall_schedules set active = false where organization_id = ${staleOrgId}`;
+				});
+
+				/** A hop-1 chain in the stale org, open and past its deadline. */
+				async function seedStaleOrgChain(deadlineAt: Date): Promise<string> {
+					const issueId = randomUUID();
+					await sql`
+						insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
+						values (${issueId}, ${staleProjectId}, ${'fp-' + issueId}, ${'Save spins forever'},
+						        ${'UserReport'}, ${'user_report'}, ${'user_report_api'})
+					`;
+					await sql`
+						insert into issue_escalations
+							(id, issue_id, schedule_id, assignee_id, hop, escalated_at, ack_deadline_at)
+						values (${randomUUID()}, ${issueId}, ${openedScheduleId}, ${ENGINEERS[0]}, ${1},
+						        ${minutes(-59)}, ${deadlineAt})
+					`;
+					await sql`
+						update issues set assignee_type = 'user', assigned_to = ${ENGINEERS[0]} where id = ${issueId}
+					`;
+					return issueId;
+				}
+
+				it('terminates a due row whose org deactivated its schedule, and never re-reads it', async () => {
+					// §4.4a's `DELETE /oncall` is a deactivation, not a delete — `deactivateSchedule`
+					// sets `active = false` — so this is exactly the state that endpoint leaves.
+					const issueId = await seedStaleOrgChain(minutes(-5));
+
+					const res = await SWEEP(sweepRequest());
+					expect(res.status).toBe(200);
+					const result = (await res.json()).result;
+					expect(result).toMatchObject({ due: 1, reassigned: 0, exhausted: 0, skipped: 1 });
+
+					// The row reached a TERMINAL state rather than being left as it was found.
+					const chain = await escalationRows(issueId);
+					expect(chain).toHaveLength(1);
+					expect(chain[0].exhausted).toBe(true);
+					expect(chain[0].acknowledged_at).toBeNull();
+					// Nothing was moved: no hop 2, and the last engineer tried keeps the report.
+					expect(await assignment(issueId)).toEqual({
+						assignee_type: 'user',
+						assigned_to: ENGINEERS[0],
+					});
+
+					// "The schedule was deactivated" is a different operator story from §12's "nobody
+					// answered", so it lands on the unresolved counter and NOT on the exhausted one.
+					const body = (await metrics.renderMetrics()).body;
+					expect(body).toContain('sentinel_oncall_schedule_unresolved_total 1');
+					expect(body).toContain('sentinel_report_escalations_exhausted_total 0');
+
+					// The regression itself: the next minute's sweep does not see it again.
+					const again = await SWEEP(sweepRequest());
+					expect((await again.json()).result).toMatchObject({ due: 0, skipped: 0 });
+					expect(await escalationRows(issueId)).toHaveLength(1);
+				});
+
+				it('terminates a due row whose schedule has been REPLACED by another', async () => {
+					const issueId = await seedStaleOrgChain(minutes(-5));
+					// A different schedule is the live one now. The chain was never phased against it,
+					// so it must not walk that rota — and it must not sit due forever either.
+					await sql`update oncall_schedules set active = true where id = ${replacementScheduleId}`;
+
+					const res = await SWEEP(sweepRequest());
+					expect((await res.json()).result).toMatchObject({
+						due: 1,
+						reassigned: 0,
+						exhausted: 0,
+						skipped: 1,
+					});
+
+					const chain = await escalationRows(issueId);
+					expect(chain).toHaveLength(1);
+					expect(chain[0].exhausted).toBe(true);
+					// The replacement rota was NOT walked: no hop 2 on anybody.
+					expect(await assignment(issueId)).toEqual({
+						assignee_type: 'user',
+						assigned_to: ENGINEERS[0],
+					});
+					expect((await metrics.renderMetrics()).body).toContain(
+						'sentinel_oncall_schedule_unresolved_total 1'
+					);
+
+					const again = await SWEEP(sweepRequest());
+					expect((await again.json()).result).toMatchObject({ due: 0, skipped: 0 });
+				});
+
+				it('does not spend the bounded sweep budget on rows it cannot act on', async () => {
+					// The global consequence, at `limit = 1` so the budget is observable. The stale row
+					// carries the OLDER deadline, so `ORDER BY ack_deadline_at ASC` puts it first and
+					// it is the only row either sweep can see. Before the fix, EVERY sweep from here
+					// to forever spent its one slot on it and the actionable row below was never
+					// reached; after it, the first sweep drains the stale row and the second reassigns.
+					const staleIssueId = await seedStaleOrgChain(minutes(-30));
+					const liveIssueId = await seedReport();
+					await seedChain({ issueId: liveIssueId, hops: [ENGINEERS[0]], deadlineAt: minutes(-5) });
+
+					const first = await escalation.sweepEscalations({ limit: 1 });
+					expect(first).toMatchObject({ due: 1, skipped: 1, reassigned: 0 });
+
+					const second = await escalation.sweepEscalations({ limit: 1 });
+					expect(second).toMatchObject({ due: 1, skipped: 0, reassigned: 1 });
+
+					// The actionable report moved to hop 2; the stale one is terminal and stayed put.
+					const live = await escalationRows(liveIssueId);
+					expect(live).toHaveLength(2);
+					expect(live[1].hop).toBe(2);
+					expect(live[1].assignee_id).toBe(ENGINEERS[1]);
+					const stale = await escalationRows(staleIssueId);
+					expect(stale).toHaveLength(1);
+					expect(stale[0].exhausted).toBe(true);
+				});
+			});
 		});
 	}
 );
