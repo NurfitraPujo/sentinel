@@ -23,6 +23,7 @@ import {
 import { upsertExternalReporter } from '$lib/db/queries/external-reporters';
 import { createExternalIssueReport, ReportAttachmentNotFoundError } from '$lib/db/queries/reports';
 import { runTriage, type TriageResult } from '$lib/server/triage';
+import { escalateReportAtIntake, sendEscalationEmails } from '$lib/server/escalation';
 import { recordReportReceived, REPORT_OUTCOME, type ReportOutcome } from '$lib/server/metrics';
 import { log } from '$lib/server/observability/log';
 
@@ -54,7 +55,7 @@ import { log } from '$lib/server/observability/log';
  * exactly what §4.1-b's "`null` when triage is deferred" describes.
  */
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ request, url }) => {
 	// 1. Credential.
 	let credential: ReportKeyCredential;
 	try {
@@ -173,6 +174,29 @@ export const POST: RequestHandler = async ({ request }) => {
 			occurredAt: parseOccurredAt(parsed.context.occurred_at) ?? new Date(),
 			context: parsed.context,
 		});
+
+		// §4.4, and §8's "escalation is never simultaneous with the response": it runs after the
+		// report is durable, for the same reason triage does. `escalateReportAtIntake` absorbs its
+		// own failure and returns a null escalation, so an organization with no on-call schedule,
+		// a rota that resolves to nobody, and a database error during assignment are all the same
+		// thing from here — a created report that is simply unassigned, with a metric to say so.
+		// Its first observable effect is `escalation` in §4.2; §4.1-b's body does not carry it.
+		//
+		// The outer `catch` on this block is not redundant with that. The report is COMMITTED by
+		// the time this runs, so any throw from here — including one from reading the request's
+		// origin — must not fall through to the `catch` below and be reported as a `500`
+		// `create_failed`. That would tell a client its report was lost when it was not, and a
+		// retry would create a second one.
+		try {
+			const escalation = await escalateReportAtIntake({
+				issueId: issue.id,
+				organizationId: credential.organizationId,
+			});
+			// SR-2's email, post-commit and best-effort, exactly like the notification fan-out's.
+			await sendEscalationEmails(escalation.notified, url.origin);
+		} catch (err) {
+			log.error('report_intake.escalation_failed', { reportId: issue.id, error: err });
+		}
 
 		return finish(createdResponse(issue.id, false, triage), REPORT_OUTCOME.Created);
 	} catch (err) {

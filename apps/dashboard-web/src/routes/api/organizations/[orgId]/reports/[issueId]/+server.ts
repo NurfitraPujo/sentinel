@@ -10,6 +10,7 @@ import { getReporterId, getOrgRole, requireReportAccess } from '$lib/server/repo
 import { bestEffortDeleteObjects } from '$lib/server/retention';
 import { listIssueAttachments } from '$lib/db/queries/reports';
 import { readTriage, type TriageResult } from '$lib/server/triage';
+import { getLatestEscalation } from '$lib/server/escalation';
 import { log } from '$lib/server/observability/log';
 
 /**
@@ -114,11 +115,39 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 			sizeBytes: attachment.sizeBytes,
 		})),
 		triage: await loadTriage(detail),
-		// §4.4's object. `null` until the escalation item lands; the field is declared here because
-		// §4.2 declares it nullable and "absent" and "null" must not be the same wire shape.
-		escalation: null,
+		// §4.4's object, or `null` when escalation has not run or the organization has no active
+		// schedule. The LATEST hop is the one §4.2 renders: `hop` is "incremented by each timer
+		// reassignment", so an earlier row is a superseded state, not the current one.
+		escalation: await loadEscalation(detail.issue.id),
 	});
 };
+
+/**
+ * §4.2's `escalation`, or `null`.
+ *
+ * Never allowed to fail the read: a report detail page that 500s because the escalation lookup
+ * threw would be strictly worse than one that renders without the strip. `null` here means the
+ * same thing §4.2 says it means — escalation has not run, or the organization has no active
+ * schedule — and a lookup failure is logged rather than silently indistinguishable from it.
+ */
+async function loadEscalation(issueId: string) {
+	try {
+		const latest = await getLatestEscalation(issueId);
+		if (!latest) return null;
+		return {
+			scheduleId: latest.scheduleId,
+			assigneeId: latest.assigneeId,
+			escalatedAt: latest.escalatedAt,
+			ackDeadlineAt: latest.ackDeadlineAt,
+			acknowledgedAt: latest.acknowledgedAt,
+			hop: latest.hop,
+			exhausted: latest.exhausted,
+		};
+	} catch (err) {
+		log.error('report_detail.escalation_lookup_failed', { issueId, error: err });
+		return null;
+	}
+}
 
 /**
  * §4.2's `triage`, or `null`.

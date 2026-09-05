@@ -1,5 +1,6 @@
 # Builds the tiny sentinel-cron scheduler image: an alpine + curl base that runs
-# scripts/cron-entrypoint.sh, which POSTs the dashboard's /api/cron/retention endpoint on a schedule.
+# scripts/cron-entrypoint.sh, which POSTs the dashboard's /api/cron/retention and
+# /api/cron/oncall-escalation endpoints on two independent schedules.
 #
 # N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11). Mirrors the dlq-drainer's "wrap a CLI
 # in a sleep-loop" pattern (scripts/Dockerfile.dlq-drainer) but needs no Go build — the only tool it
@@ -18,11 +19,18 @@ RUN chmod +x /app/entrypoint.sh
 
 USER appuser
 
-# Safe-by-default: the schedule is inert until RETENTION_CRON_ENABLED is explicitly "true".
+# Safe-by-default: each schedule is inert until its own gate is explicitly "true".
 # See scripts/cron-entrypoint.sh for the full knob list.
 ENV RETENTION_CRON_ENABLED=false
 ENV RETENTION_CRON_INTERVAL_SECONDS=3600
 ENV RETENTION_CRON_URL=http://dashboard:3000/api/cron/retention
 ENV RETENTION_CRON_TIMEOUT_SECONDS=30
+
+# sentinel-user-report-issue §4.4b: the second loop. Its own gate, so enabling the escalation sweep
+# never implies enabling retention's destructive one, and vice versa.
+ENV ONCALL_CRON_ENABLED=false
+ENV ONCALL_CRON_INTERVAL_SECONDS=60
+ENV ONCALL_CRON_URL=http://dashboard:3000/api/cron/oncall-escalation
+ENV ONCALL_CRON_TIMEOUT_SECONDS=20
 
 ENTRYPOINT ["/app/entrypoint.sh"]

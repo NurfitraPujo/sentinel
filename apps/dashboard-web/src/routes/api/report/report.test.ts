@@ -21,6 +21,12 @@ const createExternalIssueReport = vi.fn();
 const findReportIdempotency = vi.fn();
 const deleteExpiredReportIdempotency = vi.fn();
 const runTriage = vi.fn();
+// §4.4 runs at intake, after creation commits. It is mocked here for the same reason `runTriage`
+// is: what it WRITES is a database claim, proved against real Postgres in
+// `src/lib/server/escalation.sweep.integration.test.ts`. What this file owns is that the route
+// calls it after the report is durable and that its failure never reaches the caller.
+const escalateReportAtIntake = vi.fn();
+const sendEscalationEmails = vi.fn();
 
 vi.mock('$lib/server/report-auth', async () => {
 	const actual = await vi.importActual<typeof import('$lib/server/report-auth')>('$lib/server/report-auth');
@@ -28,6 +34,7 @@ vi.mock('$lib/server/report-auth', async () => {
 });
 vi.mock('$lib/db/queries/external-reporters', () => ({ upsertExternalReporter }));
 vi.mock('$lib/server/triage', () => ({ runTriage }));
+vi.mock('$lib/server/escalation', () => ({ escalateReportAtIntake, sendEscalationEmails }));
 vi.mock('$lib/db/queries/reports', async () => {
 	const actual = await vi.importActual<typeof import('$lib/db/queries/reports')>('$lib/db/queries/reports');
 	return { ...actual, createExternalIssueReport };
@@ -73,7 +80,11 @@ function request(payload: unknown, headers: Record<string, string> = {}): Reques
 }
 
 async function post(payload: unknown = body(), headers: Record<string, string> = {}) {
-	const res = await POST({ request: request(payload, headers) } as never);
+	// `url` is the request origin the `escalated` email's issue link is built from (SR-2).
+	const res = await POST({
+		request: request(payload, headers),
+		url: new URL('http://localhost/api/report'),
+	} as never);
 	return { status: res.status, headers: res.headers, json: await res.clone().json() };
 }
 
@@ -100,6 +111,8 @@ beforeEach(() => {
 		strategy: 'window_release',
 		candidates: [],
 	});
+	escalateReportAtIntake.mockResolvedValue({ escalation: null, notified: [] });
+	sendEscalationEmails.mockResolvedValue(undefined);
 });
 
 describe('§4.1-b success', () => {
@@ -474,5 +487,60 @@ describe('§12 sentinel_reports_received_total', () => {
 		});
 		await post(body({ idempotency_key: 'k1' }));
 		expect(await counter(REPORT_OUTCOME.Conflict)).toBe(1);
+	});
+});
+
+describe('§4.4 escalation at intake', () => {
+	it('runs escalation for the report AFTER creation, scoped to the credential s organization', async () => {
+		await post();
+		expect(escalateReportAtIntake).toHaveBeenCalledWith({
+			issueId: ISSUE_ID,
+			// B7: the tenant comes from the credential, never from the request body.
+			organizationId: CREDENTIAL.organizationId,
+		});
+	});
+
+	it('sends the escalated email with the request origin, after escalation', async () => {
+		const notified = [{ issueId: ISSUE_ID, userId: 'usr_on_call' }];
+		escalateReportAtIntake.mockResolvedValue({ escalation: { hop: 1 }, notified });
+		await post();
+		expect(sendEscalationEmails).toHaveBeenCalledWith(notified, 'http://localhost');
+	});
+
+	it('still returns 201 when escalation throws — the report is already durable', async () => {
+		// §4.4/§12: escalation failing costs an assignment and a metric, never the report. A 500
+		// here would tell the client its report was lost when it was not, and the retry would
+		// create a second one.
+		escalateReportAtIntake.mockRejectedValue(new Error('deliberate escalation failure'));
+		const res = await post();
+		expect(res.status).toBe(201);
+		expect(res.json).toMatchObject({ report_id: ISSUE_ID, status: 'created' });
+		expect(await counter(REPORT_OUTCOME.Created)).toBe(1);
+		expect(await counter(REPORT_OUTCOME.Error)).toBe(0);
+	});
+
+	it('still returns 201 when the escalated email throws', async () => {
+		sendEscalationEmails.mockRejectedValue(new Error('smtp is down'));
+		const res = await post();
+		expect(res.status).toBe(201);
+	});
+
+	it('does not escalate a deduplicated replay — nothing was created to escalate', async () => {
+		// §4.4's idempotency lives in `issue_escalations` too, but the cheaper guarantee is that
+		// the replay path never reaches escalation at all: the first call already opened the chain,
+		// and a retried request must not produce a second `escalated` notification.
+		const { hashReportRequest } = await import('$lib/server/report-idempotency');
+		const payload = body({ idempotency_key: 'bugrep-01J8Z9K3QX7M2' });
+		findReportIdempotency.mockResolvedValue({
+			id: 'rec-1',
+			requestHash: hashReportRequest(payload, 'proj-1'),
+			issueId: ISSUE_ID,
+			createdAt: new Date(),
+		});
+
+		const res = await post(payload);
+		expect(res.json).toMatchObject({ deduplicated: true });
+		expect(escalateReportAtIntake).not.toHaveBeenCalled();
+		expect(sendEscalationEmails).not.toHaveBeenCalled();
 	});
 });

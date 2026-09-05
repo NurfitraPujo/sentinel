@@ -1,0 +1,94 @@
+{{- if .Values.prometheusRule.enabled }}
+# sentinel-user-report-issue §12 / SR-3 — the alerting half of the metrics chain.
+#
+# §12 records that "where those rules live is half-resolved": the scheduling half is this chart, and
+# the plane's Prometheus/Grafana configuration lives in the `infra` repo, which is NOT an
+# implementing repo for this feature. The rules therefore ship HERE, as a chart-rendered
+# `PrometheusRule`, so the CronJob that produces these states and the alerts that notice them cannot
+# be deployed separately. `infra` remains free to own them later; moving a rendered rule is a much
+# smaller change than discovering the signals were never written.
+#
+# Ships OFF (`prometheusRule.enabled: false`) because the CRD belongs to the Prometheus Operator and
+# a cluster without it would fail the whole release on an unknown kind.
+#
+# **Aggregation under `dashboard.replicaCount: 2`.** Every counter in
+# `apps/dashboard-web/src/lib/server/metrics.ts` is process-local: a scrape sees one replica, and a
+# restart resets it to zero. So every expression below is `sum(increase(...))` ACROSS the pod
+# targets — `sum` for the replicas, `increase()` to absorb a restart. Never a bare counter value:
+# `sentinel_report_escalations_exhausted_total > 0` would stay true forever after one exhaustion and
+# would silently reset to false on a redeploy.
+#
+# Three signals, and §12 names each of them as the ONLY thing that notices a designed-silent state.
+# The `sentinel_report_triage_duration_seconds` p95 rule §12 also lists is deliberately absent:
+# "no number is set here — nobody has measured one, and an alert with an invented threshold is an
+# alert that gets muted." It belongs to the `sentinel-report-intake-measurement` follow-on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sentinel.fullname" . }}-user-reports
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ include "sentinel.fullname" . }}.user-reports
+      rules:
+        # §12: "above zero — a report walked the whole chain and no engineer acknowledged it. This
+        # is the 'nobody answered' signal, and it is the only thing that notices §4.4's terminal
+        # state." §4.4 makes `exhausted` a DESIGNED state, not a bug — which is exactly why it must
+        # page: nothing else in the system reacts to it.
+        - alert: SentinelReportEscalationExhausted
+          expr: sum(increase(sentinel_report_escalations_exhausted_total[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.exhausted }}
+          annotations:
+            summary: "A user report walked every escalation hop with no acknowledgement"
+            description: >-
+              An escalation chain reached ESCALATION_MAX_HOPS unacknowledged. The report stays
+              assigned to the last engineer tried and the chain will not move again. Contract
+              sentinel-user-report-issue §4.4.
+
+        # §12: "above zero — escalation ran for an org whose schedule resolves to nobody." The
+        # report is created and left unassigned for the pull loop; nothing else surfaces it.
+        - alert: SentinelOncallScheduleUnresolved
+          expr: sum(increase(sentinel_oncall_schedule_unresolved_total[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.unresolved }}
+          annotations:
+            summary: "Escalation ran for an organization with no resolvable on-call engineer"
+            description: >-
+              An on-call schedule is missing, has no members, or none of its members still holds an
+              ISSUE_WRITE_ROLES role. Reports for that organization are created unassigned.
+              Contract sentinel-user-report-issue §4.4/§12.
+
+        # §12's "unassigned `user_report` age — oldest unassigned report above a threshold —
+        # escalation stopped running, which is otherwise invisible". This is the backstop for
+        # §12's "the cron never runs" failure mode: both schedulers ship off, and an operator who
+        # deploys and forgets gets escalation-at-intake with no reassignment and nothing saying so.
+        #
+        # It is expressed on the escalation counter rather than on a report-age gauge, and that is a
+        # deliberate, stated limitation: this feature emits no age gauge, adding one would mean a
+        # per-scrape database query from the dashboard, and the observable that actually
+        # distinguishes "the sweep is running" from "nothing calls it" is whether the endpoint moves
+        # ANY escalation counter while reports keep arriving. A stated proxy beats a rule that
+        # references a series nobody emits.
+        - alert: SentinelReportEscalationStalled
+          expr: >-
+            sum(increase(sentinel_reports_received_total{outcome="created"}[{{ .Values.prometheusRule.stalledWindow }}])) > 0
+            and sum(increase(sentinel_report_escalations_total[{{ .Values.prometheusRule.stalledWindow }}])) == 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.stalled }}
+          annotations:
+            summary: "Reports are being created but no escalation is running"
+            description: >-
+              Reports were created in the window and no escalation was assigned, reassigned or
+              failed. Either every organization is unescalatable, or the escalation path is not
+              running at all. Check that ONE of the two schedulers is enabled
+              (oncallCron.enabled here, ONCALL_CRON_ENABLED under compose).
+              Contract sentinel-user-report-issue §12.
+{{- end }}

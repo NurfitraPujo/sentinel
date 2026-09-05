@@ -103,6 +103,21 @@ config:
     authTrustHost: "true"
     emailFrom: "noreply@sentinel.example.com"
     dataRetentionDays: "30"
+    # sentinel-user-report-issue §8's config knobs, with the defaults the contract states.
+    # There is no feature flag here and that is the decision, not an omission: the `report` key
+    # scope IS the switch (OQ-3), and no key that exists today carries it.
+    #
+    # §4.3's triage window: how far back the matcher looks for candidate error issues.
+    reportMatchWindowMinutes: "30"
+    # §4.4's acknowledgement deadline, in minutes. Lengthening it past the sweep interval is safe;
+    # shortening it below one sweep period is not, since the sweep is what enforces it.
+    escalationAckMinutes: "15"
+    # §4.4's bound. "It does not loop the rotation forever — a pager that keeps moving is a pager
+    # nobody owns."
+    escalationMaxHops: "3"
+    # §4.5's per-key upload throttle and rolling-24h byte ceiling (SR-5, counted in Postgres).
+    reportUploadRpm: "10"
+    reportUploadBytesPerDay: "262144000"
   ingestor:
     # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
     ratelimitStrictMode: "true"
@@ -240,6 +255,62 @@ retentionCron:
   resources:
     requests: { cpu: 10m, memory: 16Mi }
     limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# oncall-escalation cron — sentinel-user-report-issue §4.4b. A SECOND scheduled job, not a
+# widening of retentionCron above: retention runs hourly and a 15-minute acknowledgement deadline
+# swept hourly is a 75-minute deadline. This one runs every minute.
+#
+# Ships OFF, per this chart's convention for scheduled jobs and per §4.4b's "off by default". §12
+# names the consequence of leaving it off: escalation-at-intake still assigns the on-call engineer,
+# but an unacknowledged deadline never reassigns, and the prometheusRule alerts below are the only
+# thing that notices.
+# -----------------------------------------------------------------------------
+oncallCron:
+  enabled: false
+  # Every minute. §4.4b fixes this value; it is not a tuning knob in the way retention's is.
+  schedule: "*/1 * * * *"
+  image:
+    # The same plain curl image retentionCron uses — the Job only makes one HTTP POST.
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  timeoutSeconds: 20
+  # A minute-period job that misses its slot by more than this should be skipped rather than
+  # stacked: the next run is 60 seconds away and will find the same due rows.
+  startingDeadlineSeconds: 45
+  # Below the 60s period, so a wedged run cannot sit in front of the next one under Forbid.
+  activeDeadlineSeconds: 50
+  # No retries: the next scheduled run is a minute away and the sweep is idempotent, so a retry
+  # buys nothing a re-run does not.
+  backoffLimit: 0
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# PrometheusRule — sentinel-user-report-issue §12's alert rules. Ships OFF because the CRD belongs
+# to the Prometheus Operator; enabling it on a cluster without the operator fails the release on an
+# unknown kind. See templates/prometheusrule.yaml for why the rules live in this chart at all.
+# -----------------------------------------------------------------------------
+prometheusRule:
+  enabled: false
+  # Extra labels the cluster's Prometheus uses to select rule objects (e.g. `release: kube-prom`).
+  labels: {}
+  # Evaluation window for the two "above zero" signals. Long enough that one scrape gap cannot
+  # clear a real exhaustion, short enough to page while the report still matters.
+  window: 15m
+  # Both signals are counters of events that already happened; a `for` beyond one evaluation cycle
+  # would only delay a page nobody can un-fire.
+  for: 5m
+  # The stalled-escalation backstop compares two counters over the same window, so the window has
+  # to be long enough for a normal quiet period not to look like a stall.
+  stalledWindow: 1h
+  severity:
+    exhausted: critical
+    unresolved: warning
+    stalled: warning
 
 # -----------------------------------------------------------------------------
 # Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.

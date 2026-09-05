@@ -23,6 +23,19 @@ spec:
         app.kubernetes.io/component: dashboard
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # sentinel-user-report-issue SR-3 / §12: the scrape half of the metrics chain, in the same
+        # three-annotation shape processor.yaml already uses. Verified at `b768e5b` this app had no
+        # /metrics route and no annotation, so nothing scraped it.
+        #
+        # The path is `/api/metrics`, not `/metrics`: `api` is in hooks.server.ts's reservedRoutes
+        # and a bare `/metrics` would be parsed as an organization slug by the `[orgSlug]`
+        # catch-all. The endpoint is unauthenticated by the same rule the ingestor's is — a scraper
+        # has no session — and what makes that safe is that every label value the app can emit is
+        # from a fixed, closed constant set, so the response carries no organization, project, key,
+        # reporter or report content. Keep that property if you add a metric.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.dashboard.containerPort | quote }}
+        prometheus.io/path: /api/metrics
     spec:
       serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
       securityContext:

@@ -78,7 +78,9 @@ const keyIdAThrottled = randomUUID();
 const sha256 = (v: string) => createHash('sha256').update(v).digest('hex');
 
 let sql: ReturnType<typeof postgres>;
-let POST: (event: { request: Request }) => Promise<Response>;
+// `url` joined `request` when escalation landed: §4.4's `escalated` email builds its issue link
+// from the request origin, exactly as every other notification email in this app does.
+let POST: (event: { request: Request; url: URL }) => Promise<Response>;
 let deriveReportTitle: typeof import('$lib/server/report-title').deriveReportTitle;
 
 /** Every response this suite captures, for `status/be.md`'s "one captured response each". */
@@ -97,7 +99,7 @@ async function call(
 		headers,
 		body: typeof payload === 'string' ? payload : JSON.stringify(payload),
 	});
-	const res = await POST({ request });
+	const res = await POST({ request, url: new URL('http://localhost/api/report') });
 	const body = await res.clone().json();
 	if (label) captured.push({ label, status: res.status, body });
 	return { status: res.status, headers: res.headers, body: body as any };
@@ -158,7 +160,10 @@ describe.skipIf(!dbReachable)('POST /api/report (integration, real Postgres)', (
 			`;
 		}
 
-		({ POST } = await import('./+server'));
+		// The handler's own `RequestEvent` carries a dozen fields this suite never touches; the cast
+		// narrows to the two it does drive. Widening the local type instead would mean building a
+		// whole fake RequestEvent per call to satisfy fields the route never reads.
+		({ POST } = (await import('./+server')) as unknown as { POST: typeof POST });
 		({ deriveReportTitle } = await import('$lib/server/report-title'));
 	});
 

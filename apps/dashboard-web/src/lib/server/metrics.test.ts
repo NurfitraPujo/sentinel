@@ -5,6 +5,10 @@ import {
 	renderMetrics,
 	metricsRegistry,
 	resetMetricsForTest,
+	ESCALATION_OUTCOME,
+	recordEscalation,
+	recordEscalationExhausted,
+	recordOncallScheduleUnresolved,
 } from './metrics';
 
 /**
@@ -109,5 +113,79 @@ describe('SR-3 sentinel_reports_received_total', () => {
 			k.startsWith('sentinel_reports_received_total')
 		);
 		expect(series).toHaveLength(Object.values(REPORT_OUTCOME).length);
+	});
+});
+
+/**
+ * The escalation half of §12's table. Same three properties as above, and the third one matters
+ * more here than anywhere: `sentinel_report_escalations_exhausted_total` and
+ * `sentinel_oncall_schedule_unresolved_total` are the ONLY things that notice two states §4.4
+ * designs to be silent, so an alert on `> 0` that cannot evaluate because the series does not
+ * exist yet is the same as no alert at all.
+ */
+describe('§12 escalation metrics', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('exposes all three under their §12 names', async () => {
+		const { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_report_escalations_total counter');
+		expect(body).toContain('# TYPE sentinel_report_escalations_exhausted_total counter');
+		expect(body).toContain('# TYPE sentinel_oncall_schedule_unresolved_total counter');
+	});
+
+	it('initialises every series to zero, so a "> 0" alert evaluates from t=0', async () => {
+		const series = parse((await renderMetrics()).body);
+		for (const outcome of Object.values(ESCALATION_OUTCOME)) {
+			expect(series.get(`sentinel_report_escalations_total{outcome="${outcome}"}`)).toBe(0);
+		}
+		expect(series.get('sentinel_report_escalations_exhausted_total')).toBe(0);
+		expect(series.get('sentinel_oncall_schedule_unresolved_total')).toBe(0);
+	});
+
+	it('carries the closed set of escalation outcomes and nothing else', () => {
+		expect(Object.values(ESCALATION_OUTCOME).sort()).toEqual([
+			'assigned',
+			'failed',
+			'reassigned',
+		]);
+	});
+
+	it('counts each signal on its own counter', async () => {
+		recordEscalation(ESCALATION_OUTCOME.Assigned);
+		recordEscalation(ESCALATION_OUTCOME.Assigned);
+		recordEscalation(ESCALATION_OUTCOME.Reassigned);
+		recordEscalationExhausted();
+		recordOncallScheduleUnresolved();
+		recordOncallScheduleUnresolved();
+
+		const series = parse((await renderMetrics()).body);
+		expect(series.get('sentinel_report_escalations_total{outcome="assigned"}')).toBe(2);
+		expect(series.get('sentinel_report_escalations_total{outcome="reassigned"}')).toBe(1);
+		expect(series.get('sentinel_report_escalations_total{outcome="failed"}')).toBe(0);
+		expect(series.get('sentinel_report_escalations_exhausted_total')).toBe(1);
+		expect(series.get('sentinel_oncall_schedule_unresolved_total')).toBe(2);
+	});
+
+	it('drops an outcome outside the closed set rather than minting a series', async () => {
+		// The unbounded-cardinality rule at runtime, not only in the type system: an organization
+		// id reaching a label is exactly the failure §12's "fixed label constants" forbids.
+		expect(() => recordEscalation('11111111-1111-4111-8111-111111111111' as never)).not.toThrow();
+		const body = (await renderMetrics()).body;
+		expect(body).not.toContain('11111111-1111-4111-8111-111111111111');
+	});
+
+	it('never emits a label other than outcome', async () => {
+		recordEscalation(ESCALATION_OUTCOME.Failed);
+		const body = (await renderMetrics()).body;
+		for (const line of body.split('\n')) {
+			if (!line.startsWith('sentinel_report_escalations_total{')) continue;
+			expect(line).toMatch(/^sentinel_report_escalations_total\{outcome="[a-z]+"\} \d+$/);
+		}
+		// The two unlabelled counters must stay unlabelled — there is nothing to break either down
+		// by that is not tenant-identifying.
+		expect(body).not.toMatch(/sentinel_report_escalations_exhausted_total\{/);
+		expect(body).not.toMatch(/sentinel_oncall_schedule_unresolved_total\{/);
 	});
 });

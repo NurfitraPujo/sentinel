@@ -4,6 +4,7 @@ import { requireReportAccessForIssue } from '$lib/server/report-access';
 import { requireIssueAccessAnyType } from '$lib/server/issue-access-dispatch';
 import { claimIssue, releaseClaim, ClaimConflictError } from '$lib/db/queries/reports';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
+import { acknowledgeEscalationQuietly } from '$lib/server/escalation';
 
 // R4/R17 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the claim DELETE route's per-issue-type
 // access dispatch now goes through the shared `requireIssueAccessAnyType`
@@ -39,6 +40,13 @@ export const POST: RequestHandler = async ({ params, locals, url }) => {
 	try {
 		const { issue: updated, notified } = await claimIssue(issueId, 'user', userId);
 		await sendIssueNotificationEmails(notified, { issueId, origin: url.origin });
+
+		// §4.4's implicit acknowledgement: "the assignee claims, comments on, or changes the status
+		// of that issue … Someone who is already working on it must not be reassigned for not
+		// pressing a button." Post-commit and never throwing — a failed stamp costs one extra
+		// reassignment, which the chain is bounded against, and must not fail this request.
+		await acknowledgeEscalationQuietly(issueId, userId);
+
 		return json({ success: true, issue: updated });
 	} catch (err) {
 		if (err instanceof ClaimConflictError) {

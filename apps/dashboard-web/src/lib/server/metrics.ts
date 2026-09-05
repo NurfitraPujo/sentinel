@@ -28,9 +28,13 @@ import { Registry, Counter } from '@prometheus-io/client';
  * deliberately so: it would need the dashboard-to-Redis dependency SR-1 already declined for the
  * throttle, to make a number Prometheus can compute itself.
  *
- * The scrape annotation on `deploy/helm/sentinel/templates/dashboard.yaml` and the alert rule
- * files are the rest of SR-3 and belong to the item that wires the metrics chain -- this one
- * stands the surface up and emits the first metric on it.
+ * The rest of SR-3's chain now exists alongside this file: the scrape annotation on
+ * `deploy/helm/sentinel/templates/dashboard.yaml` (`prometheus.io/scrape` + `/api/metrics`,
+ * matching `processor.yaml`'s) and the alert rules in
+ * `deploy/helm/sentinel/templates/prometheusrule.yaml`. §12 put Prometheus' own configuration in
+ * the `infra` repo, which is not an implementing repo for this feature; the rules therefore ship
+ * as a chart-rendered `PrometheusRule`, off by default, so the scheduling half and the alerting
+ * half live together and neither can be forgotten.
  */
 
 /**
@@ -65,6 +69,25 @@ export const REPORT_OUTCOME = {
 
 export type ReportOutcome = (typeof REPORT_OUTCOME)[keyof typeof REPORT_OUTCOME];
 
+/**
+ * §12's `sentinel_report_escalations_total{outcome}`, alerted on as "`outcome="failed"` above
+ * zero -- a report was assigned and nobody was told".
+ *
+ * Closed and fixed, exactly like `REPORT_OUTCOME`. There is deliberately no `unresolved` member:
+ * §12 gives that state its own counter (`sentinel_oncall_schedule_unresolved_total`), and a state
+ * counted twice under two names is a state whose two numbers eventually disagree.
+ */
+export const ESCALATION_OUTCOME = {
+	/** §4.4 at intake: the on-call engineer was resolved, assigned and told. */
+	Assigned: 'assigned',
+	/** §4.4b: an unacknowledged deadline moved the report to the next untried member. */
+	Reassigned: 'reassigned',
+	/** The only value §12's alert fires on: escalation threw, so nobody was told. */
+	Failed: 'failed',
+} as const;
+
+export type EscalationOutcome = (typeof ESCALATION_OUTCOME)[keyof typeof ESCALATION_OUTCOME];
+
 /** The one label this metric carries. Named once, so a typo cannot invent a second dimension. */
 const LABEL_OUTCOME = 'outcome';
 
@@ -78,6 +101,9 @@ const LABEL_OUTCOME = 'outcome';
 interface MetricsState {
 	registry: Registry;
 	reportsReceived: Counter<typeof LABEL_OUTCOME> | null;
+	escalations: Counter<typeof LABEL_OUTCOME> | null;
+	escalationsExhausted: Counter<string> | null;
+	oncallUnresolved: Counter<string> | null;
 }
 
 const GLOBAL_KEY = Symbol.for('sentinel.dashboard.metrics');
@@ -108,7 +134,44 @@ function createState(): MetricsState {
 		// is still strictly better than failing an intake request. Mirrors procmetrics' nil guard.
 		reportsReceived = null;
 	}
-	return { registry, reportsReceived };
+
+	// §12's three escalation signals. Two of them are the ONLY thing that notices a designed
+	// silent state -- `exhausted` is §4.4's terminal "nobody answered", and `unresolved` is
+	// "escalation ran for an org whose schedule resolves to nobody" -- which is why both are
+	// initialised to zero below: an alert on `> 0` over a series that does not exist yet does not
+	// evaluate, and "the counter is absent" would read exactly like "it never happened".
+	let escalations: Counter<typeof LABEL_OUTCOME> | null = null;
+	let escalationsExhausted: Counter<string> | null = null;
+	let oncallUnresolved: Counter<string> | null = null;
+	try {
+		escalations = new Counter({
+			name: 'sentinel_report_escalations_total',
+			help: 'Report escalations by outcome (contract §4.4/§4.4b/§12).',
+			labelNames: [LABEL_OUTCOME],
+			registers: [registry],
+		});
+		for (const outcome of Object.values(ESCALATION_OUTCOME)) {
+			escalations.labels({ [LABEL_OUTCOME]: outcome }).inc(0);
+		}
+		escalationsExhausted = new Counter({
+			name: 'sentinel_report_escalations_exhausted_total',
+			help: 'Escalation chains that walked every hop with no acknowledgement (contract §4.4).',
+			registers: [registry],
+		});
+		escalationsExhausted.inc(0);
+		oncallUnresolved = new Counter({
+			name: 'sentinel_oncall_schedule_unresolved_total',
+			help: 'Escalations that ran for an organization whose on-call schedule resolved to nobody.',
+			registers: [registry],
+		});
+		oncallUnresolved.inc(0);
+	} catch {
+		escalations = null;
+		escalationsExhausted = null;
+		oncallUnresolved = null;
+	}
+
+	return { registry, reportsReceived, escalations, escalationsExhausted, oncallUnresolved };
 }
 
 function state(): MetricsState {
@@ -138,6 +201,35 @@ const KNOWN_OUTCOMES = new Set<string>(Object.values(REPORT_OUTCOME));
 export function recordReportReceived(outcome: ReportOutcome): void {
 	if (!KNOWN_OUTCOMES.has(outcome)) return;
 	state().reportsReceived?.labels({ [LABEL_OUTCOME]: outcome }).inc();
+}
+
+const KNOWN_ESCALATION_OUTCOMES = new Set<string>(Object.values(ESCALATION_OUTCOME));
+
+/**
+ * Increments `sentinel_report_escalations_total{outcome}`. Same closed-set runtime guard, and the
+ * same never-throw contract, as `recordReportReceived`: escalation is called from a request that
+ * has already created a report, and a metric must never be the thing that fails it.
+ */
+export function recordEscalation(outcome: EscalationOutcome): void {
+	if (!KNOWN_ESCALATION_OUTCOMES.has(outcome)) return;
+	state().escalations?.labels({ [LABEL_OUTCOME]: outcome }).inc();
+}
+
+/**
+ * §12: "above zero -- a report walked the whole chain and no engineer acknowledged it. This is
+ * the 'nobody answered' signal, and it is the only thing that notices §4.4's terminal state."
+ * No labels: there is nothing to break the count down by that is not tenant-identifying.
+ */
+export function recordEscalationExhausted(): void {
+	state().escalationsExhausted?.inc();
+}
+
+/**
+ * §12: "above zero -- escalation ran for an org whose schedule resolves to nobody." Unlabelled
+ * for the same reason: the organization id is exactly the value that must never become a series.
+ */
+export function recordOncallScheduleUnresolved(): void {
+	state().oncallUnresolved?.inc();
 }
 
 /** Renders the Prometheus text exposition format, with the content type a scraper expects. */
