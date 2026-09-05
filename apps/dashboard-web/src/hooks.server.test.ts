@@ -40,7 +40,13 @@ vi.mock('$lib/db/schema', () => ({
 	users: { id: 'id', email: 'email' },
 }));
 
-const { orgHandle } = await import('./hooks.server');
+// `dev` is true under vitest (the SvelteKit vite plugin resolves `$app/environment` in dev mode),
+// and `csrfHandle` matches upstream by only guarding production -- so the mock is what makes the
+// production behaviour testable at all. `dev: true` is asserted separately below.
+const environment = { dev: false, browser: false, building: false, version: 'test' };
+vi.mock('$app/environment', () => environment);
+
+const { orgHandle, csrfHandle } = await import('./hooks.server');
 
 function makeEvent(pathname: string, authenticated: boolean) {
 	return {
@@ -97,5 +103,88 @@ describe('orgHandle reservedRoutes (D01)', () => {
 		await orgHandle({ event, resolve });
 
 		expect(resolve).toHaveBeenCalledWith(event);
+	});
+});
+
+/**
+ * `svelte.config.js` sets `kit.csrf.checkOrigin: false` because SvelteKit's built-in check runs
+ * before `handle`, has no per-route escape hatch, and answers `403 "Cross-site POST form
+ * submissions are forbidden"` to any `Origin`-less multipart POST -- which is exactly what
+ * sentinel-user-report-issue §4.5's service caller sends. `csrfHandle` is the replacement. The
+ * predicate itself is covered in `src/lib/server/csrf.test.ts`; what is asserted HERE is that the
+ * hook is wired to it, that the exemption is applied, and that `dev` is honoured.
+ */
+describe('csrfHandle (§4.5 -- the intake exemption, and only that)', () => {
+	function csrfEvent(pathname: string, request: Request) {
+		return { url: new URL(request.url), request } as any;
+	}
+
+	function multipartPost(pathname: string, origin?: string): Request {
+		const headers = new Headers({ 'content-type': 'multipart/form-data; boundary=x' });
+		if (origin) headers.set('origin', origin);
+		return new Request(`https://sentinel.example.com${pathname}`, { method: 'POST', headers });
+	}
+
+	beforeEach(() => {
+		environment.dev = false;
+	});
+
+	it('lets an Origin-less multipart POST through to /api/report/attachments', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/report/attachments');
+
+		const response = await csrfHandle({ event: csrfEvent('/api/report/attachments', request), resolve } as any);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
+		expect(response.status).toBe(200);
+	});
+
+	it('lets an Origin-less multipart POST through to /api/report', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/report');
+
+		await csrfHandle({ event: csrfEvent('/api/report', request), resolve } as any);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
+	});
+
+	it('still 403s an Origin-less multipart POST to /api/uploads, without calling the route', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/uploads');
+
+		const response = await csrfHandle({ event: csrfEvent('/api/uploads', request), resolve } as any);
+
+		expect(response.status).toBe(403);
+		expect(await response.text()).toBe('Cross-site POST form submissions are forbidden');
+		expect(resolve).not.toHaveBeenCalled();
+	});
+
+	it('still 403s a foreign-origin multipart POST to a non-exempt path', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/uploads', 'https://evil.example');
+
+		const response = await csrfHandle({ event: csrfEvent('/api/uploads', request), resolve } as any);
+
+		expect(response.status).toBe(403);
+		expect(resolve).not.toHaveBeenCalled();
+	});
+
+	it('lets a same-origin multipart POST through to a non-exempt path', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/uploads', 'https://sentinel.example.com');
+
+		await csrfHandle({ event: csrfEvent('/api/uploads', request), resolve } as any);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
+	});
+
+	it('does nothing in dev, matching upstream\'s `if (!DEV)` guard', async () => {
+		environment.dev = true;
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/uploads');
+
+		await csrfHandle({ event: csrfEvent('/api/uploads', request), resolve } as any);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
 	});
 });

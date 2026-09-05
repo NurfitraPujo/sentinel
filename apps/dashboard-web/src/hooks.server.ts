@@ -8,6 +8,35 @@ import { error } from '@sveltejs/kit';
 import { log } from '$lib/server/observability/log';
 import { HTTP_REQUEST_ID_HEADER } from '$lib/server/observability/constants';
 import { runWithTraceContext, traceContextForRequest } from '$lib/server/observability/trace';
+import { dev } from '$app/environment';
+import {
+	isCsrfExemptPath,
+	isForbiddenCrossSiteFormPost,
+	crossSiteForbiddenResponse,
+} from '$lib/server/csrf';
+
+// csrfHandle re-applies the cross-site form-post check that `svelte.config.js` turns off with
+// `kit.csrf.checkOrigin: false`. See src/lib/server/csrf.ts for WHY it is off: SvelteKit's own
+// check runs before `handle`, has no per-route escape hatch, and rejects every `Origin`-less
+// multipart POST — which is exactly what sentinel-user-report-issue §4.5's service caller sends.
+//
+// The behaviour is upstream's, unchanged, for every path except the two `X-API-Key` intake
+// endpoints. `dev` is honoured because upstream guards its own check with `if (!DEV)`; matching
+// that keeps local development exactly as it was rather than making it stricter as a side effect
+// of this change.
+//
+// Exported so the exemption can be driven directly in a test without standing up the Auth.js
+// handle chain, the same reason `orgHandle` below is exported.
+export const csrfHandle: Handle = async ({ event, resolve }) => {
+	if (
+		!dev &&
+		!isCsrfExemptPath(event.url.pathname) &&
+		isForbiddenCrossSiteFormPost(event.request, event.url.origin)
+	) {
+		return crossSiteForbiddenResponse(event.request);
+	}
+	return resolve(event);
+};
 
 // requestContextHandle is FIRST in the sequence (see `handle` below), deliberately outside/around
 // authHandle and orgHandle: it must wrap the entire request lifecycle so every log line emitted by any
@@ -172,4 +201,4 @@ export const orgHandle = async ({ event, resolve }: any) => {
 	return resolve(event);
 };
 
-export const handle = sequence(requestContextHandle, authHandle, orgHandle);
+export const handle = sequence(requestContextHandle, csrfHandle, authHandle, orgHandle);

@@ -11,7 +11,13 @@ import {
 	getObjectRangeBytes,
 	deleteObject,
 } from '$lib/server/storage';
-import { sniffContentType, resolveContentType, isAllowedContentType } from '$lib/server/attachment-sniff';
+import {
+	sniffContentType,
+	resolveContentType,
+	isAllowedContentType,
+	ALLOWED_CONTENT_TYPES,
+	type AllowedContentType,
+} from '$lib/server/attachment-sniff';
 import { reapOrgOrphanAttachments } from '$lib/server/attachment-reaper';
 import { log } from '$lib/server/observability/log';
 
@@ -39,6 +45,18 @@ export interface UploadCoreInput {
 	formData: FormData;
 	uploaderType: UploaderType;
 	uploaderId: string;
+	/**
+	 * The content types this CALLER admits, defaulting to the full `ALLOWED_CONTENT_TYPES`.
+	 *
+	 * It is a per-caller parameter for the same reason the ingestor's scope allowlist became a
+	 * per-chain one (contract §2): the session and agent upload routes and the external-reporter
+	 * one do not have the same threat model, and one shared list means narrowing it for the
+	 * stranger narrows it for the org member too. `POST /api/report/attachments` passes
+	 * `REPORT_ALLOWED_CONTENT_TYPES` (images + PDF); everything else passes nothing and keeps the
+	 * wider list. A value here can only ever REMOVE types — the sniffer is still the only thing
+	 * that decides what the bytes are.
+	 */
+	allowedContentTypes?: readonly AllowedContentType[];
 }
 
 export interface UploadCoreResult {
@@ -72,6 +90,14 @@ export async function handleAttachmentUpload(input: UploadCoreInput): Promise<Up
 	const detected = sniffContentType(buffer);
 	const resolved = resolveContentType(detected, file.type || undefined);
 	if (!resolved) {
+		throw error(415, 'File content is not an allowed type (or does not match its declared type)');
+	}
+
+	// The caller's own narrowing, applied AFTER the sniff so a declared type can never reach it.
+	// A `.png` whose bytes are a ZIP header resolves to `application/zip` above and is rejected
+	// here for the report route, which is exactly the case §4.5's abuse table is about.
+	const allowed = input.allowedContentTypes ?? ALLOWED_CONTENT_TYPES;
+	if (!allowed.includes(resolved)) {
 		throw error(415, 'File content is not an allowed type (or does not match its declared type)');
 	}
 

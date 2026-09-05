@@ -47,6 +47,7 @@ vi.mock('$lib/rate-limit', async () => {
 });
 
 const { POST } = await import('./+server');
+const { REPORT_ALLOWED_CONTENT_TYPES } = await import('$lib/server/attachment-sniff');
 
 const CTX = {
 	keyId: 'key-1',
@@ -133,6 +134,21 @@ describe('POST /api/report/attachments', () => {
 				uploaderType: 'external_reporter',
 				uploaderId: 'reporter-1',
 			})
+		);
+	});
+
+	it('passes the NARROWED images+PDF allowlist to the upload core (§10 narrowing of §4.5)', async () => {
+		// The operator narrowed §4.5's content-type rule on 2026-09-04: the shared
+		// ALLOWED_CONTENT_TYPES admits application/zip, application/msword, DOCX, video/* and
+		// text/plain, none of which a near-unauthenticated stranger has any reason to send. The
+		// enforcement lives in upload-core (upload-core.report-allowlist.test.ts); what this route
+		// owes is passing the narrow list rather than defaulting to the wide one.
+		await post();
+		expect(handleAttachmentUpload).toHaveBeenCalledWith(
+			expect.objectContaining({ allowedContentTypes: REPORT_ALLOWED_CONTENT_TYPES })
+		);
+		expect([...REPORT_ALLOWED_CONTENT_TYPES].sort()).toEqual(
+			['application/pdf', 'image/gif', 'image/jpeg', 'image/png', 'image/webp'].sort()
 		);
 	});
 

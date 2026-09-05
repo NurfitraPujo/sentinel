@@ -12,6 +12,7 @@ import {
 	checkReportUploadBudget,
 	resolveReportUploadBytesPerDay,
 } from '$lib/server/upload-core';
+import { REPORT_ALLOWED_CONTENT_TYPES } from '$lib/server/attachment-sniff';
 import { upsertExternalReporter } from '$lib/db/queries/external-reporters';
 import { checkReportUploadRateLimit, resolveReportUploadRpm } from '$lib/rate-limit';
 import { log } from '$lib/server/observability/log';
@@ -33,6 +34,12 @@ import { log } from '$lib/server/observability/log';
  * magic-byte allowlist in `attachment-sniff.ts`, the MinIO write, the opportunistic reap) and
  * explicitly NOT `createPresignedAttachment` -- §1 keeps the 500 MB direct-to-storage path
  * session-only.
+ *
+ * The content-type allowlist it passes is NARROWER than §4.5 as drafted: images and PDF only
+ * (`REPORT_ALLOWED_CONTENT_TYPES`), per the operator's §10 narrowing of 2026-09-04. The shared
+ * `ALLOWED_CONTENT_TYPES` admits `application/zip`, `application/msword`, DOCX, `video/*` and
+ * `text/plain`, all of which this caller -- a stranger behind a service's key -- has no reason to
+ * send and every reason to be refused.
  *
  * Every non-2xx here carries §7's envelope, which is why nothing in this file throws SvelteKit's
  * `error()`: that helper produces `{"message": ...}`.
@@ -164,6 +171,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			formData,
 			uploaderType: 'external_reporter',
 			uploaderId: reporterId,
+			allowedContentTypes: REPORT_ALLOWED_CONTENT_TYPES,
 		});
 	} catch (err) {
 		// 413 (over the cap after buffering), 415 (magic bytes off the allowlist), 400, 503 --
