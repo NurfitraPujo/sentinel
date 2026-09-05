@@ -5,7 +5,13 @@ WORKDIR /app
 
 # Copy package files from project root (context is project root)
 COPY apps/dashboard-web/package.json apps/dashboard-web/package-lock.json ./
-RUN npm install -g pnpm && pnpm install
+# pnpm pinned, not floating. Unpinned, this resolved to whatever `npm install -g pnpm`
+# served that day; pnpm 11 turned ignored build scripts into a hard error and every
+# compose build began failing with ERR_PNPM_IGNORED_BUILDS on esbuild and protobufjs,
+# taking the `integration` and `e2e` jobs with it. 10 is the version .github/workflows/ci.yml
+# already pins for the `dashboard` job (pnpm/action-setup version: 10), so the image and CI
+# now agree instead of drifting.
+RUN npm install -g pnpm@10 && pnpm install
 
 # Copy source
 COPY apps/dashboard-web/ ./
