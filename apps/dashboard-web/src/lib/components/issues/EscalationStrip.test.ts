@@ -101,6 +101,80 @@ describe('EscalationStrip — the Acknowledge control is the assignee’s alone 
 	});
 });
 
+describe('EscalationStrip — the local acknowledgement belongs to ONE report (BUG-02)', () => {
+	beforeEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	// SvelteKit reuses the `[orgSlug]/reports/[issueId]` page component across a param change, so
+	// this component sees new props rather than a fresh instance. A bare `acknowledgedLocally`
+	// boolean survives that, and §4.4's `escalated` notification links straight to this page as a
+	// plain `<a>`, so the navigation is on the feature's own critical path: report B would render
+	// "Acknowledged" — with no control and no countdown — on the strength of an ack for report A.
+	//
+	// This test is a prop change on a LIVE instance on purpose. Every other case in this file
+	// renders fresh, which is exactly the shape that cannot observe the defect.
+	it('drops the local ack when the issueId prop moves to another report', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+		vi.stubGlobal('fetch', fetchMock);
+
+		const { rerender } = render(EscalationStrip, {
+			issueId: ISSUE_ID,
+			escalation: escalationHopOneFixture,
+			currentUserId: ASSIGNEE,
+		});
+
+		await fireEvent.click(screen.getByTestId('escalation-acknowledge'));
+		expect(await screen.findByTestId('escalation-acknowledged')).toBeTruthy();
+
+		// Navigate to a different, un-acknowledged report while the instance is reused.
+		await rerender({
+			issueId: 'a-different-report',
+			escalation: escalationHopOneFixture,
+			currentUserId: ASSIGNEE,
+		});
+
+		expect(screen.queryByTestId('escalation-acknowledged')).toBeNull();
+		expect(screen.getByTestId('escalation-live')).toBeTruthy();
+		expect(screen.getByTestId('escalation-acknowledge')).toBeTruthy();
+		expect(screen.getByTestId('escalation-countdown')).toBeTruthy();
+
+		// And the ack it then sends names the report on screen, not the one it came from.
+		await fireEvent.click(screen.getByTestId('escalation-acknowledge'));
+		expect(fetchMock).toHaveBeenLastCalledWith(
+			'/api/issues/a-different-report/escalation/ack',
+			expect.objectContaining({ method: 'POST' })
+		);
+	});
+
+	it('keeps the local ack across an unrelated prop change on the SAME report', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) })
+		);
+
+		const { rerender } = render(EscalationStrip, {
+			issueId: ISSUE_ID,
+			escalation: escalationHopOneFixture,
+			currentUserId: ASSIGNEE,
+		});
+
+		await fireEvent.click(screen.getByTestId('escalation-acknowledge'));
+		expect(await screen.findByTestId('escalation-acknowledged')).toBeTruthy();
+
+		// The page polls at ~10 s (fe.md); a re-render with the same report must not undo the ack.
+		await rerender({
+			issueId: ISSUE_ID,
+			escalation: escalationHopOneFixture,
+			currentUserId: ASSIGNEE,
+			waitingOn: 'assignee',
+		});
+
+		expect(screen.getByTestId('escalation-acknowledged')).toBeTruthy();
+		expect(screen.queryByTestId('escalation-acknowledge')).toBeNull();
+	});
+});
+
 describe('EscalationStrip — the hop chain and its terminal state (S11, S12)', () => {
 	it('renders "escalated N of 3" at each hop', () => {
 		const first = render(EscalationStrip, {

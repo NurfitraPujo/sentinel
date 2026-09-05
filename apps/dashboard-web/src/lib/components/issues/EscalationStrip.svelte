@@ -39,8 +39,18 @@
 	let now = $state(Date.now());
 	let acknowledging = $state(false);
 	let ackError = $state<string | null>(null);
-	/** Set locally on a successful ack so the control and countdown go without a reload. */
-	let acknowledgedLocally = $state(false);
+	/**
+	 * The report whose escalation this component acknowledged locally, so the control and countdown
+	 * go without a reload — NOT a bare boolean.
+	 *
+	 * BUG-02: a bare `acknowledgedLocally = true` survives a client-side navigation from one report
+	 * to another, because SvelteKit reuses the `[orgSlug]/reports/[issueId]` page component across a
+	 * param change and component-local `$state` is not reset by a prop change. The `escalated`
+	 * notification in `NotificationBell.svelte` links straight to this page, so that navigation is on
+	 * this feature's own critical path. Keying the override on `issueId` makes it inert the moment
+	 * the prop names a different report, with no effect and no `untrack` to get wrong.
+	 */
+	let acknowledgedIssueId = $state<string | null>(null);
 
 	onMount(() => {
 		const timer = setInterval(() => (now = Date.now()), 1000);
@@ -48,7 +58,9 @@
 	});
 
 	let acknowledgedAt = $derived(
-		acknowledgedLocally ? new Date().toISOString() : (escalation?.acknowledgedAt ?? null)
+		acknowledgedIssueId === issueId
+			? new Date().toISOString()
+			: (escalation?.acknowledgedAt ?? null)
 	);
 
 	let isAssignee = $derived(escalation !== null && escalation.assigneeId === currentUserId);
@@ -89,7 +101,7 @@
 				const body = await res.json().catch(() => ({}));
 				throw new Error(body.message || `Failed to acknowledge (${res.status})`);
 			}
-			acknowledgedLocally = true;
+			acknowledgedIssueId = issueId;
 		} catch (err) {
 			ackError = err instanceof Error ? err.message : 'Failed to acknowledge';
 		} finally {

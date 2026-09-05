@@ -36,6 +36,29 @@
 	let deleting = $state(false);
 	let deleteError = $state<string | null>(null);
 
+	// BUG-02. SvelteKit reuses this component across an `[issueId]` param change, so nothing above
+	// is reset by a client-side navigation from one report to another — and §4.4's `escalated`
+	// notification links straight here (`NotificationBell.svelte`), so that navigation is on the
+	// feature's critical path. Two halves, because they leak in two different places:
+	//
+	//  1. The `{#key data.detail.issue.id}` below re-creates every child, which is what resets
+	//     state owned by a child — `EscalationStrip`'s local acknowledgement among them.
+	//  2. `{#key}` does NOT touch state declared in THIS script; a block only re-creates the
+	//     markup inside it. So the page's own per-report transients are reset here, or an open
+	//     edit of report A would PATCH report B with A's draft.
+	$effect(() => {
+		data.detail.issue.id;
+		editing = false;
+		editTitle = '';
+		editBodyMd = '';
+		editSeverity = 'low';
+		saveError = null;
+		deleteError = null;
+		claimError = null;
+		moveProjectId = '';
+		moveError = null;
+	});
+
 	function startEdit() {
 		editTitle = data.detail.issue.message;
 		editBodyMd = data.detail.bodyMd;
@@ -150,6 +173,7 @@
 	}
 </script>
 
+{#key data.detail.issue.id}
 <div class="report-detail-page">
 	<div class="report-header">
 		<div>
@@ -322,6 +346,7 @@
 		<IssueTimeline activity={data.activity} />
 	{/if}
 </div>
+{/key}
 
 <style>
 	.report-detail-page {
