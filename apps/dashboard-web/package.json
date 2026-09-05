@@ -47,5 +47,11 @@
     "semver": "^7.6.3",
     "zod": "^3.23.6"
   },
-  "type": "module"
+  "type": "module",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "protobufjs"
+    ]
+  }
 }
