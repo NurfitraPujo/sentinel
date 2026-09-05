@@ -9,6 +9,7 @@ import {
 	attachments,
 	issueComments,
 	externalIssueReports,
+	externalReporters,
 } from '$lib/db/schema';
 import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 import { subscribe } from '$lib/db/queries/subscriptions';
@@ -525,12 +526,23 @@ export async function listIssueAttachments(issueId: string) {
 
 export type ReportTab = 'all' | 'mine' | 'claimed-by-me' | 'unclaimed' | 'needs-input' | 'triage';
 
+/**
+ * sentinel-user-report-issue *Decisions taken*, OQ-8: the separation between an org-member report
+ * and an externally-submitted one is `issues.source_channel` plus a filter and a badge -- not the
+ * `is_inbox` Triage project, and not nothing. This is the filter half; the badge is fe.md's.
+ */
+export const REPORT_SOURCE_CHANNELS = ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'] as const;
+
+export type ReportSourceChannel = (typeof REPORT_SOURCE_CHANNELS)[number];
+
 export interface ListReportsOptions {
 	organizationId: string;
 	tab: ReportTab;
 	userId: string;
 	/** Restrict to a set of project ids the caller may see (viewer scoping mirrors issues.ts). */
 	accessibleProjectIds?: Set<string> | null;
+	/** OQ-8's `source` filter. Omitted = every source, which is the pre-existing behaviour. */
+	source?: ReportSourceChannel;
 }
 
 /**
@@ -538,7 +550,7 @@ export interface ListReportsOptions {
  * scoped to `issue_type='user_report'` (§9 strict separation is the whole point of this table
  * existing alongside issues.ts's error-dashboard queries, not a shared listing).
  */
-export async function listReports({ organizationId, tab, userId, accessibleProjectIds }: ListReportsOptions) {
+export async function listReports({ organizationId, tab, userId, accessibleProjectIds, source }: ListReportsOptions) {
 	const conditions = [eq(projects.organizationId, organizationId), eq(issues.issueType, 'user_report')];
 
 	switch (tab) {
@@ -577,10 +589,24 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 		)})`);
 	}
 
-	return await db
+	if (source) {
+		conditions.push(eq(issues.sourceChannel, source));
+	}
+
+	// §4.2's correction, applied to the list: a `user_report` issue has EXACTLY ONE companion, and
+	// which table it lives in depends on which door it came through. Requiring one of the two keeps
+	// this query's original guarantee (never surface a `system_error` row through the reports list)
+	// while no longer silently dropping every report this feature creates.
+	conditions.push(
+		sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+	);
+
+	const rows = await db
 		.select({
 			issue: issues,
 			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
 			projectName: projects.name,
 			projectIsInbox: projects.isInbox,
 			reporterName: users.name,
@@ -591,11 +617,59 @@ export async function listReports({ organizationId, tab, userId, accessibleProje
 			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
-		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		// §4.2's correction: LEFT, not INNER. An externally-submitted report has no
+		// `manual_issue_reports` row and no `"user"` row (Decisions taken, OQ-6), so the INNER join
+		// this used to carry returned nothing for every report this feature creates.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
 		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
 		.where(and(...conditions))
 		.orderBy(desc(issues.firstSeen));
+
+	return rows.map(withUnifiedReportFields);
+}
+
+/**
+ * The two companions, reduced to the fields every reader of a report needs regardless of which
+ * door it came through. Added, never substituted: `report`, `reporterName` and `reporterEmail`
+ * keep exactly the values they had before this feature for an org-member report, so §6's "no
+ * field removed, no type or nullability changed" holds for the existing `fe` consumer.
+ */
+function withUnifiedReportFields<
+	T extends {
+		report: typeof manualIssueReports.$inferSelect | null;
+		externalReport: typeof externalIssueReports.$inferSelect | null;
+		externalReporter: typeof externalReporters.$inferSelect | null;
+		reporterName: string | null;
+		reporterEmail: string | null;
+	}
+>(row: T) {
+	const isExternal = row.externalReport !== null;
+	return {
+		...row,
+		/** §4.2 `reporter.kind`. */
+		reporterKind: (isExternal ? 'external' : 'org_member') as 'external' | 'org_member',
+		// Both queries that call this require one companion or the other in their WHERE, so exactly
+		// one of the two is present and these are `string`, not `string | null`. The `!` is that
+		// predicate restated for the type checker -- delete the predicate and this becomes a lie.
+		/** The report text, from whichever companion holds it. */
+		bodyMd: row.report ? row.report.bodyMd : row.externalReport!.bodyMd,
+		/** The severity, from whichever companion holds it. */
+		severity: row.report ? row.report.severity : row.externalReport!.severity,
+		/** §4.2 `reporter.displayName`. */
+		reporterDisplayName: isExternal ? (row.externalReporter?.displayName ?? null) : row.reporterName,
+		/** §4.2 `reporter.email`. The UI must not render an external reporter's address as a mailto
+		 *  link -- there is no reply channel (§1). */
+		reporterEmailAddress: isExternal ? (row.externalReporter?.email ?? null) : row.reporterEmail,
+		/** §4.2 `reporter.externalId`. `null` for an org member. */
+		reporterExternalId: isExternal ? (row.externalReporter?.externalId ?? null) : null,
+		/** §4.2 `reporter.firstSeenAt`. `null` for an org member. */
+		reporterFirstSeenAt: isExternal ? (row.externalReporter?.firstSeenAt ?? null) : null,
+		/** §4.2 `context`, verbatim, or `null` for an org-member report. */
+		context: (row.externalReport?.context ?? null) as Record<string, unknown> | null,
+	};
 }
 
 /**
@@ -608,6 +682,8 @@ export async function getReportDetail(issueId: string) {
 		.select({
 			issue: issues,
 			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
 			projectId: projects.id,
 			projectName: projects.name,
 			projectIsInbox: projects.isInbox,
@@ -618,12 +694,25 @@ export async function getReportDetail(issueId: string) {
 			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
 		})
 		.from(issues)
-		.innerJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		// §4.2's correction, and the reason this endpoint 404'd for every externally-submitted
+		// report: LEFT, not INNER, on both the org-member companion and the `"user"` row, plus the
+		// external companion and its reporter. The guard that made the INNER join safe -- "never
+		// leak a `system_error` issue through this path" -- is now the explicit predicate below.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
 		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
-		.where(and(eq(issues.id, issueId), eq(issues.issueType, 'user_report')));
+		.where(
+			and(
+				eq(issues.id, issueId),
+				eq(issues.issueType, 'user_report'),
+				sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+			)
+		);
 
-	return rows[0] ?? null;
+	const row = rows[0];
+	return row ? withUnifiedReportFields(row) : null;
 }
 
 /**
@@ -707,10 +796,24 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			throw new Error(`Issue ${input.issueId} not found`);
 		}
 
-		const [existingReport] = await tx
+		// §4.2's correction reaches this write too: a `user_report` issue has exactly one companion
+		// and it may be the external one. Looking only at `manual_issue_reports` made the agent
+		// severity op (agent-ops.ts, A09) throw "Report not found" -- a 500 -- for every report this
+		// feature creates. `companion` names which table the rest of this function updates.
+		const [existingManualReport] = await tx
 			.select({ bodyMd: manualIssueReports.bodyMd, severity: manualIssueReports.severity })
 			.from(manualIssueReports)
 			.where(eq(manualIssueReports.issueId, input.issueId));
+
+		const [existingExternalReport] = existingManualReport
+			? []
+			: await tx
+					.select({ bodyMd: externalIssueReports.bodyMd, severity: externalIssueReports.severity })
+					.from(externalIssueReports)
+					.where(eq(externalIssueReports.issueId, input.issueId));
+
+		const existingReport = existingManualReport ?? existingExternalReport;
+		const companion = existingManualReport ? manualIssueReports : externalIssueReports;
 
 		if (!existingReport) {
 			throw new Error(`Report ${input.issueId} not found`);
@@ -725,7 +828,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			await tx.update(issues).set({ message: input.title }).where(eq(issues.id, input.issueId));
 		}
 
-		const reportUpdate: Partial<typeof manualIssueReports.$inferInsert> = {};
+		const reportUpdate: { bodyMd?: string; severity?: string } = {};
 		if (input.bodyMd !== undefined && input.bodyMd !== existingReport.bodyMd) {
 			oldValue.bodyMd = existingReport.bodyMd;
 			newValue.bodyMd = input.bodyMd;
@@ -737,7 +840,7 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 			reportUpdate.severity = input.severity;
 		}
 		if (Object.keys(reportUpdate).length > 0) {
-			await tx.update(manualIssueReports).set(reportUpdate).where(eq(manualIssueReports.issueId, input.issueId));
+			await tx.update(companion).set(reportUpdate).where(eq(companion.issueId, input.issueId));
 		}
 
 		if (Object.keys(newValue).length > 0) {
@@ -754,8 +857,8 @@ export async function updateManualIssueReport(input: UpdateManualIssueReportInpu
 		const [updatedIssue] = await tx.select().from(issues).where(eq(issues.id, input.issueId));
 		const [updatedReport] = await tx
 			.select()
-			.from(manualIssueReports)
-			.where(eq(manualIssueReports.issueId, input.issueId));
+			.from(companion)
+			.where(eq(companion.issueId, input.issueId));
 
 		return { issue: updatedIssue, report: updatedReport };
 	});

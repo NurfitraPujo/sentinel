@@ -57,7 +57,12 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// author-only) any report at any time. Computed here, not just re-derived client-side, since
 	// the route itself re-checks on every PATCH/DELETE regardless -- this only controls whether the
 	// UI offers the buttons.
-	const isAuthor = detail.report.reporterId === userId;
+	// sentinel-user-report-issue §4.2: `detail.report` is the ORG-MEMBER companion and is now null
+	// for an externally-submitted report (which has an `external_issue_reports` row instead), so
+	// this must not dereference it. An external report has no org-member author, which is the
+	// correct authorization answer as well as the safe one: nobody is its author, so nobody gets
+	// the author's edit/delete affordance. Rendering the external reporter is fe.md's.
+	const isAuthor = detail.report?.reporterId === userId;
 	const isResolved = detail.issue.status === 'resolved';
 	const isModerator = role === 'owner' || role === 'admin';
 	const canEditOwnReport = isAuthor && !isResolved;

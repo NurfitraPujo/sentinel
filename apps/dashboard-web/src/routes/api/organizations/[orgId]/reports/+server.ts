@@ -3,7 +3,13 @@ import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { projects } from '$lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { createManualIssue, listReports, type ReportTab } from '$lib/db/queries/reports';
+import {
+	createManualIssue,
+	listReports,
+	REPORT_SOURCE_CHANNELS,
+	type ReportTab,
+	type ReportSourceChannel,
+} from '$lib/db/queries/reports';
 import { requireReportAccess } from '$lib/server/report-access';
 import { getAccessibleProjectIds } from '$lib/server/issue-access';
 
@@ -18,6 +24,12 @@ const VALID_TABS = ['all', 'mine', 'claimed-by-me', 'unclaimed', 'needs-input', 
 
 function isValidTab(value: unknown): value is ReportTab {
 	return typeof value === 'string' && (VALID_TABS as readonly string[]).includes(value);
+}
+
+// sentinel-user-report-issue OQ-8: `?source=` narrows the list to one `issues.source_channel`.
+// Absent means every source, so a caller that sends nothing sees exactly what it saw before.
+function isValidSource(value: unknown): value is ReportSourceChannel {
+	return typeof value === 'string' && (REPORT_SOURCE_CHANNELS as readonly string[]).includes(value);
 }
 
 // Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §9, §10). Manual-validation style
@@ -43,6 +55,11 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 		throw error(400, `tab must be one of: ${VALID_TABS.join(', ')}`);
 	}
 
+	const sourceParam = url.searchParams.get('source');
+	if (sourceParam !== null && !isValidSource(sourceParam)) {
+		throw error(400, `source must be one of: ${REPORT_SOURCE_CHANNELS.join(', ')}`);
+	}
+
 	// A viewer sees only reports in projects they are actually a member of (mirrors D10's
 	// project-membership scoping for the error-issue search path); write roles see the whole org,
 	// since an org-level write role is itself an org-wide grant (see issue-access.ts's comment).
@@ -54,6 +71,7 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 		tab: tabParam,
 		userId,
 		accessibleProjectIds,
+		source: sourceParam ?? undefined,
 	});
 
 	return json({ reports });

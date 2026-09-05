@@ -194,7 +194,14 @@ describe.skipIf(!dbReachable)('POST /api/report (integration, real Postgres)', (
 				issue_id: res.body.report_id,
 				status: 'created',
 				deduplicated: false,
-				triage: null,
+				// §4.1-b's inline §4.2 object. This project has no `system_error` issue with an
+				// in-window occurrence, so it is "looked, found nothing" -- `{candidates: []}`, which
+				// §4.2 insists is a DIFFERENT state from `null` ("not looked at").
+				triage: {
+					ranAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+					strategy: 'window_release',
+					candidates: [],
+				},
 			});
 
 			const [issue] = await sql`

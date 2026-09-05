@@ -6,7 +6,12 @@ import {
 	toReportError,
 	type ReportKeyCredential,
 } from '$lib/server/report-auth';
-import { readReportBody, parseReportRequest, type ParsedReportRequest } from '$lib/server/report-intake';
+import {
+	readReportBody,
+	parseReportRequest,
+	parseOccurredAt,
+	type ParsedReportRequest,
+} from '$lib/server/report-intake';
 import { deriveReportTitle } from '$lib/server/report-title';
 import {
 	hashReportRequest,
@@ -17,6 +22,7 @@ import {
 } from '$lib/server/report-idempotency';
 import { upsertExternalReporter } from '$lib/db/queries/external-reporters';
 import { createExternalIssueReport, ReportAttachmentNotFoundError } from '$lib/db/queries/reports';
+import { runTriage, type TriageResult } from '$lib/server/triage';
 import { recordReportReceived, REPORT_OUTCOME, type ReportOutcome } from '$lib/server/metrics';
 import { log } from '$lib/server/observability/log';
 
@@ -156,7 +162,19 @@ export const POST: RequestHandler = async ({ request }) => {
 			deduplicated: false,
 		});
 
-		return finish(createdResponse(issue.id, false), REPORT_OUTCOME.Created);
+		// §4.3 runs INSIDE this request (OQ-1 variant (b): "§4.2's `triage` may be inline") and
+		// AFTER creation has committed, never inside its transaction. That ordering is the whole of
+		// §12's "a forced triage failure yields `triage: null` and a created report, never a 500 and
+		// never a lost report": the report is already durable when the matcher runs, so the matcher
+		// has nothing left it can take away. `triageForReport` swallows its own failure.
+		const triage = await triageForReport({
+			issueId: issue.id,
+			projectId: project.projectId,
+			occurredAt: parseOccurredAt(parsed.context.occurred_at) ?? new Date(),
+			context: parsed.context,
+		});
+
+		return finish(createdResponse(issue.id, false, triage), REPORT_OUTCOME.Created);
 	} catch (err) {
 		if (err instanceof ReportAttachmentNotFoundError) {
 			// One code for unknown, claimed and another tenant's, so the endpoint cannot probe another
@@ -239,18 +257,57 @@ async function checkIdempotency(
 }
 
 /**
- * §4.1-b's success body. `issue_id` repeats `report_id` deliberately -- "present so a client need
- * not know they are the same row" -- and `triage` is `null` because triage does not run inside
- * this request.
+ * §4.3, run for a report that has just been created, with its failure absorbed.
+ *
+ * The contract makes this the difference between a feature that degrades and one that loses data:
+ * the report exists and is committed by the time this is called, so a matcher that throws costs a
+ * `triage` object and nothing else. `null` here is the same `null` §4.2 defines -- "not looked
+ * at" -- and is distinguishable by a client from `{"candidates": []}`, which is "looked, found
+ * nothing".
  */
-function createdResponse(reportId: string, deduplicated: boolean): Response {
+async function triageForReport(input: {
+	issueId: string;
+	projectId: string;
+	occurredAt: Date;
+	context: Record<string, unknown>;
+}): Promise<TriageResult | null> {
+	try {
+		return await runTriage({
+			issueId: input.issueId,
+			projectId: input.projectId,
+			occurredAt: input.occurredAt,
+			context: {
+				release: typeof input.context.release === 'string' ? input.context.release : null,
+				environment: typeof input.context.environment === 'string' ? input.context.environment : null,
+				// Accepted, stored, and inert in v1 (§4.3, OQ-4).
+				traceId: typeof input.context.trace_id === 'string' ? input.context.trace_id : null,
+				sessionId: typeof input.context.session_id === 'string' ? input.context.session_id : null,
+			},
+		});
+	} catch (err) {
+		log.error('report_intake.triage_failed', { reportId: input.issueId, error: err });
+		return null;
+	}
+}
+
+/**
+ * §4.1-b's success body. `issue_id` repeats `report_id` deliberately -- "present so a client need
+ * not know they are the same row". `triage` is the §4.2 object inline, or `null` -- for a
+ * deduplicated replay (nothing was created, so nothing was triaged in this request) or for a run
+ * that failed.
+ */
+function createdResponse(
+	reportId: string,
+	deduplicated: boolean,
+	triage: TriageResult | null = null
+): Response {
 	return new Response(
 		JSON.stringify({
 			report_id: reportId,
 			issue_id: reportId,
 			status: 'created',
 			deduplicated,
-			triage: null,
+			triage,
 		}),
 		{ status: 201, headers: { 'Content-Type': 'application/json' } }
 	);

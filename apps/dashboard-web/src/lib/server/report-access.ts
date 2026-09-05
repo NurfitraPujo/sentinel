@@ -1,7 +1,14 @@
 import { error } from '@sveltejs/kit';
 import { and, eq } from 'drizzle-orm';
 import { db } from './db';
-import { issues, projects, organizationMembers, manualIssueReports } from '$lib/db/schema';
+import {
+	issues,
+	projects,
+	organizationMembers,
+	manualIssueReports,
+	externalIssueReports,
+	externalReporters,
+} from '$lib/db/schema';
 import { ISSUE_WRITE_ROLES } from './issue-access';
 
 /**
@@ -150,12 +157,66 @@ export async function getOrgRole(userId: string, organizationId: string): Promis
 	return rows[0]?.role ?? null;
 }
 
-/** Reads the reporterId for an issue without pulling in the full report-detail query. */
-export async function getReporterId(issueId: string): Promise<string | null> {
-	const rows = await db
+/**
+ * sentinel-user-report-issue §4.2 / SR-6: who reported an issue, without pulling in the full
+ * report-detail query.
+ *
+ * **The return is a tagged union, not a bare id, and that is the point.** This used to return
+ * `manual_issue_reports.reporter_id` -- a `"user".id` -- or `null`, and every caller compared it
+ * to a session user id. An externally-submitted report has no `manual_issue_reports` row, so it
+ * came back `null`; returning `external_reporters.id` in its place would have been worse, because
+ * that id lives in a DIFFERENT id space and a caller comparing it to a session user id would be
+ * asking a question with no meaning. The tag makes "is this caller the author?" answerable only
+ * after the caller has established WHICH KIND of reporter it is looking at.
+ *
+ * An external report has no org-member author, so no session user is ever its author -- which is
+ * exactly the authorization answer §2 wants: an external reporter is data, never a principal.
+ */
+export type IssueReporter =
+	| { kind: 'org_member'; userId: string }
+	| {
+			kind: 'external';
+			externalReporterId: string;
+			externalId: string;
+			displayName: string | null;
+			email: string | null;
+			firstSeenAt: Date;
+	  };
+
+export async function getReporterId(issueId: string): Promise<IssueReporter | null> {
+	const manualRows = await db
 		.select({ reporterId: manualIssueReports.reporterId })
 		.from(manualIssueReports)
 		.where(eq(manualIssueReports.issueId, issueId));
 
-	return rows[0]?.reporterId ?? null;
+	const manual = manualRows[0];
+	if (manual) {
+		return { kind: 'org_member', userId: manual.reporterId };
+	}
+
+	const externalRows = await db
+		.select({
+			externalReporterId: externalReporters.id,
+			externalId: externalReporters.externalId,
+			displayName: externalReporters.displayName,
+			email: externalReporters.email,
+			firstSeenAt: externalReporters.firstSeenAt,
+		})
+		.from(externalIssueReports)
+		.innerJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
+		.where(eq(externalIssueReports.issueId, issueId));
+
+	const external = externalRows[0];
+	if (!external) {
+		return null;
+	}
+
+	return { kind: 'external', ...external };
+}
+
+/** The org-member author's `"user".id`, or `null` when the report has none (external, or no
+ *  companion at all). The narrow question the PATCH/DELETE author gate actually asks. */
+export async function getAuthorUserId(issueId: string): Promise<string | null> {
+	const reporter = await getReporterId(issueId);
+	return reporter?.kind === 'org_member' ? reporter.userId : null;
 }

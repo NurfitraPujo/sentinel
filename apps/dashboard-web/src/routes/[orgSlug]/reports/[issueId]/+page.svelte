@@ -34,8 +34,8 @@
 
 	function startEdit() {
 		editTitle = data.detail.issue.message;
-		editBodyMd = data.detail.report.bodyMd;
-		editSeverity = data.detail.report.severity;
+		editBodyMd = data.detail.bodyMd;
+		editSeverity = data.detail.severity;
 		saveError = null;
 		editing = true;
 	}
@@ -157,7 +157,7 @@
 			</p>
 		</div>
 		<div class="header-badges">
-			<span class="severity-tag severity-{data.detail.report.severity}">{data.detail.report.severity}</span>
+			<span class="severity-tag severity-{data.detail.severity}">{data.detail.severity}</span>
 			<span class="status-tag status-{data.detail.issue.status}">{data.detail.issue.status}</span>
 			{#if data.detail.issue.waitingOn}
 				<span class="waiting-badge">waiting on {data.detail.issue.waitingOn}</span>
@@ -237,7 +237,7 @@
 		</div>
 	{:else}
 		<div class="report-body-panel">
-			<Markdown source={data.detail.report.bodyMd} />
+			<Markdown source={data.detail.bodyMd} />
 		</div>
 	{/if}
 

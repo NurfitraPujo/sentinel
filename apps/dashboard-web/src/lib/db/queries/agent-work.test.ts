@@ -39,6 +39,7 @@ vi.mock('$lib/db/schema', () => ({
 		id: 'id',
 		projectId: 'projectId',
 		issueType: 'issueType',
+		sourceChannel: 'sourceChannel',
 		message: 'message',
 		errorClass: 'errorClass',
 		status: 'status',
@@ -53,6 +54,10 @@ vi.mock('$lib/db/schema', () => ({
 	},
 	projects: { id: 'id', organizationId: 'organizationId', isInbox: 'isInbox', name: 'name' },
 	manualIssueReports: { issueId: 'issueId', severity: 'severity', reporterId: 'reporterId' },
+	// sentinel-user-report-issue §4.2's correction: `listAgentIssues` now left-joins the SECOND
+	// report companion and its reporter, so the schema double has to carry them too.
+	externalIssueReports: { issueId: 'issueId', severity: 'severity', externalReporterId: 'externalReporterId' },
+	externalReporters: { id: 'id', displayName: 'displayName' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
 }));
 

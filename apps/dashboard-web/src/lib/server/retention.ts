@@ -9,6 +9,8 @@ import {
 	projects,
 	agentIdempotencyKeys,
 	reportIdempotencyKeys,
+	externalIssueReports,
+	externalReporters,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
 import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency';
@@ -47,6 +49,13 @@ export interface RetentionResult {
 	tombstonesWritten: number;
 	deletedTombstones: number;
 	tombstoneRetentionDays: number;
+	// sentinel-user-report-issue §6: the manual-issue retention sweep has to know about the SECOND
+	// companion. `orphanCondition` below already ages an externally-sourced report out, because it
+	// keys on `issues.issue_type = 'user_report'` -- which an external report is -- and the
+	// `external_issue_reports` row goes with it through the FK cascade. What did NOT go with it is
+	// the `external_reporters` row, which has no cascade from `issues` at all and would otherwise
+	// outlive every report it ever made, forever. This counts the reporters reaped for that reason.
+	deletedExternalReporters: number;
 }
 
 /**
@@ -120,6 +129,13 @@ export async function cleanupRetainedData(
 	// A04: manual issues additionally require status IN ('resolved','ignored') -- never delete an
 	// 'unresolved' one, however old -- AND assigned_to IS NULL -- never delete a claimed one, agent
 	// or human, mid-triage -- AND the longer `manualCutoff`.
+	//
+	// sentinel-user-report-issue §6: this condition is COMPANION-AGNOSTIC and must stay that way.
+	// It keys on `issues.issue_type`, not on the presence of a `manual_issue_reports` row, so an
+	// externally-sourced report -- which is an `issue_type = 'user_report'` row with an
+	// `external_issue_reports` companion instead -- is aged out by exactly this branch, and its
+	// companion goes with it through that table's `ON DELETE CASCADE`. Narrowing this to the
+	// manual companion (a join, an EXISTS) would make every external report immortal.
 	const manualIssueOrphanCondition = and(
 		noOccurrencesCondition,
 		eq(issues.issueType, 'user_report'),
@@ -229,6 +245,27 @@ export async function cleanupRetainedData(
 		.returning({ id: issueTombstones.id });
 	const deletedTombstones = deletedTombstonesResult.length;
 
+	// sentinel-user-report-issue §6 / §4.6: reap external reporters that no longer have a report.
+	// `external_reporters` is referenced by `external_issue_reports.external_reporter_id` with no
+	// ON DELETE behaviour back from `issues`, so deleting a report above leaves the reporter row
+	// standing. Both conditions matter: no remaining report (a reporter with one live report must
+	// survive even if it has not been seen for a year) AND `last_seen_at` older than the same long
+	// `manualCutoff` the reports themselves use (a reporter that filed and had its report deleted
+	// yesterday is still a repeat reporter for §4.2's "first report from this person" signal).
+	const deletedExternalReportersResult = await db
+		.delete(externalReporters)
+		.where(
+			and(
+				lt(externalReporters.lastSeenAt, manualCutoff),
+				sql`NOT EXISTS (
+					SELECT 1 FROM ${externalIssueReports}
+					WHERE ${externalIssueReports.externalReporterId} = ${externalReporters.id}
+				)`
+			)
+		)
+		.returning({ id: externalReporters.id });
+	const deletedExternalReporters = deletedExternalReportersResult.length;
+
 	return {
 		deletedOccurrences,
 		deletedOrphanedIssues,
@@ -238,6 +275,7 @@ export async function cleanupRetainedData(
 		tombstonesWritten,
 		deletedTombstones,
 		tombstoneRetentionDays,
+		deletedExternalReporters,
 	};
 }
 

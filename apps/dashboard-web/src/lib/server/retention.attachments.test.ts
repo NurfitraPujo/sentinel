@@ -26,6 +26,13 @@ vi.mock('$lib/db/schema', () => ({
 	// N8: retention now also joins projects (for organization_id) and writes/prunes issueTombstones.
 	projects: { id: 'id', organizationId: 'organizationId' },
 	issueTombstones: { id: 'id', deletedAt: 'deletedAt' },
+	// sentinel-user-report-issue §6: the sweep also reaps `external_reporters` rows that no longer
+	// have a report -- nothing cascades to them from `issues`.
+	externalIssueReports: { issueId: 'issueId', externalReporterId: 'externalReporterId' },
+	externalReporters: { id: 'id', lastSeenAt: 'lastSeenAt' },
+	agentIdempotencyKeys: { id: 'id', createdAt: 'createdAt' },
+	reportIdempotencyKeys: { id: 'id', createdAt: 'createdAt' },
+	issueActivity: { id: 'id', issueId: 'issueId' },
 }));
 
 function makeQueueableDb() {

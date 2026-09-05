@@ -1,5 +1,12 @@
 import { db } from '$lib/server/db';
-import { issues, projects, manualIssueReports, errorOccurrences } from '$lib/db/schema';
+import {
+	issues,
+	projects,
+	manualIssueReports,
+	errorOccurrences,
+	externalIssueReports,
+	externalReporters,
+} from '$lib/db/schema';
 import { and, desc, eq, lt } from 'drizzle-orm';
 import { getAgentSettingsForProjects, type RepoConnectionRow } from '$lib/db/queries/agent-settings';
 
@@ -49,12 +56,34 @@ export async function getAgentIssueDetail(issueId: string): Promise<AgentIssueDe
 export interface AgentReportDetail {
 	bodyMd: string;
 	severity: string;
+	/** The reporting `"user".id`, and `null` for an external report -- an external reporter is DATA,
+	 *  never a Sentinel principal (§2), and has no row in the user id space. `reporterKind` is what
+	 *  a caller branches on; this field stays a user id or nothing. */
 	reporterId: string | null;
+	/** sentinel-user-report-issue §4.2 / SR-6. */
+	reporterKind: 'org_member' | 'external';
+	/** `external_reporters.id` for an external report, `null` for an org-member one. Never
+	 *  interchangeable with `reporterId`. */
+	externalReporterId: string | null;
+	reporterDisplayName: string | null;
+	/** Stored, and never a reply channel (MANUAL_ISSUES_DESIGN §0 Q1). */
+	reporterEmail: string | null;
+	/** The service's own opaque user id, for an external report. Never resolved, never trusted as
+	 *  identity (§2). */
+	reporterExternalId: string | null;
+	/** `external_issue_reports.context` verbatim, or `null` for an org-member report. */
+	context: Record<string, unknown> | null;
 }
 
-/** `user_report` issues only -- returns null for `system_error` issues (no companion row). */
+/**
+ * `user_report` issues only -- returns null for `system_error` issues (no companion row).
+ *
+ * SR-6 / §4.2's correction: this used to read `manual_issue_reports` alone, so an externally
+ * submitted report -- which has no row there -- came back `null` and an agent saw a title and
+ * nothing else. Both companions are read; exactly one of them exists for any `user_report` issue.
+ */
 export async function getAgentReportDetail(issueId: string): Promise<AgentReportDetail | null> {
-	const rows = await db
+	const manualRows = await db
 		.select({
 			bodyMd: manualIssueReports.bodyMd,
 			severity: manualIssueReports.severity,
@@ -62,7 +91,52 @@ export async function getAgentReportDetail(issueId: string): Promise<AgentReport
 		})
 		.from(manualIssueReports)
 		.where(eq(manualIssueReports.issueId, issueId));
-	return rows[0] ?? null;
+
+	const manual = manualRows[0];
+	if (manual) {
+		return {
+			bodyMd: manual.bodyMd,
+			severity: manual.severity,
+			reporterId: manual.reporterId,
+			reporterKind: 'org_member',
+			externalReporterId: null,
+			reporterDisplayName: null,
+			reporterEmail: null,
+			reporterExternalId: null,
+			context: null,
+		};
+	}
+
+	const externalRows = await db
+		.select({
+			bodyMd: externalIssueReports.bodyMd,
+			severity: externalIssueReports.severity,
+			context: externalIssueReports.context,
+			externalReporterId: externalReporters.id,
+			displayName: externalReporters.displayName,
+			email: externalReporters.email,
+			externalId: externalReporters.externalId,
+		})
+		.from(externalIssueReports)
+		.innerJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
+		.where(eq(externalIssueReports.issueId, issueId));
+
+	const external = externalRows[0];
+	if (!external) {
+		return null;
+	}
+
+	return {
+		bodyMd: external.bodyMd,
+		severity: external.severity,
+		reporterId: null,
+		reporterKind: 'external',
+		externalReporterId: external.externalReporterId,
+		reporterDisplayName: external.displayName,
+		reporterEmail: external.email,
+		reporterExternalId: external.externalId,
+		context: (external.context ?? null) as Record<string, unknown> | null,
+	};
 }
 
 export interface AgentOccurrence {

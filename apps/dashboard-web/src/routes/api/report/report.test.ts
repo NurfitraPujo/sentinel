@@ -20,12 +20,14 @@ const upsertExternalReporter = vi.fn();
 const createExternalIssueReport = vi.fn();
 const findReportIdempotency = vi.fn();
 const deleteExpiredReportIdempotency = vi.fn();
+const runTriage = vi.fn();
 
 vi.mock('$lib/server/report-auth', async () => {
 	const actual = await vi.importActual<typeof import('$lib/server/report-auth')>('$lib/server/report-auth');
 	return { ...actual, authenticateReportKey, resolveReportProject };
 });
 vi.mock('$lib/db/queries/external-reporters', () => ({ upsertExternalReporter }));
+vi.mock('$lib/server/triage', () => ({ runTriage }));
 vi.mock('$lib/db/queries/reports', async () => {
 	const actual = await vi.importActual<typeof import('$lib/db/queries/reports')>('$lib/db/queries/reports');
 	return { ...actual, createExternalIssueReport };
@@ -93,11 +95,38 @@ beforeEach(() => {
 	createExternalIssueReport.mockResolvedValue({ issue: { id: ISSUE_ID }, report: {} });
 	findReportIdempotency.mockResolvedValue(null);
 	deleteExpiredReportIdempotency.mockResolvedValue(true);
+	runTriage.mockResolvedValue({
+		ranAt: '2026-09-04T09:12:04.000Z',
+		strategy: 'window_release',
+		candidates: [],
+	});
 });
 
 describe('§4.1-b success', () => {
-	it('returns 201 with report_id, issue_id, status=created, deduplicated=false, triage=null', async () => {
+	it('returns 201 with report_id, issue_id, status=created, deduplicated=false and the inline triage object', async () => {
 		const res = await post();
+		expect(res.status).toBe(201);
+		expect(res.json).toEqual({
+			report_id: ISSUE_ID,
+			issue_id: ISSUE_ID,
+			status: 'created',
+			deduplicated: false,
+			// §4.1-b: "the §4.2 `triage` object, inline". OQ-1 variant (b) makes triage inline-capable
+			// and §4.3 runs it inside this request, after creation has committed.
+			triage: { ranAt: '2026-09-04T09:12:04.000Z', strategy: 'window_release', candidates: [] },
+		});
+		expect(res.headers.get('Content-Type')).toBe('application/json');
+	});
+
+	// §12 / be.md criterion 16, and the one that decides whether this endpoint degrades or loses
+	// data: triage runs AFTER creation has committed, so a matcher that throws costs a `triage`
+	// object and nothing else. If this ever goes red as a 500, a reporter's report is being thrown
+	// away because a heuristic failed.
+	it('a FORCED triage failure yields triage: null and a CREATED report — never a 500, never a lost report', async () => {
+		runTriage.mockRejectedValueOnce(new Error('deliberate triage failure'));
+
+		const res = await post();
+
 		expect(res.status).toBe(201);
 		expect(res.json).toEqual({
 			report_id: ISSUE_ID,
@@ -106,7 +135,24 @@ describe('§4.1-b success', () => {
 			deduplicated: false,
 			triage: null,
 		});
-		expect(res.headers.get('Content-Type')).toBe('application/json');
+		// The report was created, and creation was not rolled back or retried by the failure.
+		expect(createExternalIssueReport).toHaveBeenCalledTimes(1);
+	});
+
+	it('triage runs AFTER creation, so it can never abort it', async () => {
+		const order: string[] = [];
+		createExternalIssueReport.mockImplementationOnce(async () => {
+			order.push('create');
+			return { issue: { id: ISSUE_ID }, report: {} };
+		});
+		runTriage.mockImplementationOnce(async () => {
+			order.push('triage');
+			return { ranAt: '2026-09-04T09:12:04.000Z', strategy: 'window_release', candidates: [] };
+		});
+
+		await post();
+
+		expect(order).toEqual(['create', 'triage']);
 	});
 
 	it('creates with source_channel/issue_type via createExternalIssueReport, never createManualIssue', async () => {

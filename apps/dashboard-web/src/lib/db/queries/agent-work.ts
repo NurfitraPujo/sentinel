@@ -1,5 +1,12 @@
 import { db } from '$lib/server/db';
-import { issues, projects, manualIssueReports, issueActivity } from '$lib/db/schema';
+import {
+	issues,
+	projects,
+	manualIssueReports,
+	issueActivity,
+	externalIssueReports,
+	externalReporters,
+} from '$lib/db/schema';
 import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
@@ -33,6 +40,11 @@ export const AGENT_ISSUES_MAX_LIMIT = 200;
 
 export type AgentIssuesSort = 'firstSeen' | 'lastSeen';
 
+/** `issues.source_channel`'s vocabulary after §4.6's CHECK swap. */
+export const AGENT_ISSUE_SOURCES = ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'] as const;
+
+export type AgentIssueSource = (typeof AGENT_ISSUE_SOURCES)[number];
+
 export interface AgentIssuesCursor {
 	/** The value of the sort column (firstSeen or lastSeen) on the last row of the prior page. */
 	sortValue: Date;
@@ -52,6 +64,13 @@ export interface ListAgentIssuesOptions {
 	claimedByAgentId?: string;
 	projectId?: string;
 	waiting?: boolean;
+	/**
+	 * SR-6 / OQ-8: filter on `issues.source_channel`. §6's stated mitigation for the volume and
+	 * character change external intake brings -- a filter and a badge -- is a dashboard query
+	 * parameter and a Svelte component and does NOT reach the agent API, so the agent feed gets its
+	 * own. Omitted = every source, byte-identical to the pre-existing behaviour.
+	 */
+	source?: AgentIssueSource;
 	/** Only issues whose firstSeen >= since. */
 	since?: Date;
 	/** Sort column; default 'lastSeen' matches pre-N7b behavior. Always ordered descending. */
@@ -82,7 +101,15 @@ export interface AgentIssueListItem {
 	lastSeen: Date | null;
 	count: number;
 	severity: string | null;
+	/** The reporting `"user".id`. Stays `null` for an external report -- see `reporterKind`. */
 	reporterId: string | null;
+	/** SR-6: `null` for a `system_error` issue, otherwise which door the report came through. */
+	reporterKind: 'org_member' | 'external' | null;
+	/** SR-6: the external reporter's display name, `null` for every other row. */
+	reporterDisplayName: string | null;
+	/** SR-6 / OQ-8: `issues.source_channel`, so an agent can tell an externally-sourced report from
+	 *  an org-member one without a second request. */
+	sourceChannel: string;
 	isWaiting: boolean;
 	/** N7e (A07): when the CURRENT claim (assigneeType/assignedTo) was made -- null if unclaimed. */
 	claimedAt: Date | null;
@@ -147,6 +174,9 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	if (options.waiting === true) {
 		conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
 	}
+	if (options.source) {
+		conditions.push(eq(issues.sourceChannel, options.source));
+	}
 	if (options.since) {
 		conditions.push(gte(issues.firstSeen, options.since));
 	}
@@ -184,13 +214,22 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			firstSeen: issues.firstSeen,
 			lastSeen: issues.lastSeen,
 			count: issues.count,
-			// Manual reports only: null for system_error rows (left join).
-			severity: manualIssueReports.severity,
+			sourceChannel: issues.sourceChannel,
+			// Reports only: null for system_error rows (left joins). SR-6 / §4.2's correction --
+			// reading only `manual_issue_reports` here made `severity` and `reporterId` silently
+			// null for every externally-submitted report, which is indistinguishable from "this is
+			// not a report" to the agent that reads them.
+			severity: sql<string | null>`coalesce(${manualIssueReports.severity}, ${externalIssueReports.severity})`,
 			reporterId: manualIssueReports.reporterId,
+			manualIssueId: manualIssueReports.issueId,
+			externalIssueId: externalIssueReports.issueId,
+			reporterDisplayName: externalReporters.displayName,
 		})
 		.from(issues)
 		.innerJoin(projects, eq(projects.id, issues.projectId))
 		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
 		.where(and(...conditions))
 		.orderBy(desc(sortColumn), desc(issues.id));
 
@@ -201,13 +240,20 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	const hasMore = clampedLimit !== undefined && rows.length > clampedLimit;
 	const page = hasMore ? rows.slice(0, clampedLimit) : rows;
 
-	const mapped: AgentIssueListItem[] = page.map((row: (typeof rows)[number]) => ({
-		...row,
+	const mapped: AgentIssueListItem[] = page.map((row: (typeof rows)[number]) => {
+		// `manualIssueId`/`externalIssueId` are companion-presence probes, not response fields --
+		// destructured out so they never reach the agent's JSON.
+		const { manualIssueId, externalIssueId, ...rest } = row;
+		return {
+		...rest,
+		reporterKind: manualIssueId !== null ? 'org_member' : externalIssueId !== null ? 'external' : null,
+		reporterDisplayName: externalIssueId !== null ? row.reporterDisplayName : null,
 		isWaiting: row.waitingOn !== null,
 		// N9 (C12): only surface waitingSince for a currently-waiting issue -- a cleared question can
 		// leave a stale timestamp behind (issues.ts backfill/re-open paths), so gate on waitingOn.
 		waitingSince: row.waitingOn !== null ? row.waitingSince : null,
-	}));
+		};
+	});
 
 	let nextCursor: string | undefined;
 	if (hasLimit && hasMore) {
