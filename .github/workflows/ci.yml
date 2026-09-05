@@ -11,6 +11,12 @@
 # recorded: that number was measured against a corrupted shared dev database. Do not add a leniency marker
 # back without first re-running the job and recording why in docs/memory/VERIFIED_STATE.md.
 #
+# Runners: the tuju-ai org runs its own `self-hosted,linux,tuju-ai-runner` pool and has NO
+# GitHub-hosted minutes, so `runs-on: ubuntu-latest` is never picked up: on 2026-09-05 every
+# job of this workflow failed in ~2s with an empty `runner_name` and zero steps executed, on a
+# branch whose code was fine. Matched to core and web, which use the same expression: the
+# `vars.CI_RUNNER_LABELS` override lets a repo or the org retarget the pool without editing
+# this file, and the literal is the fallback when that variable is unset.
 # `task` (go-task) is intentionally never invoked here (see CLAUDE.md / constraint C6): it is not installed on
 # contributor machines in this repo, so CI calls the underlying go/pnpm/buf/docker commands directly.
 
@@ -50,7 +56,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   go-root:
     name: go-root
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     env:
       GOWORK: "off"
     steps:
@@ -88,7 +94,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   go-sdk:
     name: go-sdk (go ${{ matrix.go-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     env:
       GOWORK: "off"
     defaults:
@@ -129,7 +135,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   go-migrations:
     name: go-migrations
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     env:
       GOWORK: "off"
     defaults:
@@ -160,7 +166,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   sentinel-cli:
     name: sentinel-cli
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     env:
       GOWORK: "off"
     defaults:
@@ -203,7 +209,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   dashboard:
     name: dashboard
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     defaults:
       run:
         working-directory: apps/dashboard-web
@@ -306,7 +312,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   integration:
     name: integration
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     # P0-5 has landed: docker-compose.yml now has a `redis` service with a healthcheck and a one-shot `migrate`
     # step, and `docker compose up -d` reaches an all-healthy state. The leniency below is NOT about P0-5
     # anymore — it stays because the suite itself still has ~15 real, unowned failures once the stack is up:
@@ -377,7 +383,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   proto:
     name: proto
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -434,7 +440,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   contract:
     name: contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -491,7 +497,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   e2e:
     name: e2e
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     steps:
       - uses: actions/checkout@v4
 
