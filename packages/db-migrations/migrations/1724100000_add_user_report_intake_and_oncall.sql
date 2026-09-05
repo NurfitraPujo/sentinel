@@ -98,8 +98,11 @@ CREATE TABLE IF NOT EXISTS oncall_schedules (
     timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
     kind VARCHAR(20) NOT NULL CHECK (kind IN ('daily', 'weekly')),
     handoff_time TIME NOT NULL,
-    -- Null unless weekly (§4.6). 0-6, ISO-style with 0 = Sunday, matching the JS getDay() the
-    -- dashboard resolves it with. Guarded by oncall_schedules_handoff_weekday_check below.
+    -- Null unless weekly (§4.6). Written 0-6 by this file's own vintage (0 = Sunday, matching the
+    -- JS getDay() the dashboard resolved it with); re-encoded to ISO 1-7 by
+    -- 1724200000_add_oncall_rotation_anchor.sql. Guarded by
+    -- oncall_schedules_handoff_weekday_check below, which accepts BOTH encodings -- see BUG-03
+    -- at that constraint.
     handoff_weekday SMALLINT,
     active BOOLEAN NOT NULL DEFAULT true,
     created_by VARCHAR(255) NOT NULL,
@@ -107,6 +110,21 @@ CREATE TABLE IF NOT EXISTS oncall_schedules (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- REPLAY SAFETY (BUG-03). The range is 0 AND 7, not 0 AND 6, deliberately. Under A1 one flat
+-- directory serves several goose ledgers against the SAME physical database, so this file is
+-- replayed per target -- including AFTER 1724200000_add_oncall_rotation_anchor.sql has re-encoded
+-- Sunday to ISO 7 and narrowed this constraint to `BETWEEN 1 AND 7`. This swap is an
+-- unconditional DROP + ADD, so a replay re-imposes whatever it names; naming 0-6 re-narrowed a
+-- constraint 1724200000 had already superseded, and Postgres validates an ADD CONSTRAINT against
+-- existing rows: `check constraint "oncall_schedules_handoff_weekday_check" of relation
+-- "oncall_schedules" is violated by some row` on any live ISO Sunday. The dashboard's PUT
+-- validates with isIsoWeekday (1..7) and writes 7 for Sunday, so that row is one an operator
+-- creates through the shipped UI, not a hypothetical.
+--
+-- Widening to the UNION of both encodings (0 = old Sunday .. 7 = ISO Sunday) makes this file the
+-- no-op on an already-applied schema its header promises to be, in either replay order. It only
+-- ever loosens: 1724200000 follows immediately in the same directory and narrows the live
+-- constraint back to ISO 1-7, which is the range that judges every write the application makes.
 DO $$
 BEGIN
   IF EXISTS (
@@ -117,7 +135,7 @@ BEGIN
   END IF;
 
   ALTER TABLE oncall_schedules ADD CONSTRAINT oncall_schedules_handoff_weekday_check CHECK (
-    (kind = 'weekly' AND handoff_weekday IS NOT NULL AND handoff_weekday BETWEEN 0 AND 6)
+    (kind = 'weekly' AND handoff_weekday IS NOT NULL AND handoff_weekday BETWEEN 0 AND 7)
     OR (kind = 'daily' AND handoff_weekday IS NULL)
   );
 END $$;
