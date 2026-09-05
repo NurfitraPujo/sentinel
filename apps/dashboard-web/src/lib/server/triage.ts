@@ -171,6 +171,14 @@ export function scoreTriageCandidates(
 	return scored.slice(0, Math.max(0, maxCandidates)).map((entry) => entry.candidate);
 }
 
+/**
+ * Whatever runs the candidate query. `db` in production; a `db.transaction` callback's `tx` in the
+ * timezone regression test, which is the only way to pin `SET LOCAL TIME ZONE` and the SELECT to
+ * the SAME pooled session — the claim that the window bounds are session-independent is not
+ * observable otherwise.
+ */
+export type TriageExecutor = Pick<typeof db, 'execute'> | Tx;
+
 export interface FindTriageCandidatesOptions {
 	projectId: string;
 	windowStart: Date;
@@ -200,19 +208,26 @@ export interface FindTriageCandidatesOptions {
  * a cross-tenant read the WHERE then throws away.
  */
 export async function findTriageCandidates(
-	options: FindTriageCandidatesOptions
+	options: FindTriageCandidatesOptions,
+	executor: TriageExecutor = db
 ): Promise<TriageCandidateRow[]> {
 	const limit = Math.max(1, options.limit ?? TRIAGE_MAX_CANDIDATES);
 
 	// Bound as ISO strings and cast, never as `Date` objects: `db.execute` hands parameters to
 	// postgres-js's `unsafe` path, which does not run its Date serializer and throws on one. The
-	// same reason agent-work.ts's keyset cursor binds `.toISOString()`. `error_occurrences.created_at`
-	// is `timestamp` (no zone) holding UTC, so `::timestamp` on a `Z`-suffixed literal is the
-	// comparison that means what it says.
+	// same reason agent-work.ts's keyset cursor binds `.toISOString()`.
+	//
+	// The cast is `::timestamptz`, and that is load-bearing. `error_occurrences.created_at` is
+	// `TIMESTAMP WITH TIME ZONE` (packages/db-migrations/migrations/1716508800_init.sql), so a
+	// `::timestamp` cast would DROP the `Z` off the ISO literal and Postgres would then re-read the
+	// naive value in the SESSION's `TimeZone` — silently sliding the window by the server's UTC
+	// offset and returning zero candidates on any deployment whose `timezone` GUC is not UTC, with
+	// no error and no log. `::timestamptz` parses the offset and is session-independent. The
+	// `::timestamp` in `agent-work.ts`'s keyset cursor carries the same bug; do not copy it.
 	const windowStartIso = options.windowStart.toISOString();
 	const windowEndIso = options.windowEnd.toISOString();
 
-	const result = await db.execute(sql`
+	const result = await executor.execute(sql`
 		SELECT
 			i.id AS issue_id,
 			i.message AS message,
@@ -228,8 +243,8 @@ export async function findTriageCandidates(
 				array_remove(array_agg(DISTINCT eo.environment), NULL) AS environments
 			FROM error_occurrences eo
 			WHERE eo.issue_id = i.id
-			  AND eo.created_at >= ${windowStartIso}::timestamp
-			  AND eo.created_at <= ${windowEndIso}::timestamp
+			  AND eo.created_at >= ${windowStartIso}::timestamptz
+			  AND eo.created_at <= ${windowEndIso}::timestamptz
 		) occ
 		WHERE i.project_id = ${options.projectId}
 		  AND i.issue_type = 'system_error'

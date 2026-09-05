@@ -223,6 +223,50 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 		});
 	});
 
+	describe('the window bounds — session-independence (BUG-04)', () => {
+		it('finds the in-window occurrence with the session TimeZone set to Asia/Jakarta', async () => {
+			// The regression this file exists to hold: the bounds used to be cast `::timestamp`,
+			// which drops the `Z` off the ISO literal and lets Postgres re-read the naive value in
+			// the SESSION's TimeZone. Under a non-UTC session that slides the window by the UTC
+			// offset (+07:00 here), the candidate set comes back EMPTY, and nothing anywhere says
+			// so: no error, no log, and §4.2's `null` vs `[]` distinction reads it as
+			// "looked, found nothing". Every other case in this file runs against a UTC-defaulted
+			// container and so cannot see it.
+			//
+			// `SET LOCAL` inside `db.transaction` and the query through the same `tx` is the point:
+			// the pool hands out sessions, so a `SET` on one connection says nothing about the
+			// connection the next query lands on.
+			const issueId = await seedSystemError({ message: 'jakarta session', at: minutes(-5) });
+			const { windowStart, windowEnd } = triage.triageWindow(OCCURRED_AT, 30);
+			const drizzleSql = (await import('drizzle-orm')).sql;
+
+			const { zone, ids } = await db.transaction(async (tx) => {
+				await tx.execute(drizzleSql`SET LOCAL TIME ZONE 'Asia/Jakarta'`);
+				// Prove the session really is non-UTC, so a green assertion below cannot be a
+				// SET that silently did nothing.
+				const shown = await tx.execute(drizzleSql`SHOW TimeZone`);
+				const rows = await triage.findTriageCandidates(
+					{
+						projectId,
+						windowStart,
+						windowEnd,
+						release: null,
+						environment: null,
+						limit: 50,
+					},
+					tx
+				);
+				return {
+					zone: (shown as unknown as Record<string, string>[])[0].TimeZone,
+					ids: rows.map((row) => row.issueId),
+				};
+			});
+
+			expect(zone).toBe('Asia/Jakarta');
+			expect(ids).toContain(issueId);
+		});
+	});
+
 	describe('the write discipline — §4.3\'s "part that is not tuning"', () => {
 		it('a 0.4 candidate comes back linked:false and writes NO issue_relations row', async () => {
 			// Window only: the report names no release, so nothing can reach 0.7.
