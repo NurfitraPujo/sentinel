@@ -14,9 +14,15 @@
 # PR scope (2026-09-06, operator): a pull request proves the tree still BUILDS - `go build`,
 # `go vet`, `pnpm build` and the proto codegen-drift gate all run. What it no longer runs is
 # TESTS: the unit suites are guarded step-by-step, and `integration`, `contract` and `e2e` are
-# guarded whole, because those three boot a full compose stack and rebuild every image. All of
-# it still runs on push to main. The reason is the shared self-hosted pool, not the tests'
-# worth: one sentinel PR was claiming ten runner slots while core, web and cdc-pipeline queued.
+# guarded whole. The unit suites run on push to main. `integration`, `contract` and `e2e` run
+# NOWHERE automatically as of 2026-09-06 (operator): not on a PR, not on a push. They boot a
+# full compose stack and rebuild every image, and they are what starved a self-hosted pool
+# shared with core, web and cdc-pipeline. They are kept, not deleted, and stay runnable with
+# `gh workflow run ci.yml --ref <branch>` when someone wants them.
+# NOTE the consequence: nothing automatic exercises the running stack any more. The e2e
+# recovery plan this file was built for (docs/plans/E2E_RECOVERY_PLAN.md) assumed these three
+# were the safety net; they are now opt-in, so a stack-level regression will reach production
+# unless somebody dispatches them or the deploy is verified by hand.
 # What a green PR means here: it compiles. It does not mean the suite passed.
 #
 # Runners: the tuju-ai org runs its own `self-hosted,linux,tuju-ai-runner` pool and has NO
@@ -37,6 +43,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # `integration`, `contract` and `e2e` are reachable ONLY from here - a deliberate
+  # `gh workflow run` - never from a push or a pull request. See their job guards.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -331,9 +340,12 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   integration:
     name: integration
-    # Not a PR check: the self-hosted pool is shared and sentinel was taking ten
-    # slots at once. Runs on push to main, where it gates what actually lands.
-    if: github.event_name != 'pull_request'
+    # OFF in CI entirely (operator, 2026-09-06): not on pull_request AND not on push.
+    # These three boot a full compose stack and rebuild every image in the repo, and
+    # they are what starved a self-hosted pool shared with core, web and cdc-pipeline.
+    # They remain runnable on demand - `gh workflow run ci.yml --ref <branch>` - so the
+    # harness is kept rather than deleted, but nothing schedules them automatically.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     # P0-5 has landed: docker-compose.yml now has a `redis` service with a healthcheck and a one-shot `migrate`
     # step, and `docker compose up -d` reaches an all-healthy state. The leniency below is NOT about P0-5
@@ -462,9 +474,12 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   contract:
     name: contract
-    # Not a PR check: the self-hosted pool is shared and sentinel was taking ten
-    # slots at once. Runs on push to main, where it gates what actually lands.
-    if: github.event_name != 'pull_request'
+    # OFF in CI entirely (operator, 2026-09-06): not on pull_request AND not on push.
+    # These three boot a full compose stack and rebuild every image in the repo, and
+    # they are what starved a self-hosted pool shared with core, web and cdc-pipeline.
+    # They remain runnable on demand - `gh workflow run ci.yml --ref <branch>` - so the
+    # harness is kept rather than deleted, but nothing schedules them automatically.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     steps:
       - uses: actions/checkout@v4
@@ -522,9 +537,12 @@ jobs:
   # ---------------------------------------------------------------------------------------------------------
   e2e:
     name: e2e
-    # Not a PR check: the self-hosted pool is shared and sentinel was taking ten
-    # slots at once. Runs on push to main, where it gates what actually lands.
-    if: github.event_name != 'pull_request'
+    # OFF in CI entirely (operator, 2026-09-06): not on pull_request AND not on push.
+    # These three boot a full compose stack and rebuild every image in the repo, and
+    # they are what starved a self-hosted pool shared with core, web and cdc-pipeline.
+    # They remain runnable on demand - `gh workflow run ci.yml --ref <branch>` - so the
+    # harness is kept rather than deleted, but nothing schedules them automatically.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     steps:
       - uses: actions/checkout@v4
