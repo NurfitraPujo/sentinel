@@ -41,6 +41,15 @@ export const organizationInvitations = pgTable('organization_invitations', {
 	// time that the inviter still holds authority to grant `role` -- see the migration's comment
 	// (1722500000) for why a demoted/removed inviter's outstanding grant must not still honor.
 	invitedBy: varchar('invited_by', { length: 255 }).references(() => users.id, { onDelete: 'set null' }),
+	// sentinel-project-environments §4.10a, decision 28. NULL = the invitation carries no scope and
+	// the accepted member is unrestricted; every existing row is NULL and none is backfilled.
+	// JSONB rather than a child table: the value is a short list of {projectId, environments}
+	// entries that exists only between sending an invitation and accepting it, is read exactly once,
+	// and a child table would need its own cascade on a row that is already deleted on acceptance.
+	//
+	// NOTE: contract §4.9/§4.10a call this table `invitations`. It is `organization_invitations`
+	// here and there is no table by the other name -- see the migration's comment and status/be.md.
+	environmentScopes: jsonb('environment_scopes'),
 });
 
 export const userSessionPreferences = pgTable('user_session_preferences', {
@@ -76,6 +85,13 @@ export const projectMembers = pgTable('project_members', {
 export const issues = pgTable('issues', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	projectId: uuid('project_id').notNull().references(() => projects.id),
+	// sentinel-project-environments §4.9: part of the issue's IDENTITY, not a display field. The
+	// migrated column is NOT NULL with no DEFAULT and the table's unique constraint is
+	// (project_id, environment, fingerprint), so every insert must supply it -- all three writers do
+	// (store.go, and reports.ts's createManualIssue/createExternalIssueReport via
+	// resolveReportEnvironment). Declared without a default deliberately: a default here would let a
+	// new write path omit it and still compile.
+	environment: varchar('environment', { length: 50 }).notNull(),
 	fingerprint: varchar('fingerprint', { length: 64 }).notNull(),
 	message: text('message').notNull(),
 	errorClass: varchar('error_class', { length: 255 }).notNull(),
@@ -318,6 +334,50 @@ export const errorSearchIndex = pgTable('error_search_index', {
 // projectApiKeys above: organizationId NOT NULL, projectId nullable, NULL meaning organization-wide (applies
 // to every project in the organization). A composite FK on (projectId, organizationId) enforces at the DB
 // level that a project-scoped config's project actually belongs to the organization it names.
+// sentinel-project-environments §4.9's registry. A row exists here because a PERSON declared it
+// (decision 8): the processor TOUCHES this table (first_seen_at/last_seen_at, §4.8) and never
+// inserts, and the migration creates no rows at all. Every project's registry is empty on day one
+// by design, so §4.1's empty-collection case is the normal state, not an edge one.
+//
+// `name` is the join key and matches issues.environment and error_occurrences.environment. It is
+// immutable (decision 3) -- `displayName` is what a rename changes -- which is what makes a
+// name-keyed grant safe.
+export const projectEnvironments = pgTable('project_environments', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	name: varchar('name', { length: 50 }).notNull(),
+	displayName: varchar('display_name', { length: 64 }).notNull(),
+	// Consumed by §4.7's new-config default (decision 11) and by nothing else. "At most one default
+	// per project" is a database fact, not a hope in the handler: the migration carries a partial
+	// unique index on (project_id) WHERE is_default.
+	isDefault: boolean('is_default').notNull().default(false),
+	// Display only, NEVER access. §4.10's grants are access.
+	hidden: boolean('hidden').notNull().default(false),
+	// NULL until §4.8's UPDATE first touches the row.
+	firstSeenAt: timestamp('first_seen_at', { withTimezone: true }),
+	lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	uniqueProjectName: uniqueIndex('project_environments_project_id_name_key').on(table.projectId, table.name),
+}));
+
+// sentinel-project-environments §2.2's grant. The ABSENCE of a row is what makes this narrow
+// nobody: no row for (user, project) means that user is unrestricted in that project, so the
+// migration creates none and nothing about who sees what changes when it lands.
+//
+// `environments` is a name-keyed TEXT[] with a CHECK that it is non-empty -- §4.10 rejects `[]`
+// outright, because an empty grant would silently mean "sees nothing" rather than "sees everything".
+export const projectEnvironmentGrants = pgTable('project_environment_grants', {
+	userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	environments: text('environments').array().notNull(),
+	createdBy: text('created_by').notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.userId, table.projectId] }),
+	byProject: index('idx_project_environment_grants_project').on(table.projectId),
+}));
+
 export const alertConfigs = pgTable('alert_configs', {
 	id: uuid('id').primaryKey().defaultRandom(),
 	organizationId: uuid('organization_id').notNull().references(() => organizations.id),
@@ -327,6 +387,12 @@ export const alertConfigs = pgTable('alert_configs', {
 	frequencyThreshold: integer('frequency_threshold').notNull().default(50),
 	frequencyWindowSeconds: integer('frequency_window_seconds').notNull().default(60),
 	enabled: boolean('enabled').notNull().default(true),
+	// sentinel-project-environments §4.9, decisions 6 and 11. NULL = every environment, which is
+	// what every existing row is: the migration adds the column with DEFAULT NULL and backfills
+	// nothing, because a schema change must not silently change who is alerted. TEXT[] rather than a
+	// join table so refreshConfigs' single SELECT (processor-go/alerts/dispatcher.go) stays a single
+	// SELECT.
+	environments: text('environments').array(),
 	createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 

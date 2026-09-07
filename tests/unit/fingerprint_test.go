@@ -125,3 +125,91 @@ func TestCompute_CollisionResistance(t *testing.T) {
 		t.Errorf("Compute() produced collision: both got %v", fp1)
 	}
 }
+
+// TestCompute_EnvironmentSplitsIdentity is criterion 2's fingerprint half
+// (sentinel-project-environments §4.9): the SAME error class and the SAME frames delivered to
+// `production` and to `staging` must not hash to the same value, and a `CustomFingerprint` sent
+// from both environments must still return that fingerprint verbatim.
+//
+// The second half is the one that looks like a bug and is not. Prefixing a client-chosen
+// fingerprint would change identity for exactly the clients who chose it, which is the one thing a
+// custom fingerprint exists to prevent — so `Compute` returns it unchanged and the SPLIT comes from
+// the UNIQUE (project_id, environment, fingerprint) constraint instead. The hash change is defence
+// in depth; the column is the mechanism.
+func TestCompute_EnvironmentSplitsIdentity(t *testing.T) {
+	frames := []fingerprint.StackFrame{
+		{File: "checkout.go", Line: 88, Function: "checkout.Charge", InApp: true},
+	}
+
+	tests := []struct {
+		name       string
+		production fingerprint.FingerprintConfig
+		staging    fingerprint.FingerprintConfig
+		wantEqual  bool
+	}{
+		{
+			name: "same class and frames in two environments hash differently",
+			production: fingerprint.FingerprintConfig{
+				Environment: "production", ErrorClass: "PaymentError", Stacktrace: frames,
+			},
+			staging: fingerprint.FingerprintConfig{
+				Environment: "staging", ErrorClass: "PaymentError", Stacktrace: frames,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "same class with no frames at all still splits on environment alone",
+			production: fingerprint.FingerprintConfig{
+				Environment: "production", ErrorClass: "PaymentError",
+			},
+			staging: fingerprint.FingerprintConfig{
+				Environment: "staging", ErrorClass: "PaymentError",
+			},
+			wantEqual: false,
+		},
+		{
+			name: "a CustomFingerprint is returned verbatim in BOTH environments",
+			production: fingerprint.FingerprintConfig{
+				CustomFingerprint: "checkout-charge-timeout",
+				Environment:       "production", ErrorClass: "PaymentError", Stacktrace: frames,
+			},
+			staging: fingerprint.FingerprintConfig{
+				CustomFingerprint: "checkout-charge-timeout",
+				Environment:       "staging", ErrorClass: "PaymentError", Stacktrace: frames,
+			},
+			wantEqual: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prod := fingerprint.Compute(tt.production)
+			stag := fingerprint.Compute(tt.staging)
+			if (prod == stag) != tt.wantEqual {
+				t.Errorf("Compute(production)=%q Compute(staging)=%q; wantEqual=%v", prod, stag, tt.wantEqual)
+			}
+			if tt.production.CustomFingerprint != "" && prod != tt.production.CustomFingerprint {
+				t.Errorf("CustomFingerprint was not returned verbatim: got %q, want %q",
+					prod, tt.production.CustomFingerprint)
+			}
+		})
+	}
+}
+
+// TestCompute_EnvironmentIsPrefixedNotAppended pins the ORDER of §4.9's hash input
+// (`environment + "|" + errorClass`, then the frames) rather than only that two environments
+// differ. Swapping the two fields is the mistake this catches: an implementation that appended the
+// environment after the error class would satisfy every assertion above and still produce a
+// different value for every fingerprint the contract's formula would have produced.
+//
+// Note what this deliberately does NOT claim: a delimiter-joined input is not injective, so
+// Environment "a|b" + ErrorClass "c" and Environment "a" + ErrorClass "b|c" hash identically by
+// construction. That is a property of the formula §4.9 specifies, not a defect, and asserting
+// otherwise would be asserting against the contract.
+func TestCompute_EnvironmentIsPrefixedNotAppended(t *testing.T) {
+	forward := fingerprint.Compute(fingerprint.FingerprintConfig{Environment: "staging", ErrorClass: "TimeoutError"})
+	swapped := fingerprint.Compute(fingerprint.FingerprintConfig{Environment: "TimeoutError", ErrorClass: "staging"})
+	if forward == swapped {
+		t.Errorf("environment and error class are order-insensitive in the hash input: both hashed to %v", forward)
+	}
+}

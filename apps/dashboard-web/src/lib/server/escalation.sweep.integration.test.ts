@@ -119,8 +119,8 @@ function sweepRequest() {
 async function seedReport(): Promise<string> {
 	const issueId = randomUUID();
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
-		values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'Save spins forever'},
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel)
+		values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'Save spins forever'},
 		        ${'UserReport'}, ${'user_report'}, ${'user_report_api'})
 	`;
 	return issueId;
@@ -304,8 +304,8 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))(
 				`;
 				const issueId = randomUUID();
 				await sql`
-					insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
-					values (${issueId}, ${otherProject}, ${'fp-' + issueId}, ${'no rota'}, ${'UserReport'},
+					insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel)
+					values (${issueId}, ${otherProject}, ${'production'}, ${'fp-' + issueId}, ${'no rota'}, ${'UserReport'},
 					        ${'user_report'}, ${'user_report_api'})
 				`;
 
@@ -669,8 +669,8 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))(
 				async function seedStaleOrgChain(deadlineAt: Date): Promise<string> {
 					const issueId = randomUUID();
 					await sql`
-						insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
-						values (${issueId}, ${staleProjectId}, ${'fp-' + issueId}, ${'Save spins forever'},
+						insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel)
+						values (${issueId}, ${staleProjectId}, ${'production'}, ${'fp-' + issueId}, ${'Save spins forever'},
 						        ${'UserReport'}, ${'user_report'}, ${'user_report_api'})
 					`;
 					await sql`

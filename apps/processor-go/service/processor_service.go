@@ -201,7 +201,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 
 	var projectID string
 	issue := &store.Issue{
-		ID:          uuid.New().String(),
+		ID: uuid.New().String(),
+		// sentinel-project-environments §4.9: part of the issue's identity, not just the
+		// occurrence's. Taken from the event (§4.8) — the registry is never consulted here.
+		Environment: evt.Environment,
 		Fingerprint: evt.Fingerprint,
 		Message:     evt.Message,
 		ErrorClass:  evt.ErrorClass,

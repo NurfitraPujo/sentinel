@@ -67,8 +67,8 @@ describe.skipIf(!dbReachable)('searchIssuesInOrg (integration, real Postgres)', 
 			        ${'k_' + suffix}, ${'h_' + suffix})
 		`;
 		await sql`
-			insert into issues (id, project_id, fingerprint, message, error_class)
-			values (${issueId}, ${projectId}, ${'fp-' + suffix},
+			insert into issues (id, project_id, environment, fingerprint, message, error_class)
+			values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + suffix},
 			        ${'search integration seed'}, ${'SearchIntegrationSeedError'})
 		`;
 	});

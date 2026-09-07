@@ -105,10 +105,10 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 		const id = randomUUID();
 		await sql`
 			insert into issues (
-				id, project_id, fingerprint, message, error_class, status, issue_type,
+				id, project_id, environment, fingerprint, message, error_class, status, issue_type,
 				assignee_type, assigned_to, claimed_at, first_seen
 			) values (
-				${id}, ${projectId}, ${overrides.fingerprint}, ${'seed'}, ${'SeedError'},
+				${id}, ${projectId}, ${'production'}, ${overrides.fingerprint}, ${'seed'}, ${'SeedError'},
 				${overrides.status ?? 'unresolved'}, ${overrides.issueType ?? 'system_error'},
 				${overrides.assigneeType ?? null}, ${overrides.assignedTo ?? null},
 				${overrides.claimedAt ?? null}, ${overrides.firstSeen ?? new Date()}

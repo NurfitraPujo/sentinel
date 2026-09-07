@@ -544,3 +544,77 @@ describe('§4.4 escalation at intake', () => {
 		expect(sendEscalationEmails).not.toHaveBeenCalled();
 	});
 });
+
+/**
+ * sentinel-project-environments §4.8a and decisions 29/50 — the environment on the route that
+ * ALREADY had one.
+ *
+ * Two claims, and they are the same claim: `context.environment` is this route's assertion and no
+ * second field is added, and ONE value per request reaches both the writer and the triager. A
+ * second, differently-validated environment would mean a client that set only the shipped key got a
+ * report filed as `production` whose triage matched against `staging` — the issue and the ranking
+ * disagreeing about the same report, silently, on the one path where the reporter is not a Sentinel
+ * user and cannot see either.
+ */
+describe('§4.8a the environment on POST /api/report', () => {
+	it('files a report that asserts nothing under `production`, and triages the SAME value', async () => {
+		const res = await post();
+
+		expect(res.status).toBe(201);
+		expect(createExternalIssueReport).toHaveBeenCalledWith(
+			expect.objectContaining({ context: expect.not.objectContaining({ environment: expect.anything() }) })
+		);
+		// This is the majority path, and it is the one decision 50 breaks if the RAW value is
+		// passed: under a hard filter a `null` matches no row, so every report that asserted nothing
+		// would get zero candidates and no auto-link at all.
+		expect(runTriage).toHaveBeenCalledWith(
+			expect.objectContaining({ context: expect.objectContaining({ environment: 'production' }) })
+		);
+	});
+
+	it('passes a matching context.environment straight through to triage, verbatim', async () => {
+		await post(body({ context: { environment: 'staging' } }));
+
+		expect(runTriage).toHaveBeenCalledWith(
+			expect.objectContaining({ context: expect.objectContaining({ environment: 'staging' }) })
+		);
+	});
+
+	// The third row of §4.8a's table, and the reason this route gains no new error case: a shipped
+	// route that starts 400-ing a body it accepted yesterday is a breaking change. "Production"
+	// names no environment any writer in this system can produce, so triage falls back to the
+	// resolved value rather than filtering on a string that matches nothing.
+	it.each(['Production', 'eu west', '', '_unspecified'])(
+		'accepts a NON-matching context.environment %j with a 201 and triages `production` instead',
+		async (asserted) => {
+			const res = await post(body({ context: { environment: asserted } }));
+
+			expect(res.status).toBe(201);
+			expect(runTriage).toHaveBeenCalledWith(
+				expect.objectContaining({ context: expect.objectContaining({ environment: 'production' }) })
+			);
+		}
+	);
+
+	// `external_issue_reports.context` stores the client's object VERBATIM, unknown keys and all.
+	// This resolution changes what the issue is filed under, never what was recorded as sent.
+	it('still stores the client context verbatim, including a non-matching value', async () => {
+		await post(body({ context: { environment: 'Production', page: '/visits/12' } }));
+
+		expect(createExternalIssueReport).toHaveBeenCalledWith(
+			expect.objectContaining({
+				context: expect.objectContaining({ environment: 'Production', page: '/visits/12' }),
+			})
+		);
+	});
+
+	// Decision 29: this route has a field for the environment, and a second ambient channel on top
+	// of it is the exact shape that reconciliation removed.
+	it('does NOT read X-Sentinel-Environment on this route', async () => {
+		await post(body(), { 'X-Sentinel-Environment': 'staging' });
+
+		expect(runTriage).toHaveBeenCalledWith(
+			expect.objectContaining({ context: expect.objectContaining({ environment: 'production' }) })
+		);
+	});
+});

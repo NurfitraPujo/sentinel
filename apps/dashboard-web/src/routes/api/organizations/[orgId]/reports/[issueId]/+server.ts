@@ -8,7 +8,7 @@ import {
 } from '$lib/db/queries/reports';
 import { getReporterId, getOrgRole, requireReportAccess } from '$lib/server/report-access';
 import { bestEffortDeleteObjects } from '$lib/server/retention';
-import { listIssueAttachments } from '$lib/db/queries/reports';
+import { listIssueAttachments, resolveReportEnvironment } from '$lib/db/queries/reports';
 import { readTriage, type TriageResult } from '$lib/server/triage';
 import { getLatestEscalation } from '$lib/server/escalation';
 import { log } from '$lib/server/observability/log';
@@ -179,7 +179,14 @@ async function loadTriage(
 			occurredAt,
 			context: {
 				release: typeof context.release === 'string' ? context.release : null,
-				environment: typeof context.environment === 'string' ? context.environment : null,
+				// sentinel-project-environments decision 53, and this is the SECOND of the two
+				// production consumers of findTriageCandidates — the one that appeared in no
+				// document until round seven. It must hand over the RESOLVED environment, the same
+				// value §4.8a wrote to `issues.environment`, never the raw nullable assertion:
+				// decision 50 made this a hard `WHERE` predicate, so a `null` matches no row and
+				// this detail panel would return zero candidates for every report that asserted
+				// nothing — the majority path, filed as `production`.
+				environment: resolveReportEnvironment(context.environment),
 				traceId: typeof context.trace_id === 'string' ? context.trace_id : null,
 				sessionId: typeof context.session_id === 'string' ? context.session_id : null,
 			},

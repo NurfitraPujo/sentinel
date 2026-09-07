@@ -106,6 +106,7 @@ func TestStorePackage_UpsertIssue_InsertsNewIssue(t *testing.T) {
 	issue := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fmt.Sprintf("fp-insert-%d", time.Now().UnixNano()),
 		Message:     "first occurrence",
 		ErrorClass:  "UpsertInsertError",
@@ -144,6 +145,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 	first := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fingerprint,
 		Message:     "first error",
 		ErrorClass:  "UpsertDuplicateError",
@@ -169,6 +171,7 @@ func TestStorePackage_UpsertIssue_DuplicateIncrementsCountAndUpdatesLastSeen(t *
 	second := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fingerprint,
 		Message:     "second error",
 		ErrorClass:  "UpsertDuplicateError",
@@ -208,6 +211,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 	first := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fingerprint,
 		Message:     "first",
 		ErrorClass:  "GreatestError",
@@ -221,6 +225,7 @@ func TestStorePackage_UpsertIssue_DuplicateWithOlderLastSeenKeepsGreatest(t *tes
 	older := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fingerprint,
 		Message:     "stale duplicate",
 		ErrorClass:  "GreatestError",
@@ -253,6 +258,7 @@ func TestStorePackage_InsertOccurrence_InsertsRow(t *testing.T) {
 	issue := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fmt.Sprintf("fp-occ-%d", time.Now().UnixNano()),
 		Message:     "occ insert",
 		ErrorClass:  "OccurrenceInsertError",
@@ -334,6 +340,7 @@ func TestStorePackage_GetIssueIDByFingerprint_ReturnsID(t *testing.T) {
 	issue := &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: "test",
 		Fingerprint: fingerprint,
 		Message:     "get by fingerprint",
 		ErrorClass:  "GetByFingerprintError",
@@ -343,7 +350,7 @@ func TestStorePackage_GetIssueIDByFingerprint_ReturnsID(t *testing.T) {
 	}
 	require.NoError(t, s.UpsertIssue(ctx, issue, ""))
 
-	got, err := s.GetIssueIDByFingerprint(ctx, projectID, fingerprint)
+	got, err := s.GetIssueIDByFingerprint(ctx, projectID, "test", fingerprint)
 	require.NoError(t, err)
 	assert.Equal(t, issue.ID, got)
 }
@@ -355,7 +362,7 @@ func TestStorePackage_GetIssueIDByFingerprint_UnknownReturnsError(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	got, err := s.GetIssueIDByFingerprint(ctx, projectID, "fp-does-not-exist")
+	got, err := s.GetIssueIDByFingerprint(ctx, projectID, "test", "fp-does-not-exist")
 	require.Error(t, err)
 	assert.Empty(t, got)
 }

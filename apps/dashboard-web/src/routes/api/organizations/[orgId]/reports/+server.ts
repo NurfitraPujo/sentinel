@@ -6,6 +6,7 @@ import { eq } from 'drizzle-orm';
 import {
 	createManualIssue,
 	listReports,
+	ENV_NAME_RE,
 	REPORT_SOURCE_CHANNELS,
 	type ReportTab,
 	type ReportSourceChannel,
@@ -34,6 +35,54 @@ function isValidSource(value: unknown): value is ReportSourceChannel {
 
 // Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §9, §10). Manual-validation style
 // (allowlists + throw error(status)) matching the invitations endpoint — no schema library.
+
+// sentinel-project-environments §4.8a: the header is the alternate channel for a non-browser
+// client. The header NAME is case-insensitive, as HTTP requires; the VALUE is case-sensitive like
+// every other environment name (§3).
+const ENVIRONMENT_HEADER = 'x-sentinel-environment';
+
+/**
+ * §4.8a's precedence chain: body field, then header, then nothing.
+ *
+ * "Present" means **a non-empty string and nothing else**. An explicit `"environment": null`, an
+ * explicit `""` and an omitted key are all NOT assertions — they fall through to the header and
+ * then to `production`. This is `report-intake.ts`'s own `optionalString` convention on the sibling
+ * route, and it is spelled out because a chain that treated `null` as an assertion would file a
+ * report under the literal string `"null"`, or 23502 on it.
+ *
+ * Body over header, and when both are present and differ the header is simply ignored — NOT a 400:
+ * a proxy that adds a default header must not break a client that was explicit.
+ *
+ * A present value that fails §3's pattern is a 400 (§7). This field is NEW on this route, so that
+ * rejection breaks no existing client — which is exactly the difference from `POST /api/report`,
+ * where `context.environment` has accepted any string since it shipped and still does.
+ *
+ * It is NOT checked against `project_environments`: under decisions 8 and 9 an environment may
+ * legitimately exist in the data and not in the registry, so an override naming an unregistered
+ * environment is stored, not rejected.
+ */
+function resolveAssertedEnvironment(bodyValue: unknown, request: Request): string | null {
+	if (typeof bodyValue === 'string' && bodyValue.length > 0) {
+		if (!ENV_NAME_RE.test(bodyValue)) {
+			throw error(400, `environment must match ${ENV_NAME_RE.source}`);
+		}
+		return bodyValue;
+	}
+	if (bodyValue !== undefined && bodyValue !== null && typeof bodyValue !== 'string') {
+		throw error(400, 'environment must be a string');
+	}
+
+	const headerValue = request.headers.get(ENVIRONMENT_HEADER);
+	if (headerValue !== null && headerValue.length > 0) {
+		if (!ENV_NAME_RE.test(headerValue)) {
+			throw error(400, `environment must match ${ENV_NAME_RE.source}`);
+		}
+		return headerValue;
+	}
+
+	// Neither channel asserted anything. createManualIssue resolves this to `production`.
+	return null;
+}
 
 export const GET: RequestHandler = async ({ params, url, locals }) => {
 	const session = await locals.auth();
@@ -93,7 +142,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	await requireReportAccess(userId, orgId, 'create');
 
 	const body = await request.json().catch(() => ({}));
-	const { title, bodyMd, severity, projectId, attachmentIds } = body;
+	const { title, bodyMd, severity, projectId, attachmentIds, environment } = body;
 
 	if (typeof title !== 'string' || title.trim().length === 0) {
 		throw error(400, 'title is required');
@@ -145,6 +194,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		title,
 		bodyMd,
 		severity,
+		environment: resolveAssertedEnvironment(environment, request),
 		attachmentIds: resolvedAttachmentIds,
 	});
 

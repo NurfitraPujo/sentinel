@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -18,7 +21,17 @@ type LoadTestConfig struct {
 	EventsPerSec int
 	DurationSec  int
 	ProjectKey   string
+	// Environment is the environment every generated event claims. Empty means
+	// defaultLoadEnvironment. It is a field rather than a constant because
+	// sentinel-project-environments §13's M3 has to drive the SAME load twice — once at an
+	// environment the project has declared (§4.8's registry UPDATE matches one hot row) and once at
+	// an environment it has not (the UPDATE matches zero) — and the difference between those two
+	// runs is the whole measurement.
+	Environment string
 }
+
+// defaultLoadEnvironment preserves the value this harness sent before it was configurable.
+const defaultLoadEnvironment = "load-test"
 
 type ErrorPayload struct {
 	ProjectKey  string                 `json:"project_key"`
@@ -79,10 +92,15 @@ func RunLoadTest(cfg LoadTestConfig) (*LoadResult, error) {
 		}
 	}()
 
+	environment := cfg.Environment
+	if environment == "" {
+		environment = defaultLoadEnvironment
+	}
+
 	payload := ErrorPayload{
 		ProjectKey:  cfg.ProjectKey,
 		Platform:    "golang",
-		Environment: "load-test",
+		Environment: environment,
 		Message:     "Load test error message",
 		ErrorClass:  "LoadTestError",
 		TraceID:     "load-test-trace",
@@ -242,4 +260,63 @@ func PrintResult(r *LoadResult) {
 	} else {
 		fmt.Println("\n✗ FAIL: Success rate < 99%")
 	}
+}
+
+// TestLoadIngest is the entry point this package did not have.
+//
+// sentinel-project-environments §13's M3 names `tests/load/` as its driver, and until now that was
+// not something anyone could run: the package declared LoadTestConfig, RunLoadTest and PrintResult
+// and NO TestXxx function at all, so `go test ./tests/load/... -v -count=1` compiled it and ran
+// zero tests, and LoadTestConfig was read from no environment variable, no flag and no caller
+// anywhere in the repository.
+//
+// The t.Skip is the load-bearing half. `go test ./...` on a machine with no stack must stay green
+// and must not fire ten thousand HTTP requests at whatever happens to be listening — so this drives
+// traffic only for somebody who has deliberately pointed it at a stack by setting both
+// SENTINEL_LOAD_INGESTER_URL and SENTINEL_LOAD_API_KEY.
+//
+// M3's two cases are the same invocation with SENTINEL_LOAD_ENVIRONMENT set to an environment the
+// project has declared and then to one it has not. The number M3 reports comes from the PROCESSOR's
+// own `sentinel_process_duration_seconds` histogram, scraped from its /metrics before and after
+// each run — this harness publishes at the ingest HTTP edge and cannot see StoreEvent, which runs
+// downstream of NATS. Any latency printed below is publish latency, not processing latency.
+func TestLoadIngest(t *testing.T) {
+	ingesterURL := os.Getenv("SENTINEL_LOAD_INGESTER_URL")
+	apiKey := os.Getenv("SENTINEL_LOAD_API_KEY")
+	if ingesterURL == "" || apiKey == "" {
+		t.Skip("SENTINEL_LOAD_INGESTER_URL and SENTINEL_LOAD_API_KEY are unset — " +
+			"set both to point this harness at a running stack (§13 M3)")
+	}
+
+	cfg := LoadTestConfig{
+		IngesterURL:  ingesterURL,
+		APIKey:       apiKey,
+		ProjectKey:   os.Getenv("SENTINEL_LOAD_PROJECT_KEY"),
+		NumWorkers:   loadEnvInt(t, "SENTINEL_LOAD_WORKERS", 10),
+		EventsPerSec: loadEnvInt(t, "SENTINEL_LOAD_EVENTS_PER_SEC", 200),
+		DurationSec:  loadEnvInt(t, "SENTINEL_LOAD_DURATION_SEC", 50),
+		Environment:  os.Getenv("SENTINEL_LOAD_ENVIRONMENT"),
+	}
+
+	result, err := RunLoadTest(cfg)
+	if err != nil {
+		t.Fatalf("RunLoadTest: %v", err)
+	}
+	PrintResult(result)
+}
+
+// loadEnvInt reads a positive integer override, falling back to def. A malformed or non-positive
+// value fails the test rather than silently reverting to the default: a typo'd worker count that
+// quietly runs the default is a measurement nobody can reproduce.
+func loadEnvInt(t *testing.T, name string, def int) int {
+	t.Helper()
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		t.Fatalf("%s must be a positive integer, got %q", name, raw)
+	}
+	return v
 }

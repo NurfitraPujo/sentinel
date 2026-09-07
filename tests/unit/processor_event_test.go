@@ -244,8 +244,12 @@ func TestDeserialize_ComputesFingerprintWhenMissing(t *testing.T) {
 	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
 	require.NoError(t, err)
 
+	// sentinel-project-environments §4.9: Deserialize passes event.Environment into the config, so
+	// the expectation carries it too. Without it this assertion would pass for a call site that
+	// silently dropped the environment out of the hash input.
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
-		ErrorClass: "RuntimeError",
+		Environment: "production",
+		ErrorClass:  "RuntimeError",
 		Stacktrace: []fingerprint.StackFrame{
 			{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 		},
@@ -270,7 +274,8 @@ func TestDeserialize_ComputesFingerprintWhenOverrideIsTrue(t *testing.T) {
 	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
 	require.NoError(t, err)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
-		ErrorClass: "RuntimeError",
+		Environment: "production",
+		ErrorClass:  "RuntimeError",
 	}), got.Fingerprint)
 }
 
@@ -282,7 +287,8 @@ func TestDeserialize_RecomputesProvidedFingerprintWhenOverrideIsTrue(t *testing.
 	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
 	require.NoError(t, err)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
-		ErrorClass: "RuntimeError",
+		Environment: "production",
+		ErrorClass:  "RuntimeError",
 	}), got.Fingerprint)
 	assert.NotEqual(t, "provided-fingerprint", got.Fingerprint)
 }

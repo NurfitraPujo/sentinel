@@ -185,8 +185,11 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 			}
 		}
 		event.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
-			ErrorClass: event.ErrorClass,
-			Stacktrace: frames,
+			// sentinel-project-environments §4.9: the environment is part of issue identity, so it is
+			// part of the hash input.
+			Environment: event.Environment,
+			ErrorClass:  event.ErrorClass,
+			Stacktrace:  frames,
 		})
 	}
 

@@ -34,21 +34,27 @@ function row(overrides: Partial<TriageCandidateRow> & { issueId: string }): Tria
 		errorClass: 'PostgresError',
 		latestOccurrenceAt: AT('2026-09-04T09:10:00Z'),
 		releaseVersions: [],
-		environments: [],
 		...overrides,
 	};
 }
 
 function context(overrides: Partial<TriageMatchContext> = {}): TriageMatchContext {
-	return { release: null, environment: null, traceId: null, sessionId: null, ...overrides };
+	// sentinel-project-environments decision 50: `environment` is no longer nullable on this type
+	// and is no longer a scoring signal — the query filters on it, so every row that reaches the
+	// scorer is already in this environment. The default here is §4.8a's default for a report that
+	// asserted nothing.
+	return { release: null, environment: 'production', traceId: null, sessionId: null, ...overrides };
 }
 
 describe('§4.3 constants are the contract, not a preference', () => {
 	it('fixes the score table, the threshold, the bound and the strategy name', () => {
+		// `environment: 0.1` is deliberately ABSENT (decision 50): environment stopped being a
+		// signal and became a `WHERE` predicate in findTriageCandidates. This assertion is what
+		// catches somebody re-adding it as a tautology that lifts every score by the same 0.1 and
+		// silently moves the 0.7 threshold.
 		expect(TRIAGE_SIGNAL_WEIGHTS).toEqual({
 			window: 0.4,
 			release: 0.3,
-			environment: 0.1,
 			trace_id: 0.2,
 			session_id: 0.1,
 		});
@@ -86,19 +92,24 @@ describe('scoreTriageCandidates — §4.3\'s score table', () => {
 			linkable: true,
 		},
 		{
-			name: 'window + release + environment = 0.8',
-			row: row({ issueId: 'a', releaseVersions: ['v31.70'], environments: ['production'] }),
+			// Decision 50: this used to be 0.8 with an `environment` signal. The environment is now a
+			// precondition of the row EXISTING, so the top reachable score in v1 is 0.7 and the only
+			// thing that separates candidates is the release.
+			name: 'window + release in the reported environment = 0.7, and environment adds nothing',
+			row: row({ issueId: 'a', releaseVersions: ['v31.70'] }),
 			context: context({ release: 'v31.70', environment: 'production' }),
-			score: 0.8,
-			signals: ['window', 'release', 'environment'],
+			score: 0.7,
+			signals: ['window', 'release'],
 			linkable: true,
 		},
 		{
-			name: 'window + environment alone = 0.5, still a suggestion',
-			row: row({ issueId: 'a', environments: ['production'] }),
+			// The old 'window + environment alone = 0.5' case. A matching environment can no longer
+			// lift a score on its own, because every candidate matches it.
+			name: 'the environment alone is 0.4, not 0.5 — it is no longer a signal',
+			row: row({ issueId: 'a' }),
 			context: context({ environment: 'production' }),
-			score: 0.5,
-			signals: ['window', 'environment'],
+			score: 0.4,
+			signals: ['window'],
 			linkable: false,
 		},
 		{
@@ -126,9 +137,13 @@ describe('scoreTriageCandidates — §4.3\'s score table', () => {
 			linkable: true,
 		},
 		{
-			name: 'a null context environment does not fire',
-			row: row({ issueId: 'a', environments: ['production'] }),
-			context: context({ environment: null }),
+			// The old 'a null context environment does not fire' case, restated for a type that no
+			// longer admits null: a DIFFERENT environment cannot change the score either, because
+			// the scorer does not look at it at all. Whether the row belongs in this environment is
+			// decided by the query, and is asserted in triage.integration.test.ts.
+			name: 'a different context environment changes nothing — the scorer does not read it',
+			row: row({ issueId: 'a' }),
+			context: context({ environment: 'staging' }),
 			score: 0.4,
 			signals: ['window'],
 			linkable: false,
@@ -176,12 +191,12 @@ describe('scoreTriageCandidates — trace_id and session_id are INERT in v1', ()
 
 	it('never emits trace_id or session_id in signals, even at the top score', () => {
 		const [candidate] = scoreTriageCandidates(
-			[row({ issueId: 'a', releaseVersions: ['v1'], environments: ['production'] })],
+			[row({ issueId: 'a', releaseVersions: ['v1'] })],
 			context({ release: 'v1', environment: 'production', traceId: 't-1', sessionId: 's-1' })
 		);
 		expect(candidate.signals).not.toContain('trace_id');
 		expect(candidate.signals).not.toContain('session_id');
-		expect(candidate.score).toBe(0.8);
+		expect(candidate.score).toBe(0.7);
 	});
 
 	it('signals is never empty for a candidate', () => {
@@ -200,13 +215,15 @@ describe('scoreTriageCandidates — §4.3\'s ranking', () => {
 		const scored = scoreTriageCandidates(
 			[
 				row({ issueId: 'low' }),
-				row({ issueId: 'top', releaseVersions: ['v1'], environments: ['production'] }),
+				row({ issueId: 'top', releaseVersions: ['v1'], latestOccurrenceAt: AT('2026-09-04T09:20:00Z') }),
 				row({ issueId: 'mid', releaseVersions: ['v1'] }),
 			],
 			context({ release: 'v1', environment: 'production' })
 		);
+		// Decision 50 collapsed the old 0.8/0.7/0.4 ladder: `top` and `mid` both score 0.7 now (the
+		// environment no longer separates them), so `top` leads on the recency tie-break instead.
 		expect(scored.map((candidate) => candidate.issueId)).toEqual(['top', 'mid', 'low']);
-		expect(scored.map((candidate) => candidate.score)).toEqual([0.8, 0.7, 0.4]);
+		expect(scored.map((candidate) => candidate.score)).toEqual([0.7, 0.7, 0.4]);
 	});
 
 	it('breaks a score tie on the most recent in-window occurrence', () => {

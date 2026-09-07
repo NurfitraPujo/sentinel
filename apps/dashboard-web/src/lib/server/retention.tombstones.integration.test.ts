@@ -97,10 +97,10 @@ describe.skipIf(!dbReachable)('retention tombstones (integration, real Postgres)
 		const id = randomUUID();
 		await sql`
 			insert into issues (
-				id, project_id, fingerprint, message, error_class, status, issue_type,
+				id, project_id, environment, fingerprint, message, error_class, status, issue_type,
 				assignee_type, assigned_to, claimed_at, first_seen
 			) values (
-				${id}, ${projectId}, ${overrides.fingerprint}, ${'orphan seed ' + overrides.fingerprint},
+				${id}, ${projectId}, ${'production'}, ${overrides.fingerprint}, ${'orphan seed ' + overrides.fingerprint},
 				${'SeedError'}, ${'unresolved'}, ${'system_error'},
 				${overrides.assigneeType ?? null}, ${overrides.assignedTo ?? null}, ${null},
 				${overrides.firstSeen}

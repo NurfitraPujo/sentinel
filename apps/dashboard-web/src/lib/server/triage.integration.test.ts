@@ -85,14 +85,18 @@ async function seedSystemError(options: {
 	id?: string;
 }): Promise<string> {
 	const issueId = options.id ?? randomUUID();
+	const environment = options.environment ?? 'production';
+	// sentinel-project-environments §4.9: `issues.environment` is NOT NULL with no DEFAULT, and it
+	// is what findTriageCandidates now filters on (decision 50) — the occurrence's environment no
+	// longer decides candidacy, the issue's own column does.
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type)
-		values (${issueId}, ${options.projectId ?? projectId}, ${'fp-' + issueId}, ${options.message},
-		        ${'PostgresError'}, ${'system_error'})
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
+		values (${issueId}, ${options.projectId ?? projectId}, ${environment}, ${'fp-' + issueId},
+		        ${options.message}, ${'PostgresError'}, ${'system_error'})
 	`;
 	await sql`
 		insert into error_occurrences (id, issue_id, environment, platform, release_version, created_at)
-		values (${randomUUID()}, ${issueId}, ${options.environment ?? 'production'}, ${'go'},
+		values (${randomUUID()}, ${issueId}, ${environment}, ${'go'},
 		        ${options.release ?? null}, ${options.at})
 	`;
 	return issueId;
@@ -101,9 +105,11 @@ async function seedSystemError(options: {
 /** One `user_report` issue with an `external_issue_reports` companion. */
 async function seedExternalReport(context: Record<string, string>): Promise<string> {
 	const issueId = randomUUID();
+	// §4.8a: a user report is filed under the RESOLVED environment. This fixture asserts nothing, so
+	// `production` is the value the shipped path would have written.
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
-		values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'Visits — save spins forever'},
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel)
+		values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'Visits — save spins forever'},
 		        ${'UserReport'}, ${'user_report'}, ${'user_report_api'})
 	`;
 	await sql`
@@ -176,7 +182,7 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 				windowStart,
 				windowEnd,
 				release: null,
-				environment: null,
+				environment: 'production',
 				limit: 50,
 			});
 
@@ -187,22 +193,23 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 			expect(ids).not.toContain(anotherReport);
 		});
 
-		it('aggregates the DISTINCT in-window releases and environments the scorer needs', async () => {
+		it('aggregates the DISTINCT in-window releases the scorer needs', async () => {
 			const issueId = randomUUID();
 			await sql`
-				insert into issues (id, project_id, fingerprint, message, error_class, issue_type)
-				values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'multi'}, ${'PostgresError'}, ${'system_error'})
+				insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
+				values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'multi'},
+				        ${'PostgresError'}, ${'system_error'})
 			`;
-			for (const [release, environment, at] of [
-				['v31.69', 'staging', minutes(-20)],
-				['v31.70', 'production', minutes(-3)],
+			for (const [release, at] of [
+				['v31.69', minutes(-20)],
+				['v31.70', minutes(-3)],
 				// Outside the window: its release must NOT reach the aggregate, or the window stops
 				// meaning anything.
-				['v99.99', 'production', minutes(-90)],
+				['v99.99', minutes(-90)],
 			] as const) {
 				await sql`
 					insert into error_occurrences (id, issue_id, environment, platform, release_version, created_at)
-					values (${randomUUID()}, ${issueId}, ${environment}, ${'go'}, ${release}, ${at})
+					values (${randomUUID()}, ${issueId}, ${'production'}, ${'go'}, ${release}, ${at})
 				`;
 			}
 
@@ -218,8 +225,64 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 			const row = rows.find((candidate) => candidate.issueId === issueId);
 			expect(row).toBeDefined();
 			expect([...row!.releaseVersions].sort()).toEqual(['v31.69', 'v31.70']);
-			expect([...row!.environments].sort()).toEqual(['production', 'staging']);
 			expect(row!.latestOccurrenceAt.toISOString()).toBe(minutes(-3).toISOString());
+			// The DISTINCT environments aggregate is GONE (decision 50). Asserting its absence here
+			// rather than only in the type is what catches somebody restoring the LATERAL column and
+			// leaving the scorer reading a field the query stopped selecting.
+			expect(row).not.toHaveProperty('environments');
+		});
+
+		// sentinel-project-environments decision 50 — the hard environment filter. Two assertions,
+		// and the second is the one that matters: this is the ONLY thing standing between a
+		// production report and a staging issue now that decision 7 has made them separate rows, and
+		// the LIMIT 5 above is a hard SQL bound that a cross-environment twin would eat a slot from.
+		it('returns candidates ONLY from the reported environment', async () => {
+			const production = await seedSystemError({
+				message: 'env filter — production',
+				at: minutes(-4),
+				environment: 'production',
+			});
+			const staging = await seedSystemError({
+				message: 'env filter — staging',
+				at: minutes(-4),
+				environment: 'staging',
+			});
+
+			const { windowStart, windowEnd } = triage.triageWindow(OCCURRED_AT, 30);
+
+			const inProduction = await triage.findTriageCandidates({
+				projectId,
+				windowStart,
+				windowEnd,
+				release: null,
+				environment: 'production',
+				limit: 50,
+			});
+			expect(inProduction.map((row) => row.issueId)).toContain(production);
+			expect(inProduction.map((row) => row.issueId)).not.toContain(staging);
+
+			const inStaging = await triage.findTriageCandidates({
+				projectId,
+				windowStart,
+				windowEnd,
+				release: null,
+				environment: 'staging',
+				limit: 50,
+			});
+			expect(inStaging.map((row) => row.issueId)).toContain(staging);
+			expect(inStaging.map((row) => row.issueId)).not.toContain(production);
+
+			// An environment nobody has an issue in returns nothing at all, rather than everything.
+			const inNowhere = await triage.findTriageCandidates({
+				projectId,
+				windowStart,
+				windowEnd,
+				release: null,
+				environment: 'eu-west-1',
+				limit: 50,
+			});
+			expect(inNowhere.map((row) => row.issueId)).not.toContain(production);
+			expect(inNowhere.map((row) => row.issueId)).not.toContain(staging);
 		});
 	});
 
@@ -251,7 +314,7 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 						windowStart,
 						windowEnd,
 						release: null,
-						environment: null,
+						environment: 'production',
 						limit: 50,
 					},
 					tx
@@ -279,7 +342,7 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 				issueId: reportIssueId,
 				projectId,
 				occurredAt: OCCURRED_AT,
-				context: { release: null, environment: null, traceId: null, sessionId: null },
+				context: { release: null, environment: 'production', traceId: null, sessionId: null },
 				windowMinutes: 30,
 			});
 
@@ -316,8 +379,11 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 			});
 
 			const scored = result.candidates.find((c) => c.issueId === candidate);
-			expect(scored!.score).toBe(0.8);
-			expect(scored!.signals).toEqual(['window', 'release', 'environment']);
+			// Decision 50: 0.7, not the old 0.8, and `environment` is not in `signals`. The
+			// environment is now a precondition of the row being HERE at all, so scoring it as well
+			// would lift every candidate by the same 0.1 and move the 0.7 threshold instead.
+			expect(scored!.score).toBe(0.7);
+			expect(scored!.signals).toEqual(['window', 'release']);
 			expect(scored!.linked).toBe(true);
 			expect(result.strategy).toBe('window_release');
 			expect(result.candidates.length).toBeLessThanOrEqual(5);
@@ -362,7 +428,7 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 				issueId: reportIssueId,
 				projectId,
 				occurredAt: OCCURRED_AT,
-				context: { release: `rel-idem-${suffix}`, environment: null, traceId: null, sessionId: null },
+				context: { release: `rel-idem-${suffix}`, environment: 'production', traceId: null, sessionId: null },
 				windowMinutes: 30,
 			};
 

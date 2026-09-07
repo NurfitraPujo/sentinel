@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/fingerprint"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
@@ -71,10 +72,18 @@ func newEIDStoreAndPoolFromEnv(t *testing.T) (store.IssueStore, *pgxpool.Pool) {
 // call deliberately: StoreEvent resolves the real row by (project_id, fingerprint) and RETURNS its own
 // id, mirroring exactly how a real redelivery — a NEW proto message, no shared Go state — behaves.
 func eidIssue(projectID, fingerprint string) *store.Issue {
+	return eidIssueIn(projectID, "test", fingerprint)
+}
+
+// eidIssueIn is eidIssue with the environment named explicitly — sentinel-project-environments
+// §4.9 makes (project_id, environment, fingerprint) the identity, so the environment-split tests
+// need to vary the one field eidIssue pins.
+func eidIssueIn(projectID, environment, fingerprint string) *store.Issue {
 	now := time.Now().UTC()
 	return &store.Issue{
 		ID:          uuid.New().String(),
 		ProjectID:   projectID,
+		Environment: environment,
 		Fingerprint: fingerprint,
 		Message:     "event idempotency test error",
 		ErrorClass:  "EventIdempotencyError",
@@ -87,9 +96,13 @@ func eidIssue(projectID, fingerprint string) *store.Issue {
 // eidOccurrence returns a fresh ErrorOccurrence seed carrying eventID as its idempotency key ("" means
 // "no key", D-b's NULLIF mapping).
 func eidOccurrence(eventID string) *store.ErrorOccurrence {
+	return eidOccurrenceIn("test", eventID)
+}
+
+func eidOccurrenceIn(environment, eventID string) *store.ErrorOccurrence {
 	return &store.ErrorOccurrence{
 		ID:          uuid.New().String(),
-		Environment: "test",
+		Environment: environment,
 		Platform:    "go",
 		Stacktrace:  json.RawMessage(`[]`),
 		Metadata:    json.RawMessage(`{}`),
@@ -744,3 +757,229 @@ func indexOf(s, substr string) int {
 // keeps the compiler enforcing that the identifier still resolves to the constant this test's
 // source-text check is verifying against.
 var _ = pgx.ReadCommitted
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-project-environments §4.9 — the identity split, and §4.8's registry touch
+// ---------------------------------------------------------------------------------------------------
+
+// TestStoreEvent_EnvironmentSplitsIssueIdentity is criterion 2's StoreEvent half. The SAME error
+// class and the SAME frames delivered to `production` and to `staging` must land as TWO `issues`
+// rows with independent `status` — resolving one must leave the other open.
+//
+// The fingerprints differ here because §4.9 also folds the environment into the hash, which is what
+// a real delivery does; the test that proves the COLUMN rather than the hash is
+// TestStoreEvent_CustomFingerprintStillSplitsOnEnvironment below, where the fingerprint is
+// deliberately identical in both environments.
+func TestStoreEvent_EnvironmentSplitsIssueIdentity(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "envsplit")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	frames := []fingerprint.StackFrame{
+		{File: "checkout.go", Line: 88, Function: "checkout.Charge", InApp: true},
+	}
+	fpProd := fingerprint.Compute(fingerprint.FingerprintConfig{
+		Environment: "production", ErrorClass: "PaymentError", Stacktrace: frames,
+	})
+	fpStag := fingerprint.Compute(fingerprint.FingerprintConfig{
+		Environment: "staging", ErrorClass: "PaymentError", Stacktrace: frames,
+	})
+	require.NotEqual(t, fpProd, fpStag, "§4.9 folds the environment into the hash input")
+
+	prodIssue := eidIssueIn(projectID, "production", fpProd)
+	_, storedProd, err := s.StoreEvent(ctx, prodIssue, eidOccurrenceIn("production", "evt-envsplit-prod"), "")
+	require.NoError(t, err)
+	require.True(t, storedProd)
+
+	stagIssue := eidIssueIn(projectID, "staging", fpStag)
+	_, storedStag, err := s.StoreEvent(ctx, stagIssue, eidOccurrenceIn("staging", "evt-envsplit-stag"), "")
+	require.NoError(t, err)
+	require.True(t, storedStag)
+
+	// Counted by the two fingerprints the SAME class and frames produced, which is the whole claim:
+	// eidIssueIn writes its own fixed error_class, so counting on that would measure the fixture.
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issues WHERE project_id = $1 AND fingerprint = ANY($2)`,
+		projectID, []string{fpProd, fpStag}).Scan(&rowCount))
+	assert.Equal(t, 2, rowCount, "one error class in two environments must be two issue rows")
+	assert.NotEqual(t, prodIssue.ID, stagIssue.ID)
+
+	// Independent status is the payoff of the whole decision: resolving in staging must leave
+	// production open, with no extra column and no aggregate anywhere.
+	_, err = pool.Exec(ctx, `UPDATE issues SET status = 'resolved' WHERE id = $1`, stagIssue.ID)
+	require.NoError(t, err)
+
+	var prodStatus, stagStatus string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status FROM issues WHERE id = $1`, prodIssue.ID).Scan(&prodStatus))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status FROM issues WHERE id = $1`, stagIssue.ID).Scan(&stagStatus))
+	assert.Equal(t, "unresolved", prodStatus, "resolving in staging must not resolve production")
+	assert.Equal(t, "resolved", stagStatus)
+}
+
+// TestStoreEvent_CustomFingerprintStillSplitsOnEnvironment is the assertion that fails if the
+// migration's UNIQUE (project_id, environment, fingerprint) is missing or if either ON CONFLICT
+// clause still names (project_id, fingerprint). A client-chosen fingerprint is returned verbatim by
+// fingerprint.Compute in EVERY environment (§4.9 leaves that early return alone), so the identical
+// string arrives from two environments — and the column, not the hash, is what makes them two rows.
+func TestStoreEvent_CustomFingerprintStillSplitsOnEnvironment(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "customfp")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// The one fingerprint a client chose, sent from both environments.
+	shared := eidFingerprint(t, "customfp")
+
+	prodIssue := eidIssueIn(projectID, "production", shared)
+	_, storedProd, err := s.StoreEvent(ctx, prodIssue, eidOccurrenceIn("production", "evt-customfp-prod"), "")
+	require.NoError(t, err)
+	require.True(t, storedProd)
+
+	stagIssue := eidIssueIn(projectID, "staging", shared)
+	_, storedStag, err := s.StoreEvent(ctx, stagIssue, eidOccurrenceIn("staging", "evt-customfp-stag"), "")
+	require.NoError(t, err,
+		"a second environment on the same fingerprint must INSERT, not fail and not update the first row")
+	require.True(t, storedStag)
+
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issues WHERE project_id = $1 AND fingerprint = $2`,
+		projectID, shared).Scan(&rowCount))
+	assert.Equal(t, 2, rowCount, "one custom fingerprint in two environments must still be two issue rows")
+
+	var prodCount, stagCount int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count FROM issues WHERE project_id = $1 AND environment = 'production' AND fingerprint = $2`,
+		projectID, shared).Scan(&prodCount))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count FROM issues WHERE project_id = $1 AND environment = 'staging' AND fingerprint = $2`,
+		projectID, shared).Scan(&stagCount))
+	assert.Equal(t, int64(1), prodCount, "the staging delivery must not have bumped production's count")
+	assert.Equal(t, int64(1), stagCount)
+}
+
+// TestStoreEvent_RedeliveryInOneEnvironmentAdvancesNeitherCounter is criterion 2's third clause,
+// asserted against the widened conflict target: a redelivered event (same issue, same event_id)
+// must advance neither `last_seen` nor `count`, and must not touch the OTHER environment's row
+// either.
+func TestStoreEvent_RedeliveryInOneEnvironmentAdvancesNeitherCounter(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "envredeliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	shared := eidFingerprint(t, "envredeliver")
+	eventID := "evt-envredeliver-" + uuid.New().String()
+
+	_, stored1, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", shared),
+		eidOccurrenceIn("production", eventID), "")
+	require.NoError(t, err)
+	require.True(t, stored1)
+
+	var lastSeenBefore time.Time
+	var countBefore int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen, count FROM issues WHERE project_id = $1 AND environment = 'production' AND fingerprint = $2`,
+		projectID, shared).Scan(&lastSeenBefore, &countBefore))
+
+	_, stored2, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", shared),
+		eidOccurrenceIn("production", eventID), "")
+	require.NoError(t, err, "a redelivery ACKs as a no-op, it does not error")
+	assert.False(t, stored2)
+
+	var lastSeenAfter time.Time
+	var countAfter int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen, count FROM issues WHERE project_id = $1 AND environment = 'production' AND fingerprint = $2`,
+		projectID, shared).Scan(&lastSeenAfter, &countAfter))
+
+	assert.Equal(t, countBefore, countAfter, "a redelivery must not advance count")
+	assert.WithinDuration(t, lastSeenBefore, lastSeenAfter, 0, "a redelivery must not advance last_seen")
+}
+
+// TestStoreEvent_RegistryTouchUpdatesDeclaredEnvironmentOnly covers contract §4.8's registry touch,
+// all four of its properties in one place because each of them fails SILENTLY:
+//
+//	declared    -> first_seen_at and last_seen_at are set, inside the same transaction
+//	undeclared  -> zero rows updated, and the event is STILL stored (decision 9)
+//	redelivery  -> last_seen_at does not move, because the UPDATE is never reached
+//	no INSERT   -> ingest creates no registry row for an environment nobody declared (decision 8)
+func TestStoreEvent_RegistryTouchUpdatesDeclaredEnvironmentOnly(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "registry")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Only `production` is declared. `shadow` deliberately is not.
+	_, err := pool.Exec(ctx,
+		`INSERT INTO project_environments (project_id, name, display_name) VALUES ($1, 'production', 'Production')`,
+		projectID)
+	require.NoError(t, err)
+
+	// --- declared: both timestamps are set by the first delivery.
+	_, stored, err := s.StoreEvent(ctx,
+		eidIssueIn(projectID, "production", eidFingerprint(t, "registry-prod")),
+		eidOccurrenceIn("production", "evt-registry-prod-1"), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	var firstSeenAt, lastSeenAt *time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT first_seen_at, last_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&firstSeenAt, &lastSeenAt))
+	require.NotNil(t, firstSeenAt, "first_seen_at must be set by the first touch")
+	require.NotNil(t, lastSeenAt, "last_seen_at must be set by the first touch")
+	firstTouch := *firstSeenAt
+
+	// --- redelivery: the UPDATE is never reached, so last_seen_at does not move.
+	redeliveredEventID := "evt-registry-prod-dup"
+	fpDup := eidFingerprint(t, "registry-dup")
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fpDup),
+		eidOccurrenceIn("production", redeliveredEventID), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	var beforeRedelivery time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&beforeRedelivery))
+
+	_, storedDup, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", fpDup),
+		eidOccurrenceIn("production", redeliveredEventID), "")
+	require.NoError(t, err)
+	require.False(t, storedDup, "the second delivery of the same (issue, event_id) is a duplicate")
+
+	var afterRedelivery time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&afterRedelivery))
+	assert.WithinDuration(t, beforeRedelivery, afterRedelivery, 0,
+		"a deduplicated redelivery must not advance last_seen_at (flow F2)")
+
+	// first_seen_at is COALESCEd, so it never moves after the first touch.
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT first_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&firstSeenAt))
+	assert.WithinDuration(t, firstTouch, *firstSeenAt, 0, "first_seen_at is COALESCEd and never moves")
+
+	// --- undeclared: zero rows updated is not an error, the event is stored, and NO row is created.
+	_, storedShadow, err := s.StoreEvent(ctx,
+		eidIssueIn(projectID, "shadow", eidFingerprint(t, "registry-shadow")),
+		eidOccurrenceIn("shadow", "evt-registry-shadow-1"), "")
+	require.NoError(t, err, "an unregistered environment must never fail ingest (decision 9)")
+	assert.True(t, storedShadow, "the occurrence is stored regardless of the registry")
+
+	var registryRows int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM project_environments WHERE project_id = $1`, projectID).Scan(&registryRows))
+	assert.Equal(t, 1, registryRows,
+		"ingest must TOUCH the registry and never create a row (decision 8) — only §4.3 creates rows")
+}
