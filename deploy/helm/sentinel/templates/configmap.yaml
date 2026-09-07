@@ -6,7 +6,11 @@ metadata:
     {{- include "sentinel.labels" . | nindent 4 }}
 data:
   # Shared, non-secret configuration. Passwords/keys live in the Secret, not here.
+  {{- if include "sentinel.natsUrlIsSecret" . }}
+  # NATS_URL is injected from the Secret (authenticated DSN) — see pod env.
+  {{- else }}
   NATS_URL: {{ include "sentinel.natsUrl" . | quote }}
+  {{- end }}
   REDIS_ADDR: {{ include "sentinel.redisAddr" . | quote }}
   REDIS_DB: {{ .Values.config.redis.db | quote }}
   S3_ENDPOINT: {{ include "sentinel.s3Endpoint" . | quote }}
@@ -27,3 +31,7 @@ data:
   ESCALATION_MAX_HOPS: {{ .Values.config.dashboard.escalationMaxHops | quote }}
   REPORT_UPLOAD_RPM: {{ .Values.config.dashboard.reportUploadRpm | quote }}
   REPORT_UPLOAD_BYTES_PER_DAY: {{ .Values.config.dashboard.reportUploadBytesPerDay | quote }}
+  # Retention-cron knobs (N9). Tunable per env on Huawei; code defaults are
+  # 24 / 365 when the values are empty.
+  CLAIM_STALE_HOURS: {{ .Values.config.dashboard.claimStaleHours | default "24" | quote }}
+  MANUAL_ISSUE_RETENTION_DAYS: {{ .Values.config.dashboard.manualIssueRetentionDays | default "365" | quote }}

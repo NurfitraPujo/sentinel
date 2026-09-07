@@ -7,6 +7,9 @@
 # Global settings shared by every service.
 # -----------------------------------------------------------------------------
 global:
+  # Cloud target. "generic" keeps the demo/nginx path; "huawei" enables the CCE
+  # ingresses and external-services. Huawei env files set this to "huawei".
+  provider: generic
   # Prefix for image repositories. Leave empty to use the fully-qualified repos below as-is.
   imageRegistry: ""
   imagePullSecrets: []
@@ -45,6 +48,11 @@ images:
 secrets:
   create: true
   existingSecret: "" # when set, `create` is ignored and this Secret name is mounted instead
+  # Secret backend. "plain" renders the in-chart Secret from `data` (demo only).
+  # "sealed" renders a SealedSecret from `sealedData` (Huawei CCE via
+  # kubeseal-encryptor — seal per namespace, paste ciphertext into sealedData).
+  backend: plain
+  sealedData: {}
   # These INSECURE defaults exist only so `helm install` renders on a kicking-the-tyres cluster.
   # NEVER ship them. `helm lint`/CI should reject any release that keeps a `change-me` value.
   data:
@@ -118,9 +126,21 @@ config:
     # §4.5's per-key upload throttle and rolling-24h byte ceiling (SR-5, counted in Postgres).
     reportUploadRpm: "10"
     reportUploadBytesPerDay: "262144000"
+    # Retention-cron knobs (N9). Code defaults are 24 / 365; set explicitly
+    # per env to make them visible and tunable.
+    claimStaleHours: "24"
+    manualIssueRetentionDays: "365"
   ingestor:
     # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
     ratelimitStrictMode: "true"
+
+# -----------------------------------------------------------------------------
+# External managed endpoints (Huawei CCE only). Each entry renders a
+# selector-less Service + Endpoints bridging the in-cluster name to the VPC
+# private IP. Empty (default) renders nothing. Huawei env files define
+# rds-postgres-sentinel / dcs-redis-sentinel here.
+# -----------------------------------------------------------------------------
+externalServices: []
 
 # -----------------------------------------------------------------------------
 # Database migration Job. Runs `migrate up` for every target as a pre-install/pre-upgrade hook.
@@ -146,6 +166,15 @@ ingestor:
   service:
     type: ClusterIP
     port: 8080
+    # Set with type: NodePort on Huawei CCE (verified-free ports per env file).
+    nodePort: null
+  # Huawei CCE ingress (ingestor-ingress.yaml). Ignored unless
+  # global.provider == "huawei".
+  ingress:
+    enabled: false
+    host: ""
+    elbId: ""
+    tlsCertIds: ""
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
@@ -194,6 +223,15 @@ dashboard:
   service:
     type: ClusterIP
     port: 3000
+    # Set with type: NodePort on Huawei CCE (verified-free ports per env file).
+    nodePort: null
+  # Huawei CCE ingress (dashboard-ingress.yaml). Ignored unless
+  # global.provider == "huawei".
+  ingress:
+    enabled: false
+    host: ""
+    elbId: ""
+    tlsCertIds: ""
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 768Mi }

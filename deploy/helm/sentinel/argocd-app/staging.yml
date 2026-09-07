@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sentinel-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:tuju-ai/sentinel.git
+    path: deploy/helm/sentinel
+    targetRevision: main
+    helm:
+      version: v3
+      releaseName: sentinel
+      valueFiles:
+        - values-huawei-staging.yml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sentinel-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true

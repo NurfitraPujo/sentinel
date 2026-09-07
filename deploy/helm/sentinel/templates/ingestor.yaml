@@ -58,6 +58,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "sentinel.secretName" . }}
                   key: REDIS_PASSWORD
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- end }}
           livenessProbe:
             httpGet: { path: {{ .Values.ingestor.livenessPath }}, port: http }
             initialDelaySeconds: 10
@@ -85,6 +92,9 @@ spec:
     - name: http
       port: {{ .Values.ingestor.service.port }}
       targetPort: http
+      {{- if and (eq .Values.ingestor.service.type "NodePort") .Values.ingestor.service.nodePort }}
+      nodePort: {{ .Values.ingestor.service.nodePort }}
+      {{- end }}
 {{- if .Values.ingestor.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

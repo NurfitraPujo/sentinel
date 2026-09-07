@@ -1,0 +1,31 @@
+# Kube-linter config for the Sentinel chart (Huawei CCE renders).
+# Mirrors cdc-pipeline's proven baseline: default check set with waivers for
+# chart debt / by-design patterns, not regressions.
+#
+# latest-tag: ArgoCD pins real image tags per deploy (`image.tag=<git tag>`);
+#   empty tag (→ Chart.AppVersion) is only the un-pinned default in values.
+# dangling-service: templates/external-services.yaml intentionally creates
+#   selector-less Services + manual Endpoints to reach RDS/DCS private IPs
+#   from the CCE Standard cluster (see file header comment).
+# no-read-only-root-fs / run-as-non-root: pods already run as 65532 with
+#   readOnlyRootFilesystem via pod/container securityContext; kube-linter
+#   cannot see Dockerfile USER so these would false-positive.
+# pdb-unhealthy-pod-eviction-policy: pre-existing PDBs predate the check;
+#   eviction policy is a hardening follow-up, not a Huawei blocker.
+# job-ttl-seconds-after-finished: migrate + nats-init are Helm hook Jobs
+#   (hook-delete-policy owns cleanup); TTL would fight hook lifecycle.
+# unset-cpu/memory-requirements: nats-init is a seconds-long one-shot with no
+#   resources block by design (pre-existing).
+#
+# Run: helm template sentinel . -f values-huawei-staging.yml \
+#        | kube-linter lint --config .kube-linter.yaml -
+checks:
+  exclude:
+    - "latest-tag"
+    - "no-read-only-root-fs"
+    - "run-as-non-root"
+    - "dangling-service"
+    - "pdb-unhealthy-pod-eviction-policy"
+    - "job-ttl-seconds-after-finished"
+    - "unset-cpu-requirements"
+    - "unset-memory-requirements"

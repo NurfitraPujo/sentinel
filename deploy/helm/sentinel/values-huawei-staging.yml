@@ -1,0 +1,231 @@
+# Huawei CCE staging values for the Sentinel chart.
+#
+# Fill every PLACEHOLDER before installing:
+#   - sealedData: paste kubeseal-encryptor ciphertext scoped to the
+#     sentinel-staging namespace (see RUNBOOK.md). Never commit plaintext.
+#   - externalServices IPs: managed RDS / DCS Redis private IPs (10.200.x.x).
+#   - S3_* : OBS endpoint / bucket / browser-reachable public endpoint.
+#   - elbId / tlsCertIds: reuse cdc's shared internal ELB unless the platform
+#     team provisions a Sentinel-specific one.
+#
+# Render check (no cluster needed):
+#   helm template sentinel . -f values-huawei-staging.yml
+
+global:
+  provider: huawei
+
+imagePullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: default-secret
+
+nodeSelector:
+  node_type: spot
+
+# -----------------------------------------------------------------------------
+# First-party images. All built from this repo and pushed to SWR
+# (swr.ap-southeast-3.myhuaweicloud.com/daya-engineering). Tags default to
+# Chart.AppVersion; the release workflows --set image.tag to the git tag.
+# -----------------------------------------------------------------------------
+images:
+  ingestor:
+    repository: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-ingestor
+    tag: ""
+  processor:
+    repository: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-processor
+    tag: ""
+  dashboard:
+    repository: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-dashboard
+    tag: ""
+  migrate:
+    repository: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-db-migrate
+    tag: ""
+  dlqDrainer:
+    repository: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-dlq-drainer
+    tag: ""
+
+secrets:
+  create: false
+  existingSecret: ""
+  backend: sealed
+  # kubeseal-encryptor ciphertext, scope: namespace sentinel-staging.
+  # Replace every PLACEHOLDER via the encryptor API before installing.
+  sealedData:
+    POSTGRES_PASSWORD: "AgAma8ixSYwCaZ/HSOjyugrg1y5I8L4V5h4Qw2TyUR+c87uWwNC6tpdc6RwpwrpvCbfg8JntJleVM8zSoggKcocYD7KEhJaFPz31KNL/hADsTPhGwXrQXaVN1cMNucKDBLEciUOFg+6o2d6c+E8aQiDMhik1jLmxOWBhUjoSrhWJpF9iLdCAUYzkar4TJM8A1mMFLKunZnv0qg0G/oVm6XytfsGCSbahOWsNUQdSFh0pJWWyh8CPkJnC7vdHqUGLlxQw3RvenTEc6u1pnVL+RXWdlLCEHKXkyYHtY0JNTsEa9TS7vVCm1Ufbctxa0b9gDtUUXZ1gpfy5xlZfuhr/Mw00P0Afff/k1lZ0UJT6aVEh/EZUJMkn0SLWJhTchysG+EWwQzL9AJz6idPctl+qy6Huzis+Ztr0xzsgP4sKqDV1PF9yRG4nL87nKZ2x0ioOQrDWYSZ4GVstUPPLqcb6Oim+1iNCIoYe5hLPo9id77om+iCknYG+TvHbF+1WWuRBlLKFAmHThvMs2dnHvrmXCBEAwzvoYGCGc4YpiHlZ6npJcD0ajEgKuy/PNHP724GlhBltvy+LDmds14IHDbT0J/qy01n6TC3m67Fsv8bHL36c2XKUaFASCjEoolz4I1Oh2rtDYbb+KsbsNWBZvXnSAvK2EBS9L/s6CcpnAFhfC7uzdd/Jk7ceBZyfs70IYkd+6nNExcRgvIpCCw/sIMU="
+    REDIS_PASSWORD: "AgCdg3410D6a9WZHf3gNlQLHnJabnSKZXYx7sa/v5J9bDk8rhqh/6DIEZpQXFNUMuKx54WI7qD5L/qi+MFECx6VuS+8FWhduxrPwSOSUV7LT6+ZQ5xFuh4y27mZY8Zk/WMF9LhuawkscajSttcQ7q4yaDyggTmhfu5MjVOWPy2gpij3c+YsJgx0BhJgHbGMaPeFWZKLdfpdXnR7TLnM3fTu73s4ln1p84J86iRz0CmQlYwUwC1rYNoahE6L1o5KKuYlkp898ZafDQ8b/q27S3H85/oPWkg9QYCjqJfjIbOGeYEw2wSNKZBZ7OCLHh53iHQ+k0Z6hgdINrUb2bt5v18Sgc8ccQKDDccLnxNChtiS6OEpCdVJGw+ehsyl1gtQGdQLxN2qOHeAEzAEI/R0PnU3lMijSrdm3PnqUfQpE8pcTHUnWUwf3AV03ff7S6ghHqZmO5DAoaCB+iJVvhdMwsei6OWSG/HvHb1EZ9bCnuEKkQYd6KVeO+Nl6axup67IVypX9AFC4TqUxPPboc6DymsmnbSrnkzL2fFovLM7dWvetk/rFqRnLn8IHJ80iOc4dvpTbO45EQmZakPskv8TiROujDY4FnPTNcM+FV89jmKTppurPKlHrW2hS2Itr1akRM2ZNVBClyQvtvbdScYONNV7LAIZKYFUQDgb54CBBdM5IAY5NJSPYNLA9xAypNuKkP+E99lOnLQw0UA=="
+    S3_ACCESS_KEY: "AgDSSz0aRN4KYM2a/oQ7KCqlHKbtwN+QYIUnOl+V3VONPCAXeVPsyaq3CrRALNN9okGqZA4jjcHiwQgRIgxqEUNpZ1qIXNGnyRc7w1jMwIIqMdLcR8t1XeiiPLtPVHpxW9u2VOSIxpgeHucaR73AjjkBA85Jwauhu1lNKOdfmPPh60tcG8h0eqHoXh7a4jAozUrpx/3iaLtzRoFgvzQFwdPRr2ETMPTBf2BqgNmevATt+iUPSWydxfemcWLA356Ds6FmFTvaP5tYR5VfKTyT/ZJBgRGFHadhECeSMDq1YKab//+YOTl3Wvnd7cSIGg3UZSNyF8rR4LDtwlpF5dBf5umZU8UNaHAJzlMajHZav/kglBiFVmPeERP1PXxlMXEZEVgfPE/YpzdNMvJ8RkfDsF/gmOBa5pteu9RnPTnD4kEwOZ0Bikx5rGWrQEnx2PH+MGczwga02frCjccTVv9Ralxmpa/JXXHJWrLGzvqd6yrXf7VbkhIgMP4WgswK7YELoox1ZGGodksBhCeYYXbnogQnl6+0lhs067ge67r3/30himWBmFhm6BDx0XsErZRqAeA1iFF2fdi5Hf23oRLnn8a2myBaky/mfPjdNVMT2F2C38PRwc8UEgy/1urPK3/boZbKzGQinlD4kyizO6Ep9Olp6hMhim0MFYnb2AX0hikDTJ3PAtP4FFjf0HUTHuS+AXXWsYTczrCJNG59/gr04GbrwWM8Ig=="
+    S3_SECRET_KEY: "AgAMhf2z7QQftvURSi7lrHOxhx5H1YuBgQNanz6AE8Dgrv2zMAOxf1KnjTky+Zeodis3Q4jDPTp9P/Zy3rPudpTdz0Ps5c9ONB7GBatKCeyZoimyPUDd7QN6AavKjdo6KFLtHs33eSWvMxJZSI4ZP+UqYlpO7oSpENEtUMbeaFpzdfazIcL4Ezb1lq9OovvDrV36BbjE7c3dYId9W6g2bpJQu2rmsN8hbQFYoXtvlfjif1NxNWmwrFS03k46HMQcnd997+jxwUM+Bpz0d937YSTl6AB1b5CHG0I4Y9QjmKxKY3kutSb176UUZ81dj7/OifZv1ivGkybGxIbbKHPw1xzOkFklt7lJ+j4fgHiR4QXbFs+mP5SirHADlIu9lrrHWVBZYg3+N0q6G8JCjKYfsxhzk4xpYM23//c959oYFwaWp3cjKDehURimwM0NVmQautcNBGmaFG2nvp3bjnH6Te7Ks6VpiwqdCuRFWRddyWkYMwhSfAfGLoFxG2UfTWKPHfk8tpVPasuoVgL/yxRQVvKqTDzIjurg5WQt+ADj7Y2mzwz/b8hU62X8CW+lUg30UhTzAEC0nKn5djp3salnAVN5ZediaA6N3/1MLr8l0pmINcplP4wqra0E6g5cqYhQ4KOqaP3Yjs4EacOUzJRGltsE+wE8Id4Rg9rEaI7MVGWBAF5ZTKrXAyBiQLRqewypOLvm3B95u8vMel9mOIx1"
+    AUTH_SECRET: "AgCnNfAqjLXae6cn1hpY96jR5nKB5di7fYX/sZk8mHE9mjYLQb/qwHSo2iyP+Dc7rgFI9Vq41vLuIx91nfcIIVmMEbZremu+XPBpVAPVDmrd6YbTsz7fowSVbwdPxckRfSwdd/VUZOlenYFJ1GIey66J7NZmRfktS/tVQ2barWovyoe3KGv7O3JB9V3X3Yo65qi/K8vqsFwweiiEHA4IDbxv2LSsauOW4bfgDgmn23niotA4W/GTgc5oVsv3d4z+95Kpvx7BI1j+Cdq7y7koAVeE38iWFlytDx1tFbZINBi6gLVwy8/r26BKylbRgNqtBAEtbI4/+6ce0b9fEJm3SvrIoa/LV6jNqDlP+xC8C4lHZKfGLo+ZLMC2w5tWIoxTqYmdGB7WY/oxEjV63dbLALzq5tNP9OWY9mIGu7/KiaR9oz2TERLLDylN/ZH906JlSaYl+08mP57Rh1dSXI5aVZqUqdPAyNDiV3B45kwGkuqno+5vZcHAjMPMsdCZioAYrqFHzy1jUO7irvePtZJ86LchmehlKaUXM8zp0dqfEHBZgcjEFgOvtrtGLBzX6ank9C0tCqHfQ4Tkm55Egu3XgmIx7BXDbBg8b+bCSAscZytOYca8Z0Z6S0WsLwbtVhDhQhHL3WTjrnpMMdYUC2dxXkJv3OrqCodLskl492k05oUONw0sJ5YayulM3WePbky/lwlic3quJnH66I7sIFO1Yimf5L0ma/W4TE9FpePn+OQyOQ=="
+    SETTINGS_ENCRYPTION_KEY: "AgBPhRD8Yxft1wIs9QwrfzR91FQGe1J6YrjPGb3xGWSzOXFLMQ8wA0SoyIYTPqI+PXbnx55jz8chyMX4lXAkyXEIdN/Rus51c567/87vbh6pbnnlDa43v+4G9/Z10mvLb+todtKSU1fcSqGc2QC56RA3vZ3BUTazNQlxBZTYapRqA+FvvMNy/piRxQVgy0MW1vOCZs2mRm4AdHIaRlXALgpqNf7sM19ITqAUvnCmJyT8tvb5FF1lWGV3JcoHA8SyApNJcE/3aqdrEG79fH483fiGabCF4MD08RcvDZiaIII6ORwD+FyRe8kefSkLOuPrATRrD/U/WcEbT83kypPJQ8QOKGcSb9lXo6+QWTlJGwnLE0vJyxsbE+JrOZGN1JX/0CbDQzS5dfvPsxinv8+7g8QVC2OTJTbgSszlFPsqrbi5rBM7dC7xdp64NdpcwLm29llUK2M6KnERYsX4LUmbwjd0va3T4uo3W4i7D4/6Ad9Ay3viG31rj0SSl9wq7oZ8DJd+T8sw0/pbCu9BtDcoNuYzOOsFrcY/KIt5L4pKEADf0I65cPjsbCRpsVJtOqH3lA9vEij4xxvUVuH3hf2iR+n0YG0tDw3IMoHeCj48hAY9cZFU6qFihUcKDl5xJiQZYBKoNd5avG/MLS2/jxLA+ZNr5lKgiUImcqgVbKOYmmAGjRqIEvk4xR7dgRkU76vqTFlc+WmsipuSZlRSpl1jXacJ3MWvQhFcpcGYdRfgOYo4Lg=="
+    SENTINEL_ENCRYPTION_KEY: "AgCSf29UO/OVnJodpg41DHFxUDcie6l0sX1wzE97lz7I7Ia/cvi3CcxMGc5VSCTsD7JqWx/5SEIID+4IP+TbE1NrTRFAvx8QTBg3o/NQE79tV5IU/vqORmxR9ShlanS1mHD8P8tCpWoKHUPFok+7dh5lVlRxTsXyUauYc0jX8J+41NEzKnxIe6B6KyTjRBs9xkYe9J/2Ln0tQo4D5pbAbOAyG84RBDVxWm71TtzUuP9tMHDjXvdrzn6Tx9m1sLyasCTywEyUJ529prH3DcIjScXrAEu72s2SLAq1pGolpu4KyBl0+eyCJ+mqr7WRadsnWpCWQ4vvXkCzNQyZKiRpLePJGKNJIlxOtM8i1Hb8Lxats6T+CVIB+cwFSJFk83Tu+WKfEaPCcbtpZR67BmcAAgOV/297gkE3Dz6DBeE7PNHiEvR47QheU0Y/JMJpg3dYM9+Ypi+/2nPYjSkc6j2QTdsoCoFMMCVeChcK+byndAlHLX+oR+Th/LAll85kXAqDzRaVQLNmtjbzGpAqk8eG4V64VV1JyP5bB3xy+gQkJo05xwuiB6UuakLxnq6abspvbVYrgREveSwpZT6m7/tH7HlSif/A8UhfwQX4h1J+MGDgNzyytqGZCrA1o48TQIpCXozdVZBWcSMn0/iBZzs6WKRWauI26qnNBu8PwuAa43NFAYa+05CGbPfWIkSvwbPmRcRV1hNvfFtPItvIshIuRcc3erzS3rD30ycpSB+5NR2Xaw=="
+    CRON_SECRET: "AgCh+bxL5Y1Ai4bxv93ml4RzWLZGmAVXSopjY07MBSXiyVt0vDrk3XSe8HCRY4FBTKvxiI8S//VzWgjhg/B5x+JwoevjbNhGIDtP6e0pgV9wn7x3ju8eD0yrd+oHrqllyTfuITTZnzDaf5bD/7l+MFA4C6wpgr7kDP8h4d975xAzOECugPdy+RG6f/gIjZ7O1Rw+Fn7nX2jxCTn5rcyLOyxkAoW92HpAccEphoqwNZBDrDj3x6BvQ2XqSLLglDPNVujA3mpOO1X8lYLZeyS4pVMSZuVWWHyHCqIWO+3BiNhQhHUoOSvuC+SB4Vb2JhSYWHATJHzTozR4HYr5HxJebdiHYOmJI5828UxePyPRjpiqUuYpM56qxcO5j1kaC6XV/IQtETz5aWLyeYsDIh/V2tUuCM/5oYHzVqbiQ9OMvmfJAlAKMtcZFPqq7Sc4zgHZd8CEBgAqrTutJFV7jFeu/lww3lfUvDbMiwI3pW2HtLJ2WlcF+zYpQ+7i0r/g5rm6ywkNxFeFJbW6PtTI9/uT1RRLJlewoOeAjCYJyejcPjAyVw1iuxBYG0oLpLkN1aZAm/nZ3DqMu1BztYcCd+1dSxiNKL5Kcc5s1ZsZYx5K8MHq9z6KBSQaYWWad+sdhwU1qv//bsfmTStNBnlfTMeI1cNdmYjz8Dp15Vem1txC0SZhtzGQYyTSoOry1vGeXytpjLcBHFik4eQsvbfA4NjEIXXGrGmmlP23tRZxX2rgyqDuPg=="
+    EMAIL_SERVER: "AgBGd5M/s7Knb0vZ4ioM1/D/iN816SYJ8nOPpchUJ6G7x0iNz6hpBb7M3zKDbSeTkX24eTG70xNKnW7e0wJoMPXUIO/0eQLiAWhI1gpy/ISPsw1iA1aOC9qCBPVVm+8YnMQLcoQlYpSYZEi6g6SrZAWpczWYoDkL2+h+Vdl59qc+a+CqftpVfvVBBIfkpXz47tK0dXNflRKijKwJi9N4khQN/vyjuPtJ92az8mvRbQN2c5ldU3swA7TGka7ujQCCFFWZEKAMISXf6xBrYDvoWRoGQ2KiL35cUFgSRhUbN+2UbaQvHO5emRaMIMFVwiAYomd0gSaIqjfSAU78GXU2Xm2WQECyE6eSIbQl0ICGojihyOD7NnVhVgsUO/auDMZnsRWyO1JXeM5ZyvUiH08xUp07TZDZN3bRfNEgcMOvS2UM9DB2Mq8H6i+RMQVZcOveNlvq1pMbngVbuoJ/BqWBl1I0g9dshZuihC7lODSBNCjJF6NFmldqeNOUE1OudtjA1XBrH9A1usJuFr9+RuNUNbwbayFphJjVYFtb21E1h4QDdnal8+p3x31sJyQbTE7FaY0EXxkJCjkMTtuEFUhlxkFB09Wr8V/dVJ/lt6mVQNqJuBQTX7mTKMt7iX7foQCU+cdXsiZPfNLIAl18FcfvTF/cZCah+a1ATCK+RI/h0ST7IlDeC5/Njxuv9d2SKhTF3NnyM2ujWaNin/LBcpWTZGMRs4aCkRj+za5JflGMVL4ZNnFmOnB/cdRZ/+8SM2M2vq2lBz/Lu/gRWrK+BjeTFAmQvcXLPzuKx4D7Nsu5tv08D0LjAf2c3HkZlTQuHgEGRGyM0RdQf/Wfdf4IyuEmhRfdyqXBeQ=="
+    # Shared-cluster NATS DSN (with credentials) — seal via kubeseal-encrypt-string
+    # scoped to namespace sentinel-staging, name sentinel-sentinel-secrets.
+    NATS_URL: "AgDRxKFUtHjezCqZRsPkTuCkgk9B1neCmALZ7zzzNKKOMG5xsLFWl2e67EzGslojPMAVHkoG75tZZRu/j5EyG/wILY+jI6p3ofntNhR/uA7wIR6nqtbPaaf/NsIJod3i7exQlllhimDjHuy/wYm8SS9RzdoCZDtbJNX+m+8xxA9XxdnTAE5sR1VzscIQs/t7NSBbeNe3mrGg5Iqurly+sRiFq/4CB5IhcSOyNz+FEqL2bD5pXIxSWSZxrR9Bp5Mgy+BLNAPK5Rtza/ppIqwQt47ZpcRTuGR2mTgw87L6xzVZJP6FBILQNads45DFQv3dTWkx/cx3tjbSpYfEfiQMTWzc34Nbo4gEutGfhSEkO1i+LGe4g/SMGoMgcJ7QffwdmrTKzXV2zmiLXp+M1uhExSeJgp79DFHffK+3fif2ysVlshFqUKifS+uyeQH0g3RqDRdHMFXj78vkk3Km9oVkI6XFK2oXYw1of8DuNn4B9WXus8jDLnBNPJTFUD5HZzvIm48bVN14GYUKRBH8EE/QsTd6s+NjKEK8pSiJRoWp/jb6lVwoHiOCfQ3nbMbPNcIxxBQoYn7O/TqQdNv4VbXFYvNZ79Ylvl6hzjNo2H4dr95AtHG4ZBkwiczGkMqm5D8xVhAXxS3+ImfI6SXrmtCP074avffiQXIO63f7F6zfxJm4ifMumvBGyXQeYDN2rZyrIpDoigFAA7lRyyDdIcMgcIMVtUKrteOVBP96ifRSBVsKwigqG4A3x3nQjO0y/ObHiuxU1yoGVoWLFaBsOV5De61A0/glU1FX+mHTWmwH13ddinF8WTodhg=="
+
+# -----------------------------------------------------------------------------
+# Managed VPC endpoints. CCE Standard cannot route pod traffic to these IPs
+# directly, so each entry also renders a selector-less Service + Endpoints
+# (templates/external-services.yaml) that apps dial by in-cluster DNS name.
+# -----------------------------------------------------------------------------
+externalServices:
+  - name: rds-postgres-sentinel
+    ip: 10.200.38.64
+    port: 5432
+  - name: dcs-redis-sentinel
+    ip: 10.200.49.78
+    port: 6379
+
+config:
+  postgres:
+    host: rds-postgres-sentinel
+    port: 5432
+    user: daya-core-api-user
+    database: sentinel-staging
+    sslmode: require
+  nats:
+    # Shared cluster NATS (authenticated DSN sealed as NATS_URL) — bundled off.
+    url: ""
+  redis:
+    addr: "dcs-redis-sentinel:6379"
+    # DB 1: the shared DCS instance also serves cdc-pipeline on DB 0 —
+    # a dedicated index avoids key collisions. Confirm index 1 is free.
+    db: 1
+  s3:
+    endpoint: "https://obs.ap-southeast-3.myhuaweicloud.com"
+    publicEndpoint: "https://obs.ap-southeast-3.myhuaweicloud.com"
+    bucket: sentinel-staging
+  otel:
+    exporterEndpoint: ""
+  dashboard:
+    authUrl: "https://sentinel-stg.daya.ai"
+    authTrustHost: "true"
+    emailFrom: "noreply@daya.ai"
+    dataRetentionDays: "30"
+    reportMatchWindowMinutes: "30"
+    escalationAckMinutes: "15"
+    escalationMaxHops: "3"
+    reportUploadRpm: "10"
+    reportUploadBytesPerDay: "262144000"
+    claimStaleHours: "24"
+    manualIssueRetentionDays: "365"
+  ingestor:
+    ratelimitStrictMode: "true"
+
+migrate:
+  enabled: true
+  targets:
+    - processor
+    - ingestor
+    - dashboard
+
+ingestor:
+  replicaCount: 2
+  containerPort: 8080
+  service:
+    type: NodePort
+    port: 8080
+    nodePort: 31123
+  ingress:
+    enabled: true
+    host: api-sentinel-stg.daya.ai
+    elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
+    tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+processor:
+  replicaCount: 2
+  healthPort: 8081
+  service:
+    type: ClusterIP
+    port: 8081
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+dashboard:
+  replicaCount: 2
+  containerPort: 3000
+  service:
+    type: NodePort
+    port: 3000
+    nodePort: 31124
+  ingress:
+    enabled: true
+    host: sentinel-stg.daya.ai
+    elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
+    tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
+
+# Bundled stateful deps: all OFF on Huawei — managed/shared equivalents above.
+dependencies:
+  postgres:
+    enabled: false
+  nats:
+    enabled: false
+  redis:
+    enabled: false
+  minio:
+    enabled: false
+
+init:
+  nats:
+    enabled: true
+    image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-nats-init
+    tag: ""
+  minio:
+    enabled: false
+    image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-minio-init
+    tag: ""
+
+# Legacy combined ingress renders nothing when provider == huawei.
+ingress:
+  enabled: false
+
+retentionCron:
+  enabled: true
+  schedule: "0 * * * *"
+
+oncallCron:
+  enabled: false
+
+prometheusRule:
+  enabled: false
+
+dlqDrainer:
+  enabled: true
+  drainerEnabled: "false"
+  drainerExecute: "false"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

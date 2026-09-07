@@ -65,6 +65,13 @@ spec:
             # POSTGRES_* must precede DATABASE_URL — Kubernetes expands $(VAR) using vars
             # defined earlier in this list.
             {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- end }}
             - name: DATABASE_URL
               value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode={{ .Values.config.postgres.sslmode }}"
             - name: OTEL_SERVICE_NAME
@@ -82,10 +89,23 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SENTINEL_ENCRYPTION_KEY } }
             - name: CRON_SECRET
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: CRON_SECRET } }
+            # Google OAuth is optional (email magic-link is the fallback auth).
+            # These env entries render only when the keys exist in the ACTIVE
+            # secret pool (sealedData when backend=sealed, else data) — Helm
+            # deep-merges the base values, so the check must not look at the
+            # inactive pool. Omitting the keys disables Google SSO without a
+            # CreateContainerConfigError on missing secret keys.
+            {{- $sealed := .Values.secrets.sealedData | default dict }}
+            {{- $plain := .Values.secrets.data | default dict }}
+            {{- $pool := ternary $sealed $plain (eq (.Values.secrets.backend | default "plain") "sealed") }}
+            {{- if hasKey $pool "GOOGLE_CLIENT_ID" }}
             - name: GOOGLE_CLIENT_ID
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_ID } }
+            {{- end }}
+            {{- if hasKey $pool "GOOGLE_CLIENT_SECRET" }}
             - name: GOOGLE_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_SECRET } }
+            {{- end }}
             - name: EMAIL_SERVER
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: EMAIL_SERVER } }
           livenessProbe:
@@ -115,6 +135,9 @@ spec:
     - name: http
       port: {{ .Values.dashboard.service.port }}
       targetPort: http
+      {{- if and (eq .Values.dashboard.service.type "NodePort") .Values.dashboard.service.nodePort }}
+      nodePort: {{ .Values.dashboard.service.nodePort }}
+      {{- end }}
 {{- if .Values.dashboard.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

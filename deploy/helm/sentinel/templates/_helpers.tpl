@@ -64,6 +64,17 @@ external hosts come from config.* when provided.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Renders "true" when NATS_URL is supplied via secrets (sealedData/data) instead
+of the ConfigMap — e.g. an authenticated shared-cluster DSN. Guards hasKey
+against nil maps.
+*/}}
+{{- define "sentinel.natsUrlIsSecret" -}}
+{{- $sealed := .Values.secrets.sealedData | default dict -}}
+{{- $plain := .Values.secrets.data | default dict -}}
+{{- if or (hasKey $sealed "NATS_URL") (hasKey $plain "NATS_URL") }}true{{- end -}}
+{{- end -}}
+
 {{- define "sentinel.redisAddr" -}}
 {{- if .Values.config.redis.addr -}}
 {{- .Values.config.redis.addr -}}

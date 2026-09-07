@@ -1,0 +1,163 @@
+name: Release Huawei Staging
+
+# Staging release: push tag v*-staging (e.g. v0.1.0-staging).
+# Builds all 7 first-party images, pushes to SWR (:ref_name), then ArgoCD-syncs
+# sentinel-staging with per-service image.tag parameters.
+# Mirrors cdc-pipeline's release-staging.yml (inline build-push; Sentinel has no
+# private Go modules, so no host-binary Dockerfile.swr dance is needed).
+
+on:
+  push:
+    tags: ["v*-staging"]
+
+permissions:
+  contents: read
+  id-token: write # Required for AWS OIDC (ArgoCD SSM credentials)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint-helm-huawei:
+    name: Lint Huawei Helm manifests
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Install kube-linter
+        run: |
+          go install golang.stackrox.io/kube-linter/cmd/kube-linter@v0.6.5
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: helm lint
+        run: helm lint deploy/helm/sentinel
+
+      - name: helm template + kube-linter (both Huawei envs)
+        run: |
+          set -euo pipefail
+          for env in staging production; do
+            helm template sentinel ./deploy/helm/sentinel \
+              --values ./deploy/helm/sentinel/values-huawei-$env.yml \
+              > /tmp/sentinel-huawei-$env.yaml
+            kube-linter lint \
+              --config ./deploy/helm/sentinel/.kube-linter.yaml \
+              /tmp/sentinel-huawei-$env.yaml
+          done
+
+  build-images:
+    name: Build & Push images to SWR
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
+    timeout-minutes: 30
+    needs: [lint-helm-huawei]
+    strategy:
+      matrix:
+        include:
+          - image: sentinel-ingestor
+            dockerfile: apps/ingestor-go/Dockerfile
+            context: .
+          - image: sentinel-processor
+            dockerfile: apps/processor-go/Dockerfile
+            context: .
+          - image: sentinel-dashboard
+            dockerfile: apps/dashboard-web/Dockerfile
+            context: .
+          - image: sentinel-db-migrate
+            dockerfile: packages/db-migrations/Dockerfile
+            context: packages/db-migrations
+          - image: sentinel-dlq-drainer
+            dockerfile: scripts/Dockerfile.dlq-drainer
+            context: .
+          - image: sentinel-nats-init
+            dockerfile: scripts/Dockerfile.nats-init
+            context: scripts
+          - image: sentinel-minio-init
+            dockerfile: scripts/Dockerfile.minio-init
+            context: scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate SWR login password (HMAC-SHA256)
+        id: derive-swr-password
+        env:
+          SWR_REGION: ${{ secrets.SWR_REGION }}
+          SWR_AK: ${{ secrets.SWR_ACCESS_KEY }}
+          SWR_SK: ${{ secrets.SWR_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWR_REGION:-}" ] || [ -z "${SWR_AK:-}" ] || [ -z "${SWR_SK:-}" ]; then
+            echo "::error::Missing required SWR secret (SWR_REGION/SWR_ACCESS_KEY/SWR_SECRET_KEY). SWR_SECRET_KEY must be RAW SK from credentials.csv, not pre-hashed." >&2
+            exit 1
+          fi
+          if command -v xxd >/dev/null 2>&1; then
+            SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | xxd -p -c 256)
+          else
+            SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | od -An -vtx1 | tr -d ' \t\n\r')
+          fi
+          if [ -z "$SWR_LOGIN_PWD" ]; then
+            echo "::error::Failed to derive SWR login password" >&2
+            exit 1
+          fi
+          echo "::add-mask::$SWR_LOGIN_PWD"
+          echo "swr_login_password=$SWR_LOGIN_PWD" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Huawei SWR
+        uses: docker/login-action@v3
+        with:
+          registry: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com
+          username: ${{ secrets.SWR_REGION }}@${{ secrets.SWR_ACCESS_KEY }}
+          password: ${{ steps.derive-swr-password.outputs.swr_login_password }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  gate-staging:
+    name: Gate Staging Environment
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
+    timeout-minutes: 5
+    needs: [build-images]
+    environment: staging
+    steps:
+      - run: echo "Staging gate passed for ${{ github.ref_name }}"
+
+  deploy-staging:
+    name: Deploy Staging Environment
+    needs: [gate-staging]
+    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@88b33a7e98ee773ebd33d55e80914b1bcce326be # main as of 2026-09-04, PR #97 stale-key unset fix
+    with:
+      runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
+      app_name: "sentinel-staging"
+      argocd_url: "argocd.daya.ai"
+      argocd_username_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_USER"
+      argocd_password_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_PASSWORD"
+      parameters: |
+        images.ingestor.tag=${{ github.ref_name }}
+        images.processor.tag=${{ github.ref_name }}
+        images.dashboard.tag=${{ github.ref_name }}
+        images.migrate.tag=${{ github.ref_name }}
+        images.dlqDrainer.tag=${{ github.ref_name }}
+        init.nats.tag=${{ github.ref_name }}
+        init.minio.tag=${{ github.ref_name }}
+      sync: true
+      wait: true
+      wait_timeout: 600

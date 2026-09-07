@@ -31,8 +31,16 @@ spec:
           image: "{{ $img.repository }}:{{ $tag }}"
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           env:
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- else }}
             - name: NATS_URL
               value: {{ include "sentinel.natsUrl" . | quote }}
+            {{- end }}
             - name: DLQ_STREAM
               value: {{ .Values.dlqDrainer.stream | quote }}
             # Both gates must be "true" for anything destructive; ships OFF (D14).

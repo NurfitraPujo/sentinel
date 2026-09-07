@@ -1,0 +1,37 @@
+{{- if and (eq (.Values.global.provider | default "generic") "huawei") .Values.externalServices }}
+# Huawei CCE Standard cannot route pod traffic to VPC addresses outside the
+# cluster (e.g. RDS, DCS Redis). Each entry renders a selector-less Service
+# plus a static Endpoints object bridging the in-cluster name to the managed
+# private IP — the same pattern as cdc-pipeline's external-services.yaml.
+# Apps dial `<name>:<port>` (in-cluster DNS); kube-proxy forwards to the IP.
+{{- range .Values.externalServices }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .port }}
+      targetPort: {{ .targetPort | default .port }}
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/managed-by: Helm
+subsets:
+  - addresses:
+      - ip: {{ required (printf "externalServices entry %s needs an ip" .name) .ip | quote }}
+    ports:
+      - port: {{ .port }}
+        protocol: TCP
+{{- end }}
+{{- end }}

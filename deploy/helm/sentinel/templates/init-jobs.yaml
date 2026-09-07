@@ -26,8 +26,16 @@ spec:
         - name: nats-init
           image: "{{ .Values.init.nats.image }}:{{ .Values.init.nats.tag | default .Chart.AppVersion }}"
           env:
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- else }}
             - name: NATS_URL
               value: {{ include "sentinel.natsUrl" . | quote }}
+            {{- end }}
 {{- end }}
 {{- if .Values.init.minio.enabled }}
 ---
