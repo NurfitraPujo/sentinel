@@ -87,6 +87,28 @@ export async function getProjectEnvironment(
 }
 
 /**
+ * §4.5a's `environmentDisplayName`: the registry's `display_name` for `(projectId, name)`, falling
+ * back to the raw environment name when no registry row exists.
+ *
+ * **The fallback is the NORMAL path, not a defensive branch.** Under decisions 8 and 9 registration
+ * is declared-only — traffic never creates a registry row — so an environment can be present in the
+ * data and absent from the registry indefinitely, and a new environment's first day is always a
+ * miss here. A page that rendered blank, `undefined`, or threw on the miss would be broken for
+ * every environment on its first day.
+ */
+export async function resolveEnvironmentDisplayName(
+	projectId: string,
+	name: string,
+	executor: Executor = db
+): Promise<string> {
+	const [row] = await executor
+		.select({ displayName: projectEnvironments.displayName })
+		.from(projectEnvironments)
+		.where(and(eq(projectEnvironments.projectId, projectId), eq(projectEnvironments.name, name)));
+	return row?.displayName ?? name;
+}
+
+/**
  * §4.2/§4.3: clearing every OTHER default of this project. Called inside the same transaction as
  * the write that sets one, which is what "in one write" means on the wire — the partial unique
  * index `(project_id) WHERE is_default` is what makes at-most-one a database fact, and it fires if

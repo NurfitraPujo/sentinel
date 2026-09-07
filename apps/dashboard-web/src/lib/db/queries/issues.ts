@@ -5,6 +5,7 @@ import semver from 'semver';
 import type { RelationType } from '$lib/types/relation-type';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { environmentScopeCondition } from '$lib/server/environment-access';
 
 // Robust semver comparison helper with fallback
 function isRegression(releaseVersion: string, resolvedInVersion: string): boolean {
@@ -492,7 +493,14 @@ export async function searchIssuesInOrg(
 	orgId: string,
 	query: string,
 	excludeIssueId?: string,
-	issueType?: string
+	issueType?: string,
+	// sentinel-project-environments §2.2, decision 25 — the caller's environment scopes, as
+	// `resolveEnvironmentScopes` returns them. This is an ORG-WIDE search with no project filter of
+	// its own, and it returns issue rows: message, error class, status and fingerprint. Its own
+	// `issue-access.ts` comment records that callers must scope it, and decision 25 makes that a
+	// guard rather than a convention. An empty map adds no predicate; a project absent from the map
+	// is unrestricted.
+	environmentScopes: Map<string, string[]> = new Map()
 ) {
 	const sanitized = query.trim().replace(/[%_\\]/g, '\\$&');
 	const searchTerm = `%${sanitized}%`;
@@ -512,6 +520,7 @@ export async function searchIssuesInOrg(
 				eq(projects.organizationId, orgId),
 				excludeIssueId ? sql`${issues.id} != ${excludeIssueId}` : sql`1=1`,
 				issueType ? eq(issues.issueType, issueType) : sql`1=1`,
+				environmentScopeCondition(environmentScopes) ?? sql`1=1`,
 				sql`(${issues.id}::text ILIKE ${searchTerm} OR ${issues.errorClass} ILIKE ${searchTerm} OR ${issues.message} ILIKE ${searchTerm} OR ${issues.fingerprint} ILIKE ${searchTerm})`
 			)
 		)

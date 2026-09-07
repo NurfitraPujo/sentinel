@@ -1,6 +1,6 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, ne, or, type SQL } from 'drizzle-orm';
 import { db } from './db';
-import { projectEnvironmentGrants } from '$lib/db/schema';
+import { issues, projectEnvironmentGrants } from '$lib/db/schema';
 
 /**
  * sentinel-project-environments §2.2 — the environment access model, and the ONLY place the rule
@@ -112,4 +112,35 @@ export function scopeForProject(
 	projectId: string
 ): string[] | null {
 	return scopes.get(projectId) ?? null;
+}
+
+/**
+ * The §2.2 predicate, rendered once as SQL over `issues`, for every query that returns issue rows.
+ *
+ * §2.2's *One resolver* rule offers two acceptable shapes — the `Map` above, or "the predicate
+ * expressed once as a SQL fragment that every site composes" — and this is the second half of the
+ * same rule rather than a third resolver: it performs no I/O and derives nothing. Four query
+ * builders compose it (`listIssues`, `countIssues`, `searchErrors`'s two queries and
+ * `searchIssuesInOrg`), and without it each of them would spell out "absence means all" for itself,
+ * which is the thing §2.2 says will not stay complete.
+ *
+ * Shape, per scoped project: `project_id <> $p OR environment = ANY($scope)`. A project the map
+ * does not mention is not named by any disjunct, so it is unrestricted — the same "absence means
+ * all" rule {@link scopeForProject} states, expressed in SQL. An empty map therefore yields
+ * `undefined`: **no predicate at all**, never `false`.
+ *
+ * It is deliberately NOT a tenancy predicate. Which projects the caller may reach is a separate
+ * condition the call site applies beside this one (§4.4's unconditional `inArray`); conflating the
+ * two is how a guard becomes a filter the caller controls.
+ */
+export function environmentScopeCondition(scopes: Map<string, string[]>): SQL | undefined {
+	if (scopes.size === 0) {
+		return undefined;
+	}
+
+	const perProject = [...scopes.entries()].map(([projectId, environments]) =>
+		or(ne(issues.projectId, projectId), inArray(issues.environment, environments))
+	);
+
+	return and(...perProject);
 }

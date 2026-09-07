@@ -2,6 +2,7 @@ import { error } from '@sveltejs/kit';
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from './db';
 import { issues, projects, organizationMembers, projectMembers } from '$lib/db/schema';
+import { resolveEnvironmentScope } from './environment-access';
 
 /**
  * Org roles allowed to perform WRITE operations on issues (resolve/ignore/unresolve/assign).
@@ -107,6 +108,7 @@ export async function requireIssueAccess(
 		.select({
 			issueId: issues.id,
 			projectId: issues.projectId,
+			environment: issues.environment,
 			organizationId: projects.organizationId,
 		})
 		.from(issues)
@@ -117,7 +119,7 @@ export async function requireIssueAccess(
 		throw error(404, 'Issue not found');
 	}
 
-	const { projectId, organizationId } = issueRows[0];
+	const { projectId, environment, organizationId } = issueRows[0];
 
 	if (!organizationId) {
 		throw error(400, 'Issue project does not belong to an organization');
@@ -126,6 +128,18 @@ export async function requireIssueAccess(
 	const { organizationId: orgId } = await requireProjectAccess(userId, projectId, permission, {
 		organizationId,
 	});
+
+	// sentinel-project-environments §2.2 — the ENVIRONMENT dimension, applied after the project one.
+	//
+	// Denial here is `404`, never `403` (decision 20). An issue in an environment the caller may not
+	// see is indistinguishable from an issue that does not exist: a `403` on `/issues/<uuid>` tells
+	// a contractor that a production issue with that id exists, which is the fact the boundary was
+	// drawn to withhold. The project dimension keeps its `403`s above, and that asymmetry is
+	// deliberate.
+	const scope = await resolveEnvironmentScope(userId, projectId);
+	if (scope !== null && !scope.includes(environment)) {
+		throw error(404, 'Issue not found');
+	}
 
 	return { issueId: issueRows[0].issueId, projectId, organizationId: orgId };
 }

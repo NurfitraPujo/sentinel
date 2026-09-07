@@ -138,3 +138,53 @@ describe('GET /api/agent/issues -- nextCursor in response', () => {
 		expect(body).toEqual({ issues: [], nextCursor: 'next-abc' });
 	});
 });
+
+// sentinel-project-environments §4.6 — the `environment` parameter.
+//
+// It is a FILTER and there is no guard on this surface, deliberately (contract §12 *Known limits*
+// 2): `authenticateAgentRequest` resolves a `project_api_keys` row to an ORGANIZATION, not a
+// person, so `AgentAuthContext` has an `organizationId` and no `userId` — there is no membership
+// row and no grant to resolve. A registered agent reads every environment of every project in its
+// organization, before and after this feature.
+describe('GET /api/agent/issues -- environment (§4.6)', () => {
+	it('is absent from the query-layer options when the caller did not supply it', async () => {
+		await GET(makeEvent());
+
+		expect(listAgentIssues).toHaveBeenCalledWith(
+			expect.objectContaining({ environment: undefined })
+		);
+	});
+
+	// The assertion that matters: absent `environment` returns byte-for-byte today's result. The
+	// route builds its body from `result.issues` / `result.nextCursor` and nothing about the shape
+	// moves, so this asserts the whole body rather than a field of it.
+	it('returns byte-for-byte the pre-existing response body when environment is absent', async () => {
+		const issue = { id: 'issue-1', projectId: 'proj-1', message: 'boom' };
+		listAgentIssues.mockResolvedValue({ issues: [issue] });
+
+		const res = await GET(makeEvent());
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe(JSON.stringify({ issues: [issue] }));
+	});
+
+	it('forwards the name verbatim — exact and case-sensitive, no normalisation', async () => {
+		await GET(makeEvent('?environment=eu-west-1'));
+
+		expect(listAgentIssues).toHaveBeenCalledWith(
+			expect.objectContaining({ environment: 'eu-west-1' })
+		);
+	});
+
+	// An unrecognised name is not an error — it returns an empty list, because "no issues in `qa`"
+	// and "there is no `qa`" are the same fact to a reader. So there is no validation to 400 on, and
+	// an empty string is the same as omitting it.
+	it('treats an empty environment as absent rather than as a name', async () => {
+		const res = await GET(makeEvent('?environment='));
+
+		expect(res.status).toBe(200);
+		expect(listAgentIssues).toHaveBeenCalledWith(
+			expect.objectContaining({ environment: undefined })
+		);
+	});
+});

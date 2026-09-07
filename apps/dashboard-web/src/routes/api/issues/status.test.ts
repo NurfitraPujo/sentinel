@@ -31,10 +31,20 @@ const dbMock = makeDbMock();
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
-	issues: { id: 'id', projectId: 'projectId' },
+	issues: { id: 'id', projectId: 'projectId', environment: 'environment' },
 	projects: { id: 'id', organizationId: 'organizationId' },
 	organizationMembers: { organizationId: 'organizationId', userId: 'userId', role: 'role' },
 	projectMembers: { projectId: 'projectId', userId: 'userId', role: 'role' },
+	// sentinel-project-environments §2.2: `requireIssueAccess` now resolves the caller's environment
+	// scope as its last step. The grant read falls through to the db double's base resolution (`[]`)
+	// in every test below that does not queue one, which is "no grant row" — unrestricted, the
+	// absence-means-all rule — so the role assertions here are unaffected by it. The guard's own
+	// behaviour is asserted in `src/lib/server/issue-access.environment.test.ts`.
+	projectEnvironmentGrants: {
+		userId: 'userId',
+		projectId: 'projectId',
+		environments: 'environments',
+	},
 }));
 
 const issueQueries = {
@@ -59,7 +69,12 @@ function patchRequest(body: unknown) {
 	return new Request('http://x', { method: 'PATCH', body: JSON.stringify(body) });
 }
 
-const issueRow = { issueId: 'issue-1', projectId: 'project-1', organizationId: 'org-1' };
+const issueRow = {
+	issueId: 'issue-1',
+	projectId: 'project-1',
+	environment: 'production',
+	organizationId: 'org-1',
+};
 
 describe('PATCH /api/issues/:id/status', () => {
 	beforeEach(() => {
@@ -122,8 +137,10 @@ describe('PATCH /api/issues/:id/status', () => {
 		async (role) => {
 			dbMock.then
 				.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
-				.mockImplementationOnce((resolve: any) => resolve([{ role }])) // org role
-				.mockImplementationOnce((resolve: any) => resolve([{ role: 'developer' }])); // project membership
+				.mockImplementationOnce((resolve: any) => resolve([{ role }])); // org role
+			// No third resolution is queued: an org role on the write allowlist short-circuits the
+			// `project_members` lookup (D17), and the grant read `requireIssueAccess` now ends with
+			// falls through to the base `[]` — no grant row, unrestricted.
 
 			const res = await PATCH({
 				params: { issueId: 'issue-1' },
@@ -220,8 +237,7 @@ describe('PATCH /api/issues/:id/status', () => {
 	it('accepts a resolvedInVersion at exactly the 100-char limit', async () => {
 		dbMock.then
 			.mockImplementationOnce((resolve: any) => resolve([issueRow]))
-			.mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }]))
-			.mockImplementationOnce((resolve: any) => resolve([{ role: 'developer' }]));
+			.mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }]));
 
 		const res = await PATCH({
 			params: { issueId: 'issue-1' },

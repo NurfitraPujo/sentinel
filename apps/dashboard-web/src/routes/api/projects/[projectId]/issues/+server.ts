@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
 import { issues, projects, organizationMembers, errorOccurrences } from '$lib/db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
+import { resolveEnvironmentScope } from '$lib/server/environment-access';
 
 export const GET: RequestHandler = async ({ params, url, locals }) => {
 	const session = await locals.auth();
@@ -63,6 +64,18 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
 	}
 	if (assigneeType) conditions.push(eq(issues.assigneeType, assigneeType));
 	if (assignedTo) conditions.push(eq(issues.assignedTo, assignedTo));
+
+	// sentinel-project-environments §2.2, decision 25 — the THIRD door to issue rows, separate from
+	// `/`'s page loader and from `searchErrors`, reached by project id with an `organization_members`
+	// join. A guard missing from any one of §2.2's call sites is the whole boundary.
+	//
+	// `null` is unrestricted (no grant row) and adds no predicate — the absence-means-all rule. Rows
+	// outside the scope are simply not returned; there is no `403` to give, because a list does not
+	// have a subject to deny (decision 20's `404` shape lives on the by-id paths).
+	const scope = await resolveEnvironmentScope(userId, projectId);
+	if (scope !== null) {
+		conditions.push(inArray(issues.environment, scope));
+	}
 
 	const filteredIssues = await db
 		.select()

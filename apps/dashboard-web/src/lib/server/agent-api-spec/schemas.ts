@@ -111,6 +111,9 @@ export const ListIssuesQuerySchema = z
 		// N9 (C12): `me` restricts to the calling agent's own claims (resolved from the credential).
 		claimed: z.enum(['true', 'false', 'me']).optional(),
 		project: z.string().optional(),
+		/** sentinel-project-environments §4.6: exact, case-sensitive match on issues.environment.
+		 * Absent = every environment (unchanged behaviour). */
+		environment: z.string().optional(),
 		waiting: z.enum(['true', 'false']).optional(),
 		/** ISO timestamp; only issues with firstSeen >= since. */
 		since: z.string().optional(),

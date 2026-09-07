@@ -63,6 +63,12 @@ export interface ListAgentIssuesOptions {
 	 */
 	claimedByAgentId?: string;
 	projectId?: string;
+	/**
+	 * sentinel-project-environments §4.6: `WHERE issues.environment = $1`. Absent = every
+	 * environment, byte-identical to the pre-existing behaviour. A FILTER, not a guard — see the
+	 * comment at the predicate below.
+	 */
+	environment?: string;
 	waiting?: boolean;
 	/**
 	 * SR-6 / OQ-8: filter on `issues.source_channel`. §6's stated mitigation for the volume and
@@ -170,6 +176,15 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	}
 	if (options.projectId) {
 		conditions.push(eq(issues.projectId, options.projectId));
+	}
+	// sentinel-project-environments §4.6: a plain column predicate (decision 7 put `environment`
+	// into issue identity, so an issue belongs to exactly one). Absent means every environment —
+	// the existing behaviour, unchanged, so no deployed agent changes what it sees. There is no
+	// GUARD on this surface and none is wanted: `authenticateAgentRequest` resolves a key to an
+	// ORGANIZATION, not a person, so there is no membership row and no grant to resolve
+	// (contract §12 *Known limits* 2).
+	if (options.environment) {
+		conditions.push(eq(issues.environment, options.environment));
 	}
 	if (options.waiting === true) {
 		conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
