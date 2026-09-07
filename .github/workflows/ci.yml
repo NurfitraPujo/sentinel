@@ -582,37 +582,42 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
         with:
           version: v3.14.0
 
+      - name: Set up Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version: "1.26"
+          cache: false
+
       - name: Install kube-linter
         run: |
-          set -euo pipefail
-          KUBE_LINTER_VERSION=v0.6.5
-          mkdir -p "$HOME/.local/bin"
-          curl -sSL -o /tmp/kube-linter.tar.gz "https://github.com/stackrox/kube-linter/releases/download/${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz"
-          tar xzf /tmp/kube-linter.tar.gz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          kube-linter version
+          go install golang.stackrox.io/kube-linter/cmd/kube-linter@v0.6.5
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: helm lint
         run: helm lint deploy/helm/sentinel
 
-      - name: helm template + kube-linter (both Huawei envs)
+      - name: Lint Helm manifests
         run: |
           set -euo pipefail
-          for env in staging production; do
-            helm template sentinel ./deploy/helm/sentinel \
-              --values ./deploy/helm/sentinel/values-huawei-$env.yml \
-              > /tmp/sentinel-huawei-$env.yaml
-            echo "Linting values-huawei-$env.yml ..."
-            kube-linter lint \
-              --config ./deploy/helm/sentinel/.kube-linter.yaml \
-              /tmp/sentinel-huawei-$env.yaml
+          timestamp=$(date +%s)
+          mkdir -p tmp
+
+          generateManifests() {
+            helm template sentinel ./deploy/helm/sentinel --values ./deploy/helm/sentinel/"$1" > ./tmp/"$1-$timestamp.yaml"
+          }
+
+          for manifest in values-huawei-production.yml values-huawei-staging.yml; do
+            generateManifests "$manifest"
+            echo "Linting $manifest ..."
+            kube-linter lint --config ./deploy/helm/sentinel/.kube-linter.yaml "./tmp/$manifest-$timestamp.yaml"
           done
 
   # ---------------------------------------------------------------------------------------------------------
@@ -649,13 +654,13 @@ jobs:
             dockerfile: scripts/Dockerfile.minio-init
             context: scripts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.18.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
