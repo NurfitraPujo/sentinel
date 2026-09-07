@@ -15,6 +15,10 @@ import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { insertReportIdempotency } from '$lib/server/report-idempotency';
+import {
+	environmentScopeCondition,
+	resolveEnvironmentScopes,
+} from '$lib/server/environment-access';
 
 /**
  * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
@@ -612,6 +616,28 @@ export interface ListReportsOptions {
  */
 export async function listReports({ organizationId, tab, userId, accessibleProjectIds, source }: ListReportsOptions) {
 	const conditions = [eq(projects.organizationId, organizationId), eq(issues.issueType, 'user_report')];
+
+	// sentinel-project-environments §2.2, decision 36 — **a guard point of its own, and
+	// `requireIssueAccessAnyType`'s does not reach it.** `GET /api/organizations/{orgId}/reports`
+	// guards at the ORGANIZATION level (`requireReportAccess(userId, orgId, 'read')`) and then hands
+	// this function `accessibleProjectIds = null` — the whole organization — for any role above
+	// `viewer`, so the per-issue dispatch never runs on this path. §4.8a writes the literal
+	// `production` on every report with no client assertion, so without this predicate a member
+	// granted only `{staging}` reads most of the organization's reports, and §12 *Known limits* 5 is
+	// a promise the product does not keep.
+	//
+	// Resolved PER PROJECT and from `userId` — the caller's own id, the same one the `mine` and
+	// `claimed-by-me` tabs use. The list is org-scoped, so there is no single `projectId` to hand
+	// the single-project resolver; a per-organization scope would pass the narrow case and leak the
+	// one that matters (narrowed in project A, unrestricted in project B).
+	//
+	// **The tab counts.** There is no count query on `main` — the tabs are unbadged links and any
+	// number on that page is derived from the rows this function returned, so "the count agrees with
+	// the list" holds by construction. The first count anybody adds must carry this same predicate.
+	const environmentScope = environmentScopeCondition(await resolveEnvironmentScopes(userId));
+	if (environmentScope) {
+		conditions.push(environmentScope);
+	}
 
 	switch (tab) {
 		case 'mine':

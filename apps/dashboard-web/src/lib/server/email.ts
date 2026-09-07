@@ -102,6 +102,47 @@ const NOTIFICATION_SUBJECTS: Record<IssueNotificationKind, string> = {
 };
 
 /**
+ * sentinel-project-environments §2.2 (decisions 38, 41): the second map, selected on the payload
+ * marker rather than by threading a free-text suffix through the sender. That is one of the two
+ * shapes the contract offers and this is the one built: a suffix parameter would let any caller
+ * write any subject, where a second keyed entry keeps every subject line in this file.
+ *
+ * Only `escalated` can be unscoped -- it is the one kind `escalation.ts` writes, and the only path
+ * that pages somebody who does NOT hold the issue's environment (contract §12 *Known limits* 5b).
+ */
+const UNSCOPED_NOTIFICATION_SUBJECTS: Partial<Record<IssueNotificationKind, string>> = {
+  escalated: 'You are on call (unscoped rota page) for:',
+};
+
+/** What a notification email's subject and heading are built from. */
+export interface IssueNotificationSubjectOptions {
+  /**
+   * Decision 38's marker. `true` pages the whole rota because nobody resolved holds the issue's
+   * environment, and the word `unscoped` must reach the recipient -- it is what tells each
+   * responder why they were included.
+   */
+  unscoped?: boolean;
+}
+
+/**
+ * The subject line, as a pure function of what goes into it.
+ *
+ * Exported because contract §11 asserts the string this builds and there is no local route to a
+ * delivered email: a test can call this, it cannot open an inbox. `sendIssueNotificationEmail`
+ * below is its only production caller, so the assertion is on the real thing.
+ */
+export function buildIssueNotificationSubject(
+  kind: IssueNotificationKind,
+  issueTitle: string,
+  options?: IssueNotificationSubjectOptions
+): string {
+  const prefix =
+    (options?.unscoped ? UNSCOPED_NOTIFICATION_SUBJECTS[kind] : undefined) ??
+    NOTIFICATION_SUBJECTS[kind];
+  return `${prefix} ${escapeHtml(issueTitle.replace(/[\r\n]/g, ' '))}`;
+}
+
+/**
  * §8: the single email side-effect of notify.ts's fan-out, following the invitation pattern --
  * called AFTER the mutation's transaction has committed, best-effort, returning a `delivered`
  * boolean rather than throwing (a failed email must never roll back or fail the mutation it
@@ -113,7 +154,8 @@ export async function sendIssueNotificationEmail(
   toEmail: string,
   issueUrl: string,
   kind: IssueNotificationKind,
-  issueTitle: string
+  issueTitle: string,
+  options?: IssueNotificationSubjectOptions
 ): Promise<boolean> {
   const emailServer = env.EMAIL_SERVER;
   const emailFrom = env.EMAIL_FROM ?? 'noreply@sentinel.local';
@@ -126,17 +168,18 @@ export async function sendIssueNotificationEmail(
   try {
     const transporter = getTransporter(emailServer);
 
-    const safeTitle = escapeHtml(issueTitle.replace(/[\r\n]/g, ' '));
     const safeIssueUrl = escapeHtml(issueUrl);
-    const subjectPrefix = NOTIFICATION_SUBJECTS[kind];
+    // One builder for the subject and the heading, so the `unscoped` marker cannot reach one and
+    // miss the other.
+    const subject = buildIssueNotificationSubject(kind, issueTitle, options);
 
     const mailOptions = {
       from: emailFrom,
       to: toEmail,
-      subject: `${subjectPrefix} ${safeTitle}`,
+      subject,
       html: `
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 24px; border-radius: 8px;">
-          <h2 style="color: #3b82f6; margin-top: 0;">${subjectPrefix} ${safeTitle}</h2>
+          <h2 style="color: #3b82f6; margin-top: 0;">${subject}</h2>
           <p style="margin: 24px 0;">
             <a href="${safeIssueUrl}" style="background-color: #3b82f6; color: #ffffff; padding: 10px 18px; border-radius: 4px; text-decoration: none; font-weight: 600; display: inline-block;">View on Sentinel</a>
           </p>

@@ -5,7 +5,7 @@ import semver from 'semver';
 import type { RelationType } from '$lib/types/relation-type';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
-import { environmentScopeCondition } from '$lib/server/environment-access';
+import { environmentScopeCondition, scopeForProject } from '$lib/server/environment-access';
 
 // Robust semver comparison helper with fallback
 function isRegression(releaseVersion: string, resolvedInVersion: string): boolean {
@@ -416,7 +416,70 @@ export async function getIssueActivity(issueId: string) {
 		.orderBy(desc(issueActivity.createdAt));
 }
 
-export async function getIssueRelations(issueId: string) {
+/**
+ * sentinel-project-environments §2.2, decision 37 — **the ONE recorded exception to decision 20,
+ * and it is stated here so nobody "fixes" it into a `404`.**
+ *
+ * This function applied no access check at all to the RELATED issue: both branches `innerJoin
+ * issues` and return the other issue's `id`, `errorClass`, `message`, `status` and `fingerprint`,
+ * and it is called from three page loaders AFTER only the PRIMARY issue has been guarded. Decision
+ * 7 makes that the normal path rather than an exotic one — the same error in staging and in
+ * production is now two rows in the same project, so "this is the same error as the staging one" is
+ * the first relation a triager creates, and any unrestricted member can create it.
+ *
+ * Where the related issue is out of scope the row is **NOT dropped**: it comes back as a REDACTED
+ * PLACEHOLDER carrying no `id`, `message`, `errorClass`, `status` or `fingerprint` — see
+ * {@link RedactedRelatedIssue}. That placeholder leaks EXISTENCE, which decision 20 forbids, and it
+ * is accepted deliberately and ONLY here: a panel that silently omits relations misrepresents the
+ * graph, and a triager can re-link an issue that is already linked with no indication why the link
+ * will not take. Every other list, search, count and direct fetch keeps decision 20's `404` shape.
+ *
+ * The filter is **per project** — `issue_relations` carries no project constraint, so one call can
+ * return related issues in several projects at once and a single scope for the call would be wrong.
+ *
+ * `environmentScopes` defaults to an empty map, which is unrestricted (`scopeForProject`'s
+ * absence-means-all). That default is what keeps the FOURTH caller,
+ * `routes/api/agent/issues/[issueId]/+server.ts`, byte-for-byte unchanged: it is key-authenticated
+ * with no user and therefore has no grant to resolve (§12 *Known limits* 2).
+ */
+export interface VisibleRelatedIssue {
+	redacted: false;
+	id: string;
+	errorClass: string;
+	message: string;
+	status: string;
+	fingerprint: string;
+}
+
+/**
+ * Decision 37's placeholder. The `redacted` discriminant is the WHOLE object: no identifier, no
+ * message, no error class, no status and no fingerprint, because each of those is the fact the
+ * grant was drawn to withhold. The relation's own `id`, `relationType`, `direction` and audit
+ * columns survive — they are facts about the LINK, which the viewer's own issue is one end of.
+ */
+export interface RedactedRelatedIssue {
+	redacted: true;
+}
+
+export type RelatedIssueView = VisibleRelatedIssue | RedactedRelatedIssue;
+
+export async function getIssueRelations(
+	issueId: string,
+	environmentScopes: Map<string, string[]> = new Map()
+) {
+	// `projectId` and `environment` are selected for the guard and then dropped: they are what
+	// decides the branch, and a placeholder that carried the related issue's project would be a
+	// smaller version of the leak it exists to avoid.
+	const relatedIssueColumns = {
+		id: issues.id,
+		errorClass: issues.errorClass,
+		message: issues.message,
+		status: issues.status,
+		fingerprint: issues.fingerprint,
+		projectId: issues.projectId,
+		environment: issues.environment,
+	} as const;
+
 	const outgoing = await db
 		.select({
 			id: issueRelations.id,
@@ -430,13 +493,7 @@ export async function getIssueRelations(issueId: string) {
 			// D43: this joined issue IS the target for an outgoing row (issueId is the source), so
 			// `relatedIssue` is accurate here too — it is simply named to match the incoming branch
 			// below, where the same key would otherwise lie about which side of the relation it is.
-			relatedIssue: {
-				id: issues.id,
-				errorClass: issues.errorClass,
-				message: issues.message,
-				status: issues.status,
-				fingerprint: issues.fingerprint,
-			},
+			relatedIssue: relatedIssueColumns,
 		})
 		.from(issueRelations)
 		.innerJoin(issues, eq(issues.id, issueRelations.targetIssueId))
@@ -455,19 +512,55 @@ export async function getIssueRelations(issueId: string) {
 			// D43: this joined issue is issueRelations.sourceIssueId — the SOURCE of the relation, not
 			// the target. The old key name `targetIssue` was simply wrong here; `relatedIssue` names
 			// what it actually is: "the other issue in this relation", regardless of direction.
-			relatedIssue: {
-				id: issues.id,
-				errorClass: issues.errorClass,
-				message: issues.message,
-				status: issues.status,
-				fingerprint: issues.fingerprint,
-			},
+			relatedIssue: relatedIssueColumns,
 		})
 		.from(issueRelations)
 		.innerJoin(issues, eq(issues.id, issueRelations.sourceIssueId))
 		.where(eq(issueRelations.targetIssueId, issueId));
 
-	return [...outgoing, ...incoming];
+	// BOTH branches, through one function. `outgoing` joins on `targetIssueId` and `incoming` on
+	// `sourceIssueId`; redacting one and not the other is the natural half-fix and is invisible from
+	// the page unless the relation happens to run the other way.
+	return [...outgoing, ...incoming].map((row) => redactOutOfScope(row, environmentScopes));
+}
+
+function redactOutOfScope<
+	T extends {
+		sourceIssueId: string;
+		targetIssueId: string;
+		direction: 'outgoing' | 'incoming';
+		relatedIssue: {
+			id: string;
+			errorClass: string;
+			message: string;
+			status: string;
+			fingerprint: string;
+			projectId: string;
+			environment: string;
+		};
+	},
+>(row: T, environmentScopes: Map<string, string[]>) {
+	const { projectId, environment, ...visible } = row.relatedIssue;
+	const scope = scopeForProject(environmentScopes, projectId);
+
+	if (scope === null || scope.includes(environment)) {
+		return {
+			...row,
+			sourceIssueId: row.sourceIssueId as string | null,
+			targetIssueId: row.targetIssueId as string | null,
+			relatedIssue: { redacted: false as const, ...visible },
+		};
+	}
+
+	// The related issue's id is ALSO one of `sourceIssueId` / `targetIssueId` — whichever end is not
+	// the issue being viewed — so redacting `relatedIssue.id` alone would hand the same value back
+	// under another key. The viewer's own end is kept; the other is nulled.
+	return {
+		...row,
+		sourceIssueId: row.direction === 'outgoing' ? row.sourceIssueId : null,
+		targetIssueId: row.direction === 'outgoing' ? null : row.targetIssueId,
+		relatedIssue: { redacted: true as const },
+	};
 }
 
 // issues.id is `uuid` (schema.ts:59), and Postgres has no ILIKE operator for uuid — every search

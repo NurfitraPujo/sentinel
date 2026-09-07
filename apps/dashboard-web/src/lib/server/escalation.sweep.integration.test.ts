@@ -775,5 +775,238 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))(
 				});
 			});
 		});
+
+		/**
+		 * sentinel-project-environments §2.2, decisions 30, 38 and 41 — **the unscoped fallback, at
+		 * BOTH call sites**, which is the branch nothing else in this feature covers. Shipping only
+		 * the happy path means a production incident that pages nobody at all.
+		 *
+		 * **There is no walk.** One candidate is resolved and, if they do not hold the issue's
+		 * environment, the fallback fires at once — not a skip, not a second candidate.
+		 *
+		 * Every engineer in the rota is narrowed to `{staging}` rather than only the one the rotation
+		 * happens to resolve: the assertion is about the fallback's shape, and pinning it to the
+		 * rota's arithmetic would make it a test about `whoIsOnCall` instead.
+		 */
+		describe('the unscoped fallback (§2.2, decisions 30/38/41)', () => {
+			/** A fifth user, deliberately NOT in `schedule.members` — the override case. */
+			const overrideHolder = 'esc-override-' + suffix;
+
+			beforeAll(async () => {
+				await sql`insert into "user" (id, name, email) values (${overrideHolder}, ${overrideHolder}, ${overrideHolder + '@example.test'})`;
+				await sql`
+					insert into organization_members (id, organization_id, user_id, role)
+					values (${randomUUID()}, ${orgId}, ${overrideHolder}, ${'engineer'})
+				`;
+			});
+
+			afterAll(async () => {
+				await sql`delete from oncall_overrides where schedule_id = ${scheduleId}`;
+				await sql`delete from project_environment_grants where project_id = ${projectId}`;
+				await sql`delete from organization_members where user_id = ${overrideHolder}`;
+				await sql`delete from "user" where id = ${overrideHolder}`;
+			});
+
+			beforeEach(async () => {
+				await sql`delete from oncall_overrides where schedule_id = ${scheduleId}`;
+				await sql`delete from project_environment_grants where project_id = ${projectId}`;
+			});
+
+			/** Narrow everybody named to `{staging}`, against a fixture whose reports are production. */
+			async function narrowToStaging(userIds: readonly string[]) {
+				for (const userId of userIds) {
+					await sql`
+						insert into project_environment_grants (user_id, project_id, environments, created_by)
+						values (${userId}, ${projectId}, ${sql.array(['staging'])}, ${ENGINEERS[0]})
+					`;
+				}
+			}
+
+			async function notificationRows(issueId: string) {
+				return await sql`
+					select user_id, kind, payload from notifications
+					where issue_id = ${issueId} order by user_id
+				`;
+			}
+
+			describe('AT INTAKE — escalateReportAtIntake, where no chain opens', () => {
+				it('pages the whole rota, writes no chain, and never starts the ack clock', async () => {
+					await narrowToStaging(ENGINEERS);
+					const issueId = await seedReport();
+
+					const attempt = await escalation.escalateReportAtIntake({
+						issueId,
+						organizationId: orgId,
+						at: T0,
+						ackMinutes: 15,
+					});
+
+					// (1) EXACTLY ONE `notifications` row per rota member.
+					const rows = await notificationRows(issueId);
+					expect(rows.map((r) => r.user_id).sort()).toEqual([...ENGINEERS].sort());
+					// The EXISTING kind — decision 38 adds no value to `notifications_kind_check`, and
+					// the marker rides in the `jsonb` payload instead.
+					expect(rows[0].kind).toBe('escalated');
+					expect(rows[0].payload).toMatchObject({
+						unscoped: true,
+						scheduleId,
+						environment: 'production',
+					});
+					// (5) The word `unscoped` in the notification text rendered from that payload.
+					expect(String((rows[0].payload as { text: string }).text)).toContain('unscoped');
+
+					// (2) ZERO `issue_escalations` rows. There is no chain, so the sweep never selects
+					// this issue — which is exactly why assertions 1 and 5 are made HERE and not
+					// through a hop that does not exist.
+					expect(await escalationRows(issueId)).toHaveLength(0);
+					expect(attempt.escalation).toBeNull();
+
+					// (3) `issues.assigned_to` is still NULL, so no ack deadline exists anywhere. The
+					// clock must never run against somebody who structurally cannot acknowledge.
+					expect(await assignment(issueId)).toEqual({ assignee_type: null, assigned_to: null });
+					// …and nothing else was written either: no assignment activity, no subscription.
+					expect(
+						await countWhere('issue_activity', issueId, sql`and event_type = 'assigned'`)
+					).toBe(0);
+					expect(await countWhere('issue_subscriptions', issueId)).toBe(0);
+
+					// (4) The word `unscoped` in the built email subject — the STRING `email.ts`
+					// builds, since there is no local route to a delivered message. Every recipient is
+					// carried as unscoped, which is what selects that subject.
+					expect(attempt.notified.map((n) => n.userId).sort()).toEqual([...ENGINEERS].sort());
+					expect(attempt.notified.every((n) => n.unscoped === true)).toBe(true);
+					const { buildIssueNotificationSubject } = await import('./email');
+					expect(
+						buildIssueNotificationSubject('escalated', 'Save spins forever', { unscoped: true })
+					).toContain('unscoped');
+				});
+
+				it('includes an override holder who is not in schedule.members at all', async () => {
+					// `whoIsOnCall` returns an override holder outright (`via: 'override'`) and such a
+					// holder need not appear in the rota, so "one row per rota member" is undefined for
+					// this case unless the union is built. A fan-out over `members` alone silently drops
+					// the one person actually resolved.
+					await narrowToStaging([...ENGINEERS, overrideHolder]);
+					await sql`
+						insert into oncall_overrides (id, schedule_id, user_id, starts_at, ends_at, created_by)
+						values (${randomUUID()}, ${scheduleId}, ${overrideHolder}, ${minutes(-30)}, ${minutes(120)}, ${ENGINEERS[0]})
+					`;
+					const issueId = await seedReport();
+
+					const attempt = await escalation.escalateReportAtIntake({
+						issueId,
+						organizationId: orgId,
+						at: T0,
+						ackMinutes: 15,
+					});
+
+					const rows = await notificationRows(issueId);
+					expect(rows.map((r) => r.user_id).sort()).toEqual(
+						[...ENGINEERS, overrideHolder].sort()
+					);
+					expect(attempt.escalation).toBeNull();
+					expect(await escalationRows(issueId)).toHaveLength(0);
+				});
+
+				it('is UNCHANGED when the resolved candidate does hold the environment', async () => {
+					// The regression that matters: every rota in every organization on the day this
+					// ships has no grant rows at all, and absence means all.
+					const issueId = await seedReport();
+
+					const attempt = await escalation.escalateReportAtIntake({
+						issueId,
+						organizationId: orgId,
+						at: T0,
+						ackMinutes: 15,
+					});
+
+					expect(attempt.escalation?.hop).toBe(1);
+					expect(attempt.notified).toEqual([{ issueId, userId: attempt.escalation?.assigneeId }]);
+					expect(await escalationRows(issueId)).toHaveLength(1);
+					const [row] = await notificationRows(issueId);
+					expect(row.payload).not.toMatchObject({ unscoped: true });
+				});
+			});
+
+			describe('IN THE SWEEP — sweepOne, where a due row MUST be terminated', () => {
+				it('pages the rota, terminates the row, counts its own counter, and a SECOND sweep finds nothing', async () => {
+					const { renderMetrics, resetMetricsForTest } = await import('./metrics');
+					resetMetricsForTest();
+
+					await narrowToStaging(ENGINEERS);
+					const issueId = await seedReport();
+					await seedChain({ issueId, hops: [ENGINEERS[0]], deadlineAt: minutes(-1) });
+
+					const first = await escalation.sweepEscalations({ now: T0, ackMinutes: 15, maxHops: 3 });
+
+					// (6) The FOURTH `SweepOutcome` kind — not `exhausted`, not `staleSchedule`. The
+					// schedule resolves perfectly well and no human declined.
+					expect(first).toMatchObject({
+						due: 1,
+						unscoped: 1,
+						exhausted: 0,
+						skipped: 0,
+						reassigned: 0,
+						contended: 0,
+					});
+
+					// The four intake facts, again: one row per rota member, no NEW escalation row, no
+					// reassignment of `assigned_to`.
+					const rows = await notificationRows(issueId);
+					expect(rows.map((r) => r.user_id).sort()).toEqual([...ENGINEERS].sort());
+					expect(rows[0].payload).toMatchObject({ unscoped: true, environment: 'production' });
+					expect(String((rows[0].payload as { text: string }).text)).toContain('unscoped');
+					expect(first.notified.every((n) => n.unscoped === true)).toBe(true);
+
+					// (7) `exhausted = true` on the due row — `markExhausted`'s claimed write. Still one
+					// row: no hop was written, because there is no walk.
+					const chain = await escalationRows(issueId);
+					expect(chain).toHaveLength(1);
+					expect(chain[0].exhausted).toBe(true);
+					expect(await assignment(issueId)).toEqual({
+						assignee_type: 'user',
+						assigned_to: ENGINEERS[0],
+					});
+
+					// (8) The unscoped counter incremented and the EXHAUSTED one NOT: §12's "nobody
+					// answered" alert must not fire at an operator for a chain that stopped on a grant.
+					const { body } = await renderMetrics();
+					expect(body).toContain('sentinel_report_escalations_unscoped_total 1');
+					expect(body).toContain('sentinel_report_escalations_exhausted_total 0');
+
+					// (9) **The assertion that catches the defect.** Without the termination the row
+					// still matches `pastDeadline`, and the cron runs EVERY MINUTE — so the whole rota
+					// is paged again, and again, forever. A test that sweeps once passes on the broken
+					// build.
+					const notificationsAfterFirst = rows.length;
+					const second = await escalation.sweepEscalations({
+						now: minutes(5),
+						ackMinutes: 15,
+						maxHops: 3,
+					});
+
+					expect(second).toMatchObject({ due: 0, unscoped: 0, exhausted: 0, skipped: 0 });
+					expect(second.notified).toEqual([]);
+					expect(await notificationRows(issueId)).toHaveLength(notificationsAfterFirst);
+					const { body: after } = await renderMetrics();
+					expect(after).toContain('sentinel_report_escalations_unscoped_total 1');
+				});
+
+				it('reassigns exactly as today when the next candidate DOES hold the environment', async () => {
+					const issueId = await seedReport();
+					await seedChain({ issueId, hops: [ENGINEERS[0]], deadlineAt: minutes(-1) });
+
+					const result = await escalation.sweepEscalations({
+						now: T0,
+						ackMinutes: 15,
+						maxHops: 3,
+					});
+
+					expect(result).toMatchObject({ due: 1, reassigned: 1, unscoped: 0 });
+					expect(await escalationRows(issueId)).toHaveLength(2);
+				});
+			});
+		});
+
 	}
 );

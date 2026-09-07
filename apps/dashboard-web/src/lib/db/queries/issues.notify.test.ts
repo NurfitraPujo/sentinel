@@ -41,7 +41,17 @@ dbMock.transaction = vi.fn(async (cb: any) => cb(txMock));
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
-	issues: { id: 'id', projectId: 'projectId', status: 'status', assignedTo: 'assignedTo' },
+	issues: {
+		id: 'id',
+		projectId: 'projectId',
+		status: 'status',
+		assignedTo: 'assignedTo',
+		// sentinel-project-environments §2.2, decision 25: notifyIssueEvent reads the issue's
+		// environment (decision 7 put it on this row) and resolves every candidate subscriber's grant
+		// in one batched call, both on `tx`.
+		environment: 'environment',
+	},
+	projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
 	issueRelations: {
 		id: 'id',
@@ -80,6 +90,14 @@ function queueSubscribersThenMembers(subscribers: unknown[], memberUserIds: stri
 	}
 	fn.mockImplementationOnce((resolve: any) => resolve(subscribers));
 	fn.mockImplementationOnce((resolve: any) => resolve(memberUserIds.map((userId) => ({ userId }))));
+	// §2.2's guard adds two more `tx` reads in the same "there is at least one user subscriber"
+	// branch: the issue row it takes `projectId` + `environment` off, then ONE batched grant lookup
+	// for every candidate. No grant rows here -- absence means all, so these tests keep asserting
+	// exactly the fan-out they always did.
+	fn.mockImplementationOnce((resolve: any) =>
+		resolve([{ projectId: 'proj-1', environment: 'production' }])
+	);
+	fn.mockImplementationOnce((resolve: any) => resolve([]));
 	// notifyIssueEvent's own `notifications` insert (bare-awaited, no `.returning()`) is the NEXT
 	// call whenever any target survives filtering -- a trailing dummy so that await resolves
 	// instead of falling through to the base (no-op) implementation and hanging.

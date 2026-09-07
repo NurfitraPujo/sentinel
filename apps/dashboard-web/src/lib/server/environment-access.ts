@@ -100,6 +100,60 @@ export async function resolveEnvironmentScopes(
 }
 
 /**
+ * §2.2's `notify.ts` row — the SAME rule batched over the other axis.
+ *
+ * `notifyIssueEvent` resolves ONE issue in ONE project for MANY subscribers, inside the caller's
+ * open mutation transaction (D18), so the per-user round trip the single-project form would cost is
+ * the one price §2.2 refuses to pay on a write path: *"the per-subscriber resolutions must be
+ * resolved by ONE batched call"*. This is that call. It is not a third derivation of the rule — it
+ * reads the same table with the same primary key and the same **absence means all**: a user absent
+ * from the returned map has no grant row in this project and is unrestricted, exactly as
+ * {@link resolveEnvironmentScope} returns `null` for them.
+ *
+ * Use {@link holdsEnvironment} to read it, for the reason {@link scopeForProject} exists.
+ */
+export async function resolveEnvironmentScopesForUsers(
+	projectId: string,
+	userIds: readonly string[],
+	executor: Executor = db
+): Promise<Map<string, string[]>> {
+	if (userIds.length === 0) {
+		return new Map();
+	}
+
+	const rows = await executor
+		.select({
+			userId: projectEnvironmentGrants.userId,
+			environments: projectEnvironmentGrants.environments,
+		})
+		.from(projectEnvironmentGrants)
+		.where(
+			and(
+				eq(projectEnvironmentGrants.projectId, projectId),
+				inArray(projectEnvironmentGrants.userId, [...userIds])
+			)
+		);
+
+	return new Map(rows.map((r) => [r.userId, r.environments]));
+}
+
+/**
+ * Whether `userId` may see `environment`, read off a {@link resolveEnvironmentScopesForUsers} map.
+ *
+ * A user the map does not mention is unrestricted and the answer is `true` — the same inversion
+ * {@link scopeForProject} guards against, in the place where getting it backwards would silently
+ * stop notifying everybody rather than silently notifying too many.
+ */
+export function holdsEnvironment(
+	scopes: Map<string, string[]>,
+	userId: string,
+	environment: string
+): boolean {
+	const scope = scopes.get(userId);
+	return scope === undefined || scope.includes(environment);
+}
+
+/**
  * Reads a {@link resolveEnvironmentScopes} map the one way it may be read: an absent project is
  * unrestricted (`null`), not denied (`[]`).
  *

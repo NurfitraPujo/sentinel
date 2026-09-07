@@ -5,6 +5,7 @@ import { db } from '$lib/server/db';
 import { projects } from '$lib/db/schema';
 import { getReportDetail, getIssueActivity, listIssueAttachments } from '$lib/db/queries/reports';
 import { getIssueRelations } from '$lib/db/queries/issues';
+import { resolveEnvironmentScopes } from '$lib/server/environment-access';
 import { requireReportAccessForIssue } from '$lib/server/report-access';
 import { ISSUE_WRITE_ROLES } from '$lib/server/issue-access';
 import type { Escalation, Triage } from '$lib/types/report-detail';
@@ -42,7 +43,9 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	}
 
 	const [relations, activity, orgProjects, attachments] = await Promise.all([
-		getIssueRelations(issueId),
+		// §2.2, decision 37: guarded on the RELATED issue, per project. An out-of-scope relation
+		// comes back as a redacted placeholder rather than being dropped or 404'd.
+		resolveEnvironmentScopes(userId).then((scopes) => getIssueRelations(issueId, scopes)),
 		getIssueActivity(issueId),
 		db
 			.select({ id: projects.id, name: projects.name, isInbox: projects.isInbox })

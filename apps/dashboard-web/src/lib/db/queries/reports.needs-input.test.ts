@@ -36,7 +36,11 @@ vi.mock('$lib/db/schema', () => ({
 		assignedTo: 'assignedTo',
 		assigneeType: 'assigneeType',
 		firstSeen: 'firstSeen',
+		// sentinel-project-environments §2.2, decision 36: listReports composes an environment
+		// predicate over these two, resolved from the caller's own grant rows.
+		environment: 'environment',
 	},
+	projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 	manualIssueReports: { issueId: 'issueId', reporterId: 'reporterId' },
 	// sentinel-user-report-issue §4.2's correction: listReports left-joins the external companion.
 	externalIssueReports: { issueId: 'issueId', externalReporterId: 'externalReporterId' },
@@ -55,11 +59,22 @@ beforeEach(() => {
 	dbMock.__result = [];
 });
 
+/**
+ * sentinel-project-environments §2.2, decision 36: `listReports` now resolves the caller's
+ * environment grants FIRST, on the same `db` double, so the query under test is the LAST `where`
+ * call rather than the first. Reading `calls[0]` here would assert against the grant lookup's
+ * predicate and pass or fail for reasons that have nothing to do with the tab.
+ */
+function lastWhereArg() {
+	const calls = dbMock.where.mock.calls;
+	return calls[calls.length - 1][0];
+}
+
 describe('listReports needs-input tab excludes resolved/ignored (R7)', () => {
 	it('filters on status = unresolved in addition to waitingOn IS NOT NULL', async () => {
 		await listReports({ organizationId: 'org-1', tab: 'needs-input', userId: 'user-1' });
 
-		const whereArg = dbMock.where.mock.calls[0][0];
+		const whereArg = lastWhereArg();
 		const serialized = JSON.stringify(whereArg);
 		expect(serialized).toContain('waitingOn');
 		expect(serialized).toContain('status');
@@ -69,7 +84,7 @@ describe('listReports needs-input tab excludes resolved/ignored (R7)', () => {
 	it('the "all" tab does NOT filter on status', async () => {
 		await listReports({ organizationId: 'org-1', tab: 'all', userId: 'user-1' });
 
-		const whereArg = dbMock.where.mock.calls[0][0];
+		const whereArg = lastWhereArg();
 		const serialized = JSON.stringify(whereArg);
 		expect(serialized).not.toContain('unresolved');
 	});

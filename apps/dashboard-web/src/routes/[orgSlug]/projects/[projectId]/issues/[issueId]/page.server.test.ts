@@ -13,6 +13,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const authMock = vi.fn();
 const requireProjectAccessMock = vi.fn();
 const resolveEnvironmentScopeMock = vi.fn();
+// sentinel-project-environments §2.2, decision 37: the loader also resolves the caller's
+// multi-project scopes and hands them to `getIssueRelations`, so a relation to an issue the viewer
+// may not see comes back as a redacted placeholder rather than whole.
+const resolveEnvironmentScopesMock = vi.fn(() => Promise.resolve(new Map()));
 const resolveEnvironmentDisplayNameMock = vi.fn();
 const getIssueByIdMock = vi.fn();
 const getProjectByIdMock = vi.fn();
@@ -26,6 +30,7 @@ vi.mock('$lib/server/issue-access', () => ({
 
 vi.mock('$lib/server/environment-access', () => ({
 	resolveEnvironmentScope: resolveEnvironmentScopeMock,
+	resolveEnvironmentScopes: resolveEnvironmentScopesMock,
 }));
 
 vi.mock('$lib/db/queries/environments', () => ({

@@ -7,9 +7,11 @@ import { whoIsOnCall } from '$lib/server/oncall';
 import {
 	recordEscalation,
 	recordEscalationExhausted,
+	recordEscalationUnscoped,
 	recordOncallScheduleUnresolved,
 	ESCALATION_OUTCOME,
 } from '$lib/server/metrics';
+import { resolveEnvironmentScope } from '$lib/server/environment-access';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
 import { log } from '$lib/server/observability/log';
 import { env } from '$env/dynamic/private';
@@ -99,6 +101,13 @@ export interface EscalationRecord {
 export interface EscalationEmail {
 	issueId: string;
 	userId: string;
+	/**
+	 * sentinel-project-environments §2.2, decisions 38/41 — this page went to a rota member who does
+	 * NOT hold the issue's environment, and the email must say so. It is what tells each responder
+	 * why they were included, and it is the only reason a subject other than
+	 * `NOTIFICATION_SUBJECTS.escalated` is ever built.
+	 */
+	unscoped?: boolean;
 }
 
 /** What an escalation attempt produced, plus the post-commit email work it owes. */
@@ -120,10 +129,13 @@ export async function sendEscalationEmails(
 ): Promise<void> {
 	for (const entry of notified) {
 		try {
-			await sendIssueNotificationEmails([{ userId: entry.userId, kind: 'escalated' }], {
-				issueId: entry.issueId,
-				origin,
-			});
+			await sendIssueNotificationEmails(
+				[{ userId: entry.userId, kind: 'escalated', unscoped: entry.unscoped }],
+				{
+					issueId: entry.issueId,
+					origin,
+				}
+			);
 		} catch (err) {
 			log.error('escalation.email_failed', {
 				issueId: entry.issueId,
@@ -166,6 +178,117 @@ export async function getLatestEscalation(issueId: string): Promise<EscalationRe
 		.orderBy(sql`${issueEscalations.hop} DESC`)
 		.limit(1);
 	return rows[0] ?? null;
+}
+
+/**
+ * sentinel-project-environments §2.2, decisions 30, 38 and 41 — **the unscoped fallback**, and the
+ * one thing in this module that reaches people who deliberately cannot see the issue.
+ *
+ * **There is no walk.** One candidate is resolved — `whoIsOnCall`'s at intake, `nextUntriedMember`'s
+ * in the sweep — and if that candidate does not hold `issue.environment`, this fires AT ONCE. Do not
+ * add a loop and do not look for a second candidate (decision 41). Over-paging is chosen
+ * deliberately: a rota that can silently page NOBODY for a production incident is the worse failure,
+ * and the `unscoped` label is what tells each responder why they were included.
+ *
+ * **Nothing new is persisted** — no column, no table, no new `kind`. `notifications.kind` is
+ * `varchar(30)` under `notifications_kind_check` and a new value would need a constraint migration,
+ * which decision 33 forbids for a presentation concern; the marker rides in the existing `jsonb`
+ * `payload`. The cost, accepted rather than fixed: an unscoped escalation is **not queryable after
+ * the fact** — it exists in email and in `notifications` rows, not as a flag anything can `SELECT`
+ * by.
+ *
+ * **It writes no `issue_escalations` row and no `issues.assigned_to`**, so the ack clock does not
+ * start. That is the point rather than a side effect: the clock must never run against somebody who
+ * structurally cannot acknowledge.
+ *
+ * **The recipient set is `schedule.members` PLUS the override holder when one is in force.**
+ * `whoIsOnCall` returns an override holder outright (`via: 'override'`) and such a holder need not
+ * appear in `schedule.members` at all, so a fan-out over `members` alone would silently drop the one
+ * person actually resolved.
+ *
+ * Contract §12 *Known limits* **5b** records the boundary crossing as a shipped property. Do not
+ * "fix" it by filtering these recipients — that is the under-paging branch the operator rejected.
+ */
+export const UNSCOPED_ESCALATION_TEXT =
+	'Escalated to the whole rota as unscoped: nobody resolved on call holds this issue’s environment, so no assignment was made and no acknowledgement deadline is running.';
+
+/**
+ * The fan-out set, exported for the unit boundary the way `nextUntriedMember` is: it is the part of
+ * the fallback that is a pure function of a member list and a resolution, and asserting the union
+ * rule through a seeded rota would be indirection. A build that fans out over `members` alone
+ * silently drops the one person `whoIsOnCall` actually resolved.
+ */
+export function unscopedRecipients(
+	members: readonly { userId: string }[],
+	resolved: { userId: string; via: string } | null
+): string[] {
+	const set = new Set(members.map((m) => m.userId));
+	if (resolved && resolved.via === 'override') {
+		set.add(resolved.userId);
+	}
+	return [...set];
+}
+
+/**
+ * The four facts of decision 38, written in one transaction: one `notifications` row per recipient,
+ * of the existing `escalated` kind, carrying the `unscoped` marker and the text in its payload —
+ * and nothing else at all.
+ */
+async function writeUnscopedRotaPage(input: {
+	issueId: string;
+	scheduleId: string;
+	environment: string;
+	recipients: readonly string[];
+}): Promise<EscalationEmail[]> {
+	if (input.recipients.length === 0) {
+		return [];
+	}
+
+	await db.transaction(async (tx) => {
+		await tx.insert(notifications).values(
+			input.recipients.map((userId) => ({
+				userId,
+				issueId: input.issueId,
+				// Decision 38: the EXISTING kind. The marker is the payload, not a new value.
+				kind: 'escalated' as const,
+				actorType: 'system' as const,
+				actorId: 'system',
+				payload: {
+					unscoped: true,
+					scheduleId: input.scheduleId,
+					environment: input.environment,
+					text: UNSCOPED_ESCALATION_TEXT,
+				},
+			}))
+		);
+	});
+
+	return input.recipients.map((userId) => ({
+		issueId: input.issueId,
+		userId,
+		unscoped: true,
+	}));
+}
+
+/** The issue columns the guard needs. `environment` is a column on the issue row (decision 7). */
+async function loadIssueScopeContext(
+	issueId: string
+): Promise<{ projectId: string; environment: string } | null> {
+	const [row] = await db
+		.select({ projectId: issues.projectId, environment: issues.environment })
+		.from(issues)
+		.where(eq(issues.id, issueId));
+	return row ?? null;
+}
+
+/** Decision 41's single question: does this one candidate hold the issue's environment? */
+async function candidateHoldsEnvironment(
+	userId: string,
+	projectId: string,
+	environment: string
+): Promise<boolean> {
+	const scope = await resolveEnvironmentScope(userId, projectId);
+	return scope === null || scope.includes(environment);
 }
 
 /**
@@ -216,6 +339,45 @@ export async function escalateReportAtIntake(input: {
 				reason: 'nobody_on_call',
 			});
 			return { escalation: null, notified: [] };
+		}
+
+		// sentinel-project-environments §2.2, decisions 30/38/41 — the environment guard, on the ONE
+		// candidate `whoIsOnCall` resolved. Without it an engineer granted only `{staging}` is
+		// assigned a production report, subscribed, emailed a deep link — and then gets a `404` when
+		// they open it, because decision 20 made environment-dimension denial a `404`.
+		const scopeContext = await loadIssueScopeContext(input.issueId);
+		if (
+			scopeContext &&
+			!(await candidateHoldsEnvironment(
+				resolved.userId,
+				scopeContext.projectId,
+				scopeContext.environment
+			))
+		) {
+			// AT INTAKE there is no due row to terminate — nothing was written, so nothing matches the
+			// sweep's due predicate and the sweep never sees this issue. The asymmetry with `sweepOne`
+			// is deliberate; do not unify them. And the rows below are written INSTEAD OF a chain, not
+			// instead of anything: reading "write no `issue_escalations` row" as "write nothing" is
+			// the silently-page-nobody failure decision 30 exists to prevent.
+			const recipients = unscopedRecipients(schedule.members, resolved);
+			const notified = await writeUnscopedRotaPage({
+				issueId: input.issueId,
+				scheduleId: schedule.id,
+				environment: scopeContext.environment,
+				recipients,
+			});
+
+			log.warn('escalation.unscoped', {
+				issueId: input.issueId,
+				organizationId: input.organizationId,
+				scheduleId: schedule.id,
+				candidateId: resolved.userId,
+				environment: scopeContext.environment,
+				recipients: recipients.length,
+				at: 'intake',
+			});
+
+			return { escalation: null, notified };
 		}
 
 		const record = await db.transaction(async (tx) => {
@@ -433,6 +595,13 @@ export interface SweepResult {
 	 * rows the sweep can act on.
 	 */
 	skipped: number;
+	/**
+	 * sentinel-project-environments §2.2, decisions 38/41: due rows whose next candidate does not
+	 * hold the issue's environment. The whole rota was paged with the `unscoped` label and the row
+	 * was TERMINATED — counted here and never under `exhausted`, because that one is §12's "nobody
+	 * answered" signal and this chain stopped on a GRANT rather than on a human.
+	 */
+	unscoped: number;
 	/** Lost the claim race with a concurrent sweep, or failed. Nothing written by this run. */
 	contended: number;
 	/** Post-commit email work, one entry per engineer this sweep put on a report. */
@@ -473,7 +642,14 @@ export async function sweepEscalations(options?: {
 	);
 
 	const dueRows = await db
-		.select({ ...ESCALATION_SELECTION, organizationId: projects.organizationId })
+		.select({
+			...ESCALATION_SELECTION,
+			organizationId: projects.organizationId,
+			// §2.2's guard needs both, and decision 7 put `environment` on the issue row itself — so
+			// this is two more columns on a join the sweep already makes, not a second query.
+			projectId: issues.projectId,
+			environment: issues.environment,
+		})
 		.from(issueEscalations)
 		.innerJoin(issues, eq(issues.id, issueEscalations.issueId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
@@ -507,6 +683,7 @@ export async function sweepEscalations(options?: {
 		exhausted: 0,
 		stoppedByReassignment: stoppedRows[0]?.count ?? 0,
 		skipped: 0,
+		unscoped: 0,
 		contended: 0,
 		notified: [],
 	};
@@ -532,6 +709,22 @@ export async function sweepEscalations(options?: {
 					assigneeId: row.assigneeId,
 					hop: row.hop,
 					reason: outcome.reason,
+				});
+			} else if (outcome.kind === 'unscoped') {
+				result.unscoped += 1;
+				result.notified.push(...outcome.notified);
+				// Its OWN counter, never `recordEscalationExhausted()`: §12's "nobody answered" alert
+				// must not fire for a chain that stopped on a grant, at an operator who was never
+				// asked anything. Same distinction the `staleSchedule` branch below already draws.
+				recordEscalationUnscoped();
+				log.warn('escalation.unscoped', {
+					issueId: row.issueId,
+					assigneeId: row.assigneeId,
+					candidateId: outcome.candidateId,
+					environment: row.environment,
+					hop: row.hop,
+					recipients: outcome.notified.length,
+					at: 'sweep',
 				});
 			} else {
 				result.skipped += 1;
@@ -566,7 +759,10 @@ export async function sweepEscalations(options?: {
 type SweepOutcome =
 	| { kind: 'reassigned'; assigneeId: string; hop: number }
 	| { kind: 'exhausted'; reason: 'max_hops' | 'no_untried_member' }
-	| { kind: 'staleSchedule'; reason: 'no_active_schedule' | 'schedule_replaced' };
+	| { kind: 'staleSchedule'; reason: 'no_active_schedule' | 'schedule_replaced' }
+	// sentinel-project-environments §2.2, decisions 38/41 — the FOURTH kind, and it is neither of
+	// the other two: the schedule resolves perfectly well, and no human declined.
+	| { kind: 'unscoped'; candidateId: string; notified: EscalationEmail[] };
 
 /**
  * One due row, in one transaction.
@@ -576,7 +772,11 @@ type SweepOutcome =
  * hold.
  */
 async function sweepOne(
-	row: EscalationRecord & { organizationId: string | null },
+	row: EscalationRecord & {
+		organizationId: string | null;
+		projectId: string;
+		environment: string;
+	},
 	config: { now: Date; ackMinutes: number; maxHops: number }
 ): Promise<SweepOutcome> {
 	// §4.4: at `ESCALATION_MAX_HOPS` the chain stops, `assigned_to` stays on the last engineer
@@ -621,6 +821,28 @@ async function sweepOne(
 		// and it is over in the state §12's "nobody answered" alert already watches.
 		await markExhausted(row, config.now);
 		return { kind: 'exhausted', reason: 'no_untried_member' };
+	}
+
+	// sentinel-project-environments §2.2, decisions 38/41 — the same single-candidate guard intake
+	// applies, at the sweep's own call site. There is no walk: `next` is the one candidate, and if
+	// they do not hold the issue's environment the fallback fires instead of a hop.
+	if (!(await candidateHoldsEnvironment(next, row.projectId, row.environment))) {
+		// **TERMINATE THE ROW FIRST, and this is the half that pages a whole rota every minute if it
+		// is skipped.** The fallback persists no `issue_escalations` row and no `assigned_to`, so
+		// nothing else makes this row stop matching `pastDeadline` — and the cron runs every minute.
+		// `markExhausted` is the same claimed conditional write the two `staleSchedule` branches use,
+		// so two concurrent sweeps cannot both count one termination, and it throws
+		// `EscalationRaceLost` before anything is sent if another sweeper already claimed the row.
+		await markExhausted(row, config.now);
+
+		const notified = await writeUnscopedRotaPage({
+			issueId: row.issueId,
+			scheduleId: row.scheduleId,
+			environment: row.environment,
+			recipients: unscopedRecipients(schedule.members, null),
+		});
+
+		return { kind: 'unscoped', candidateId: next, notified };
 	}
 
 	const nextHop = row.hop + 1;

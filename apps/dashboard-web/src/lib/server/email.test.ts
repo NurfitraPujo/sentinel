@@ -142,3 +142,56 @@ describe('sendInvitationEmail', () => {
     expect(createTransportMock).toHaveBeenCalledTimes(2);
   });
 });
+
+/**
+ * sentinel-project-environments §2.2, decisions 38/41 — **the built subject string**, which is what
+ * contract §11 asserts because there is no local route to a delivered email.
+ *
+ * `NOTIFICATION_SUBJECTS` has no per-call override, so carrying the word `unscoped` needed a
+ * mechanism. The one built is the SECOND MAP keyed on the payload marker (the contract's other
+ * option was a free-text suffix threaded through the sender), and this is the assertion that proves
+ * it works. `sendIssueNotificationEmail` has no other subject path, so asserting the builder is
+ * asserting the real thing.
+ */
+describe('buildIssueNotificationSubject — the unscoped marker (§2.2, decisions 38/41)', () => {
+  let buildIssueNotificationSubject: typeof import('./email').buildIssueNotificationSubject;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    ({ buildIssueNotificationSubject } = await import('./email'));
+  });
+
+  it('carries the word "unscoped" for an unscoped escalation', () => {
+    const subject = buildIssueNotificationSubject('escalated', 'Checkout 500s', { unscoped: true });
+
+    expect(subject).toContain('unscoped');
+    expect(subject).toContain('Checkout 500s');
+  });
+
+  it('is the ordinary on-call subject when the marker is absent — nothing else changes', () => {
+    // The regression that matters: every escalation email that is NOT the fallback keeps today's
+    // subject exactly.
+    expect(buildIssueNotificationSubject('escalated', 'Checkout 500s')).toBe(
+      'You are on call for: Checkout 500s'
+    );
+    expect(buildIssueNotificationSubject('escalated', 'Checkout 500s', { unscoped: false })).toBe(
+      'You are on call for: Checkout 500s'
+    );
+  });
+
+  it('leaves every other kind alone even when the marker is set', () => {
+    // Only `escalated` has an unscoped form -- it is the one kind escalation.ts writes, and the
+    // only path that reaches somebody who does not hold the issue's environment.
+    expect(buildIssueNotificationSubject('commented', 'Checkout 500s', { unscoped: true })).toBe(
+      'New comment on Checkout 500s'
+    );
+  });
+
+  it('escapes the title the same way the delivered subject does', () => {
+    // The builder feeds BOTH the subject and the heading, so an escape that lived only in the html
+    // path would put raw markup in one of them.
+    expect(buildIssueNotificationSubject('escalated', '<b>x</b>\ny', { unscoped: true })).toContain(
+      '&lt;b&gt;x&lt;/b&gt; y'
+    );
+  });
+});

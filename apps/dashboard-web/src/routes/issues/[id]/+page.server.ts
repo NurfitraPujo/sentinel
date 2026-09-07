@@ -1,7 +1,10 @@
 import type { PageServerLoad } from './$types';
 import { error } from '@sveltejs/kit';
 import { requireProjectAccess } from '$lib/server/issue-access';
-import { resolveEnvironmentScope } from '$lib/server/environment-access';
+import {
+	resolveEnvironmentScope,
+	resolveEnvironmentScopes,
+} from '$lib/server/environment-access';
 import { resolveEnvironmentDisplayName } from '$lib/db/queries/environments';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getIssueRelations } from '$lib/db/queries/issues';
@@ -57,7 +60,12 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		issue.projectId,
 		issue.environment
 	);
-	const relations = await getIssueRelations(issueId);
+	// §2.2, decision 37: the relations panel is guarded on the RELATED issue too, per project — an
+	// out-of-scope relation comes back as a redacted placeholder rather than being dropped or 404'd.
+	const relations = await getIssueRelations(
+		issueId,
+		await resolveEnvironmentScopes(session.user.id)
+	);
 
 	return {
 		issue,

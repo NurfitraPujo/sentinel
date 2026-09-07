@@ -44,7 +44,11 @@ vi.mock('$lib/db/schema', () => ({
 		issueType: 'issueType',
 		status: 'status',
 		message: 'message',
+		// sentinel-project-environments §2.2 (decisions 25 and 36): the column both the notify guard
+		// and `listReports`'s predicate read, and the table the scope is resolved from.
+		environment: 'environment',
 	},
+	projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
 	manualIssueReports: { issueId: 'issueId', reporterId: 'reporterId', bodyMd: 'bodyMd', severity: 'severity' },
 	attachments: { id: 'id', issueId: 'issueId', commentId: 'commentId', storageKey: 'storageKey' },
@@ -342,6 +346,14 @@ describe('claimIssue', () => {
 				])
 			)
 			.mockImplementationOnce((resolve: any) => resolve([{ userId: 'user-2' }, { userId: 'user-1' }]))
+			// sentinel-project-environments §2.2, decision 25: two more reads in the same branch --
+			// the issue row notifyIssueEvent takes `projectId` + `environment` off, then ONE batched
+			// grant lookup for every candidate subscriber. No grant rows, so absence means all and the
+			// fan-out asserted below is exactly the one this test always asserted.
+			.mockImplementationOnce((resolve: any) =>
+				resolve([{ projectId: 'proj-1', environment: 'production' }])
+			)
+			.mockImplementationOnce((resolve: any) => resolve([]))
 			.mockImplementationOnce((resolve: any) => resolve(undefined)); // notifyIssueEvent's own notifications insert
 
 		const { issue, notified } = await claimIssue('issue-1', 'user', 'user-1');
@@ -440,6 +452,11 @@ describe('releaseClaim', () => {
 			.mockImplementationOnce((resolve: any) => resolve(undefined)) // issue_activity insert
 			.mockImplementationOnce((resolve: any) => resolve([{ subscriberType: 'user', subscriberId: 'user-2' }]))
 			.mockImplementationOnce((resolve: any) => resolve([{ userId: 'user-2' }]))
+			// §2.2, decision 25's two reads: the issue row, then one batched grant lookup. No grants.
+			.mockImplementationOnce((resolve: any) =>
+				resolve([{ projectId: 'proj-1', environment: 'production' }])
+			)
+			.mockImplementationOnce((resolve: any) => resolve([]))
 			.mockImplementationOnce((resolve: any) => resolve(undefined)); // notifyIssueEvent's own notifications insert
 
 		const { issue, notified } = await releaseClaim('issue-1', 'admin-1', { force: true });
