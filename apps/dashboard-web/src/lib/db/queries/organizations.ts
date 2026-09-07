@@ -5,7 +5,8 @@ import {
   organizationInvitations,
   userSessionPreferences,
   projects,
-  projectMembers
+  projectMembers,
+  projectEnvironmentGrants
 } from '$lib/db/schema';
 import { eq, and, sql, count, lt } from 'drizzle-orm';
 import crypto from 'crypto';
@@ -267,13 +268,25 @@ export async function reapAllExpiredInvitations(): Promise<number> {
  * for the same email, and reaps this org's other expired pending invitations (D42), all in the same
  * transaction as the insert.
  */
+/**
+ * sentinel-project-environments §4.10a, decision 28: one entry of an invitation's optional
+ * environment scope, as stored in `organization_invitations.environment_scopes` (JSONB) and read
+ * back at acceptance. NULL on the column -- not `[]` -- is what "unrestricted" is stored as, which
+ * is what every invitation sent before this feature means.
+ */
+export interface InvitationEnvironmentScope {
+  projectId: string;
+  environments: string[];
+}
+
 export async function createOrganizationInvitation(
   organizationId: string,
   email: string,
   role: OrgRoleValue,
   token: string,
   expiresAt: Date,
-  invitedBy?: string
+  invitedBy?: string,
+  environmentScopes?: InvitationEnvironmentScope[] | null
 ) {
   const tokenHash = hashInvitationToken(token);
 
@@ -300,6 +313,9 @@ export async function createOrganizationInvitation(
         status: 'pending',
         expiresAt,
         invitedBy,
+        // §4.10a: absent means unrestricted and stores NULL. `?? null` rather than leaving the key
+        // off, so re-inviting somebody WITHOUT a scope cannot inherit a previous row's value.
+        environmentScopes: environmentScopes ?? null,
       })
       .returning();
 
@@ -448,8 +464,69 @@ async function claimInvitationTx(tokenHash: string, userId: string): Promise<Cla
     // here rolls back the status='accepted' claim too (the token is not burned for nothing).
     const member = await upsertOrganizationMember(claimed.organizationId, userId, claimed.role, tx);
 
+    // sentinel-project-environments §4.10a, decision 28: one project_environment_grants row per
+    // entry, IN THE SAME TRANSACTION as the membership. `environment_scopes` is NULL for every
+    // invitation sent without a scope -- which is every invitation sent today -- and nothing is
+    // written then, so the accepted member is unrestricted. That absence is the claim that matters.
+    await applyInvitationEnvironmentScopes(tx, claimed, userId);
+
     return { ok: true, invitation: claimed, organization, member };
   });
+}
+
+/**
+ * sentinel-project-environments §4.10a — writes the invitation's environment scopes as grant rows,
+ * inside the caller's membership transaction.
+ *
+ * Three rules, each of which comes from somewhere:
+ *
+ * - **Nothing is written when the column is NULL**, which is every invitation sent today. §2.2's
+ *   absence-means-all rule is unchanged and nothing narrows a person by machine.
+ * - **A stale entry is SKIPPED, not fatal, and "stale" means a deleted PROJECT.** An invitation that
+ *   refuses to be accepted because of a settings change made after it was sent is worse than a
+ *   member who is wider than intended and can be narrowed through §4.10. (There is no deleted
+ *   *environment* transition in this feature: §4.1–§4.3 define no DELETE on project_environments,
+ *   and the only removal is ON DELETE CASCADE from projects, which takes the grant with it.)
+ * - **An UPSERT, never a plain INSERT.** `PRIMARY KEY (user_id, project_id)`, and the invitee may
+ *   already hold a grant in that project -- two scoped invitations to the same person for the same
+ *   organization, or a member narrowed through §4.10 after joining and then re-invited. A plain
+ *   INSERT raises 23505 and aborts this whole transaction, so the person could not join at all.
+ *   The invitation's scope wins because the inviter made an explicit choice on it.
+ *
+ * `created_by` is the inviter (`invited_by`), not the accepting user: a boundary with no author is
+ * a boundary nobody can ask about, and the person who chose the narrowing is the inviter.
+ */
+async function applyInvitationEnvironmentScopes(
+  tx: Executor,
+  claimed: typeof organizationInvitations.$inferSelect,
+  acceptingUserId: string
+): Promise<void> {
+  const raw = claimed.environmentScopes;
+  if (!Array.isArray(raw) || raw.length === 0) return;
+
+  for (const entry of raw as InvitationEnvironmentScope[]) {
+    if (!entry || typeof entry.projectId !== 'string') continue;
+    if (!Array.isArray(entry.environments) || entry.environments.length === 0) continue;
+
+    const [project] = await tx
+      .select({ id: projects.id })
+      .from(projects)
+      .where(eq(projects.id, entry.projectId));
+    if (!project) continue; // stale: the project is gone. Skip; the member is unrestricted there.
+
+    await tx
+      .insert(projectEnvironmentGrants)
+      .values({
+        userId: acceptingUserId,
+        projectId: entry.projectId,
+        environments: entry.environments,
+        createdBy: claimed.invitedBy ?? acceptingUserId,
+      })
+      .onConflictDoUpdate({
+        target: [projectEnvironmentGrants.userId, projectEnvironmentGrants.projectId],
+        set: { environments: entry.environments, createdBy: claimed.invitedBy ?? acceptingUserId },
+      });
+  }
 }
 
 /**
