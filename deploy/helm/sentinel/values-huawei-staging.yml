@@ -224,6 +224,9 @@ dlqDrainer:
   enabled: true
   drainerEnabled: "false"
   drainerExecute: "false"
+  # CCE has no default StorageClass — Everest CSI csi-disk provisions EVS.
+  persistence:
+    storageClass: "csi-disk"
 
 serviceAccount:
   create: true
