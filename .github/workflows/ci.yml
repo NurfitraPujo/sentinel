@@ -591,8 +591,13 @@ jobs:
 
       - name: Install kube-linter
         run: |
-          go install golang.stackrox.io/kube-linter/cmd/kube-linter@v0.6.5
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          KUBE_LINTER_VERSION=v0.6.5
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o /tmp/kube-linter.tar.gz "https://github.com/stackrox/kube-linter/releases/download/${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz"
+          tar xzf /tmp/kube-linter.tar.gz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          kube-linter version
 
       - name: helm lint
         run: helm lint deploy/helm/sentinel
