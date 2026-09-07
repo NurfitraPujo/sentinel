@@ -10,9 +10,13 @@ metadata:
     app.kubernetes.io/component: migrate
   annotations:
     # Run migrations before the app pods start, on every install and upgrade.
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # ArgoCD sync-wave (not a Helm hook): hooks run before plain manifests so
+    # the Secret/bridge would not exist yet, and ArgoCD deletes hook resources
+    # post-sync. Wave 1 runs after infra (wave -1/0) and gates app
+    # Deployments (wave 2) — ArgoCD waits for the Job to Complete first.
+    # Replace forces a fresh run whenever the rendered Job changes.
+    "argocd.argoproj.io/sync-wave": "1"
+    "argocd.argoproj.io/sync-options": Replace=true
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
   template:
