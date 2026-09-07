@@ -91,9 +91,6 @@ jobs:
           - image: sentinel-nats-init
             dockerfile: scripts/Dockerfile.nats-init
             context: scripts
-          - image: sentinel-minio-init
-            dockerfile: scripts/Dockerfile.minio-init
-            context: scripts
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -171,7 +168,6 @@ jobs:
         images.migrate.tag=${{ github.ref_name }}
         images.dlqDrainer.tag=${{ github.ref_name }}
         init.nats.tag=${{ github.ref_name }}
-        init.minio.tag=${{ github.ref_name }}
       sync: true
       wait: true
       wait_timeout: 600
