@@ -749,3 +749,24 @@ curl -s -X POST "$SENTINEL_URL/api/agent/uploads" -H "$AUTH" -F "file=@./screens
 curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
   -H 'Content-Type: application/json' --data-binary @docs/agents/examples/triage-batch.json
 ```
+
+---
+
+## 15. Changelog
+
+Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
+deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
+shapes.
+
+### `environment` (sentinel-project-environments, decision 54)
+
+- **`environment` is now a declared field on an issue.** It appears on the issue object returned by
+  `GET /api/agent/issues/{issueId}`, `POST /api/agent/issues/{issueId}/claim` and
+  `DELETE /api/agent/issues/{issueId}/claim`, and on every row of `GET /api/agent/issues`. It is a
+  non-empty string and is never null.
+- **The result set of `GET /api/agent/issues` changes.** An environment is part of an issue's
+  identity, so the same error seen in two environments is now **two** issues — two rows, each
+  independently claimable. `environment` is the only field that tells two such siblings apart.
+- **`GET /api/agent/issues?environment=<name>` filters the list** by exact, case-sensitive match.
+  Omitting it returns every environment, byte-for-byte the previous behaviour. An unrecognised name
+  is not an error; it returns an empty list.

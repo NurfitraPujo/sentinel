@@ -38,6 +38,7 @@ vi.mock('$lib/db/schema', () => ({
 	issues: {
 		id: 'id',
 		projectId: 'projectId',
+		environment: 'environment',
 		issueType: 'issueType',
 		sourceChannel: 'sourceChannel',
 		message: 'message',
@@ -121,6 +122,24 @@ describe('listAgentIssues', () => {
 		// Deleting the `row.waitingOn !== null ? row.waitingSince : null` gate makes i2 leak a stale ws.
 		expect(result.issues[0].waitingSince).toEqual(ws);
 		expect(result.issues[1].waitingSince).toBeNull();
+	});
+
+	// sentinel-project-environments decision 54: `environment` is PUBLISHED on the agent contract,
+	// not merely filtered on. Two assertions, because the two halves fail separately: the projection
+	// has to name the column (delete `environment: issues.environment` from the select and the first
+	// expectation goes red), and the mapper has to pass it through to the list item (the spread
+	// carries it, so this pins the spread).
+	it('decision 54: selects issues.environment and passes it through to the list item', async () => {
+		dbMock.__result = [
+			{ id: 'i1', environment: 'staging', waitingOn: null, firstSeen: null, lastSeen: null },
+		];
+
+		const result = await listAgentIssues({ organizationId: 'org-1' });
+
+		expect(dbMock.select).toHaveBeenCalledWith(
+			expect.objectContaining({ environment: issues.environment })
+		);
+		expect(result.issues[0].environment).toBe('staging');
 	});
 
 	it('N9 (C12): claimed=me pushes assigneeType=agent AND assignedTo=agentId conditions', async () => {

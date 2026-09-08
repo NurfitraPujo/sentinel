@@ -96,6 +96,10 @@ export interface AgentIssueListItem {
 	message: string;
 	errorClass: string;
 	status: string;
+	/** sentinel-project-environments decision 54 (§4.9): the issue's environment. Part of issue
+	 *  IDENTITY (decision 7), so one error across N environments is N rows in this list -- this is
+	 *  the only field that tells two such siblings apart. NOT NULL in the schema. */
+	environment: string;
 	assigneeType: string | null;
 	assignedTo: string | null;
 	waitingOn: string | null;
@@ -221,6 +225,8 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			message: issues.message,
 			errorClass: issues.errorClass,
 			status: issues.status,
+			// sentinel-project-environments decision 54: published on the agent contract.
+			environment: issues.environment,
 			assigneeType: issues.assigneeType,
 			assignedTo: issues.assignedTo,
 			claimedAt: issues.claimedAt,

@@ -147,6 +147,8 @@ paths:
                             - "null"
                         isWaiting:
                           type: boolean
+                        environment:
+                          type: string
                         waitingSince:
                           type:
                             - string
@@ -175,6 +177,7 @@ paths:
                         - severity
                         - reporterId
                         - isWaiting
+                        - environment
                         - waitingSince
                         - claimedAt
                       additionalProperties: false
@@ -231,6 +234,8 @@ paths:
                       id:
                         type: string
                       projectId:
+                        type: string
+                      environment:
                         type: string
                       fingerprint:
                         type: string
@@ -306,6 +311,7 @@ paths:
                     required:
                       - id
                       - projectId
+                      - environment
                       - fingerprint
                       - message
                       - errorClass
@@ -593,6 +599,8 @@ paths:
                         type: string
                       projectId:
                         type: string
+                      environment:
+                        type: string
                       fingerprint:
                         type: string
                       message:
@@ -667,6 +675,7 @@ paths:
                     required:
                       - id
                       - projectId
+                      - environment
                       - fingerprint
                       - message
                       - errorClass
@@ -770,6 +779,8 @@ paths:
                         type: string
                       projectId:
                         type: string
+                      environment:
+                        type: string
                       fingerprint:
                         type: string
                       message:
@@ -844,6 +855,7 @@ paths:
                     required:
                       - id
                       - projectId
+                      - environment
                       - fingerprint
                       - message
                       - errorClass

@@ -38,6 +38,11 @@ export const IssueRowSchema = z
 	.object({
 		id: z.string(),
 		projectId: z.string(),
+		// sentinel-project-environments decision 54: `issues.environment` (§4.9) is part of the
+		// issue's IDENTITY and reaches this response whether or not it is declared -- getAgentIssueDetail
+		// is a full-row `db.select()`. NOT NULL in the schema, so a plain string. Declaring it only
+		// widens the declared type (the same reasoning claimedAt's note records).
+		environment: z.string(),
 		fingerprint: z.string(),
 		message: z.string(),
 		errorClass: z.string(),
@@ -90,6 +95,10 @@ export const AgentIssueListItemSchema = z
 		severity: z.string().nullable(),
 		reporterId: z.string().nullable(),
 		isWaiting: z.boolean(),
+		// sentinel-project-environments decision 54: decision 7 puts `environment` into issue identity,
+		// so one error across N environments is now N independently claimable rows -- without this
+		// field a list caller cannot tell two siblings apart.
+		environment: z.string(),
 		// N9 (AGENT_WORKER_PLAN C12): when the current blocking question was asked -- null unless the
 		// issue is currently waiting (waitingOn set). Lets an agent nag stale questions by age.
 		waitingSince: z.coerce.date().nullable(),
