@@ -154,7 +154,7 @@ jobs:
   deploy-production:
     name: Deploy Production Environment
     needs: [gate-production]
-    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@88b33a7e98ee773ebd33d55e80914b1bcce326be # main as of 2026-09-04, PR #97 stale-key unset fix
+    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
     with:
       runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
       app_name: "sentinel-production"

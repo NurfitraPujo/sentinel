@@ -21,6 +21,9 @@ metadata:
     "argocd.argoproj.io/sync-options": Force=true
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
+  # Auto-remove the completed Job so the next release creates a fresh Job
+  # instead of hitting Job spec.template immutability on re-apply.
+  ttlSecondsAfterFinished: 120
   template:
     metadata:
       labels:
