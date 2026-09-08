@@ -10,17 +10,14 @@ metadata:
     app.kubernetes.io/component: nats-init
   annotations:
     # Create the JetStream streams before the app pods (wave 2) consume them.
-    # ArgoCD sync-wave (not a Helm hook): ArgoCD strips Helm hooks, so the
-    # streams were never created. Same wave as migrate-job (1).
-    # Force (delete+recreate, not in-place replace): Job spec.template is
-    # immutable, so Replace=true fails on re-sync with "field is immutable".
+    # ArgoCD Sync hook: a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up. HookSucceeded+BeforeHookCreation deletes the
+    # completed Job so the next release re-runs fresh.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
     "argocd.argoproj.io/sync-wave": "1"
-    "argocd.argoproj.io/sync-options": Force=true
 spec:
   backoffLimit: 5
-  # Auto-remove the completed Job so the next release creates a fresh Job
-  # instead of hitting Job spec.template immutability on re-apply.
-  ttlSecondsAfterFinished: 120
   template:
     metadata:
       labels:
@@ -62,8 +59,6 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 5
-  # Match nats-init: auto-remove the completed Job on re-install/upgrade.
-  ttlSecondsAfterFinished: 120
   template:
     metadata:
       labels:

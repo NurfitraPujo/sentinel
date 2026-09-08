@@ -10,20 +10,17 @@ metadata:
     app.kubernetes.io/component: migrate
   annotations:
     # Run migrations before the app pods start, on every install and upgrade.
-    # ArgoCD sync-wave (not a Helm hook): hooks run before plain manifests so
-    # the Secret/bridge would not exist yet, and ArgoCD deletes hook resources
-    # post-sync. Wave 1 runs after infra (wave -1/0) and gates app
-    # Deployments (wave 2) — ArgoCD waits for the Job to Complete first.
-    # Replace forces a fresh run whenever the rendered Job changes.
-    # Force (delete+recreate, not in-place replace): Job spec.template is
-    # immutable, so Replace=true fails on re-sync with "field is immutable".
+    # ArgoCD Sync hook (not a plain manifest, not a Helm hook): ArgoCD strips
+    # Helm hooks, and a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up (health Missing gates wave 2). As a Sync hook
+    # in wave 1 it runs after infra (wave -1/0), gates app Deployments
+    # (wave 2), and HookSucceeded+BeforeHookCreation deletes the completed Job
+    # so the next release re-runs fresh without spec.template immutability.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
     "argocd.argoproj.io/sync-wave": "1"
-    "argocd.argoproj.io/sync-options": Force=true
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
-  # Auto-remove the completed Job so the next release creates a fresh Job
-  # instead of hitting Job spec.template immutability on re-apply.
-  ttlSecondsAfterFinished: 120
   template:
     metadata:
       labels:
