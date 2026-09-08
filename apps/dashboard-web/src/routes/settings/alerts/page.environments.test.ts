@@ -189,3 +189,109 @@ describe('alert settings environment picker (contract §4.7, decisions 32-33)', 
 		);
 	});
 });
+
+// BUG-05 — the third state. Before this, `configEnvironments` had exactly two values and neither of
+// them meant "not known yet": `loadConfigEnvironments()` returned silently on `!res.ok` and swallowed
+// every throw, leaving the map `{}`, and `environmentsOf()` answers `null` for an absent key. `null`
+// is the FACT "All environments" — so a failed read rendered the widest possible scope for every
+// rule in the table AND seeded `startEdit`'s picker from it, which is a save that unscopes a live
+// rule while looking like it worked. These tests exist because no test file covered that path at all;
+// that absence was part of the finding.
+describe('alert settings: the stored environment scope is not known yet (BUG-05)', () => {
+	function failingFetch(kind: 'status' | 'throw', registry: string[] = ['production']) {
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			if (url === '/api/alerts' && (!init || !init.method || init.method === 'GET')) {
+				if (kind === 'throw') throw new TypeError('Failed to fetch');
+				return { ok: false, status: 503, json: async () => ({}) };
+			}
+			if (url.startsWith(`/api/organizations/${ORG_ID}/projects/${PROJECT_ID}/environments`)) {
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ environments: registry.map((name) => ({ name })) }),
+				};
+			}
+			return { ok: true, status: 200, json: async () => ({ id: 'cfg-1' }) };
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		return fetchMock;
+	}
+
+	it('never renders "All environments" when the GET fails — it renders an unknown marker', async () => {
+		failingFetch('status');
+		render(Page, { data: pageData({ 'cfg-1': null }) as unknown as AlertsPageData });
+
+		// Wait for the failure to have landed, not merely for the marker: while the GET is in flight the
+		// same cell reads "Loading…", and the assertion that matters is the one after it has failed.
+		await waitFor(() => expect(screen.getByTestId('config-environments-error')).toBeTruthy());
+		expect(screen.getByTestId('config-environments-unknown')).toBeTruthy();
+		const cells = screen.getAllByTestId('config-environments').map((c) => c.textContent?.trim());
+		expect(cells).not.toContain('All environments');
+		expect(cells).toContain('Unknown');
+	});
+
+	it('surfaces the failure with a retry, and the retry populates the real scope', async () => {
+		const fetchMock = failingFetch('status');
+		render(Page, { data: pageData({ 'cfg-1': null }) as unknown as AlertsPageData });
+
+		await waitFor(() => expect(screen.getByTestId('config-environments-error')).toBeTruthy());
+		expect(screen.getByTestId('config-environments-error').textContent).toContain('503');
+
+		// The read now succeeds. Nothing else on the page changed, so a retry is the whole recovery.
+		fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+			if (url === '/api/alerts' && (!init || !init.method || init.method === 'GET')) {
+				return { ok: true, status: 200, json: async () => [{ id: 'cfg-1', environments: ['staging'] }] };
+			}
+			return { ok: true, status: 200, json: async () => ({ environments: [] }) };
+		});
+		await fireEvent.click(screen.getByTestId('config-environments-retry'));
+
+		await waitFor(() =>
+			expect(screen.getByTestId('config-environments').textContent?.trim()).toBe('staging')
+		);
+		expect(screen.queryByTestId('config-environments-error')).toBeNull();
+	});
+
+	it('swallows nothing when the fetch throws either — the marker and the retry still appear', async () => {
+		failingFetch('throw');
+		render(Page, { data: pageData({ 'cfg-1': null }) as unknown as AlertsPageData });
+
+		await waitFor(() => expect(screen.getByTestId('config-environments-error')).toBeTruthy());
+		expect(screen.getByTestId('config-environments-unknown')).toBeTruthy();
+	});
+
+	it('offers no environment picker on edit while the stored scope is unknown', async () => {
+		failingFetch('status');
+		render(Page, { data: pageData({ 'cfg-1': null }) as unknown as AlertsPageData });
+		await waitFor(() => expect(screen.getByTestId('config-environments-error')).toBeTruthy());
+
+		await fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+		// The picker is absent rather than pre-checked on "All environments": a radio checked there is
+		// itself the claim that the rule is unscoped, and it is the claim that loses scope on save.
+		await waitFor(() => expect(screen.getByTestId('edit-scope-unknown')).toBeTruthy());
+		expect(screen.queryByLabelText('All environments')).toBeNull();
+		expect(screen.queryByLabelText('Only these environments')).toBeNull();
+		expect(screen.getByTestId('edit-scope-retry')).toBeTruthy();
+	});
+
+	it('saves an unrelated field with the environments key OMITTED while the scope is unknown', async () => {
+		// Decision 32's first rule is what makes this edit safe: an omitted key leaves the stored scope
+		// exactly as it is, so a threshold change does not need to know what that scope was.
+		const fetchMock = failingFetch('status');
+		render(Page, { data: pageData({ 'cfg-1': null }) as unknown as AlertsPageData });
+		await waitFor(() => expect(screen.getByTestId('config-environments-error')).toBeTruthy());
+
+		await fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+		await waitFor(() => expect(screen.getByTestId('edit-scope-unknown')).toBeTruthy());
+		await fireEvent.input(screen.getByLabelText(/threshold \(errors per window\)/i), {
+			target: { value: '99' },
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /update alert/i }));
+
+		await waitFor(() => expect(savedBody(fetchMock)).toBeTruthy());
+		const body = savedBody(fetchMock);
+		expect('environments' in body).toBe(false);
+		expect(body.frequencyThreshold).toBe(99);
+	});
+});

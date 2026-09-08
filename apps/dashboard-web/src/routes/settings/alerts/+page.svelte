@@ -68,6 +68,14 @@
 	// nobody made. This map is that response, per config id, and the page loader does not carry the
 	// column (it is BE's file under §6a), so it is also seeded from `GET /api/alerts`.
 	let configEnvironments = $state<Record<string, string[] | null>>({});
+	// BUG-05. `configEnvironments` alone has only two values, and neither of them is "not known
+	// yet": an empty map is indistinguishable from a map of rules that all read `null`, and `null`
+	// is the FACT "All environments". So a failed or in-flight GET rendered — and seeded the edit
+	// picker with — the widest possible scope for every rule, which is exactly the guess the comment
+	// below used to say it must never make. These two flags are the third state.
+	let configEnvironmentsLoaded = $state(false);
+	let configEnvironmentsLoading = $state(false);
+	let configEnvironmentsError = $state<string | null>(null);
 
 	// Task 13 / flow `E4`. `defaultEnvironmentApplied: false` is a field on the POST response and is
 	// NOT persisted anywhere — no column carries it, deliberately — so this is an event reported
@@ -77,16 +85,27 @@
 	let noDefaultNotice = $state<string | null>(null);
 
 	async function loadConfigEnvironments() {
+		// Every failure path here leaves `configEnvironmentsLoaded` false, which is what makes the
+		// table cell and the edit picker render "unknown" rather than the stated fact. Nothing is
+		// swallowed: the message is surfaced with a retry, because the alternative is a page that
+		// looks correct and has silently unscoped every rule on it.
+		configEnvironmentsLoading = true;
 		try {
 			const res = await fetch('/api/alerts');
-			if (!res.ok) return;
+			if (!res.ok) {
+				configEnvironmentsError = `Could not read the environment scope of these rules (HTTP ${res.status}).`;
+				return;
+			}
 			const rows = (await res.json()) as { id: string; environments: string[] | null }[];
 			const next: Record<string, string[] | null> = {};
 			for (const row of rows) next[row.id] = row.environments ?? null;
 			configEnvironments = next;
+			configEnvironmentsLoaded = true;
+			configEnvironmentsError = null;
 		} catch {
-			// A picker that cannot read the stored scope simply shows "All environments" until it can;
-			// it must never guess, because a guess is what silently unscopes a live rule.
+			configEnvironmentsError = 'Could not read the environment scope of these rules.';
+		} finally {
+			configEnvironmentsLoading = false;
 		}
 	}
 
@@ -133,6 +152,12 @@
 		return configEnvironments[configId] ?? null;
 	}
 
+	// BUG-05. While the stored scope is unknown the picker is not shown at all, let alone seeded: a
+	// picker seeded from an unknown value cannot produce a safe save, and a radio pre-checked on
+	// "All environments" is itself the claim that the rule is unscoped. Creation is unaffected — a
+	// new rule has no stored scope to be unknown about.
+	let storedScopeUnknown = $derived(editMode && editingConfig !== null && !configEnvironmentsLoaded);
+
 	function toggleEnvironment(name: string) {
 		environmentTouched = true;
 		environmentSelection = environmentSelection.includes(name)
@@ -178,7 +203,10 @@
 		// Flow `E2`: a config untouched since the migration carries `NULL`, which is exactly today's
 		// behaviour and reads as "All environments" — not as an empty scope and not as missing data.
 		// Everything else opens on what the config actually holds, per decision 32's re-render rule.
-		const stored = environmentsOf(config.id);
+		// BUG-05: only when the GET actually succeeded. Until then `environmentsOf` would answer
+		// `null` for a rule that may hold a narrow scope, and seeding "all" from that is the silent
+		// unscoping this whole file is written against.
+		const stored = configEnvironmentsLoaded ? environmentsOf(config.id) : null;
 		environmentMode = stored === null ? 'all' : 'specific';
 		environmentSelection = stored === null ? [] : [...stored];
 		environmentTouched = false;
@@ -265,7 +293,10 @@
 		//     leave the rule scoped while looking like it had been widened.
 		//   - specific          -> the chosen names, which the server then MERGES with the ones this
 		//     caller could not have been offered.
-		if (environmentTouched) {
+		//   - stored scope unknown -> the key is OMITTED too (BUG-05). The picker is not rendered in
+		//     that state, so `environmentTouched` cannot be set through the UI; this is the belt to
+		//     that brace, so a future control cannot reintroduce a save built on a guess.
+		if (environmentTouched && !storedScopeUnknown) {
 			payload.environments = environmentMode === 'all' ? null : environmentSelection;
 		}
 
@@ -530,6 +561,29 @@
 				<div class="form-group">
 					<span id="environment-scope-label" class="form-group-label">Environments</span>
 					<div role="group" aria-labelledby="environment-scope-label" class="environment-picker">
+						{#if storedScopeUnknown}
+							<!--
+								BUG-05. The stored scope of this rule could not be read, so there is nothing
+								honest to seed a picker from. Editing everything else on the rule stays open —
+								an omitted `environments` key leaves the scope exactly as it is (decision 32) —
+								and the picker comes back as soon as the read succeeds.
+							-->
+							<p class="environment-hint" data-testid="edit-scope-unknown">
+								{configEnvironmentsLoading
+									? 'Reading this rule’s environments…'
+									: 'This rule’s environments could not be read, so they cannot be changed here. Everything else on the rule can still be saved and its environments are left untouched.'}
+							</p>
+							{#if !configEnvironmentsLoading}
+								<button
+									type="button"
+									class="btn-action"
+									data-testid="edit-scope-retry"
+									onclick={loadConfigEnvironments}
+								>
+									Retry
+								</button>
+							{/if}
+						{:else}
 						<label class="environment-mode">
 							<input
 								type="radio"
@@ -591,6 +645,7 @@
 									<span class="environment-carried">already on this rule</span>
 								</label>
 							{/each}
+						{/if}
 						{/if}
 					</div>
 					{#if fieldErrors.environments}
@@ -671,6 +726,24 @@
 		{#if data.alertConfigs.length > 0}
 			<div class="configs-section">
 				<h2>Existing Alert Configurations</h2>
+				<!--
+					BUG-05. The read that carries every rule's environment scope failed. It used to fail
+					silently and the table below went on stating "All environments" for every row.
+				-->
+				{#if configEnvironmentsError}
+					<p class="environments-error" role="alert" data-testid="config-environments-error">
+						<span>{configEnvironmentsError}</span>
+						<button
+							type="button"
+							class="btn-action"
+							data-testid="config-environments-retry"
+							disabled={configEnvironmentsLoading}
+							onclick={loadConfigEnvironments}
+						>
+							Retry
+						</button>
+					</p>
+				{/if}
 				<table class="configs-table">
 					<thead>
 						<tr>
@@ -700,7 +773,16 @@
 									cell — a blank reads as missing data rather than as the stated fact.
 								-->
 								<td class="environments-cell" data-testid="config-environments">
-									{#if environmentsOf(config.id) === null}
+									{#if !configEnvironmentsLoaded}
+										<!--
+											BUG-05. There is no stated fact to show yet, so none is shown. "All
+											environments" here would be a guess, and it is the one guess that reads
+											as a wider scope than the rule may actually have.
+										-->
+										<span class="environments-unknown" data-testid="config-environments-unknown">
+											{configEnvironmentsLoading ? 'Loading…' : 'Unknown'}
+										</span>
+									{:else if environmentsOf(config.id) === null}
 										All environments
 									{:else}
 										{environmentsOf(config.id)?.join(', ')}
@@ -845,6 +927,23 @@
 	.environment-carried {
 		font-size: 0.7rem;
 		opacity: 0.7;
+	}
+
+	.environments-unknown {
+		color: #6b7280;
+		font-style: italic;
+	}
+
+	.environments-error {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin: 0 0 0.75rem;
+		padding: 0.5rem 0.75rem;
+		border: 1px solid #fca5a5;
+		border-radius: 4px;
+		background: #fef2f2;
+		color: #991b1b;
 	}
 
 	.environments-cell {
