@@ -119,6 +119,15 @@
 		<p class="message">{data.issue.message}</p>
 		<div class="meta-info">
 			<span class="meta-item"><strong class="meta-label">Project:</strong> {data.project?.name ?? 'Unknown'}</span>
+			<!--
+				sentinel-project-environments task 2, flows `D1`/`D3`. `environmentDisplayName` is the
+				registry's label falling back to the raw `issues.environment` name, and the FALLBACK IS
+				THE NORMAL PATH — under decisions 8 and 9 an environment can be present in the data and
+				absent from the registry indefinitely, so there is deliberately no warning, no
+				placeholder and no "unregistered" marker here. A page that flagged the miss would be
+				shouting on every environment's first day.
+			-->
+			<span class="meta-item"><strong class="meta-label">Environment:</strong> {data.environmentDisplayName ?? data.issue.environment}</span>
 			<span class="meta-item"><strong class="meta-label">First seen:</strong> {formatDate(data.issue.firstSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Last seen:</strong> {formatDate(data.issue.lastSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>
@@ -132,7 +141,18 @@
 	/>
 
 	<section class="occurrences">
-		<h2 class="section-title">Occurrence History ({data.occurrences.length})</h2>
+		<!--
+			sentinel-project-environments task 1, flow `D2`. This read `({data.occurrences.length})`,
+			which is the PAGE SIZE — `getOccurrencesByIssueId` caps at 100 — presented as a total. The
+			heading now carries the loader's real `COUNT(*)` and the line below says how many of them
+			are actually listed, so the two numbers can differ on screen without either one lying.
+		-->
+		<h2 class="section-title">Occurrence History ({Number(data.occurrenceTotal ?? data.occurrences.length).toLocaleString()})</h2>
+		{#if (data.occurrenceTotal ?? data.occurrences.length) > data.occurrences.length}
+			<p class="occurrence-window">
+				Showing the {data.occurrences.length.toLocaleString()} most recent.
+			</p>
+		{/if}
 
 		{#each occurrenceGroups as group}
 			<div class="date-group">
@@ -260,6 +280,13 @@
 		font-size: 1.125rem;
 		font-weight: 600;
 		color: var(--text-primary);
+		margin-bottom: 1rem;
+	}
+
+	.occurrence-window {
+		font-size: 0.8125rem;
+		color: var(--text-subtle);
+		margin-top: -0.5rem;
 		margin-bottom: 1rem;
 	}
 

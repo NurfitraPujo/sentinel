@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import type { PageData } from './$types';
 
@@ -39,6 +40,116 @@
 
 	let selectedOrgId = $state('');
 
+	// ---------------------------------------------------------------------------------------------
+	// sentinel-project-environments tasks 12-13 — the environment picker and the no-default notice.
+	// Contract §4.7 and decisions 32 and 33, flows `E1`-`E13`.
+	// ---------------------------------------------------------------------------------------------
+
+	// The names this picker can OFFER: §4.1's registry (scope-filtered, hidden rows excluded) for a
+	// project-scoped rule, and §4.3a's guarded cross-project union for an org-wide one. There is no
+	// free-text path anywhere — flow `E8`: a typed environment name in an alert config silently means
+	// "never alert", and nothing in the system would report that.
+	let offeredEnvironments = $state<string[]>([]);
+	let offeredLoaded = $state(false);
+
+	// `null` = all environments; an array = exactly those names.
+	let environmentMode = $state<'all' | 'specific'>('all');
+	let environmentSelection = $state<string[]>([]);
+	// Decision 32's second rule: an OMITTED key means "leave unchanged", and that is the shape that
+	// cannot go wrong for a save that is not about environments. So the field is sent only when the
+	// picker was actually touched — which is also what makes flows `E3`/`E4` work on creation, where
+	// an untouched picker is what asks the server to apply the project's default.
+	let environmentTouched = $state(false);
+
+	// Decision 32's third rule: the server MERGES what is sent with the names the caller could not
+	// have been offered — unregistered, hidden, or outside their grant — and returns the merged
+	// array. Re-rendering from the RESPONSE rather than from what was sent is what stops the picker
+	// showing fewer environments than the config holds and turning the next save into a deselection
+	// nobody made. This map is that response, per config id, and the page loader does not carry the
+	// column (it is BE's file under §6a), so it is also seeded from `GET /api/alerts`.
+	let configEnvironments = $state<Record<string, string[] | null>>({});
+
+	// Task 13 / flow `E4`. `defaultEnvironmentApplied: false` is a field on the POST response and is
+	// NOT persisted anywhere — no column carries it, deliberately — so this is an event reported
+	// once, at creation, on the screen the rule was created from. It is not a toast that disappears
+	// on a timer and there is nothing to re-render after a reload. The standing form of the same
+	// warning lives on project settings' "no default set" line (decision 33).
+	let noDefaultNotice = $state<string | null>(null);
+
+	async function loadConfigEnvironments() {
+		try {
+			const res = await fetch('/api/alerts');
+			if (!res.ok) return;
+			const rows = (await res.json()) as { id: string; environments: string[] | null }[];
+			const next: Record<string, string[] | null> = {};
+			for (const row of rows) next[row.id] = row.environments ?? null;
+			configEnvironments = next;
+		} catch {
+			// A picker that cannot read the stored scope simply shows "All environments" until it can;
+			// it must never guess, because a guess is what silently unscopes a live rule.
+		}
+	}
+
+	async function loadOfferedEnvironments() {
+		offeredLoaded = false;
+		offeredEnvironments = [];
+		try {
+			let url: string | null = null;
+			if (scope === 'project' && selectedProjectId) {
+				const project = data.projects.find((p) => p.id === selectedProjectId);
+				if (project?.organizationId) {
+					url = `/api/organizations/${project.organizationId}/projects/${selectedProjectId}/environments`;
+				}
+			} else if (scope === 'organization' && activeOrgId) {
+				// §4.3a. There is no single project to take a registry from, so the names are the
+				// guarded union across the projects this caller can reach in that organization.
+				url = `/api/environments?organizationId=${encodeURIComponent(activeOrgId)}`;
+			}
+			if (!url) return;
+			const res = await fetch(url);
+			if (!res.ok) return;
+			const body = await res.json();
+			offeredEnvironments = ((body.environments ?? []) as { name: string }[]).map((e) => e.name);
+		} catch {
+			offeredEnvironments = [];
+		} finally {
+			offeredLoaded = true;
+		}
+	}
+
+	$effect(() => {
+		// Re-read whenever the scope target changes: a project's registry and an organization's union
+		// are different lists, and offering one where the other applies is how a rule gets scoped to a
+		// name the server will refuse.
+		void scope;
+		void selectedProjectId;
+		void activeOrgId;
+		loadOfferedEnvironments();
+	});
+
+	onMount(loadConfigEnvironments);
+
+	function environmentsOf(configId: string): string[] | null {
+		return configEnvironments[configId] ?? null;
+	}
+
+	function toggleEnvironment(name: string) {
+		environmentTouched = true;
+		environmentSelection = environmentSelection.includes(name)
+			? environmentSelection.filter((n) => n !== name)
+			: [...environmentSelection, name];
+		delete fieldErrors.environments;
+		fieldErrors = { ...fieldErrors };
+	}
+
+	function setEnvironmentMode(mode: 'all' | 'specific') {
+		environmentTouched = true;
+		environmentMode = mode;
+		if (mode === 'all') environmentSelection = [];
+		delete fieldErrors.environments;
+		fieldErrors = { ...fieldErrors };
+	}
+
 	let editableAlertConfigIds = $derived(
 		new Set(data.editableAlertConfigs.map((c: AlertConfig) => c.id))
 	);
@@ -64,6 +175,14 @@
 		frequencyThreshold = config.frequencyThreshold;
 		windowSeconds = config.windowSeconds;
 		enabled = config.enabled;
+		// Flow `E2`: a config untouched since the migration carries `NULL`, which is exactly today's
+		// behaviour and reads as "All environments" — not as an empty scope and not as missing data.
+		// Everything else opens on what the config actually holds, per decision 32's re-render rule.
+		const stored = environmentsOf(config.id);
+		environmentMode = stored === null ? 'all' : 'specific';
+		environmentSelection = stored === null ? [] : [...stored];
+		environmentTouched = false;
+		noDefaultNotice = null;
 		fieldErrors = {};
 		toastMessage = null;
 	}
@@ -83,6 +202,12 @@
 		frequencyThreshold = 50;
 		windowSeconds = 60;
 		enabled = true;
+		// Nothing is pre-selected on a fresh form: an untouched picker sends no `environments` key at
+		// all, which is what lets §4.7 apply the project's default (flow `E3`) or report that there is
+		// none (`E4`).
+		environmentMode = 'all';
+		environmentSelection = [];
+		environmentTouched = false;
 		fieldErrors = {};
 		toastMessage = null;
 	}
@@ -113,6 +238,15 @@
 			isSubmitting = false;
 			return;
 		}
+		// Flow `E6`: deselecting everything is refused BEFORE the request goes out. `[]` is a `400`
+		// (§4.7) because an alert that can never fire is not a state to store — and the server's own
+		// `400` is still handled below, in case one arrives another way.
+		if (environmentMode === 'specific' && environmentSelection.length === 0) {
+			fieldErrors.environments =
+				'Choose at least one environment, or switch this rule back to All environments.';
+			isSubmitting = false;
+			return;
+		}
 
 		const payload: Record<string, unknown> = {
 			channel,
@@ -121,6 +255,19 @@
 			windowSeconds,
 			enabled,
 		};
+
+		// Decision 32, all three rules in one place, because each of them is a way to unscope a live
+		// rule by accident:
+		//   - untouched picker  -> the key is OMITTED entirely, meaning "leave unchanged" on a PUT and
+		//     "apply the project default" on a POST. A save that changes a threshold must not carry an
+		//     `environments` array.
+		//   - "All environments" -> `null`. NOT `[]` (a `400`) and NOT an omitted key, which would
+		//     leave the rule scoped while looking like it had been widened.
+		//   - specific          -> the chosen names, which the server then MERGES with the ones this
+		//     caller could not have been offered.
+		if (environmentTouched) {
+			payload.environments = environmentMode === 'all' ? null : environmentSelection;
+		}
 
 		let url = '/api/alerts';
 		let method = 'POST';
@@ -155,6 +302,8 @@
 						fieldErrors.projectId = errMsg;
 					} else if (errMsg.toLowerCase().includes('org') || errMsg.toLowerCase().includes('organizationid')) {
 						fieldErrors.organizationId = errMsg;
+					} else if (errMsg.toLowerCase().includes('environment')) {
+						fieldErrors.environments = errMsg;
 					} else if (errMsg.toLowerCase().includes('target') || errMsg.toLowerCase().includes('channel')) {
 						fieldErrors.channelTarget = errMsg;
 					} else {
@@ -176,6 +325,28 @@
 					text: editMode ? 'Alert rule updated successfully' : 'Alert rule created successfully',
 					type: 'success',
 				};
+
+				// Decision 32's third rule: re-render from what came BACK, never from what was sent. A
+				// rule may legitimately hold an environment this picker could not offer — unregistered,
+				// hidden, or outside this caller's grant — and the server preserves those on the merge.
+				// Re-rendering from the request would show fewer environments than the rule has, and the
+				// next save would look like a deselection nobody made.
+				if (result?.id) {
+					configEnvironments = {
+						...configEnvironments,
+						[result.id]: result.environments ?? null,
+					};
+				}
+
+				// Task 13 / flow `E4`, decision 33. Reported once, at creation, on this screen — the
+				// project has no default environment, so §4.7's fallback left the new rule covering
+				// everything. It is not persisted and there is nothing to look for after a reload; the
+				// standing condition is project settings' "no default set" line.
+				noDefaultNotice =
+					!editMode && result?.defaultEnvironmentApplied === false
+						? 'This project has no default environment set, so this rule was created covering every environment. Set a default in the project\u2019s settings, or scope this rule explicitly above.'
+						: null;
+
 				resetForm();
 				editMode = false;
 				editingConfig = null;
@@ -236,6 +407,21 @@
 		<form onsubmit={handleSubmit}>
 			<div class="form-section">
 				<h2>{editMode ? 'Edit Alert Configuration' : 'Create New Alert'}</h2>
+
+				<!--
+					Task 13 / flow `E4`, decision 33. Reported at the moment of creation, from the POST
+					response's `defaultEnvironmentApplied: false`, on the screen the rule was created
+					from. It is deliberately NOT a toast on a timer, and equally deliberately not
+					persistent: nothing stores this field, so there is nothing to render on a reload. The
+					standing form of the warning is project settings' "no default set" line, which is
+					where the condition is actually true and stays true.
+				-->
+				{#if noDefaultNotice}
+					<div class="no-default-notice" role="status" data-testid="no-default-notice">
+						<span>{noDefaultNotice}</span>
+						<button type="button" class="toast-dismiss" onclick={() => (noDefaultNotice = null)}>&times;</button>
+					</div>
+				{/if}
 
 				<!-- Form Scope Switcher -->
 				<div class="form-group">
@@ -335,6 +521,83 @@
 				{/if}
 
 
+				<!--
+					sentinel-project-environments task 12, flows `E1`, `E5`-`E9`, `E11`-`E13`. A choice
+					between "every environment" and a set picked from the server's list — there is no
+					free-text path here on purpose (`E8`): a typed name that matches nothing means
+					"never alert", and nothing anywhere would report that it had happened.
+				-->
+				<div class="form-group">
+					<span id="environment-scope-label" class="form-group-label">Environments</span>
+					<div role="group" aria-labelledby="environment-scope-label" class="environment-picker">
+						<label class="environment-mode">
+							<input
+								type="radio"
+								name="environmentMode"
+								checked={environmentMode === 'all'}
+								onchange={() => setEnvironmentMode('all')}
+							/>
+							<span>All environments</span>
+						</label>
+						<label class="environment-mode">
+							<input
+								type="radio"
+								name="environmentMode"
+								checked={environmentMode === 'specific'}
+								onchange={() => setEnvironmentMode('specific')}
+							/>
+							<span>Only these environments</span>
+						</label>
+
+						{#if environmentMode === 'specific'}
+							{#if !offeredLoaded}
+								<p class="environment-hint">Loading environments…</p>
+							{:else if offeredEnvironments.length === 0}
+								<!--
+									Under decision 8 a project has no declared environments until somebody adds
+									one, so this is the ordinary day-one state rather than a fault. An empty
+									multi-select would read as broken.
+								-->
+								<p class="environment-hint">
+									{scope === 'project'
+										? 'This project has no declared environments yet, so there is nothing to narrow to. Declare one in the project’s settings, or leave this rule covering every environment.'
+										: 'None of the projects you can reach in this organization have declared environments yet.'}
+								</p>
+							{:else}
+								<div class="environment-options">
+									{#each offeredEnvironments as name (name)}
+										<label class="environment-option">
+											<input
+												type="checkbox"
+												checked={environmentSelection.includes(name)}
+												onchange={() => toggleEnvironment(name)}
+											/>
+											<span>{name}</span>
+										</label>
+									{/each}
+								</div>
+							{/if}
+							<!--
+								Decision 48 / flow `E11a`: names the picker could not offer — unregistered,
+								hidden, or outside this caller's grant — are preserved by the server's merge
+								and still shown here, and re-submitting them is explicitly allowed. They are
+								not stripped, because stripping them is the silent unscoping decision 32
+								exists to prevent.
+							-->
+							{#each environmentSelection.filter((n) => !offeredEnvironments.includes(n)) as name (name)}
+								<label class="environment-option">
+									<input type="checkbox" checked onchange={() => toggleEnvironment(name)} />
+									<span>{name}</span>
+									<span class="environment-carried">already on this rule</span>
+								</label>
+							{/each}
+						{/if}
+					</div>
+					{#if fieldErrors.environments}
+						<p class="field-error-text">{fieldErrors.environments}</p>
+					{/if}
+				</div>
+
 				<div class="form-group">
 					<label for="channel">Notification Channel</label>
 					<select id="channel" name="channel" bind:value={channel} required>
@@ -412,6 +675,7 @@
 					<thead>
 						<tr>
 							<th>Scope / Target</th>
+							<th>Environments</th>
 							<th>Channel</th>
 							<th>Target</th>
 							<th>Threshold</th>
@@ -428,6 +692,18 @@
 										<span class="org-badge">[ORG-WIDE]</span>
 									{:else}
 										<span class="project-name">{getProjectName(config.projectId)}</span>
+									{/if}
+								</td>
+								<!--
+									Flow `E2`: `null` reads as "All environments", which is exactly what every
+									pre-migration row carries and exactly what it has always done. Never a blank
+									cell — a blank reads as missing data rather than as the stated fact.
+								-->
+								<td class="environments-cell" data-testid="config-environments">
+									{#if environmentsOf(config.id) === null}
+										All environments
+									{:else}
+										{environmentsOf(config.id)?.join(', ')}
 									{/if}
 								</td>
 								<td class="channel-cell">{config.channel}</td>
@@ -536,6 +812,57 @@
 		background: rgba(16, 185, 129, 0.12);
 		border: 1px solid rgba(16, 185, 129, 0.3);
 		color: #10b981;
+	}
+
+	.environment-picker {
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
+	}
+
+	.environment-mode,
+	.environment-option {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.85rem;
+	}
+
+	.environment-options {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		padding-left: 1.25rem;
+	}
+
+	.environment-hint {
+		font-size: 0.75rem;
+		opacity: 0.75;
+		line-height: 1.45;
+		margin: 0.25rem 0 0 1.25rem;
+	}
+
+	.environment-carried {
+		font-size: 0.7rem;
+		opacity: 0.7;
+	}
+
+	.environments-cell {
+		font-size: 0.8rem;
+	}
+
+	.no-default-notice {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-left-width: 3px;
+		border-radius: var(--radius-sm);
+		padding: 0.625rem 0.75rem;
+		font-size: 0.8rem;
+		line-height: 1.45;
+		margin-bottom: 1rem;
 	}
 
 	.toast-dismiss {

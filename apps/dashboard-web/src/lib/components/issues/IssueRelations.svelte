@@ -9,15 +9,36 @@
 		fingerprint: string;
 	}
 
+	// sentinel-project-environments decision 37, contract §2.2/§4.5a, flows `D7`-`D9`.
+	//
+	// `getIssueRelations` guards the RELATED issue against the viewer's environment scope, per
+	// project, and an out-of-scope relation is NOT dropped: it comes back as a redacted placeholder.
+	// The `redacted` discriminant is the whole of that object — no id, no message, no error class,
+	// no status, no fingerprint — and the query layer also nulls whichever of `sourceIssueId` /
+	// `targetIssueId` is the far end, because the related issue's id is also one of those two and
+	// redacting one key while returning it under another is not redaction.
+	//
+	// This is the ONE place in this feature where the product says "something exists here that you
+	// cannot open"; everywhere else denial is a `404` indistinguishable from non-existence
+	// (decision 20). It is a deliberate, recorded exception — contract §12 *Known limits* 7 — chosen
+	// against the review panel's recommendation, because a panel that silently omits relations
+	// misrepresents the graph and a triager can then re-link an issue that is already linked with no
+	// indication why the link will not take. Do not "fix" it into an omission or a not-found.
+	type RelatedIssueView = ({ redacted?: false } & RelatedIssue) | { redacted: true };
+
+	function isRedacted(view: RelatedIssueView): view is { redacted: true } {
+		return view.redacted === true;
+	}
+
 	interface RelationItem {
 		id: string;
-		sourceIssueId: string;
-		targetIssueId: string;
+		sourceIssueId: string | null;
+		targetIssueId: string | null;
 		relationType: RelationType;
 		direction: 'outgoing' | 'incoming';
 		// D43: the other issue in the relation, regardless of direction — never necessarily the
 		// "target" (for an incoming relation it is the source).
-		relatedIssue: RelatedIssue;
+		relatedIssue: RelatedIssueView;
 	}
 
 	interface Props {
@@ -104,7 +125,10 @@
 				{
 					...createdRelation,
 					direction: 'outgoing',
-					relatedIssue: target,
+					// A relation the viewer just created is one they can obviously see — the redaction
+					// branch above is a server decision about somebody else's issue, never about this
+					// optimistic row.
+					relatedIssue: { redacted: false, ...target },
 				},
 			];
 
@@ -136,6 +160,12 @@
 	async function unlinkIssue(rel: RelationItem) {
 		const endpointIssueId = rel.direction === 'outgoing' ? currentIssueId : rel.sourceIssueId;
 		const targetId = rel.direction === 'outgoing' ? rel.targetIssueId : currentIssueId;
+
+		// A redacted relation has its far end nulled (decision 37), so there is no pair of ids to
+		// address the row with — and no unlink control is rendered for one either. This is belt and
+		// braces on the same fact, not a second policy: the write path is `requireIssueAccess` and is
+		// guarded regardless (flow `D8`).
+		if (!endpointIssueId || !targetId) return;
 
 		// Optimistic removal
 		const prevRelations = [...relations];
@@ -241,6 +271,49 @@
 		{/if}
 	</div>
 
+	<!--
+		One card renderer for all three groups. The three lists were byte-identical before decision
+		37, and adding the redaction branch to each of them separately is exactly the "natural
+		half-fix" contract §11 warns about for `getIssueRelations`'s two join branches — one group
+		would quietly keep rendering a link for an issue the viewer may not open.
+	-->
+	{#snippet relationCard(rel: RelationItem)}
+		{#if isRedacted(rel.relatedIssue)}
+			<!--
+				Decision 37's placeholder. A ROW, not a gap: the fact being stated is that this issue is
+				related to something, and the reader cannot see what. It carries no id, no message, no
+				error class, no status and no fingerprint; it is not an anchor, has no hover affordance
+				and no unlink control, so there is nothing here to click, copy or correlate. Kept
+				visually quiet on purpose — it is neither an error nor a warning, and a row showing only
+				a dash would read as broken data instead.
+			-->
+			<li class="relation-card redacted" data-testid="redacted-relation">
+				<div class="card-content">
+					<span class="redacted-text">A related issue exists that you do not have access to.</span>
+				</div>
+			</li>
+		{:else}
+			<li class="relation-card">
+				<div class="card-content">
+					<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
+						<span class="error-class">{rel.relatedIssue.errorClass}</span>
+						<span class="issue-msg">{rel.relatedIssue.message}</span>
+					</a>
+					<div class="card-meta">
+						<span class="mono-id">{rel.relatedIssue.id}</span>
+						<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
+						{#if rel.direction === 'incoming'}
+							<span class="dir-tag">incoming</span>
+						{/if}
+					</div>
+				</div>
+				<button class="btn-unlink" onclick={() => unlinkIssue(rel)} title="Unlink issue" aria-label="Unlink issue">
+					&times;
+				</button>
+			</li>
+		{/if}
+	{/snippet}
+
 	<!-- Relations Lists -->
 	<div class="relations-groups">
 		<!-- Duplicates -->
@@ -251,26 +324,7 @@
 					<span class="badge">{duplicates.length}</span>
 				</h4>
 				<ul class="relation-list">
-					{#each duplicates as rel}
-						<li class="relation-card">
-							<div class="card-content">
-								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
-									<span class="error-class">{rel.relatedIssue.errorClass}</span>
-									<span class="issue-msg">{rel.relatedIssue.message}</span>
-								</a>
-								<div class="card-meta">
-									<span class="mono-id">{rel.relatedIssue.id}</span>
-									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
-									{#if rel.direction === 'incoming'}
-										<span class="dir-tag">incoming</span>
-									{/if}
-								</div>
-							</div>
-							<button class="btn-unlink" onclick={() => unlinkIssue(rel)} title="Unlink issue" aria-label="Unlink issue">
-								&times;
-							</button>
-						</li>
-					{/each}
+					{#each duplicates as rel}{@render relationCard(rel)}{/each}
 				</ul>
 			</div>
 		{/if}
@@ -283,26 +337,7 @@
 					<span class="badge">{causes.length}</span>
 				</h4>
 				<ul class="relation-list">
-					{#each causes as rel}
-						<li class="relation-card">
-							<div class="card-content">
-								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
-									<span class="error-class">{rel.relatedIssue.errorClass}</span>
-									<span class="issue-msg">{rel.relatedIssue.message}</span>
-								</a>
-								<div class="card-meta">
-									<span class="mono-id">{rel.relatedIssue.id}</span>
-									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
-									{#if rel.direction === 'incoming'}
-										<span class="dir-tag">incoming</span>
-									{/if}
-								</div>
-							</div>
-							<button class="btn-unlink" onclick={() => unlinkIssue(rel)} title="Unlink issue" aria-label="Unlink issue">
-								&times;
-							</button>
-						</li>
-					{/each}
+					{#each causes as rel}{@render relationCard(rel)}{/each}
 				</ul>
 			</div>
 		{/if}
@@ -315,26 +350,7 @@
 					<span class="badge">{linked.length}</span>
 				</h4>
 				<ul class="relation-list">
-					{#each linked as rel}
-						<li class="relation-card">
-							<div class="card-content">
-								<a href="/issues/{rel.relatedIssue.id}" class="issue-link">
-									<span class="error-class">{rel.relatedIssue.errorClass}</span>
-									<span class="issue-msg">{rel.relatedIssue.message}</span>
-								</a>
-								<div class="card-meta">
-									<span class="mono-id">{rel.relatedIssue.id}</span>
-									<span class="status-tag {rel.relatedIssue.status}">{rel.relatedIssue.status}</span>
-									{#if rel.direction === 'incoming'}
-										<span class="dir-tag">incoming</span>
-									{/if}
-								</div>
-							</div>
-							<button class="btn-unlink" onclick={() => unlinkIssue(rel)} title="Unlink issue" aria-label="Unlink issue">
-								&times;
-							</button>
-						</li>
-					{/each}
+					{#each linked as rel}{@render relationCard(rel)}{/each}
 				</ul>
 			</div>
 		{/if}
@@ -689,5 +705,17 @@
 		padding: 0.75rem 0;
 		color: var(--text-muted, #94a3b8);
 		font-size: 0.75rem;
+	}
+
+	/* Decision 37: quiet, not alarming. Same card frame as a whole relation so the panel still reads
+	   as a list, dimmed and italic so it is obviously not a thing to click. */
+	.relation-card.redacted {
+		border-style: dashed;
+	}
+
+	.redacted-text {
+		font-size: 0.75rem;
+		font-style: italic;
+		color: var(--text-muted, #94a3b8);
 	}
 </style>
