@@ -113,5 +113,11 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 		// own; /signin is outside its reserved /auth/* namespace. See
 		// src/routes/signin/+page.server.ts and +page.svelte for the actual page.
 		signIn: '/signin',
+		// Auth.js's default post-send page is its own /auth/verify-request; sending the user there
+		// drops them out of this app's shell mid-sign-in. `/signin?sent=1` is the same page they are
+		// already looking at, which renders its own "check your email" panel off this flag.
+		verifyRequest: '/signin?sent=1',
+		// Likewise for failures: /signin already reads `error` off the query string and renders it.
+		error: '/signin',
 	},
 });

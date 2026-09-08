@@ -1,24 +1,63 @@
 import { env } from '$env/dynamic/private';
-import { fail } from '@sveltejs/kit';
+import { fail, isRedirect } from '@sveltejs/kit';
 import { z } from 'zod';
 import { checkRateLimit } from '$lib/rate-limit';
 import { logAuditEvent } from '$lib/server/audit';
 import { signIn } from '$lib/server/auth-config';
+import type { RequestEvent } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
 
 const emailSchema = z.object({
 	email: z.string().email('Invalid email address'),
 });
 
-export const load: PageServerLoad = async () => {
+// `signIn` as exported by SvelteKitAuth is a SvelteKit form ACTION — its one argument is the
+// RequestEvent, and the provider plus its options are read out of `await event.request.formData()`
+// as `providerId` + the remaining fields. It is NOT the `(provider, options)` programmatic helper;
+// that signature belongs to the internal `@auth/sveltekit/actions` export, which is not public and
+// additionally wants the resolved config and the event.
+//
+// Calling it as `signIn('email', { email, callbackUrl })` made `event` the string 'email', so
+// `event.request` was undefined and it threw `TypeError: Cannot read properties of undefined
+// (reading 'formData')` BEFORE any mail was attempted — the action's catch then reported that as
+// "Failed to send magic link". Nothing ever reached SMTP; staging logged the TypeError against
+// every magic_link_failed audit event.
+//
+// So drive it the way it wants to be driven: hand it this same event carrying a form body we
+// wrote. The headers are the real request's (Auth.js reads Host/Origin/Cookie off them) with the
+// content type forced, because the body below is ours, not the browser's.
+function authEventFor(event: RequestEvent, fields: Record<string, string>): RequestEvent {
+	const headers = new Headers(event.request.headers);
+	headers.set('content-type', 'application/x-www-form-urlencoded');
+
+	const request = new Request(event.request.url, {
+		method: 'POST',
+		headers,
+		body: new URLSearchParams(fields),
+	});
+
+	return { ...event, request };
+}
+
+export const load: PageServerLoad = async ({ url }) => {
 	return {
 		emailConfigured: !!env.EMAIL_SERVER,
+		// Auth.js redirects here after it has accepted the address and dispatched the mail; see
+		// `pages.verifyRequest` in auth-config.ts.
+		linkSent: url.searchParams.get('sent') === '1',
 	};
 };
 
 export const actions: Actions = {
-	magiclink: async ({ request, getClientAddress }) => {
-		const formData = await request.formData();
+	// The page's Google button posts here. Before this action existed the button posted to a
+	// SvelteKit action that was never defined, so it answered 404 and Google sign-in was as dead
+	// as the magic link.
+	google: async (event) => {
+		await signIn(authEventFor(event, { providerId: 'google', redirectTo: '/' }));
+	},
+
+	magiclink: async (event) => {
+		const formData = await event.request.formData();
 		const email = formData.get('email')?.toString() ?? '';
 
 		const validation = emailSchema.safeParse({ email });
@@ -31,7 +70,7 @@ export const actions: Actions = {
 			logAuditEvent({
 				type: 'magic_link_requested',
 				email,
-				ip: getClientAddress(),
+				ip: event.getClientAddress(),
 				error: `Rate limit exceeded - retry after ${rateLimit.retryAfter}s`,
 			});
 			return fail(429, {
@@ -44,27 +83,29 @@ export const actions: Actions = {
 		logAuditEvent({
 			type: 'magic_link_requested',
 			email,
-			ip: getClientAddress(),
+			ip: event.getClientAddress(),
 		});
 
 		try {
-			// signIn's declared type is SvelteKit's form-action `Action` (single
-			// RequestEvent arg), but @auth/sveltekit's runtime signIn accepts
-			// (provider, options) for programmatic sign-in. Cast to bridge the
-			// version-mismatch between @auth/core and @auth/sveltekit types.
-			await (signIn as unknown as (provider: string, options: Record<string, unknown>) => Promise<unknown>)(
-				'email',
-				{ email, callbackUrl: '/' }
-			);
-			return { success: true, email };
+			await signIn(authEventFor(event, { providerId: 'email', email, redirectTo: '/' }));
 		} catch (err) {
+			// A successful send EXITS THROUGH HERE: `signIn` reports success by throwing SvelteKit's
+			// redirect to `pages.verifyRequest`. Swallowing it — which the previous shape did — turns
+			// every delivered magic link into a 500 the user reads as "it didn't work". Let it fly.
+			if (isRedirect(err)) {
+				throw err;
+			}
 			logAuditEvent({
 				type: 'magic_link_failed',
 				email,
-				ip: getClientAddress(),
+				ip: event.getClientAddress(),
 				error: err instanceof Error ? err.message : 'Unknown error',
 			});
 			return fail(500, { error: 'Failed to send magic link', email });
 		}
+
+		// Unreachable in practice (signIn always redirects), but an action must return something and
+		// the page still honours this shape.
+		return { success: true, email };
 	},
 };
