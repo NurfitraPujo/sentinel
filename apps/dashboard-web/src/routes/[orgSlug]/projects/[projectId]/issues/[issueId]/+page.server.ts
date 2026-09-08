@@ -1,53 +1,19 @@
+import { redirect } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
-import { error } from '@sveltejs/kit';
-import { checkProjectAccess } from '$lib/server/projects';
-import { issueQueries } from '$lib/server/queries/issue-queries';
-import { getIssueRelations } from '$lib/db/queries/issues';
-import { getOrgRole } from '$lib/server/report-access';
 
-// D03: this route previously had no loader at all, so `data` was undefined and the page fell
-// through to hardcoded mock data (currentIssueId = 'ISSUE-123'). Every mutation then carried a
-// non-UUID id and failed at the DB layer — mirrors the working legacy loader at
-// src/routes/issues/[id]/+page.server.ts, but scoped under the org/project path and re-verifying
-// that the issue actually belongs to :projectId (a bare issueId lookup alone would let a caller
-// view any issue by guessing/crawling ids as long as they had access to SOME project).
-export const load: PageServerLoad = async ({ params, locals }) => {
-	const session = await locals.auth();
-	if (!session?.user?.id) {
-		throw error(401, 'Unauthorized');
-	}
-
-	const { projectId, issueId } = params;
-
-	const issue = await issueQueries.getIssueById(issueId);
-
-	if (!issue || issue.projectId !== projectId) {
-		throw error(404, 'Issue not found');
-	}
-
-	const isAuthorized = await checkProjectAccess(session.user.id, projectId, 'viewer');
-	if (!isAuthorized) {
-		throw error(403, 'Forbidden');
-	}
-
-	const project = await issueQueries.getProjectById(projectId);
-	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
-	const relations = await getIssueRelations(issueId);
-
-	// Manual Issues M3 (design §5): the thread mounts here too -- "discussion on service issues is
-	// the deliberate by-product" -- so the loader needs organizationId (for uploads) and the
-	// caller's org role (for the thread's owner/admin delete-others rule), same shape as the
-	// reports detail loader.
-	const organizationId = project?.organizationId ?? null;
-	const userRole = organizationId ? await getOrgRole(session.user.id, organizationId) : null;
-
-	return {
-		issue,
-		project: project ?? null,
-		occurrences,
-		relations,
-		organizationId,
-		userId: session.user.id,
-		userRole,
-	};
+// Issue detail existed at two URLs — this one and `/issues/[id]` — and only the latter was linked
+// from the UI. `/issues/[id]` is now the single canonical address (owner's call, 2026-09-08), so
+// this route no longer renders a second copy of the page.
+//
+// It is a REDIRECT rather than a deletion because `lib/server/notify.ts` put this path into
+// notification emails that have already been delivered. Deleting the route would 404 every
+// historical email link, which is not something a later change can undo. Emails minted from now on
+// carry `/issues/[id]`; this can be dropped once the old ones have aged out.
+//
+// Authorisation is deliberately NOT repeated here: the redirect target performs the real check
+// (routes/issues/[id]/+page.server.ts resolves the issue, then checkProjectAccess against the
+// project it actually belongs to). Answering identically for every id — rather than 403ing on one
+// and redirecting on another — also keeps this from reporting whether an id exists.
+export const load: PageServerLoad = async ({ params }) => {
+	redirect(308, `/issues/${params.issueId}`);
 };

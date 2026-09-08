@@ -4,7 +4,7 @@
 	// refresh, via the shared `startVisiblePolling` helper. Dropdown lists the latest ~10
 	// notifications (`GET /api/notifications?limit=10`); clicking a row marks it read and follows
 	// its link (built per `issue_type`, mirroring notify.ts's `buildIssueUrl` split -- `user_report`
-	// goes to `/reports/[issueId]`, everything else to `/projects/[projectId]/issues/[issueId]`).
+	// goes to `/[orgSlug]/reports/[issueId]`, everything else to the canonical `/issues/[id]`).
 	import { startVisiblePolling } from '$lib/utils/visible-poll';
 	import type { NotificationListItem } from '$lib/notifications/types';
 
@@ -39,7 +39,10 @@
 		if (item.issueType === 'user_report') {
 			return `/${item.orgSlug}/reports/${item.issueId}`;
 		}
-		return `/${item.orgSlug}/projects/${item.projectId}/issues/${item.issueId}`;
+		// Service issues live at the canonical /issues/[id]. The org-scoped path still resolves
+		// (it redirects there) so links in already-delivered notification emails keep working, but
+		// nothing new should be minted against it.
+		return `/issues/${item.issueId}`;
 	}
 
 	function actorLabel(item: NotificationListItem): string {
