@@ -23,8 +23,8 @@ message ErrorEvent {
       },
       {
         id: "error_event.environment"
-        message: "environment is required, must be lowercase alphanumeric, and must not exceed 50 characters"
-        expression: "this.environment.matches('^[a-z0-9]+$') && this.environment.size() <= 50"
+        message: "environment must match ^[a-z0-9][a-z0-9._-]{0,49}$ (lowercase alphanumeric, dot, underscore or hyphen; must start with a letter or digit; at most 50 characters)"
+        expression: "this.environment.matches('^[a-z0-9][a-z0-9._-]{0,49}$')"
       },
       {
         id: "error_event.message"

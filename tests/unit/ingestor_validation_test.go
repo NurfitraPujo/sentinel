@@ -128,19 +128,46 @@ func TestValidatePayload_PlatformFormat(t *testing.T) {
 	}
 }
 
+// TestValidatePayload_EnvironmentFormat covers sentinel-project-environments §4.8 / decision 10's
+// widened accepted set: ^[a-z0-9][a-z0-9._-]{0,49}$.
+//
+// The four accepted names are the ones the operator actually named, and they are here rather than as
+// generic "a hyphen works" cases because that is what the widening is FOR — `prod-env` passing tells
+// you a character class changed, `eu-west-1` passing tells you a real environment can now be
+// reported. The rejections keep the two ends of the pattern honest: the character set (uppercase,
+// non-ASCII) and the anchor (a leading separator).
+//
+// The direction is permissive, so nothing deployed breaks: ^[a-z0-9]+$ is a subset of the new
+// pattern, and `production` — every existing caller's value — is still accepted.
 func TestValidatePayload_EnvironmentFormat(t *testing.T) {
-	tests := []struct {
+	accepted := []string{"pre-prod", "eu-west-1", "staging-2", "prod_eu", "production", "a", "prod.eu"}
+	for _, env := range accepted {
+		t.Run("accepted/"+env, func(t *testing.T) {
+			p := validPayload()
+			p.Environment = env
+
+			result := validation.ValidatePayload(p)
+
+			assert.True(t, result.Valid, "expected %q to be accepted under decision 10's widened set", env)
+			assert.Empty(t, result.Errors)
+		})
+	}
+
+	rejected := []struct {
 		name string
 		env  string
 	}{
 		{name: "uppercase letters", env: "Production"},
-		{name: "underscore", env: "prod_env"},
-		{name: "hyphen", env: "prod-env"},
+		{name: "leading hyphen", env: "-prod"},
+		{name: "leading dot", env: ".prod"},
+		{name: "leading underscore", env: "_prod"},
 		{name: "non-ASCII", env: "pröd"},
+		{name: "space", env: "pre prod"},
+		{name: "slash", env: "eu/west"},
+		{name: "51 characters", env: strings.Repeat("a", 51)},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tt := range rejected {
+		t.Run("rejected/"+tt.name, func(t *testing.T) {
 			p := validPayload()
 			p.Environment = tt.env
 
@@ -149,6 +176,30 @@ func TestValidatePayload_EnvironmentFormat(t *testing.T) {
 			require.False(t, result.Valid)
 			require.Len(t, result.Errors, 1)
 			assert.Equal(t, "environment", result.Errors[0].Field)
+			assert.Contains(t, result.Errors[0].Message, "^[a-z0-9][a-z0-9._-]{0,49}$")
+		})
+	}
+}
+
+// TestValidatePayload_PlatformStillRejectsWidenedEnvironmentNames is the assertion §11 names as the
+// one that catches a widened-in-place isValidAlphanumeric.
+//
+// validator.go shares isValidAlphanumeric between payload.Platform and payload.Environment, and
+// `platform` has its own CEL rule (error_event.platform) that decision 10 does NOT change. Widening
+// the shared function would leave the Go check and the wire check disagreeing about what a platform
+// is — a split that surfaces months later as an event the ingestor accepted and protovalidate
+// rejected. The four names the environment rule now accepts must therefore still be rejected here.
+func TestValidatePayload_PlatformStillRejectsWidenedEnvironmentNames(t *testing.T) {
+	for _, platform := range []string{"pre-prod", "eu-west-1", "staging-2", "prod_eu"} {
+		t.Run(platform, func(t *testing.T) {
+			p := validPayload()
+			p.Platform = platform
+
+			result := validation.ValidatePayload(p)
+
+			require.False(t, result.Valid, "platform must NOT have been widened alongside environment")
+			require.Len(t, result.Errors, 1)
+			assert.Equal(t, "platform", result.Errors[0].Field)
 			assert.Contains(t, result.Errors[0].Message, "lowercase alphanumeric")
 		})
 	}

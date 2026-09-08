@@ -1,10 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { inArray } from 'drizzle-orm';
-import { db } from '$lib/server/db';
-import { projectEnvironments } from '$lib/db/schema';
-import { getAccessibleProjects } from '$lib/server/issue-access';
-import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
+import { resolveEnvironmentUnion } from '$lib/server/environment-union';
 import { requireOrgMembership } from '../organizations/[orgId]/keys/_shared';
 
 // GET /api/environments — sentinel-project-environments §4.3a, the cross-project union.
@@ -49,41 +45,18 @@ export const GET: RequestHandler = async ({ locals, url }) => {
 		}
 	}
 
-	const accessible = await getAccessibleProjects(userId, organizationId);
-	if (accessible.length === 0) {
-		return json({ environments: [] });
-	}
-
-	const [rows, scopes] = await Promise.all([
-		db
-			.select({
-				projectId: projectEnvironments.projectId,
-				name: projectEnvironments.name,
-				hidden: projectEnvironments.hidden,
-			})
-			.from(projectEnvironments)
-			.where(
-				inArray(
-					projectEnvironments.projectId,
-					accessible.map((p) => p.id)
-				)
-			),
-		resolveEnvironmentScopes(userId),
-	]);
-
-	const names = new Set<string>();
-	for (const row of rows) {
-		if (row.hidden) continue;
-		const scope = scopeForProject(scopes, row.projectId);
-		if (scope !== null && !scope.includes(row.name)) continue;
-		names.add(row.name);
-	}
+	// The union itself is $lib/server/environment-union.ts, because PUT /api/alerts's org-wide scope
+	// guard is the SAME question and §4.7 requires it to be the same call rather than a second
+	// derivation of the rule (decision 26). The two rules that are easy to invert — hidden excluded
+	// per project before de-duplication, and absent-from-the-scopes-map means unrestricted — live
+	// there with them.
+	const names = await resolveEnvironmentUnion(userId, organizationId);
 
 	// The raw name only. No id, no displayName, no isDefault, no timestamps — every one of those
 	// belongs to a (project_id, name) row, and two projects' `production` are two different rows
 	// with two different labels. Presenting one project's label for a union entry would be a lie
 	// the API tells for free.
 	return json({
-		environments: [...names].sort().map((name) => ({ name })),
+		environments: names.map((name) => ({ name })),
 	});
 };

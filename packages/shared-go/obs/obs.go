@@ -54,6 +54,38 @@ const (
 	// UUIDv4 instead of using the client's value verbatim (docs/plans/IDEMPOTENCY_PLAN.md D-a). Never
 	// records the id itself as a label (D15 cardinality rule) - only the fixed EventIDReason* below.
 	MetricIngestEventIDReplaced = "sentinel_ingest_event_id_replaced_total"
+
+	// The four sentinel-project-environments §12 instruments. They are declared here, beside the
+	// eight above, for the same B5 reason: infra's Prometheus rules (a THIRD repo — see decision 17)
+	// name these strings in their `expr`s, and the only defence against a rule that silently matches
+	// nothing is that exactly one place in this repo spells each name.
+	//
+	// None of them carries a label. `environment` is client-controlled and must never become one
+	// (obs/provider.go's unboundedMetricAttributes deny-filter exists for exactly this class), and
+	// project_id is unbounded for the reason the LabelOutcome block below already records.
+
+	// MetricUnregisteredEnvironmentEvents counts stored occurrences whose environment has no
+	// project_environments row (decision 9: the event is ACCEPTED and stored regardless — ingest
+	// never fails because of the registry). Sustained above zero means errors are landing in an
+	// environment nobody declared, so they are unfilterable, unlabelled and ungrantable.
+	MetricUnregisteredEnvironmentEvents = "sentinel_unregistered_environment_events_total"
+	// MetricEnvironmentRegistryTouchFailures counts failures of §4.8's
+	// `UPDATE project_environments SET last_seen_at = now() ...` touch. Above zero means
+	// first_seen_at/last_seen_at are drifting from reality and an admin cannot tell a live
+	// environment from a dead one.
+	MetricEnvironmentRegistryTouchFailures = "sentinel_environment_registry_touch_failures_total"
+	// MetricAlertsSuppressedByEnvironment counts occurrences that an alert config did NOT count
+	// toward its threshold because the occurrence's environment is outside the config's
+	// `environments` scope (§4.7). Its alert rule is "sustained zero WHILE
+	// MetricAlertConfigsEnvironmentScoped > 0" — i.e. scoping is configured and suppressing nothing,
+	// which is the only signal in the feature that catches it silently not being applied.
+	MetricAlertsSuppressedByEnvironment = "sentinel_alerts_suppressed_by_environment_total"
+	// MetricAlertConfigsEnvironmentScoped is a GAUGE, not a counter: the number of enabled
+	// alert_configs rows whose `environments` is non-NULL, set on every refreshConfigs pass
+	// (apps/processor-go/alerts/dispatcher.go). It alerts on nothing by itself — it exists solely as
+	// the predicate the rule above needs, because a flat-zero suppression counter is also what a
+	// correctly installed feature with nothing to do looks like.
+	MetricAlertConfigsEnvironmentScoped = "sentinel_alert_configs_environment_scoped"
 )
 
 // Label keys. Kept few and low-cardinality on purpose: project_id is unbounded and would blow up the
