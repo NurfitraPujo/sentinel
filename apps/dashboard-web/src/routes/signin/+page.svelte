@@ -26,7 +26,7 @@
 			</div>
 		{/if}
 
-		{#if form?.success}
+		{#if form?.success || data.linkSent}
 			<div class="alert success">
 				<p class="alert-title">Check your email</p>
 				<p class="alert-desc">A magic link has been dispatched to your email address.</p>
