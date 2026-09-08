@@ -110,90 +110,72 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="members-container min-h-screen bg-slate-950 text-slate-100 p-6">
-  <div class="max-w-6xl mx-auto">
-    <!-- Header -->
-    <div class="flex justify-between items-start border-b border-slate-800 pb-4 mb-6">
+<div class="members-page">
+  <div class="page-inner">
+    <div class="page-header">
       <div>
-        <h1 class="text-xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
-          <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <h1 class="page-title">
+          <svg class="title-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
           </svg>
           Organization Members
         </h1>
-        <p class="text-xs text-slate-400 mt-1">
+        <p class="page-subtitle">
           Manage team members, permissions, and roles within this organization.
         </p>
       </div>
-      <button
-        type="button"
-        on:click={() => (showInviteModal = true)}
-        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-md text-xs transition-colors flex items-center gap-1.5 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-      >
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <button type="button" on:click={() => (showInviteModal = true)} class="btn btn-primary">
+        <svg class="btn-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
         </svg>
         Invite Member
       </button>
     </div>
 
-    <!-- Toast Notification Banner -->
     {#if toastMessage}
-      <div
-        role="status"
-        aria-live="polite"
-        class={`mb-4 px-4 py-3 rounded-md text-xs font-medium border flex justify-between items-center ${toastType === 'error' ? 'bg-red-950/80 border-red-800 text-red-200' : 'bg-emerald-950/80 border-emerald-800 text-emerald-200'}`}
-      >
+      <div role="status" aria-live="polite" class="toast" class:toast-error={toastType === 'error'} class:toast-success={toastType !== 'error'}>
         <span>{toastMessage}</span>
-        <button
-          type="button"
-          on:click={() => (toastMessage = null)}
-          aria-label="Dismiss notification"
-          class="text-xs font-bold opacity-75 hover:opacity-100 p-1"
-        >
+        <button type="button" on:click={() => (toastMessage = null)} aria-label="Dismiss notification" class="toast-dismiss">
           ✕
         </button>
       </div>
     {/if}
 
-    <!-- Members Table -->
-    <div class="bg-slate-900 border border-slate-800 rounded-md overflow-hidden">
-      <div class="overflow-x-auto">
-        <table class="w-full text-left border-collapse">
+    <div class="table-card">
+      <div class="table-scroll">
+        <table class="members-table">
           <thead>
-            <tr class="bg-slate-900/90 border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400">
-              <th scope="col" class="py-3 px-4 font-semibold">User</th>
-              <th scope="col" class="py-3 px-4 font-semibold">Email</th>
-              <th scope="col" class="py-3 px-4 font-semibold">Role</th>
-              <th scope="col" class="py-3 px-4 text-right font-semibold">Actions</th>
+            <tr>
+              <th scope="col">User</th>
+              <th scope="col">Email</th>
+              <th scope="col">Role</th>
+              <th scope="col" class="align-right">Actions</th>
             </tr>
           </thead>
-          <tbody class="divide-y divide-slate-800/60 text-xs">
+          <tbody>
             {#each members as member}
-              <tr class="hover:bg-slate-800/40 transition-colors h-10">
-                <td class="py-2.5 px-4 font-medium text-slate-200">{member.user.name}</td>
-                <td class="py-2.5 px-4 font-mono text-slate-400 truncate max-w-[200px] md:max-w-[320px]">
-                  {member.user.email}
-                </td>
-                <td class="py-2.5 px-4">
+              <tr>
+                <td class="cell-name">{member.user.name}</td>
+                <td class="cell-email">{member.user.email}</td>
+                <td>
                   <select
                     value={member.role}
                     disabled={updatingMemberId === member.id}
                     aria-label={`Role for ${member.user.name}`}
                     on:change={(e) => handleRoleChange(member.id, e.currentTarget.value)}
-                    class="bg-slate-950 border border-slate-800 text-slate-200 font-mono text-xs rounded px-2.5 py-1 focus:outline-hidden focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
+                    class="role-select"
                   >
                     {#each roles as role}
                       <option value={role}>{role}</option>
                     {/each}
                   </select>
                 </td>
-                <td class="py-2.5 px-4 text-right">
+                <td class="align-right">
                   <button
                     type="button"
                     aria-label={`Revoke access for ${member.user.name}`}
                     on:click={() => promptRevokeAccess(member.id, member.user.name)}
-                    class="text-red-400 hover:text-red-300 font-medium text-xs transition-colors px-2 py-1 rounded hover:bg-red-950/40"
+                    class="link-danger"
                   >
                     Revoke Access
                   </button>
@@ -202,7 +184,7 @@
             {/each}
             {#if members.length === 0}
               <tr>
-                <td colspan="4" class="py-12 text-center text-xs text-slate-500 font-mono">
+                <td colspan="4" class="cell-empty">
                   No organization members found.
                 </td>
               </tr>
@@ -214,17 +196,15 @@
   </div>
 </div>
 
-<!-- Invite Member Modal -->
 <InviteMemberModal
   bind:show={showInviteModal}
   orgId={data.orgId}
   on:invited={handleInvited}
 />
 
-<!-- Revoke Confirmation Modal -->
 {#if revokingMember}
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80"
+    class="modal-backdrop"
     role="dialog"
     aria-modal="true"
     aria-labelledby="revoke-modal-title"
@@ -235,35 +215,25 @@
       if (e.key === 'Escape') revokingMember = null;
     }}
   >
-    <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-md p-5 text-slate-100 space-y-4">
-      <div class="flex items-center gap-3 text-red-400">
-        <svg class="w-6 h-6 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <div class="modal">
+      <div class="modal-head">
+        <svg class="modal-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
         </svg>
-        <h3 id="revoke-modal-title" class="text-sm font-semibold text-slate-100">Revoke Organization Access</h3>
+        <h3 id="revoke-modal-title" class="modal-title">Revoke Organization Access</h3>
       </div>
-      <p id="revoke-modal-desc" class="text-xs text-slate-300">
-        Are you sure you want to revoke access for <strong class="text-slate-100">{revokingMember.name}</strong>? They will lose access to all organization resources and projects immediately.
+      <p id="revoke-modal-desc" class="modal-body">
+        Are you sure you want to revoke access for <strong>{revokingMember.name}</strong>? They will lose access to all organization resources and projects immediately.
       </p>
-      <div class="flex justify-end gap-3 pt-2">
-        <button
-          type="button"
-          disabled={isRevoking}
-          on:click={() => (revokingMember = null)}
-          class="px-3 py-1.5 text-xs font-medium text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-50"
-        >
+      <div class="modal-actions">
+        <button type="button" disabled={isRevoking} on:click={() => (revokingMember = null)} class="btn btn-ghost">
           Cancel
         </button>
-        <button
-          type="button"
-          disabled={isRevoking}
-          on:click={confirmRevokeAccess}
-          class="px-3 py-1.5 text-xs font-semibold bg-red-600 hover:bg-red-500 text-white rounded transition-colors flex items-center gap-1.5 disabled:opacity-50"
-        >
+        <button type="button" disabled={isRevoking} on:click={confirmRevokeAccess} class="btn btn-danger">
           {#if isRevoking}
-            <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            <svg class="btn-icon spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"></circle>
+              <path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
             </svg>
             Revoking...
           {:else}
@@ -274,3 +244,292 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind.
+     The unconstrained `w-5 h-5` icons are why this page rendered with a full-width SVG. */
+  .members-page {
+    min-height: calc(100vh - 120px);
+    padding: 1.5rem 1rem;
+  }
+
+  .page-inner {
+    max-width: 72rem;
+    margin: 0 auto;
+  }
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .page-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.125rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  /* The whole point of the original `w-5 h-5`: without a size an inline SVG fills its container. */
+  .title-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    flex-shrink: 0;
+    color: var(--color-primary);
+  }
+
+  .page-subtitle {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-icon {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
+  }
+
+  .spin {
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .btn-primary {
+    background-color: var(--color-primary);
+    color: var(--text-primary);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-primary-hover);
+  }
+
+  .btn-ghost {
+    background: none;
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    color: var(--text-primary);
+  }
+
+  .btn-danger {
+    background-color: var(--severity-critical-text);
+    color: var(--text-primary);
+  }
+
+  .toast {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 500;
+    border: 1px solid transparent;
+  }
+
+  .toast-error {
+    background-color: var(--severity-critical-bg);
+    border-color: var(--severity-critical-border);
+    color: var(--severity-critical-text);
+  }
+
+  .toast-success {
+    background-color: var(--status-resolved-bg);
+    border-color: rgba(16, 185, 129, 0.3);
+    color: var(--status-resolved-text);
+  }
+
+  .toast-dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    font-weight: 700;
+    cursor: pointer;
+    opacity: 0.75;
+    padding: 0.25rem;
+  }
+
+  .toast-dismiss:hover {
+    opacity: 1;
+  }
+
+  .table-card {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+  }
+
+  .members-table {
+    width: 100%;
+    text-align: left;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+  }
+
+  .members-table thead tr {
+    background-color: var(--bg-root);
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .members-table th {
+    padding: 0.75rem 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .members-table td {
+    padding: 0.625rem 1rem;
+    border-top: 1px solid var(--border-color-muted);
+  }
+
+  .members-table tbody tr:hover {
+    background-color: var(--bg-surface-hover);
+  }
+
+  .align-right {
+    text-align: right;
+  }
+
+  .cell-name {
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .cell-email {
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cell-empty {
+    padding: 3rem 1rem;
+    text-align: center;
+    font-family: var(--font-mono);
+    color: var(--text-subtle);
+  }
+
+  .role-select {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.25rem 0.625rem;
+  }
+
+  .role-select:disabled {
+    opacity: 0.5;
+  }
+
+  .link-danger {
+    background: none;
+    border: none;
+    padding: 0.25rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--severity-critical-text);
+    cursor: pointer;
+  }
+
+  .link-danger:hover {
+    background-color: var(--severity-critical-bg);
+  }
+
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background-color: rgba(15, 23, 42, 0.8);
+  }
+
+  .modal {
+    width: 100%;
+    max-width: 24rem;
+    padding: 1.25rem;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+  }
+
+  .modal-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: var(--severity-critical-text);
+    margin-bottom: 1rem;
+  }
+
+  .modal-icon {
+    width: 1.5rem;
+    height: 1.5rem;
+    flex-shrink: 0;
+  }
+
+  .modal-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .modal-body {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.6;
+    margin-bottom: 1rem;
+  }
+
+  .modal-body strong {
+    color: var(--text-primary);
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+  }
+</style>

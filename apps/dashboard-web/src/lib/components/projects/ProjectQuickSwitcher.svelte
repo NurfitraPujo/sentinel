@@ -10,38 +10,112 @@
   }
 </script>
 
-<div class="relative inline-block text-left">
-  <button
-    type="button"
-    class="inline-flex items-center gap-x-2 rounded-md bg-gray-100 px-3 py-2 text-sm font-medium text-gray-900 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    on:click={toggle}
-  >
+<div class="switcher">
+  <button type="button" class="switcher-trigger" on:click={toggle}>
     {activeProject ? activeProject.name : 'Select Project'}
-    <span class="text-xs text-gray-500 ml-2 border border-gray-300 rounded px-1">⌘K</span>
+    <span class="kbd">⌘K</span>
   </button>
 
   {#if isOpen}
-    <div class="absolute left-0 z-10 mt-2 w-64 origin-top-left rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none">
-      <div class="p-2">
-        <input
-          type="text"
-          class="block w-full rounded-md border-0 py-1.5 text-gray-900 shadow-sm ring-1 ring-inset ring-gray-300 placeholder:text-gray-400 focus:ring-2 focus:ring-inset focus:ring-indigo-600 sm:text-sm sm:leading-6"
-          placeholder="Search projects..."
-        />
+    <div class="menu">
+      <div class="menu-search">
+        <input type="text" class="search-input" placeholder="Search projects..." />
       </div>
-      <div class="max-h-60 overflow-y-auto py-1">
+      <div class="menu-list">
         {#each projects as project}
-          <a
-            href="/{orgSlug}/{project.slug}"
-            class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
-          >
+          <a href="/{orgSlug}/{project.slug}" class="menu-item">
             {project.name}
           </a>
         {/each}
         {#if projects.length === 0}
-          <div class="px-4 py-2 text-sm text-gray-500">No projects found.</div>
+          <div class="menu-empty">No projects found.</div>
         {/if}
       </div>
     </div>
   {/if}
 </div>
+
+<style>
+  /* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind. */
+  .switcher {
+    position: relative;
+    display: inline-block;
+    text-align: left;
+  }
+
+  .switcher-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius-md);
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .switcher-trigger:hover {
+    background-color: var(--bg-surface-hover);
+  }
+
+  .kbd {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    padding: 0 0.25rem;
+    margin-left: 0.5rem;
+  }
+
+  .menu {
+    position: absolute;
+    left: 0;
+    z-index: 10;
+    margin-top: 0.5rem;
+    width: 16rem;
+    transform-origin: top left;
+    border-radius: var(--radius-md);
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  }
+
+  .menu-search {
+    padding: 0.5rem;
+  }
+
+  .search-input {
+    display: block;
+    width: 100%;
+    padding: 0.375rem 0.625rem;
+    font-size: 0.875rem;
+  }
+
+  .menu-list {
+    max-height: 15rem;
+    overflow-y: auto;
+    padding: 0.25rem 0;
+  }
+
+  .menu-item {
+    display: block;
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+
+  .menu-item:hover {
+    background-color: var(--bg-surface-hover);
+  }
+
+  .menu-empty {
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+  }
+</style>

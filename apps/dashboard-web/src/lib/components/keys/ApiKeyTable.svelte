@@ -64,48 +64,43 @@
 </script>
 
 <div class="api-key-table-container">
-	<!-- Active Keys Table -->
-	<table class="min-w-full divide-y divide-gray-800 bg-gray-900 text-gray-100 rounded-lg overflow-hidden">
-		<thead class="bg-gray-950/80 text-gray-400">
+	<table class="key-table">
+		<thead>
 			<tr>
-				<th class="px-6 py-3.5 text-left text-xs font-semibold uppercase tracking-wider">Name</th>
-				<th class="px-6 py-3.5 text-left text-xs font-semibold uppercase tracking-wider">Prefix</th>
-				<th class="px-6 py-3.5 text-left text-xs font-semibold uppercase tracking-wider">Scope</th>
-				<th class="px-6 py-3.5 text-left text-xs font-semibold uppercase tracking-wider">Target</th>
-				<th class="px-6 py-3.5 text-left text-xs font-semibold uppercase tracking-wider">Status</th>
-				<th class="px-6 py-3.5 text-right text-xs font-semibold uppercase tracking-wider">Actions</th>
+				<th>Name</th>
+				<th>Prefix</th>
+				<th>Scope</th>
+				<th>Target</th>
+				<th>Status</th>
+				<th class="align-right">Actions</th>
 			</tr>
 		</thead>
-		<tbody class="divide-y divide-gray-800/60 bg-gray-900">
+		<tbody>
 			{#each activeKeys as key}
-				<tr class="hover:bg-gray-800/40 transition-colors">
-					<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-100">{key.name}</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-emerald-400 font-mono tracking-wide">{key.keyPrefix || 'sent_'}••••</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm">
+				<tr>
+					<td class="cell-name">{key.name}</td>
+					<td class="cell-prefix">{key.keyPrefix || 'sent_'}••••</td>
+					<td>
 						{#each formatScopes(key) as sc}
-							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-950 text-emerald-300 border border-emerald-800/50 uppercase tracking-wider">
-								{sc}
-							</span>
+							<span class="pill pill-scope">{sc}</span>
 						{/each}
 					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
+					<td class="cell-muted">
 						{key.targetProject || (key.projectId ? key.projectId : 'All Projects [Org-Wide]')}
 					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm">
-						<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-900/40 text-emerald-400 border border-emerald-700/40">
-							Active
-						</span>
+					<td>
+						<span class="pill pill-active">Active</span>
 					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-						<button on:click={() => openRotateModal(key)} class="text-amber-400 hover:text-amber-300 mr-4 font-medium transition-colors">Rotate</button>
-						<button on:click={() => openRevokeModal(key)} class="text-rose-400 hover:text-rose-300 font-medium transition-colors">Revoke</button>
+					<td class="align-right">
+						<button on:click={() => openRotateModal(key)} class="link-action link-rotate">Rotate</button>
+						<button on:click={() => openRevokeModal(key)} class="link-action link-revoke">Revoke</button>
 					</td>
 				</tr>
 			{/each}
 
 			{#if activeKeys.length === 0}
 				<tr>
-					<td colspan="6" class="px-6 py-8 text-center text-sm text-gray-400 bg-gray-900/50">
+					<td colspan="6" class="cell-empty">
 						No API keys found. Click "Create API Key" to provision a new credential.
 					</td>
 				</tr>
@@ -113,38 +108,31 @@
 		</tbody>
 	</table>
 
-	<!-- Revoked Keys Collapsible Section -->
 	{#if revokedKeys.length > 0}
-		<div class="mt-6 border-t border-gray-800 pt-4">
-			<button 
-				type="button" 
-				on:click={() => showRevoked = !showRevoked}
-				class="flex items-center justify-between w-full text-left px-2 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition-colors"
-			>
+		<div class="revoked-section">
+			<button type="button" on:click={() => showRevoked = !showRevoked} class="revoked-toggle">
 				<span>Revoked Keys ({revokedKeys.length})</span>
-				<span class="text-xs">{showRevoked ? '▲ Hide' : '▼ Show'}</span>
+				<span class="revoked-toggle-hint">{showRevoked ? '▲ Hide' : '▼ Show'}</span>
 			</button>
 
 			{#if showRevoked}
-				<table class="min-w-full divide-y divide-gray-800 bg-gray-950/60 text-gray-400 rounded-lg overflow-hidden mt-2 border border-gray-800">
-					<thead class="bg-gray-950 text-gray-500">
+				<table class="key-table key-table-revoked">
+					<thead>
 						<tr>
-							<th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Name</th>
-							<th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Prefix</th>
-							<th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Scope</th>
-							<th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Status</th>
+							<th>Name</th>
+							<th>Prefix</th>
+							<th>Scope</th>
+							<th>Status</th>
 						</tr>
 					</thead>
-					<tbody class="divide-y divide-gray-800/40">
+					<tbody>
 						{#each revokedKeys as key}
-							<tr class="opacity-60">
-								<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-400 line-through">{key.name}</td>
-								<td class="px-6 py-3 whitespace-nowrap text-sm font-mono text-gray-500">{key.keyPrefix || 'sent_'}••••</td>
-								<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-500">{formatScopes(key).join(', ')}</td>
-								<td class="px-6 py-3 whitespace-nowrap text-sm">
-									<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-950 text-red-400 border border-red-900/40">
-										Revoked
-									</span>
+							<tr class="row-revoked">
+								<td class="cell-struck">{key.name}</td>
+								<td class="cell-prefix cell-prefix-muted">{key.keyPrefix || 'sent_'}••••</td>
+								<td class="cell-muted">{formatScopes(key).join(', ')}</td>
+								<td>
+									<span class="pill pill-revoked">Revoked</span>
 								</td>
 							</tr>
 						{/each}
@@ -155,42 +143,31 @@
 	{/if}
 </div>
 
-<!-- Rotate Confirmation Modal (Two-Step Impact Preview) -->
 {#if confirmRotateId && confirmRotateKey}
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm">
-	<div class="bg-gray-900 border border-amber-500/30 rounded-xl shadow-2xl w-full max-w-lg p-6 text-gray-100">
-		<div class="flex items-center gap-3 mb-4">
-			<div class="p-2 bg-amber-950 border border-amber-700/50 rounded-lg text-amber-400">
-				⚠️
-			</div>
+<div class="modal-backdrop">
+	<div class="modal modal-warn">
+		<div class="modal-head">
+			<div class="modal-icon modal-icon-warn">⚠️</div>
 			<div>
-				<h3 class="text-lg font-semibold text-amber-200">Confirm API Key Rotation</h3>
-				<p class="text-xs text-gray-400">Target Key: <span class="font-mono text-amber-300">{confirmRotateKey.name}</span></p>
+				<h3 class="modal-title modal-title-warn">Confirm API Key Rotation</h3>
+				<p class="modal-subtitle">Target Key: <span class="mono">{confirmRotateKey.name}</span></p>
 			</div>
 		</div>
 
-		<div class="bg-amber-950/40 border border-amber-800/40 rounded-lg p-4 mb-5 text-xs text-amber-200/90 leading-relaxed space-y-2">
+		<div class="modal-note modal-note-warn">
 			<p><strong>Security Impact Preview:</strong></p>
-			<ul class="list-disc list-inside space-y-1 text-gray-300">
+			<ul>
 				<li>The old key secret will be <strong>revoked immediately</strong> via NATS cache invalidation.</li>
 				<li>Services currently using this key will experience authentication failures until updated.</li>
 				<li>A new secret token will be generated and displayed <strong>only once</strong>.</li>
 			</ul>
 		</div>
 
-		<div class="flex justify-end gap-3">
-			<button 
-				type="button" 
-				on:click={() => { confirmRotateId = null; confirmRotateKey = null; }}
-				class="px-4 py-2 bg-gray-800 text-gray-300 hover:bg-gray-700 rounded-lg text-xs font-medium transition-colors"
-			>
+		<div class="modal-actions">
+			<button type="button" on:click={() => { confirmRotateId = null; confirmRotateKey = null; }} class="btn btn-cancel">
 				Cancel
 			</button>
-			<button 
-				type="button" 
-				on:click={executeRotate}
-				class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-gray-950 font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-amber-950/50"
-			>
+			<button type="button" on:click={executeRotate} class="btn btn-warn">
 				Confirm Rotation
 			</button>
 		</div>
@@ -198,45 +175,348 @@
 </div>
 {/if}
 
-<!-- Revoke Confirmation Modal (Two-Step Impact Preview) -->
 {#if confirmRevokeId && confirmRevokeKey}
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm">
-	<div class="bg-gray-900 border border-rose-500/30 rounded-xl shadow-2xl w-full max-w-lg p-6 text-gray-100">
-		<div class="flex items-center gap-3 mb-4">
-			<div class="p-2 bg-rose-950 border border-rose-700/50 rounded-lg text-rose-400">
-				🚨
-			</div>
+<div class="modal-backdrop">
+	<div class="modal modal-danger">
+		<div class="modal-head">
+			<div class="modal-icon modal-icon-danger">🚨</div>
 			<div>
-				<h3 class="text-lg font-semibold text-rose-200">Confirm API Key Revocation</h3>
-				<p class="text-xs text-gray-400">Target Key: <span class="font-mono text-rose-300">{confirmRevokeKey.name}</span></p>
+				<h3 class="modal-title modal-title-danger">Confirm API Key Revocation</h3>
+				<p class="modal-subtitle">Target Key: <span class="mono">{confirmRevokeKey.name}</span></p>
 			</div>
 		</div>
 
-		<div class="bg-rose-950/40 border border-rose-800/40 rounded-lg p-4 mb-5 text-xs text-rose-200/90 leading-relaxed space-y-2">
+		<div class="modal-note modal-note-danger">
 			<p><strong>Permanent Action Warning:</strong></p>
-			<ul class="list-disc list-inside space-y-1 text-gray-300">
+			<ul>
 				<li>This API key will be permanently invalidated across all ingestor nodes.</li>
 				<li>All future events tagged with this key will be rejected.</li>
 				<li>This action cannot be undone.</li>
 			</ul>
 		</div>
 
-		<div class="flex justify-end gap-3">
-			<button 
-				type="button" 
-				on:click={() => { confirmRevokeId = null; confirmRevokeKey = null; }}
-				class="px-4 py-2 bg-gray-800 text-gray-300 hover:bg-gray-700 rounded-lg text-xs font-medium transition-colors"
-			>
+		<div class="modal-actions">
+			<button type="button" on:click={() => { confirmRevokeId = null; confirmRevokeKey = null; }} class="btn btn-cancel">
 				Cancel
 			</button>
-			<button 
-				type="button" 
-				on:click={executeRevoke}
-				class="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-rose-950/50"
-			>
+			<button type="button" on:click={executeRevoke} class="btn btn-danger">
 				Revoke Key
 			</button>
 		</div>
 	</div>
 </div>
 {/if}
+
+<style>
+	/* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind
+	   (no config, no dependency, none in the lockfile, none in git history). The tokens below are
+	   app.css's; the previous slate/emerald/amber literals were Tailwind palette names that
+	   happened to match some of them. */
+	.api-key-table-container {
+		width: 100%;
+	}
+
+	.key-table {
+		width: 100%;
+		border-collapse: collapse;
+		background-color: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		overflow: hidden;
+		font-size: 0.875rem;
+	}
+
+	.key-table thead {
+		background-color: var(--bg-root);
+	}
+
+	.key-table th {
+		padding: 0.75rem 1rem;
+		text-align: left;
+		font-size: 0.6875rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-muted);
+		white-space: nowrap;
+	}
+
+	.key-table td {
+		padding: 0.875rem 1rem;
+		white-space: nowrap;
+		border-top: 1px solid var(--border-color-muted);
+	}
+
+	.key-table tbody tr:hover {
+		background-color: var(--bg-surface-hover);
+	}
+
+	.align-right {
+		text-align: right;
+	}
+
+	.cell-name {
+		font-weight: 500;
+		color: var(--text-primary);
+	}
+
+	.cell-muted {
+		color: var(--text-muted);
+	}
+
+	.cell-prefix {
+		font-family: var(--font-mono);
+		color: var(--status-resolved-text);
+		letter-spacing: 0.03em;
+	}
+
+	.cell-prefix-muted {
+		color: var(--text-subtle);
+	}
+
+	.cell-struck {
+		color: var(--text-muted);
+		text-decoration: line-through;
+	}
+
+	.cell-empty {
+		padding: 2rem 1rem;
+		text-align: center;
+		color: var(--text-muted);
+	}
+
+	.pill {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.125rem 0.625rem;
+		border-radius: 999px;
+		font-size: 0.6875rem;
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.pill + .pill {
+		margin-left: 0.25rem;
+	}
+
+	.pill-scope,
+	.pill-active {
+		background-color: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
+		border: 1px solid rgba(16, 185, 129, 0.3);
+	}
+
+	.pill-active {
+		text-transform: none;
+		letter-spacing: normal;
+	}
+
+	.pill-revoked {
+		background-color: var(--severity-critical-bg);
+		color: var(--severity-critical-text);
+		border: 1px solid var(--severity-critical-border);
+		text-transform: none;
+		letter-spacing: normal;
+	}
+
+	.link-action {
+		background: none;
+		border: none;
+		padding: 0;
+		font-size: 0.875rem;
+		font-weight: 500;
+		cursor: pointer;
+	}
+
+	.link-action + .link-action {
+		margin-left: 1rem;
+	}
+
+	.link-rotate {
+		color: var(--status-open-text);
+	}
+
+	.link-revoke {
+		color: var(--severity-critical-text);
+	}
+
+	.link-action:hover {
+		text-decoration: underline;
+	}
+
+	.revoked-section {
+		margin-top: 1.5rem;
+		border-top: 1px solid var(--border-color);
+		padding-top: 1rem;
+	}
+
+	.revoked-toggle {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
+		padding: 0.5rem;
+		background: none;
+		border: none;
+		color: var(--text-muted);
+		font-size: 0.875rem;
+		font-weight: 500;
+		cursor: pointer;
+	}
+
+	.revoked-toggle:hover {
+		color: var(--text-primary);
+	}
+
+	.revoked-toggle-hint {
+		font-size: 0.75rem;
+	}
+
+	.key-table-revoked {
+		margin-top: 0.5rem;
+		background-color: var(--bg-root);
+	}
+
+	.row-revoked {
+		opacity: 0.6;
+	}
+
+	.modal-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background-color: rgba(0, 0, 0, 0.75);
+		padding: 1rem;
+	}
+
+	.modal {
+		width: 100%;
+		max-width: 32rem;
+		padding: 1.5rem;
+		background-color: var(--bg-surface);
+		border-radius: var(--radius-lg);
+		box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+		color: var(--text-primary);
+	}
+
+	.modal-warn {
+		border: 1px solid rgba(245, 158, 11, 0.3);
+	}
+
+	.modal-danger {
+		border: 1px solid var(--severity-critical-border);
+	}
+
+	.modal-head {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 1rem;
+	}
+
+	.modal-icon {
+		padding: 0.5rem;
+		border-radius: var(--radius-md);
+		line-height: 1;
+	}
+
+	.modal-icon-warn {
+		background-color: var(--status-open-bg);
+		border: 1px solid rgba(245, 158, 11, 0.3);
+	}
+
+	.modal-icon-danger {
+		background-color: var(--severity-critical-bg);
+		border: 1px solid var(--severity-critical-border);
+	}
+
+	.modal-title {
+		font-size: 1.0625rem;
+		font-weight: 600;
+	}
+
+	.modal-title-warn {
+		color: var(--status-open-text);
+	}
+
+	.modal-title-danger {
+		color: var(--severity-critical-text);
+	}
+
+	.modal-subtitle {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+	}
+
+	.mono {
+		font-family: var(--font-mono);
+	}
+
+	.modal-note {
+		border-radius: var(--radius-md);
+		padding: 1rem;
+		margin-bottom: 1.25rem;
+		font-size: 0.75rem;
+		line-height: 1.6;
+	}
+
+	.modal-note-warn {
+		background-color: var(--status-open-bg);
+		border: 1px solid rgba(245, 158, 11, 0.3);
+	}
+
+	.modal-note-danger {
+		background-color: var(--severity-critical-bg);
+		border: 1px solid var(--severity-critical-border);
+	}
+
+	.modal-note ul {
+		margin: 0.5rem 0 0;
+		padding-left: 1.25rem;
+		color: var(--text-primary);
+	}
+
+	.modal-note li + li {
+		margin-top: 0.25rem;
+	}
+
+	.modal-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 0.75rem;
+	}
+
+	.btn {
+		padding: 0.5rem 1rem;
+		border-radius: var(--radius-md);
+		font-size: 0.75rem;
+		font-weight: 500;
+		border: none;
+		cursor: pointer;
+	}
+
+	.btn-cancel {
+		background-color: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.btn-warn {
+		background-color: var(--status-open-text);
+		color: var(--bg-root);
+		font-weight: 600;
+	}
+
+	.btn-danger {
+		background-color: var(--severity-critical-text);
+		color: var(--text-primary);
+		font-weight: 600;
+	}
+
+	.btn:hover {
+		opacity: 0.9;
+	}
+</style>

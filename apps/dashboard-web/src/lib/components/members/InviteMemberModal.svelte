@@ -95,7 +95,7 @@
 
 {#if show}
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80"
+    class="modal-backdrop"
     role="dialog"
     aria-modal="true"
     aria-labelledby="invite-modal-title"
@@ -105,56 +105,45 @@
       if (e.key === 'Escape') handleClose();
     }}
   >
-    <div
-      class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-md p-6 text-slate-100"
-    >
-      <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-4">
-        <h2 id="invite-modal-title" class="text-base font-semibold text-slate-100 flex items-center gap-2">
-          <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="invite-modal-title" class="modal-title">
+          <svg class="title-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
           </svg>
           Invite Team Member
         </h2>
-        <button
-          type="button"
-          on:click={handleClose}
-          class="text-slate-400 hover:text-slate-200 transition-colors p-1 rounded focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-          aria-label="Close modal"
-        >
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <button type="button" on:click={handleClose} class="modal-close" aria-label="Close modal">
+          <svg class="close-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
           </svg>
         </button>
       </div>
 
       {#if invitationSent}
-        <div class="space-y-4">
-          <div class="p-3 bg-emerald-950/40 border border-emerald-500/30 rounded-md text-sm text-emerald-300">
+        <div class="stack">
+          <div class="notice notice-success">
             Invitation created for <strong>{email}</strong>. We've sent them an email with a link to
             accept it. If they don't receive it, they can be re-invited from this org's outstanding
             invitations list.
           </div>
 
-          <div class="pt-4 border-t border-slate-800 flex justify-end">
-            <button
-              type="button"
-              on:click={handleClose}
-              class="px-4 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded border border-slate-700 transition-colors"
-            >
+          <div class="modal-actions">
+            <button type="button" on:click={handleClose} class="btn btn-secondary">
               Done
             </button>
           </div>
         </div>
       {:else}
-        <form on:submit|preventDefault={handleSubmit} class="space-y-4">
+        <form on:submit|preventDefault={handleSubmit} class="stack">
           {#if errorMessage}
-            <div class="p-3 bg-red-950/50 border border-red-500/40 rounded-md text-xs text-red-300">
+            <div class="notice notice-error">
               {errorMessage}
             </div>
           {/if}
 
           <div>
-            <label for="invite-email" class="block text-xs font-mono uppercase text-slate-400 mb-1">
+            <label for="invite-email" class="field-label">
               Email Address
             </label>
             <input
@@ -164,43 +153,30 @@
               bind:value={email}
               required
               placeholder="colleague@company.com"
-              class="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-hidden focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              class="field-input"
             />
           </div>
 
           <div>
-            <label for="invite-role" class="block text-xs font-mono uppercase text-slate-400 mb-1">
+            <label for="invite-role" class="field-label">
               Organization Role
             </label>
-            <select
-              id="invite-role"
-              bind:value={selectedRole}
-              class="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 focus:outline-hidden focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            >
+            <select id="invite-role" bind:value={selectedRole} class="field-input">
               {#each roles as role}
                 <option value={role.value}>{role.label}</option>
               {/each}
             </select>
           </div>
 
-          <div class="pt-4 border-t border-slate-800 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              on:click={handleClose}
-              disabled={loading}
-              class="px-4 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-50"
-            >
+          <div class="modal-actions">
+            <button type="button" on:click={handleClose} disabled={loading} class="btn btn-ghost">
               Cancel
             </button>
-            <button
-              type="submit"
-              disabled={loading}
-              class="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors flex items-center gap-2 focus:outline-hidden focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-            >
+            <button type="submit" disabled={loading} class="btn btn-primary">
               {#if loading}
-                <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                <svg class="btn-icon spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"></circle>
+                  <path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
                 Creating...
               {:else}
@@ -213,3 +189,175 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind. */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background-color: rgba(15, 23, 42, 0.8);
+  }
+
+  .modal {
+    width: 100%;
+    max-width: 28rem;
+    padding: 1.5rem;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+  }
+
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .modal-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .title-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    flex-shrink: 0;
+    color: var(--color-primary);
+  }
+
+  .modal-close {
+    background: none;
+    border: none;
+    padding: 0.25rem;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .modal-close:hover {
+    color: var(--text-primary);
+  }
+
+  .close-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    display: block;
+  }
+
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .notice {
+    padding: 0.75rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+
+  .notice-success {
+    background-color: var(--status-resolved-bg);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: var(--status-resolved-text);
+  }
+
+  .notice-error {
+    background-color: var(--severity-critical-bg);
+    border: 1px solid var(--severity-critical-border);
+    color: var(--severity-critical-text);
+    font-size: 0.75rem;
+  }
+
+  .field-label {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+  }
+
+  .field-input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+  }
+
+  .modal-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border-color);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-icon {
+    width: 0.875rem;
+    height: 0.875rem;
+  }
+
+  .spin {
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .btn-primary {
+    background-color: var(--color-primary);
+    color: var(--text-primary);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-primary-hover);
+  }
+
+  .btn-secondary {
+    background-color: var(--bg-surface-hover);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    font-weight: 500;
+  }
+
+  .btn-ghost {
+    background: none;
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    color: var(--text-primary);
+  }
+</style>

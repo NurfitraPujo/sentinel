@@ -133,75 +133,52 @@
 	}
 </script>
 
-<div class="keys-container min-h-screen bg-gray-950 text-gray-100 p-6">
-	<div class="max-w-6xl mx-auto">
-		<!-- Page Header -->
-		<div class="flex justify-between items-start border-b border-gray-800 pb-4 mb-6">
+<div class="keys-page">
+	<div class="page-inner">
+		<div class="page-header">
 			<div>
-				<div class="flex items-center gap-2 mb-1">
-					<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-950 text-indigo-300 border border-indigo-800/60 uppercase tracking-wider">
-						Project: {data.projectName}
-					</span>
-				</div>
-				<h1 class="text-xl font-bold tracking-tight text-gray-100">Project API Keys</h1>
-				<p class="text-xs text-gray-400 mt-1">
-					Manage secret API keys scoped specifically to project <code class="text-emerald-400 bg-gray-900 px-1.5 py-0.5 rounded border border-gray-800">{data.projectName}</code>.
+				<h1 class="page-title">Project API Keys</h1>
+				<p class="page-subtitle">
+					Manage secret API keys scoped specifically to project <code>{data.projectName}</code>.
 				</p>
 			</div>
-			<button 
-				on:click={() => isModalOpen = true} 
-				class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-emerald-950/40"
-			>
+			<button on:click={() => isModalOpen = true} class="btn btn-primary">
 				+ Create Project API Key
 			</button>
 		</div>
 
-		<!-- Toast Notification Banner -->
 		{#if toastMessage}
-			<div class={`mb-4 px-4 py-3 rounded-lg text-xs font-medium border flex justify-between items-center ${toastType === 'error' ? 'bg-rose-950/80 border-rose-800 text-rose-200' : 'bg-emerald-950/80 border-emerald-800 text-emerald-200'}`}>
+			<div class="toast" class:toast-error={toastType === 'error'} class:toast-success={toastType !== 'error'}>
 				<span>{toastMessage}</span>
-				<button on:click={() => toastMessage = null} class="text-xs font-bold opacity-75 hover:opacity-100">✕</button>
+				<button on:click={() => toastMessage = null} class="toast-dismiss" aria-label="Dismiss">✕</button>
 			</div>
 		{/if}
 
-		<!-- Single-Exposure Raw Secret Token Alert Tray -->
 		{#if newlyCreatedToken}
-			<div class="mb-6 bg-amber-950/60 border-2 border-amber-500/80 rounded-xl p-5 shadow-2xl relative">
-				<div class="flex items-start justify-between">
-					<div class="space-y-1">
-						<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-amber-500 text-gray-950 uppercase tracking-wider">
-							Save Secret Token Now
-						</span>
-						<h3 class="text-sm font-semibold text-amber-200">Single-Exposure Project API Key Secret</h3>
-						<p class="text-xs text-amber-300/80">
-							This secret token will <strong>never be shown again</strong>. Store it securely in your project configuration.
+			<div class="secret-tray">
+				<div class="secret-tray-head">
+					<div>
+						<span class="secret-badge">Save Secret Token Now</span>
+						<h3 class="secret-title">Single-Exposure API Key Secret</h3>
+						<p class="secret-desc">
+							This secret token will <strong>never be shown again</strong>. Store it securely in your secret manager or environment variables.
 						</p>
 					</div>
-					<button 
-						on:click={() => newlyCreatedToken = null}
-						class="text-amber-400 hover:text-amber-200 text-sm font-bold p-1"
-						title="Dismiss secret banner"
-					>
+					<button on:click={() => newlyCreatedToken = null} class="secret-dismiss" title="Dismiss secret banner" aria-label="Dismiss secret banner">
 						✕
 					</button>
 				</div>
 
-				<div class="mt-4 flex items-center gap-3">
-					<div class="flex-1 bg-gray-950 border border-amber-700/50 rounded-lg px-4 py-2.5 font-mono text-sm text-emerald-400 select-all tracking-wide break-all">
-						{newlyCreatedToken}
-					</div>
-					<button 
-						on:click={() => copyToClipboard(newlyCreatedToken!)}
-						class="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-gray-950 font-bold rounded-lg text-xs transition-colors shrink-0 flex items-center gap-1.5"
-					>
+				<div class="secret-row">
+					<div class="secret-value">{newlyCreatedToken}</div>
+					<button on:click={() => copyToClipboard(newlyCreatedToken!)} class="btn btn-copy">
 						{copiedToken ? '✓ Copied' : 'Copy Secret'}
 					</button>
 				</div>
 			</div>
 		{/if}
 
-		<!-- Key Inventory Table -->
-		<div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
+		<div class="table-card">
 			<ApiKeyTable {keys} on:rotate={handleRotate} on:revoke={handleRevoke} />
 		</div>
 	</div>
@@ -214,3 +191,196 @@
 	allowOrgWide={false}
 	on:create={handleCreate}
 />
+
+<style>
+	/* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind. */
+	.keys-page {
+		min-height: calc(100vh - 120px);
+		padding: 1.5rem 1rem;
+	}
+
+	.page-inner {
+		max-width: 72rem;
+		margin: 0 auto;
+	}
+
+	.page-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		gap: 1rem;
+		border-bottom: 1px solid var(--border-color);
+		padding-bottom: 1rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.page-title {
+		font-size: 1.125rem;
+		font-weight: 700;
+		color: var(--text-primary);
+	}
+
+	.page-subtitle {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		margin-top: 0.25rem;
+		line-height: 1.6;
+	}
+
+	.page-subtitle code {
+		font-family: var(--font-mono);
+		color: var(--status-resolved-text);
+		background-color: var(--bg-root);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.0625rem 0.375rem;
+	}
+
+	.btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.5rem 1rem;
+		border-radius: var(--radius-md);
+		font-size: 0.75rem;
+		font-weight: 600;
+		border: none;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+
+	.btn-primary {
+		background-color: var(--status-resolved-text);
+		color: var(--bg-root);
+	}
+
+	.btn-primary:hover {
+		opacity: 0.9;
+	}
+
+	.toast {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 1rem;
+		margin-bottom: 1rem;
+		padding: 0.75rem 1rem;
+		border-radius: var(--radius-md);
+		font-size: 0.75rem;
+		font-weight: 500;
+		border: 1px solid transparent;
+	}
+
+	.toast-error {
+		background-color: var(--severity-critical-bg);
+		border-color: var(--severity-critical-border);
+		color: var(--severity-critical-text);
+	}
+
+	.toast-success {
+		background-color: var(--status-resolved-bg);
+		border-color: rgba(16, 185, 129, 0.3);
+		color: var(--status-resolved-text);
+	}
+
+	.toast-dismiss {
+		background: none;
+		border: none;
+		color: inherit;
+		font-weight: 700;
+		cursor: pointer;
+		opacity: 0.75;
+	}
+
+	.toast-dismiss:hover {
+		opacity: 1;
+	}
+
+	/* The one-time secret. Loud on purpose: it is the only time this value is ever shown. */
+	.secret-tray {
+		margin-bottom: 1.5rem;
+		background-color: var(--status-open-bg);
+		border: 2px solid var(--status-open-text);
+		border-radius: var(--radius-lg);
+		padding: 1.25rem;
+	}
+
+	.secret-tray-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 1rem;
+	}
+
+	.secret-badge {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.125rem 0.5rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.625rem;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		background-color: var(--status-open-text);
+		color: var(--bg-root);
+	}
+
+	.secret-title {
+		font-size: 0.875rem;
+		font-weight: 600;
+		color: var(--status-open-text);
+		margin-top: 0.25rem;
+	}
+
+	.secret-desc {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		margin-top: 0.25rem;
+		line-height: 1.5;
+	}
+
+	.secret-dismiss {
+		background: none;
+		border: none;
+		color: var(--status-open-text);
+		font-size: 0.875rem;
+		font-weight: 700;
+		cursor: pointer;
+		padding: 0.25rem;
+	}
+
+	.secret-row {
+		margin-top: 1rem;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+
+	.secret-value {
+		flex: 1;
+		background-color: var(--bg-root);
+		border: 1px solid rgba(245, 158, 11, 0.5);
+		border-radius: var(--radius-md);
+		padding: 0.625rem 1rem;
+		font-family: var(--font-mono);
+		font-size: 0.875rem;
+		color: var(--status-resolved-text);
+		user-select: all;
+		word-break: break-all;
+	}
+
+	.btn-copy {
+		background-color: var(--status-open-text);
+		color: var(--bg-root);
+		font-weight: 700;
+		padding: 0.625rem 1rem;
+		flex-shrink: 0;
+	}
+
+	.table-card {
+		background-color: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-lg);
+		overflow: hidden;
+	}
+</style>
