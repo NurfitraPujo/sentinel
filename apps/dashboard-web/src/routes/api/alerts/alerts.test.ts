@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { error } from '@sveltejs/kit';
 
 // A chainable Drizzle-query double, mirroring src/routes/api/organizations/keys.test.ts's approach:
 // select/insert/update/delete chains all resolve through the same queued `then` implementation, so
@@ -71,7 +72,8 @@ vi.mock('$lib/server/auth', () => ({
 	requireAuth: vi.fn(async ({ locals }: any) => {
 		const session = await locals.auth?.();
 		if (!session?.user?.id) {
-			throw new Error('Authentication required');
+			// Mirrors the real requireAuth: SvelteKit's HttpError, not a bare Error.
+			error(401, 'Authentication required');
 		}
 		return { id: session.user.id, email: 'user@example.com' };
 	}),
