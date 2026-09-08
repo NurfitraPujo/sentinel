@@ -13,6 +13,14 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	
 	const userAccess = await getUserProjectAccess(user.id);
 	const authorizedProjectIds = userAccess.map(a => a.projectId);
+
+	// A user who has just signed in for the first time has no organization and no project, so this
+	// page could only ever render an empty list with no way to act on it. Send them to the one
+	// place that can fix that. Only when they have NOTHING — a member of a project with no issues
+	// yet still gets the real (empty) dashboard.
+	if (authorizedProjectIds.length === 0) {
+		redirect(303, '/onboarding');
+	}
 	
 	const statusFilter = url.searchParams.get('status') ?? 'all';
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';

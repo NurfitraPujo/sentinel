@@ -39,6 +39,7 @@ const EXPECTED_RESERVED_ROUTES = [
 	'support',
 	'signin',
 	'invitations',
+	'onboarding',
 ];
 
 // The dynamic segment that IS the org-slug catch-all, by design.

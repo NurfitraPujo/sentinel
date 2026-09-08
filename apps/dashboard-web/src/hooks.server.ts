@@ -128,6 +128,9 @@ export const orgHandle = async ({ event, resolve }: any) => {
 		'support',
 		'signin',
 		'invitations',
+		// Without this, orgHandle reads 'onboarding' as an organization slug, finds no membership
+		// and 403s — locking out exactly the users the onboarding page exists to serve.
+		'onboarding',
 	];
 	let orgSlugFromUrl = null;
 
