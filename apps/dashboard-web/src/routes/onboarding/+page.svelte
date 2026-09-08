@@ -56,7 +56,7 @@
 			>
 				<label class="field">
 					<span class="field-label">Project name</span>
-					<input name="name" placeholder="Web app" required maxlength="255" class="input" />
+					<input type="text" name="name" placeholder="Web app" required maxlength="255" class="input" />
 				</label>
 				<button type="submit" disabled={loading} class="btn btn-primary btn-full">
 					{loading ? 'Creating…' : 'Create project'}
@@ -78,6 +78,7 @@
 				<label class="field">
 					<span class="field-label">Organization name</span>
 					<input
+						type="text"
 						name="name"
 						bind:value={name}
 						placeholder="Acme Engineering"
@@ -90,6 +91,7 @@
 				<label class="field">
 					<span class="field-label">URL slug</span>
 					<input
+						type="text"
 						name="slug"
 						bind:value={slug}
 						on:input={() => (slugTouched = true)}
