@@ -7,6 +7,7 @@ import {
 	type ReportSeverity,
 } from '$lib/db/queries/reports';
 import { getReporterId, getOrgRole, requireReportAccess } from '$lib/server/report-access';
+import { requireIssueAccessAnyType } from '$lib/server/issue-access-dispatch';
 import { bestEffortDeleteObjects } from '$lib/server/retention';
 import { listIssueAttachments, resolveReportEnvironment } from '$lib/db/queries/reports';
 import { readTriage, type TriageResult } from '$lib/server/triage';
@@ -44,6 +45,28 @@ async function loadReportOrNotFound(orgId: string, issueId: string) {
 		throw error(404, 'Report not found');
 	}
 	return detail;
+}
+
+/**
+ * sentinel-project-environments §2.2 — the environment dimension, on all three handlers of this
+ * route.
+ *
+ * §2.2's guard table names `issue-access-dispatch.ts: requireIssueAccessAnyType` as the guard point
+ * for reports and claims it covers `api/organizations/[orgId]/reports/[issueId]` "by construction".
+ * That was not true of this file: every handler here authorises at the ORGANIZATION level
+ * (`requireReportAccess(userId, orgId, …)`, `getOrgRole`) and none of them called the dispatch at
+ * all, so the predicate placed there reached the comment and attachment paths and skipped this one.
+ * Since §4.8a writes the literal `production` on every report with no client assertion, that is the
+ * majority of report rows.
+ *
+ * It runs AFTER `loadReportOrNotFound` deliberately. That guard already 404s a report belonging to
+ * another organization, and running the dispatch first would resolve membership against the ISSUE's
+ * organization instead — turning today's cross-tenant `404` into a `403`, which is the existence
+ * leak decision 20 exists to prevent. Ordered this way the org verdicts are exactly what they were
+ * and the only new outcome is decision 20's `404` on the environment dimension.
+ */
+async function requireReportEnvironmentScope(userId: string, issueId: string): Promise<void> {
+	await requireIssueAccessAnyType(userId, issueId, 'read');
 }
 
 /**
@@ -85,6 +108,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	// `loadReportOrNotFound` guard for the org mismatch (404, never a leak of another tenant's id).
 	await requireReportAccess(session.user.id, orgId, 'read');
 	const detail = await loadReportOrNotFound(orgId, issueId);
+	await requireReportEnvironmentScope(session.user.id, issueId);
 
 	const attachments = await listIssueAttachments(issueId);
 
@@ -210,6 +234,7 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 
 	const userId = session.user.id;
 	const detail = await loadReportOrNotFound(orgId, issueId);
+	await requireReportEnvironmentScope(userId, issueId);
 
 	// §4.2 / SR-6: `getReporterId` is a tagged union now. An external report has no org-member
 	// author, so `kind === 'org_member'` is what "there is an author to compare against" means --
@@ -262,6 +287,7 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 
 	const userId = session.user.id;
 	const detail = await loadReportOrNotFound(orgId, issueId);
+	await requireReportEnvironmentScope(userId, issueId);
 
 	const reporter = await getReporterId(issueId);
 	const role = await getOrgRole(userId, orgId);

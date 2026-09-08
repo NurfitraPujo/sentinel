@@ -14,6 +14,13 @@ import { randomUUID } from 'node:crypto';
  *     other is invisible at every other boundary and is a live leak.
  *   - `lib/server/issue-access.ts: requireIssueAccess` (§2.2) — `404` on the environment dimension,
  *     never `403` (decision 20), over the `project_members` ∪ `organization_members` OR.
+ *   - `lib/server/issue-access-dispatch.ts: requireIssueAccessAnyType` (§2.2, decision 25) — the
+ *     guard point for reports, comments and attachments, asserted HERE and not at
+ *     `report-access.ts: requireReportAccessForIssue`, because this is the function that dispatches
+ *     on `issue_type` and a test at the report-specific helper proves nothing about the comment and
+ *     attachment branches. **This boundary had no test file of its own at all**, which is why the
+ *     predicate could be added to `requireIssueAccess` — reached on the `system_error` branch ONLY —
+ *     and leave every `user_report` unguarded with nothing red.
  *
  * **Why a real database and not a mocked query layer.** A chained Drizzle double cannot tell "the
  * predicate was composed into the WHERE clause" from "the predicate object was constructed and
@@ -87,22 +94,44 @@ const issueOpenProd = randomUUID();
 const issueOpenStaging = randomUUID();
 const issueForeignProd = randomUUID();
 
+// The `user_report` half of the dispatch. Everything above is a `system_error` (the column's
+// default), and that asymmetry is the finding: §4.8a writes the literal `production` on every
+// report with no client assertion, so a report is exactly the row a `{staging}` grant must hide.
+const reportNarrowedProd = randomUUID();
+const reportNarrowedStaging = randomUUID();
+
 const SEEDED_ISSUES = [
-	[issueNarrowedProd, projectNarrowed, 'production'],
-	[issueNarrowedStaging, projectNarrowed, 'staging'],
-	[issueOpenProd, projectOpen, 'production'],
-	[issueOpenStaging, projectOpen, 'staging'],
-	[issueForeignProd, projectForeign, 'production'],
+	[issueNarrowedProd, projectNarrowed, 'production', 'system_error'],
+	[issueNarrowedStaging, projectNarrowed, 'staging', 'system_error'],
+	[issueOpenProd, projectOpen, 'production', 'system_error'],
+	[issueOpenStaging, projectOpen, 'staging', 'system_error'],
+	[issueForeignProd, projectForeign, 'production', 'system_error'],
+	[reportNarrowedProd, projectNarrowed, 'production', 'user_report'],
+	[reportNarrowedStaging, projectNarrowed, 'staging', 'user_report'],
 ] as const;
 
-/** What the narrowed member may see: `projectNarrowed` staging only, `projectOpen` entirely. */
-const VISIBLE_TO_NARROWED: string[] = [issueNarrowedStaging, issueOpenProd, issueOpenStaging];
+/**
+ * What the narrowed member may see: `projectNarrowed` staging only, `projectOpen` entirely.
+ *
+ * The two `user_report` rows belong here beside the `system_error` ones because neither
+ * `listIssues` nor `searchErrors` filters on `issue_type` — a report is an `issues` row like any
+ * other to them, so the narrowed member sees the staging report and not the production one on
+ * exactly the same predicate.
+ */
+const VISIBLE_TO_NARROWED: string[] = [
+	issueNarrowedStaging,
+	issueOpenProd,
+	issueOpenStaging,
+	reportNarrowedStaging,
+];
 /** What the unrestricted member may see: every issue of both reachable projects. */
 const VISIBLE_TO_OPEN: string[] = [
 	issueNarrowedProd,
 	issueNarrowedStaging,
 	issueOpenProd,
 	issueOpenStaging,
+	reportNarrowedProd,
+	reportNarrowedStaging,
 ];
 
 const ids = (rows: { id: string }[]) => rows.map((r) => r.id).sort();
@@ -159,11 +188,11 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 			values (${narrowedUser}, ${projectNarrowed}, ${sql.array(['staging'])}, ${openUser})
 		`;
 
-		for (const [id, projectId, environment] of SEEDED_ISSUES) {
+		for (const [id, projectId, environment, issueType] of SEEDED_ISSUES) {
 			await sql`
-				insert into issues (id, project_id, environment, fingerprint, message, error_class)
+				insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
 				values (${id}, ${projectId}, ${environment}, ${`fp-${id}`},
-				        ${`rg seed ${suffix}`}, ${'ReadGuardSeedError'})
+				        ${`rg seed ${suffix}`}, ${'ReadGuardSeedError'}, ${issueType})
 			`;
 			// One occurrence + one search-index row per issue: `searchErrors` inner-joins both, so an
 			// issue with neither is invisible to it for reasons that have nothing to do with the guard.
@@ -279,7 +308,9 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 			1,
 			100
 		);
-		expect(ids(staging)).toEqual([issueNarrowedStaging, issueOpenStaging].sort());
+		expect(ids(staging)).toEqual(
+			[issueNarrowedStaging, issueOpenStaging, reportNarrowedStaging].sort()
+		);
 
 		// A filter the caller controls cannot be a guard: asking for `production` does not widen the
 		// narrowed project, it only narrows the unrestricted one.
@@ -367,15 +398,17 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 			{ projectId: projectNarrowed },
 			{ limit: 100 }
 		);
-		expect(narrowed.total).toBe(1);
-		expect(issueIds(narrowed.results as { issueId: string }[])).toEqual([issueNarrowedStaging]);
+		expect(narrowed.total).toBe(2);
+		expect(issueIds(narrowed.results as { issueId: string }[])).toEqual(
+			[issueNarrowedStaging, reportNarrowedStaging].sort()
+		);
 
 		const open = await searchErrors(
 			{ id: openUser } as any,
 			{ projectId: projectNarrowed },
 			{ limit: 100 }
 		);
-		expect(open.total).toBe(2);
+		expect(open.total).toBe(4);
 	});
 
 	// ---------------------------------------------------------------------------------------------
@@ -409,5 +442,83 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 		await expect(
 			requireIssueAccess(openUser, issueNarrowedProd, 'read')
 		).resolves.toMatchObject({ projectId: projectNarrowed });
+	});
+	// ---------------------------------------------------------------------------------------------
+	// §2.2, decision 25 — `requireIssueAccessAnyType`, the guard point the table names for reports,
+	// comments and attachments.
+	//
+	// This is the boundary §11 lists as "existing" and which had NO test file at all; that absence
+	// is part of the finding these tests close. The assertions come in pairs on purpose: the
+	// `system_error` branch alone was already guarded (it dispatches to `requireIssueAccess`, which
+	// carries its own §2.2 predicate), so a test that only exercised it would have passed against
+	// the broken code. The `user_report` branch is the one that was open, and it is the majority of
+	// report rows because §4.8a writes the literal `production` with no client assertion.
+	// ---------------------------------------------------------------------------------------------
+
+	it('requireIssueAccessAnyType 404s on an out-of-scope user_report — the branch requireIssueAccess never reaches', async () => {
+		const { requireIssueAccessAnyType } = await import('./issue-access-dispatch');
+
+		let caught: any;
+		try {
+			await requireIssueAccessAnyType(narrowedUser, reportNarrowedProd, 'read');
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(caught).toBeDefined();
+		// Decision 20: `404`, never `403`. `requireReportAccessForIssue` — the helper this branch
+		// dispatches to, and the placement §2.2 rejects by name — resolves the issue row and then
+		// applies an ORG-level check with no environment predicate at all, so before this guard the
+		// call below RESOLVED.
+		expect(caught.status).toBe(404);
+		expect(caught.body?.message ?? caught.message).toContain('not found');
+	});
+
+	it('requireIssueAccessAnyType 404s on an out-of-scope system_error too — both branches, one predicate', async () => {
+		const { requireIssueAccessAnyType } = await import('./issue-access-dispatch');
+
+		let caught: any;
+		try {
+			await requireIssueAccessAnyType(narrowedUser, issueNarrowedProd, 'read');
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(caught).toBeDefined();
+		expect(caught.status).toBe(404);
+	});
+
+	it('the guard runs BEFORE the dispatch, so a write action is refused on the same 404', async () => {
+		const { requireIssueAccessAnyType } = await import('./issue-access-dispatch');
+
+		// `narrowedUser` is an org `engineer`, i.e. on ISSUE_WRITE_ROLES — the project dimension
+		// grants this write. Only the environment dimension refuses it, and it must refuse it as a
+		// 404 rather than the 403 the project dimension would use.
+		await expect(
+			requireIssueAccessAnyType(narrowedUser, reportNarrowedProd, 'write')
+		).rejects.toMatchObject({ status: 404 });
+	});
+
+	it('requireIssueAccessAnyType admits what the grant covers, on both branches', async () => {
+		const { requireIssueAccessAnyType } = await import('./issue-access-dispatch');
+
+		await expect(
+			requireIssueAccessAnyType(narrowedUser, reportNarrowedStaging, 'read')
+		).resolves.toMatchObject({ issueType: 'user_report', organizationId: orgOwn });
+
+		await expect(
+			requireIssueAccessAnyType(narrowedUser, issueNarrowedStaging, 'read')
+		).resolves.toMatchObject({ issueType: 'system_error', organizationId: orgOwn });
+	});
+
+	it('an unrestricted member is admitted to the production report the narrowed one is refused', async () => {
+		const { requireIssueAccessAnyType } = await import('./issue-access-dispatch');
+
+		// The other half of "absence means all": a caller with no grant row sees every environment,
+		// so the 404 above is the grant firing and not the report being unreachable for some other
+		// reason. Without this the first assertion could pass vacuously.
+		await expect(
+			requireIssueAccessAnyType(openUser, reportNarrowedProd, 'read')
+		).resolves.toMatchObject({ issueType: 'user_report', organizationId: orgOwn });
 	});
 });
