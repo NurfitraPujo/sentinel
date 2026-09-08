@@ -13,9 +13,12 @@ import { isEncryptionKeyAvailable } from '$lib/server/repo-credential-crypto';
  * place decrypted git credentials ever leave the server. Defense layers, in order:
  *
  *  1. Normal agent-key auth (B7: org scope comes off the credential).
- *  2. `agents.can_access_repo_credentials` -- an admin-set grant, default false. A plain agent
- *     key gets 403 here; possession of a valid key is deliberately NOT enough to receive
+ *  2. `agents.can_access_repo_credentials` -- an admin-set master switch, default false. A plain
+ *     agent key gets 403 here; possession of a valid key is deliberately NOT enough to receive
  *     write-capable git tokens.
+ *  2b. Project scope (1724300000): the flag alone no longer means "every credential in the org".
+ *     Org-wide credentials (project_id IS NULL) are served to any agent past the flag, unchanged;
+ *     a project-scoped credential is served only to an agent holding a grant for that project.
  *  3. SENTINEL_ENCRYPTION_KEY must be present -- without it the server refuses (503) rather
  *     than serving anything from a degraded configuration.
  *  4. Every credential actually served is audited (agent id, credential id, timestamp).
@@ -40,7 +43,10 @@ export const GET: RequestHandler = async ({ request }) => {
 		throw error(503, 'Server encryption key is not configured; refusing to serve credentials');
 	}
 
-	const decrypted = await fetchDecryptedCredentialsForAgent(ctx.organizationId);
+	// Both identifiers come off the authenticated context — the org scope (B7) and now the agent
+	// whose project grants decide which project-scoped credentials are in range. Nothing here is
+	// taken from the request.
+	const decrypted = await fetchDecryptedCredentialsForAgent(ctx.organizationId, ctx.agentId);
 
 	for (const cred of decrypted) {
 		await writeAgentAuditLog(ctx, 'agent.repo_credential_fetched', 'repo_credential', cred.id, {

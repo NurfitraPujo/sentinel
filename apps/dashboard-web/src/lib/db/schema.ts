@@ -471,8 +471,30 @@ export const repoCredentials = pgTable('repo_credentials', {
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 	revokedAt: timestamp('revoked_at', { withTimezone: true }),
 	lastFetchedAt: timestamp('last_fetched_at', { withTimezone: true }),
+	// 1724300000_add_repo_credential_project_scope.sql: NULL means org-wide, which is what every
+	// row created before that migration is. A non-NULL value binds the credential to one project,
+	// and it is then delivered only to agents holding a grant for that project. A DB trigger
+	// enforces that the project belongs to organization_id — a CHECK cannot read another table,
+	// and without it a foreign tenant's project id could be written here and would match that
+	// tenant's grants.
+	projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
 }, (table) => ({
 	idxRepoCredentialsOrg: index('idx_repo_credentials_org').on(table.organizationId),
+	idxRepoCredentialsProject: index('idx_repo_credentials_project').on(table.projectId),
+}));
+
+// 1724300000_add_repo_credential_project_scope.sql: which projects an agent may receive repo
+// credentials for. The grant is the SCOPE; agents.can_access_repo_credentials is the outer master
+// switch, kept so revoking everything for one agent stays a single toggle. An agent needs the flag
+// either way; project-scoped credentials additionally need a matching grant.
+export const agentRepoCredentialGrants = pgTable('agent_repo_credential_grants', {
+	agentId: uuid('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	createdBy: varchar('created_by', { length: 255 }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.agentId, table.projectId] }),
+	idxAgentRepoCredentialGrantsProject: index('idx_agent_repo_credential_grants_project').on(table.projectId),
 }));
 
 // N1a (AI-agent-native Sentinel), source of truth is

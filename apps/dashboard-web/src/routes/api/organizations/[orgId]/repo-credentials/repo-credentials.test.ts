@@ -90,6 +90,8 @@ describe('POST create', () => {
 			provider: 'github',
 			label: 'CI bot',
 			secret: { token: 'ghp_supersecret' },
+			// Omitted in the request body = org-wide, the pre-1724300000 shape.
+			projectId: null,
 		});
 	});
 

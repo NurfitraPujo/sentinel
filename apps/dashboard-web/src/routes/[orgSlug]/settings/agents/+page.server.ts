@@ -27,9 +27,17 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	}
 	const { agents } = await res.json();
 
+	// 1724300000: the credential-scope UI on this page needs the org's projects — both to bind a
+	// credential to one project and to pick which projects an agent may receive credentials for.
+	// Fetched through the guarded API route for the same reason the agent roster is: one place
+	// decides who may see it.
+	const projectsRes = await fetch(`/api/organizations/${org.id}/projects`);
+	const projects = projectsRes.ok ? ((await projectsRes.json()).projects ?? []) : [];
+
 	return {
 		orgId: org.id,
 		orgSlug,
 		agents: agents || [],
+		projects,
 	};
 };

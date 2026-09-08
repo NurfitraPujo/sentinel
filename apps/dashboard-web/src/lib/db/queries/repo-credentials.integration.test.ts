@@ -39,6 +39,11 @@ if (required && !dbReachable) {
 
 const suffix = randomUUID().slice(0, 8);
 const orgId = randomUUID();
+// 1724300000: the delivery path is scoped by the agent's project grants. This agent holds none, so
+// it sees org-wide credentials only — which is exactly what the credential below is (project_id
+// NULL), and is the pre-migration behaviour these cases were written to pin. No agents row is
+// needed: the grant lookup is a plain read that returns nothing for an unknown id.
+const agentIdForScope = randomUUID();
 const SECRET_TOKEN = 'ghp_plaintext_must_never_rest_' + suffix;
 
 process.env.SENTINEL_ENCRYPTION_KEY ??= Buffer.alloc(32, 11).toString('base64');
@@ -86,7 +91,7 @@ describe.skipIf(!dbReachable)('repo credentials at rest (integration, real Postg
 
 	it('serves the decrypted secret to the delivery path while active', async () => {
 		const { fetchDecryptedCredentialsForAgent } = await import('./repo-credentials');
-		const served = await fetchDecryptedCredentialsForAgent(orgId);
+		const served = await fetchDecryptedCredentialsForAgent(orgId, agentIdForScope);
 		expect(served).toHaveLength(1);
 		expect(served[0].secret).toEqual({ token: SECRET_TOKEN });
 
@@ -100,7 +105,7 @@ describe.skipIf(!dbReachable)('repo credentials at rest (integration, real Postg
 		);
 		await revokeRepoCredential('user-int', orgId, credentialId);
 
-		const served = await fetchDecryptedCredentialsForAgent(orgId);
+		const served = await fetchDecryptedCredentialsForAgent(orgId, agentIdForScope);
 		expect(served).toHaveLength(0);
 
 		const [raw] = await sql`select * from repo_credentials where id = ${credentialId}`;

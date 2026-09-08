@@ -9,6 +9,9 @@ import { EncryptionKeyUnavailableError } from '$lib/server/repo-credential-crypt
 import { parseRepoCredentialSecret } from '$lib/server/repo-credential-input';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership } from '../keys/_shared';
+import { db } from '$lib/server/db';
+import { projects } from '$lib/db/schema';
+import { eq, and } from 'drizzle-orm';
 
 /**
  * N10 part 2: org git-credentials management. WRITE-ONLY -- the response of every handler in
@@ -53,11 +56,30 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	}
 	const secret = parseRepoCredentialSecret(provider, body);
 
+	// 1724300000: optional project binding. Absent/null keeps the pre-migration org-wide shape.
+	// The project must belong to this org — a DB trigger enforces it too, but a 400 here is a
+	// better answer than a raised exception, and the trigger is the backstop rather than the gate.
+	const rawProjectId = body?.projectId;
+	if (rawProjectId !== undefined && rawProjectId !== null && typeof rawProjectId !== 'string') {
+		throw error(400, 'projectId must be a string or null');
+	}
+	const projectId = typeof rawProjectId === 'string' && rawProjectId ? rawProjectId : null;
+	if (projectId) {
+		const [owned] = await db
+			.select({ id: projects.id })
+			.from(projects)
+			.where(and(eq(projects.id, projectId), eq(projects.organizationId, params.orgId!)));
+		if (!owned) {
+			throw error(400, 'projectId must belong to this organization');
+		}
+	}
+
 	try {
 		const credential = await createRepoCredential(userId, {
 			orgId: params.orgId!,
 			provider,
 			label,
+			projectId,
 			secret,
 		});
 		return json({ credential }, { status: 201 });
