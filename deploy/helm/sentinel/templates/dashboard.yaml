@@ -153,6 +153,12 @@ metadata:
   name: {{ include "sentinel.fullname" . }}-dashboard
   labels:
     {{- include "sentinel.labels" . | nindent 4 }}
+  annotations:
+    # Wave 3: attach only after the Deployment (wave 2) exists. Creating the
+    # HPA in wave 0 on a fresh install makes the HPA controller report
+    # "unable to get the target's current scale" (health Degraded), which
+    # aborts the whole ArgoCD sync before migrations (wave 1) ever run.
+    "argocd.argoproj.io/sync-wave": "3"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -176,6 +182,10 @@ metadata:
   name: {{ include "sentinel.fullname" . }}-dashboard
   labels:
     {{- include "sentinel.labels" . | nindent 4 }}
+  annotations:
+    # Wave 3: PDB selects Deployment pods (wave 2); keep it with the HPA so a
+    # fresh install never evaluates budgets against missing workloads.
+    "argocd.argoproj.io/sync-wave": "3"
 spec:
   minAvailable: {{ .Values.dashboard.podDisruptionBudget.minAvailable }}
   selector:
