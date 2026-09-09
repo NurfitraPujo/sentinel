@@ -131,12 +131,34 @@ export async function batchUpdateIssues(
 		assignedTo?: string;
 		actorType?: 'user' | 'agent';
 		actorId?: string;
-	} = {}
+		/**
+		 * sentinel-project-environments §2.2 — the caller's environment scope in `projectId`, as
+		 * `resolveEnvironmentScope` returns it: `null` for unrestricted, the granted names otherwise.
+		 *
+		 * **Required, deliberately, and that is the fix.** §2.2's guard table names this path by
+		 * name and says "a guard missing from any one of these is the whole boundary"; the bulk path
+		 * carried no environment predicate at all while the single-issue path
+		 * (`issue-access.ts: requireIssueAccess`) resolved the scope and 404'd, which is exactly the
+		 * bulk-is-more-permissive drift D23 claims the shared helper closed — re-opened on a new
+		 * axis. An optional field with an "unrestricted" default would let the next caller re-open
+		 * it silently; omitting it is a type error instead.
+		 */
+		environmentScope: string[] | null;
+	}
 ) {
 	if (issueIds.length > MAX_BATCH_ISSUE_IDS) {
 		throw new Error(
 			`Batch too large: ${issueIds.length} ids exceeds max of ${MAX_BATCH_ISSUE_IDS}`
 		);
+	}
+
+	// A grant row with an empty array cannot exist — §4.9's CHECK (array_length(environments, 1) >= 1)
+	// refuses it and §4.10 rejects `[]` before it gets that far. Handled anyway because the failing
+	// shape matters: `inArray(col, [])` THROWS in drizzle ("inArray requires at least one value"),
+	// so the open direction would be a 500 on a write path rather than a scope that matches nothing.
+	// Fail closed: nothing is in scope, so nothing is updated and no activity is written.
+	if (options.environmentScope !== null && options.environmentScope.length === 0) {
+		return 0;
 	}
 
 	// CONTEXT.md "Claim" / DECISIONS.md D24: claims are only ever self-acquired — nothing assigns
@@ -194,12 +216,27 @@ export async function batchUpdateIssues(
 				break;
 		}
 
+		// sentinel-project-environments §2.2 — the environment dimension, composed beside the existing
+		// tenancy predicates. `null` is unrestricted (absence means all) and adds nothing.
+		//
+		// Decision 20's shape on a bulk path is FEWER ROWS UPDATED, not a 403: refusing the batch
+		// would tell a narrowed caller that an issue with the id they named exists in an environment
+		// they may not see, which is the fact the boundary was drawn to withhold. The returned count
+		// is already the count of rows actually matched (see below), so an out-of-scope id is
+		// indistinguishable from an id that does not exist — the same answer the single-issue path's
+		// 404 gives.
+		const environmentPredicate =
+			options.environmentScope === null
+				? undefined
+				: inArray(issues.environment, options.environmentScope);
+
 		const updated = await tx.update(issues)
 			.set(updateData)
 			.where(
 				and(
 					eq(issues.projectId, projectId),
-					inArray(issues.id, issueIds)
+					inArray(issues.id, issueIds),
+					environmentPredicate
 				)
 			)
 			.returning({ id: issues.id });
