@@ -630,6 +630,18 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     timeout-minutes: 20
     strategy:
+      # A single image build failing must not cancel the others. The buildkit daemon on the
+      # self-hosted runners dies mid-build under load ("received prior goaway ... graceful_stop"):
+      # six occurrences on 2026-09-08/09, and each one took every sibling image down with it —
+      # on PR #16 one processor failure cancelled all six images, including a dashboard image
+      # whose own build had nothing wrong with it. Containing that is the difference between
+      # rerunning one job and rerunning a whole release.
+      fail-fast: false
+      # And the likely reason the daemon dies at all: every image built concurrently on one
+      # runner. Two at a time still parallelises the slow Go builds without asking one machine to
+      # host six simultaneous docker builds. Raise this once the daemon is understood — it is a
+      # throughput knob, not a correctness one.
+      max-parallel: 2
       matrix:
         include:
           - image: sentinel-ingestor
