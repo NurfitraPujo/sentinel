@@ -41,6 +41,12 @@ func MapPayloadToEvent(payload *validation.ErrorPayload) *sentinelv1.ErrorEvent 
 		Timestamp:      timestamppb.New(payload.Timestamp),
 		TraceFlags:     payload.TraceFlags,
 		ReleaseVersion: payload.ReleaseVersion,
+		// Custom grouping. Both fields existed in the proto and were honoured by
+		// the processor (event.go:177), but nothing decoded them from JSON — so
+		// the capability was reachable only by a hypothetical proto client, and
+		// the only ingest path anyone has is JSON.
+		Fingerprint:         payload.Fingerprint,
+		FingerprintOverride: payload.FingerprintOverride,
 		// TODO(P3-1): payload.ProjectID is client-supplied at this point and
 		// MUST NOT be trusted as-is — it has to be replaced with the project
 		// resolved by auth.APIKeyAuthenticator.Middleware from the

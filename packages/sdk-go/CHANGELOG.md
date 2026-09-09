@@ -2,6 +2,26 @@
 
 All notable changes to `packages/sdk-go` are documented here.
 
+## v0.2.2 — Custom fingerprints
+
+### Added
+
+- **`Event.Fingerprint`** — an optional custom grouping key. Leave it empty (the normal case) and the
+  server computes one from the error class and stacktrace; set it and the server stores it verbatim,
+  so two events sharing a value are the same issue whatever their stacktraces look like. Maximum 64
+  characters, matching `issues.fingerprint VARCHAR(64)`; the ingestor rejects an oversized value with
+  a 400 rather than truncating, because a shortened grouping key would silently merge issues that
+  were meant to stay apart.
+
+  This needed a server change too: the proto has carried `fingerprint` since the beginning and the
+  processor honoured it, but the ingestor never decoded it from JSON — so the capability was
+  reachable only by a hypothetical protobuf client, and JSON is the only ingest path there is.
+
+  The proto's companion `fingerprint_override` is deliberately **not** exposed. Its effect is the
+  reverse of what the name suggests: it forces the server to recompute and discards whatever
+  fingerprint was sent with it, so an SDK field for it would be a switch whose only function is to
+  throw away the value beside it.
+
 ## v0.2.1 — Rate-limit retries and trace flags
 
 Both fixes come from an audit of this SDK against what the server actually accepts
