@@ -53,12 +53,24 @@ func getTagsMap(ctx context.Context) map[string]interface{} {
 }
 
 func ExtractTraceIDs(ctx context.Context) (traceID string, spanID string) {
+	traceID, spanID, _ = ExtractTraceContext(ctx)
+	return traceID, spanID
+}
+
+// ExtractTraceContext returns the trace id, span id AND the W3C trace-flags byte from
+// ctx's span context.
+//
+// ExtractTraceIDs above dropped the flags, which sit on the very same SpanContext, so
+// every SDK-originated event reached the server with its sampled bit lost even though
+// the ingestor accepts and stores trace_flags. ExtractTraceIDs is kept as-is because it
+// is exported and callers outside this repo may depend on its signature.
+func ExtractTraceContext(ctx context.Context) (traceID string, spanID string, traceFlags uint32) {
 	if ctx == nil {
-		return "", ""
+		return "", "", 0
 	}
 	spanCtx := trace.SpanContextFromContext(ctx)
 	if spanCtx.IsValid() {
-		return spanCtx.TraceID().String(), spanCtx.SpanID().String()
+		return spanCtx.TraceID().String(), spanCtx.SpanID().String(), uint32(spanCtx.TraceFlags())
 	}
-	return "", ""
+	return "", "", 0
 }

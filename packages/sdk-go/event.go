@@ -56,6 +56,13 @@ type Event struct {
 	ReleaseVersion string `json:"release_version,omitempty"`
 	TraceID        string `json:"trace_id,omitempty"`
 	SpanID         string `json:"span_id,omitempty"`
+	// TraceFlags is the W3C trace-flags byte from the originating span context —
+	// bit 0 is "sampled". The ingestor accepts it (validation.ErrorPayload.TraceFlags),
+	// the mapper forwards it and the processor stores it, so dropping it here was the
+	// only reason SDK-originated events arrived with sampled-ness lost. Not omitempty:
+	// 0 is a meaningful value (an unsampled span), distinct from "no trace context",
+	// which is already expressed by TraceID being empty.
+	TraceFlags uint32 `json:"trace_flags"`
 	// Metadata carries user tags and PII-scrubbed context. Previously
 	// emitted as "context", which the ingestor never read (VERIFIED_STATE.md
 	// S4) - the field the server actually maps is "metadata".

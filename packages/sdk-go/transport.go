@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,12 +17,18 @@ import (
 
 const (
 	// sendMaxAttempts bounds the number of times a single batch is sent
-	// before it is dropped. Retries only happen for network errors and 5xx
-	// responses - a 4xx response is not retried, since resending the same
+	// before it is dropped. Retries happen for network errors, 5xx responses
+	// and 429 - every OTHER 4xx is not retried, since resending the same
 	// payload cannot change a validation outcome.
 	sendMaxAttempts    = 4
 	sendInitialBackoff = 200 * time.Millisecond
 	sendMaxBackoff     = 5 * time.Second
+	// sendMaxRetryAfter caps how long a server-supplied Retry-After can park a
+	// batch. The ingestor sends 60s (middleware/ratelimit.go); this bound is
+	// what stops a misconfigured or hostile value from parking events for
+	// hours. Waiting is also interruptible - see the sleep below - so a Close
+	// or Flush does not have to sit through it.
+	sendMaxRetryAfter = 60 * time.Second
 	// maxErrorBodyBytes caps how much of a non-2xx response body is read,
 	// so a misbehaving server can't make the SDK buffer an unbounded amount
 	// of memory just to log an error.
@@ -167,7 +174,11 @@ func (t *Transport) sendBatch(batch []*Event) {
 	var lastErr error
 
 	for attempt := 1; attempt <= sendMaxAttempts; attempt++ {
-		status, respBody, sendErr := t.doSend(endpoint, body)
+		status, respBody, retryAfter, sendErr := t.doSend(endpoint, body)
+
+		// wait is the delay before the next attempt: exponential backoff, unless the
+		// server told us how long to wait, in which case it wins.
+		wait := backoff
 
 		if sendErr != nil {
 			// Network error: always retryable.
@@ -187,9 +198,23 @@ func (t *Transport) sendBatch(batch []*Event) {
 		} else if status >= 500 {
 			// Server error: retryable.
 			lastErr = fmt.Errorf("sentinel: ingest returned status %d", status)
+		} else if status == http.StatusTooManyRequests {
+			// Rate limited. This is the one 4xx where resending IS the correct
+			// action, and the ingestor even says when: it answers 429 with
+			// `Retry-After: 60` (apps/ingestor-go/middleware/ratelimit.go).
+			// This branch used to fall through to the generic 4xx case below and
+			// discard the batch outright, so a rate-limited client silently threw
+			// away telemetry it could have delivered a minute later.
+			lastErr = fmt.Errorf("sentinel: ingest rate limited: status=%d", status)
+			if retryAfter > 0 {
+				wait = retryAfter
+			}
+			if t.cfg.Debug {
+				log.Printf("sentinel: rate limited, retrying %d event(s) in %s", len(batch), wait)
+			}
 		} else {
-			// 4xx: not retryable - the payload itself was rejected and
-			// resending it unchanged cannot succeed.
+			// Every other 4xx: not retryable - the payload itself was rejected
+			// and resending it unchanged cannot succeed.
 			lastErr = fmt.Errorf("sentinel: ingest rejected batch: status=%d body=%s", status, respBody)
 			if t.cfg.Debug {
 				log.Printf("sentinel: dropping %d event(s): status=%d body=%s", len(batch), status, respBody)
@@ -201,7 +226,15 @@ func (t *Transport) sendBatch(batch []*Event) {
 		if attempt == sendMaxAttempts {
 			break
 		}
-		time.Sleep(backoff)
+		// A plain sleep, deliberately NOT selected against t.ctx: Flush cancels that
+		// context before draining (see Flush), so waiting on it here would mean no
+		// batch is ever retried during a flush — silently disabling the existing 5xx
+		// retries too, which is a worse failure than the one this fix addresses.
+		//
+		// The cost is that a batch parked on a 60s Retry-After can outlast a short
+		// Flush timeout, which then returns false. That is what Flush's bool already
+		// means, and sendMaxRetryAfter bounds how long it can be.
+		time.Sleep(wait)
 		backoff *= 2
 		if backoff > sendMaxBackoff {
 			backoff = sendMaxBackoff
@@ -216,28 +249,69 @@ func (t *Transport) sendBatch(batch []*Event) {
 }
 
 // doSend performs a single HTTP POST attempt and returns the response status
-// code and (truncated) body. err is non-nil only for transport-level
-// failures (DNS, connection refused, timeout, etc.) - a non-2xx HTTP
-// response is reported via the returned status code, not err.
-func (t *Transport) doSend(endpoint string, body []byte) (statusCode int, respBody []byte, err error) {
+// code, (truncated) body and any Retry-After the server asked for. err is
+// non-nil only for transport-level failures (DNS, connection refused, timeout,
+// etc.) - a non-2xx HTTP response is reported via the returned status code,
+// not err.
+func (t *Transport) doSend(endpoint string, body []byte) (statusCode int, respBody []byte, retryAfter time.Duration, err error) {
 	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer reqCancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", t.cfg.APIKey)
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	respBody, _ = io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-	return resp.StatusCode, respBody, nil
+	return resp.StatusCode, respBody, parseRetryAfter(resp.Header.Get("Retry-After")), nil
+}
+
+// parseRetryAfter reads an HTTP Retry-After header, which RFC 9110 allows in two
+// forms: delay-seconds, or an HTTP-date. The ingestor sends the seconds form
+// ("60"); the date form is handled anyway because this header comes from
+// whatever sits in front of the ingestor too — a proxy or gateway rate-limiting
+// ahead of it may well send a date.
+//
+// Returns 0 for anything unparseable, negative, or already in the past, which
+// makes the caller fall back to its own exponential backoff. The result is
+// capped at sendMaxRetryAfter so a bad value cannot park a batch indefinitely.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		d := time.Duration(secs) * time.Second
+		if d > sendMaxRetryAfter {
+			return sendMaxRetryAfter
+		}
+		return d
+	}
+
+	if when, err := http.ParseTime(v); err == nil {
+		d := time.Until(when)
+		if d <= 0 {
+			return 0
+		}
+		if d > sendMaxRetryAfter {
+			return sendMaxRetryAfter
+		}
+		return d
+	}
+
+	return 0
 }
 
 // batchIngestResult mirrors apps/ingestor-go/main.go's batchResult - the
