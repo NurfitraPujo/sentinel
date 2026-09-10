@@ -248,3 +248,61 @@ func TestAlertSubject(t *testing.T) {
 		})
 	}
 }
+
+// TestAlertsDispatcher_OrgWideSafetyNetSurvivesDestinationDedup is BUG-13: the environment scope has
+// to be applied BEFORE two configs are collapsed onto one destination, not after.
+//
+// A project-scoped config to ops@example.test scoped to {production} and an ORG-WIDE config to the
+// same ops@example.test with Environments == nil (covers everything) share a destinationKey. The
+// project-scoped one is appended first and used to win the dedup unconditionally, so the org-wide
+// safety net was dropped from the resolved set — and then the surviving project config failed
+// coversEnvironment("staging") in dispatchToConfig and suppressed the send. A staging occurrence
+// reached nobody, contradicting resolveConfigs' own documented rule that an org-wide config "must
+// still fire even when a project-scoped config also exists".
+//
+// TestAlertsDispatcher_EnvironmentScopeAppliesPerConfig cannot see this: its two configs route to
+// different `to` targets, so dedup never engages at all.
+func TestAlertsDispatcher_OrgWideSafetyNetSurvivesDestinationDedup(t *testing.T) {
+	const sharedDestination = "ops@example.test"
+
+	newDispatcher := func(t *testing.T) (*alerts.Dispatcher, func() []*alerts.Alert) {
+		d, sent := captureAlerts(t)
+
+		projScoped := envScopedConfig(1, []string{"production"})
+		projScoped.ID = "proj-prod-only"
+		projScoped.ChannelConfig = map[string]interface{}{"to": sharedDestination}
+
+		orgWide := envScopedConfig(1, nil)
+		orgWide.ID = "org-everything"
+		orgWide.ProjectID = ""
+		orgWide.ChannelConfig = map[string]interface{}{"to": sharedDestination}
+
+		d.SetProjectConfigsForTest(map[string][]*alerts.AlertConfig{
+			envScopeProjectID: {projScoped},
+		})
+		d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{
+			"env-scope-org": {orgWide},
+		})
+		d.SetProjectOrgForTest(map[string]string{envScopeProjectID: "env-scope-org"})
+
+		return d, sent
+	}
+
+	t.Run("a staging occurrence still reaches the org-wide config sharing the destination", func(t *testing.T) {
+		d, sent := newDispatcher(t)
+
+		d.Dispatch(context.Background(), "issue-1", envScopeProjectID, "staging", "TestError", "boom")
+
+		require.Len(t, sent(), 1, "the org-wide config covers every environment and must not be deduped away by a project config that does not cover this one")
+		assert.Equal(t, "staging", sent()[0].Environment)
+	})
+
+	t.Run("a production occurrence both configs cover is still sent exactly once", func(t *testing.T) {
+		d, sent := newDispatcher(t)
+
+		d.Dispatch(context.Background(), "issue-1", envScopeProjectID, "production", "TestError", "boom")
+
+		require.Len(t, sent(), 1, "two configs resolving to the same channel+target must still dedup to one send")
+		assert.Equal(t, "production", sent()[0].Environment)
+	})
+}

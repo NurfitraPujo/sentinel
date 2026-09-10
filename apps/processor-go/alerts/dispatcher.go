@@ -513,33 +513,47 @@ func destinationKey(cfg *AlertConfig) string {
 // more specific rule, so its frequency threshold/window is the one a caller configuring both would
 // reasonably expect to apply.
 //
+// environment is the occurrence's environment (§4.7) and it participates in the dedup, because a
+// config that will not count this occurrence must not be allowed to STAND IN for one that will. Only
+// a config whose scope covers the environment claims its destinationKey; a config outside scope is
+// still returned (dispatchToConfig is where §4.7's suppression, and its metric, is recorded, once per
+// (occurrence, config) pair) but leaves the key free for a later config that does cover it. Without
+// this, a project-scoped config to ops@ scoped to {production} silently swallowed the org-wide
+// config to the same ops@ with NULL environments, and a staging occurrence reached nobody at all —
+// exactly the "safety net that must still fire" this function's own rule promises.
+//
 // The enabled filter itself is normally already applied by refreshConfigs' query (WHERE enabled =
 // true), so in production every config reaching this function is enabled; Dispatch still checks
 // cfg.Enabled defensively (and tests exercise that path directly via SetConfigsForTest /
 // SetOrgConfigsForTest with Enabled: false, bypassing the DB-level filter).
 //
 // Must be called with d.configMu held for reading (or writing).
-func (d *Dispatcher) resolveConfigs(projectID string) []*AlertConfig {
+func (d *Dispatcher) resolveConfigs(projectID, environment string) []*AlertConfig {
 	var result []*AlertConfig
 	seen := make(map[string]bool)
 
-	for _, cfg := range d.configs[projectID] {
+	keep := func(cfg *AlertConfig) {
+		if !cfg.coversEnvironment(environment) {
+			// Out of scope for THIS occurrence: it cannot fire, so it must not claim the
+			// destination either. dispatchToConfig still sees it and records the suppression.
+			result = append(result, cfg)
+			return
+		}
 		key := destinationKey(cfg)
 		if seen[key] {
-			continue
+			return
 		}
 		seen[key] = true
 		result = append(result, cfg)
 	}
 
+	for _, cfg := range d.configs[projectID] {
+		keep(cfg)
+	}
+
 	if orgID, ok := d.projectOrg[projectID]; ok {
 		for _, cfg := range d.orgConfigs[orgID] {
-			key := destinationKey(cfg)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			result = append(result, cfg)
+			keep(cfg)
 		}
 	}
 
@@ -551,10 +565,11 @@ func (d *Dispatcher) resolveConfigs(projectID string) []*AlertConfig {
 // each one's frequency threshold/window independently, so an organization-wide config and a
 // project-scoped config for the same project rate-limit separately rather than sharing one counter.
 // environment is the environment of the occurrence being dispatched (§4.7); each config counts it
-// only if the config covers that environment (AlertConfig.coversEnvironment).
+// only if the config covers that environment (AlertConfig.coversEnvironment), and it is passed into
+// resolveConfigs so the scope decision is made BEFORE destination dedup rather than after it.
 func (d *Dispatcher) Dispatch(ctx context.Context, issueID, projectID, environment, errorClass, message string) {
 	d.configMu.RLock()
-	cfgs := d.resolveConfigs(projectID)
+	cfgs := d.resolveConfigs(projectID, environment)
 	d.configMu.RUnlock()
 
 	for _, cfg := range cfgs {
