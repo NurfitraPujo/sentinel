@@ -278,7 +278,11 @@ describe('sendIssueNotificationEmails', () => {
 		);
 	});
 
-	it('builds a service-issue URL (/[orgSlug]/projects/[projectId]/issues/[issueId]) for issue_type=system_error', async () => {
+	// The canonical service-issue URL is /issues/[id] (owner's call, 2026-09-08). This used to
+	// assert /[orgSlug]/projects/[projectId]/issues/[issueId]; that path still RESOLVES — it
+	// redirects — so links in already-delivered emails keep working, but nothing new is minted
+	// against it.
+	it('builds a service-issue URL (/issues/[id]) for issue_type=system_error', async () => {
 		resultQueue.push(
 			[{ ...ISSUE_LINK_ROW, issueType: 'system_error' }],
 			[{ count: 0 }],
@@ -292,7 +296,7 @@ describe('sendIssueNotificationEmails', () => {
 
 		expect(sendIssueNotificationEmail).toHaveBeenCalledWith(
 			'dev@example.com',
-			'https://app.example/acme/projects/proj-1/issues/issue-2',
+			'https://app.example/issues/issue-2',
 			'resolved',
 			'Login broken'
 		);

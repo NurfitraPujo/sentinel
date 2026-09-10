@@ -1,5 +1,5 @@
 import type { RequestHandler } from './$types';
-import { json } from '@sveltejs/kit';
+import { json, isHttpError } from '@sveltejs/kit';
 import { db } from '$lib/server/db';
 import { alertConfigs, projectMembers, projects, organizationMembers, projectEnvironments } from '$lib/db/schema';
 import { requireAuth } from '$lib/server/auth';
@@ -379,7 +379,10 @@ export const GET: RequestHandler = async ({ locals }) => {
 
 		return json(configs.map(toApiShape), { status: 200 });
 	} catch (error) {
-		if (error instanceof Error && error.message === 'Authentication required') {
+		// requireAuth throws SvelteKit's HttpError now, not a bare Error whose message could be
+		// string-matched. The 401 body stays byte-identical to what this endpoint has always
+		// returned — `{ error: ... }`, not SvelteKit's own `{ message: ... }` shape.
+		if (isHttpError(error) && error.status === 401) {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
 		log.error('alerts.fetch_failed', { error });
@@ -508,7 +511,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			{ status: 201 }
 		);
 	} catch (error) {
-		if (error instanceof Error && error.message === 'Authentication required') {
+		// requireAuth throws SvelteKit's HttpError now, not a bare Error whose message could be
+		// string-matched. The 401 body stays byte-identical to what this endpoint has always
+		// returned — `{ error: ... }`, not SvelteKit's own `{ message: ... }` shape.
+		if (isHttpError(error) && error.status === 401) {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
 		log.error('alerts.create_failed', { error });
@@ -625,7 +631,10 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 
 		return json(toApiShape(updatedConfig[0]), { status: 200 });
 	} catch (error) {
-		if (error instanceof Error && error.message === 'Authentication required') {
+		// requireAuth throws SvelteKit's HttpError now, not a bare Error whose message could be
+		// string-matched. The 401 body stays byte-identical to what this endpoint has always
+		// returned — `{ error: ... }`, not SvelteKit's own `{ message: ... }` shape.
+		if (isHttpError(error) && error.status === 401) {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
 		log.error('alerts.update_failed', { error });
@@ -663,7 +672,10 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 
 		return json({ success: true }, { status: 200 });
 	} catch (error) {
-		if (error instanceof Error && error.message === 'Authentication required') {
+		// requireAuth throws SvelteKit's HttpError now, not a bare Error whose message could be
+		// string-matched. The 401 body stays byte-identical to what this endpoint has always
+		// returned — `{ error: ... }`, not SvelteKit's own `{ message: ... }` shape.
+		if (isHttpError(error) && error.status === 401) {
 			return json({ error: 'Authentication required' }, { status: 401 });
 		}
 		log.error('alerts.delete_failed', { error });

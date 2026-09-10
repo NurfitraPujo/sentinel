@@ -159,7 +159,7 @@ describe('fetchDecryptedCredentialsForAgent', () => {
 				status: 'active',
 			},
 		];
-		const out = await fetchDecryptedCredentialsForAgent('org-1');
+		const out = await fetchDecryptedCredentialsForAgent('org-1', 'agent-1');
 		expect(out).toEqual([
 			{ id: 'cred-1', provider: 'github', label: 'CI', secret: { token: SECRET_TOKEN } },
 		]);

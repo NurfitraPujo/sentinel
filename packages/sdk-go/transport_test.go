@@ -245,3 +245,137 @@ func TestSendBatchDropsAfterExhaustingRetriesOnNetworkError(t *testing.T) {
 		t.Fatalf("expected a non-nil error describing the failure")
 	}
 }
+
+// The ingestor answers a rate-limited client with 429 + `Retry-After: 60`
+// (apps/ingestor-go/middleware/ratelimit.go). Before this, 429 fell through the
+// generic 4xx branch and the batch was discarded outright, so a rate-limited
+// client silently threw away telemetry it could have delivered moments later.
+func TestSendBatchRetriesOn429ThenSucceeds(t *testing.T) {
+	var requestCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requestCount, 1)
+		if n < 3 {
+			// A tiny Retry-After keeps the test quick while still exercising the
+			// header path rather than the exponential-backoff fallback.
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+
+	var onErrorCalls int32
+	tr := NewTransport(Config{
+		ProjectKey:    "pk_test",
+		Endpoint:      ts.URL,
+		MaxBufferSize: 10,
+		BatchSize:     10,
+		BatchWait:     50 * time.Millisecond,
+		OnError:       func(error) { atomic.AddInt32(&onErrorCalls, 1) },
+	})
+
+	tr.Push(&Event{EventID: "e1", Message: "err"})
+	tr.Flush(10 * time.Second)
+
+	if got := atomic.LoadInt32(&requestCount); got != 3 {
+		t.Fatalf("expected 3 requests (2 rate-limited + 1 success), got %d", got)
+	}
+	if got := atomic.LoadInt32(&onErrorCalls); got != 0 {
+		t.Fatalf("expected OnError not called on eventual success, got %d", got)
+	}
+}
+
+// A permanently rate-limited server must still terminate: retried, then dropped
+// and reported, not retried forever.
+func TestSendBatchDropsAfterExhaustingRetriesOn429(t *testing.T) {
+	var requestCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer ts.Close()
+
+	var onErrorCalls int32
+	tr := NewTransport(Config{
+		ProjectKey:    "pk_test",
+		Endpoint:      ts.URL,
+		MaxBufferSize: 10,
+		BatchSize:     10,
+		BatchWait:     50 * time.Millisecond,
+		OnError:       func(error) { atomic.AddInt32(&onErrorCalls, 1) },
+	})
+
+	tr.Push(&Event{EventID: "e1", Message: "err"})
+	tr.Flush(15 * time.Second)
+
+	if got := atomic.LoadInt32(&requestCount); got != sendMaxAttempts {
+		t.Fatalf("expected %d attempts, got %d", sendMaxAttempts, got)
+	}
+	if got := atomic.LoadInt32(&onErrorCalls); got != 1 {
+		t.Fatalf("expected OnError once after exhausting retries, got %d", got)
+	}
+}
+
+// Every other 4xx must keep its existing behaviour: dropped on the first
+// response, never retried.
+func TestSendBatchStillDropsOtherFourXXImmediately(t *testing.T) {
+	var requestCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	tr := NewTransport(Config{
+		ProjectKey:    "pk_test",
+		Endpoint:      ts.URL,
+		MaxBufferSize: 10,
+		BatchSize:     10,
+		BatchWait:     50 * time.Millisecond,
+	})
+
+	tr.Push(&Event{EventID: "e1", Message: "err"})
+	tr.Flush(5 * time.Second)
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("expected exactly 1 request for a 400, got %d", got)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"empty", "", 0},
+		{"seconds", "30", 30 * time.Second},
+		{"zero", "0", 0},
+		{"negative", "-5", 0},
+		{"garbage", "soon", 0},
+		{"whitespace", "  15  ", 15 * time.Second},
+		// A value beyond the cap must be clamped, not honoured — otherwise a bad
+		// header could park a batch for hours.
+		{"above cap", "86400", sendMaxRetryAfter},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseRetryAfter(tc.in); got != tc.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// The HTTP-date form is accepted too: this header may come from a proxy in
+	// front of the ingestor, not only from the ingestor itself.
+	if got := parseRetryAfter(time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat)); got <= 0 || got > 21*time.Second {
+		t.Fatalf("expected an HTTP-date Retry-After near 20s, got %v", got)
+	}
+	// A date already in the past means "retry now", not "wait".
+	if got := parseRetryAfter(time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)); got != 0 {
+		t.Fatalf("expected 0 for a past HTTP-date, got %v", got)
+	}
+}

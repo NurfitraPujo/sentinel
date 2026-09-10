@@ -163,13 +163,28 @@ describe('GET / page load (§4.4)', () => {
 		expect(listProjectsMock).toHaveBeenCalledWith([PROJECT_A, PROJECT_B]);
 	});
 
-	it('passes an EMPTY authorised set through rather than omitting it — the empty set must deny', async () => {
+	// This asserted that the EMPTY authorised set was passed through to the queries rather than
+	// omitted, because omitting it is what turned `/` into "every issue in the database". `main`'s
+	// nav-guard work (#10) then made an empty set redirect to `/onboarding` before any query runs —
+	// a user who reaches no project has nothing to render and no way to act on it. The two intents
+	// agree on the outcome and `main`'s is stricter: the empty set now denies by never reaching the
+	// query at all, which is asserted here.
+	//
+	// The original property — that `projectIds: []` composes to a predicate matching no row, and is
+	// never dropped — is not lost. It belongs to the query layer and is asserted there against a
+	// real Postgres: src/lib/server/read-guards.integration.test.ts:340, 'an empty authorised set
+	// DENIES rather than admitting every issue in the database'. A mocked query layer cannot tell a
+	// composed predicate from a constructed-and-dropped one anyway (see this file's header).
+	it('redirects an empty authorised set to /onboarding without querying issues at all', async () => {
 		getAccessibleProjectsMock.mockResolvedValue([]);
 
-		await loadWith('');
+		await expect(loadWith('')).rejects.toMatchObject({
+			status: 303,
+			location: '/onboarding',
+		});
 
-		expect(listIssuesMock.mock.calls[0][0].projectIds).toEqual([]);
-		expect(countIssuesMock.mock.calls[0][0].projectIds).toEqual([]);
-		expect(listProjectsMock).toHaveBeenCalledWith([]);
+		expect(listIssuesMock).not.toHaveBeenCalled();
+		expect(countIssuesMock).not.toHaveBeenCalled();
+		expect(listProjectsMock).not.toHaveBeenCalled();
 	});
 });

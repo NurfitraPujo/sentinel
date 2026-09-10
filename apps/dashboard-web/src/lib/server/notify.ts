@@ -353,8 +353,13 @@ async function getIssueLinkInfo(
 
 /**
  * §8/§10: reports vs service-issue path, by `issue_type` -- `/[orgSlug]/reports/[issueId]` for
- * `user_report` (routes/[orgSlug]/reports/[issueId]), `/[orgSlug]/projects/[projectId]/issues/
- * [issueId]` for `system_error` (routes/[orgSlug]/projects/[projectId]/issues/[issueId]).
+ * `user_report` (routes/[orgSlug]/reports/[issueId]), `/issues/[id]` for `system_error`.
+ *
+ * The service-issue half used to emit `/[orgSlug]/projects/[projectId]/issues/[issueId]`. Issue
+ * detail existed at two URLs and that was the one nothing in the UI linked; `/issues/[id]` is now
+ * the single canonical address (owner's call, 2026-09-08). The old path is kept as a redirect
+ * rather than deleted precisely because THIS function put it into emails that are already
+ * delivered -- deleting the route would 404 every historical notification link.
  */
 function buildIssueUrl(
 	origin: string,
@@ -365,5 +370,5 @@ function buildIssueUrl(
 	if (info.issueType === 'user_report') {
 		return `${trimmedOrigin}/${info.orgSlug}/reports/${issueId}`;
 	}
-	return `${trimmedOrigin}/${info.orgSlug}/projects/${info.projectId}/issues/${issueId}`;
+	return `${trimmedOrigin}/issues/${issueId}`;
 }

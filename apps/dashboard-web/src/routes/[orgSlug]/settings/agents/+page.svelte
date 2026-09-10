@@ -47,7 +47,7 @@
 	}
 
 	interface Props {
-		data: { orgId: string; orgSlug: string; agents: AgentRow[] };
+		data: { orgId: string; orgSlug: string; agents: AgentRow[]; projects: { id: string; name: string }[] };
 	}
 
 	let { data }: Props = $props();
@@ -154,6 +154,55 @@
 		newCredToken = '';
 		newCredUsername = '';
 		newCredAppPassword = '';
+	}
+
+	// 1724300000: an agent's project grants. The master switch above says WHETHER an agent may
+	// fetch credentials at all; these say WHICH projects' credentials are in range. Org-wide
+	// credentials (no project) still reach any agent past the switch — narrowing is opt-in, per
+	// credential, so no already-deployed worker loses access when this ships.
+	let grantsForAgent = $state<Record<string, string[]>>({});
+	let grantsLoaded = $state<Record<string, boolean>>({});
+	let savingGrantsFor = $state<string | null>(null);
+
+	async function loadGrants(agentId: string) {
+		if (grantsLoaded[agentId]) return;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/credential-grants`);
+			if (!res.ok) {
+				showToast('Failed to load credential scope');
+				return;
+			}
+			const body = await res.json();
+			grantsForAgent = { ...grantsForAgent, [agentId]: body.projectIds ?? [] };
+			grantsLoaded = { ...grantsLoaded, [agentId]: true };
+		} catch {
+			showToast('Failed to load credential scope');
+		}
+	}
+
+	async function toggleGrant(agentId: string, projectId: string, granted: boolean) {
+		const current = grantsForAgent[agentId] ?? [];
+		const next = granted ? [...new Set([...current, projectId])] : current.filter((id) => id !== projectId);
+
+		savingGrantsFor = agentId;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/credential-grants`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ projectIds: next })
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to save credential scope' }));
+				showToast(err.message || 'Failed to save credential scope');
+				return;
+			}
+			const body = await res.json();
+			grantsForAgent = { ...grantsForAgent, [agentId]: body.projectIds ?? next };
+		} catch {
+			showToast('Failed to save credential scope');
+		} finally {
+			savingGrantsFor = null;
+		}
 	}
 
 	function credentialSecretBody(): Record<string, string> | null {
@@ -496,6 +545,43 @@
 							{/if}
 						</div>
 					</div>
+
+					{#if agent.canAccessRepoCredentials}
+						<details class="credential-scope" ontoggle={() => loadGrants(agent.id)}>
+							<summary>
+								Credential scope
+								{#if grantsLoaded[agent.id]}
+									<span class="scope-count">
+										{(grantsForAgent[agent.id] ?? []).length === 0
+											? 'org-wide credentials only'
+											: `${(grantsForAgent[agent.id] ?? []).length} project(s)`}
+									</span>
+								{/if}
+							</summary>
+							<p class="scope-help">
+								Credentials with no project are delivered to this agent regardless. Tick a project to
+								also deliver credentials bound to that project.
+							</p>
+							{#if data.projects.length === 0}
+								<p class="scope-help">This organization has no projects yet.</p>
+							{:else}
+								<div class="scope-list">
+									{#each data.projects as project}
+										<label class="scope-item">
+											<input
+												type="checkbox"
+												disabled={savingGrantsFor === agent.id || !grantsLoaded[agent.id]}
+												checked={(grantsForAgent[agent.id] ?? []).includes(project.id)}
+												onchange={(e) =>
+													toggleGrant(agent.id, project.id, (e.currentTarget as HTMLInputElement).checked)}
+											/>
+											{project.name}
+										</label>
+									{/each}
+								</div>
+							{/if}
+						</details>
+					{/if}
 
 					<div class="agent-keys">
 						{#if !keysLoaded}
@@ -1080,5 +1166,44 @@
 	.credential-form button:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
+	}
+
+	.credential-scope {
+		margin: 0.5rem 0 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.75rem;
+	}
+
+	.credential-scope summary {
+		cursor: pointer;
+		font-size: 0.8125rem;
+		font-weight: 500;
+	}
+
+	.scope-count {
+		font-weight: 400;
+		color: var(--text-muted);
+		margin-left: 0.375rem;
+	}
+
+	.scope-help {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		margin: 0.5rem 0;
+		line-height: 1.4;
+	}
+
+	.scope-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.scope-item {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.8125rem;
 	}
 </style>

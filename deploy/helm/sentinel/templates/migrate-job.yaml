@@ -10,9 +10,15 @@ metadata:
     app.kubernetes.io/component: migrate
   annotations:
     # Run migrations before the app pods start, on every install and upgrade.
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # ArgoCD Sync hook (not a plain manifest, not a Helm hook): ArgoCD strips
+    # Helm hooks, and a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up (health Missing gates wave 2). As a Sync hook
+    # in wave 1 it runs after infra (wave -1/0), gates app Deployments
+    # (wave 2), and HookSucceeded+BeforeHookCreation deletes the completed Job
+    # so the next release re-runs fresh without spec.template immutability.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
+    "argocd.argoproj.io/sync-wave": "1"
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
   template:
@@ -22,6 +28,10 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}

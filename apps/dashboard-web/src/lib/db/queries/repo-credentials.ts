@@ -1,6 +1,6 @@
 import { db } from '$lib/server/db';
-import { repoCredentials, auditLogs } from '$lib/db/schema';
-import { eq, and, desc } from 'drizzle-orm';
+import { repoCredentials, auditLogs, agentRepoCredentialGrants } from '$lib/db/schema';
+import { eq, and, or, desc, isNull, inArray } from 'drizzle-orm';
 import {
 	encryptRepoCredentialSecret,
 	decryptRepoCredentialSecret,
@@ -27,6 +27,8 @@ export interface RepoCredentialListItem {
 	provider: RepoCredentialProvider;
 	label: string;
 	secretPrefix: string;
+	/** null = org-wide. */
+	projectId: string | null;
 	status: 'active' | 'revoked';
 	createdBy: string;
 	createdAt: Date | null;
@@ -42,6 +44,7 @@ const listColumns = {
 	provider: repoCredentials.provider,
 	label: repoCredentials.label,
 	secretPrefix: repoCredentials.secretPrefix,
+	projectId: repoCredentials.projectId,
 	status: repoCredentials.status,
 	createdBy: repoCredentials.createdBy,
 	createdAt: repoCredentials.createdAt,
@@ -73,6 +76,8 @@ export async function createRepoCredential(
 		provider: RepoCredentialProvider;
 		label: string;
 		secret: RepoCredentialSecret;
+		/** Bind the credential to one project. Omitted/null = org-wide, the pre-1724300000 shape. */
+		projectId?: string | null;
 	}
 ): Promise<RepoCredentialListItem> {
 	const enc = encryptRepoCredentialSecret(data.orgId, data.secret);
@@ -88,6 +93,7 @@ export async function createRepoCredential(
 			keyVersion: enc.keyVersion,
 			status: 'active',
 			createdBy: actorUserId,
+			projectId: data.projectId ?? null,
 		})
 		.returning(listColumns);
 
@@ -96,7 +102,14 @@ export async function createRepoCredential(
 		resourceType: 'repo_credential',
 		resourceId: row.id,
 		actorId: actorUserId,
-		metadata: { orgId: data.orgId, provider: data.provider, label: data.label },
+		metadata: {
+			orgId: data.orgId,
+			provider: data.provider,
+			label: data.label,
+			// Recorded because it is the scope decision — an auditor reading this line needs to know
+			// whether the credential was created org-wide or bound to one project.
+			projectId: data.projectId ?? null,
+		},
 	});
 
 	return row as RepoCredentialListItem;
@@ -197,16 +210,50 @@ export interface DecryptedRepoCredential {
 
 /**
  * The ONLY decrypting read path. Caller (GET /api/agent/repo-credentials) is responsible for the
- * can_access_repo_credentials gate and for auditing each served credential id. Serves active
- * rows only; stamps last_fetched_at.
+ * can_access_repo_credentials master switch and for auditing each served credential id. Serves
+ * active rows only; stamps last_fetched_at.
+ *
+ * SCOPE (1724300000_add_repo_credential_project_scope.sql). This used to return every active
+ * credential in the organization, so an agent working on one project received the git tokens for
+ * all of them. It now returns:
+ *
+ *   - org-wide credentials (`project_id IS NULL`) — unchanged behaviour, and what every row
+ *     created before the migration is, so no deployed worker loses access;
+ *   - project-scoped credentials ONLY for projects this agent holds a grant for.
+ *
+ * `agentId` is taken from the authenticated agent context, never from the request — the grant set
+ * is read here rather than passed in, so no caller can widen its own scope.
  */
 export async function fetchDecryptedCredentialsForAgent(
-	orgId: string
+	orgId: string,
+	agentId: string
 ): Promise<DecryptedRepoCredential[]> {
+	const grants = await db
+		.select({ projectId: agentRepoCredentialGrants.projectId })
+		.from(agentRepoCredentialGrants)
+		.where(eq(agentRepoCredentialGrants.agentId, agentId));
+	const grantedProjectIds = grants.map((g) => g.projectId);
+
+	// `inArray` with an empty list is not a safe way to express "match nothing" across drizzle
+	// versions, so an agent with no grants is expressed as the org-wide clause alone.
+	const scope =
+		grantedProjectIds.length > 0
+			? or(
+					isNull(repoCredentials.projectId),
+					inArray(repoCredentials.projectId, grantedProjectIds)
+				)
+			: isNull(repoCredentials.projectId);
+
 	const rows = await db
 		.select()
 		.from(repoCredentials)
-		.where(and(eq(repoCredentials.organizationId, orgId), eq(repoCredentials.status, 'active')))
+		.where(
+			and(
+				eq(repoCredentials.organizationId, orgId),
+				eq(repoCredentials.status, 'active'),
+				scope
+			)
+		)
 		.orderBy(desc(repoCredentials.createdAt));
 
 	const now = new Date();
@@ -229,4 +276,51 @@ export async function fetchDecryptedCredentialsForAgent(
 		});
 	}
 	return out;
+}
+
+/**
+ * 1724300000: an agent's project grants — the scope for project-bound credentials.
+ * `agents.can_access_repo_credentials` remains the outer master switch; these say WHICH projects.
+ */
+export async function listAgentCredentialGrants(agentId: string): Promise<string[]> {
+	const rows = await db
+		.select({ projectId: agentRepoCredentialGrants.projectId })
+		.from(agentRepoCredentialGrants)
+		.where(eq(agentRepoCredentialGrants.agentId, agentId));
+	return rows.map((r) => r.projectId);
+}
+
+/**
+ * Replaces an agent's grants wholesale. A set-semantics write rather than add/remove verbs: the UI
+ * edits a checklist, and a partial apply would leave an agent holding a scope nobody chose.
+ *
+ * Callers MUST have already verified that `agentId` and every id in `projectIds` belong to `orgId`
+ * — this function does not re-derive org membership, and a project id from another tenant written
+ * here would be a cross-tenant grant.
+ */
+export async function replaceAgentCredentialGrants(
+	actorUserId: string,
+	agentId: string,
+	projectIds: string[]
+): Promise<string[]> {
+	const unique = [...new Set(projectIds)];
+
+	await db.transaction(async (tx) => {
+		await tx.delete(agentRepoCredentialGrants).where(eq(agentRepoCredentialGrants.agentId, agentId));
+		if (unique.length > 0) {
+			await tx.insert(agentRepoCredentialGrants).values(
+				unique.map((projectId) => ({ agentId, projectId, createdBy: actorUserId }))
+			);
+		}
+	});
+
+	await db.insert(auditLogs).values({
+		action: 'agent.repo_credential_grants_replaced',
+		resourceType: 'agent',
+		resourceId: agentId,
+		actorId: actorUserId,
+		metadata: { projectIds: unique },
+	});
+
+	return unique;
 }

@@ -56,6 +56,30 @@ type Event struct {
 	ReleaseVersion string `json:"release_version,omitempty"`
 	TraceID        string `json:"trace_id,omitempty"`
 	SpanID         string `json:"span_id,omitempty"`
+	// TraceFlags is the W3C trace-flags byte from the originating span context —
+	// bit 0 is "sampled". The ingestor accepts it (validation.ErrorPayload.TraceFlags),
+	// the mapper forwards it and the processor stores it, so dropping it here was the
+	// only reason SDK-originated events arrived with sampled-ness lost. Not omitempty:
+	// 0 is a meaningful value (an unsampled span), distinct from "no trace context",
+	// which is already expressed by TraceID being empty.
+	TraceFlags uint32 `json:"trace_flags"`
+	// Fingerprint is an optional custom grouping key. Leave it empty — the normal
+	// case — and the server computes one from the error class and stacktrace.
+	// Set it and the server stores it VERBATIM as the issue's fingerprint, so two
+	// events sharing a value are the same issue and two differing values are not,
+	// whatever their stacktraces look like.
+	//
+	// Maximum 64 characters: it is written unhashed into issues.fingerprint
+	// VARCHAR(64), and the ingestor rejects the event with a 400 rather than
+	// truncating, because a shortened grouping key would silently merge issues
+	// that were meant to stay apart.
+	//
+	// The proto's companion `fingerprint_override` is deliberately NOT exposed
+	// here. Its effect is the reverse of what the name suggests — it forces the
+	// SERVER to recompute and discards whatever Fingerprint was sent with it
+	// (apps/processor-go/event/event.go:177) — so an SDK field for it would be a
+	// switch whose only function is to throw away the value next to it.
+	Fingerprint string `json:"fingerprint,omitempty"`
 	// Metadata carries user tags and PII-scrubbed context. Previously
 	// emitted as "context", which the ingestor never read (VERIFIED_STATE.md
 	// S4) - the field the server actually maps is "metadata".

@@ -71,6 +71,18 @@ jobs:
     timeout-minutes: 30
     needs: [lint-helm-huawei]
     strategy:
+      # A single image build failing must not cancel the others. The buildkit daemon on the
+      # self-hosted runners dies mid-build under load ("received prior goaway ... graceful_stop"):
+      # six occurrences on 2026-09-08/09, and each one took every sibling image down with it —
+      # on PR #16 one processor failure cancelled all six images, including a dashboard image
+      # whose own build had nothing wrong with it. Containing that is the difference between
+      # rerunning one job and rerunning a whole release.
+      fail-fast: false
+      # And the likely reason the daemon dies at all: every image built concurrently on one
+      # runner. Two at a time still parallelises the slow Go builds without asking one machine to
+      # host six simultaneous docker builds. Raise this once the daemon is understood — it is a
+      # throughput knob, not a correctness one.
+      max-parallel: 2
       matrix:
         include:
           - image: sentinel-ingestor
@@ -90,9 +102,6 @@ jobs:
             context: .
           - image: sentinel-nats-init
             dockerfile: scripts/Dockerfile.nats-init
-            context: scripts
-          - image: sentinel-minio-init
-            dockerfile: scripts/Dockerfile.minio-init
             context: scripts
     steps:
       - name: Checkout code
@@ -157,7 +166,7 @@ jobs:
   deploy-production:
     name: Deploy Production Environment
     needs: [gate-production]
-    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@88b33a7e98ee773ebd33d55e80914b1bcce326be # main as of 2026-09-04, PR #97 stale-key unset fix
+    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
     with:
       runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
       app_name: "sentinel-production"
@@ -171,7 +180,6 @@ jobs:
         images.migrate.tag=${{ github.ref_name }}
         images.dlqDrainer.tag=${{ github.ref_name }}
         init.nats.tag=${{ github.ref_name }}
-        init.minio.tag=${{ github.ref_name }}
       sync: true
       wait: true
       wait_timeout: 600

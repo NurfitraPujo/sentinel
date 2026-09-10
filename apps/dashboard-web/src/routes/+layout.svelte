@@ -18,10 +18,20 @@
 			<nav class="nav-menu">
 				<a href="/" class="nav-link active">Dashboard</a>
 				<a href="/issues" class="nav-link">Issues</a>
+				<!-- /search had exactly one inbound link in the entire app: its own "Clear" button.
+				     The page works and is substantial (trace/span/request/tenant/user filters), it
+				     just could not be found from anywhere. -->
+				<a href="/search" class="nav-link">Search</a>
 				{#if data.orgSlug}
 					<a href="/{data.orgSlug}/reports" class="nav-link">Reports</a>
+					<a href="/{data.orgSlug}/projects" class="nav-link">Projects</a>
 				{/if}
-				<a href="/settings" class="nav-link">Settings</a>
+				<!-- Settings points at the ORGANIZATION's settings when the user has one. Every
+				     org-scoped page — API keys above all — used to be reachable only by typing its
+				     URL, because this link went to the global /settings (alerts, auth,
+				     observability) and nothing anywhere linked to the org pages. The org settings
+				     index lists the global sections too, so nothing became unreachable in trade. -->
+				<a href={data.orgSlug ? `/${data.orgSlug}/settings` : '/settings'} class="nav-link">Settings</a>
 			</nav>
 			<div class="user-menu">
 				{#if data.session}

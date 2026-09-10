@@ -20,6 +20,13 @@ data:
   OTEL_SERVICE_NAME_PROCESSOR: "processor-go"
   OTEL_SERVICE_NAME_DASHBOARD: "dashboard-web"
   RATELIMIT_STRICT_MODE: {{ .Values.config.ingestor.ratelimitStrictMode | quote }}
+  # Where the dashboard's /settings/observability page fetches processor and ingestor health.
+  # These were never set in this chart, and lib/server/observability.ts falls back to
+  # http://localhost:8081 / :8080 when they are absent — so the dashboard fetched ITSELF on ports
+  # nothing listens on, and the page reported both services "offline" with "Database: unreachable"
+  # while both were healthy. In-cluster service DNS by default; overridable per environment.
+  PROCESSOR_HEALTH_URL: {{ .Values.config.dashboard.processorHealthUrl | default (printf "http://%s-processor:%v" (include "sentinel.fullname" .) .Values.processor.service.port) | quote }}
+  INGESTOR_HEALTH_URL: {{ .Values.config.dashboard.ingestorHealthUrl | default (printf "http://%s-ingestor:%v" (include "sentinel.fullname" .) .Values.ingestor.service.port) | quote }}
   AUTH_URL: {{ .Values.config.dashboard.authUrl | quote }}
   AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
   EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}

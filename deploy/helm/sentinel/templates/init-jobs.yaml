@@ -9,10 +9,13 @@ metadata:
     {{- include "sentinel.labels" . | nindent 4 }}
     app.kubernetes.io/component: nats-init
   annotations:
-    # Create the JetStream streams after NATS is up, before the app pods consume them.
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "-2"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # Create the JetStream streams before the app pods (wave 2) consume them.
+    # ArgoCD Sync hook: a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up. HookSucceeded+BeforeHookCreation deletes the
+    # completed Job so the next release re-runs fresh.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
+    "argocd.argoproj.io/sync-wave": "1"
 spec:
   backoffLimit: 5
   template:
@@ -22,6 +25,10 @@ spec:
         app.kubernetes.io/component: nats-init
     spec:
       restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: nats-init
           image: "{{ .Values.init.nats.image }}:{{ .Values.init.nats.tag | default .Chart.AppVersion }}"
@@ -59,6 +66,10 @@ spec:
         app.kubernetes.io/component: minio-init
     spec:
       restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: minio-init
           image: "{{ .Values.init.minio.image }}:{{ .Values.init.minio.tag | default .Chart.AppVersion }}"

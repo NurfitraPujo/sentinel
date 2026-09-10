@@ -570,3 +570,47 @@ export async function listOrganizationInvitations(organizationId: string) {
     .where(eq(organizationInvitations.organizationId, organizationId));
 }
 
+
+/**
+ * Creates a project inside an organization and makes the creator a project member.
+ *
+ * The membership row is the point: `getUserProjectAccess` (lib/server/projects.ts) reads
+ * `project_members`, and the dashboard's issue list is scoped to what it returns. A project
+ * created without one is invisible to the person who just created it.
+ *
+ * `projects.api_key` / `api_key_hash` are NOT NULL legacy columns that NOTHING authenticates
+ * against — ingestion resolves a key through `project_api_keys.key_hash`
+ * (apps/ingestor-go/auth/apikey.go). They are filled with an inert unique placeholder, the same
+ * shape the auto-provisioned Triage inbox project uses, and the real SDK key is minted afterwards
+ * through the existing key UI. Storing a usable secret here would be a credential nothing checks.
+ */
+export async function createProject(
+	userId: string,
+	organizationId: string,
+	data: { name: string }
+) {
+	const placeholder = crypto.randomBytes(24).toString('hex');
+
+	return await db.transaction(async (tx) => {
+		const [project] = await tx
+			.insert(projects)
+			.values({
+				organizationId,
+				name: data.name,
+				apiKey: `proj_${placeholder}`,
+				apiKeyHash: crypto.createHash('sha256').update(placeholder).digest('hex'),
+			})
+			.returning();
+
+		await tx.insert(projectMembers).values({
+			projectId: project.id,
+			userId,
+			// 'admin' of the project they created — project_members.role is CHECKed against
+			// ('admin','developer','viewer','support'); 'owner' is an ORGANIZATION role and would
+			// violate the constraint.
+			role: 'admin',
+		});
+
+		return project;
+	});
+}

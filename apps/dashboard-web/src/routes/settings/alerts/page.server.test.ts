@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { error } from '@sveltejs/kit';
 
 // A chainable Drizzle-query double (same pattern as api/alerts/alerts.test.ts and
 // organizations/keys.test.ts): every select/join/where chains through to `then`, and each test
@@ -50,7 +51,8 @@ vi.mock('$lib/server/auth', () => ({
 	requireAuth: vi.fn(async ({ locals }: any) => {
 		const session = await locals.auth?.();
 		if (!session?.user?.id) {
-			throw new Error('Authentication required');
+			// Mirrors the real requireAuth: SvelteKit's HttpError, not a bare Error.
+			error(401, 'Authentication required');
 		}
 		return { id: session.user.id, email: 'user@example.com' };
 	}),
@@ -218,7 +220,12 @@ describe('settings/alerts +page.server.ts load (D13 — exercises the real loade
 	});
 
 	it('401s (throws) for an unauthenticated caller before touching the database', async () => {
-		await expect(load({ locals: locals(null) } as any)).rejects.toThrow('Authentication required');
+		// requireAuth throws SvelteKit's HttpError, which is not an Error subclass — assert on the
+		// status and body rather than on a message string.
+		await expect(load({ locals: locals(null) } as any)).rejects.toMatchObject({
+			status: 401,
+			body: { message: 'Authentication required' },
+		});
 		expect(dbMock.select).not.toHaveBeenCalled();
 	});
 });

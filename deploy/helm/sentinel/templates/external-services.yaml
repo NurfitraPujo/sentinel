@@ -13,6 +13,13 @@ metadata:
   labels:
     app.kubernetes.io/name: {{ .name }}
     app.kubernetes.io/managed-by: Helm
+  annotations:
+    # ArgoCD applies lower waves first and waits for health before the next
+    # wave: bridge (-1) -> migrate Job (1) -> app Deployments (2). The migrate
+    # Job dials these names, so they must exist before it runs. (Helm hooks
+    # were tried first but ArgoCD deletes hook resources post-sync, which
+    # removed the ServiceAccount and broke pod creation.)
+    "argocd.argoproj.io/sync-wave": "-1"
 spec:
   type: ClusterIP
   ports:
@@ -27,6 +34,8 @@ metadata:
   labels:
     app.kubernetes.io/name: {{ .name }}
     app.kubernetes.io/managed-by: Helm
+  annotations:
+    "argocd.argoproj.io/sync-wave": "-1"
 subsets:
   - addresses:
       - ip: {{ required (printf "externalServices entry %s needs an ip" .name) .ip | quote }}

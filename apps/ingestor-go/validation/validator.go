@@ -48,6 +48,24 @@ type ErrorPayload struct {
 	// field 15) so it survives processor-side normalization untouched — see
 	// VERIFIED_STATE.md S5.
 	ReleaseVersion string `json:"release_version"`
+	// Fingerprint is a client-supplied custom grouping key, mirroring
+	// ErrorEvent.fingerprint (proto field 12). When non-empty it is written
+	// VERBATIM into issues.fingerprint VARCHAR(64) with no server-side hashing,
+	// so the length bound below is not cosmetic: an oversized value would fail
+	// at the INSERT, after the event had already been accepted and published.
+	//
+	// Semantics are the processor's (apps/processor-go/event/event.go:177):
+	// a fingerprint is recomputed when it is empty OR when FingerprintOverride
+	// is set. Supplying one and leaving the flag false is what "custom
+	// grouping" means; see FingerprintOverride below for the trap in its name.
+	Fingerprint string `json:"fingerprint"`
+	// FingerprintOverride mirrors proto field 13. Read the direction carefully:
+	// setting it does NOT mean "my fingerprint overrides yours" — it forces the
+	// SERVER to recompute and DISCARDS any Fingerprint supplied alongside it.
+	// That is what the processor does today, so it is what this decodes; the
+	// name is misleading and is documented rather than changed, because
+	// changing it would alter behaviour for anything already sending it.
+	FingerprintOverride bool `json:"fingerprint_override"`
 	// ProjectID mirrors ErrorEvent.project_id (proto field 16). It is decoded
 	// here so the field exists on the wire type, but it MUST NOT be trusted
 	// from the request body in production: it has to be overwritten from the
@@ -70,6 +88,11 @@ type StackFrame struct {
 
 const (
 	MaxStacktraceFrames = 100
+	// MaxFingerprintLength matches issues.fingerprint VARCHAR(64) (1716508800_init.sql)
+	// and the "error_event.fingerprint" CEL rule in the proto. A client fingerprint
+	// is stored unhashed, so exceeding the column is a real failure mode, not a
+	// theoretical one.
+	MaxFingerprintLength = 64
 	MaxMetadataSize     = 64 * 1024
 	MaxMessageLength    = 10000
 	MaxFilePathLength   = 512
@@ -121,6 +144,14 @@ func ValidatePayload(payload *ErrorPayload) ValidationResult {
 	if len(metadataBytes) > MaxMetadataSize {
 		result.Valid = false
 		result.Errors = append(result.Errors, ValidationError{Field: "metadata", Message: fmt.Sprintf("metadata must not exceed %d bytes", MaxMetadataSize)})
+	}
+
+	// Rejected here rather than truncated: silently shortening a grouping key would
+	// merge issues the caller meant to keep apart, which is worse than a 400 that
+	// says what was wrong.
+	if len(payload.Fingerprint) > MaxFingerprintLength {
+		result.Valid = false
+		result.Errors = append(result.Errors, ValidationError{Field: "fingerprint", Message: fmt.Sprintf("fingerprint must not exceed %d characters", MaxFingerprintLength)})
 	}
 
 	for i, frame := range payload.Stacktrace {

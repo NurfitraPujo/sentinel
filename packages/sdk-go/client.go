@@ -70,9 +70,10 @@ func (c *Client) CaptureErrorContext(ctx context.Context, err error, additionalC
 	}
 
 	event := NewEvent(c.cfg, err, ctxTags)
-	traceID, spanID := ExtractTraceIDs(ctx)
+	traceID, spanID, traceFlags := ExtractTraceContext(ctx)
 	event.TraceID = traceID
 	event.SpanID = spanID
+	event.TraceFlags = traceFlags
 
 	c.transport.Push(event)
 }

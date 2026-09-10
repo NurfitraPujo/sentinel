@@ -126,6 +126,11 @@ config:
     # §4.5's per-key upload throttle and rolling-24h byte ceiling (SR-5, counted in Postgres).
     reportUploadRpm: "10"
     reportUploadBytesPerDay: "262144000"
+    # Health endpoints the observability page reads. Left empty on purpose: the configmap then
+    # derives in-cluster service DNS from the release name, which is correct for every normal
+    # deployment. Set these only when processor/ingestor are reachable somewhere else.
+    processorHealthUrl: ""
+    ingestorHealthUrl: ""
     # Retention-cron knobs (N9). Code defaults are 24 / 365; set explicitly
     # per env to make them visible and tunable.
     claimStaleHours: "24"

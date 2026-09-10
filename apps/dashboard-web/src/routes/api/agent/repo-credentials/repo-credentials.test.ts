@@ -92,8 +92,10 @@ describe('GET /api/agent/repo-credentials', () => {
 		expect(res.headers.get('cache-control')).toBe('no-store');
 		const body = await res.json();
 
-		// Tenant scope came from the authenticated context, nowhere else.
-		expect(fetchDecryptedCredentialsForAgent).toHaveBeenCalledWith('org-1');
+		// Tenant scope AND agent identity came from the authenticated context, nowhere else. The
+		// agent id is what decides which project-scoped credentials are in range (1724300000), so
+		// taking it from the request would let a caller widen its own scope.
+		expect(fetchDecryptedCredentialsForAgent).toHaveBeenCalledWith('org-1', 'agent-1');
 		expect(body.credentials).toEqual([
 			{ id: 'cred-1', provider: 'github', label: 'CI bot', secret: { token: 'ghp_abc' } },
 			{

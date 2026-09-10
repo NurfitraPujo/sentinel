@@ -23,6 +23,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const accessibleProjects = await getAccessibleProjects(user.id);
 	const authorizedProjectIds = accessibleProjects.map((p) => p.id);
 
+	// A user who has just signed in for the first time has no organization and no project, so this
+	// page could only ever render an empty list with no way to act on it. Send them to the one
+	// place that can fix that. Only when they have NOTHING — a member of a project with no issues
+	// yet still gets the real (empty) dashboard. Under the widened derivation above this fires for
+	// strictly fewer users than it did on `main`: organization-role staff now reach a real project
+	// set and no longer land on /onboarding.
+	if (authorizedProjectIds.length === 0) {
+		redirect(303, '/onboarding');
+	}
+
 	// §2.2's guard, resolved once for every project the caller can reach. One round trip, and the
 	// one derivation of "which environments may this user see" — a project absent from the map is
 	// unrestricted, never denied.

@@ -2,25 +2,66 @@
   export let filters = { status: 'all', assignee: 'all' };
 </script>
 
-<div class="flex items-center space-x-4 p-4 bg-gray-50 border-b border-gray-200">
-  <div class="flex items-center space-x-2">
-    <label for="status-filter" class="text-sm font-medium text-gray-700">Status</label>
-    <select id="status-filter" bind:value={filters.status} class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+<div class="filter-bar">
+  <div class="filter-group">
+    <label for="status-filter" class="filter-label">Status</label>
+    <select id="status-filter" bind:value={filters.status} class="filter-select">
       <option value="all">All</option>
       <option value="unresolved">Unresolved</option>
       <option value="resolved">Resolved</option>
     </select>
   </div>
-  <div class="flex items-center space-x-2">
-    <label for="assignee-filter" class="text-sm font-medium text-gray-700">Assignee</label>
-    <select id="assignee-filter" bind:value={filters.assignee} class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+  <div class="filter-group">
+    <label for="assignee-filter" class="filter-label">Assignee</label>
+    <select id="assignee-filter" bind:value={filters.assignee} class="filter-select">
       <option value="all">All</option>
       <option value="unassigned">Unassigned</option>
       <option value="me">Me</option>
     </select>
   </div>
-  <div class="flex-grow"></div>
+  <div class="filter-spacer"></div>
   <div>
-    <input type="text" placeholder="Search issues..." class="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 rounded-md" />
+    <input type="text" placeholder="Search issues..." class="filter-search" />
   </div>
 </div>
+
+<style>
+  /* Rewritten from Tailwind utility classes, which never resolved — this project has no Tailwind.
+     The original `bg-gray-50` / `text-gray-700` were light-theme defaults in a dark application. */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem;
+    background-color: var(--bg-surface);
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .filter-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .filter-label {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .filter-select {
+    padding: 0.375rem 0.625rem;
+    font-size: 0.875rem;
+  }
+
+  .filter-spacer {
+    flex-grow: 1;
+  }
+
+  .filter-search {
+    padding: 0.375rem 0.625rem;
+    font-size: 0.875rem;
+    min-width: 14rem;
+  }
+</style>

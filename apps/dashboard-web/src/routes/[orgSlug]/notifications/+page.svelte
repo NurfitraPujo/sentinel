@@ -37,7 +37,10 @@
 		if (item.issueType === 'user_report') {
 			return `/${item.orgSlug}/reports/${item.issueId}`;
 		}
-		return `/${item.orgSlug}/projects/${item.projectId}/issues/${item.issueId}`;
+		// Service issues live at the canonical /issues/[id]. The org-scoped path still resolves
+		// (it redirects there) so links in already-delivered notification emails keep working, but
+		// nothing new should be minted against it.
+		return `/issues/${item.issueId}`;
 	}
 
 	function actorLabel(item: (typeof items)[number]): string {

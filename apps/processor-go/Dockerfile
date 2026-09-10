@@ -5,7 +5,16 @@ RUN apk add --no-cache git
 
 WORKDIR /app
 
-# Copy entire project for module resolution
+# Huawei Cloud runners fetch modules over flaky international egress:
+# use the China proxy mirror so `go mod download` doesn't stall.
+ENV GOPROXY=https://goproxy.cn,direct
+
+# Copy module manifests first so the dependency layer stays cached
+# across rebuilds (same pattern as cdc-pipeline Dockerfile).
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source and build from project root.
 COPY . .
 
 # Build from project root
@@ -29,7 +38,6 @@ USER appuser
 ENV POSTGRES_HOST=localhost
 ENV POSTGRES_PORT=5432
 ENV POSTGRES_USER=sentinel
-ENV POSTGRES_PASSWORD=changeme
 ENV POSTGRES_DB=sentinel
 ENV NATS_URL=nats://localhost:4222
 
