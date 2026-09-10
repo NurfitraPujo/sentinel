@@ -1006,6 +1006,87 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))(
 					expect(await escalationRows(issueId)).toHaveLength(2);
 				});
 			});
+
+			/**
+			 * THE READ SIDE of decision 38, and the half that was inert.
+			 *
+			 * Decision 38 says the unscoped page "exists in email and in `notifications` rows". The rows
+			 * were written — the tests above prove that — but every recipient of one is BY CONSTRUCTION a
+			 * person who does not hold the issue's environment (that is the trigger for the fallback), and
+			 * all three read helpers in `lib/db/queries/notifications.ts` filter on
+			 * `environmentScopeCondition(resolveEnvironmentScopes(userId))` over the joined `issues` row.
+			 * So the list, the `/notifications` page count and the bell badge each dropped the one row the
+			 * fallback existed to deliver: half of decision 38 was a write nobody could ever see.
+			 *
+			 * The exemption is deliberately NARROW — `kind = 'escalated'` AND `payload->>'unscoped' =
+			 * 'true'`, the marker decision 38 already writes (nothing new is persisted) — so the last
+			 * assertion here is the negative control: an ordinary notification about a production issue is
+			 * still invisible to a `{staging}` user. A fix that widened into "notifications are not scoped"
+			 * would pass every positive assertion below and fail that one.
+			 *
+			 * Counts are asserted as DELTAS around the fallback, never as absolutes: this file seeds many
+			 * reports for the same engineers against one disposable database, so an absolute count would
+			 * assert on whatever else happened to run first.
+			 */
+			describe('the rows are READABLE by the people they were written for (decision 38)', () => {
+				it('survives the environment predicate in listNotifications, the count and the badge', async () => {
+					const { listNotifications, getNotificationCount, getUnreadNotificationCount } = await import(
+						'../db/queries/notifications'
+					);
+					await narrowToStaging(ENGINEERS);
+					const reader = ENGINEERS[0];
+
+					// The baseline is taken WITH the narrowing already in force, so the delta below is the
+					// fallback's own row and nothing else.
+					const before = {
+						list: (await listNotifications({ userId: reader, limit: 100 })).length,
+						total: await getNotificationCount(reader),
+						unread: await getUnreadNotificationCount(reader),
+					};
+
+					const issueId = await seedReport();
+					const attempt = await escalation.escalateReportAtIntake({
+						issueId,
+						organizationId: orgId,
+						at: T0,
+						ackMinutes: 15,
+					});
+					// The fallback fired (no chain opened) — otherwise this test would be asserting the
+					// readability of an ordinary escalation notification.
+					expect(attempt.escalation).toBeNull();
+					expect(attempt.notified.map((n) => n.userId)).toContain(reader);
+
+					const after = await listNotifications({ userId: reader, limit: 100 });
+					const row = after.find((n) => n.issueId === issueId);
+					expect(row).toBeDefined();
+					expect(row?.kind).toBe('escalated');
+					expect(row?.payload).toMatchObject({ unscoped: true, environment: 'production' });
+					expect(after.length).toBe(before.list + 1);
+					expect(await getNotificationCount(reader)).toBe(before.total + 1);
+					expect(await getUnreadNotificationCount(reader)).toBe(before.unread + 1);
+				});
+
+				it('does NOT exempt an ordinary notification about the same out-of-scope issue', async () => {
+					const { listNotifications, getUnreadNotificationCount } = await import(
+						'../db/queries/notifications'
+					);
+					await narrowToStaging(ENGINEERS);
+					const reader = ENGINEERS[0];
+					const issueId = await seedReport();
+
+					const unread = await getUnreadNotificationCount(reader);
+					// Same kind, same production issue, no `unscoped` marker: the §2.2 predicate still applies.
+					await sql`
+						insert into notifications (id, user_id, issue_id, kind, actor_type, actor_id, payload)
+						values (${randomUUID()}, ${reader}, ${issueId}, ${'escalated'}, ${'system'}, ${'system'},
+						        ${sql.json({ scheduleId })})
+					`;
+
+					const rows = await listNotifications({ userId: reader, limit: 100 });
+					expect(rows.some((n) => n.issueId === issueId)).toBe(false);
+					expect(await getUnreadNotificationCount(reader)).toBe(unread);
+				});
+			});
 		});
 
 	}

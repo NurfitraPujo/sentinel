@@ -1,6 +1,6 @@
 import { db } from '$lib/server/db';
 import { notifications, issues, projects, organizations, users } from '$lib/db/schema';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, or, sql } from 'drizzle-orm';
 import {
 	environmentScopeCondition,
 	resolveEnvironmentScopes,
@@ -17,6 +17,31 @@ export type { NotificationListItem };
  */
 
 /**
+ * sentinel-project-environments §2.2, decision 38 — the ONE exemption to the §2.2 scope predicate below.
+ *
+ * The unscoped escalation fallback (`escalation.ts: writeUnscopedRotaPage`) writes one
+ * `notifications` row per rota member precisely BECAUSE none of them holds the issue's environment
+ * — that is the trigger for the fallback, not an accident. Every one of those rows is therefore a
+ * row the §2.2 predicate would drop, from the list, from `/notifications`'s count and from the bell
+ * badge alike: decision 38 says the page "exists in email and in `notifications` rows", and without
+ * this half of that is a write nobody can ever see.
+ *
+ * The marker is the one decision 38 already writes, and nothing new is persisted for it (decision
+ * 33 forbids a `notifications_kind_check` migration for a presentation concern): the EXISTING
+ * `escalated` kind plus `payload->>'unscoped' = 'true'` in the existing `jsonb` column.
+ *
+ * It is deliberately narrow — both conjuncts, never `kind = 'escalated'` alone. An ordinary
+ * escalation notification about an out-of-scope issue stays hidden; only a row somebody was
+ * DELIBERATELY paged with, by a rule that already accepted the boundary crossing (contract §12
+ * *Known limits* 5b), survives the scope filter. Widening it to all notifications would turn one
+ * agreed exception into "notifications are not environment-scoped".
+ */
+const UNSCOPED_ESCALATION_PAGE = and(
+	eq(notifications.kind, 'escalated'),
+	sql`${notifications.payload}->>'unscoped' = 'true'`
+);
+
+/**
  * sentinel-project-environments §2.2, decision 25 — the scope predicate all three read helpers
  * carry, resolved from the caller's own id rather than taken as a parameter.
  *
@@ -28,7 +53,10 @@ export type { NotificationListItem };
  * list refuses to show is the §4.4 count leak in the place a user looks every day.
  */
 async function environmentScopePredicate(userId: string) {
-	return environmentScopeCondition(await resolveEnvironmentScopes(userId));
+	const scope = environmentScopeCondition(await resolveEnvironmentScopes(userId));
+	// `undefined` is "no predicate at all" (environment-access.ts) — the unrestricted caller, who
+	// already sees everything. OR-ing the exemption onto nothing would be nothing.
+	return scope === undefined ? undefined : or(scope, UNSCOPED_ESCALATION_PAGE);
 }
 
 const DEFAULT_PAGE_SIZE = 25;
