@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -982,4 +983,195 @@ func TestStoreEvent_RegistryTouchUpdatesDeclaredEnvironmentOnly(t *testing.T) {
 		`SELECT COUNT(*) FROM project_environments WHERE project_id = $1`, projectID).Scan(&registryRows))
 	assert.Equal(t, 1, registryRows,
 		"ingest must TOUCH the registry and never create a row (decision 8) — only §4.3 creates rows")
+}
+
+// ---------------------------------------------------------------------------------------------------
+// BUG-12: the registry touch never fails ingest, and it is counted either way
+// ---------------------------------------------------------------------------------------------------
+
+// collectUnlabelledCounter snapshots the cumulative value of an UNLABELLED int64 counter by name. A
+// family the binary has not recorded to yet is 0, not an error — the §12 instruments are created at
+// procmetrics init but emit nothing until their first Add.
+func collectUnlabelledCounter(t *testing.T, ctx context.Context, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "expected %s to be an int64 Sum, got %T", name, m.Data)
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+		}
+	}
+	return total
+}
+
+// breakRegistryTouch installs a BEFORE UPDATE trigger on project_environments that raises for
+// projectID and nothing else, so the §4.8 UPDATE — and only that statement, for only this test's
+// project — errors against a REAL Postgres. It is dropped again by t.Cleanup, and returned as a
+// function so a test can drop it early and prove the failure was not sticky.
+func breakRegistryTouch(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string) (restore func()) {
+	t.Helper()
+
+	_, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION eid_registry_touch_boom() RETURNS trigger AS $fn$
+		BEGIN
+			IF NEW.project_id::text = %s THEN
+				RAISE EXCEPTION 'simulated project_environments touch failure (BUG-12)';
+			END IF;
+			RETURN NEW;
+		END;
+		$fn$ LANGUAGE plpgsql;
+	`, quoteSQLLiteral(projectID)))
+	require.NoError(t, err, "creating the touch-failure trigger function")
+
+	_, err = pool.Exec(ctx, `
+		CREATE TRIGGER eid_registry_touch_boom
+		BEFORE UPDATE ON project_environments
+		FOR EACH ROW EXECUTE FUNCTION eid_registry_touch_boom()
+	`)
+	require.NoError(t, err, "creating the touch-failure trigger")
+
+	dropped := false
+	drop := func() {
+		if dropped {
+			return
+		}
+		dropped = true
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS eid_registry_touch_boom ON project_environments`)
+		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS eid_registry_touch_boom()`)
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// quoteSQLLiteral single-quotes a value for interpolation into DDL, which takes no bind parameters.
+func quoteSQLLiteral(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+}
+
+// TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent is BUG-12. §4.8 point 1 says "ingest never
+// fails because of the registry" without qualification, and §12 describes a failing touch as
+// first_seen_at/last_seen_at drifting from reality — a counted, logged degradation, NOT a lost
+// event. Returning the UPDATE's error from StoreEvent aborted the transaction and dropped the
+// occurrence AND the issue with it, which is the exact inversion those two sections forbid.
+//
+// The touch stays inside the transaction (property 2); a SAVEPOINT is what makes an erroring
+// statement survivable there, since Postgres otherwise poisons the whole transaction.
+func TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "touchfail")
+	reader := eidManualReader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// `production` IS declared, so the UPDATE matches a row and the trigger below actually fires.
+	_, err := pool.Exec(ctx,
+		`INSERT INTO project_environments (project_id, name, display_name) VALUES ($1, 'production', 'Production')`,
+		projectID)
+	require.NoError(t, err)
+
+	dropTrigger := breakRegistryTouch(t, ctx, pool, projectID)
+
+	failuresBefore := collectUnlabelledCounter(t, ctx, reader, obs.MetricEnvironmentRegistryTouchFailures)
+
+	fp := eidFingerprint(t, "touchfail")
+	eventID := "evt-touchfail-" + uuid.New().String()
+
+	issue := eidIssueIn(projectID, "production", fp)
+	outcome, stored, err := s.StoreEvent(ctx, issue, eidOccurrenceIn("production", eventID), "")
+	require.NoError(t, err, "a failing registry touch must never surface as an ingest error (§4.8 point 1)")
+	assert.True(t, stored, "the occurrence must still be stored when the registry touch fails")
+	assert.Equal(t, store.IssueOutcomeNew, outcome, "the issue is still a new issue")
+
+	// The occurrence committed.
+	var occCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM error_occurrences eo JOIN issues i ON i.id = eo.issue_id
+		  WHERE i.project_id = $1 AND i.environment = 'production' AND i.fingerprint = $2 AND eo.event_id = $3`,
+		projectID, fp, eventID).Scan(&occCount))
+	assert.Equal(t, 1, occCount, "the occurrence row must be committed, not rolled back with the touch")
+
+	// The issue committed.
+	var issueCount int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count FROM issues WHERE project_id = $1 AND environment = 'production' AND fingerprint = $2`,
+		projectID, fp).Scan(&issueCount))
+	assert.Equal(t, int64(1), issueCount, "the issue row must be committed with count = 1")
+
+	// The failure is counted — this is the signal §12 alerts on.
+	failuresAfter := collectUnlabelledCounter(t, ctx, reader, obs.MetricEnvironmentRegistryTouchFailures)
+	assert.Equal(t, failuresBefore+1, failuresAfter,
+		"%s must increment once per failed touch", obs.MetricEnvironmentRegistryTouchFailures)
+
+	// And the drift §12 names is exactly what happened: the timestamps did not move.
+	var lastSeenAt *time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&lastSeenAt))
+	assert.Nil(t, lastSeenAt, "a failed touch leaves last_seen_at behind reality — that is the accepted cost")
+
+	// The transaction was not left poisoned for the NEXT delivery: with the trigger gone, the very
+	// same path touches the registry normally again.
+	dropTrigger()
+
+	fp2 := eidFingerprint(t, "touchfail-recovered")
+	_, stored2, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp2),
+		eidOccurrenceIn("production", "evt-touchfail-ok-"+uuid.New().String()), "")
+	require.NoError(t, err)
+	require.True(t, stored2)
+
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen_at FROM project_environments WHERE project_id = $1 AND name = 'production'`,
+		projectID).Scan(&lastSeenAt))
+	require.NotNil(t, lastSeenAt, "once the touch succeeds again last_seen_at moves")
+
+	assert.Equal(t, failuresBefore+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricEnvironmentRegistryTouchFailures),
+		"a successful touch must not increment the failure counter")
+}
+
+// TestStoreEvent_UnregisteredEnvironmentIsCounted is the other half of BUG-12: decision 9 pairs
+// "accept the event anyway" with a counter, and the UPDATE's tag was being discarded with `_`, so
+// RowsAffected was never inspected and sentinel_unregistered_environment_events_total had no caller
+// anywhere in the tree.
+func TestStoreEvent_UnregisteredEnvironmentIsCounted(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "unregistered")
+	reader := eidManualReader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO project_environments (project_id, name, display_name) VALUES ($1, 'production', 'Production')`,
+		projectID)
+	require.NoError(t, err)
+
+	// A REGISTERED environment does not move the counter.
+	before := collectUnlabelledCounter(t, ctx, reader, obs.MetricUnregisteredEnvironmentEvents)
+	_, stored, err := s.StoreEvent(ctx,
+		eidIssueIn(projectID, "production", eidFingerprint(t, "unreg-declared")),
+		eidOccurrenceIn("production", "evt-unreg-declared-"+uuid.New().String()), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+	assert.Equal(t, before, collectUnlabelledCounter(t, ctx, reader, obs.MetricUnregisteredEnvironmentEvents),
+		"a declared environment is registered — %s must not move", obs.MetricUnregisteredEnvironmentEvents)
+
+	// An UNREGISTERED one is stored (decision 9) AND counted.
+	_, storedShadow, err := s.StoreEvent(ctx,
+		eidIssueIn(projectID, "shadow", eidFingerprint(t, "unreg-shadow")),
+		eidOccurrenceIn("shadow", "evt-unreg-shadow-"+uuid.New().String()), "")
+	require.NoError(t, err, "an unregistered environment must never fail ingest (decision 9)")
+	require.True(t, storedShadow, "the occurrence is stored regardless of the registry")
+	assert.Equal(t, before+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricUnregisteredEnvironmentEvents),
+		"%s must increment once per stored occurrence in an undeclared environment", obs.MetricUnregisteredEnvironmentEvents)
 }

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -559,9 +561,20 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	// got wrong:
 	//
 	//  1. Zero rows updated is NOT an error — it means this environment is not registered, and
-	//     decision 9 says ACCEPT the event anyway. The occurrence is already written and the
-	//     transaction commits. An error tracker that drops errors because a settings table is out
-	//     of date is worse than the problem it is solving.
+	//     decision 9 says ACCEPT the event anyway. The occurrence is already written, the
+	//     transaction commits, and sentinel_unregistered_environment_events_total is incremented.
+	//     An error tracker that drops errors because a settings table is out of date is worse than
+	//     the problem it is solving.
+	//  1a. Neither is a FAILING UPDATE an error the caller ever sees. §4.8 point 1 says "ingest
+	//     never fails because of the registry" without qualification, and §12 states the
+	//     consequence of this statement erroring as first_seen_at/last_seen_at drifting from
+	//     reality — not as a lost event. So the failure is logged, counted on
+	//     sentinel_environment_registry_touch_failures_total, and the transaction still commits.
+	//     Returning the error here dropped the event, which is the exact inversion point 1 names.
+	//     Postgres aborts a transaction on any statement error, so the touch runs inside a
+	//     SAVEPOINT (pgx models a nested Begin as one): rolling back TO that savepoint restores
+	//     the enclosing transaction — with the issue and the occurrence intact — so it can commit.
+	//     This keeps the UPDATE inside the transaction (property 2) rather than dodging its lock.
 	//  2. It is inside this transaction, so a last_seen_at that moved with no occurrence behind it
 	//     is impossible.
 	//  3. It runs AFTER the duplicate check above, so a deduplicated redelivery never reaches it.
@@ -571,13 +584,8 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	//  4. There is NO cap enforcement here. MAX_ENVIRONMENTS_PER_PROJECT is enforced at §4.3 and
 	//     nowhere else, precisely because ingest no longer creates rows.
 	//
-	// Two things a future reader will look for and not find:
+	// One thing a future reader will look for and not find:
 	//
-	//   - decision 9's sentinel_unregistered_environment_events_total is not incremented yet. Its
-	//     name constant belongs in packages/shared-go/obs/obs.go, which is a different work item's
-	//     surface (TASK-05). Until that lands, an unregistered environment is accepted and stored
-	//     exactly as specified above and is simply not counted — a gap in observability, not in
-	//     behaviour.
 	//   - this does add a second row lock to a transaction whose doc comment above says it acquires
 	//     exactly one. That is deliberate and contract §12 names it: "last_seen_at turns
 	//     project_environments into a hot row". It is one indexed single-row UPDATE on a tiny table,
@@ -590,12 +598,40 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		       first_seen_at = COALESCE(first_seen_at, now())
 		 WHERE project_id = $1 AND name = $2
 	`
-	if _, err := tx.Exec(ctx, registryQuery, issue.ProjectID, occ.Environment); err != nil {
-		return IssueOutcomeExisting, false, err
+	unregisteredEnvironment := false
+	if touchErr := func() error {
+		// The savepoint of point 1a. Its Commit is a RELEASE SAVEPOINT, its Rollback a
+		// ROLLBACK TO SAVEPOINT — neither ends the enclosing transaction.
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		tag, err := sp.Exec(ctx, registryQuery, issue.ProjectID, occ.Environment)
+		if err != nil {
+			_ = sp.Rollback(ctx)
+			return err
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return err
+		}
+		unregisteredEnvironment = tag.RowsAffected() == 0
+		return nil
+	}(); touchErr != nil {
+		slog.ErrorContext(ctx, "environment registry touch failed; the event is still stored (contract §4.8 point 1)",
+			slog.String("project_id", issue.ProjectID),
+			slog.String("environment", occ.Environment),
+			slog.String("error", touchErr.Error()))
+		procmetrics.RecordEnvironmentRegistryTouchFailure(ctx)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return IssueOutcomeExisting, false, err
+	}
+
+	// Recorded after the commit: the metric counts occurrences that were STORED for an environment
+	// nobody declared, so an event that failed to commit must not appear on it.
+	if unregisteredEnvironment {
+		procmetrics.RecordUnregisteredEnvironmentEvent(ctx)
 	}
 
 	switch {
