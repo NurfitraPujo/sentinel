@@ -266,6 +266,76 @@ func TestDeserialize_UsesProvidedFingerprintWithoutOverride(t *testing.T) {
 	assert.Equal(t, "provided-fingerprint", got.Fingerprint)
 }
 
+// BUG-20, the semantic overlap between `fccfc7d feat(ingest): let clients send a custom
+// fingerprint` and decision 7, which folds `environment` into `fingerprint.Compute`. A custom
+// fingerprint bypasses that computation entirely (event.go:177 only computes when the field is
+// empty or the override is set), so the question is whether issue identity is still per-environment
+// on that path.
+//
+// It is, and NOT because of the fingerprint: identity is the tuple
+// `UNIQUE (project_id, environment, fingerprint)`
+// (packages/db-migrations/migrations/1724300000_add_project_environments.sql:67), and both ON
+// CONFLICT clauses name all three columns (apps/processor-go/store/store.go:280 and :444). What
+// this test pins is the hop those depend on: Deserialize must carry the event's own environment
+// through UNCHANGED alongside a client fingerprint it deliberately leaves alone. Blank the
+// environment here, or derive it from the fingerprint, and the tuple collapses to
+// (project_id, '', fingerprint) — one issue for two environments — with no constraint violation to
+// notice it.
+//
+// The end-to-end claim, against the real constraint, is
+// tests/integration/event_idempotency_test.go:829
+// (TestStoreEvent_CustomFingerprintStillSplitsOnEnvironment).
+func TestDeserialize_CustomFingerprintLeavesTheEnvironmentIntact(t *testing.T) {
+	const shared = "checkout-timeout"
+
+	prodEvent := validProtoEvent()
+	prodEvent.Environment = "production"
+	prodEvent.Fingerprint = shared
+
+	stagEvent := validProtoEvent()
+	stagEvent.Environment = "staging"
+	stagEvent.Fingerprint = shared
+
+	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
+	require.NoError(t, err)
+	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
+	require.NoError(t, err)
+
+	// The client's value survives in both — §4.9 left that early return alone, so the identical
+	// string does arrive from two environments.
+	assert.Equal(t, shared, prod.Fingerprint)
+	assert.Equal(t, shared, stag.Fingerprint)
+
+	// And the environment, which is what actually separates them, is the event's own in each.
+	assert.Equal(t, "production", prod.Environment)
+	assert.Equal(t, "staging", stag.Environment)
+	assert.NotEqual(t, prod.Environment, stag.Environment,
+		"the identity tuple must differ on the environment axis when the fingerprint does not")
+}
+
+// The companion for the computed path, which decision 7 DOES reach: two events identical but for
+// their environment must not hash to the same fingerprint. Drop `Environment` from the
+// FingerprintConfig at event.go:190 and this fails, while every other fingerprint test here keeps
+// passing — they each assert one environment at a time.
+func TestDeserialize_ComputedFingerprintDiffersByEnvironment(t *testing.T) {
+	prodEvent := validProtoEvent()
+	prodEvent.Environment = "production"
+	prodEvent.Fingerprint = ""
+
+	stagEvent := validProtoEvent()
+	stagEvent.Environment = "staging"
+	stagEvent.Fingerprint = ""
+
+	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
+	require.NoError(t, err)
+	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
+	require.NoError(t, err)
+
+	require.NotEmpty(t, prod.Fingerprint)
+	assert.NotEqual(t, prod.Fingerprint, stag.Fingerprint,
+		"decision 7 folds the environment into the hash input")
+}
+
 func TestDeserialize_ComputesFingerprintWhenOverrideIsTrue(t *testing.T) {
 	protoEvent := validProtoEvent()
 	protoEvent.Fingerprint = ""
