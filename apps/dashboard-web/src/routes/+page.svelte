@@ -56,12 +56,18 @@
 	 * `environment` is deliberately DROPPED when the project changes: environments are per project
 	 * (§4.4), so carrying `production` from one project to another would either filter by a name
 	 * that project has never reported or, on `project=all`, mean "any project's production".
+	 *
+	 * Decision 55: the all-projects anchor drops it UNCONDITIONALLY, not only when the project is
+	 * changing. On `project=all` the control is not rendered (`data.environments` is `[]`), so that
+	 * anchor is the only way out of the filter — it cannot be the link that preserves it. The loader
+	 * coerces the echo to `all` there as well, which is what normally keeps this branch unreachable.
 	 */
 	function href(params: { status?: string; project?: string; environment?: string; page?: number }) {
 		const status = params.status ?? data.filters.status;
 		const project = params.project ?? data.filters.project;
 		const environment =
-			params.project !== undefined && params.project !== data.filters.project
+			project === 'all' ||
+			(params.project !== undefined && params.project !== data.filters.project)
 				? 'all'
 				: (params.environment ?? data.filters.environment);
 

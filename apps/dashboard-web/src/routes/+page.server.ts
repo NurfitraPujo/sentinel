@@ -44,11 +44,22 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
 	const limit = 20;
 
+	// Decision 55 (`OQ-41` = (a)): on `project=all` the loader coerces `environment` to `all` and
+	// adds NO environment predicate. An environment name is only meaningful inside a project, so
+	// across projects `production` would mean "any project's production", which nothing in the data
+	// model backs. The state is reachable by an ordinary route and not only by a hand-typed URL:
+	// flow `L7` makes the parameter ride on the filter and paging anchors, so it survives a switch
+	// to `project=all` and the reload of a bookmark. Since §4.4 returns `environments: []` there,
+	// the control is not rendered — applied, the list would be silently narrowed with no on-screen
+	// affordance to clear it, on the page whose empty state is required to name the environment.
+	// The GUARD (`environmentScopes`) is unaffected; only the offered FILTER is dropped.
+	const effectiveEnvironment = projectIdFilter === 'all' ? 'all' : environmentFilter;
+
 	const filters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
 		projectIds: authorizedProjectIds,
-		environment: environmentFilter,
+		environment: effectiveEnvironment,
 		environmentScopes,
 	};
 
@@ -86,7 +97,10 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		filters: {
 			status: statusFilter,
 			project: projectIdFilter,
-			environment: environmentFilter,
+			// The coerced value, not the raw parameter: the page builds every anchor from this echo
+			// (`href()` in `+page.svelte`), so echoing `production` here would keep the parameter
+			// riding on links the reader has no control to clear it from (decision 55, flow `L7`).
+			environment: effectiveEnvironment,
 		},
 		pagination: {
 			page,

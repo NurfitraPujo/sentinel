@@ -121,6 +121,24 @@ describe('GET / page load (§4.4)', () => {
 		);
 	});
 
+	// Decision 55 (`OQ-41` = (a)): on `project=all` the loader coerces `environment` to `all` and
+	// adds NO environment predicate. The state is reachable by an ordinary route — flow `L7` makes
+	// the parameter ride on the paging anchors, so it survives a switch to `project=all` and on the
+	// reload of a bookmark — and since `environments: []` means the control is not rendered, the
+	// list would be silently narrowed by a filter with no on-screen affordance to clear it, on the
+	// page whose empty state is required to name the environment.
+	it('coerces environment to "all" on project=all, for the list, the count and the echo', async () => {
+		const data = await loadWith('?project=all&environment=production');
+
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ environment: 'all' });
+		// Same filter object reaches the count: a total that counts rows the list does not show is
+		// the same inconsistency in a smaller font.
+		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ environment: 'all' });
+		// The echo is what the page builds every anchor from (`href()`), so the coercion has to be
+		// visible there too or the parameter keeps riding on the links.
+		expect(data.filters.environment).toBe('all');
+	});
+
 	it('offers the selected project’s registry, minus hidden rows and minus anything outside the grant', async () => {
 		resolveEnvironmentScopesMock.mockResolvedValue(new Map([[PROJECT_A, ['staging']]]));
 		listProjectEnvironmentsMock.mockResolvedValue([

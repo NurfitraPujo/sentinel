@@ -71,4 +71,37 @@ describe('/ environment filter (contract §4.4, flows L3 and L6)', () => {
 		// otherwise `project=all` would claim a project has no environments.
 		expect(screen.queryByTestId('environment-registry-empty')).toBeNull();
 	});
+
+	// Decision 55's second half: `fe.md` drops the parameter from the all-projects anchor. Flow `L7`
+	// makes `environment` ride on the anchors, so a reader who pages through a filtered project and
+	// then clicks "All Projects" must not carry the name across — on `project=all` the control is
+	// not rendered, so there would be no on-screen affordance to clear it. The loader coerces too,
+	// which is what makes the `project=all` row below normally unreachable; the anchor drops it
+	// unconditionally so the link is right even when the echo is not.
+	it('drops environment from the all-projects anchor — decision 55, flow L7', () => {
+		const fromProject = render(Page, {
+			data: pageData({
+				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
+				filters: { status: 'open', project: 'proj-1', environment: 'production' },
+				pagination: { page: 2, limit: 20, total: 60, totalPages: 3 },
+			}) as unknown as PageData,
+		});
+
+		const allProjects = screen.getByRole('link', { name: 'All Projects' });
+		expect(allProjects.getAttribute('href')).toBe('?status=open&project=all');
+		fromProject.unmount();
+
+		// Already on `project=all` with the parameter still in the query string: the anchor is the
+		// way out, so it cannot be the thing that preserves it.
+		render(Page, {
+			data: pageData({
+				environments: [],
+				filters: { status: 'all', project: 'all', environment: 'production' },
+			}) as unknown as PageData,
+		});
+
+		expect(screen.getByRole('link', { name: 'All Projects' }).getAttribute('href')).toBe(
+			'?status=all&project=all'
+		);
+	});
 });
