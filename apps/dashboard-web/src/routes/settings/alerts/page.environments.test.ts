@@ -295,3 +295,157 @@ describe('alert settings: the stored environment scope is not known yet (BUG-05)
 		expect(body.frequencyThreshold).toBe(99);
 	});
 });
+
+// BUG-16 — the picker's selection outlived the scope target it was made against. The `$effect`
+// re-reads `offeredEnvironments` whenever `scope` / `selectedProjectId` / `activeOrgId` change, but
+// `environmentSelection` / `environmentMode` were only ever reset by `resetForm()` and `startEdit()`.
+// So: pick project A, choose "Only these environments", check `production`; switch the dropdown to
+// project B, whose registry has no `production`. The offered list reloads to B's names while the
+// selection still holds A's — and because the name is no longer offered, it rendered through the
+// decision-48 carry-forward block labelled "already on this rule", on a rule that does not exist yet
+// and a name that was never on it, and was submitted as `payload.environments`, scoping the new
+// project-B rule to another project's environment name.
+describe('alert settings: switching the scope target mid-form (BUG-16)', () => {
+	const PROJECT_A = 'proj-a';
+	const PROJECT_B = 'proj-b';
+
+	function twoProjectData() {
+		return {
+			alertConfigs: [],
+			editableAlertConfigs: [],
+			projects: [
+				{ id: PROJECT_A, name: 'Checkout API', organizationId: ORG_ID },
+				{ id: PROJECT_B, name: 'Billing', organizationId: ORG_ID },
+			],
+			projectRoles: { [PROJECT_A]: 'admin', [PROJECT_B]: 'admin' },
+			orgRoles: { [ORG_ID]: 'admin' },
+			canManageOrgAlerts: false,
+			userOrganizations: [],
+		};
+	}
+
+	function twoProjectFetch(registries: Record<string, string[]>) {
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			if (url === '/api/alerts' && (!init || !init.method || init.method === 'GET')) {
+				return { ok: true, status: 200, json: async () => [] };
+			}
+			const match = url.match(/\/projects\/([^/]+)\/environments/);
+			if (match) {
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						environments: (registries[match[1]] ?? []).map((name) => ({ name })),
+					}),
+				};
+			}
+			return { ok: true, status: 200, json: async () => ({ id: 'cfg-new' }) };
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		return fetchMock;
+	}
+
+	async function pickProjectAndCheck(projectId: string, name: string) {
+		await fireEvent.change(screen.getByLabelText(/target project/i), {
+			target: { value: projectId },
+		});
+		await fireEvent.click(screen.getByLabelText('Only these environments'));
+		await waitFor(() => expect(screen.getByLabelText(name)).toBeTruthy());
+		await fireEvent.click(screen.getByLabelText(name));
+	}
+
+	it('drops the first project’s selection when the project dropdown changes', async () => {
+		twoProjectFetch({ [PROJECT_A]: ['production', 'staging'], [PROJECT_B]: ['sandbox'] });
+		render(Page, { data: twoProjectData() as unknown as AlertsPageData });
+
+		await pickProjectAndCheck(PROJECT_A, 'production');
+
+		await fireEvent.change(screen.getByLabelText(/target project/i), {
+			target: { value: PROJECT_B },
+		});
+
+		// B's registry is what is offered now, and the picker is back to its untouched state: no
+		// `production` checkbox at all, and none of it carried forward under "already on this rule",
+		// which is a label about a rule that does not exist yet.
+		await waitFor(() => expect(screen.getByLabelText('All environments')).toBeTruthy());
+		expect((screen.getByLabelText('All environments') as HTMLInputElement).checked).toBe(true);
+		// A carried-forward name renders as `<name> already on this rule`, so match the prefix rather
+		// than the exact label — an exact match would pass on the buggy render too.
+		expect(screen.queryByLabelText(/^production/)).toBeNull();
+		expect(screen.queryByText('already on this rule')).toBeNull();
+	});
+
+	it('never submits the first project’s environment name against the second project', async () => {
+		const fetchMock = twoProjectFetch({
+			[PROJECT_A]: ['production', 'staging'],
+			[PROJECT_B]: ['sandbox'],
+		});
+		render(Page, { data: twoProjectData() as unknown as AlertsPageData });
+
+		await pickProjectAndCheck(PROJECT_A, 'production');
+
+		await fireEvent.change(screen.getByLabelText(/target project/i), {
+			target: { value: PROJECT_B },
+		});
+		await waitFor(() => expect(screen.getByLabelText('All environments')).toBeTruthy());
+
+		await fireEvent.input(screen.getByLabelText(/email address/i), {
+			target: { value: 'oncall@example.com' },
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /create alert/i }));
+
+		await waitFor(() => expect(savedBody(fetchMock)).toBeTruthy());
+		const body = savedBody(fetchMock);
+		expect(body.projectId).toBe(PROJECT_B);
+		// The picker is untouched again, so decision 32's first rule applies: the key is omitted and
+		// the server applies B's default. What must never happen is `['production']` going out here.
+		expect('environments' in body).toBe(false);
+	});
+
+	it('still keeps a re-selection made against the NEW target', async () => {
+		const fetchMock = twoProjectFetch({
+			[PROJECT_A]: ['production', 'staging'],
+			[PROJECT_B]: ['sandbox'],
+		});
+		render(Page, { data: twoProjectData() as unknown as AlertsPageData });
+
+		await pickProjectAndCheck(PROJECT_A, 'production');
+		await fireEvent.change(screen.getByLabelText(/target project/i), {
+			target: { value: PROJECT_B },
+		});
+		await waitFor(() => expect(screen.getByLabelText('All environments')).toBeTruthy());
+
+		await fireEvent.click(screen.getByLabelText('Only these environments'));
+		await waitFor(() => expect(screen.getByLabelText('sandbox')).toBeTruthy());
+		await fireEvent.click(screen.getByLabelText('sandbox'));
+		await fireEvent.input(screen.getByLabelText(/email address/i), {
+			target: { value: 'oncall@example.com' },
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /create alert/i }));
+
+		await waitFor(() => expect(savedBody(fetchMock)).toBeTruthy());
+		expect(savedBody(fetchMock).environments).toEqual(['sandbox']);
+	});
+});
+
+// BUG-16, the other half of the finding: the decision-48 carry-forward block is about names the
+// SERVER merged back onto an existing rule. On the create path there is no server answer to carry
+// anything forward from, so the block belongs to the edit path only — where the names really did
+// come back from `GET /api/alerts`.
+describe('alert settings: the decision-48 carry-forward is the edit path only (BUG-16)', () => {
+	it('still shows a merged name the picker cannot offer when EDITING — flow E11a', async () => {
+		stubFetch({ registry: ['production'], stored: { 'cfg-1': ['production', 'retired-region'] } });
+		render(Page, { data: pageData({ 'cfg-1': [] }) as unknown as AlertsPageData });
+
+		await waitFor(() =>
+			expect(screen.getByTestId('config-environments').textContent?.trim()).toBe(
+				'production, retired-region'
+			)
+		);
+		await fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+		await waitFor(() => expect(screen.getByLabelText(/^retired-region/)).toBeTruthy());
+		expect((screen.getByLabelText(/^retired-region/) as HTMLInputElement).checked).toBe(true);
+		expect(screen.getByText('already on this rule')).toBeTruthy();
+	});
+});

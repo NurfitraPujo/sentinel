@@ -60,6 +60,18 @@
 	// picker was actually touched — which is also what makes flows `E3`/`E4` work on creation, where
 	// an untouched picker is what asks the server to apply the project's default.
 	let environmentTouched = $state(false);
+	// BUG-16. The selection is only meaningful against ONE scope target: project A's `production` is
+	// not project B's, and the server refuses (or worse, stores) a name from the wrong registry. The
+	// `$effect` below already reloads the OFFERED names on every target change, so without this the
+	// two drift apart — the picker showing B's registry while `environmentSelection` still holds A's
+	// choice, which then renders through the decision-48 carry-forward block and is submitted as
+	// `payload.environments`. This records which target the current selection was made against;
+	// `null` means "no selection to protect", which is how `resetForm()` hands over to the effect.
+	let selectionScopeKey = $state<string | null>(null);
+
+	function scopeTargetKey(): string {
+		return scope === 'project' ? `project:${selectedProjectId}` : `organization:${activeOrgId}`;
+	}
 
 	// Decision 32's third rule: the server MERGES what is sent with the names the caller could not
 	// have been offered — unregistered, hidden, or outside their grant — and returns the merged
@@ -143,6 +155,21 @@
 		void scope;
 		void selectedProjectId;
 		void activeOrgId;
+		const key = scopeTargetKey();
+		// BUG-16. The offered names and the selection move together or not at all. A selection made
+		// against a DIFFERENT target is discarded here rather than carried across, and the picker goes
+		// back to untouched — which under decision 32's first rule omits the `environments` key
+		// entirely, so the server applies the NEW target's default (flows `E3`/`E4`) instead of the
+		// previous target's names. `startEdit()` seeds `selectionScopeKey` itself, so re-opening a rule
+		// for edit is not mistaken for a target change and does not lose the stored scope.
+		if (selectionScopeKey !== null && selectionScopeKey !== key) {
+			environmentMode = 'all';
+			environmentSelection = [];
+			environmentTouched = false;
+			delete fieldErrors.environments;
+			fieldErrors = { ...fieldErrors };
+		}
+		selectionScopeKey = key;
 		loadOfferedEnvironments();
 	});
 
@@ -210,6 +237,13 @@
 		environmentMode = stored === null ? 'all' : 'specific';
 		environmentSelection = stored === null ? [] : [...stored];
 		environmentTouched = false;
+		// BUG-16: these names came back from the server for THIS config, so they belong to this
+		// config's target. Claiming the target here is what stops the effect — which is about to run
+		// because `scope`/`selectedProjectId` just changed — from treating the seeding as a switch.
+		selectionScopeKey =
+			config.scope === 'project'
+				? `project:${config.projectId ?? ''}`
+				: `organization:${config.organizationId ?? ''}`;
 		noDefaultNotice = null;
 		fieldErrors = {};
 		toastMessage = null;
@@ -236,6 +270,8 @@
 		environmentMode = 'all';
 		environmentSelection = [];
 		environmentTouched = false;
+		// BUG-16: nothing to protect, so the effect's next run just records the new target.
+		selectionScopeKey = null;
 		fieldErrors = {};
 		toastMessage = null;
 	}
@@ -638,7 +674,15 @@
 								not stripped, because stripping them is the silent unscoping decision 32
 								exists to prevent.
 							-->
-							{#each environmentSelection.filter((n) => !offeredEnvironments.includes(n)) as name (name)}
+							<!--
+								BUG-16: `editMode` and `offeredLoaded` are both load-bearing. "already on this rule"
+								is a statement about names the SERVER merged onto an EXISTING rule — on the create
+								path there is no rule and no server answer, so any name reaching this block there
+								is a leftover from a different scope target, and rendering it invites submitting it.
+								And while the offered list is still in flight it is `[]`, so every selected name
+								would momentarily qualify as un-offerable.
+							-->
+							{#each editMode && offeredLoaded ? environmentSelection.filter((n) => !offeredEnvironments.includes(n)) : [] as name (name)}
 								<label class="environment-option">
 									<input type="checkbox" checked onchange={() => toggleEnvironment(name)} />
 									<span>{name}</span>
