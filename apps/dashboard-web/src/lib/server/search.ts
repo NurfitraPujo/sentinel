@@ -1,6 +1,6 @@
 import { db } from './db';
 import { errorSearchIndex, errorOccurrences, issues, projects } from '$lib/db/schema';
-import { eq, and, or, inArray, sql } from 'drizzle-orm';
+import { eq, and, or, inArray, sql, desc, asc } from 'drizzle-orm';
 import type { AuthUser } from './auth';
 import { getAccessibleProjects } from './issue-access';
 import { environmentScopeCondition, resolveEnvironmentScopes } from './environment-access';
@@ -155,7 +155,37 @@ export async function searchErrors(
 		allConditions.push(or(...searchConditions));
 	}
 
-	const baseQuery = db
+	// sentinel-project-environments/BUG-14 — one row per ISSUE, not one row per OCCURRENCE.
+	//
+	// `issues → error_occurrences → error_search_index` is one-to-many, so the result query fanned
+	// out: an issue with 50 indexed occurrences produced 50 rows and filled an entire 50-row page by
+	// itself, while the count query below has always counted `DISTINCT issues.id`. `total` therefore
+	// described a set that pagination could not produce. The fan-out was invisible until decision 31
+	// widened the access derivation — before that `searchErrors` returned `{ results: [], total: 0 }`
+	// to everybody and nothing ever fanned out.
+	//
+	// `DISTINCT ON (issues.id)` over the SAME `allConditions` picks exactly one occurrence per issue:
+	// the most recent MATCHING one, tie-broken on the occurrence id so the choice is stable rather
+	// than whatever the plan happens to emit. It selects the occurrence id alone — one column, so the
+	// subquery has no ambiguous `"id"` to resolve — and the result query then joins to it, which
+	// leaves every column of the projection reading from its own table exactly as before.
+	const chosenOccurrence = db
+		.selectDistinctOn([issues.id], { occurrenceId: errorOccurrences.id })
+		.from(issues)
+		.innerJoin(errorOccurrences, eq(errorOccurrences.issueId, issues.id))
+		.innerJoin(errorSearchIndex, eq(errorSearchIndex.occurrenceId, errorOccurrences.id))
+		.where(allConditions.length > 0 ? and(...allConditions) : undefined)
+		// Postgres requires the DISTINCT ON expressions to lead the ORDER BY. This ordering decides
+		// WHICH occurrence survives; the ordering the CALLER sees is the one applied below.
+		.orderBy(issues.id, desc(errorOccurrences.createdAt), desc(errorOccurrences.id))
+		.as('chosen_occurrence');
+
+	// The guard stays on the result query itself (§4.5) — the join above narrows the cardinality, it
+	// is not the access predicate. And LIMIT/OFFSET over an unordered set is non-deterministic
+	// paging: the same offset can return one row twice across two requests and skip another
+	// entirely. `lastSeen` is the order the page presents; `issues.id` is the tie-break that makes
+	// it total.
+	const results = await db
 		.select({
 			issueId: issues.id,
 			projectId: issues.projectId,
@@ -183,9 +213,9 @@ export async function searchErrors(
 		.innerJoin(projects, eq(issues.projectId, projects.id))
 		.innerJoin(errorOccurrences, eq(errorOccurrences.issueId, issues.id))
 		.innerJoin(errorSearchIndex, eq(errorSearchIndex.occurrenceId, errorOccurrences.id))
-		.where(allConditions.length > 0 ? and(...allConditions) : undefined);
-
-	const results = await baseQuery
+		.innerJoin(chosenOccurrence, eq(chosenOccurrence.occurrenceId, errorOccurrences.id))
+		.where(allConditions.length > 0 ? and(...allConditions) : undefined)
+		.orderBy(desc(issues.lastSeen), asc(issues.id))
 		.limit(limit)
 		.offset(offset);
 

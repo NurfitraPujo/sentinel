@@ -134,6 +134,21 @@ const VISIBLE_TO_OPEN: string[] = [
 	reportNarrowedStaging,
 ];
 
+// sentinel-project-environments/BUG-14 — the FAN-OUT fixture, deliberately in an organization of
+// its own so the exact-set assertions above keep asserting exactly what they asserted before.
+// `searchErrors` joins `issues → error_occurrences → error_search_index`, which is one-to-many: an
+// issue with several indexed occurrences produced one ROW PER OCCURRENCE while `total` counted
+// `DISTINCT issues.id`. Two issues in one project, one of them fanned out, is the smallest fixture
+// that can tell "one row per issue" from "one row per occurrence" AND pin the paging order.
+const orgFanout = randomUUID();
+const projectFanout = randomUUID();
+const fanoutUser = randomUUID();
+const issueFanout = randomUUID();
+const issueSingle = randomUUID();
+const FANOUT_OCCURRENCE_COUNT = 5;
+// The occurrence DISTINCT ON must keep: the newest of `issueFanout`'s five.
+let newestFanoutOccurrence = '';
+
 const ids = (rows: { id: string }[]) => rows.map((r) => r.id).sort();
 const issueIds = (rows: { issueId: string }[]) => rows.map((r) => r.issueId).sort();
 
@@ -203,17 +218,77 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 			`;
 			await sql`insert into error_search_index (occurrence_id) values (${occurrenceId})`;
 		}
+
+		// --- BUG-14's fan-out fixture -------------------------------------------------------------
+		await sql`
+			insert into organizations (id, name, slug)
+			values (${orgFanout}, ${`rg-fanout-${suffix}`}, ${`rg-fanout-${suffix}`})
+		`;
+		await sql`
+			insert into projects (id, name, organization_id, api_key, api_key_hash)
+			values (${projectFanout}, ${`rg-fanout-${suffix}`}, ${orgFanout},
+			        ${`k_fanout_${suffix}`}, ${`h_fanout_${suffix}`})
+		`;
+		await sql`
+			insert into "user" (id, name, email)
+			values (${fanoutUser}, ${'fanout'}, ${`rg-fanout-${suffix}@example.test`})
+		`;
+		await sql`
+			insert into organization_members (organization_id, user_id, role)
+			values (${orgFanout}, ${fanoutUser}, ${'engineer'})
+		`;
+
+		// Every timestamp below is RELATIVE to now, deliberately: `retention.ts` deletes occurrences
+		// older than `retentionDays` (30 by default) across the whole database, and the retention
+		// suite runs against this same database, so a fixture dated in absolute terms is deleted out
+		// from under this file whenever the two happen to run together.
+		//
+		// `issueSingle` is the NEWER of the two by `last_seen`, so the outer ordering the fix applies
+		// puts it first — an assertion that fails if the ordering is dropped again and the plan's
+		// emission order happens to differ.
+		const fixtureNow = Date.now();
+		for (const [id, lastSeen] of [
+			[issueFanout, new Date(fixtureNow - 2 * 60 * 60 * 1000).toISOString()],
+			[issueSingle, new Date(fixtureNow - 1 * 60 * 60 * 1000).toISOString()],
+		] as const) {
+			await sql`
+				insert into issues (id, project_id, environment, fingerprint, message, error_class, last_seen)
+				values (${id}, ${projectFanout}, ${'production'}, ${`fp-${id}`},
+				        ${`rg fanout seed ${suffix}`}, ${'ReadGuardFanoutError'}, ${lastSeen})
+			`;
+		}
+
+		for (let i = 0; i < FANOUT_OCCURRENCE_COUNT; i++) {
+			const occurrenceId = randomUUID();
+			// Ascending, so the LAST one written is the newest — the one DISTINCT ON must keep.
+			const createdAt = new Date(
+				fixtureNow - (FANOUT_OCCURRENCE_COUNT - i) * 60 * 1000
+			).toISOString();
+			await sql`
+				insert into error_occurrences (id, issue_id, environment, platform, created_at)
+				values (${occurrenceId}, ${issueFanout}, ${'production'}, ${'node'}, ${createdAt})
+			`;
+			await sql`insert into error_search_index (occurrence_id) values (${occurrenceId})`;
+			newestFanoutOccurrence = occurrenceId;
+		}
+
+		const singleOccurrence = randomUUID();
+		await sql`
+			insert into error_occurrences (id, issue_id, environment, platform)
+			values (${singleOccurrence}, ${issueSingle}, ${'production'}, ${'node'})
+		`;
+		await sql`insert into error_search_index (occurrence_id) values (${singleOccurrence})`;
 	});
 
 	afterAll(async () => {
 		if (!sql) return;
 		try {
-			await sql`delete from issues where project_id in (${projectNarrowed}, ${projectOpen}, ${projectForeign})`;
+			await sql`delete from issues where project_id in (${projectNarrowed}, ${projectOpen}, ${projectForeign}, ${projectFanout})`;
 			await sql`delete from project_environment_grants where user_id in (${narrowedUser}, ${openUser})`;
-			await sql`delete from organization_members where organization_id in (${orgOwn}, ${orgForeign})`;
-			await sql`delete from projects where organization_id in (${orgOwn}, ${orgForeign})`;
-			await sql`delete from "user" where id in (${narrowedUser}, ${openUser}, ${outsiderUser})`;
-			await sql`delete from organizations where id in (${orgOwn}, ${orgForeign})`;
+			await sql`delete from organization_members where organization_id in (${orgOwn}, ${orgForeign}, ${orgFanout})`;
+			await sql`delete from projects where organization_id in (${orgOwn}, ${orgForeign}, ${orgFanout})`;
+			await sql`delete from "user" where id in (${narrowedUser}, ${openUser}, ${outsiderUser}, ${fanoutUser})`;
+			await sql`delete from organizations where id in (${orgOwn}, ${orgForeign}, ${orgFanout})`;
 		} finally {
 			await sql.end({ timeout: 5 }).catch(() => {});
 		}
@@ -409,6 +484,86 @@ describe.skipIf(!dbReachable)('the §2.2 read guards (integration, real Postgres
 			{ limit: 100 }
 		);
 		expect(open.total).toBe(4);
+	});
+
+	// ---------------------------------------------------------------------------------------------
+	// BUG-14 — one row per ISSUE. The result query fanned out over `error_occurrences` while the
+	// count query counted `DISTINCT issues.id`, so `total` described a set the page could not
+	// produce and one busy issue could fill a whole page by itself. Nothing else in this file could
+	// see it: every other fixture issue carries exactly ONE occurrence, at which cardinality the
+	// broken query and the fixed one return the same rows.
+	// ---------------------------------------------------------------------------------------------
+
+	it('an issue with several indexed occurrences is ONE result row, and total agrees with it', async () => {
+		const { searchErrors } = await import('./search');
+
+		const { results, total } = await searchErrors(
+			{ id: fanoutUser } as any,
+			{ projectId: projectFanout },
+			{ limit: 100 }
+		);
+
+		// Pre-fix this was FANOUT_OCCURRENCE_COUNT + 1 rows against a total of 2.
+		expect(results.filter((r) => r.issueId === issueFanout)).toHaveLength(1);
+		expect(issueIds(results as { issueId: string }[])).toEqual(
+			[issueFanout, issueSingle].sort()
+		);
+		expect(total).toBe(2);
+		expect(results).toHaveLength(total);
+	});
+
+	it('a single-issue search is one row and total === 1, not one row per occurrence', async () => {
+		const { searchErrors } = await import('./search');
+
+		// The finding's own example, isolated: ONE issue carrying several indexed occurrences.
+		const { results, total } = await searchErrors(
+			{ id: fanoutUser } as any,
+			{ projectId: projectFanout, platform: 'node', search: 'fanout' },
+			{ limit: 100 }
+		);
+		const fanout = results.filter((r) => r.issueId === issueFanout);
+
+		expect(fanout).toHaveLength(1);
+		expect(total).toBe(results.length);
+	});
+
+	it('the surviving row carries the NEWEST matching occurrence, deterministically', async () => {
+		const { searchErrors } = await import('./search');
+
+		const first = await searchErrors(
+			{ id: fanoutUser } as any,
+			{ projectId: projectFanout },
+			{ limit: 100 }
+		);
+		const second = await searchErrors(
+			{ id: fanoutUser } as any,
+			{ projectId: projectFanout },
+			{ limit: 100 }
+		);
+
+		const pick = (r: typeof first) =>
+			r.results.find((x) => x.issueId === issueFanout)?.matchingOccurrence.id;
+
+		// WHICH of the five survives is a choice, and it has to be the same choice every time or the
+		// row's `matchingOccurrence` flickers between requests.
+		expect(pick(first)).toBe(newestFanoutOccurrence);
+		expect(pick(second)).toBe(newestFanoutOccurrence);
+	});
+
+	it('LIMIT/OFFSET pages deterministically: every issue once, in a stable order', async () => {
+		const { searchErrors } = await import('./search');
+
+		const page = (offset: number) =>
+			searchErrors({ id: fanoutUser } as any, { projectId: projectFanout }, { limit: 1, offset });
+
+		const [first, second, firstAgain] = await Promise.all([page(0), page(1), page(0)]);
+
+		// Without an ORDER BY, LIMIT/OFFSET may repeat a row on one page and skip another entirely.
+		expect(issueIds(first.results as { issueId: string }[])).toEqual([issueSingle]);
+		expect(issueIds(second.results as { issueId: string }[])).toEqual([issueFanout]);
+		// `issueSingle` has the newer `last_seen`, so it leads — and it leads on every request.
+		expect(issueIds(firstAgain.results as { issueId: string }[])).toEqual([issueSingle]);
+		expect(first.total).toBe(2);
 	});
 
 	// ---------------------------------------------------------------------------------------------
