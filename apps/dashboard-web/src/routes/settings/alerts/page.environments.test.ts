@@ -18,6 +18,8 @@ type AlertsPageData = Parameters<typeof Page>[1]['data'];
 //   - "All environments" must send `null`, not `[]` (a `400`) and not an omitted key;
 //   - the picker must re-render from the RESPONSE, so a name the server merged back — unregistered,
 //     hidden, or outside this caller's grant — is not silently dropped by the next save (`E11`).
+//     Pinned by the BUG-18 block at the bottom of this file; the E2/E11 case in this block only
+//     covers the initial GET.
 
 const ORG_ID = 'org-1';
 const PROJECT_ID = 'proj-1';
@@ -447,5 +449,82 @@ describe('alert settings: the decision-48 carry-forward is the edit path only (B
 		await waitFor(() => expect(screen.getByLabelText(/^retired-region/)).toBeTruthy());
 		expect((screen.getByLabelText(/^retired-region/) as HTMLInputElement).checked).toBe(true);
 		expect(screen.getByText('already on this rule')).toBeTruthy();
+	});
+});
+
+// BUG-18 — decision 32's third rule had no fence. The header above names it, and the E2/E11 case
+// renders the merged name from the initial GET, but nothing issued a PUT and looked at what the page
+// did with the RESPONSE: the `configEnvironments` assignment in `handleSubmit` could be deleted and
+// the suite stayed green. These two cases drive the path the rule is about. The picker is TOUCHED
+// on purpose — an untouched picker omits the key, and a server that merges nothing answers with
+// exactly what the GET already seeded, which is a case no re-render bug can fail. The merge only
+// happens when something is sent, so something is sent, and the stub answers with one more name
+// than the client did: a hidden one this caller could not have been offered.
+describe('alert settings: the row re-renders from the PUT response (BUG-18, decision 32 rule 3)', () => {
+	function mergedSaveFetch() {
+		return stubFetch({
+			registry: ['production', 'staging'],
+			stored: { 'cfg-1': ['production', 'retired-region'] },
+			// What the server holds after the merge: the three names the client sent, plus one the
+			// picker never offered and the client never sent.
+			saveResponse: {
+				id: 'cfg-1',
+				environments: ['production', 'retired-region', 'staging', 'hidden-region'],
+			},
+		});
+	}
+
+	async function editAndAddStaging() {
+		await waitFor(() =>
+			expect(screen.getByTestId('config-environments').textContent?.trim()).toBe(
+				'production, retired-region'
+			)
+		);
+		await fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+		await waitFor(() => expect(screen.getByLabelText('staging')).toBeTruthy());
+		await fireEvent.click(screen.getByLabelText('staging'));
+		await fireEvent.click(screen.getByRole('button', { name: /update alert/i }));
+	}
+
+	it('shows the name the server merged back, which the client never sent — flow E11', async () => {
+		const fetchMock = mergedSaveFetch();
+		render(Page, { data: pageData({ 'cfg-1': [] }) as unknown as AlertsPageData });
+
+		await editAndAddStaging();
+
+		await waitFor(() => expect(savedBody(fetchMock)).toBeTruthy());
+		// What went out is the picker's state — `hidden-region` is not in it, so the only way it can
+		// reach the screen is through the response.
+		expect(savedBody(fetchMock).environments).toEqual(['production', 'retired-region', 'staging']);
+		await waitFor(() =>
+			expect(screen.getByTestId('config-environments').textContent?.trim()).toBe(
+				'production, retired-region, staging, hidden-region'
+			)
+		);
+	});
+
+	it('carries the merged name into the next edit and the next save, instead of dropping it', async () => {
+		const fetchMock = mergedSaveFetch();
+		render(Page, { data: pageData({ 'cfg-1': [] }) as unknown as AlertsPageData });
+
+		await editAndAddStaging();
+		await waitFor(() =>
+			expect(screen.getByTestId('config-environments').textContent?.trim()).toContain('hidden-region')
+		);
+
+		// The next edit seeds its picker from the same map, so the merged name is pre-checked under
+		// "already on this rule" — and a save that touches something else still sends it.
+		await fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+		await waitFor(() => expect(screen.getByLabelText(/^hidden-region/)).toBeTruthy());
+		expect((screen.getByLabelText(/^hidden-region/) as HTMLInputElement).checked).toBe(true);
+
+		await fireEvent.click(screen.getByLabelText('staging'));
+		await fireEvent.click(screen.getByRole('button', { name: /update alert/i }));
+
+		await waitFor(() => expect(fetchMock.mock.calls.filter(([, i]) => (i as RequestInit)?.method === 'PUT').length).toBe(2));
+		const body = savedBody(fetchMock);
+		expect(body.environments).toContain('hidden-region');
+		expect(body.environments).toContain('retired-region');
+		expect(body.environments).not.toContain('staging');
 	});
 });
