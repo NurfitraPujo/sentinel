@@ -274,7 +274,7 @@ func TestDeserialize_UsesProvidedFingerprintWithoutOverride(t *testing.T) {
 //
 // It is, and NOT because of the fingerprint: identity is the tuple
 // `UNIQUE (project_id, environment, fingerprint)`
-// (packages/db-migrations/migrations/1724300000_add_project_environments.sql:67), and both ON
+// (packages/db-migrations/migrations/1724400000_add_project_environments.sql:67), and both ON
 // CONFLICT clauses name all three columns (apps/processor-go/store/store.go:280 and :444). What
 // this test pins is the hop those depend on: Deserialize must carry the event's own environment
 // through UNCHANGED alongside a client fingerprint it deliberately leaves alone. Blank the

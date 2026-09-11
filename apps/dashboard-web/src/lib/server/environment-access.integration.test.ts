@@ -168,8 +168,9 @@ describe.skipIf(!dbReachable)('environment-access resolvers (integration, real P
 	 * Contract §2.2 states `CHECK (array_length(environments, 1) >= 1)` and says of it "**an empty
 	 * array is refused**". It is not. In PostgreSQL `array_length('{}', 1)` is **NULL**, not 0, so
 	 * the predicate evaluates to NULL — and a CHECK constraint that evaluates to NULL is
-	 * **satisfied**. The migration (1724300000) transcribes the contract's expression faithfully;
-	 * the expression itself is what does not hold. Proved on a freshly migrated Postgres:
+	 * **satisfied**. The migration (1724400000_add_project_environments.sql) transcribes the
+	 * contract's expression faithfully; the expression itself is what does not hold. Proved on a
+	 * freshly migrated Postgres:
 	 *
 	 *     select array_length('{}'::text[], 1) is null;  -->  t
 	 *
