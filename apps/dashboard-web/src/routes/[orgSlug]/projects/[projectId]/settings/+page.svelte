@@ -256,7 +256,12 @@
 	}
 
 	onMount(() => {
-		if (canWrite) loadEnvironments();
+		// BUG-17: the grants editor below keys flow `G6` on the registry, so it needs `environments`
+		// whether or not the reader can edit them. Gating this on `canWrite` alone left a
+		// manage-members-only reader with a list that never loaded and a section that permanently
+		// claimed the project had no environments. (In the current RBAC matrix every
+		// `manage_members` role also holds `write`, so the `includeHidden=true` gate still admits it.)
+		if (canWrite || canManageMembers) loadEnvironments();
 		if (canManageMembers) loadMembers();
 	});
 
@@ -718,10 +723,17 @@
 				notifications and alerts.
 			</p>
 
-			{#if !membersLoaded}
+			{#if !membersLoaded || !environmentsLoaded}
 				<p class="empty-state">Loading environment access…</p>
 			{:else if membersError}
 				<p class="section-error" role="status">{membersError}</p>
+			{:else if environmentsError}
+				<!--
+					BUG-17: the branch below reads `environments`, which is populated by a DIFFERENT fetch
+					from `members`. Its load and error states have to be in this chain, or a registry
+					that has not arrived (or failed to) renders as "this project has no environments".
+				-->
+				<p class="section-error" role="status">{environmentsError}</p>
 			{:else if environments.length === 0}
 				<!--
 					Flow `G6`. A limit names environments, and this project has none declared, so there is

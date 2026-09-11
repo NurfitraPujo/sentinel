@@ -221,3 +221,83 @@ describe('project settings — Environment access (contract §4.10, flows G1, G3
 		expect(fetchMock.mock.calls.length).toBe(callsBefore);
 	});
 });
+
+describe('project settings — Environment access reads the registry it keys on (BUG-17, flow G6)', () => {
+	const members = [
+		{ userId: 'u-1', displayName: 'Ana Beltre', projectRole: null, orgRole: 'admin', environments: null },
+	];
+
+	it('loads environments for a manage-members user with no write access, and does NOT show the G6 empty state once they arrive', async () => {
+		// BUG-17. `loadEnvironments()` used to be gated on `canWrite` while this section is gated on
+		// `canManageMembers`; the two are independent loader flags, so a manage-members-only reader
+		// never fetched the registry and the section permanently claimed the project had no
+		// environments — pointing the admin at a task already done.
+		const { fetchMock } = stubFetch({
+			environments: [environment({ name: 'staging', displayName: 'Staging' })],
+			members,
+		});
+
+		render(Page, { data: { ...pageData(), canWrite: false, canManageMembers: true } });
+
+		await waitFor(() => expect(screen.getByText('Ana Beltre')).toBeTruthy());
+		expect(fetchMock.mock.calls.map((c) => c[0])).toContain(ENVIRONMENTS_URL);
+		await waitFor(() => expect(screen.queryByTestId('environment-access-empty')).toBeNull());
+		// And the Environments (write) section stays off — the fetch is for the grants editor, not
+		// for a section the reader cannot use.
+		expect(screen.queryByText('Add an environment')).toBeNull();
+	});
+
+	it('keeps loading while members are in but environments are still in flight — never a false "no environments"', async () => {
+		// The two fetches are independent. Resolve members first and hold environments open; the
+		// section must not key G6's empty state on a list that has not arrived.
+		let releaseEnvironments!: () => void;
+		const environmentsGate = new Promise<void>((resolve) => (releaseEnvironments = resolve));
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string) => {
+				if (url.startsWith(GRANTS_URL)) {
+					return { ok: true, status: 200, json: async () => ({ grants: [], members }) };
+				}
+				await environmentsGate;
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ environments: [environment({ name: 'staging', displayName: 'Staging' })] }),
+				};
+			})
+		);
+
+		render(Page, { data: pageData() });
+
+		// Members have resolved (the fetch mock returned synchronously for them); environments have not.
+		await new Promise((r) => setTimeout(r, 0));
+		await new Promise((r) => setTimeout(r, 0));
+		expect(screen.queryByTestId('environment-access-empty')).toBeNull();
+		expect(screen.queryByText('Ana Beltre')).toBeNull();
+
+		releaseEnvironments();
+		await waitFor(() => expect(screen.getByText('Ana Beltre')).toBeTruthy());
+		expect(screen.queryByTestId('environment-access-empty')).toBeNull();
+	});
+
+	it('surfaces the environments fetch error in the access section instead of the G6 empty state', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string) => {
+				if (url.startsWith(GRANTS_URL)) {
+					return { ok: true, status: 200, json: async () => ({ grants: [], members }) };
+				}
+				return { ok: false, status: 500, json: async () => ({ message: 'registry is down' }) };
+			})
+		);
+
+		render(Page, { data: { ...pageData(), canWrite: false, canManageMembers: true } });
+
+		const section = await waitFor(() => {
+			const el = document.querySelector('section.environment-access') as HTMLElement;
+			expect(el.textContent).toContain('registry is down');
+			return el;
+		});
+		expect(section.querySelector('[data-testid="environment-access-empty"]')).toBeNull();
+	});
+});
