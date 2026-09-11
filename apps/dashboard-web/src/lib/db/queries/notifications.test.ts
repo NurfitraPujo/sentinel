@@ -43,7 +43,16 @@ vi.mock('$lib/db/schema', () => ({
 		readAt: 'readAt',
 		createdAt: 'createdAt',
 	},
-	issues: { id: 'id', message: 'message', issueType: 'issueType', projectId: 'projectId' },
+	issues: {
+		id: 'id',
+		message: 'message',
+		issueType: 'issueType',
+		projectId: 'projectId',
+		// sentinel-project-environments §2.2: the column all three read helpers now carry a predicate
+		// over, and the grant table the scope is resolved from.
+		environment: 'environment',
+	},
+	projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 	projects: { id: 'id', organizationId: 'organizationId' },
 	organizations: { id: 'id', slug: 'slug' },
 	users: { id: 'id', name: 'name' },

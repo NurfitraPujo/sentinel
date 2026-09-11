@@ -201,7 +201,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 
 	var projectID string
 	issue := &store.Issue{
-		ID:          uuid.New().String(),
+		ID: uuid.New().String(),
+		// sentinel-project-environments §4.9: part of the issue's identity, not just the
+		// occurrence's. Taken from the event (§4.8) — the registry is never consulted here.
+		Environment: evt.Environment,
 		Fingerprint: evt.Fingerprint,
 		Message:     evt.Message,
 		ErrorClass:  evt.ErrorClass,
@@ -321,7 +324,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	// used to feed the alert frequency counter for an event that was then rolled back at the
 	// occurrence step can no longer happen, because dispatch does not run at all when stored==false.
 	_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
-		s.dispatchAlert(ctx, issue.ID, projectID, evt.ErrorClass, evt.Message)
+		// issue.Environment, not occ.Environment: they are the same value on this path (both come
+		// from the event), but the alert scope in §4.7 is a decision about the ISSUE's environment,
+		// which decision 7 made part of its identity.
+		s.dispatchAlert(ctx, issue.ID, projectID, issue.Environment, evt.ErrorClass, evt.Message)
 		return nil
 	})
 
@@ -352,12 +358,12 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 // on this call path to time out on — but a panic anywhere in a
 // caller-supplied sender must still not be allowed to take down the event
 // that triggered it.
-func (s *ProcessorService) dispatchAlert(ctx context.Context, issueID, projectID, errorClass, message string) {
+func (s *ProcessorService) dispatchAlert(ctx context.Context, issueID, projectID, environment, errorClass, message string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.ErrorContext(ctx, "alerts: recovered from panic dispatching alert",
 				slog.String("issue_id", issueID), slog.String("project_id", projectID), slog.Any("panic", r))
 		}
 	}()
-	s.alerts.Dispatch(ctx, issueID, projectID, errorClass, message)
+	s.alerts.Dispatch(ctx, issueID, projectID, environment, errorClass, message)
 }

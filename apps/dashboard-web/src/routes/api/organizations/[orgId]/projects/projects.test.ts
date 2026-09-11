@@ -6,6 +6,13 @@ vi.mock('../keys/_shared', () => ({ requireOrgMembership: (...a: any[]) => requi
 const createProject = vi.fn();
 vi.mock('$lib/db/queries/organizations', () => ({ createProject: (...a: any[]) => createProject(...a) }));
 
+// sentinel-project-environments §4.10, decision 31: GET's population is the accessible union, not
+// the organization's whole project table.
+const getAccessibleProjects = vi.fn();
+vi.mock('$lib/server/issue-access', () => ({
+	getAccessibleProjects: (...a: any[]) => getAccessibleProjects(...a),
+}));
+
 const dbMock: any = { select: vi.fn(), from: vi.fn(), where: vi.fn() };
 dbMock.select.mockReturnValue(dbMock);
 dbMock.from.mockReturnValue(dbMock);
@@ -33,6 +40,12 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	requireOrgMembership.mockResolvedValue({ role: 'owner' });
 	createProject.mockResolvedValue({ id: 'proj-1', name: 'Web app' });
+	getAccessibleProjects.mockResolvedValue([
+		{ id: 'proj-1', name: 'Web app', organizationId: 'org-1' },
+	]);
+	dbMock.select.mockReturnValue(dbMock);
+	dbMock.from.mockReturnValue(dbMock);
+	dbMock.where.mockResolvedValue([{ id: 'proj-1', name: 'Web app', createdAt: null }]);
 });
 
 describe('POST /api/organizations/[orgId]/projects', () => {
@@ -79,5 +92,51 @@ describe('GET /api/organizations/[orgId]/projects', () => {
 
 	it('401s an anonymous caller', async () => {
 		await expect(GET(event(null))).rejects.toMatchObject({ status: 401 });
+		expect(getAccessibleProjects).not.toHaveBeenCalled();
+	});
+
+	it('403s a caller who is not a member of the organization', async () => {
+		requireOrgMembership.mockResolvedValue(undefined);
+
+		await expect(GET(event('user-1'))).rejects.toMatchObject({ status: 403 });
+		expect(getAccessibleProjects).not.toHaveBeenCalled();
+	});
+
+	// Decision 31: the population is the accessible union scoped to THIS organization, resolved from
+	// the session user — not `select ... where organization_id = :orgId`. Delete the
+	// `getAccessibleProjects` call and this fails: nothing else derives the id set the query filters
+	// on.
+	it('derives the list from the caller\'s accessible union, scoped to the organization', async () => {
+		await GET(event('user-1'));
+
+		expect(getAccessibleProjects).toHaveBeenCalledWith('user-1', 'org-1');
+	});
+
+	// A caller with no accessible project in this organization gets an empty list without a second
+	// query — `inArray(id, [])` is not a filter this endpoint should ever emit.
+	it('returns an empty list, and queries nothing, when the union is empty', async () => {
+		getAccessibleProjects.mockResolvedValue([]);
+
+		const res = await GET(event('user-1'));
+
+		expect(await res.json()).toEqual({ projects: [] });
+		expect(dbMock.select).not.toHaveBeenCalled();
+	});
+
+	// Inbox projects stay excluded, as they were when this listed the table directly: they are the
+	// landing place for unassigned reports, not something anyone chose to create.
+	it('excludes inbox projects from the union it returns', async () => {
+		getAccessibleProjects.mockResolvedValue([
+			{ id: 'proj-1', name: 'Web app', organizationId: 'org-1' },
+			{ id: 'inbox-1', name: 'Triage', organizationId: 'org-1' },
+		]);
+		dbMock.where.mockResolvedValue([{ id: 'proj-1', name: 'Web app', createdAt: null }]);
+
+		const res = await GET(event('user-1'));
+
+		expect(await res.json()).toEqual({
+			projects: [{ id: 'proj-1', name: 'Web app', createdAt: null }],
+		});
+		expect(dbMock.where).toHaveBeenCalledTimes(1);
 	});
 });

@@ -39,6 +39,7 @@ vi.mock('$lib/db/schema', () => ({
   issues: { id: 'id', projectId: 'projectId' },
   projects: { id: 'id', organizationId: 'organizationId' },
   issueSubscriptions: { id: 'id', issueId: 'issueId', subscriberType: 'subscriberType', subscriberId: 'subscriberId' },
+  projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 }));
 const schemaMock = await import('$lib/db/schema');
 
@@ -323,6 +324,46 @@ describe('Organization Member Management Routes', () => {
       expect(dbMock.transaction).toHaveBeenCalledTimes(1);
     });
 
+    // sentinel-project-environments §4.10, decision 40, asserted BESIDE R1's above because they are
+    // the same lifecycle: a grant does not outlive the membership it narrows, and a future edit that
+    // moves one delete must move the other. R1's own comment gives the reason with the sign flipped
+    // -- a subscription that lingers over-notifies, a grant that lingers under-shows.
+    //
+    // Three deletes inside the ONE db.transaction: the membership row, the subscriptions, the
+    // grants. That the rollback of that transaction leaves all of them intact is asserted against a
+    // real Postgres in environment-grants-lifecycle.integration.test.ts -- a mock cannot roll back.
+    it('decision 40: deletes the revoked member\'s project_environment_grants rows in the same transaction as the membership and the subscriptions', async () => {
+      dbMock.then
+        .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }])) // caller
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'mem-target', userId: 'user-target', role: 'engineer' }])) // target
+        .mockImplementationOnce((resolve: any) => resolve([])) // delete organizationMembers await
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'issue-1' }])); // this org's issue ids
+
+      const res = await DELETE({ params: { orgId: 'org-1', memberId: 'mem-target' }, locals: locals({ id: 'user-caller' }) } as any);
+
+      expect(res.status).toBe(200);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.organizationMembers);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.issueSubscriptions);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.projectEnvironmentGrants);
+      expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('decision 40: the grant delete runs even when this org has no issues at all -- it is not conditional on the subscriptions branch', async () => {
+      dbMock.then
+        .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }])) // caller
+        .mockImplementationOnce((resolve: any) => resolve([{ id: 'mem-target', userId: 'user-target', role: 'engineer' }])) // target
+        .mockImplementationOnce((resolve: any) => resolve([])) // delete organizationMembers await
+        .mockImplementationOnce((resolve: any) => resolve([])); // no issues in this org
+
+      const res = await DELETE({ params: { orgId: 'org-1', memberId: 'mem-target' }, locals: locals({ id: 'user-caller' }) } as any);
+
+      expect(res.status).toBe(200);
+      // The subscriptions delete is correctly skipped -- and the grant delete is NOT, because a
+      // grant's lifecycle has nothing to do with whether this organization has issues yet.
+      expect(dbMock.delete).not.toHaveBeenCalledWith(schemaMock.issueSubscriptions);
+      expect(dbMock.delete).toHaveBeenCalledWith(schemaMock.projectEnvironmentGrants);
+    });
+
     it('R1: skips the subscriptions delete entirely when this org has no issues (no-op, not an error)', async () => {
       dbMock.then
         .mockImplementationOnce((resolve: any) => resolve([{ role: 'owner' }])) // caller
@@ -589,7 +630,13 @@ describe('Organization Member Management Routes', () => {
         expect.any(Date),
         // D31 (residual): the inviter's id is recorded so redemption can re-check, at claim time,
         // that they still hold authority to grant this role.
-        'user-caller'
+        'user-caller',
+        // sentinel-project-environments §4.10a, decision 28 -- THE ABSENCE CLAIM at this boundary:
+        // an invitation sent with no `environmentScopes` (which is this body, and every invitation
+        // sent today) stores NULL, so acceptance writes no grant row and the new member is
+        // unrestricted. `null` rather than an omitted argument, so re-inviting somebody without a
+        // scope cannot inherit anything.
+        null
       );
       // The endpoint generates its own 256-bit (32-byte -> 64 hex char) raw token via
       // crypto.randomBytes internally; createOrganizationInvitation hashes it before persisting

@@ -120,9 +120,9 @@ func ValidatePayload(payload *ErrorPayload) ValidationResult {
 	if payload.Environment == "" {
 		result.Valid = false
 		result.Errors = append(result.Errors, ValidationError{Field: "environment", Message: "environment is required"})
-	} else if !isValidAlphanumeric(payload.Environment) {
+	} else if !isValidEnvironmentName(payload.Environment) {
 		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "environment", Message: "environment must be lowercase alphanumeric"})
+		result.Errors = append(result.Errors, ValidationError{Field: "environment", Message: "environment must match ^[a-z0-9][a-z0-9._-]{0,49}$"})
 	}
 
 	if len(payload.Message) > MaxMessageLength {
@@ -164,6 +164,44 @@ func ValidatePayload(payload *ErrorPayload) ValidationResult {
 	return result
 }
 
+// isValidEnvironmentName implements sentinel-project-environments §4.8's widened set, decision 10:
+//
+//	^[a-z0-9][a-z0-9._-]{0,49}$
+//
+// i.e. a lowercase-alphanumeric first character followed by up to 49 more characters drawn from
+// lowercase alphanumerics, dot, underscore and hyphen. `pre-prod`, `eu-west-1`, `staging-2` and
+// `prod_eu` — the four names operators actually use — are accepted; `Production` (uppercase) and
+// `-prod` (leading separator) are not. The 50-character bound is folded into the pattern rather than
+// checked separately, exactly as the proto CEL rule now does it.
+//
+// This is a NEW function and isValidAlphanumeric is deliberately left exactly as it was. That
+// function is SHARED with payload.Platform, whose own CEL rule (error_event.platform) is unchanged
+// by this feature: widening it in place would widen `platform` on the Go side only, leaving the Go
+// check and the wire check disagreeing about what a platform is — a split that surfaces months later
+// as an event rejected by protovalidate after the ingestor accepted it. §11 makes "platform still
+// rejects all four names" an assertion for exactly this reason.
+//
+// Written as an explicit scan rather than a regexp because this runs on every ingested event and the
+// pattern is simple enough that a regexp would be the more surprising choice here.
+func isValidEnvironmentName(s string) bool {
+	if len(s) == 0 || len(s) > 50 {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			continue
+		case i > 0 && (c == '.' || c == '_' || c == '-'):
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isValidAlphanumeric is payload.Platform's check and, since decision 10, ONLY payload.Platform's.
+// Do not widen it: see isValidEnvironmentName above.
 func isValidAlphanumeric(s string) bool {
 	for _, c := range s {
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {

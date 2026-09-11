@@ -141,7 +141,7 @@ func TestAlertsDispatcher_ConfigReloadRaceFree(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 2000; i++ {
-			d.Dispatch(context.Background(), "issue-1", projectID, "TestError", "msg")
+			d.Dispatch(context.Background(), "issue-1", projectID, "production", "TestError", "msg")
 		}
 		close(stop)
 	}()
@@ -234,7 +234,7 @@ func TestAlertsDispatcher_ResolveOrgWideOnly(t *testing.T) {
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 1)
@@ -251,7 +251,7 @@ func TestAlertsDispatcher_ResolveProjectScopedOnly(t *testing.T) {
 	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 1)
@@ -271,7 +271,7 @@ func TestAlertsDispatcher_ResolveBothLayersUnion(t *testing.T) {
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 2, "both an org-wide and a project-scoped config apply and must both fire")
@@ -293,7 +293,7 @@ func TestAlertsDispatcher_ResolveSameDestinationDeduplicated(t *testing.T) {
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 1, "two configs resolving to the same channel+target must be deduplicated to one send")
@@ -316,7 +316,7 @@ func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
 		d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{resolutionOrgID: {orgCfg}})
 		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-		d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+		d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 		got := sent()
 		require.Len(t, got, 1)
@@ -333,7 +333,7 @@ func TestAlertsDispatcher_ResolveDisabledConfigIgnored(t *testing.T) {
 		d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{resolutionOrgID: {orgCfg}})
 		d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-		d.Dispatch(context.Background(), "issue-2", resolutionProjectID, "TestError", "msg")
+		d.Dispatch(context.Background(), "issue-2", resolutionProjectID, "production", "TestError", "msg")
 
 		got := sent()
 		require.Len(t, got, 1)
@@ -367,7 +367,7 @@ func TestAlertsDispatcher_ResolveMultipleOrgWideRulesUnion(t *testing.T) {
 	})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 2, "both org-wide rules (email and telegram) must fire, not just the last one loaded")
@@ -398,7 +398,7 @@ func TestAlertsDispatcher_ResolveMultipleProjectScopedConfigs(t *testing.T) {
 	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	got := sent()
 	require.Len(t, got, 2, "both project-scoped rules must fire; a single-value map drops one silently")
@@ -425,7 +425,7 @@ func TestAlertsDispatcher_MultipleProjectConfigsSameDestinationDedup(t *testing.
 	d.SetOrgConfigsForTest(map[string][]*alerts.AlertConfig{})
 	d.SetProjectOrgForTest(map[string]string{resolutionProjectID: resolutionOrgID})
 
-	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "TestError", "msg")
+	d.Dispatch(context.Background(), "issue-1", resolutionProjectID, "production", "TestError", "msg")
 
 	require.Len(t, sent(), 1, "same channel+destination must dedup to a single send")
 }

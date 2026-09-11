@@ -1,7 +1,7 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { db } from '$lib/server/db';
-import { organizationMembers, issues, projects, issueSubscriptions } from '$lib/db/schema';
+import { organizationMembers, issues, projects, issueSubscriptions, projectEnvironmentGrants } from '$lib/db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 import { upsertOrganizationMember } from '$lib/db/queries/organizations';
 import { requireOrgMembership } from '../../keys/_shared';
@@ -206,6 +206,30 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
           )
         );
     }
+
+    // sentinel-project-environments §4.10, decision 40: a grant does not outlive the membership it
+    // narrows. Same transaction as the removal above and beside the issue_subscriptions delete --
+    // not after it, not in a job -- because a rollback of one must roll back the other (D18), and
+    // because these are the same lifecycle: a future edit that moves one must move the other.
+    //
+    // The precedent is R1 immediately above, with the sign flipped: a subscription that lingers
+    // OVER-notifies, and a grant that lingers UNDER-shows. Without this, a contractor narrowed to
+    // {staging}, removed, and invited back later as a full engineer is walled out of production
+    // with no UI anywhere saying why -- under §2.2's 404 rule a short list, a thin search and a
+    // quiet bell are indistinguishable from "there is nothing there" by design.
+    //
+    // Only org-membership removal needs this: project_environment_grants.project_id cascades from
+    // projects and user_id cascades from "user", and neither the user nor the project is deleted
+    // here.
+    await tx.delete(projectEnvironmentGrants).where(
+      and(
+        eq(projectEnvironmentGrants.userId, target.userId),
+        inArray(
+          projectEnvironmentGrants.projectId,
+          tx.select({ id: projects.id }).from(projects).where(eq(projects.organizationId, orgId))
+        )
+      )
+    );
 
     return target;
   });

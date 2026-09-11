@@ -47,6 +47,11 @@ export const GET: RequestHandler = async ({ request, url }) => {
 
 	const projectId = url.searchParams.get('project') || undefined;
 
+	// sentinel-project-environments §4.6: additive and unvalidated beyond emptiness, exactly like
+	// `project` above. An unrecognised name is not an error — it returns an empty list, because
+	// "no issues in `qa`" and "there is no `qa`" are the same fact to a reader.
+	const environment = url.searchParams.get('environment') || undefined;
+
 	// sentinel-user-report-issue SR-6 / OQ-8: `?source=` narrows on `issues.source_channel`, so an
 	// agent can separate externally-submitted reports from org-member ones. §6's mitigation for the
 	// volume change external intake brings is a dashboard filter and a badge -- neither reaches this
@@ -112,6 +117,7 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		claimed,
 		claimedByAgentId,
 		projectId,
+		environment,
 		waiting,
 		source,
 		since,

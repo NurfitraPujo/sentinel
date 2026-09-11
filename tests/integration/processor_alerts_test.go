@@ -267,7 +267,7 @@ func TestAlertsDispatcher_FormatAlertMessageShortMessage(t *testing.T) {
 			projectID: configFromRow(projectID, 1, 60, true),
 		})
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "short message")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "short message")
 
 		got := cap.snapshot()
 		require.Len(t, got, 1, "expected exactly one alert for threshold=1")
@@ -293,7 +293,7 @@ func TestAlertsDispatcher_FormatAlertMessageTruncates(t *testing.T) {
 		for i := range long {
 			long[i] = 'a'
 		}
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", string(long))
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", string(long))
 
 		got := cap.snapshot()
 		require.Len(t, got, 1)
@@ -313,7 +313,7 @@ func TestAlertsDispatcher_DispatchNoConfigDoesNothing(t *testing.T) {
 		d.SetSenderForTest(cap.sender())
 		d.SetConfigsForTest(map[string]*alerts.AlertConfig{})
 
-		d.Dispatch(ctx, "issue-1", "nonexistent-project", "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", "nonexistent-project", "production", "TestError", "msg")
 
 		assert.Equal(t, 0, cap.count(), "no alert should be sent when no config is loaded")
 	})
@@ -333,7 +333,7 @@ func TestAlertsDispatcher_DispatchDisabledConfigDoesNothing(t *testing.T) {
 			projectID: configFromRow(projectID, 1, 60, false),
 		})
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 
 		assert.Equal(t, 0, cap.count(),
 			"disabled configs should be skipped by Dispatch's enabled check")
@@ -354,8 +354,8 @@ func TestAlertsDispatcher_DispatchBelowThresholdDoesNotSend(t *testing.T) {
 			projectID: configFromRow(projectID, 3, 60, true),
 		})
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 
 		assert.Equal(t, 0, cap.count(), "below threshold should not send an alert")
 	})
@@ -375,8 +375,8 @@ func TestAlertsDispatcher_DispatchAtThresholdSendsAlert(t *testing.T) {
 			projectID: configFromRow(projectID, 2, 60, true),
 		})
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "first")
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "second")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "first")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "second")
 
 		got := cap.snapshot()
 		require.Len(t, got, 1, "expected exactly one alert when threshold is reached")
@@ -386,7 +386,7 @@ func TestAlertsDispatcher_DispatchAtThresholdSendsAlert(t *testing.T) {
 		assert.Contains(t, got[0].alert.Message, "[2x]")
 		assert.Contains(t, got[0].alert.Message, "TestError")
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "third")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "third")
 		assert.Equal(t, 1, cap.count(), "counter should reset after an alert is sent")
 	})
 }
@@ -405,19 +405,19 @@ func TestAlertsDispatcher_CounterResetsAfterWindow(t *testing.T) {
 			projectID: configFromRow(projectID, 3, 60, true),
 		})
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		require.Equal(t, 0, cap.count())
 
 		// Advance past the 60s window. The counter resets, so reaching the
 		// threshold takes another 3 calls from this point in synthetic time.
 		time.Sleep(61 * time.Second)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		require.Equal(t, 0, cap.count(), "first two dispatches after window reset should not trigger")
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		got := cap.snapshot()
 		require.Len(t, got, 1, "counter reset should require a fresh threshold-worth of dispatches")
 		assert.Contains(t, got[0].alert.Message, "[3x]", "alert should reflect the new count after reset")
@@ -437,7 +437,7 @@ func TestAlertsDispatcher_RefreshConfigsLoadsSeededRow(t *testing.T) {
 
 		d.RefreshConfigsForTest(ctx)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		got := cap.snapshot()
 		require.Len(t, got, 1, "refreshConfigs should populate the configs map from the seeded row")
 		assert.Equal(t, projectID, got[0].alert.ProjectID)
@@ -483,7 +483,7 @@ func TestProcessorAlerts_MultipleProjectScopedConfigsLoadFromSQL(t *testing.T) {
 		d.SetSenderForTest(cap.sender())
 
 		d.RefreshConfigsForTest(ctx)
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 
 		got := cap.snapshot()
 		require.Len(t, got, 2,
@@ -510,7 +510,7 @@ func TestAlertsDispatcher_RefreshConfigsSkipsDisabledRows(t *testing.T) {
 
 		d.RefreshConfigsForTest(ctx)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		assert.Equal(t, 0, cap.count(),
 			"refreshConfigs should filter out rows where enabled = false")
 	})
@@ -527,13 +527,13 @@ func TestAlertsDispatcher_RefreshConfigsPicksUpRowInsertedAfterStart(t *testing.
 		d.SetSenderForTest(cap.sender())
 
 		d.RefreshConfigsForTest(ctx)
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		require.Equal(t, 0, cap.count())
 
 		seedAlertConfig(t, ctx, pool, projectID, 1, 60, true)
 		d.RefreshConfigsForTest(ctx)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		got := cap.snapshot()
 		require.Len(t, got, 1,
 			"a row inserted after the first refresh should be visible after the next refresh")
@@ -561,7 +561,7 @@ func TestAlertsDispatcher_RefreshConfigsHandlesQueryError(t *testing.T) {
 		cancel()
 		d.RefreshConfigsForTest(canceledCtx)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		assert.Equal(t, 0, cap.count(),
 			"a failed refresh should leave the configs map empty so Dispatch does nothing")
 	})
@@ -584,7 +584,7 @@ func TestAlertsDispatcher_SendAlertDefaultBranch(t *testing.T) {
 		})
 
 		assert.NotPanics(t, func() {
-			d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+			d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		}, "Dispatch should fall back to the log.Printf sendAlert path without panicking")
 	})
 }
@@ -610,7 +610,7 @@ func TestAlertsDispatcher_RefreshConfigsMultipleOrgWideRulesBothFire(t *testing.
 
 		d.RefreshConfigsForTest(ctx)
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 
 		got := cap.snapshot()
 		require.Len(t, got, 2, "both org-wide rules (email and telegram, different destinations) must fire, not just one")
@@ -687,11 +687,80 @@ func TestAlertsDispatcher_LoadConfigsTickerFires(t *testing.T) {
 		time.Sleep(alerts.ConfigRefreshInterval() + time.Second)
 		synctest.Wait()
 
-		d.Dispatch(ctx, "issue-1", projectID, "TestError", "msg")
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
 		assert.Equal(t, 1, cap.count(),
 			"the backstop ticker should have fired refreshConfigs which loaded the seeded row")
 
 		cancel()
 		<-done
+	})
+}
+
+// seedScopedAlertConfig inserts a PROJECT-SCOPED row carrying sentinel-project-environments §4.7's
+// `environments` scope. environments == nil seeds SQL NULL — the pre-feature shape, "every
+// environment" — rather than an empty array, which §4.7 refuses at the API precisely because a
+// config that can never fire is a config somebody thinks is working.
+func seedScopedAlertConfig(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string, environments []string, threshold int) {
+	t.Helper()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled, environments)
+		 VALUES ($1, (SELECT organization_id FROM projects WHERE id = $1), 'email', '{"to":"scoped@example.test"}'::jsonb, $2, 60, true, $3)`,
+		projectID, threshold, environments,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM alert_configs WHERE project_id = $1`, projectID)
+	})
+}
+
+// TestProcessorAlerts_EnvironmentScopeLoadsFromSQL is the LOAD-PATH counterpart to
+// tests/unit's TestAlertsDispatcher_EnvironmentScope, and it exists for the reason
+// SetProjectConfigsForTest's own doc comment gives: a test that only ever injects configs through
+// the setters cannot catch a regression in the SQL or the scan.
+//
+// The specific regression it catches is refreshConfigs' SELECT losing the `environments` column, or
+// the scan mapping a populated TEXT[] to nil. Both leave every config unscoped — which is silent,
+// because an unscoped config fires exactly as it did before this feature, so every OTHER alerting
+// test in this file would still pass.
+func TestProcessorAlerts_EnvironmentScopeLoadsFromSQL(t *testing.T) {
+	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
+		cap := &alertCapture{}
+		ctx := context.Background()
+
+		projectID := seedProject(t, ctx, pool)
+		seedScopedAlertConfig(t, ctx, pool, projectID, []string{"production"}, 1)
+
+		d := alerts.NewDispatcherForTest(pool)
+		d.SetSenderForTest(cap.sender())
+		d.RefreshConfigsForTest(ctx)
+
+		d.Dispatch(ctx, "issue-1", projectID, "staging", "TestError", "msg")
+		require.Equal(t, 0, cap.count(), "a config stored with environments={production} must not fire for staging")
+
+		d.Dispatch(ctx, "issue-1", projectID, "production", "TestError", "msg")
+		got := cap.snapshot()
+		require.Len(t, got, 1, "the same config must fire for the environment it is scoped to")
+		assert.Equal(t, "production", got[0].alert.Environment, "the Alert carries the environment, which notify.go's subject names")
+	})
+}
+
+// TestProcessorAlerts_NullEnvironmentScopeLoadsAsEveryEnvironment is decision 6's half of the same
+// load path: a stored NULL must scan to nil and cover everything. An implementation that scanned
+// NULL into an empty non-nil slice would silence every alert config that existed before this
+// feature — the worst available failure, and one no test above would see.
+func TestProcessorAlerts_NullEnvironmentScopeLoadsAsEveryEnvironment(t *testing.T) {
+	runAlertsTest(t, func(t *testing.T, pool *pgxpool.Pool) {
+		cap := &alertCapture{}
+		ctx := context.Background()
+
+		projectID := seedProject(t, ctx, pool)
+		seedScopedAlertConfig(t, ctx, pool, projectID, nil, 1)
+
+		d := alerts.NewDispatcherForTest(pool)
+		d.SetSenderForTest(cap.sender())
+		d.RefreshConfigsForTest(ctx)
+
+		d.Dispatch(ctx, "issue-1", projectID, "any-environment-at-all", "TestError", "msg")
+		require.Len(t, cap.snapshot(), 1, "a NULL scope covers every environment, exactly as it does today")
 	})
 }

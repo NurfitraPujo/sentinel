@@ -44,7 +44,11 @@ vi.mock('$lib/db/schema', () => ({
 		issueType: 'issueType',
 		status: 'status',
 		message: 'message',
+		// sentinel-project-environments §2.2 (decisions 25 and 36): the column both the notify guard
+		// and `listReports`'s predicate read, and the table the scope is resolved from.
+		environment: 'environment',
 	},
+	projectEnvironmentGrants: { userId: 'userId', projectId: 'projectId', environments: 'environments' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
 	manualIssueReports: { issueId: 'issueId', reporterId: 'reporterId', bodyMd: 'bodyMd', severity: 'severity' },
 	attachments: { id: 'id', issueId: 'issueId', commentId: 'commentId', storageKey: 'storageKey' },
@@ -80,6 +84,9 @@ const {
 	moveIssueToProject,
 	updateManualIssueReport,
 	deleteManualIssue,
+	resolveReportEnvironment,
+	ENV_NAME_RE,
+	DEFAULT_REPORT_ENVIRONMENT,
 } = await import('./reports');
 
 beforeEach(() => {
@@ -90,6 +97,58 @@ beforeEach(() => {
 	// resolves via txMock.then -- default it to "no subscribers" so claim/release tests don't have
 	// to think about fan-out unless they're the ones testing it.
 	txMock.then = vi.fn((resolve: any) => resolve([]));
+});
+
+/**
+ * sentinel-project-environments §4.8a — the ONE helper both `issues` writers in this file share,
+ * and the value that also reaches both triage call sites (decisions 50 and 53).
+ *
+ * Pure: no database, no transaction, no route. Table-driven because the rule is a table.
+ */
+describe('resolveReportEnvironment (§4.8a)', () => {
+	it.each<[unknown, string, string]>([
+		// [asserted, resolved, why]
+		[undefined, 'production', 'an omitted key is not an assertion'],
+		[null, 'production', 'an explicit null is not an assertion'],
+		['', 'production', 'an explicit empty string is not an assertion'],
+		['production', 'production', 'the default is a real, grantable name and is accepted as one'],
+		['staging', 'staging', 'a matching value is stored verbatim'],
+		['eu-west-1', 'eu-west-1', "decision 10's widened set: hyphens and digits"],
+		['staging-2', 'staging-2', 'the widened set again'],
+		['prod_eu', 'prod_eu', 'underscores are allowed AFTER the first character'],
+		['pre-prod', 'pre-prod', 'the operator-named case decision 10 exists for'],
+		['a.b', 'a.b', 'dots are in the set'],
+		['Production', 'production', 'the set is lower-case only, so this falls back'],
+		['eu west', 'production', 'a space is outside the set'],
+		['Prod!', 'production', 'punctuation outside [._-] is outside the set'],
+		['-prod', 'production', 'a leading hyphen fails ^[a-z0-9]'],
+		[
+			'_unspecified',
+			'production',
+			"decision 51: the migration's transient DEFAULT can never be asserted as an override",
+		],
+		['a'.repeat(50), 'a'.repeat(50), 'exactly 50 characters is inside the bound'],
+		['a'.repeat(51), 'production', '51 is outside it — the size bound is folded into the pattern'],
+		[42, 'production', 'a non-string is not an assertion'],
+		[{ environment: 'staging' }, 'production', 'an object is not an assertion'],
+	])('resolves %j to %j (%s)', (asserted, expected) => {
+		expect(resolveReportEnvironment(asserted)).toBe(expected);
+	});
+
+	it('exposes the default as the literal `production` (decision 24)', () => {
+		expect(DEFAULT_REPORT_ENVIRONMENT).toBe('production');
+	});
+
+	// A `/g` RegExp carries `lastIndex` between `.test()` calls and would alternate true/false for
+	// the same input — which would make one in every two valid overrides silently fall back to
+	// `production`, with nothing anywhere to say so.
+	it('uses a non-global RegExp, so repeated tests of the same value agree', () => {
+		expect(ENV_NAME_RE.global).toBe(false);
+		expect(ENV_NAME_RE.test('staging')).toBe(true);
+		expect(ENV_NAME_RE.test('staging')).toBe(true);
+		expect(resolveReportEnvironment('staging')).toBe('staging');
+		expect(resolveReportEnvironment('staging')).toBe('staging');
+	});
 });
 
 describe('createManualIssue', () => {
@@ -113,6 +172,11 @@ describe('createManualIssue', () => {
 		});
 
 		expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+		// §4.9 makes issues.environment NOT NULL with no DEFAULT, so this writer must supply it.
+		// This report asserted nothing, so §4.8a's default is what lands.
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ projectId: 'project-1', environment: 'production' })
+		);
 		expect(result.issue).toEqual({ id: 'issue-1', projectId: 'project-1' });
 		expect(result.report).toEqual({ issueId: 'issue-1', reporterId: 'user-1' });
 		// insert called 4 times: issues, manual_issue_reports, issue_activity, issue_subscriptions
@@ -282,6 +346,14 @@ describe('claimIssue', () => {
 				])
 			)
 			.mockImplementationOnce((resolve: any) => resolve([{ userId: 'user-2' }, { userId: 'user-1' }]))
+			// sentinel-project-environments §2.2, decision 25: two more reads in the same branch --
+			// the issue row notifyIssueEvent takes `projectId` + `environment` off, then ONE batched
+			// grant lookup for every candidate subscriber. No grant rows, so absence means all and the
+			// fan-out asserted below is exactly the one this test always asserted.
+			.mockImplementationOnce((resolve: any) =>
+				resolve([{ projectId: 'proj-1', environment: 'production' }])
+			)
+			.mockImplementationOnce((resolve: any) => resolve([]))
 			.mockImplementationOnce((resolve: any) => resolve(undefined)); // notifyIssueEvent's own notifications insert
 
 		const { issue, notified } = await claimIssue('issue-1', 'user', 'user-1');
@@ -380,6 +452,11 @@ describe('releaseClaim', () => {
 			.mockImplementationOnce((resolve: any) => resolve(undefined)) // issue_activity insert
 			.mockImplementationOnce((resolve: any) => resolve([{ subscriberType: 'user', subscriberId: 'user-2' }]))
 			.mockImplementationOnce((resolve: any) => resolve([{ userId: 'user-2' }]))
+			// §2.2, decision 25's two reads: the issue row, then one batched grant lookup. No grants.
+			.mockImplementationOnce((resolve: any) =>
+				resolve([{ projectId: 'proj-1', environment: 'production' }])
+			)
+			.mockImplementationOnce((resolve: any) => resolve([]))
 			.mockImplementationOnce((resolve: any) => resolve(undefined)); // notifyIssueEvent's own notifications insert
 
 		const { issue, notified } = await releaseClaim('issue-1', 'admin-1', { force: true });
@@ -503,5 +580,44 @@ describe('deleteManualIssue', () => {
 		txMock.then = vi.fn((resolve: any) => resolve([]));
 
 		await expect(deleteManualIssue('missing')).rejects.toThrow('not found');
+	});
+});
+
+describe('createManualIssue — the environment it writes (§4.8a)', () => {
+	function queueInserts() {
+		let call = 0;
+		txMock.returning = vi.fn(() => {
+			call += 1;
+			if (call === 1) return Promise.resolve([{ id: 'issue-1', projectId: 'project-1' }]);
+			if (call === 2) return Promise.resolve([{ issueId: 'issue-1', reporterId: 'user-1' }]);
+			return Promise.resolve([]);
+		});
+	}
+
+	const input = {
+		organizationId: 'org-1',
+		projectId: 'project-1',
+		reporterId: 'user-1',
+		title: 'Cannot log in',
+		bodyMd: 'Steps to reproduce...',
+		severity: 'high' as const,
+	};
+
+	it.each<[string | null | undefined, string]>([
+		[undefined, 'production'],
+		[null, 'production'],
+		['', 'production'],
+		['eu-west-1', 'eu-west-1'],
+		// The route rejects this one with a 400 before it can get here; the writer still resolves it
+		// rather than passing a value the NOT NULL column would take and no reader could ever filter.
+		['Prod!', 'production'],
+	])('writes %j as %j on the issues row', async (asserted, expected) => {
+		queueInserts();
+
+		await createManualIssue({ ...input, environment: asserted });
+
+		expect(txMock.values).toHaveBeenCalledWith(
+			expect.objectContaining({ projectId: 'project-1', environment: expected })
+		);
 	});
 });

@@ -58,8 +58,8 @@ describe.skipIf(!dbReachable)('events feed exposes current claim state (integrat
 			values (${projectId}, ${'n9-flow-' + suffix}, ${orgId}, ${'k_' + suffix}, ${'h_' + suffix})
 		`;
 		const [issueRow] = await sql`
-			insert into issues (project_id, fingerprint, message, error_class, issue_type)
-			values (${projectId}, ${'fp_' + suffix}, ${'Something broke ' + suffix}, ${'TypeError'}, ${'system_error'})
+			insert into issues (project_id, environment, fingerprint, message, error_class, issue_type)
+			values (${projectId}, ${'production'}, ${'fp_' + suffix}, ${'Something broke ' + suffix}, ${'TypeError'}, ${'system_error'})
 			returning id
 		`;
 		issueId = issueRow.id as string;

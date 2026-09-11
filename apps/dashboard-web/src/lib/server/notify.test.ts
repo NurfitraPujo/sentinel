@@ -33,7 +33,20 @@ const { db: dbMock, resultQueue } = makeQueueableDb();
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
-	issues: { id: 'id', projectId: 'projectId', message: 'message', issueType: 'issueType' },
+	issues: {
+		id: 'id',
+		projectId: 'projectId',
+		message: 'message',
+		issueType: 'issueType',
+		// sentinel-project-environments decision 7: the issue's environment is a column on the row
+		// notifyIssueEvent already reads, which is why §2.2's guard costs no extra lookup for it.
+		environment: 'environment',
+	},
+	projectEnvironmentGrants: {
+		userId: 'userId',
+		projectId: 'projectId',
+		environments: 'environments',
+	},
 	projects: { id: 'id', organizationId: 'organizationId' },
 	organizations: { id: 'id', slug: 'slug' },
 	organizationMembers: { organizationId: 'organizationId', userId: 'userId' },
@@ -292,5 +305,160 @@ describe('sendIssueNotificationEmails', () => {
 	it('is a no-op when the notified list is empty', async () => {
 		await sendIssueNotificationEmails([], { issueId: 'issue-1', origin: 'https://app.example' });
 		expect(sendIssueNotificationEmail).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * sentinel-project-environments §2.2, decision 25 — **the highest-value new guard in the feature
+ * after the migration's**, and the only one in this file about something that CANNOT BE RECALLED.
+ *
+ * A subscriber outside the issue's environment gets no `notifications` row and no email. There is
+ * one filter and it is here, at subscriber resolution, not a second one in the post-commit sender:
+ * `sendIssueNotificationEmails` takes the `NotifiedUser[]` this function RETURNS, so a subscriber
+ * filtered out here is already absent from the sender's input.
+ *
+ * `notifyIssueEvent` runs three queries on `tx` in order — R1's org-membership check, then the
+ * issue row (project + environment), then ONE batched grant lookup for every candidate subscriber.
+ * The queue below supplies them in exactly that order, and a build that resolved per subscriber
+ * would exhaust it.
+ */
+describe('notifyIssueEvent — the §2.2 environment guard (decision 25)', () => {
+	function scopedTx(members: string[], issueRow: unknown, grants: unknown[]) {
+		const made = makeTx();
+		made.txResultQueue.push(
+			members.map((userId) => ({ userId })),
+			[issueRow],
+			grants
+		);
+		return made;
+	}
+
+	it('a subscriber narrowed out of the issue’s environment gets NO row and NO email', async () => {
+		listSubscribers.mockResolvedValueOnce([
+			{ subscriberType: 'user', subscriberId: 'narrowed-1' },
+			{ subscriberType: 'user', subscriberId: 'open-1' },
+		]);
+		const { tx, insertCalls } = scopedTx(
+			['narrowed-1', 'open-1'],
+			{ projectId: 'project-1', environment: 'production' },
+			// Only the narrowed member has a grant row. Absence means all -- `open-1` is unrestricted.
+			[{ userId: 'narrowed-1', environments: ['staging'] }]
+		);
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId: 'issue-1',
+			kind: 'status_changed',
+			actorType: 'system',
+			actorId: 'system',
+		});
+
+		// The RETURN value is what drives the email, so this single assertion covers both halves.
+		expect(notified).toEqual([{ userId: 'open-1', kind: 'status_changed' }]);
+		expect(insertCalls).toHaveLength(1);
+		expect(insertCalls[0]).toEqual([expect.objectContaining({ userId: 'open-1' })]);
+	});
+
+	it('the same member IS notified about an issue in an environment they hold', async () => {
+		// The other side of the same fixture: the guard is about the issue's environment, not about
+		// the member. Without this a filter that dropped every grant-holder would also pass above.
+		listSubscribers.mockResolvedValueOnce([{ subscriberType: 'user', subscriberId: 'narrowed-1' }]);
+		const { tx, insertCalls } = scopedTx(
+			['narrowed-1'],
+			{ projectId: 'project-1', environment: 'staging' },
+			[{ userId: 'narrowed-1', environments: ['staging'] }]
+		);
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId: 'issue-1',
+			kind: 'status_changed',
+			actorType: 'system',
+			actorId: 'system',
+		});
+
+		expect(notified).toEqual([{ userId: 'narrowed-1', kind: 'status_changed' }]);
+		expect(insertCalls).toHaveLength(1);
+	});
+
+	it('an UNRESTRICTED subscriber is notified exactly as today — absence means all', async () => {
+		// The regression that matters most: this is every subscriber in every organization on the
+		// day this ships. A map read as `get(userId) ?? []` would notify nobody, ever.
+		listSubscribers.mockResolvedValueOnce([{ subscriberType: 'user', subscriberId: 'open-1' }]);
+		const { tx, insertCalls } = scopedTx(
+			['open-1'],
+			{ projectId: 'project-1', environment: 'production' },
+			[]
+		);
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId: 'issue-1',
+			kind: 'commented',
+			actorType: 'system',
+			actorId: 'system',
+		});
+
+		expect(notified).toEqual([{ userId: 'open-1', kind: 'commented' }]);
+		expect(insertCalls).toHaveLength(1);
+	});
+
+	it('inserts NOTHING at all when every subscriber is narrowed out', async () => {
+		// Not "inserts an empty array": the absence a happy-path test cannot see.
+		listSubscribers.mockResolvedValueOnce([{ subscriberType: 'user', subscriberId: 'narrowed-1' }]);
+		const { tx, insertCalls } = scopedTx(
+			['narrowed-1'],
+			{ projectId: 'project-1', environment: 'production' },
+			[{ userId: 'narrowed-1', environments: ['staging'] }]
+		);
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId: 'issue-1',
+			kind: 'resolved',
+			actorType: 'system',
+			actorId: 'system',
+		});
+
+		expect(notified).toEqual([]);
+		expect(insertCalls).toHaveLength(0);
+	});
+});
+
+/**
+ * §2.2's one deliberate boundary crossing (decisions 38/41, *Known limits* 5b): `escalation.ts`'s
+ * unscoped rota page rides through this sender, and the marker must reach the subject `email.ts`
+ * builds. It travels on the `NotifiedUser` because this sender is the one both paths share.
+ */
+describe('sendIssueNotificationEmails — the unscoped marker reaches email.ts', () => {
+	it('passes { unscoped: true } through for an unscoped escalation, and nothing for an ordinary one', async () => {
+		// getIssueLinkInfo, then the throttle count, then the user row -- per notified user.
+		resultQueue.push(
+			[{ title: 'Checkout 500s', issueType: 'user_report', projectId: 'p1', orgSlug: 'acme' }],
+			[{ count: 0 }],
+			[{ email: 'paged@example.test' }],
+			[{ count: 0 }],
+			[{ email: 'assignee@example.test' }]
+		);
+
+		await sendIssueNotificationEmails(
+			[
+				{ userId: 'rota-1', kind: 'escalated', unscoped: true },
+				{ userId: 'assignee-1', kind: 'escalated' },
+			],
+			{ issueId: 'issue-1', origin: 'https://sentinel.test' }
+		);
+
+		expect(sendIssueNotificationEmail).toHaveBeenNthCalledWith(
+			1,
+			'paged@example.test',
+			expect.any(String),
+			'escalated',
+			'Checkout 500s',
+			{ unscoped: true }
+		);
+		expect(sendIssueNotificationEmail).toHaveBeenNthCalledWith(
+			2,
+			'assignee@example.test',
+			expect.any(String),
+			'escalated',
+			'Checkout 500s'
+		);
 	});
 });

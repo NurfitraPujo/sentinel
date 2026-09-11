@@ -18,6 +18,20 @@ const listIssueAttachments = vi.fn(async () => []);
 const requireReportAccess = vi.fn(async () => ({ organizationId: 'org-1', role: 'engineer' }));
 const readTriage = vi.fn();
 
+/**
+ * sentinel-project-environments §2.2 — this route now runs the environment guard through
+ * `issue-access-dispatch.ts: requireIssueAccessAnyType`, the guard point §2.2's table names for
+ * reports (explicitly NOT `report-access.ts: requireReportAccessForIssue`). Mocked here so these
+ * handler tests stay database-free; that it is actually CALLED on each of the three handlers is
+ * asserted below, because a mock that is never reached cannot tell "guarded" from "not guarded".
+ */
+const requireIssueAccessAnyType = vi.fn(async () => ({
+	issueId: 'issue-1',
+	issueType: 'user_report',
+	organizationId: 'org-1',
+	role: 'engineer',
+}));
+
 vi.mock('$lib/db/queries/reports', () => ({
 	getReportDetail,
 	updateManualIssueReport,
@@ -27,6 +41,7 @@ vi.mock('$lib/db/queries/reports', () => ({
 vi.mock('$lib/server/report-access', () => ({ getReporterId, getOrgRole, requireReportAccess }));
 vi.mock('$lib/server/triage', () => ({ readTriage }));
 vi.mock('$lib/server/retention', () => ({ bestEffortDeleteObjects }));
+vi.mock('$lib/server/issue-access-dispatch', () => ({ requireIssueAccessAnyType }));
 
 const { GET, PATCH, DELETE } = await import('./+server');
 
@@ -129,5 +144,61 @@ describe('DELETE /api/organizations/[orgId]/reports/[issueId] (R11)', () => {
 
 		await expect(DELETE(makeEvent('engineer-1'))).rejects.toMatchObject({ status: 403 });
 		expect(deleteManualIssue).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * sentinel-project-environments §2.2, decision 25 — that this route actually GOES THROUGH the guard
+ * point §2.2 names.
+ *
+ * The predicate itself is asserted against a real database at
+ * `src/lib/server/read-guards.integration.test.ts`; what a mock can prove and that file cannot is
+ * that each handler here calls the dispatch at all. It could not before: every handler authorised
+ * at the ORGANIZATION level only, so §2.2's claim that guarding `requireIssueAccessAnyType` covers
+ * `api/organizations/[orgId]/reports/[issueId]` "by construction" was false of this file. A mock
+ * that is never reached cannot tell "guarded" from "not guarded" (B10 addendum), so the call is the
+ * assertion.
+ */
+describe('§2.2 — the environment guard point, on all three handlers', () => {
+	it('GET runs the dispatch after the org-level checks', async () => {
+		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
+		readTriage.mockResolvedValue(null);
+
+		await GET(makeEvent('reader-1'));
+
+		expect(requireIssueAccessAnyType).toHaveBeenCalledWith('reader-1', 'issue-1', 'read');
+	});
+
+	it('PATCH runs it too — an out-of-scope report is not editable either', async () => {
+		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
+		updateManualIssueReport.mockResolvedValue({ issue: {}, report: {} });
+
+		await PATCH(makeEvent('author-1', { bodyMd: 'new body' }));
+
+		expect(requireIssueAccessAnyType).toHaveBeenCalledWith('author-1', 'issue-1', 'read');
+	});
+
+	it('DELETE runs it too', async () => {
+		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
+		getReporterId.mockResolvedValue({ kind: 'org_member', userId: 'author-1' });
+		getOrgRole.mockResolvedValue('engineer');
+		deleteManualIssue.mockResolvedValue({ storageKeys: [] });
+
+		await DELETE(makeEvent('author-1'));
+
+		expect(requireIssueAccessAnyType).toHaveBeenCalledWith('author-1', 'issue-1', 'read');
+	});
+
+	it('a 404 from the dispatch propagates rather than being swallowed', async () => {
+		getReportDetail.mockResolvedValue(reportDetail('unresolved'));
+		readTriage.mockResolvedValue(null);
+		requireIssueAccessAnyType.mockRejectedValueOnce(
+			Object.assign(new Error('Issue not found'), { status: 404 })
+		);
+
+		// Decision 20: the environment dimension denies with a 404, never a 403 — a 403 on a report
+		// id confirms that a production report with that id exists.
+		await expect(GET(makeEvent('reader-1'))).rejects.toMatchObject({ status: 404 });
 	});
 });

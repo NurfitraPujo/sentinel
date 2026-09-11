@@ -2,6 +2,7 @@ import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { batchUpdateIssues, MAX_BATCH_ISSUE_IDS } from '$lib/db/queries/issues';
 import { requireProjectAccess, validateResolvedInVersion } from '$lib/server/issue-access';
+import { resolveEnvironmentScope } from '$lib/server/environment-access';
 
 export const POST: RequestHandler = async ({ request, params, locals }) => {
 	const session = await locals.auth();
@@ -54,6 +55,19 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 		throw error(400, 'Issues cannot be assigned to agents. Agents claim issues themselves via POST /api/agent/issues/:id/claim.');
 	}
 
+	// sentinel-project-environments §2.2 — the ENVIRONMENT dimension, applied after the project one,
+	// exactly as `requireIssueAccess` applies it on the single-issue path.
+	//
+	// `requireProjectAccess` above resolves only the PROJECT dimension — it never reads
+	// `project_environment_grants` — so without this line the bulk path is MORE permissive than the
+	// single-issue one on precisely the axis this feature adds, which is the drift D23's comment
+	// claims the shared helper closed. §2.2's guard table lists this file by name.
+	//
+	// The scope is pushed into the UPDATE's predicate rather than checked here: decision 20 wants an
+	// out-of-scope issue to be indistinguishable from one that does not exist, and `updated` is the
+	// count of rows actually matched, so a narrowed caller who names one simply sees it not counted.
+	const environmentScope = await resolveEnvironmentScope(userId, projectId);
+
 	const updatedCount = await batchUpdateIssues(
 		projectId,
 		action,
@@ -63,7 +77,8 @@ export const POST: RequestHandler = async ({ request, params, locals }) => {
 			assigneeType,
 			assignedTo,
 			actorType: 'user',
-			actorId: userId
+			actorId: userId,
+			environmentScope
 		}
 	);
 

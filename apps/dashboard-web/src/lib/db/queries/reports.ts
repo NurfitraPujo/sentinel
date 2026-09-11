@@ -15,6 +15,10 @@ import { eq, and, isNull, desc, sql } from 'drizzle-orm';
 import { subscribe } from '$lib/db/queries/subscriptions';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { insertReportIdempotency } from '$lib/server/report-idempotency';
+import {
+	environmentScopeCondition,
+	resolveEnvironmentScopes,
+} from '$lib/server/environment-access';
 
 /**
  * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
@@ -23,6 +27,45 @@ import { insertReportIdempotency } from '$lib/server/report-idempotency';
  */
 
 export type ReportSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * sentinel-project-environments §3's accepted set for an environment name (decision 10), and the
+ * literal every user report falls back to (decision 24).
+ *
+ * Deliberately NOT global-flagged: a `/g` RegExp carries `lastIndex` between `.test()` calls and
+ * would return alternating results for the same input.
+ *
+ * `_unspecified` -- the migration's transient DEFAULT -- fails this pattern on its leading
+ * underscore, and that is the whole of decision 51's enforcement: no writer in this system can
+ * produce it. There is no reserved-word check here and none is to be added.
+ */
+export const ENV_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,49}$/;
+
+/** §4.8a: what a report with no valid assertion is filed under. */
+export const DEFAULT_REPORT_ENVIRONMENT = 'production';
+
+/**
+ * §4.8a: ONE definition, TWO `insert(issues)` call sites in this file, and both triage call sites.
+ *
+ * `createManualIssue` and `createExternalIssueReport` meet in this file and nowhere narrower --
+ * neither calls the other, and `createExternalIssueReport`'s doc comment records that keeping them
+ * apart was deliberate. A rule stated at each writer would be two rules that drift.
+ *
+ * The return value is **the environment of the request**: it is what `issues.environment` is written
+ * with AND what triage is filtered on (decision 50). One value per request, never two. Passing the
+ * RAW `context.environment` to triage instead is not a smaller version of this -- under decision
+ * 50's hard filter a `null` matches no row, so every report that asserts nothing (the majority path,
+ * filed as `production` by the line below) would get zero candidates and no auto-link at all.
+ *
+ * Takes `unknown` rather than `string | null | undefined` because both `/api/report` call sites read
+ * it straight out of a `Record<string, unknown>` context object; anything that is not a matching
+ * string -- absent, `null`, `''`, `42`, `'Production'` -- is the default.
+ */
+export function resolveReportEnvironment(asserted: unknown): string {
+	return typeof asserted === 'string' && ENV_NAME_RE.test(asserted)
+		? asserted
+		: DEFAULT_REPORT_ENVIRONMENT;
+}
 
 /**
  * The `attachments_uploader_type_check` vocabulary. `'external_reporter'` is
@@ -124,6 +167,14 @@ export interface CreateManualIssueInput {
 	severity: ReportSeverity;
 	sourceChannel?: 'manual_support' | 'api';
 	/**
+	 * §4.8a: the caller's environment assertion, read by the route from the body field
+	 * `environment` or the `X-Sentinel-Environment` header (body wins). Absent, `null` and `''` are
+	 * all "not asserted" and fall through to `production`. The route rejects a PRESENT value that
+	 * fails §3's pattern with a 400 before it reaches here; this field is `string | null` rather
+	 * than a validated brand because the resolution below is total either way.
+	 */
+	environment?: string | null;
+	/**
 	 * Manual Issues M2 (design §4): ids of DRAFT attachments (uploaded via POST /api/uploads,
 	 * issue_id/comment_id still NULL) to claim onto the new issue in the SAME transaction as its
 	 * creation. Ownership/org checks happen in `claimDraftAttachments` below, not here.
@@ -158,6 +209,11 @@ export async function createManualIssue(input: CreateManualIssueInput) {
 			.insert(issues)
 			.values({
 				projectId,
+				// §4.8a. The registry is NOT consulted: findOrCreateTriageProject provisions inbox
+				// projects on first use and a fresh project has zero declared environments
+				// (decision 8), so a rule that required a registry row would fail the first report
+				// into every new organisation.
+				environment: resolveReportEnvironment(input.environment),
 				fingerprint,
 				message: title,
 				errorClass: 'user_report',
@@ -308,6 +364,14 @@ export async function createExternalIssueReport(input: CreateExternalIssueReport
 			.insert(issues)
 			.values({
 				projectId: input.projectId,
+				// §4.8a: `context.environment` IS this route's assertion -- it is already one of the
+				// four keys parseContext type-checks, and adding a second top-level field beside it
+				// would mean a client that set only the shipped key got a report filed as
+				// `production` whose triage matched against `staging`. The context object itself is
+				// still stored VERBATIM on the companion row below, including a non-matching
+				// "Production": this resolution changes what the issue is filed under, never what
+				// was recorded as sent.
+				environment: resolveReportEnvironment(input.context.environment),
 				fingerprint,
 				message: title,
 				errorClass: 'user_report',
@@ -552,6 +616,28 @@ export interface ListReportsOptions {
  */
 export async function listReports({ organizationId, tab, userId, accessibleProjectIds, source }: ListReportsOptions) {
 	const conditions = [eq(projects.organizationId, organizationId), eq(issues.issueType, 'user_report')];
+
+	// sentinel-project-environments §2.2, decision 36 — **a guard point of its own, and
+	// `requireIssueAccessAnyType`'s does not reach it.** `GET /api/organizations/{orgId}/reports`
+	// guards at the ORGANIZATION level (`requireReportAccess(userId, orgId, 'read')`) and then hands
+	// this function `accessibleProjectIds = null` — the whole organization — for any role above
+	// `viewer`, so the per-issue dispatch never runs on this path. §4.8a writes the literal
+	// `production` on every report with no client assertion, so without this predicate a member
+	// granted only `{staging}` reads most of the organization's reports, and §12 *Known limits* 5 is
+	// a promise the product does not keep.
+	//
+	// Resolved PER PROJECT and from `userId` — the caller's own id, the same one the `mine` and
+	// `claimed-by-me` tabs use. The list is org-scoped, so there is no single `projectId` to hand
+	// the single-project resolver; a per-organization scope would pass the narrow case and leak the
+	// one that matters (narrowed in project A, unrestricted in project B).
+	//
+	// **The tab counts.** There is no count query on `main` — the tabs are unbadged links and any
+	// number on that page is derived from the rows this function returned, so "the count agrees with
+	// the list" holds by construction. The first count anybody adds must carry this same predicate.
+	const environmentScope = environmentScopeCondition(await resolveEnvironmentScopes(userId));
+	if (environmentScope) {
+		conditions.push(environmentScope);
+	}
 
 	switch (tab) {
 		case 'mine':

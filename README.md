@@ -43,6 +43,9 @@ occurrences, organizations, and alerting configuration.
   surface for registered agents to triage issues (claim/comment/status/relations) — see
   [docs/agents/SENTINEL_AGENT_GUIDE.md](docs/agents/SENTINEL_AGENT_GUIDE.md) and
   [docs/agents/openapi.agent.yaml](docs/agents/openapi.agent.yaml).
+  Environment-scoped access — who may read which environments' issues, and the limits that boundary
+  deliberately does not cover — is documented in
+  [docs/ENVIRONMENT_ACCESS.md](docs/ENVIRONMENT_ACCESS.md).
 - `packages/shared-go` — shared Postgres pool, NATS pub/sub, and Redis client code.
 - `packages/proto` + `gen/` — the `ErrorEvent` wire contract (buf + protovalidate).
 - `packages/db-migrations` — goose-based SQL migrations, one flat directory for every target

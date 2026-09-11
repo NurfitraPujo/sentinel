@@ -21,7 +21,11 @@ import {
 	isDuplicateKeyViolation,
 } from '$lib/server/report-idempotency';
 import { upsertExternalReporter } from '$lib/db/queries/external-reporters';
-import { createExternalIssueReport, ReportAttachmentNotFoundError } from '$lib/db/queries/reports';
+import {
+	createExternalIssueReport,
+	resolveReportEnvironment,
+	ReportAttachmentNotFoundError,
+} from '$lib/db/queries/reports';
 import { runTriage, type TriageResult } from '$lib/server/triage';
 import { escalateReportAtIntake, sendEscalationEmails } from '$lib/server/escalation';
 import { recordReportReceived, REPORT_OUTCOME, type ReportOutcome } from '$lib/server/metrics';
@@ -302,7 +306,15 @@ async function triageForReport(input: {
 			occurredAt: input.occurredAt,
 			context: {
 				release: typeof input.context.release === 'string' ? input.context.release : null,
-				environment: typeof input.context.environment === 'string' ? input.context.environment : null,
+				// sentinel-project-environments §4.8a / decision 50. ONE value per request reaches
+				// both the writer and the triager: this is exactly what `createExternalIssueReport`
+				// wrote to `issues.environment` above. Passing `input.context.environment` raw — as
+				// this line did until now — is the shape that breaks the majority path: it is
+				// nullable and never checked against §3's pattern, and under a hard filter a `null`
+				// matches no row, so every report that asserts nothing would get zero candidates and
+				// no auto-link at all. `external_issue_reports.context` still stores the client's
+				// object verbatim; only what triage FILTERS on is resolved.
+				environment: resolveReportEnvironment(input.context.environment),
 				// Accepted, stored, and inert in v1 (§4.3, OQ-4).
 				traceId: typeof input.context.trace_id === 'string' ? input.context.trace_id : null,
 				sessionId: typeof input.context.session_id === 'string' ? input.context.session_id : null,

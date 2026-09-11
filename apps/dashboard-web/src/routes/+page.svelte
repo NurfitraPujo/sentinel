@@ -19,6 +19,65 @@
 		const diff = Date.now() - new Date(lastSeen).getTime();
 		return diff < 24 * 60 * 60 * 1000;
 	}
+
+	// sentinel-project-environments §4.1 — the shape `data.environments` carries. `displayName` is
+	// the registry's label; the raw `name` is what the query string and `issues.environment` use,
+	// and the two are not interchangeable (§4.2 makes `name` immutable and `displayName` editable).
+	interface EnvironmentOption {
+		id: string;
+		name: string;
+		displayName: string;
+	}
+
+	let environments = $derived((data.environments ?? []) as EnvironmentOption[]);
+
+	// §4.4: the control renders only inside a selected project. `project=all` returns `environments:
+	// []` from the loader, and an environment name is only meaningful inside a project — two
+	// projects may both report `production` and they are not the same environment, so a
+	// cross-project environment filter here would silently mean "any project's production". Flow
+	// `L3`.
+	let projectSelected = $derived(data.filters.project !== 'all');
+	let environmentActive = $derived(data.filters.environment !== 'all');
+
+	// The label to put in front of a reader: the registry's, when the registry knows this name.
+	// Under decisions 8+9 it often does not — an environment lives in the data long before anybody
+	// declares it — and the raw name is then the honest label, not a fallback worth flagging.
+	let activeEnvironmentLabel = $derived(
+		environments.find((env) => env.name === data.filters.environment)?.displayName ??
+			data.filters.environment
+	);
+
+	/**
+	 * The filter strip is a row of ANCHORS on the query string (not a form, not client state), and
+	 * every link has to carry the filters it is not itself changing — otherwise clicking "Resolved"
+	 * silently drops the environment the reader chose. Flow `L7` is the same requirement on the
+	 * pagination links.
+	 *
+	 * `environment` is deliberately DROPPED when the project changes: environments are per project
+	 * (§4.4), so carrying `production` from one project to another would either filter by a name
+	 * that project has never reported or, on `project=all`, mean "any project's production".
+	 *
+	 * Decision 55: the all-projects anchor drops it UNCONDITIONALLY, not only when the project is
+	 * changing. On `project=all` the control is not rendered (`data.environments` is `[]`), so that
+	 * anchor is the only way out of the filter — it cannot be the link that preserves it. The loader
+	 * coerces the echo to `all` there as well, which is what normally keeps this branch unreachable.
+	 */
+	function href(params: { status?: string; project?: string; environment?: string; page?: number }) {
+		const status = params.status ?? data.filters.status;
+		const project = params.project ?? data.filters.project;
+		const environment =
+			project === 'all' ||
+			(params.project !== undefined && params.project !== data.filters.project)
+				? 'all'
+				: (params.environment ?? data.filters.environment);
+
+		const q = new URLSearchParams();
+		q.set('status', status);
+		q.set('project', project);
+		if (environment && environment !== 'all') q.set('environment', environment);
+		if (params.page && params.page > 1) q.set('page', String(params.page));
+		return `?${q.toString()}`;
+	}
 </script>
 
 <div class="dashboard">
@@ -26,14 +85,14 @@
 		<h2>Projects</h2>
 		<ul>
 			<li>
-				<a href="?status={data.filters.status}&project=all" 
+				<a href={href({ project: 'all' })}
 				   class:active={data.filters.project === 'all'}>
 					All Projects
 				</a>
 			</li>
 			{#each data.projects as project}
 				<li>
-					<a href="?status={data.filters.status}&project={project.id}"
+					<a href={href({ project: project.id })}
 					   class:active={data.filters.project === project.id}>
 						{project.name}
 					</a>
@@ -44,22 +103,69 @@
 		<h2>Status</h2>
 		<ul>
 			<li>
-				<a href="?status=all&project={data.filters.project}"
+				<a href={href({ status: 'all' })}
 				   class:active={data.filters.status === 'all'}>All</a>
 			</li>
 			<li>
-				<a href="?status=open&project={data.filters.project}"
+				<a href={href({ status: 'open' })}
 				   class:active={data.filters.status === 'open'}>Open</a>
 			</li>
 			<li>
-				<a href="?status=resolved&project={data.filters.project}"
+				<a href={href({ status: 'resolved' })}
 				   class:active={data.filters.status === 'resolved'}>Resolved</a>
 			</li>
 			<li>
-				<a href="?status=ignored&project={data.filters.project}"
+				<a href={href({ status: 'ignored' })}
 				   class:active={data.filters.status === 'ignored'}>Ignored</a>
 			</li>
 		</ul>
+
+		<!--
+			sentinel-project-environments tasks 3 and 4, flows `L1`-`L3`, `L6`, `L7`. The control is
+			anchors in this same strip, and it is absent entirely on `project=all` — not disabled, not
+			empty. See `href()` for why the project links drop `environment`.
+		-->
+		{#if projectSelected}
+			<h2>Environment</h2>
+			{#if environments.length > 0}
+				<ul data-testid="environment-filter">
+					<li>
+						<a href={href({ environment: 'all' })}
+						   class:active={data.filters.environment === 'all'}>All</a>
+					</li>
+					{#each environments as environment (environment.name)}
+						<li>
+							<a href={href({ environment: environment.name })}
+							   class:active={data.filters.environment === environment.name}>
+								{environment.displayName}
+							</a>
+						</li>
+					{/each}
+				</ul>
+			{:else}
+				<!--
+					Flow `L6`. `data.environments` is `[]`, and under decision 8 that is the state of
+					EVERY project on the day this ships — no registry row is ever created by traffic,
+					only by somebody declaring one in project settings. So this is a designed
+					explanation, not an edge case and not a bare empty select: it says what is missing,
+					that nothing is broken, and where to go. The link needs the org slug the root layout
+					already puts on `data`; without it the sentence still stands on its own.
+				-->
+				<div class="environment-empty" data-testid="environment-registry-empty">
+					<p>No environments have been set up for this project yet.</p>
+					<p class="hint">
+						Errors are still arriving and being stored with the environment they were reported
+						from — nothing is lost. An environment has to be declared before it can be
+						filtered on.
+					</p>
+					{#if data.orgSlug}
+						<a class="settings-link" href="/{data.orgSlug}/projects/{data.filters.project}/settings">
+							Set up environments in project settings
+						</a>
+					{/if}
+				</div>
+			{/if}
+		{/if}
 	</aside>
 
 	<main class="issues">
@@ -76,29 +182,55 @@
 					</div>
 					<p class="message">{issue.message.slice(0, 150)}{issue.message.length > 150 ? '...' : ''}</p>
 					<div class="card-footer">
-						<span class="count">{Number(issue.count).toLocaleString()} occurrences</span>
+						<!--
+							Flow `L4`, and it is the INVERSE of what the first draft of this brief asked
+							for. Under decision 7 an issue belongs to exactly one environment
+							(`UNIQUE (project_id, environment, fingerprint)`), so `count`, `firstSeen` and
+							`lastSeen` on this row ARE that environment's — they are not a total that has
+							been narrowed and they need no hedge. Saying so out loud is only honest with a
+							filter active, because that is when a reader might otherwise take the number
+							for a project-wide one.
+						-->
+						<span class="count">
+							{Number(issue.count).toLocaleString()} occurrences{#if environmentActive}
+								<span class="count-scope">in {activeEnvironmentLabel}</span>
+							{/if}
+						</span>
 						<span class="last-seen">Last seen: {formatDate(issue.lastSeen)}</span>
 					</div>
 					<div class="meta">
 						<span class="project">{issue.projectName}</span>
+						<!--
+							Flow `L8`. `issues.environment` is a column on the row the loader already
+							selects — no extra query, no aggregate — and the chip is on every row whether
+							or not a filter is active, so a reader scanning an unfiltered list can still
+							see which environment each issue is in.
+						-->
+						<span class="environment-chip" data-testid="issue-environment">{issue.environment}</span>
 						<span class="status {issue.status}">{issue.status}</span>
 					</div>
 				</a>
 			{:else}
-				<p class="empty">No issues found.</p>
+				<!-- Flow `L5`: the empty state names THIS environment rather than saying nothing found. -->
+				{#if environmentActive}
+					<p class="empty">No issues found in {activeEnvironmentLabel}.</p>
+				{:else}
+					<p class="empty">No issues found.</p>
+				{/if}
 			{/each}
 		</div>
 
 		{#if data.pagination.totalPages > 1}
 			<nav class="pagination">
 				{#if data.pagination.page > 1}
-					<a href="?page={data.pagination.page - 1}&status={data.filters.status}&project={data.filters.project}">
+					<!-- Flow `L7`: the environment survives a page change; `href()` carries it. -->
+					<a href={href({ page: data.pagination.page - 1 })}>
 						Previous
 					</a>
 				{/if}
 				<span>Page {data.pagination.page} of {data.pagination.totalPages}</span>
 				{#if data.pagination.page < data.pagination.totalPages}
-					<a href="?page={data.pagination.page + 1}&status={data.filters.status}&project={data.filters.project}">
+					<a href={href({ page: data.pagination.page + 1 })}>
 						Next
 					</a>
 				{/if}
@@ -264,8 +396,62 @@
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
+		gap: 0.5rem;
 		font-size: 0.75rem;
 		color: var(--text-subtle);
+	}
+
+	.meta .project {
+		flex: 1;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.environment-chip {
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		padding: 0.125rem 0.5rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		color: var(--text-muted);
+		white-space: nowrap;
+	}
+
+	.count-scope {
+		margin-left: 0.375rem;
+		color: var(--text-muted);
+	}
+
+	.environment-empty {
+		margin-bottom: 1.5rem;
+		padding: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+		line-height: 1.45;
+	}
+
+	.environment-empty p {
+		margin: 0 0 0.5rem;
+	}
+
+	.environment-empty .hint {
+		color: var(--text-subtle);
+		font-size: 0.75rem;
+	}
+
+	.environment-empty .settings-link {
+		display: inline;
+		padding: 0;
+		color: var(--color-primary);
+		font-size: 0.75rem;
+		text-decoration: underline;
+	}
+
+	.environment-empty .settings-link:hover {
+		background: none;
 	}
 
 	.status {

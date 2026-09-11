@@ -63,6 +63,12 @@ export interface ListAgentIssuesOptions {
 	 */
 	claimedByAgentId?: string;
 	projectId?: string;
+	/**
+	 * sentinel-project-environments §4.6: `WHERE issues.environment = $1`. Absent = every
+	 * environment, byte-identical to the pre-existing behaviour. A FILTER, not a guard — see the
+	 * comment at the predicate below.
+	 */
+	environment?: string;
 	waiting?: boolean;
 	/**
 	 * SR-6 / OQ-8: filter on `issues.source_channel`. §6's stated mitigation for the volume and
@@ -90,6 +96,10 @@ export interface AgentIssueListItem {
 	message: string;
 	errorClass: string;
 	status: string;
+	/** sentinel-project-environments decision 54 (§4.9): the issue's environment. Part of issue
+	 *  IDENTITY (decision 7), so one error across N environments is N rows in this list -- this is
+	 *  the only field that tells two such siblings apart. NOT NULL in the schema. */
+	environment: string;
 	assigneeType: string | null;
 	assignedTo: string | null;
 	waitingOn: string | null;
@@ -171,6 +181,15 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	if (options.projectId) {
 		conditions.push(eq(issues.projectId, options.projectId));
 	}
+	// sentinel-project-environments §4.6: a plain column predicate (decision 7 put `environment`
+	// into issue identity, so an issue belongs to exactly one). Absent means every environment —
+	// the existing behaviour, unchanged, so no deployed agent changes what it sees. There is no
+	// GUARD on this surface and none is wanted: `authenticateAgentRequest` resolves a key to an
+	// ORGANIZATION, not a person, so there is no membership row and no grant to resolve
+	// (contract §12 *Known limits* 2).
+	if (options.environment) {
+		conditions.push(eq(issues.environment, options.environment));
+	}
 	if (options.waiting === true) {
 		conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
 	}
@@ -206,6 +225,8 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			message: issues.message,
 			errorClass: issues.errorClass,
 			status: issues.status,
+			// sentinel-project-environments decision 54: published on the agent contract.
+			environment: issues.environment,
 			assigneeType: issues.assigneeType,
 			assignedTo: issues.assignedTo,
 			claimedAt: issues.claimedAt,

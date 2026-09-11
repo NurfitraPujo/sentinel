@@ -33,13 +33,18 @@ export const TRIAGE_LINK_THRESHOLD = 0.7;
 /** §4.3: a bound, so §4.2's `candidates` array is never a page. */
 export const TRIAGE_MAX_CANDIDATES = 5;
 
-/** §4.3's score table, verbatim. `window` is the floor: it is true for every candidate by
- *  construction, which is exactly why `0.4 + 0.3` (release) is the only way to reach the `0.7`
- *  threshold in v1. */
+/** §4.3's score table. `window` is the floor: it is true for every candidate by construction,
+ *  which is exactly why `0.4 + 0.3` (release) is the only way to reach the `0.7` threshold in v1.
+ *
+ *  **`environment: 0.1` is GONE, and its absence is the point** — sentinel-project-environments
+ *  decision 50. It has not been re-weighted or moved; environment has stopped being a SIGNAL and
+ *  become a PRECONDITION. `findTriageCandidates` now filters on `i.environment` in its `WHERE`
+ *  clause, so every row that reaches this scorer is already in the reported environment and a
+ *  signal for it would fire on every candidate and rank nothing. Scoring a tautology at 0.1 would
+ *  have quietly lifted every score by the same amount and moved the `0.7` threshold instead. */
 export const TRIAGE_SIGNAL_WEIGHTS = {
 	window: 0.4,
 	release: 0.3,
-	environment: 0.1,
 	trace_id: 0.2,
 	session_id: 0.1,
 } as const;
@@ -63,10 +68,14 @@ export function resolveReportMatchWindowMinutes(raw: string | undefined): number
 
 /**
  * One candidate `system_error` issue, with everything the scorer needs and nothing else. The
- * release and environment values arrive as the DISTINCT sets observed on that issue's in-window
- * occurrences — not as pre-computed booleans — so that "`context.release` is non-null AND equals
- * an in-window occurrence's `release_version`" is decided by the pure function the contract makes
- * a boundary, and is testable without a database.
+ * release values arrive as the DISTINCT set observed on that issue's in-window occurrences — not as
+ * a pre-computed boolean — so that "`context.release` is non-null AND equals an in-window
+ * occurrence's `release_version`" is decided by the pure function the contract makes a boundary,
+ * and is testable without a database.
+ *
+ * There is deliberately no `environments` here any more (decision 50): the query filters on the
+ * issue's own `environment` column, so the set would have exactly one member and it would always be
+ * the one the caller asked for.
  */
 export interface TriageCandidateRow {
 	issueId: string;
@@ -76,14 +85,20 @@ export interface TriageCandidateRow {
 	latestOccurrenceAt: Date;
 	/** DISTINCT non-null `release_version` values on this issue's in-window occurrences. */
 	releaseVersions: string[];
-	/** DISTINCT `environment` values on this issue's in-window occurrences. */
-	environments: string[];
 }
 
 /** The report-side half of the match, read off `external_issue_reports.context`. */
 export interface TriageMatchContext {
 	release: string | null;
-	environment: string | null;
+	/**
+	 * **Not nullable, and that is decision 50/53 expressed in the type.** This is the RESOLVED
+	 * environment — `resolveReportEnvironment(context.environment)` from
+	 * `$lib/db/queries/reports` — the same value the report's `issues.environment` was written with,
+	 * never the raw client assertion. Under a hard filter a `null` matches no row, so a nullable
+	 * type here would let a caller hand this function the raw value and get an empty candidate list
+	 * on the majority path with no error anywhere.
+	 */
+	environment: string;
 	/** Carried for §4.2's `signals` vocabulary and **inert in v1** (§4.3). */
 	traceId: string | null;
 	/** Carried for §4.2's `signals` vocabulary and **inert in v1** (§4.3). */
@@ -139,11 +154,6 @@ export function scoreTriageCandidates(
 			signals.push('release');
 			score += TRIAGE_SIGNAL_WEIGHTS.release;
 		}
-		if (context.environment !== null && row.environments.includes(context.environment)) {
-			signals.push('environment');
-			score += TRIAGE_SIGNAL_WEIGHTS.environment;
-		}
-
 		// `trace_id` and `session_id` are deliberately NOT evaluated. They are weighted above so
 		// that adding them later does not renumber the scale, but no v1 client can send one and no
 		// v1 score depends on one (§4.3, Decisions taken OQ-4). A context that carries them scores
@@ -184,7 +194,8 @@ export interface FindTriageCandidatesOptions {
 	windowStart: Date;
 	windowEnd: Date;
 	release: string | null;
-	environment: string | null;
+	/** The RESOLVED environment. A hard predicate since decision 50 — see TriageMatchContext. */
+	environment: string;
 	limit?: number;
 }
 
@@ -192,13 +203,22 @@ export interface FindTriageCandidatesOptions {
  * §4.3's candidate query — ONE query, scoped to one project and one window, with an explicit
  * bound.
  *
+ * **`AND i.environment = $environment` is a HARD filter, and it is the newest thing here**
+ * (sentinel-project-environments decision 50). After decision 7's identity split one error across
+ * N environments is N `issues` rows, and `LIMIT 5` is a hard SQL bound — so without this predicate
+ * one error would consume N of the 5 candidate slots, and the release-over-environment ordering
+ * would let a same-release row from the WRONG environment outrank a different-release row from the
+ * right one. What it gives up, stated rather than discovered: there is now no cross-environment
+ * auto-link at all. The value bound here must be the RESOLVED environment (§4.8a's
+ * `resolveReportEnvironment`), never the raw client assertion — a `null` would match no row.
+ *
  * **Why the LATERAL.** The bound has to be applied by the database (otherwise a busy project's
  * whole window crosses the wire), and the ORDER BY that makes a `LIMIT 5` correct has to agree
- * with the pure scorer's ranking. Ordering by `release_match DESC, environment_match DESC,
- * latest DESC, id ASC` is exactly ordering by score descending with §4.3's tie-breaks, because
- * the only reachable scores in v1 are 0.8 > 0.7 > 0.5 > 0.4 in precisely that lexicographic
- * order. The scorer re-derives the score and the order from the returned rows regardless; the
- * SQL ordering only decides WHICH rows are returned.
+ * with the pure scorer's ranking. Ordering by `release_match DESC, latest DESC, id ASC` is exactly
+ * ordering by score descending with §4.3's tie-breaks, because the only reachable scores in v1 are
+ * 0.7 > 0.4 in precisely that lexicographic order (0.8 and 0.5 were the environment signal, which
+ * decision 50 removed). The scorer re-derives the score and the order from the returned rows
+ * regardless; the SQL ordering only decides WHICH rows are returned.
  *
  * The correlated `LATERAL` also fixes the plan: the driving side is `issues` filtered to one
  * project, and each iteration is an index scan of `idx_occurrences_issue_created`
@@ -233,25 +253,23 @@ export async function findTriageCandidates(
 			i.message AS message,
 			i.error_class AS error_class,
 			occ.latest_occurrence_at AS latest_occurrence_at,
-			occ.release_versions AS release_versions,
-			occ.environments AS environments
+			occ.release_versions AS release_versions
 		FROM issues i
 		CROSS JOIN LATERAL (
 			SELECT
 				max(eo.created_at) AS latest_occurrence_at,
-				array_remove(array_agg(DISTINCT eo.release_version), NULL) AS release_versions,
-				array_remove(array_agg(DISTINCT eo.environment), NULL) AS environments
+				array_remove(array_agg(DISTINCT eo.release_version), NULL) AS release_versions
 			FROM error_occurrences eo
 			WHERE eo.issue_id = i.id
 			  AND eo.created_at >= ${windowStartIso}::timestamptz
 			  AND eo.created_at <= ${windowEndIso}::timestamptz
 		) occ
 		WHERE i.project_id = ${options.projectId}
+		  AND i.environment = ${options.environment}
 		  AND i.issue_type = 'system_error'
 		  AND occ.latest_occurrence_at IS NOT NULL
 		ORDER BY
 			coalesce(${options.release} = ANY(occ.release_versions), false) DESC,
-			coalesce(${options.environment} = ANY(occ.environments), false) DESC,
 			occ.latest_occurrence_at DESC,
 			i.id ASC
 		LIMIT ${limit}
@@ -265,7 +283,6 @@ export async function findTriageCandidates(
 		errorClass: row.error_class as string,
 		latestOccurrenceAt: new Date(row.latest_occurrence_at as string),
 		releaseVersions: (row.release_versions as string[] | null) ?? [],
-		environments: (row.environments as string[] | null) ?? [],
 	}));
 }
 

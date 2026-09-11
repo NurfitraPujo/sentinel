@@ -7,11 +7,18 @@ All notable changes to `packages/sdk-go` are documented here.
 ### Added
 
 - **`Event.Fingerprint`** — an optional custom grouping key. Leave it empty (the normal case) and the
-  server computes one from the error class and stacktrace; set it and the server stores it verbatim,
-  so two events sharing a value are the same issue whatever their stacktraces look like. Maximum 64
-  characters, matching `issues.fingerprint VARCHAR(64)`; the ingestor rejects an oversized value with
-  a 400 rather than truncating, because a shortened grouping key would silently merge issues that
-  were meant to stay apart.
+  server computes one from the error class, the stacktrace and the environment; set it and the server
+  stores it verbatim, so two events sharing a value group together whatever their stacktraces look
+  like. Maximum 64 characters, matching `issues.fingerprint VARCHAR(64)`; the ingestor rejects an
+  oversized value with a 400 rather than truncating, because a shortened grouping key would silently
+  merge issues that were meant to stay apart.
+
+  **A custom fingerprint groups within one project and one environment, not across environments.**
+  Issue identity is the tuple `(project_id, environment, fingerprint)` — a `UNIQUE` constraint on the
+  `issues` table, not something the fingerprint carries — so the same custom value sent from
+  `production` and from `staging` is two issues, each with its own status and count. Resolving a bug
+  in staging must not mark it resolved in production. Setting this field does not opt out of that
+  split.
 
   This needed a server change too: the proto has carried `fingerprint` since the beginning and the
   processor honoured it, but the ingestor never decoded it from JSON — so the capability was

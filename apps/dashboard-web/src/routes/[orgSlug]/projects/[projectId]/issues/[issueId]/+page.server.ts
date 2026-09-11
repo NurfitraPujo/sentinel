@@ -14,6 +14,16 @@ import type { PageServerLoad } from './$types';
 // (routes/issues/[id]/+page.server.ts resolves the issue, then checkProjectAccess against the
 // project it actually belongs to). Answering identically for every id — rather than 403ing on one
 // and redirecting on another — also keeps this from reporting whether an id exists.
+//
+// sentinel-project-environments §4.5a called this loader the SECOND door to one issue and gave it
+// its own copy of both guard layers — decision 46's `requireProjectAccess` swap on the project
+// dimension and decision 20's `404` (never `403`) on the environment dimension. Once the route
+// stops rendering there is only one door, and both layers live at the redirect target:
+// `routes/issues/[id]/+page.server.ts:41` (project) and `:46-49` (environment). Re-guarding here
+// would ALSO be a regression against the anti-probe property above: an environment-dimension `404`
+// on this path answers differently for an id inside the caller's grant than for one outside it,
+// which is exactly the existence signal decision 20 exists to withhold. If this route is ever made
+// to render again, it must take both layers back.
 export const load: PageServerLoad = async ({ params }) => {
 	redirect(308, `/issues/${params.issueId}`);
 };

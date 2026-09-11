@@ -103,6 +103,7 @@ interface MetricsState {
 	reportsReceived: Counter<typeof LABEL_OUTCOME> | null;
 	escalations: Counter<typeof LABEL_OUTCOME> | null;
 	escalationsExhausted: Counter<string> | null;
+	escalationsUnscoped: Counter<string> | null;
 	oncallUnresolved: Counter<string> | null;
 }
 
@@ -142,6 +143,7 @@ function createState(): MetricsState {
 	// evaluate, and "the counter is absent" would read exactly like "it never happened".
 	let escalations: Counter<typeof LABEL_OUTCOME> | null = null;
 	let escalationsExhausted: Counter<string> | null = null;
+	let escalationsUnscoped: Counter<string> | null = null;
 	let oncallUnresolved: Counter<string> | null = null;
 	try {
 		escalations = new Counter({
@@ -159,6 +161,19 @@ function createState(): MetricsState {
 			registers: [registry],
 		});
 		escalationsExhausted.inc(0);
+		// sentinel-project-environments §2.2, decisions 38/41: the unscoped fallback's OWN signal,
+		// deliberately NOT `escalationsExhausted`. That one is §12's "nobody answered" alert, and a
+		// chain that stopped because the resolved candidate does not hold the issue's environment
+		// stopped on a GRANT rather than on a human -- firing it here would aim that alert at an
+		// operator who was never asked anything. Same distinction `oncallUnresolved` already draws
+		// one branch up. Unlabelled, because `organization_id`, `project_id` and `environment` are
+		// exactly the values this file forbids as label dimensions.
+		escalationsUnscoped = new Counter({
+			name: 'sentinel_report_escalations_unscoped_total',
+			help: 'Escalations whose resolved candidate did not hold the issue environment, so the whole rota was paged (contract §2.2, decisions 38/41).',
+			registers: [registry],
+		});
+		escalationsUnscoped.inc(0);
 		oncallUnresolved = new Counter({
 			name: 'sentinel_oncall_schedule_unresolved_total',
 			help: 'Escalations that ran for an organization whose on-call schedule resolved to nobody.',
@@ -168,10 +183,18 @@ function createState(): MetricsState {
 	} catch {
 		escalations = null;
 		escalationsExhausted = null;
+		escalationsUnscoped = null;
 		oncallUnresolved = null;
 	}
 
-	return { registry, reportsReceived, escalations, escalationsExhausted, oncallUnresolved };
+	return {
+		registry,
+		reportsReceived,
+		escalations,
+		escalationsExhausted,
+		escalationsUnscoped,
+		oncallUnresolved,
+	};
 }
 
 function state(): MetricsState {
@@ -222,6 +245,16 @@ export function recordEscalation(outcome: EscalationOutcome): void {
  */
 export function recordEscalationExhausted(): void {
 	state().escalationsExhausted?.inc();
+}
+
+/**
+ * sentinel-project-environments §2.2 (decisions 38, 41): above zero -- an escalation resolved a
+ * candidate who does not hold the issue's environment, so the whole rota was paged with the
+ * `unscoped` label instead. Its own counter and never `recordEscalationExhausted`, for the reason
+ * stated where it is registered: the chain stopped on a grant, not on a human.
+ */
+export function recordEscalationUnscoped(): void {
+	state().escalationsUnscoped?.inc();
 }
 
 /**

@@ -72,6 +72,9 @@ export const POST: RequestHandler = async ({ request, url }) => {
 			exhausted: result.exhausted,
 			stoppedByReassignment: result.stoppedByReassignment,
 			skipped: result.skipped,
+			// sentinel-project-environments §2.2, decisions 38/41: due rows whose next candidate did
+			// not hold the issue's environment, so the whole rota was paged and the row terminated.
+			unscoped: result.unscoped,
 			contended: result.contended,
 			ackMinutes,
 			maxHops,

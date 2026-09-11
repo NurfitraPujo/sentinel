@@ -3,6 +3,10 @@ import { issues, projects, organizations, organizationMembers, notifications, us
 import { and, eq, gt, inArray, sql } from 'drizzle-orm';
 import { listSubscribers } from '$lib/db/queries/subscriptions';
 import { sendIssueNotificationEmail, type IssueNotificationKind } from '$lib/server/email';
+import {
+	holdsEnvironment,
+	resolveEnvironmentScopesForUsers,
+} from '$lib/server/environment-access';
 import { log } from '$lib/server/observability/log';
 
 /**
@@ -44,6 +48,13 @@ export interface NotifyIssueEventInput {
 export interface NotifiedUser {
 	userId: string;
 	kind: NotificationKind;
+	/**
+	 * sentinel-project-environments §2.2 (decisions 38, 41). Never set by `notifyIssueEvent` — its
+	 * own guard is absolute (below) — only by `escalation.ts`'s deliberate boundary crossing, which
+	 * pages a whole rota that does not hold the issue's environment and must SAY so. It rides on
+	 * this type because `sendIssueNotificationEmails` is the one sender both paths share.
+	 */
+	unscoped?: boolean;
 }
 
 /**
@@ -82,6 +93,32 @@ export async function notifyIssueEvent(
 		currentOrgMemberIds = new Set(memberRows.map((r: { userId: string }) => r.userId));
 	}
 
+	// sentinel-project-environments §2.2, decision 25 — **the guard that stops something LEAVING the
+	// product**, and the reason it is here rather than in the post-commit sender:
+	// `sendIssueNotificationEmails` takes the `NotifiedUser[]` this function RETURNS, so a
+	// subscriber filtered out at resolution is already absent from the sender's input. One filter,
+	// covering both the row and the email; a second copy in the sender could drift from this one.
+	//
+	// The issue's `environment` is a column on the issue row (decision 7), and the per-subscriber
+	// scopes are ONE batched call — this runs inside the caller's open mutation transaction (D18),
+	// which is where a round trip per subscriber would be paid for.
+	let environmentScopes = new Map<string, string[]>();
+	let issueEnvironment: string | null = null;
+	if (userSubscriberIds.length > 0) {
+		const [issueRow] = await tx
+			.select({ projectId: issues.projectId, environment: issues.environment })
+			.from(issues)
+			.where(eq(issues.id, input.issueId));
+		if (issueRow) {
+			issueEnvironment = issueRow.environment;
+			environmentScopes = await resolveEnvironmentScopesForUsers(
+				issueRow.projectId,
+				userSubscriberIds,
+				tx
+			);
+		}
+	}
+
 	const targets = subscribers.filter((s: { subscriberType: string; subscriberId: string }) => {
 		if (s.subscriberType !== 'user') {
 			// Agent subscribers are not notified in M4 -- they poll (design §8).
@@ -95,6 +132,13 @@ export async function notifyIssueEvent(
 			// R1: subscribed but no longer an org member (removed since subscribing) -- never
 			// notify. If removeMember's own subscription cleanup ran, this row would already be
 			// gone; this is the belt half of belt-and-suspenders for any path that missed it.
+			return false;
+		}
+		if (issueEnvironment !== null && !holdsEnvironment(environmentScopes, s.subscriberId, issueEnvironment)) {
+			// §2.2, decision 25: subscribed, still a member, and narrowed out of this issue's
+			// environment. No `notifications` row and — because the sender reads this function's
+			// return value — no email. A read guard added in a later release cannot recall a sent
+			// email, which is why this one could not be deferred.
 			return false;
 		}
 		return true;
@@ -243,7 +287,7 @@ export async function sendIssueNotificationEmails(
 
 	const issueUrl = buildIssueUrl(ctx.origin, ctx.issueId, issueInfo);
 
-	for (const { userId, kind } of toSend) {
+	for (const { userId, kind, unscoped } of toSend) {
 		try {
 			if (kind !== BLOCKING_BYPASS_KIND) {
 				const throttled = await isThrottled(userId, ctx.issueId);
@@ -258,12 +302,24 @@ export async function sendIssueNotificationEmails(
 				continue;
 			}
 
-			await sendIssueNotificationEmail(
-				userRow.email,
-				issueUrl,
-				kind as IssueNotificationKind,
-				issueInfo.title
-			);
+			// §2.2's one deliberate boundary crossing: `escalation.ts`'s unscoped rota page, which
+			// carries the word into the subject `email.ts` builds. The ordinary call keeps its exact
+			// four-argument shape rather than passing an `undefined` fifth -- every other caller and
+			// every existing assertion sees precisely what it saw before.
+			await (unscoped
+				? sendIssueNotificationEmail(
+						userRow.email,
+						issueUrl,
+						kind as IssueNotificationKind,
+						issueInfo.title,
+						{ unscoped: true }
+					)
+				: sendIssueNotificationEmail(
+						userRow.email,
+						issueUrl,
+						kind as IssueNotificationKind,
+						issueInfo.title
+					));
 
 			// R5: stamp the notification row this email was actually for, so isThrottled's
 			// `emailed_at`-based window reflects a real send, not just an attempt. Targets the

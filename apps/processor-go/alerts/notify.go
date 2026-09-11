@@ -74,6 +74,30 @@ func NotifierConfigFromEnv() NotifierConfig {
 // set one. A missing/unknown channel or an unroutable config logs and drops
 // the alert rather than panicking — an alert that cannot be delivered must
 // never take the ingest pipeline down with it.
+// AlertSubject builds the one-line subject BuildSender puts on an email alert.
+//
+// It names the ENVIRONMENT (sentinel-project-environments §4.7). Since decision 7 made environment
+// part of issue identity, the same error in staging and in production is two issues and two alerts,
+// and a subject carrying only the issue id makes a page for staging indistinguishable at a glance
+// from the one that matters. The id stays, because it is what an operator pastes into the dashboard.
+//
+// The environment is omitted entirely — rather than printed as an empty bracket — when the alert
+// carries none. That is DispatchOperational's case (a DLQ backlog belongs to no environment and no
+// project), not a per-issue alert that lost its environment somewhere.
+//
+// It is a separate exported function rather than an inline Sprintf so that the subject is assertable
+// without standing up an SMTP dial: notifiers.EmailWorker.Send enqueues onto a private channel with
+// no interception point, so a test that drove BuildSender could observe nothing.
+func AlertSubject(alert *Alert) string {
+	if alert == nil {
+		return ""
+	}
+	if alert.Environment == "" {
+		return fmt.Sprintf("Sentinel alert: issue %s", alert.IssueID)
+	}
+	return fmt.Sprintf("Sentinel alert: [%s] issue %s", alert.Environment, alert.IssueID)
+}
+
 func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertConfig, alert *Alert) {
 	emailWorker := notifiers.NewEmailWorker(cfg.Email)
 	telegramWorker := notifiers.NewTelegramWorker(cfg.Telegram)
@@ -94,7 +118,7 @@ func BuildSender(cfg NotifierConfig) func(ctx context.Context, alertCfg *AlertCo
 			}
 			err := emailWorker.Send(&notifiers.EmailNotification{
 				ToAddress: to,
-				Subject:   fmt.Sprintf("Sentinel alert: issue %s", alert.IssueID),
+				Subject:   AlertSubject(alert),
 				Body:      alert.Message,
 			})
 			if err != nil {

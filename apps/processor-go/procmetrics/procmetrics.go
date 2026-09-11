@@ -36,6 +36,15 @@ var (
 	processDuration metric.Float64Histogram
 	processEvents   metric.Int64Counter
 	alertDispatch   metric.Int64Counter
+
+	// The four sentinel-project-environments §12 instruments. Every one is UNLABELLED — see the
+	// obs.go block that declares their names. The gauge is a synchronous Int64Gauge rather than an
+	// observable one because refreshConfigs already computes the number as a side effect of a query
+	// it already runs: a callback-based gauge would need a second path to that slice.
+	unregisteredEnvironmentEvents  metric.Int64Counter
+	environmentRegistryTouchFailed metric.Int64Counter
+	alertsSuppressedByEnvironment  metric.Int64Counter
+	alertConfigsEnvironmentScoped  metric.Int64Gauge
 )
 
 func init() {
@@ -73,6 +82,42 @@ func init() {
 		slog.Error("procmetrics: failed to create alert dispatch counter", slog.String("error", err.Error()))
 		alertDispatch = nil
 	}
+
+	unregisteredEnvironmentEvents, err = meter.Int64Counter(
+		obs.MetricUnregisteredEnvironmentEvents,
+		metric.WithDescription("Count of stored occurrences whose environment has no project_environments row (decision 9: accepted and stored anyway)"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create unregistered environment events counter", slog.String("error", err.Error()))
+		unregisteredEnvironmentEvents = nil
+	}
+
+	environmentRegistryTouchFailed, err = meter.Int64Counter(
+		obs.MetricEnvironmentRegistryTouchFailures,
+		metric.WithDescription("Count of failures of the project_environments last_seen_at/first_seen_at touch performed inside StoreEvent"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create environment registry touch failure counter", slog.String("error", err.Error()))
+		environmentRegistryTouchFailed = nil
+	}
+
+	alertsSuppressedByEnvironment, err = meter.Int64Counter(
+		obs.MetricAlertsSuppressedByEnvironment,
+		metric.WithDescription("Count of occurrences not counted toward an alert config's threshold because their environment is outside the config's scope"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create environment-suppressed alerts counter", slog.String("error", err.Error()))
+		alertsSuppressedByEnvironment = nil
+	}
+
+	alertConfigsEnvironmentScoped, err = meter.Int64Gauge(
+		obs.MetricAlertConfigsEnvironmentScoped,
+		metric.WithDescription("Number of enabled alert_configs rows whose environments is non-NULL, as of the last refreshConfigs pass"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create environment-scoped alert configs gauge", slog.String("error", err.Error()))
+		alertConfigsEnvironmentScoped = nil
+	}
 }
 
 // RecordProcessed records one ProcessEvent completion: MetricProcessDuration (seconds) and
@@ -102,5 +147,49 @@ func RecordAlertDispatch(ctx context.Context, channel, outcome string) {
 			attribute.String(obs.LabelChannel, channel),
 			attribute.String(obs.LabelOutcome, outcome),
 		))
+	}
+}
+
+// RecordUnregisteredEnvironmentEvent records one occurrence stored for an environment that has no
+// project_environments row. It is deliberately NOT an error signal: decision 9 accepts the event and
+// stores it, and this counter is the only thing that says so out loud.
+func RecordUnregisteredEnvironmentEvent(ctx context.Context) {
+	if unregisteredEnvironmentEvents != nil {
+		unregisteredEnvironmentEvents.Add(ctx, 1)
+	}
+}
+
+// RecordEnvironmentRegistryTouchFailure records one failure of §4.8's project_environments touch.
+//
+// Its single caller is the touch's error branch in store.StoreEvent (apps/processor-go/store/store.go),
+// which logs, records here, and then still COMMITS the transaction — §4.8 point 1. It was recorded
+// twice as having zero callers (BUG-12, then BUG-19) because the store returned the UPDATE's error
+// instead; the test that now pins the increment against a real failing UPDATE is
+// tests/integration's TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent, and it goes red when
+// this call is removed from the store. If you delete that call, delete this recorder and the
+// constant with it rather than shipping a counter that structurally cannot fire.
+func RecordEnvironmentRegistryTouchFailure(ctx context.Context) {
+	if environmentRegistryTouchFailed != nil {
+		environmentRegistryTouchFailed.Add(ctx, 1)
+	}
+}
+
+// RecordAlertSuppressedByEnvironment records one occurrence that an alert config did not count
+// toward its frequency threshold because the occurrence's environment is outside the config's
+// `environments` scope. Recorded once per (occurrence, config) pair — a config that covers the
+// environment records nothing here, and neither does an occurrence for which no config resolved.
+func RecordAlertSuppressedByEnvironment(ctx context.Context) {
+	if alertsSuppressedByEnvironment != nil {
+		alertsSuppressedByEnvironment.Add(ctx, 1)
+	}
+}
+
+// SetAlertConfigsEnvironmentScoped publishes the number of enabled alert_configs rows carrying a
+// non-NULL `environments`, as counted by the refreshConfigs pass that just completed. It is a Set,
+// not an Add: a refresh that finds fewer scoped configs than the previous one must move this number
+// DOWN, which is the whole reason §12 made it a gauge.
+func SetAlertConfigsEnvironmentScoped(ctx context.Context, n int) {
+	if alertConfigsEnvironmentScoped != nil {
+		alertConfigsEnvironmentScoped.Record(ctx, int64(n))
 	}
 }

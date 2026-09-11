@@ -3,6 +3,7 @@ import {
 	nextUntriedMember,
 	resolveAckMinutes,
 	resolveMaxHops,
+	unscopedRecipients,
 	DEFAULT_ESCALATION_ACK_MINUTES,
 	DEFAULT_ESCALATION_MAX_HOPS,
 } from './escalation';
@@ -91,5 +92,58 @@ describe('§8 config knobs', () => {
 			expect(resolveAckMinutes(bad)).toBe(DEFAULT_ESCALATION_ACK_MINUTES);
 			expect(resolveMaxHops(bad)).toBe(DEFAULT_ESCALATION_MAX_HOPS);
 		}
+	});
+});
+
+/**
+ * sentinel-project-environments §2.2, decisions 38 and 41 — the fan-out rule, table-driven and with
+ * no database and no clock, exactly as contract §11 asks for the resolution half.
+ *
+ * The rest of the fallback is rows: one `notifications` row per recipient, no `issue_escalations`
+ * row, no `assigned_to`, and — in the sweep only — a terminated row and its own counter. Those live
+ * in `escalation.sweep.integration.test.ts`, because three of them are ABSENCES and an absence is
+ * exactly what a mock that returns itself for every call cannot distinguish from "did nothing".
+ */
+describe('§2.2 unscopedRecipients — "schedule.members PLUS the override holder"', () => {
+	const rota = [member('a', 0), member('b', 1), member('c', 2)];
+
+	it('is the whole rota when the candidate came from the rotation', () => {
+		expect(unscopedRecipients(rota, { userId: 'b', via: 'rotation' }).sort()).toEqual([
+			'a',
+			'b',
+			'c',
+		]);
+	});
+
+	it('ADDS an override holder who is not on the rota at all', () => {
+		// The case the union exists for: `whoIsOnCall` returns an override holder outright, and such
+		// a holder need not appear in `schedule.members`. Fanning out over `members` alone silently
+		// drops the one person actually resolved.
+		expect(unscopedRecipients(rota, { userId: 'z', via: 'override' }).sort()).toEqual([
+			'a',
+			'b',
+			'c',
+			'z',
+		]);
+	});
+
+	it('does not duplicate an override holder who IS on the rota', () => {
+		// "Exactly one `notifications` row per rota member" — two rows for one person is a second
+		// page, not a thorough one.
+		expect(unscopedRecipients(rota, { userId: 'a', via: 'override' }).sort()).toEqual([
+			'a',
+			'b',
+			'c',
+		]);
+	});
+
+	it('is the members alone when there is no resolution to union in — the sweep’s call', () => {
+		// `sweepOne` resolves its candidate through `nextUntriedMember`, which only ever returns a
+		// member of the rota, so there is no override holder to add there.
+		expect(unscopedRecipients(rota, null).sort()).toEqual(['a', 'b', 'c']);
+	});
+
+	it('is empty for an empty rota rather than throwing', () => {
+		expect(unscopedRecipients([], null)).toEqual([]);
 	});
 });

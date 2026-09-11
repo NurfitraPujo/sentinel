@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { getTableColumns } from 'drizzle-orm';
+import { issues } from '$lib/db/schema';
 import * as S from './schemas';
 
 /**
@@ -27,6 +29,7 @@ const ISSUE_SCOPE = {
 const ISSUE_ROW = {
 	id: 'issue-1',
 	projectId: 'project-1',
+	environment: 'production',
 	fingerprint: 'fp',
 	message: 'msg',
 	errorClass: 'Error',
@@ -211,6 +214,7 @@ describe('GET /api/agent/issues', () => {
 					severity: null,
 					reporterId: null,
 					isWaiting: false,
+					environment: 'production',
 					waitingSince: null,
 					claimedAt: null,
 				},
@@ -609,5 +613,52 @@ describe('POST /api/agent/batch', () => {
 		);
 		expect(res.status).toBe(400);
 		expect(S.BatchValidationErrorSchema.parse(await res.json())).toBeTruthy();
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// sentinel-project-environments decision 54 -- the divergence this file could not see.
+//
+// Every route case above mocks `getAgentIssueDetail`, so the mock's object -- not the REAL
+// `db.select().from(issues)` full row that route returns verbatim -- is what meets `IssueRowSchema`.
+// A column added to `issues` therefore reaches three `.strict()` responses (issue detail, claim,
+// release) undeclared, and this suite stays green. These cases compare the schema against the
+// Drizzle table definition instead of against a mock, so the next added column is caught here.
+// ---------------------------------------------------------------------------
+
+describe('IssueRowSchema vs. the real `issues` table (decision 54)', () => {
+	const columnNames = Object.keys(getTableColumns(issues));
+	const schemaKeys = Object.keys(S.IssueRowSchema.shape);
+
+	// `waitingSince` (N9) is a PRE-EXISTING undeclared column, found while fixing decision 54 and
+	// deliberately left alone: declaring it is a second wire-visible addition that decision 54 does
+	// not sanction. Named here so it is a known gap rather than an invisible one -- remove it from
+	// this list in the change that declares the field.
+	const KNOWN_UNDECLARED = ['waitingSince'];
+
+	it('declares `environment` -- the column decision 54 publishes', () => {
+		expect(schemaKeys).toContain('environment');
+		expect(columnNames).toContain('environment');
+	});
+
+	it('declares every `issues` column except the ones named as known gaps', () => {
+		const undeclared = columnNames.filter((c) => !schemaKeys.includes(c));
+		expect(undeclared).toEqual(KNOWN_UNDECLARED);
+	});
+
+	it('declares no field that is not an `issues` column (the schema is `.strict()`)', () => {
+		expect(schemaKeys.filter((k) => !columnNames.includes(k))).toEqual([]);
+	});
+
+	it('rejects a full row whose `environment` is missing', () => {
+		const { environment, ...withoutEnvironment } = ISSUE_ROW;
+		expect(S.IssueRowSchema.safeParse(withoutEnvironment).success).toBe(false);
+	});
+});
+
+describe('AgentIssueListItemSchema (decision 54)', () => {
+	it('requires `environment` -- the only field that tells two decision-7 siblings apart', () => {
+		expect(Object.keys(S.AgentIssueListItemSchema.shape)).toContain('environment');
 	});
 });

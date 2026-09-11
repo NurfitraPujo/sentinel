@@ -31,14 +31,52 @@ type AlertConfig struct {
 	FrequencyThreshold int
 	FrequencyWindow    time.Duration
 	Enabled            bool
+	// Environments is sentinel-project-environments §4.7's scope: nil means EVERY environment (the
+	// stored NULL, which is what every pre-feature row carries and what decision 6 refuses to
+	// backfill), and a non-empty slice restricts this config to occurrences in exactly those
+	// environment NAMES. The column is names, not ids, because an organization-wide config spans
+	// projects and an environment id belongs to one project.
+	//
+	// The names are NOT validated against project_environments anywhere: under decision 8 a config
+	// may be scoped to an environment nobody has declared yet, and a name that never matches simply
+	// never fires. Empty-but-non-nil is not a state this field can arrive in — §4.7 answers `[]`
+	// with a 400 precisely because a config that can never fire is a config somebody thinks is
+	// working — but coversEnvironment still handles it explicitly rather than by accident.
+	Environments []string
+}
+
+// coversEnvironment answers §4.7's scope question for one occurrence: may this config count an
+// occurrence that happened in `environment`?
+//
+// It is a pure decision over (cfg.Environments, environment) and is the reason §11 puts this
+// feature's most important assertion in a table-driven Go test rather than behind NATS + Postgres.
+//
+// nil (the stored NULL) covers everything — that is decision 6's whole point, and inverting it would
+// silence every alert config that existed before this feature shipped.
+func (cfg *AlertConfig) coversEnvironment(environment string) bool {
+	if cfg == nil || cfg.Environments == nil {
+		return true
+	}
+	for _, name := range cfg.Environments {
+		if name == environment {
+			return true
+		}
+	}
+	return false
 }
 
 type Alert struct {
-	IssueID    string
-	ProjectID  string
-	Channel    string
-	Message    string
-	OccurredAt time.Time
+	IssueID   string
+	ProjectID string
+	// Environment is the environment of the occurrence that tripped this alert (§4.7). It is on the
+	// Alert rather than derived at the notifier because, since decision 7 put environment into issue
+	// identity, "issue 4f2c" is no longer enough to say WHERE an error is happening — two issues
+	// with the same fingerprint in staging and production are two rows and two alerts. notify.go's
+	// subject names it for exactly that reason.
+	Environment string
+	Channel     string
+	Message     string
+	OccurredAt  time.Time
 }
 
 type Dispatcher struct {
@@ -319,7 +357,7 @@ func (d *Dispatcher) StartInvalidationSubscriber(sub *nats.Subscriber) {
 // invalidation message will retry.
 func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	rows, err := d.db.Query(ctx,
-		"SELECT id, project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled FROM alert_configs WHERE enabled = true",
+		"SELECT id, project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled, environments FROM alert_configs WHERE enabled = true",
 	)
 	if err != nil {
 		slog.ErrorContext(ctx, "alerts: failed to load alert configs", slog.String("error", err.Error()))
@@ -328,6 +366,12 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 
 	projectConfigs := make(map[string][]*AlertConfig)
 	orgConfigs := make(map[string][]*AlertConfig)
+	// §12's gauge: the number of enabled rows carrying a non-NULL `environments`. Counted here
+	// because this loop already has the answer in hand — the SELECT above already reads the column,
+	// so this costs no query. Published only if the whole refresh succeeds (see the Set below): a
+	// refresh that bails leaves the previous, still-consistent caches in place, and a gauge that
+	// moved for a refresh that was abandoned would describe configs nothing is dispatching against.
+	scopedCount := 0
 
 	for rows.Next() {
 		var cfg AlertConfig
@@ -335,15 +379,20 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 		var projectID sql.NullString
 		var channelConfigJSON []byte
 		var windowSeconds int
+		// environments is TEXT[] DEFAULT NULL. pgx scans SQL NULL into a nil slice and a populated
+		// array into a non-nil one, which is exactly the nil/non-nil distinction coversEnvironment
+		// reads — so the "every environment" case needs no sentinel value of its own.
+		var environments []string
 
 		// project_id is nullable as of 1722100000_add_alert_config_org_layer.sql: NULL means this row
 		// is organization-wide. organization_id is NOT NULL on every row (project-scoped rows carry
 		// it too, backfilled by that migration), so it scans directly into cfg.OrganizationID.
-		if err := rows.Scan(&configID, &projectID, &cfg.OrganizationID, &cfg.Channel, &channelConfigJSON, &cfg.FrequencyThreshold, &windowSeconds, &cfg.Enabled); err != nil {
+		if err := rows.Scan(&configID, &projectID, &cfg.OrganizationID, &cfg.Channel, &channelConfigJSON, &cfg.FrequencyThreshold, &windowSeconds, &cfg.Enabled, &environments); err != nil {
 			slog.WarnContext(ctx, "alerts: skipping unreadable alert_configs row", slog.String("error", err.Error()))
 			continue
 		}
 		cfg.ID = configID
+		cfg.Environments = environments
 
 		// channel_config used to be scanned and then discarded, leaving ChannelConfig nil for every
 		// config. Both permitted channels read their destination out of it (email's "to", telegram's
@@ -369,6 +418,12 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 		}
 
 		cfg.FrequencyWindow = time.Duration(windowSeconds) * time.Second
+
+		// Counted here rather than at the scan, so a row this loop went on to DROP (an unreadable
+		// channel_config `continue`s above) is not reported as a scoped config that is dispatching.
+		if environments != nil {
+			scopedCount++
+		}
 
 		if projectID.Valid && projectID.String != "" {
 			cfg.ProjectID = projectID.String
@@ -413,6 +468,12 @@ func (d *Dispatcher) refreshConfigs(ctx context.Context) {
 	d.orgConfigs = orgConfigs
 	d.projectOrg = projectOrg
 	d.configMu.Unlock()
+
+	// §12: the predicate sentinel_alerts_suppressed_by_environment_total's rule needs. Without it
+	// "the suppression counter is flat at zero" is true of both a correctly installed feature nobody
+	// has scoped anything on and a feature that is silently not applied, and infra's
+	// SentinelEnvironmentScopingInert has no expressible condition at all.
+	procmetrics.SetAlertConfigsEnvironmentScoped(ctx, scopedCount)
 }
 
 // destinationKey identifies where an AlertConfig actually sends to, for deduplication purposes: two
@@ -452,33 +513,47 @@ func destinationKey(cfg *AlertConfig) string {
 // more specific rule, so its frequency threshold/window is the one a caller configuring both would
 // reasonably expect to apply.
 //
+// environment is the occurrence's environment (§4.7) and it participates in the dedup, because a
+// config that will not count this occurrence must not be allowed to STAND IN for one that will. Only
+// a config whose scope covers the environment claims its destinationKey; a config outside scope is
+// still returned (dispatchToConfig is where §4.7's suppression, and its metric, is recorded, once per
+// (occurrence, config) pair) but leaves the key free for a later config that does cover it. Without
+// this, a project-scoped config to ops@ scoped to {production} silently swallowed the org-wide
+// config to the same ops@ with NULL environments, and a staging occurrence reached nobody at all —
+// exactly the "safety net that must still fire" this function's own rule promises.
+//
 // The enabled filter itself is normally already applied by refreshConfigs' query (WHERE enabled =
 // true), so in production every config reaching this function is enabled; Dispatch still checks
 // cfg.Enabled defensively (and tests exercise that path directly via SetConfigsForTest /
 // SetOrgConfigsForTest with Enabled: false, bypassing the DB-level filter).
 //
 // Must be called with d.configMu held for reading (or writing).
-func (d *Dispatcher) resolveConfigs(projectID string) []*AlertConfig {
+func (d *Dispatcher) resolveConfigs(projectID, environment string) []*AlertConfig {
 	var result []*AlertConfig
 	seen := make(map[string]bool)
 
-	for _, cfg := range d.configs[projectID] {
+	keep := func(cfg *AlertConfig) {
+		if !cfg.coversEnvironment(environment) {
+			// Out of scope for THIS occurrence: it cannot fire, so it must not claim the
+			// destination either. dispatchToConfig still sees it and records the suppression.
+			result = append(result, cfg)
+			return
+		}
 		key := destinationKey(cfg)
 		if seen[key] {
-			continue
+			return
 		}
 		seen[key] = true
 		result = append(result, cfg)
 	}
 
+	for _, cfg := range d.configs[projectID] {
+		keep(cfg)
+	}
+
 	if orgID, ok := d.projectOrg[projectID]; ok {
 		for _, cfg := range d.orgConfigs[orgID] {
-			key := destinationKey(cfg)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			result = append(result, cfg)
+			keep(cfg)
 		}
 	}
 
@@ -489,16 +564,19 @@ func (d *Dispatcher) resolveConfigs(projectID string) []*AlertConfig {
 // project-scoped and organization-wide layers, unioned and deduplicated by destination) and evaluates
 // each one's frequency threshold/window independently, so an organization-wide config and a
 // project-scoped config for the same project rate-limit separately rather than sharing one counter.
-func (d *Dispatcher) Dispatch(ctx context.Context, issueID, projectID, errorClass, message string) {
+// environment is the environment of the occurrence being dispatched (§4.7); each config counts it
+// only if the config covers that environment (AlertConfig.coversEnvironment), and it is passed into
+// resolveConfigs so the scope decision is made BEFORE destination dedup rather than after it.
+func (d *Dispatcher) Dispatch(ctx context.Context, issueID, projectID, environment, errorClass, message string) {
 	d.configMu.RLock()
-	cfgs := d.resolveConfigs(projectID)
+	cfgs := d.resolveConfigs(projectID, environment)
 	d.configMu.RUnlock()
 
 	for _, cfg := range cfgs {
 		if !cfg.Enabled {
 			continue
 		}
-		d.dispatchToConfig(ctx, cfg, issueID, projectID, errorClass, message)
+		d.dispatchToConfig(ctx, cfg, issueID, projectID, environment, errorClass, message)
 	}
 }
 
@@ -507,7 +585,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, issueID, projectID, errorClas
 // counter key includes cfg.ID (in addition to projectID and issueID) so that when Dispatch resolves
 // multiple configs for the same project/issue (one org-wide, one project-scoped), each gets its own
 // independent counter instead of colliding on one.
-func (d *Dispatcher) dispatchToConfig(ctx context.Context, cfg *AlertConfig, issueID, projectID, errorClass, message string) {
+func (d *Dispatcher) dispatchToConfig(ctx context.Context, cfg *AlertConfig, issueID, projectID, environment, errorClass, message string) {
+	// §4.7's scope check, and it must come BEFORE the counter. An occurrence outside this config's
+	// scope must not increment projectID+":"+issueID+":"+cfg.ID toward the threshold: a config
+	// scoped to production that counts staging occurrences pages for production at a staging rate,
+	// which is worse than not being scoped at all. Returning here — rather than suppressing the send
+	// after counting — is the whole of the behaviour.
+	if !cfg.coversEnvironment(environment) {
+		procmetrics.RecordAlertSuppressedByEnvironment(ctx)
+		return
+	}
+
 	key := projectID + ":" + issueID + ":" + cfg.ID
 
 	d.mu.Lock()
@@ -532,11 +620,12 @@ func (d *Dispatcher) dispatchToConfig(ctx context.Context, cfg *AlertConfig, iss
 
 	if count >= counter.threshold {
 		alert := &Alert{
-			IssueID:    issueID,
-			ProjectID:  projectID,
-			Channel:    cfg.Channel,
-			Message:    formatAlertMessage(errorClass, message, count),
-			OccurredAt: now,
+			IssueID:     issueID,
+			ProjectID:   projectID,
+			Environment: environment,
+			Channel:     cfg.Channel,
+			Message:     formatAlertMessage(errorClass, message, count),
+			OccurredAt:  now,
 		}
 
 		d.sendAlert(ctx, cfg, alert)
@@ -566,8 +655,11 @@ func (d *Dispatcher) DispatchOperational(ctx context.Context, cfg *AlertConfig, 
 		return
 	}
 	alert := &Alert{
-		IssueID:    "dlq-backlog",
-		ProjectID:  "operational",
+		IssueID:   "dlq-backlog",
+		ProjectID: "operational",
+		// A DLQ backlog is operational and belongs to no environment — see this method's doc
+		// comment on why it has no ProjectID either. notify.go's subject omits the environment
+		// rather than printing an empty one.
 		Channel:    cfg.Channel,
 		Message:    message,
 		OccurredAt: time.Now(),

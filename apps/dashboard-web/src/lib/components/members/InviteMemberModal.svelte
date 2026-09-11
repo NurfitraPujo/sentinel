@@ -27,12 +27,110 @@
   let invitationSent = false;
   let emailInputEl: HTMLInputElement | null = null;
 
+  // -----------------------------------------------------------------------------------------------
+  // sentinel-project-environments task 14 — the optional environment scope control. Contract §4.10a,
+  // decisions 28, 39 and 44, flows `I1`-`I5`.
+  //
+  // The SHAPE of this control is the whole point. Decision 28 is (c): a new member gets no grant row
+  // and is unrestricted unless the inviter explicitly chooses otherwise. So nothing here is
+  // pre-selected, an inviter who ignores the control sends exactly today's invitation body, and
+  // `environmentScopes` is omitted ENTIRELY rather than sent as `[]` — a control that always sends a
+  // value has quietly made this (b), the option the operator rejected, and would narrow people by
+  // machine on a screen where nobody meant to.
+  // -----------------------------------------------------------------------------------------------
+
+  interface ScopeProject {
+    id: string;
+    name: string;
+  }
+
+  let scopeProjects: ScopeProject[] = [];
+  let scopeProjectsLoaded = false;
+  // Per project: the environment names the inviter has ticked. A project with no entry, or an empty
+  // one, contributes nothing to the request — which is how "chose nothing" stays the default.
+  let selectedByProject: Record<string, string[]> = {};
+  // Per project: the registry, loaded on first expand.
+  let environmentsByProject: Record<string, string[]> = {};
+  let environmentsLoadedFor: Record<string, boolean> = {};
+  let expandedProjectId: string | null = null;
+
+  // Flow `I5`. An organization owner cannot be scoped — `422`, the same rule and the same reason as
+  // the grants endpoint's: the person who can undo a narrowing must not be the one narrowed out.
+  // The control is not rendered at all for that role, with the reason said once.
+  $: inviteeIsOwner = selectedRole === 'owner';
+
+  $: chosenScopes = Object.entries(selectedByProject)
+    .filter(([, names]) => names.length > 0)
+    .map(([projectId, environments]) => ({ projectId, environments }));
+
   function resetForm() {
     email = '';
     selectedRole = 'engineer';
     loading = false;
     errorMessage = '';
     invitationSent = false;
+    selectedByProject = {};
+    expandedProjectId = null;
+  }
+
+  async function loadScopeProjects() {
+    try {
+      // Decision 31 added this endpoint because §4.10a's control is per project and nothing listed an
+      // organization's projects for a caller before. It returns the projects the caller can actually
+      // reach, which is also flow `I4b`: a project the inviter could not scope is not offered at all.
+      const res = await fetch(`/api/organizations/${orgId}/projects`);
+      if (!res.ok) return;
+      const body = await res.json();
+      scopeProjects = (body.projects ?? []) as ScopeProject[];
+    } catch {
+      scopeProjects = [];
+    } finally {
+      scopeProjectsLoaded = true;
+    }
+  }
+
+  async function loadEnvironments(projectId: string) {
+    if (environmentsLoadedFor[projectId]) return;
+    try {
+      // §4.1 with `includeHidden=true` — the management list, gated on `write` (decision 44, one
+      // gate). It is NOT filtered to the inviter's own scope: decision 39 reversed that, because
+      // §4.10's grant `PUT` is explicitly not scope-guarded and would accept one screen later exactly
+      // what a filtered list here would refuse.
+      const res = await fetch(
+        `/api/organizations/${orgId}/projects/${projectId}/environments?includeHidden=true`
+      );
+      if (!res.ok) return;
+      const body = await res.json();
+      environmentsByProject = {
+        ...environmentsByProject,
+        [projectId]: ((body.environments ?? []) as { name: string }[]).map((e) => e.name),
+      };
+    } catch {
+      environmentsByProject = { ...environmentsByProject, [projectId]: [] };
+    } finally {
+      environmentsLoadedFor = { ...environmentsLoadedFor, [projectId]: true };
+    }
+  }
+
+  function toggleProject(projectId: string) {
+    expandedProjectId = expandedProjectId === projectId ? null : projectId;
+    if (expandedProjectId) loadEnvironments(projectId);
+  }
+
+  function toggleEnvironment(projectId: string, name: string) {
+    const current = selectedByProject[projectId] ?? [];
+    const next = current.includes(name)
+      ? current.filter((n) => n !== name)
+      : [...current, name];
+    // One entry per project, keyed by projectId — the request can never name the same project twice
+    // (`I7`, `400 environmentScopes names the same project twice`), because the grant table is keyed
+    // `(user_id, project_id)` and a duplicate would abort the whole membership transaction at
+    // acceptance and leave the invitee unable to join at all.
+    selectedByProject = { ...selectedByProject, [projectId]: next };
+  }
+
+  $: if (show && !scopeProjectsLoaded) {
+    loadScopeProjects();
   }
 
   function handleClose() {
@@ -60,10 +158,17 @@
     errorMessage = '';
 
     try {
+      // Flow `I1` and criterion 22: an untouched control sends NO `environmentScopes` field. The key
+      // is added only when something was actually chosen, and never for an owner (`I5`).
+      const payload: Record<string, unknown> = { email: email.trim(), role: selectedRole };
+      if (!inviteeIsOwner && chosenScopes.length > 0) {
+        payload.environmentScopes = chosenScopes;
+      }
+
       const response = await fetch(`/api/organizations/${orgId}/invitations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), role: selectedRole }),
+        body: JSON.stringify(payload),
       });
 
       let result: any = {};
@@ -166,6 +271,89 @@
                 <option value={role.value}>{role.label}</option>
               {/each}
             </select>
+          </div>
+
+          <!--
+            Task 14's control. It is optional and deliberately quiet: an inviter who scrolls past it
+            sends today's invitation and the new member is unrestricted. What it does is said in
+            words beside it, because a silent optional control on an invite screen is a control
+            nobody uses on purpose.
+          -->
+          <div data-testid="environment-scope-control">
+            <span class="field-label">
+              Environment access (optional)
+            </span>
+            {#if inviteeIsOwner}
+              <!-- Flow `I5`: no control at all for an owner, with the reason said once. -->
+              <p class="scope-hint" data-testid="owner-scope-note">
+                An organization owner cannot be limited to specific environments.
+              </p>
+            {:else}
+              <p class="scope-hint scope-hint-lead">
+                Leave this alone and the new member sees every environment of every project they can
+                reach — that is the normal invitation. Anything chosen here can be changed later in
+                the project's settings.
+              </p>
+
+              {#if !scopeProjectsLoaded}
+                <p class="scope-note">Loading projects…</p>
+              {:else if scopeProjects.length === 0}
+                <p class="scope-note">
+                  There are no projects here you can limit access in.
+                </p>
+              {:else}
+                <ul class="scope-list">
+                  {#each scopeProjects as project (project.id)}
+                    <li class="scope-item">
+                      <button
+                        type="button"
+                        class="scope-toggle"
+                        on:click={() => toggleProject(project.id)}
+                      >
+                        <span>{project.name}</span>
+                        <span class="scope-toggle-value">
+                          {#if (selectedByProject[project.id] ?? []).length > 0}
+                            {(selectedByProject[project.id] ?? []).join(', ')}
+                          {:else}
+                            All environments
+                          {/if}
+                        </span>
+                      </button>
+
+                      {#if expandedProjectId === project.id}
+                        <div class="scope-body">
+                          {#if !environmentsLoadedFor[project.id]}
+                            <p class="scope-note">Loading environments…</p>
+                          {:else if (environmentsByProject[project.id] ?? []).length === 0}
+                            <!--
+                              Flow `I3`. Under decision 8 this is EVERY project on day one — no
+                              registry row is ever created by traffic — so it is the state an inviter
+                              sees first, and an empty multi-select here would read as broken.
+                            -->
+                            <p class="scope-hint" data-testid="invite-registry-empty">
+                              No environments have been declared in this project yet, so there is
+                              nothing to limit access to. Declare them in the project's settings; until
+                              then anyone with access to it sees everything it reports.
+                            </p>
+                          {:else}
+                            {#each environmentsByProject[project.id] as name (name)}
+                              <label class="scope-env">
+                                <input
+                                  type="checkbox"
+                                  checked={(selectedByProject[project.id] ?? []).includes(name)}
+                                  on:change={() => toggleEnvironment(project.id, name)}
+                                />
+                                <span>{name}</span>
+                              </label>
+                            {/each}
+                          {/if}
+                        </div>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            {/if}
           </div>
 
           <div class="modal-actions">
@@ -294,6 +482,72 @@
     width: 100%;
     padding: 0.5rem 0.75rem;
     font-size: 0.875rem;
+  }
+
+  /* Task 14's environment-scope control, in this file's idiom rather than Tailwind. */
+  .scope-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+
+  .scope-hint-lead {
+    margin-bottom: 0.5rem;
+  }
+
+  .scope-note {
+    font-size: 0.75rem;
+    color: var(--text-subtle);
+  }
+
+  .scope-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .scope-item {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+  }
+
+  .scope-toggle {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .scope-toggle:hover {
+    background-color: var(--bg-surface-hover);
+  }
+
+  .scope-toggle-value {
+    color: var(--text-muted);
+  }
+
+  .scope-body {
+    padding: 0.5rem 0.75rem;
+    border-top: 1px solid var(--border-color);
+  }
+
+  .scope-env {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.125rem 0;
+    font-size: 0.75rem;
+    color: var(--text-primary);
   }
 
   .modal-actions {

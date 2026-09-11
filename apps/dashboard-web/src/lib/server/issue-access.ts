@@ -1,7 +1,8 @@
 import { error } from '@sveltejs/kit';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db } from './db';
 import { issues, projects, organizationMembers, projectMembers } from '$lib/db/schema';
+import { resolveEnvironmentScope } from './environment-access';
 
 /**
  * Org roles allowed to perform WRITE operations on issues (resolve/ignore/unresolve/assign).
@@ -107,6 +108,7 @@ export async function requireIssueAccess(
 		.select({
 			issueId: issues.id,
 			projectId: issues.projectId,
+			environment: issues.environment,
 			organizationId: projects.organizationId,
 		})
 		.from(issues)
@@ -117,7 +119,7 @@ export async function requireIssueAccess(
 		throw error(404, 'Issue not found');
 	}
 
-	const { projectId, organizationId } = issueRows[0];
+	const { projectId, environment, organizationId } = issueRows[0];
 
 	if (!organizationId) {
 		throw error(400, 'Issue project does not belong to an organization');
@@ -126,6 +128,18 @@ export async function requireIssueAccess(
 	const { organizationId: orgId } = await requireProjectAccess(userId, projectId, permission, {
 		organizationId,
 	});
+
+	// sentinel-project-environments §2.2 — the ENVIRONMENT dimension, applied after the project one.
+	//
+	// Denial here is `404`, never `403` (decision 20). An issue in an environment the caller may not
+	// see is indistinguishable from an issue that does not exist: a `403` on `/issues/<uuid>` tells
+	// a contractor that a production issue with that id exists, which is the fact the boundary was
+	// drawn to withhold. The project dimension keeps its `403`s above, and that asymmetry is
+	// deliberate.
+	const scope = await resolveEnvironmentScope(userId, projectId);
+	if (scope !== null && !scope.includes(environment)) {
+		throw error(404, 'Issue not found');
+	}
 
 	return { issueId: issueRows[0].issueId, projectId, organizationId: orgId };
 }
@@ -231,6 +245,87 @@ export async function getAccessibleProjectIds(
 		.where(and(eq(projectMembers.userId, userId), eq(projects.organizationId, organizationId)));
 
 	return new Set(rows.map((r) => r.projectId));
+}
+
+/** One project as the routes that list a caller's projects return it. */
+export interface AccessibleProject {
+	id: string;
+	name: string;
+	organizationId: string;
+}
+
+/**
+ * sentinel-project-environments §4.3a / §4.10, decision 31 — "which projects may this caller see",
+ * as the WIDE population:
+ *
+ *     project_members  ∪  (organization_members whose role is in ISSUE_WRITE_ROLES, over that
+ *                          organization's projects)
+ *
+ * — the same `OR` `requireIssueAccess` above already resolves access by, and the reason §2.2 uses
+ * its own grant table rather than a column on `project_members`.
+ *
+ * **It is deliberately NOT `getAccessibleProjectIds` widened in place.** That function keeps its
+ * `project_members`-only derivation because decision 45 leaves one of its two callers
+ * (`routes/api/organizations/[orgId]/reports/+server.ts`) exactly as it is: an org `viewer` sees
+ * zero reports today and widening it would make viewers start seeing their organization's reports,
+ * which is an access decision and not a mechanical one (contract §12 *Known limits* 8). Both
+ * derivations live here, beside each other, so the disagreement is written down rather than latent.
+ *
+ * Why the wide population and not `project_members` alone: **nothing in this application writes
+ * `project_members`** — its only two writers in the whole repository are `tests/e2e/alerting_test.go`
+ * and `tests/e2e/dashboard_test.go`. Built on that table alone, every list this feeds would be empty
+ * for every user in any real deployment, and §4.7's decision-26 guard would refuse every environment
+ * to every caller.
+ *
+ * Sorted by name — §4.10's `GET /api/organizations/{orgId}/projects` returns it straight to a picker.
+ * Pass `organizationId` to narrow to one organization; omit it for §4.3a's cross-organization union
+ * (decision 47: `/search` is not organization-scoped either).
+ */
+export async function getAccessibleProjects(
+	userId: string,
+	organizationId?: string
+): Promise<AccessibleProject[]> {
+	const columns = {
+		id: projects.id,
+		name: projects.name,
+		organizationId: projects.organizationId,
+	};
+
+	const byOrgRole = await db
+		.select(columns)
+		.from(projects)
+		.innerJoin(
+			organizationMembers,
+			eq(organizationMembers.organizationId, projects.organizationId)
+		)
+		.where(
+			and(
+				eq(organizationMembers.userId, userId),
+				inArray(organizationMembers.role, ISSUE_WRITE_ROLES as unknown as string[]),
+				organizationId ? eq(projects.organizationId, organizationId) : undefined
+			)
+		);
+
+	const byProjectRole = await db
+		.select(columns)
+		.from(projects)
+		.innerJoin(projectMembers, eq(projectMembers.projectId, projects.id))
+		.where(
+			and(
+				eq(projectMembers.userId, userId),
+				organizationId ? eq(projects.organizationId, organizationId) : undefined
+			)
+		);
+
+	const merged = new Map<string, AccessibleProject>();
+	for (const row of [...byOrgRole, ...byProjectRole]) {
+		// projects.organization_id is nullable in the schema; a project belonging to no organization
+		// is reachable by neither half of the union, so it cannot appear here.
+		if (row.organizationId === null) continue;
+		merged.set(row.id, { id: row.id, name: row.name, organizationId: row.organizationId });
+	}
+
+	return [...merged.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // Matches issues.resolved_in_version VARCHAR(100)

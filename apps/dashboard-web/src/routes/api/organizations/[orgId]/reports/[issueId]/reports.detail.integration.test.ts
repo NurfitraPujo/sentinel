@@ -92,8 +92,8 @@ async function callGet(issueId: string, label?: string, asOrg = orgId) {
 async function seedExternalReport(context: Record<string, string>, firstSeen?: Date): Promise<string> {
 	const issueId = randomUUID();
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel, first_seen)
-		values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'Visits — the save button spins forever'},
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel, first_seen)
+		values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'Visits — the save button spins forever'},
 		        ${'UserReport'}, ${'user_report'}, ${'user_report_api'},
 		        ${firstSeen ?? new Date()})
 	`;
@@ -108,8 +108,8 @@ async function seedExternalReport(context: Record<string, string>, firstSeen?: D
 async function seedMemberReport(): Promise<string> {
 	const issueId = randomUUID();
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type, source_channel)
-		values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'A member-filed report'},
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type, source_channel)
+		values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'A member-filed report'},
 		        ${'ManualReport'}, ${'user_report'}, ${'manual_support'})
 	`;
 	await sql`
@@ -122,8 +122,8 @@ async function seedMemberReport(): Promise<string> {
 async function seedSystemError(release: string | null, at: Date): Promise<string> {
 	const issueId = randomUUID();
 	await sql`
-		insert into issues (id, project_id, fingerprint, message, error_class, issue_type)
-		values (${issueId}, ${projectId}, ${'fp-' + issueId}, ${'pq: deadlock detected'},
+		insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
+		values (${issueId}, ${projectId}, ${'production'}, ${'fp-' + issueId}, ${'pq: deadlock detected'},
 		        ${'PostgresError'}, ${'system_error'})
 	`;
 	await sql`
@@ -271,8 +271,8 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('GET /api/organizations/[o
 			// oracle for whether another tenant's issue id exists.
 			const foreignIssueId = randomUUID();
 			await sql`
-				insert into issues (id, project_id, fingerprint, message, error_class, issue_type)
-				values (${foreignIssueId}, ${otherProjectId}, ${'fp-' + foreignIssueId}, ${'not yours'},
+				insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
+				values (${foreignIssueId}, ${otherProjectId}, ${'production'}, ${'fp-' + foreignIssueId}, ${'not yours'},
 				        ${'ManualReport'}, ${'user_report'})
 			`;
 			await sql`

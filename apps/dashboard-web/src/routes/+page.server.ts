@@ -2,42 +2,85 @@ import type { PageServerLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getUser } from '$lib/server/auth';
-import { getUserProjectAccess } from '$lib/server/projects';
+import { getAccessibleProjects } from '$lib/server/issue-access';
+import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
+import { listProjectEnvironments, toEnvironmentApiShape } from '$lib/db/queries/environments';
 
 export const load: PageServerLoad = async ({ url, locals }) => {
 	const user = await getUser({ locals } as any);
-	
+
 	if (!user) {
 		redirect(303, '/signin');
 	}
-	
-	const userAccess = await getUserProjectAccess(user.id);
-	const authorizedProjectIds = userAccess.map(a => a.projectId);
+
+	// sentinel-project-environments §4.4, decision 35 — the project derivation WIDENS, from
+	// `getUserProjectAccess` (`project_members`, which nothing in this application writes) to
+	// `project_members` ∪ `organization_members` in `ISSUE_WRITE_ROLES`. This is user-visible in
+	// both directions: `/` starts returning issues to organization-role staff who saw nothing, and
+	// it stops returning every issue in the database to everybody — the empty array used to add no
+	// project predicate at all. Decision 47: the set spans organizations, because `/` has no
+	// organization in scope and never has.
+	const accessibleProjects = await getAccessibleProjects(user.id);
+	const authorizedProjectIds = accessibleProjects.map((p) => p.id);
 
 	// A user who has just signed in for the first time has no organization and no project, so this
 	// page could only ever render an empty list with no way to act on it. Send them to the one
 	// place that can fix that. Only when they have NOTHING — a member of a project with no issues
-	// yet still gets the real (empty) dashboard.
+	// yet still gets the real (empty) dashboard. Under the widened derivation above this fires for
+	// strictly fewer users than it did on `main`: organization-role staff now reach a real project
+	// set and no longer land on /onboarding.
 	if (authorizedProjectIds.length === 0) {
 		redirect(303, '/onboarding');
 	}
-	
+
+	// §2.2's guard, resolved once for every project the caller can reach. One round trip, and the
+	// one derivation of "which environments may this user see" — a project absent from the map is
+	// unrestricted, never denied.
+	const environmentScopes = await resolveEnvironmentScopes(user.id);
+
 	const statusFilter = url.searchParams.get('status') ?? 'all';
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
+	const environmentFilter = url.searchParams.get('environment') ?? 'all';
 	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
 	const limit = 20;
+
+	// Decision 55 (`OQ-41` = (a)): on `project=all` the loader coerces `environment` to `all` and
+	// adds NO environment predicate. An environment name is only meaningful inside a project, so
+	// across projects `production` would mean "any project's production", which nothing in the data
+	// model backs. The state is reachable by an ordinary route and not only by a hand-typed URL:
+	// flow `L7` makes the parameter ride on the filter and paging anchors, so it survives a switch
+	// to `project=all` and the reload of a bookmark. Since §4.4 returns `environments: []` there,
+	// the control is not rendered — applied, the list would be silently narrowed with no on-screen
+	// affordance to clear it, on the page whose empty state is required to name the environment.
+	// The GUARD (`environmentScopes`) is unaffected; only the offered FILTER is dropped.
+	const effectiveEnvironment = projectIdFilter === 'all' ? 'all' : environmentFilter;
 
 	const filters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
 		projectIds: authorizedProjectIds,
+		environment: effectiveEnvironment,
+		environmentScopes,
 	};
 
 	const [results, userProjects, total] = await Promise.all([
 		issueQueries.listIssues(filters, page, limit),
-		issueQueries.listProjects(),
+		issueQueries.listProjects(authorizedProjectIds),
 		issueQueries.countIssues(filters)
 	]);
+
+	// §4.4: `[]` when `project=all`, and the environment control is not rendered. An environment
+	// name is only meaningful inside a project — two projects may both report `production` and they
+	// are not the same environment — so a cross-project list here would silently mean "any
+	// project's production", which nothing in the data model backs. The GUARD still applies on
+	// `project=all`; only the offered FILTER does not.
+	const environments =
+		projectIdFilter !== 'all' && authorizedProjectIds.includes(projectIdFilter)
+			? await listSelectableEnvironments(
+					projectIdFilter,
+					scopeForProject(environmentScopes, projectIdFilter)
+				)
+			: [];
 
 	const issuesWithProject = results.map((issue) => {
 		const project = userProjects.find(p => p.id === issue.projectId);
@@ -50,9 +93,14 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	return {
 		issues: issuesWithProject,
 		projects: userProjects,
+		environments,
 		filters: {
 			status: statusFilter,
 			project: projectIdFilter,
+			// The coerced value, not the raw parameter: the page builds every anchor from this echo
+			// (`href()` in `+page.svelte`), so echoing `production` here would keep the parameter
+			// riding on links the reader has no control to clear it from (decision 55, flow `L7`).
+			environment: effectiveEnvironment,
 		},
 		pagination: {
 			page,
@@ -62,3 +110,18 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		},
 	};
 };
+
+/**
+ * §4.1 with `includeHidden=false`, inline — the selector feed, which is the registry minus `hidden`
+ * rows minus anything outside the caller's grant. A filter for data you cannot read is a control
+ * that does nothing.
+ *
+ * `[]` is the normal state of every project on the day this ships: under decision 8 no registry row
+ * is ever created by traffic, only by §4.3's `POST`.
+ */
+async function listSelectableEnvironments(projectId: string, scope: string[] | null) {
+	const rows = await listProjectEnvironments(projectId);
+	return rows
+		.filter((row) => !row.hidden && (scope === null || scope.includes(row.name)))
+		.map(toEnvironmentApiShape);
+}

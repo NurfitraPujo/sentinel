@@ -201,4 +201,112 @@ describe.skipIf(!dbReachable)('Manual issues M1 flow (integration, real Postgres
 
 		await sql`delete from projects where id = ${targetProjectId}`;
 	});
+
+	/**
+	 * sentinel-project-environments §4.8a criterion 3, against the real column.
+	 *
+	 * This is the half a mocked query layer cannot prove: `issues.environment` is NOT NULL with no
+	 * DEFAULT as of §4.9, so a writer that forgot it raises 23502 rather than writing a wrong value,
+	 * and only a real migrated Postgres shows the difference.
+	 */
+	it('files a manual report under `production` by default and under an asserted name verbatim (§4.8a)', async () => {
+		const { createManualIssue } = await import('./reports');
+
+		const noAssertion = await createManualIssue({
+			organizationId: orgId,
+			projectId,
+			reporterId,
+			title: 'env default ' + suffix,
+			bodyMd: 'no environment asserted',
+			severity: 'low',
+		});
+
+		const [defaultRow] = await sql<{ environment: string }[]>`
+			select environment from issues where id = ${noAssertion.issue.id}
+		`;
+		expect(defaultRow.environment).toBe('production');
+
+		// The registry is EMPTY for this project -- no project_environments row was ever created --
+		// and an asserted, unregistered name must still be stored verbatim (decisions 8 and 9). A
+		// rule that required a registry row would fail the first report into every new organisation,
+		// because findOrCreateTriageProject provisions inbox projects with zero declared
+		// environments.
+		const registryRows = await sql<{ count: string }[]>`
+			select count(*)::text as count from project_environments where project_id = ${projectId}
+		`;
+		expect(Number(registryRows[0].count)).toBe(0);
+
+		const asserted = await createManualIssue({
+			organizationId: orgId,
+			projectId,
+			reporterId,
+			title: 'env asserted ' + suffix,
+			bodyMd: 'eu-west-1 asserted',
+			severity: 'low',
+			environment: 'eu-west-1',
+		});
+
+		const [assertedRow] = await sql<{ environment: string }[]>`
+			select environment from issues where id = ${asserted.issue.id}
+		`;
+		expect(assertedRow.environment).toBe('eu-west-1');
+
+		// Still nothing in the registry: only §4.3 creates rows (decision 8). An environment present
+		// in the data and absent from the registry is unfilterable until somebody declares it, and
+		// that is the accepted cost of an intentional registry, not an accident.
+		const registryAfter = await sql<{ count: string }[]>`
+			select count(*)::text as count from project_environments where project_id = ${projectId}
+		`;
+		expect(Number(registryAfter[0].count)).toBe(0);
+	});
+
+	it('files an external report under the resolved `context.environment` (§4.8a, writer 3)', async () => {
+		const { createExternalIssueReport } = await import('./reports');
+		const externalReporterId = randomUUID();
+		await sql`
+			insert into external_reporters (id, organization_id, project_id, external_id, display_name)
+			values (${externalReporterId}, ${orgId}, ${projectId}, ${'ext-' + suffix}, ${'Sarah K.'})
+		`;
+
+		const cases: [Record<string, unknown>, string][] = [
+			[{}, 'production'],
+			[{ environment: 'staging' }, 'staging'],
+			// Stored verbatim on the companion row, resolved on the issue. This route gains no new
+			// error case at all -- a shipped route that starts 400-ing a body it accepted yesterday
+			// is a breaking change (§6 records it as additive).
+			[{ environment: 'Production' }, 'production'],
+			[{ environment: '' }, 'production'],
+		];
+
+		for (const [context, expected] of cases) {
+			const created = await createExternalIssueReport({
+				organizationId: orgId,
+				projectId,
+				externalReporterId,
+				title: `ext env ${expected} ${randomUUID().slice(0, 6)}`,
+				bodyMd: 'the save button spins forever',
+				severity: 'high',
+				context,
+				idempotencyKey: null,
+				attachmentIds: [],
+			});
+
+			const [row] = await sql<{ environment: string }[]>`
+				select environment from issues where id = ${created.issue.id}
+			`;
+			expect(row.environment, `context ${JSON.stringify(context)}`).toBe(expected);
+
+			// The client's object is kept EXACTLY as sent, including a non-matching "Production".
+			const [companion] = await sql<{ context: Record<string, unknown> }[]>`
+				select context from external_issue_reports where issue_id = ${created.issue.id}
+			`;
+			expect(companion.context).toEqual(context);
+		}
+
+		await sql`
+			delete from external_issue_reports
+			where issue_id in (select id from issues where project_id = ${projectId})
+		`;
+		await sql`delete from external_reporters where id = ${externalReporterId}`;
+	});
 });

@@ -14,6 +14,24 @@
 		});
 	}
 
+	// §4.1's `Environment` and §4.3a's `UnionEnvironment` in one shape: the union publishes the raw
+	// `name` only, so `displayName` is optional and the name is the label when it is absent.
+	interface EnvironmentOption {
+		name: string;
+		displayName?: string;
+	}
+
+	// Contract §4.5 change 1 puts an `environments` array on this page's `data` — §4.1's registry
+	// when a project is chosen, §4.3a's guarded cross-project union when one is not. The loader that
+	// builds it is `+page.server.ts`, which is BE's under contract §6a and does not carry the field
+	// yet, so it is read through a widened view of `data` rather than derived here: a list this page
+	// assembled for itself would be an unguarded one, and §4.3a's union is a guard, not a
+	// convenience. Until BE lands it the select degrades to "All Environments" alone and the form
+	// still submits (`S3`).
+	let environmentOptions = $derived(
+		(data as typeof data & { environments?: EnvironmentOption[] }).environments ?? []
+	);
+
 	function buildSearchUrl(params: Record<string, string | undefined>): string {
 		const searchParams = new URLSearchParams();
 		for (const [key, value] of Object.entries(params)) {
@@ -89,11 +107,26 @@
 
 				<label>
 					<span>Environment</span>
+					<!--
+						sentinel-project-environments task 7, contract §4.5 change 1, flows `S1`-`S3`.
+						This select used to hold three hard-coded option literals, so an organisation
+						reporting from any other name could never select it — while the ingest edge
+						accepted the name and stored the rows. The options now come from the server:
+						contract §4.1's registry for a chosen project, and §4.3a's guarded cross-project
+						union when no project is chosen. A union entry carries only `name` (two projects'
+						same-named environments are two rows with two labels, so §4.3a publishes no
+						label at all), which is why the label falls back to the name here.
+
+						`""` still means "every environment", unchanged — the empty registry case simply
+						leaves that as the only option and the form still submits (`S3`).
+					-->
 					<select name="environment">
 						<option value="">All Environments</option>
-						<option value="production" selected={data.filters.environment === 'production'}>Production</option>
-						<option value="staging" selected={data.filters.environment === 'staging'}>Staging</option>
-						<option value="development" selected={data.filters.environment === 'development'}>Development</option>
+						{#each environmentOptions as environment (environment.name)}
+							<option value={environment.name} selected={data.filters.environment === environment.name}>
+								{environment.displayName ?? environment.name}
+							</option>
+						{/each}
 					</select>
 				</label>
 

@@ -28,7 +28,7 @@ dbMock.transaction = vi.fn(async (cb: any) => cb(txMock));
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
-	issues: { id: 'id', projectId: 'projectId', status: 'status' },
+	issues: { id: 'id', projectId: 'projectId', status: 'status', environment: 'environment' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
 	issueRelations: { id: 'id' },
 }));
@@ -54,6 +54,34 @@ beforeEach(() => {
 	txMock.then = vi.fn((resolve: any) => resolve(txMock.__result));
 });
 
+/**
+ * Every non-literal operand in a drizzle `SQL` tree, in statement order — column references and
+ * bound values, but not the SQL text between them.
+ *
+ * The environment guard is a predicate composed into an `and(...)`, so what a test can observe
+ * without a real database is which operands reach the statement. `$lib/db/schema` is mocked to
+ * plain strings here (see the mock above), so a column arrives as its name and a value arrives as
+ * itself; only `StringChunk`s — the literal ` = `, ` and `, ` in ` — are skipped.
+ */
+function sqlOperands(node: any, out: unknown[] = []): unknown[] {
+	if (Array.isArray(node)) {
+		for (const child of node) sqlOperands(child, out);
+		return out;
+	}
+	if (node !== null && typeof node === 'object') {
+		if ('queryChunks' in node) return sqlOperands(node.queryChunks, out);
+		// A StringChunk is the literal SQL text between operands; a Param carries `encoder` too.
+		if ('value' in node && 'encoder' in node) {
+			out.push(node.value);
+			return out;
+		}
+		if ('value' in node) return out;
+		return out;
+	}
+	if (node !== undefined) out.push(node);
+	return out;
+}
+
 describe('batchUpdateIssues', () => {
 	// The defect this pins: the UPDATE is correctly scoped by projectId, but the activity insert used
 	// to map over the caller's raw id list. An id belonging to a DIFFERENT project therefore got an
@@ -68,7 +96,7 @@ describe('batchUpdateIssues', () => {
 			'proj-1',
 			'resolve',
 			['issue-a', 'issue-b', 'other-tenants-issue'],
-			{}
+			{ environmentScope: null }
 		);
 
 		const insertedRows = txMock.values.mock.calls.at(-1)?.[0];
@@ -83,7 +111,9 @@ describe('batchUpdateIssues', () => {
 	it('inserts no activity at all when the UPDATE matched nothing', async () => {
 		txMock.__result = [];
 
-		const updatedCount = await batchUpdateIssues('proj-1', 'ignore', ['not-in-this-project'], {});
+		const updatedCount = await batchUpdateIssues('proj-1', 'ignore', ['not-in-this-project'], {
+			environmentScope: null,
+		});
 
 		expect(updatedCount).toBe(0);
 		expect(txMock.insert).not.toHaveBeenCalled();
@@ -92,7 +122,9 @@ describe('batchUpdateIssues', () => {
 	it('rejects a batch over MAX_BATCH_ISSUE_IDS before doing any database work', async () => {
 		const overCap = Array.from({ length: MAX_BATCH_ISSUE_IDS + 1 }, (_, i) => `id-${i}`);
 
-		await expect(batchUpdateIssues('proj-1', 'resolve', overCap, {})).rejects.toThrow(/Batch too large/);
+		await expect(
+			batchUpdateIssues('proj-1', 'resolve', overCap, { environmentScope: null })
+		).rejects.toThrow(/Batch too large/);
 		// No partial work: the cap is checked before the transaction opens.
 		expect(dbMock.transaction).not.toHaveBeenCalled();
 	});
@@ -103,6 +135,7 @@ describe('batchUpdateIssues', () => {
 	it('rejects action "assign" with assigneeType "agent" before any database work', async () => {
 		await expect(
 			batchUpdateIssues('proj-1', 'assign', ['issue-a'], {
+				environmentScope: null,
 				assigneeType: 'agent' as any,
 				assignedTo: 'agent-1',
 				actorType: 'user',
@@ -116,6 +149,7 @@ describe('batchUpdateIssues', () => {
 		txMock.__result = [{ id: 'issue-a' }];
 
 		await batchUpdateIssues('proj-1', 'assign', ['issue-a'], {
+			environmentScope: null,
 			assigneeType: 'user',
 			assignedTo: 'user-2',
 			actorType: 'user',
@@ -127,11 +161,54 @@ describe('batchUpdateIssues', () => {
 		);
 	});
 
+	// sentinel-project-environments §2.2 — the environment dimension on the BULK path.
+	//
+	// Guard-deletion red-proof: delete `environmentPredicate` from the UPDATE's `and(...)` in
+	// batchUpdateIssues and this fails, because 'staging' stops appearing among the statement's
+	// bound parameters.
+	it('composes the environment predicate into the UPDATE for a narrowed caller', async () => {
+		txMock.__result = [{ id: 'issue-a' }];
+
+		await batchUpdateIssues('proj-1', 'resolve', ['issue-a'], {
+			environmentScope: ['staging'],
+		});
+
+		const operands = sqlOperands(txMock.where.mock.calls.at(-1)?.[0]);
+		expect(operands).toContain('environment');
+		expect(operands).toContain('staging');
+	});
+
+	// The other half, and the one that would silently empty every bulk action if it regressed:
+	// absence means all, so an unrestricted caller's statement carries no environment value.
+	it('adds no environment predicate for an unrestricted caller (null scope)', async () => {
+		txMock.__result = [{ id: 'issue-a' }];
+
+		await batchUpdateIssues('proj-1', 'resolve', ['issue-a'], { environmentScope: null });
+
+		const operands = sqlOperands(txMock.where.mock.calls.at(-1)?.[0]);
+		expect(operands).toContain('proj-1');
+		expect(operands).toContain('issue-a');
+		// No environment column and no scope value: absence means all.
+		expect(operands).not.toContain('environment');
+	});
+
+	// §4.9's CHECK makes an empty grant array impossible, so this is about the FAILING SHAPE:
+	// `inArray(col, [])` throws in drizzle, which on a write path would be a 500, not a refusal.
+	// Fail closed instead — nothing matched, nothing updated, no activity, no transaction.
+	it('updates nothing rather than throwing when the scope is empty', async () => {
+		await expect(
+			batchUpdateIssues('proj-1', 'resolve', ['issue-a'], { environmentScope: [] })
+		).resolves.toBe(0);
+		expect(dbMock.transaction).not.toHaveBeenCalled();
+	});
+
 	it('accepts a batch exactly at MAX_BATCH_ISSUE_IDS', async () => {
 		const atCap = Array.from({ length: MAX_BATCH_ISSUE_IDS }, (_, i) => `id-${i}`);
 		txMock.__result = atCap.map((id) => ({ id }));
 
-		await expect(batchUpdateIssues('proj-1', 'resolve', atCap, {})).resolves.toBe(MAX_BATCH_ISSUE_IDS);
+		await expect(
+			batchUpdateIssues('proj-1', 'resolve', atCap, { environmentScope: null })
+		).resolves.toBe(MAX_BATCH_ISSUE_IDS);
 	});
 });
 

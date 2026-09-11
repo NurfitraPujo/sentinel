@@ -21,7 +21,7 @@ dbMock.then.mockImplementation((resolve: any) => resolve([]));
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
-	issues: { id: 'id', projectId: 'projectId' },
+	issues: { id: 'id', projectId: 'projectId', environment: 'environment' },
 	projects: { id: 'id', organizationId: 'organizationId' },
 	organizationMembers: { organizationId: 'organizationId', userId: 'userId', role: 'role' },
 	projectMembers: { projectId: 'projectId', userId: 'userId', role: 'role' },
@@ -38,6 +38,11 @@ const access = {
 	validateResolvedInVersion: vi.fn(),
 };
 vi.mock('$lib/server/issue-access', () => access);
+
+const environmentAccess = {
+	resolveEnvironmentScope: vi.fn(),
+};
+vi.mock('$lib/server/environment-access', () => environmentAccess);
 
 const { POST } = await import('./[projectId]/issues/batch/+server');
 
@@ -60,6 +65,7 @@ describe('POST /api/projects/:projectId/issues/batch (D23)', () => {
 		dbMock.then.mockImplementation((resolve: any) => resolve([]));
 		access.requireProjectAccess.mockResolvedValue({ projectId: 'proj-1', organizationId: 'org-1' });
 		access.validateResolvedInVersion.mockReturnValue(null);
+		environmentAccess.resolveEnvironmentScope.mockResolvedValue(null);
 		issueQueries.batchUpdateIssues.mockResolvedValue(2);
 	});
 
@@ -134,5 +140,115 @@ describe('POST /api/projects/:projectId/issues/batch (D23)', () => {
 		} as any);
 
 		expect(await res.json()).toEqual({ success: true, updated: 2 });
+	});
+});
+
+/**
+ * sentinel-project-environments §2.2 — the environment dimension on the bulk path.
+ *
+ * This file previously had no environment case at all, and that absence IS the finding: the route
+ * resolved only the project dimension via `requireProjectAccess`, which never reads
+ * `project_environment_grants`, while the single-issue path (`requireIssueAccess`) resolved the
+ * scope and 404'd. §2.2's guard table names this file and says the bulk path "must not now become
+ * *more* permissive" than the single one — which is exactly what it had become.
+ *
+ * The guard is asserted as DELEGATION, the way the D23 tests above assert `requireProjectAccess`:
+ * the resolver is called with the caller and the project, and the scope it returns reaches
+ * `batchUpdateIssues`, whose own predicate composition is fenced at its own boundary in
+ * `src/lib/db/queries/issues.test.ts`.
+ */
+describe('POST /api/projects/:projectId/issues/batch — the environment guard (§2.2)', () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		dbMock.select.mockReturnValue(dbMock);
+		dbMock.from.mockReturnValue(dbMock);
+		dbMock.where.mockReturnValue(dbMock);
+		dbMock.innerJoin.mockReturnValue(dbMock);
+		dbMock.then.mockReset();
+		dbMock.then.mockImplementation((resolve: any) => resolve([]));
+		access.requireProjectAccess.mockResolvedValue({ projectId: 'proj-1', organizationId: 'org-1' });
+		access.validateResolvedInVersion.mockReturnValue(null);
+		environmentAccess.resolveEnvironmentScope.mockResolvedValue(null);
+		issueQueries.batchUpdateIssues.mockResolvedValue(0);
+	});
+
+	// The core fence. Guard-deletion red-proof: remove the `resolveEnvironmentScope` call (or the
+	// `environmentScope` key) from the route and this fails on both assertions.
+	it("passes the narrowed caller's scope into the update instead of updating unscoped", async () => {
+		environmentAccess.resolveEnvironmentScope.mockResolvedValue(['staging']);
+
+		await POST({
+			params: { projectId: 'proj-1' },
+			request: body({ action: 'resolve', issueIds: ['staging-issue', 'production-issue'] }),
+			locals: locals({ id: 'narrowed-user' }),
+		} as any);
+
+		expect(environmentAccess.resolveEnvironmentScope).toHaveBeenCalledWith(
+			'narrowed-user',
+			'proj-1'
+		);
+		expect(issueQueries.batchUpdateIssues).toHaveBeenCalledWith(
+			'proj-1',
+			'resolve',
+			['staging-issue', 'production-issue'],
+			expect.objectContaining({ environmentScope: ['staging'] })
+		);
+	});
+
+	// Decision 20 on a bulk path: FEWER ROWS, not a 403. A 403 would confirm to a contractor that a
+	// production issue with the id they named exists — the fact the boundary was drawn to withhold.
+	// The count is the rows actually matched, so an out-of-scope id is indistinguishable from one
+	// that does not exist.
+	it('reports the rows actually updated rather than refusing the batch outright', async () => {
+		environmentAccess.resolveEnvironmentScope.mockResolvedValue(['staging']);
+		// Two ids sent; only the in-scope one matched.
+		issueQueries.batchUpdateIssues.mockResolvedValue(1);
+
+		const res = await POST({
+			params: { projectId: 'proj-1' },
+			request: body({ action: 'resolve', issueIds: ['staging-issue', 'production-issue'] }),
+			locals: locals({ id: 'narrowed-user' }),
+		} as any);
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ success: true, updated: 1 });
+	});
+
+	// Absence means all: an unrestricted caller has no grant row, and `null` must reach the query
+	// as `null` — not as `[]`, which is the natural-but-inverted reading that would silently make
+	// every bulk action a no-op for everybody.
+	it('passes null through unchanged for an unrestricted caller', async () => {
+		environmentAccess.resolveEnvironmentScope.mockResolvedValue(null);
+		issueQueries.batchUpdateIssues.mockResolvedValue(2);
+
+		await POST({
+			params: { projectId: 'proj-1' },
+			request: body({ action: 'resolve', issueIds: ['i1', 'i2'] }),
+			locals: locals({ id: 'user-1' }),
+		} as any);
+
+		expect(issueQueries.batchUpdateIssues).toHaveBeenCalledWith(
+			'proj-1',
+			'resolve',
+			['i1', 'i2'],
+			expect.objectContaining({ environmentScope: null })
+		);
+	});
+
+	// The project dimension still comes first: a caller refused there never reaches the resolver,
+	// so the environment guard cannot be read as having replaced it.
+	it('resolves the scope only after project access has been granted', async () => {
+		access.requireProjectAccess.mockRejectedValueOnce(
+			Object.assign(new Error('Forbidden'), { status: 403 })
+		);
+
+		await expect(
+			POST({
+				params: { projectId: 'proj-1' },
+				request: body({ action: 'resolve', issueIds: ['i1'] }),
+				locals: locals({ id: 'org-member-not-on-project' }),
+			} as any)
+		).rejects.toMatchObject({ status: 403 });
+		expect(environmentAccess.resolveEnvironmentScope).not.toHaveBeenCalled();
 	});
 });

@@ -352,3 +352,20 @@ func TestObsBootstrapIsUsableWhenSDKDisabled(t *testing.T) {
 		t.Errorf("Shutdown with the SDK disabled returned %v, want nil", err)
 	}
 }
+
+// TestObsEnvironmentMetricNames pins the exact spelling of sentinel-project-environments §12's four
+// metric names.
+//
+// They are asserted as literals — the one place in this repository where duplicating the string is
+// the point. Every other reader of these names imports the constant, but the readers that matter
+// most are in a THIRD repository: infra's Prometheus rules name them in their `expr`s (decision 17),
+// and a rule whose metric name has drifted does not error, it silently matches nothing. Renaming a
+// constant here without editing that repo has to break something, and this is that something.
+func TestObsEnvironmentMetricNames(t *testing.T) {
+	assert.Equal(t, "sentinel_unregistered_environment_events_total", obs.MetricUnregisteredEnvironmentEvents)
+	assert.Equal(t, "sentinel_environment_registry_touch_failures_total", obs.MetricEnvironmentRegistryTouchFailures)
+	assert.Equal(t, "sentinel_alerts_suppressed_by_environment_total", obs.MetricAlertsSuppressedByEnvironment)
+	// A GAUGE, so deliberately no _total suffix: it is the number of enabled environment-scoped
+	// alert configs right now, and it must be able to go down.
+	assert.Equal(t, "sentinel_alert_configs_environment_scoped", obs.MetricAlertConfigsEnvironmentScoped)
+}

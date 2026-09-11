@@ -5,14 +5,22 @@ import { db } from '$lib/server/db';
 import { projects } from '$lib/db/schema';
 import { getReportDetail, getIssueActivity, listIssueAttachments } from '$lib/db/queries/reports';
 import { getIssueRelations } from '$lib/db/queries/issues';
-import { requireReportAccessForIssue } from '$lib/server/report-access';
+import { resolveEnvironmentScopes } from '$lib/server/environment-access';
+import { requireIssueAccessAnyType } from '$lib/server/issue-access-dispatch';
 import { ISSUE_WRITE_ROLES } from '$lib/server/issue-access';
 import type { Escalation, Triage } from '$lib/types/report-detail';
 
 // Manual Issues M1 (design §10): imitates the project-issue detail loader pattern at
 // [orgSlug]/projects/[projectId]/issues/[issueId]/+page.server.ts -- verify the issue belongs to
-// this org (report-access.ts's requireReportAccessForIssue does both the 404-for-wrong-type and
-// the org-membership check in one call, see B7/§9), then load everything the page renders.
+// this org, then load everything the page renders.
+//
+// sentinel-project-environments §2.2: the gate is `issue-access-dispatch.ts:
+// requireIssueAccessAnyType` and NOT `report-access.ts: requireReportAccessForIssue` it used to
+// call directly, because §2.2's guard table names the dispatch as the guard point for "reports,
+// comments and attachments" and lists BOTH report detail routes as covered by it -- a claim that
+// is only true where each of them actually goes through it. The dispatch still reaches
+// `requireReportAccessForIssue` for a `user_report`, so the 404-for-wrong-type and the
+// org-membership check (B7/§9) are unchanged; what it adds is the environment predicate.
 export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	const session = await locals.auth();
 	if (!session?.user?.id) {
@@ -25,9 +33,9 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	}
 
 	const userId = session.user.id;
-	const { organizationId, role } = await requireReportAccessForIssue(userId, issueId, 'read');
+	const { organizationId, role } = await requireIssueAccessAnyType(userId, issueId, 'read');
 
-	// requireReportAccessForIssue resolves organizationId from the issue itself, but the route is
+	// requireIssueAccessAnyType resolves organizationId from the issue itself, but the route is
 	// also parameterized by :orgSlug -- reject a mismatch rather than silently serving the report
 	// under whichever org slug happens to be in the URL (mirrors the projectId cross-check on the
 	// existing issue detail loader).
@@ -42,7 +50,9 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 	}
 
 	const [relations, activity, orgProjects, attachments] = await Promise.all([
-		getIssueRelations(issueId),
+		// §2.2, decision 37: guarded on the RELATED issue, per project. An out-of-scope relation
+		// comes back as a redacted placeholder rather than being dropped or 404'd.
+		resolveEnvironmentScopes(userId).then((scopes) => getIssueRelations(issueId, scopes)),
 		getIssueActivity(issueId),
 		db
 			.select({ id: projects.id, name: projects.name, isInbox: projects.isInbox })
@@ -51,7 +61,7 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 		listIssueAttachments(issueId),
 	]);
 
-	const canWrite = (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
+	const canWrite = role !== null && (ISSUE_WRITE_ROLES as readonly string[]).includes(role);
 
 	// sentinel-user-report-issue §4.2's `triage` and `escalation`, fetched from the API route that
 	// already computes them rather than recomputed here. That route owns the window derivation, the

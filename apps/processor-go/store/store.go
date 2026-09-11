@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -38,7 +40,11 @@ type QueryStore interface {
 	// ResolveProjectID resolves the tenant project for an incoming event.
 	// See the method doc on pgStore.ResolveProjectID for the full rationale.
 	ResolveProjectID(ctx context.Context, projectID, projectKey string) (string, error)
-	GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error)
+	// GetIssueIDByFingerprint takes `environment` because sentinel-project-environments §4.9 makes
+	// (project_id, environment, fingerprint) the issue identity. StoreEvent does NOT call this — it
+	// has its own inline SELECT — so changing only this function would leave the write path grouping
+	// across environments while every reader believed it did not.
+	GetIssueIDByFingerprint(ctx context.Context, projectID, environment, fingerprint string) (string, error)
 }
 
 // CommandStore defines the "Write" side of the Issue store.
@@ -83,11 +89,19 @@ const (
 	IssueOutcomeRegressed
 )
 
-// issuesUpsertConflictPredicate scopes the issues ON CONFLICT (project_id, fingerprint) DO
-// UPDATE to processor-owned rows only. The processor never writes issue_type, but a manual
-// (issue_type = 'user_report') issue could theoretically collide on (project_id, fingerprint);
+// issuesUpsertConflictPredicate scopes the issues ON CONFLICT (project_id, environment,
+// fingerprint) DO UPDATE to processor-owned rows only. The processor never writes issue_type, but a
+// manual (issue_type = 'user_report') issue could theoretically collide on the conflict target;
 // without this predicate the processor's upsert would bump last_seen/count on that manual issue
 // and Dispatcher.Dispatch would fire for it. See R13, docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md §10.
+//
+// sentinel-project-environments §4.9 widens the conflict TARGET and deliberately leaves this text
+// alone. `issue_type = 'system_error'` names an OWNERSHIP distinction, not an identity one, and
+// §4.8a keeps both dashboard writers writing 'user_report' rows — so the set this excludes is
+// exactly the set it excluded before. `issues.fingerprint = EXCLUDED.fingerprint` was already
+// implied by the old conflict target and stays implied by the wider one. The collision it guards
+// against becomes strictly RARER (a manual issue's fingerprint is 16 random bytes and now has to
+// match on environment too), and rarer is not never.
 const issuesUpsertConflictPredicate = "issues.fingerprint = EXCLUDED.fingerprint AND issues.issue_type = 'system_error'"
 
 // IssueStore combines both Read and Write operations for the Processor.
@@ -106,8 +120,13 @@ func NewStore(db *pgxpool.Pool) IssueStore {
 }
 
 type Issue struct {
-	ID                string
-	ProjectID         string
+	ID        string
+	ProjectID string
+	// Environment is part of the issue's identity as of sentinel-project-environments §4.9:
+	// `issues` is UNIQUE (project_id, environment, fingerprint) and the column is NOT NULL with no
+	// DEFAULT, so every write path must supply it. It comes from the event (§4.8), never from the
+	// registry — an environment may legitimately exist in the data and not in project_environments.
+	Environment       string
 	Fingerprint       string
 	Message           string
 	ErrorClass        string
@@ -195,8 +214,8 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 	var existingID string
 
 	err = tx.QueryRow(ctx,
-		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND fingerprint = $2",
-		issue.ProjectID, issue.Fingerprint,
+		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND environment = $2 AND fingerprint = $3",
+		issue.ProjectID, issue.Environment, issue.Fingerprint,
 	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
 
 	// Only "no such issue yet" is expected here. Any other error means the statement genuinely
@@ -205,8 +224,8 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 	// therefore REPLACED the actual cause (e.g. `relation "issues" does not exist`) with a generic
 	// abort message, which is worse than useless when diagnosing a live pipeline.
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return IssueOutcomeExisting, fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
-			issue.ProjectID, issue.Fingerprint, err)
+		return IssueOutcomeExisting, fmt.Errorf("failed to read existing issue for project=%s environment=%s fingerprint=%s: %w",
+			issue.ProjectID, issue.Environment, issue.Fingerprint, err)
 	}
 
 	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
@@ -258,9 +277,9 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 		}
 	} else {
 		query := `
-			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
-			ON CONFLICT (project_id, fingerprint)
+			INSERT INTO issues (id, project_id, environment, fingerprint, message, error_class, status, first_seen, last_seen, count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
+			ON CONFLICT (project_id, environment, fingerprint)
 			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
@@ -269,6 +288,7 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 		if _, err := tx.Exec(ctx, query,
 			issue.ID,
 			issue.ProjectID,
+			issue.Environment,
 			issue.Fingerprint,
 			issue.Message,
 			issue.ErrorClass,
@@ -345,15 +365,15 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	var existingID string
 
 	err = tx.QueryRow(ctx,
-		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND fingerprint = $2",
-		issue.ProjectID, issue.Fingerprint,
+		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND environment = $2 AND fingerprint = $3",
+		issue.ProjectID, issue.Environment, issue.Fingerprint,
 	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
 
 	// Only "no such issue yet" is expected here; see UpsertIssueWithOutcome's identical comment for why
 	// falling through on any other error would replace the real cause with a generic 25P02 abort.
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return IssueOutcomeExisting, false, fmt.Errorf("failed to read existing issue for project=%s fingerprint=%s: %w",
-			issue.ProjectID, issue.Fingerprint, err)
+		return IssueOutcomeExisting, false, fmt.Errorf("failed to read existing issue for project=%s environment=%s fingerprint=%s: %w",
+			issue.ProjectID, issue.Environment, issue.Fingerprint, err)
 	}
 
 	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
@@ -421,9 +441,9 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		// current version was created by THIS command (a fresh INSERT), never by the DO UPDATE
 		// arm — so it cannot alias a concurrent-race duplicate the way wasNewIssue can.
 		query := `
-			INSERT INTO issues (id, project_id, fingerprint, message, error_class, status, first_seen, last_seen, count)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
-			ON CONFLICT (project_id, fingerprint)
+			INSERT INTO issues (id, project_id, environment, fingerprint, message, error_class, status, first_seen, last_seen, count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
+			ON CONFLICT (project_id, environment, fingerprint)
 			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
@@ -435,6 +455,7 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		if scanErr := tx.QueryRow(ctx, query,
 			issue.ID,
 			issue.ProjectID,
+			issue.Environment,
 			issue.Fingerprint,
 			issue.Message,
 			issue.ErrorClass,
@@ -447,8 +468,8 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 				// DO UPDATE ... WHERE predicate being narrowed so it no longer matches — a bug in
 				// this statement, not "the issue was a duplicate". Must error, never stored=false.
 				return IssueOutcomeExisting, false, fmt.Errorf(
-					"issue upsert returned no row for project=%s fingerprint=%s (WHERE predicate narrowed?): %w",
-					issue.ProjectID, issue.Fingerprint, scanErr)
+					"issue upsert returned no row for project=%s environment=%s fingerprint=%s (WHERE predicate narrowed?): %w",
+					issue.ProjectID, issue.Environment, issue.Fingerprint, scanErr)
 			}
 			return IssueOutcomeExisting, false, scanErr
 		}
@@ -533,8 +554,84 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		return IssueOutcomeExisting, false, nil
 	}
 
+	// --- 4. Registry touch (sentinel-project-environments §4.8, decisions 8 and 9) ---
+	//
+	// An UPDATE, never an INSERT. Under decision 8 a project_environments row exists because a
+	// person declared it, so ingest creates none. Four properties, each of which fails silently if
+	// got wrong:
+	//
+	//  1. Zero rows updated is NOT an error — it means this environment is not registered, and
+	//     decision 9 says ACCEPT the event anyway. The occurrence is already written, the
+	//     transaction commits, and sentinel_unregistered_environment_events_total is incremented.
+	//     An error tracker that drops errors because a settings table is out of date is worse than
+	//     the problem it is solving.
+	//  1a. Neither is a FAILING UPDATE an error the caller ever sees. §4.8 point 1 says "ingest
+	//     never fails because of the registry" without qualification, and §12 states the
+	//     consequence of this statement erroring as first_seen_at/last_seen_at drifting from
+	//     reality — not as a lost event. So the failure is logged, counted on
+	//     sentinel_environment_registry_touch_failures_total, and the transaction still commits.
+	//     Returning the error here dropped the event, which is the exact inversion point 1 names.
+	//     Postgres aborts a transaction on any statement error, so the touch runs inside a
+	//     SAVEPOINT (pgx models a nested Begin as one): rolling back TO that savepoint restores
+	//     the enclosing transaction — with the issue and the occurrence intact — so it can commit.
+	//     This keeps the UPDATE inside the transaction (property 2) rather than dodging its lock.
+	//  2. It is inside this transaction, so a last_seen_at that moved with no occurrence behind it
+	//     is impossible.
+	//  3. It runs AFTER the duplicate check above, so a deduplicated redelivery never reaches it.
+	//     The rollback would undo the UPDATE anyway — but decision 9 pairs this statement with a
+	//     counter, and no rollback can un-increment a counter, so "never reached" is the property
+	//     to hold rather than "undone".
+	//  4. There is NO cap enforcement here. MAX_ENVIRONMENTS_PER_PROJECT is enforced at §4.3 and
+	//     nowhere else, precisely because ingest no longer creates rows.
+	//
+	// One thing a future reader will look for and not find:
+	//
+	//   - this does add a second row lock to a transaction whose doc comment above says it acquires
+	//     exactly one. That is deliberate and contract §12 names it: "last_seen_at turns
+	//     project_environments into a hot row". It is one indexed single-row UPDATE on a tiny table,
+	//     taken after every other write in this transaction, so it cannot introduce a lock-ordering
+	//     cycle with the issues row; §13's M3 reports on its cost and deliberately does not gate on
+	//     it. Do not move it out of the transaction to avoid the lock — property 2 is why it is here.
+	registryQuery := `
+		UPDATE project_environments
+		   SET last_seen_at  = now(),
+		       first_seen_at = COALESCE(first_seen_at, now())
+		 WHERE project_id = $1 AND name = $2
+	`
+	unregisteredEnvironment := false
+	if touchErr := func() error {
+		// The savepoint of point 1a. Its Commit is a RELEASE SAVEPOINT, its Rollback a
+		// ROLLBACK TO SAVEPOINT — neither ends the enclosing transaction.
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		tag, err := sp.Exec(ctx, registryQuery, issue.ProjectID, occ.Environment)
+		if err != nil {
+			_ = sp.Rollback(ctx)
+			return err
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return err
+		}
+		unregisteredEnvironment = tag.RowsAffected() == 0
+		return nil
+	}(); touchErr != nil {
+		slog.ErrorContext(ctx, "environment registry touch failed; the event is still stored (contract §4.8 point 1)",
+			slog.String("project_id", issue.ProjectID),
+			slog.String("environment", occ.Environment),
+			slog.String("error", touchErr.Error()))
+		procmetrics.RecordEnvironmentRegistryTouchFailure(ctx)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return IssueOutcomeExisting, false, err
+	}
+
+	// Recorded after the commit: the metric counts occurrences that were STORED for an environment
+	// nobody declared, so an event that failed to commit must not appear on it.
+	if unregisteredEnvironment {
+		procmetrics.RecordUnregisteredEnvironmentEvent(ctx)
 	}
 
 	switch {
@@ -616,11 +713,11 @@ func (s *pgStore) GetProjectByKey(ctx context.Context, projectKey string) (strin
 	return projectID, err
 }
 
-func (s *pgStore) GetIssueIDByFingerprint(ctx context.Context, projectID, fingerprint string) (string, error) {
+func (s *pgStore) GetIssueIDByFingerprint(ctx context.Context, projectID, environment, fingerprint string) (string, error) {
 	var issueID string
 	err := s.db.QueryRow(ctx,
-		"SELECT id FROM issues WHERE project_id = $1 AND fingerprint = $2",
-		projectID, fingerprint,
+		"SELECT id FROM issues WHERE project_id = $1 AND environment = $2 AND fingerprint = $3",
+		projectID, environment, fingerprint,
 	).Scan(&issueID)
 	return issueID, err
 }

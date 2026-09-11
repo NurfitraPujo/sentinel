@@ -64,10 +64,19 @@ type Event struct {
 	// which is already expressed by TraceID being empty.
 	TraceFlags uint32 `json:"trace_flags"`
 	// Fingerprint is an optional custom grouping key. Leave it empty — the normal
-	// case — and the server computes one from the error class and stacktrace.
-	// Set it and the server stores it VERBATIM as the issue's fingerprint, so two
-	// events sharing a value are the same issue and two differing values are not,
-	// whatever their stacktraces look like.
+	// case — and the server computes one from the error class, the stacktrace and
+	// the environment. Set it and the server stores it VERBATIM as the issue's
+	// fingerprint, so two events sharing a value group together and two differing
+	// values do not, whatever their stacktraces look like.
+	//
+	// "Group together" means WITHIN ONE PROJECT AND ONE ENVIRONMENT, and a custom
+	// fingerprint does not change that. Issue identity is the whole tuple
+	// (project_id, environment, fingerprint) — a UNIQUE constraint on the issues
+	// table, not something the fingerprint carries — so the same custom value sent
+	// from production and from staging is TWO issues, each with its own status and
+	// its own count. That is deliberate: resolving a bug in staging must not mark
+	// it resolved in production. If you want one issue across environments, this
+	// field is not the way to get it.
 	//
 	// Maximum 64 characters: it is written unhashed into issues.fingerprint
 	// VARCHAR(64), and the ingestor rejects the event with a 400 rather than

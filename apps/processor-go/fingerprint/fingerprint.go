@@ -13,8 +13,14 @@ const (
 
 type FingerprintConfig struct {
 	CustomFingerprint string
-	ErrorClass        string
-	Stacktrace        []StackFrame
+	// Environment is folded into the hash input (sentinel-project-environments §4.9) so the
+	// fingerprint VALUE itself is environment-distinct, and idx_issues_fingerprint — a
+	// fingerprint-only, non-unique index from 1716508800_init.sql — cannot be read as
+	// cross-environment identity by a future query. It is defence in depth, not the mechanism:
+	// the mechanism is the UNIQUE (project_id, environment, fingerprint) constraint.
+	Environment string
+	ErrorClass  string
+	Stacktrace  []StackFrame
 }
 
 type StackFrame struct {
@@ -26,6 +32,10 @@ type StackFrame struct {
 
 func Compute(cfg FingerprintConfig) string {
 	var input string
+	// §4.9: the CustomFingerprint early return is deliberately NOT environment-prefixed. Prefixing a
+	// client-chosen fingerprint would change identity for exactly the clients who chose it, which is
+	// the one thing a custom fingerprint exists to prevent. Two environments sending the SAME custom
+	// fingerprint still get two issue rows, because the unique key is what splits identity.
 	if cfg.CustomFingerprint != "" {
 		return cfg.CustomFingerprint
 	}
@@ -54,7 +64,7 @@ func Compute(cfg FingerprintConfig) string {
 		}
 	}
 
-	input = cfg.ErrorClass
+	input = cfg.Environment + "|" + cfg.ErrorClass
 	if len(appFrames) > 0 {
 		input += "|" + strings.Join(appFrames, "|")
 	}
