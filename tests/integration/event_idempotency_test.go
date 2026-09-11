@@ -1058,7 +1058,10 @@ func quoteSQLLiteral(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
-// TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent is BUG-12. §4.8 point 1 says "ingest never
+// TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent is BUG-12, and the regression fence for
+// BUG-19 (procmetrics.RecordEnvironmentRegistryTouchFailure "has zero callers": the failure-counter
+// assertions below go red when the store's call is removed — verified by mutation, not by
+// inspection). §4.8 point 1 says "ingest never
 // fails because of the registry" without qualification, and §12 describes a failing touch as
 // first_seen_at/last_seen_at drifting from reality — a counted, logged degradation, NOT a lost
 // event. Returning the UPDATE's error from StoreEvent aborted the transaction and dropped the

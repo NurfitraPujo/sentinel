@@ -160,6 +160,14 @@ func RecordUnregisteredEnvironmentEvent(ctx context.Context) {
 }
 
 // RecordEnvironmentRegistryTouchFailure records one failure of §4.8's project_environments touch.
+//
+// Its single caller is the touch's error branch in store.StoreEvent (apps/processor-go/store/store.go),
+// which logs, records here, and then still COMMITS the transaction — §4.8 point 1. It was recorded
+// twice as having zero callers (BUG-12, then BUG-19) because the store returned the UPDATE's error
+// instead; the test that now pins the increment against a real failing UPDATE is
+// tests/integration's TestStoreEvent_RegistryTouchFailureNeverDropsTheEvent, and it goes red when
+// this call is removed from the store. If you delete that call, delete this recorder and the
+// constant with it rather than shipping a counter that structurally cannot fire.
 func RecordEnvironmentRegistryTouchFailure(ctx context.Context) {
 	if environmentRegistryTouchFailed != nil {
 		environmentRegistryTouchFailed.Add(ctx, 1)
