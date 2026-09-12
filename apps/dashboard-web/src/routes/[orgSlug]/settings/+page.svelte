@@ -8,17 +8,12 @@
 		{ href: 'settings/members', title: 'Members', desc: 'Who belongs to this organization, and their roles.' },
 		{ href: 'settings/agents', title: 'Agents', desc: 'Agent identities and their webhooks.' },
 		{ href: 'settings/on-call', title: 'On-call', desc: 'Rotation and overrides for escalations.' },
-		{ href: 'settings/observability', title: 'Observability', desc: 'Tracing and telemetry for this organization.' },
 	];
-
-	// The global sections are listed here too. They are a different scope — instance and account
-	// settings, not this organization's — but the header only has room for one "Settings", and a
-	// user who clicks it should not lose the ability to reach the other half.
-	const globalSections = [
-		{ href: '/settings/alerts', title: 'Alerts', desc: 'Notification channels and thresholds.' },
-		{ href: '/settings/auth', title: 'Auth', desc: 'Sign-in configuration.' },
-		{ href: '/settings/observability', title: 'Observability', desc: 'Instance-wide telemetry.' },
-	];
+	// Deliberately not listed here, though the routes still answer by URL:
+	// - `settings/observability` — its loader ignores orgSlug, so the page is not actually org-scoped
+	//   and shows nothing useful for this organization yet.
+	// - `/settings/alerts`, `/settings/auth`, `/settings/observability` — instance-wide settings, which
+	//   must not be presented as if they belonged to one organization.
 </script>
 
 <div class="settings-index">
@@ -55,20 +50,6 @@
 			{/each}
 		</div>
 	{/if}
-
-	<header class="page-header section-gap">
-		<h2 class="section-title">Account &amp; instance</h2>
-		<p class="page-subtitle">Not scoped to this organization.</p>
-	</header>
-
-	<div class="card-grid">
-		{#each globalSections as section}
-			<a class="card" href={section.href}>
-				<span class="card-title">{section.title}</span>
-				<span class="card-desc">{section.desc}</span>
-			</a>
-		{/each}
-	</div>
 </div>
 
 <style>
