@@ -154,6 +154,24 @@ describe('/[orgSlug]/projects ?/create', () => {
 		expect(queries.createProject).toHaveBeenCalledWith('user-1', 'org-1', { name });
 	});
 
+	// BUG-01: `projects` is UNIQUE (organization_id, name) and every org with a report inbox
+	// already owns a hidden 'Triage' project, so a collision is an ordinary user input error.
+	it('409s a duplicate name and echoes it back instead of throwing', async () => {
+		queries.createProject.mockRejectedValue(
+			new Error('duplicate key value violates unique constraint "projects_organization_id_name_unique"'),
+		);
+		const result: any = await actions.create(postEvent({ name: 'Triage' }));
+
+		expect(result.status).toBe(409);
+		expect(result.data.error).toBe("A project named 'Triage' already exists in Acme");
+		expect(result.data.values.name).toBe('Triage');
+	});
+
+	it('rethrows a non-unique createProject failure', async () => {
+		queries.createProject.mockRejectedValue(new Error('connection refused'));
+		await expect(actions.create(postEvent({ name: 'Mobile app' }))).rejects.toThrow('connection refused');
+	});
+
 	it('401s an anonymous caller before reading the body or the membership', async () => {
 		await expect(actions.create(postEvent({ name: 'Mobile app' }, null))).rejects.toMatchObject({ status: 401 });
 		expect(shared.requireOrgMembership).not.toHaveBeenCalled();

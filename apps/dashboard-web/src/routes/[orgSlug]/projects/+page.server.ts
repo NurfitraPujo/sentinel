@@ -76,7 +76,23 @@ export const actions: Actions = {
 
 		// Tenant scope is the org resolved from the caller's membership (locals.currentOrg), not a
 		// body field — the form carries only the name.
-		const project = await createProject(userId, currentOrg.id, { name: parsed.data.name });
+		let project;
+		try {
+			project = await createProject(userId, currentOrg.id, { name: parsed.data.name });
+		} catch (err) {
+			// `projects` is UNIQUE (organization_id, name), and every org with a report inbox already
+			// owns a hidden project named 'Triage'. A taken name is the one failure the user can act
+			// on, so name it and echo the input back instead of letting the 23505 escape the action
+			// (which would land on the generic error page and lose what they typed).
+			const message = err instanceof Error ? err.message : '';
+			if (/unique|duplicate/i.test(message)) {
+				return fail(409, {
+					error: `A project named '${parsed.data.name}' already exists in ${currentOrg.name}`,
+					values: { name: parsed.data.name },
+				});
+			}
+			throw err;
+		}
 
 		// `use:enhance` re-runs `load` on success, so the new row appears in the list without a
 		// redirect; `created` lets the page confirm it by name.
