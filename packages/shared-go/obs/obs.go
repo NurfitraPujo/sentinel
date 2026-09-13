@@ -86,6 +86,19 @@ const (
 	// the predicate the rule above needs, because a flat-zero suppression counter is also what a
 	// correctly installed feature with nothing to do looks like.
 	MetricAlertConfigsEnvironmentScoped = "sentinel_alert_configs_environment_scoped"
+
+	// MetricAffectedRollupSkipped counts user/tenant identifiers that the processor read out of event
+	// metadata but did NOT write to issue_affected_users / issue_affected_tenants because the value
+	// was unusable (sentinel-affected-users §4.3 decision 5: empty, longer than 255 bytes, or carrying
+	// a control character). The event itself is still stored; only the rollup skips it. Incremented
+	// AFTER commit, beside MetricUnregisteredEnvironmentEvents, so a rolled-back event never counts.
+	// Two labels, both closed sets declared below: LabelKind (AffectedKindUser / AffectedKindTenant)
+	// and LabelReason (AffectedRollupReason*). Never the value itself — it is a client-supplied string
+	// (D15's cardinality rule), and a 300-byte id as a label is the exact failure the deny-filter in
+	// provider.go exists to prevent. It is the only way to diagnose a permanent `0` on the dashboard
+	// (§12): a producer sending `user_id: ""` shows up here as reason="empty", which is
+	// distinguishable from "no key at all", which increments nothing.
+	MetricAffectedRollupSkipped = "sentinel_affected_rollup_skipped_total"
 )
 
 // Label keys. Kept few and low-cardinality on purpose: project_id is unbounded and would blow up the
@@ -94,6 +107,9 @@ const (
 	LabelOutcome = "outcome"
 	LabelChannel = "channel"
 	LabelReason  = "reason"
+	// LabelKind names WHICH identifier MetricAffectedRollupSkipped skipped: AffectedKindUser or
+	// AffectedKindTenant. Nothing else records it.
+	LabelKind = "kind"
 )
 
 // Permitted values for LabelOutcome. Fixed sets, so a typo at one call site cannot invent an eighth
@@ -133,4 +149,20 @@ const (
 	// particular cannot be stored in a Postgres varchar at all, so passing it through would let a
 	// client dead-letter its own events once the processor writes the column (F-VW0-2).
 	EventIDReasonInvalidChars = "invalid_chars"
+)
+
+// Permitted values for LabelKind and LabelReason on MetricAffectedRollupSkipped
+// (sentinel-affected-users §4.3 / §12, decision 24). Both sets are CLOSED: the reason set is exactly
+// these three and the contract says so in those words. AffectedRollupReasonControlChar is a NEW
+// constant, deliberately not EventIDReasonInvalidChars above — the two metrics are different
+// contracts read by different rules, and the contract names this reason `control_char`. `empty` is
+// a member because a `0` caused by producers sending `user_id: ""` is exactly what the metric exists
+// to diagnose; a key that is absent altogether increments nothing.
+const (
+	AffectedKindUser   = "user"
+	AffectedKindTenant = "tenant"
+
+	AffectedRollupReasonEmpty       = "empty"        // the key was present and its value was ""
+	AffectedRollupReasonTooLong     = "too_long"     // the value exceeded 255 BYTES (VARCHAR(255) on both side tables)
+	AffectedRollupReasonControlChar = "control_char" // the value carried a rune < 0x20 or 0x7f (NUL cannot be stored in a varchar at all)
 )

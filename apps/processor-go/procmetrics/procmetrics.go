@@ -45,6 +45,11 @@ var (
 	environmentRegistryTouchFailed metric.Int64Counter
 	alertsSuppressedByEnvironment  metric.Int64Counter
 	alertConfigsEnvironmentScoped  metric.Int64Gauge
+
+	// sentinel-affected-users §12: the one instrument that feature adds. Labelled, unlike the four
+	// above, but only with the two CLOSED sets obs.go declares (kind ∈ {user, tenant}, reason ∈
+	// {empty, too_long, control_char}) — never the identifier itself.
+	affectedRollupSkipped metric.Int64Counter
 )
 
 func init() {
@@ -118,6 +123,15 @@ func init() {
 		slog.Error("procmetrics: failed to create environment-scoped alert configs gauge", slog.String("error", err.Error()))
 		alertConfigsEnvironmentScoped = nil
 	}
+
+	affectedRollupSkipped, err = meter.Int64Counter(
+		obs.MetricAffectedRollupSkipped,
+		metric.WithDescription("Count of user/tenant identifiers skipped by the issue affected-users/tenants rollup because the value was unusable (empty, too long, or carrying a control character); the event itself was stored"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create affected rollup skipped counter", slog.String("error", err.Error()))
+		affectedRollupSkipped = nil
+	}
 }
 
 // RecordProcessed records one ProcessEvent completion: MetricProcessDuration (seconds) and
@@ -171,6 +185,25 @@ func RecordUnregisteredEnvironmentEvent(ctx context.Context) {
 func RecordEnvironmentRegistryTouchFailure(ctx context.Context) {
 	if environmentRegistryTouchFailed != nil {
 		environmentRegistryTouchFailed.Add(ctx, 1)
+	}
+}
+
+// RecordAffectedRollupSkipped records one identifier that sentinel-affected-users §4.3's rollup did
+// NOT write because decision 5 judged the value unusable. kind must be obs.AffectedKindUser or
+// obs.AffectedKindTenant and reason one of the obs.AffectedRollupReason* constants — both closed
+// sets; the identifier itself is never passed here (D15: a client string is not a label).
+//
+// Its single caller is store.StoreEvent, AFTER tx.Commit and beside RecordUnregisteredEnvironmentEvent:
+// the counter describes identifiers skipped on occurrences that were STORED, so a delivery that rolled
+// back (a duplicate, an insert failure) must not appear on it. tests/integration's
+// TestAffectedRollup_UnusableIDsStoreTheEventAndCountTheSkip pins the increment per reason and goes
+// red when this call is removed from the store.
+func RecordAffectedRollupSkipped(ctx context.Context, kind, reason string) {
+	if affectedRollupSkipped != nil {
+		affectedRollupSkipped.Add(ctx, 1, metric.WithAttributes(
+			attribute.String(obs.LabelKind, kind),
+			attribute.String(obs.LabelReason, reason),
+		))
 	}
 }
 

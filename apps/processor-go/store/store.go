@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -156,6 +157,75 @@ type ErrorOccurrence struct {
 	// constraint rejects '' outright). Never log this value verbatim in a metric label (D15); it is a
 	// client-supplied string that can appear an unbounded number of times.
 	EventID string
+	// AffectedUserID / AffectedTenantID feed sentinel-affected-users §4.3's rollup: one
+	// issue_affected_users / issue_affected_tenants row per distinct (issue, id) pair, and a bump of
+	// issues.affected_user_count / affected_tenant_count only when the pair is NEW. Carried exactly as
+	// EventID is: read by event.Normalize from the PRE-normalisation metadata (decision 3 — after
+	// normalisation a UUID reads "<UUID>"), bounds-clamped by event.BoundAffectedID to "" for anything
+	// empty, over 255 bytes or carrying a control character (decision 5), and NEVER normalised or
+	// masked (decision 6: identity is the exact byte string). "" here means "nothing usable" — StoreEvent
+	// runs no side-table statement for it; the CHECK (<> '') on both tables is the tripwire that makes
+	// a regression of that loud. Never a metric label (D15): client-supplied, unbounded.
+	AffectedUserID   string
+	AffectedTenantID string
+	// AffectedUserSkipReason / AffectedTenantSkipReason are "" when the id above is usable or no key
+	// was present at all, and one of obs.AffectedRollupReason* (empty | too_long | control_char) when a
+	// key WAS present and decision 5 dropped its value. StoreEvent records each non-empty reason on
+	// sentinel_affected_rollup_skipped_total{kind,reason} AFTER commit (§12), so a delivery that rolled
+	// back — a duplicate above all — never counts.
+	AffectedUserSkipReason   string
+	AffectedTenantSkipReason string
+}
+
+// The §4.3 rollup statements, one pair per side table. RETURNING (xmax = 0) AS inserted is the same
+// exact new-vs-existing signal the 'created' activity row above already relies on: xmax = 0 means
+// this row version was created by THIS command — a fresh INSERT — never by the DO UPDATE arm, so it
+// cannot alias a race the way a pre-SELECT can. GREATEST on last_seen mirrors issues.last_seen;
+// LEAST on first_seen exists because event timestamps are client-supplied and may arrive out of
+// order — first_seen is "earliest occurrence from this user we stored", not "first delivery".
+// $3 is the occurrence's created_at (decision 9), never now(): retention compares occurrences by
+// created_at, and a last_seen on a different clock would let a user outlive every occurrence that
+// justified the row.
+const (
+	affectedUsersUpsertQuery = `
+		INSERT INTO issue_affected_users (issue_id, user_id, first_seen, last_seen)
+		VALUES ($1, $2, $3, $3)
+		ON CONFLICT (issue_id, user_id) DO UPDATE
+		   SET last_seen  = GREATEST(issue_affected_users.last_seen, EXCLUDED.last_seen),
+		       first_seen = LEAST(issue_affected_users.first_seen, EXCLUDED.first_seen)
+		RETURNING (xmax = 0) AS inserted
+	`
+	affectedUsersBumpQuery = `UPDATE issues SET affected_user_count = affected_user_count + 1 WHERE id = $1`
+
+	affectedTenantsUpsertQuery = `
+		INSERT INTO issue_affected_tenants (issue_id, tenant_id, first_seen, last_seen)
+		VALUES ($1, $2, $3, $3)
+		ON CONFLICT (issue_id, tenant_id) DO UPDATE
+		   SET last_seen  = GREATEST(issue_affected_tenants.last_seen, EXCLUDED.last_seen),
+		       first_seen = LEAST(issue_affected_tenants.first_seen, EXCLUDED.first_seen)
+		RETURNING (xmax = 0) AS inserted
+	`
+	affectedTenantsBumpQuery = `UPDATE issues SET affected_tenant_count = affected_tenant_count + 1 WHERE id = $1`
+)
+
+// rollupAffected runs one side table's pair of §4.3 statements inside tx: the upsert, then — only
+// when the upsert INSERTed — the count bump. Not savepointed (decision 8): unlike the registry touch,
+// the counts are a first-class fact, and a genuine error here (connection, constraint, disk) fails
+// the transaction so NATS redelivers the event, exactly as an occurrence-insert error does today. The
+// only deterministic error the value could cause — length or a control character — is prevented by
+// event.BoundAffectedID before the caller ever reaches this.
+func rollupAffected(ctx context.Context, tx pgx.Tx, upsertQuery, bumpQuery, issueID, id string, seenAt time.Time) error {
+	var inserted bool
+	if err := tx.QueryRow(ctx, upsertQuery, issueID, id, seenAt).Scan(&inserted); err != nil {
+		return fmt.Errorf("affected rollup upsert failed for issue id=%s: %w", issueID, err)
+	}
+	if !inserted {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, bumpQuery, issueID); err != nil {
+		return fmt.Errorf("affected rollup count bump failed for issue id=%s: %w", issueID, err)
+	}
+	return nil
 }
 
 // isRegressionVersion compares incoming releaseVersion against resolvedInVersion.
@@ -339,11 +409,34 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     already-stored message (F-TX-8).
 //  3. RowsAffected()==0 on the occurrence insert means this exact (issue_id, event_id) pair already
 //     exists: roll back (undoing this delivery's count/regression writes) and report stored=false with
-//     a nil error — the caller ACKs this as a successful no-op. Otherwise commit.
+//     a nil error — the caller ACKs this as a successful no-op. Otherwise continue.
+//  4. The affected users/tenants rollup (sentinel-affected-users §4.3): per present identifier, an
+//     upsert into issue_affected_users / issue_affected_tenants keyed (issue_id, id) and — only when
+//     that upsert INSERTed (RETURNING xmax = 0) — a +1 on issues.affected_user_count /
+//     affected_tenant_count. After the duplicate check so a deduplicated redelivery never reaches it;
+//     before the registry touch; NOT savepointed (decision 8).
+//  5. The project_environments registry touch (sentinel-project-environments §4.8), savepointed.
+//     Then commit.
 //
-// Deadlock-freedom depends on this transaction acquiring exactly ONE contended lock (the issues row,
-// via ON CONFLICT DO UPDATE / the plain UPDATE) and never waiting again — do not add audit persistence,
-// indexing, or any network I/O inside this transaction; move it after commit instead (D-d).
+// Deadlock-freedom depends on this transaction acquiring its ONE contended lock (the issues row, via
+// ON CONFLICT DO UPDATE / the plain UPDATE) FIRST and holding it to commit — do not add audit
+// persistence, indexing, or any network I/O inside this transaction; move it after commit instead
+// (D-d). Two writes are the DELIBERATE exceptions to that sentence, and both were added knowing it:
+//
+//   - the registry touch of step 5 (sentinel-project-environments decision 9) — the first exception,
+//     best-effort behind a savepoint; see its own block comment below.
+//   - the affected users/tenants rollup of step 4 (sentinel-affected-users decision 2) — the SECOND
+//     deliberate exception, and unlike the first it is a first-class fact, not best-effort. It is
+//     inside this transaction because a count that can move without an occurrence behind it is the
+//     S18 defect again, on a new column: written after commit, a NAK between the occurrence commit
+//     and the rollup write would either lose a user (never bumped) or, on retry, find the occurrence
+//     deduplicated and skip the rollup forever. Inside, both land or neither does. The property the
+//     "one lock" rule protects survives: every StoreEvent transaction takes the issues row lock first
+//     and holds it, so two deliveries for the same issue are already serialised before either touches
+//     a side-table row, two deliveries for different issues share no row, and the retention sweep
+//     takes the same order (issues FOR UPDATE, then the side table — §4.5, decision 23). No cycle is
+//     possible between any two of these transactions. Cost, stated: an occurrence from a NEW user
+//     writes the issues row twice in one transaction (the upsert, then the bump).
 //
 // The IssueOutcome return is BEST-EFFORT and currently consumed by nobody — every call site discards
 // it (verified at ship time). Its New/Existing distinction comes from a plain SELECT before the
@@ -554,7 +647,26 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		return IssueOutcomeExisting, false, nil
 	}
 
-	// --- 4. Registry touch (sentinel-project-environments §4.8, decisions 8 and 9) ---
+	// --- 4. Affected users / tenants rollup (sentinel-affected-users §4.3, decisions 2, 8, 9) ---
+	//
+	// The second deliberate in-transaction exception named in this method's doc comment. Position is
+	// load-bearing: AFTER the duplicate rollback above so a redelivered (issue_id, event_id) never
+	// writes a side row or bumps a count (flow I5), BEFORE the registry touch, and NOT inside a
+	// savepoint — a failure here is a failure to store the event, returned so NATS retries (decision
+	// 8). An event with neither identifier runs no statement at all; an identifier decision 5 dropped
+	// is "" here and is counted after commit, below.
+	if occ.AffectedUserID != "" {
+		if err := rollupAffected(ctx, tx, affectedUsersUpsertQuery, affectedUsersBumpQuery, issue.ID, occ.AffectedUserID, occ.CreatedAt); err != nil {
+			return IssueOutcomeExisting, false, err
+		}
+	}
+	if occ.AffectedTenantID != "" {
+		if err := rollupAffected(ctx, tx, affectedTenantsUpsertQuery, affectedTenantsBumpQuery, issue.ID, occ.AffectedTenantID, occ.CreatedAt); err != nil {
+			return IssueOutcomeExisting, false, err
+		}
+	}
+
+	// --- 5. Registry touch (sentinel-project-environments §4.8, decisions 8 and 9) ---
 	//
 	// An UPDATE, never an INSERT. Under decision 8 a project_environments row exists because a
 	// person declared it, so ingest creates none. Four properties, each of which fails silently if
@@ -632,6 +744,15 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	// nobody declared, so an event that failed to commit must not appear on it.
 	if unregisteredEnvironment {
 		procmetrics.RecordUnregisteredEnvironmentEvent(ctx)
+	}
+	// Same rule for the rollup's skip counter (sentinel-affected-users §12): it describes identifiers
+	// skipped on occurrences that were STORED. A duplicate returned at step 3 and a failed commit both
+	// leave it untouched.
+	if occ.AffectedUserSkipReason != "" {
+		procmetrics.RecordAffectedRollupSkipped(ctx, obs.AffectedKindUser, occ.AffectedUserSkipReason)
+	}
+	if occ.AffectedTenantSkipReason != "" {
+		procmetrics.RecordAffectedRollupSkipped(ctx, obs.AffectedKindTenant, occ.AffectedTenantSkipReason)
 	}
 
 	switch {
