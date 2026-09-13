@@ -18,6 +18,10 @@ const listProjectEnvironmentsMock = vi.fn();
 const listIssuesMock = vi.fn();
 const countIssuesMock = vi.fn();
 const listProjectsMock = vi.fn();
+// sentinel-issue-trend §4.1: the per-card series reader. Mocked like the queries — what it returns
+// for a set of ids against a real Postgres is issue-queries.trend.integration.test.ts's boundary;
+// this file owns WHICH ids it is asked about, and that it is never asked about none.
+const trendForIssuesMock = vi.fn();
 
 // sentinel-affected-users decision 21: `retentionDays` is read through `$lib/server/retention-window`,
 // which reads `DATA_RETENTION_DAYS` fresh from `$env/dynamic/private` on every call — so the env is a
@@ -57,6 +61,7 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		listIssues: listIssuesMock,
 		countIssues: countIssuesMock,
 		listProjects: listProjectsMock,
+		trendForIssues: trendForIssuesMock,
 	},
 }));
 
@@ -99,6 +104,7 @@ beforeEach(() => {
 	listProjectEnvironmentsMock.mockResolvedValue([]);
 	listIssuesMock.mockResolvedValue([]);
 	countIssuesMock.mockResolvedValue(0);
+	trendForIssuesMock.mockResolvedValue(new Map());
 	listProjectsMock.mockResolvedValue([
 		{ id: PROJECT_A, name: 'Alpha' },
 		{ id: PROJECT_B, name: 'Beta' },
@@ -280,5 +286,166 @@ describe('GET / page load — sort and retentionDays (sentinel-affected-users §
 
 		expect(data.retentionDays).toBe(45);
 		expect(Number.isInteger(data.retentionDays)).toBe(true);
+	});
+});
+
+/**
+ * sentinel-issue-trend §4.1 — the `new` filter (decision 6), the two projection fields (decision 22)
+ * and the per-card series (decision 10): the loader half of flows `L4`–`L7` and the page-data table.
+ * What the QUERIES do with `firstSeenAfter` and what the reader returns for a set of ids are query
+ * claims, asserted against a real Postgres in
+ * `src/lib/server/queries/issue-queries.trend.integration.test.ts`; this file owns the parse, the
+ * coercion, the echo, that ONE instant reaches both queries, and what the page data carries.
+ */
+describe('GET / page load — new filter, regression fields and trend24h (sentinel-issue-trend §4.1)', () => {
+	const ISSUE_1 = 'cccccccc-0000-0000-0000-000000000001';
+	const ISSUE_2 = 'cccccccc-0000-0000-0000-000000000002';
+
+	function listedIssue(id: string, extra: Record<string, unknown> = {}) {
+		return {
+			id,
+			projectId: PROJECT_A,
+			fingerprint: `fp-${id}`,
+			message: 'boom',
+			errorClass: 'TypeError',
+			environment: 'production',
+			status: 'open',
+			firstSeen: new Date('2026-09-13T09:00:00Z'),
+			lastSeen: new Date('2026-09-13T13:00:00Z'),
+			count: 7,
+			affectedUserCount: 0,
+			affectedTenantCount: 0,
+			regressionStatus: 'none',
+			lastRegressedAt: null,
+			...extra,
+		};
+	}
+
+	// Flow `L7`: the echo is what `href()` builds every anchor from, so `banana` must echo `all` —
+	// and `all` must mean NO predicate on either query, or the bad bookmark narrows the list.
+	it('coerces an unknown new to all for the echo, and passes no first_seen bound to either query', async () => {
+		const data = await loadWith('?new=banana');
+
+		expect(data.filters.new).toBe('all');
+		expect(listIssuesMock.mock.calls[0][0].firstSeenAfter).toBeUndefined();
+		expect(countIssuesMock.mock.calls[0][0].firstSeenAfter).toBeUndefined();
+	});
+
+	it('echoes all when new is absent, with no bound', async () => {
+		const data = await loadWith('');
+
+		expect(data.filters.new).toBe('all');
+		expect(listIssuesMock.mock.calls[0][0].firstSeenAfter).toBeUndefined();
+	});
+
+	// Flow `L4`, decision 6: `24h` is a FILTER, so it reaches the count too — a total that counts
+	// rows the list does not show is the same inconsistency in a smaller font — and it is the SAME
+	// instant on both, taken once in the loader, not `new Date()` twice.
+	it('passes one identical first_seen lower bound, now − 24h, to listIssues AND countIssues on new=24h', async () => {
+		const before = Date.now();
+		const data = await loadWith('?new=24h');
+		const after = Date.now();
+
+		expect(data.filters.new).toBe('24h');
+		const listBound = listIssuesMock.mock.calls[0][0].firstSeenAfter;
+		const countBound = countIssuesMock.mock.calls[0][0].firstSeenAfter;
+		expect(listBound).toBeInstanceOf(Date);
+		expect(countBound).toBe(listBound);
+		const DAY = 24 * 60 * 60 * 1000;
+		expect(listBound.getTime()).toBeGreaterThanOrEqual(before - DAY);
+		expect(listBound.getTime()).toBeLessThanOrEqual(after - DAY);
+	});
+
+	it('keeps the sort out of the count and the bound in it — the two filters compose', async () => {
+		await loadWith('?new=24h&sort=count');
+
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ sort: 'count' });
+		expect(countIssuesMock.mock.calls[0][0]).not.toHaveProperty('sort');
+		const { sort: _sort, ...listFilters } = listIssuesMock.mock.calls[0][0];
+		expect(listFilters).toEqual(countIssuesMock.mock.calls[0][0]);
+	});
+
+	it('passes sort=count and sort=first_seen to listIssues and echoes them', async () => {
+		for (const sort of ['count', 'first_seen'] as const) {
+			vi.clearAllMocks();
+			listIssuesMock.mockResolvedValue([]);
+			countIssuesMock.mockResolvedValue(0);
+			listProjectsMock.mockResolvedValue([]);
+
+			const data = await loadWith(`?sort=${sort}`);
+
+			expect(data.filters.sort).toBe(sort);
+			expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ sort });
+		}
+	});
+
+	// Decision 10: ONE reader call for the page, keyed on exactly the ids the list returned — never a
+	// project, never a user — over the 24 hourly slots ending at the current UTC hour.
+	it('asks the reader for exactly the listed ids over the 24-hour window and attaches trend24h of length 24', async () => {
+		listIssuesMock.mockResolvedValue([listedIssue(ISSUE_1), listedIssue(ISSUE_2)]);
+		const series1 = new Array(24).fill(0);
+		series1[23] = 5;
+		trendForIssuesMock.mockResolvedValue(
+			new Map([
+				[ISSUE_1, series1],
+				[ISSUE_2, new Array(24).fill(0)],
+			])
+		);
+
+		const before = Date.now();
+		const data = await loadWith('');
+
+		expect(trendForIssuesMock).toHaveBeenCalledTimes(1);
+		const [ids, windowStart, windowEnd] = trendForIssuesMock.mock.calls[0];
+		expect(ids).toEqual([ISSUE_1, ISSUE_2]);
+		const HOUR = 60 * 60 * 1000;
+		expect(windowEnd.getTime() % HOUR).toBe(0);
+		expect(windowEnd.getTime()).toBe(Math.floor(before / HOUR) * HOUR);
+		expect(windowStart.getTime()).toBe(windowEnd.getTime() - 23 * HOUR);
+
+		expect(data.issues).toHaveLength(2);
+		for (const issue of data.issues) {
+			expect(issue.trend24h).toHaveLength(24);
+			expect(issue.trend24h.every((n: number) => Number.isInteger(n))).toBe(true);
+		}
+		expect(data.issues[0].trend24h[23]).toBe(5);
+		expect(data.issues[1].trend24h).toEqual(new Array(24).fill(0));
+	});
+
+	// Decision 22: the two existing columns ride on every listed row — the projection is the query's
+	// (asserted against Postgres), the page data carrying them through unchanged is the loader's.
+	it('carries regressionStatus and lastRegressedAt on every list issue', async () => {
+		const regressedAt = new Date('2026-09-13T12:30:00Z');
+		listIssuesMock.mockResolvedValue([
+			listedIssue(ISSUE_1, { regressionStatus: 'regressed', lastRegressedAt: regressedAt }),
+			listedIssue(ISSUE_2),
+		]);
+		trendForIssuesMock.mockResolvedValue(
+			new Map([
+				[ISSUE_1, new Array(24).fill(0)],
+				[ISSUE_2, new Array(24).fill(0)],
+			])
+		);
+
+		const data = await loadWith('');
+
+		expect(data.issues[0]).toMatchObject({ regressionStatus: 'regressed', lastRegressedAt: regressedAt });
+		expect(data.issues[1]).toMatchObject({ regressionStatus: 'none', lastRegressedAt: null });
+		for (const issue of data.issues) {
+			expect(issue).toHaveProperty('regressionStatus');
+			expect(issue).toHaveProperty('lastRegressedAt');
+		}
+	});
+
+	// The `inArray([])` hazard (§4.1): an empty page — `new=24h` with nothing new, a page past the
+	// end — has nothing to attach a series to and must not reach the reader with `[]`.
+	it('never calls the reader with [] when the list is empty, and still returns issues: []', async () => {
+		listIssuesMock.mockResolvedValue([]);
+
+		const data = await loadWith('?new=24h&page=99');
+
+		expect(trendForIssuesMock).not.toHaveBeenCalled();
+		expect(data.issues).toEqual([]);
+		expect(data.filters.new).toBe('24h');
 	});
 });
