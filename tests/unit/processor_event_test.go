@@ -10,6 +10,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/normalizer"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -279,7 +280,7 @@ func TestDeserialize_UsesProvidedFingerprintWithoutOverride(t *testing.T) {
 // this test pins is the hop those depend on: Deserialize must carry the event's own environment
 // through UNCHANGED alongside a client fingerprint it deliberately leaves alone. Blank the
 // environment here, or derive it from the fingerprint, and the tuple collapses to
-// (project_id, '', fingerprint) — one issue for two environments — with no constraint violation to
+// (project_id, ”, fingerprint) — one issue for two environments — with no constraint violation to
 // notice it.
 //
 // The end-to-end claim, against the real constraint, is
@@ -385,6 +386,185 @@ func TestNormalize_NormalizesThenMasksEventFields(t *testing.T) {
 		"path":     "/<USER_PATH>/project",
 		"password": "***REDACTED***",
 	}, subject.Metadata)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-affected-users §4.3 — decision 3 (pre-normalisation read) and decision 5 (bounds)
+// ---------------------------------------------------------------------------------------------------
+
+// affectedProtoEvent is validProtoEvent with the given metadata attached, for the rollup tests below.
+func affectedProtoEvent(t *testing.T, metadata map[string]interface{}) *sentinelv1.ErrorEvent {
+	t.Helper()
+	protoEvent := validProtoEvent()
+	protoEvent.Fingerprint = "provided-fingerprint"
+	md, err := structpb.NewStruct(metadata)
+	require.NoError(t, err)
+	protoEvent.Metadata = md
+	return protoEvent
+}
+
+// TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical is the sentinel-affected-users twin of
+// TestDeserialize_EventIDSurvivesNormalizeByteIdentical (contract §11, boundary 3; decisions 3 and 6):
+// the three id shapes the normaliser destroys — a UUID ("<UUID>"), a run of >= 6 digits
+// ("<NUMERIC_ID>") and an email ("<EMAIL>") — must come out of Deserialize+Normalize on
+// AffectedUserID / AffectedTenantID byte-for-byte identical to what went in, while the SAME values
+// in the metadata map are rewritten as they always were. This test MUST fail if either field is ever
+// added to Normalize's rewrite list; the field comment in event.go names it for exactly that reason.
+func TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical(t *testing.T) {
+	t.Run("uuid user_id and 7-digit tenant_id", func(t *testing.T) {
+		got, err := event.Deserialize(marshalProtoEvent(t, affectedProtoEvent(t, map[string]interface{}{
+			"user_id":   "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+			"tenant_id": "1234567",
+		})))
+		require.NoError(t, err)
+
+		assert.Equal(t, "7c9e6679-7425-40de-944b-e07fc1f90ae7", got.AffectedUserID,
+			"AffectedUserID must survive Deserialize+Normalize byte-identical — if this now reads \"<UUID>\", "+
+				"the field was added to Normalize's rewrite list (decision 3 regression)")
+		assert.Equal(t, "1234567", got.AffectedTenantID,
+			"AffectedTenantID must survive byte-identical — \"<NUMERIC_ID>\" means it was normalised")
+		assert.Empty(t, got.AffectedUserSkipReason)
+		assert.Empty(t, got.AffectedTenantSkipReason)
+
+		// The map itself is still normalised — the read happens BEFORE NormalizeMap, it does not
+		// exempt the metadata from it (decision 13's security review point iii: the masker and
+		// normaliser still run on metadata).
+		assert.Equal(t, "<UUID>", got.Metadata["user_id"])
+		assert.Equal(t, "<NUMERIC_ID>", got.Metadata["tenant_id"])
+	})
+
+	t.Run("email under the user key", func(t *testing.T) {
+		got, err := event.Deserialize(marshalProtoEvent(t, affectedProtoEvent(t, map[string]interface{}{
+			"user": "alice@example.com",
+		})))
+		require.NoError(t, err)
+
+		assert.Equal(t, "alice@example.com", got.AffectedUserID,
+			"an email id must survive byte-identical — \"<EMAIL>\" means it was normalised or masked")
+		assert.Equal(t, "<EMAIL>", got.Metadata["user"])
+	})
+}
+
+// TestNormalize_ReadsAffectedIDsBeforeNormalizeMap pins the PLACE of the read (contract §4.3: "before
+// the MaskMap(NormalizeMap(…)) line, exactly where release_version is read") on a hand-built event,
+// without Deserialize in the way: the fields hold the raw values and the map holds the placeholders
+// after one Normalize call.
+func TestNormalize_ReadsAffectedIDsBeforeNormalizeMap(t *testing.T) {
+	subject := &event.ErrorEvent{
+		Metadata: map[string]interface{}{
+			"userId":   "9f1c2a3b-4d5e-4f60-8a7b-1c2d3e4f5a6b",
+			"tenantId": "9876543",
+		},
+	}
+
+	subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+
+	assert.Equal(t, "9f1c2a3b-4d5e-4f60-8a7b-1c2d3e4f5a6b", subject.AffectedUserID)
+	assert.Equal(t, "9876543", subject.AffectedTenantID)
+	assert.Equal(t, "<UUID>", subject.Metadata["userId"])
+	assert.Equal(t, "<NUMERIC_ID>", subject.Metadata["tenantId"])
+}
+
+// TestNormalize_AffectedIDPrecedenceIsTheIndexersVerbatim pins decision 24: the key precedence is
+// indexer.ExtractSearchFields's, copied without correction. An empty string at a higher-precedence
+// key WINS and is then skipped as `empty`; a non-string value at a higher key falls through to the
+// next; no key at all leaves both the id and the reason empty (nothing is counted).
+func TestNormalize_AffectedIDPrecedenceIsTheIndexersVerbatim(t *testing.T) {
+	t.Run("empty user_id beats a good userId and is counted as empty", func(t *testing.T) {
+		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"user_id": "", "userId": "u1"}}
+		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		assert.Empty(t, subject.AffectedUserID, "the indexer's precedence picks user_id even when it is empty")
+		assert.Equal(t, obs.AffectedRollupReasonEmpty, subject.AffectedUserSkipReason)
+	})
+
+	t.Run("a non-string user_id falls through to userId", func(t *testing.T) {
+		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"user_id": 42.0, "userId": "u1"}}
+		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		assert.Equal(t, "u1", subject.AffectedUserID)
+		assert.Empty(t, subject.AffectedUserSkipReason)
+	})
+
+	t.Run("organization_id is the last tenant key", func(t *testing.T) {
+		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"organization_id": "org-7"}}
+		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		assert.Equal(t, "org-7", subject.AffectedTenantID)
+	})
+
+	t.Run("no key at all is absent, not empty", func(t *testing.T) {
+		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"path": "/tmp"}}
+		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		assert.Empty(t, subject.AffectedUserID)
+		assert.Empty(t, subject.AffectedUserSkipReason, "no key present must increment nothing — reason stays \"\"")
+		assert.Empty(t, subject.AffectedTenantID)
+		assert.Empty(t, subject.AffectedTenantSkipReason)
+	})
+
+	t.Run("nil metadata leaves everything empty", func(t *testing.T) {
+		subject := &event.ErrorEvent{}
+		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		assert.Empty(t, subject.AffectedUserID)
+		assert.Empty(t, subject.AffectedUserSkipReason)
+	})
+}
+
+// TestBoundAffectedID pins decision 5's bounds function: the three rejections with their reasons
+// from the CLOSED set (empty | too_long | control_char), and the pass at exactly the bound. A
+// rejected value comes back as "" — never truncated (a truncated id is a different id).
+func TestBoundAffectedID(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantID     string
+		wantReason string
+	}{
+		{"empty", "", "", obs.AffectedRollupReasonEmpty},
+		{"256 bytes is too long", strings.Repeat("a", 256), "", obs.AffectedRollupReasonTooLong},
+		{"300 bytes is too long", strings.Repeat("a", 300), "", obs.AffectedRollupReasonTooLong},
+		{"the bound is bytes, not runes", strings.Repeat("é", 128), "", obs.AffectedRollupReasonTooLong}, // 128 runes, 256 bytes
+		{"NUL is a control character", "user\x00id", "", obs.AffectedRollupReasonControlChar},
+		{"a tab is a control character", "user\tid", "", obs.AffectedRollupReasonControlChar},
+		{"DEL is a control character", "user\x7fid", "", obs.AffectedRollupReasonControlChar},
+		{"255 bytes passes verbatim", strings.Repeat("b", 255), strings.Repeat("b", 255), ""},
+		{"a uuid passes verbatim", "7c9e6679-7425-40de-944b-e07fc1f90ae7", "7c9e6679-7425-40de-944b-e07fc1f90ae7", ""},
+		{"an email passes verbatim", "alice@example.com", "alice@example.com", ""},
+		{"a space is not a control character", "Alice Smith", "Alice Smith", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, reason := event.BoundAffectedID(tc.in)
+			assert.Equal(t, tc.wantID, id)
+			assert.Equal(t, tc.wantReason, reason)
+		})
+	}
+	// The reason set is closed at three: whatever a future rejection is, it must map onto one of
+	// these or change the contract.
+	assert.Equal(t, "empty", obs.AffectedRollupReasonEmpty)
+	assert.Equal(t, "too_long", obs.AffectedRollupReasonTooLong)
+	assert.Equal(t, "control_char", obs.AffectedRollupReasonControlChar)
+	assert.NotEqual(t, obs.EventIDReasonInvalidChars, obs.AffectedRollupReasonControlChar,
+		"control_char is a NEW constant, not obs.go's event_id invalid_chars")
+}
+
+// TestDeserialize_UnusableAffectedIDsAreDroppedNotFailed is the Deserialize-level view of decision 5:
+// an oversized, an empty and a control-character id each leave the event deserialisable, the field
+// "" and the reason set — the same shape D-g gives event_id.
+func TestDeserialize_UnusableAffectedIDsAreDroppedNotFailed(t *testing.T) {
+	got, err := event.Deserialize(marshalProtoEvent(t, affectedProtoEvent(t, map[string]interface{}{
+		"user_id":   strings.Repeat("x", 300),
+		"tenant_id": "",
+	})))
+	require.NoError(t, err, "an unusable id must never fail the event")
+	assert.Empty(t, got.AffectedUserID)
+	assert.Equal(t, obs.AffectedRollupReasonTooLong, got.AffectedUserSkipReason)
+	assert.Empty(t, got.AffectedTenantID)
+	assert.Equal(t, obs.AffectedRollupReasonEmpty, got.AffectedTenantSkipReason)
+
+	got, err = event.Deserialize(marshalProtoEvent(t, affectedProtoEvent(t, map[string]interface{}{
+		"user_id": "usr\x01",
+	})))
+	require.NoError(t, err)
+	assert.Empty(t, got.AffectedUserID)
+	assert.Equal(t, obs.AffectedRollupReasonControlChar, got.AffectedUserSkipReason)
 }
 
 func TestNormalize_NormalizesBeforeMasking(t *testing.T) {
