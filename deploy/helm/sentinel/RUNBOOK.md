@@ -90,7 +90,31 @@ argocd app sync sentinel-staging
 
 Migrations are forward-only (goose, one shared DB): rolling back app images
 does not roll back schema. If a migration itself is bad, fix forward with a
-new migration.
+new migration. If a `migrate down` is ever hand-run anyway, roll the images
+back to the previous tag FIRST — `down` is never run against a database with
+new-tag pods attached: dropping a table the running processor and dashboard
+read turns into an ingest outage (every `StoreEvent` fails, is retried, then
+dead-lettered), not a broken chart.
+
+### Re-running the issue_occurrence_buckets backfill (sentinel-issue-trend)
+
+`1724800000_backfill_issue_occurrence_buckets.sql` fills `issue_occurrence_buckets`
+from `error_occurrences` once, and goose never replays an applied version — so
+occurrences stored by the OLD processor in the rollout's last minutes, or during
+a rollback to the pre-feature tag, are never bucketed. To fill the missing hours
+by hand, run the same statement WITHOUT the migration's `WHERE NOT EXISTS` guard
+against the shared database (outside any transaction; it is safe with the new
+processor running — the inserts take only `FOR KEY SHARE` on `issues` rows):
+
+```sql
+INSERT INTO issue_occurrence_buckets (issue_id, bucket_start, count) SELECT issue_id, date_trunc('hour', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC', count(*) FROM error_occurrences GROUP BY 1, 2 ON CONFLICT (issue_id, bucket_start) DO NOTHING;
+```
+
+An hour that already has a row keeps its live count — the gap inside an existing
+hour is not recoverable by re-running, only hours with no row at all are filled.
+Images are rolled back to the previous tag before any `migrate down` (§3 above):
+the table this statement writes is dropped by `1724700000`'s Down, under a
+running new-tag processor that is an ingest outage.
 
 ## 4. Troubleshooting
 
