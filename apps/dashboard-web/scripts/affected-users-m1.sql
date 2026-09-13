@@ -73,11 +73,12 @@ where ("issues"."project_id" = '00000000-0000-4000-8000-0000000000a2'
 order by "issues"."affected_user_count" desc, "issues"."last_seen" desc, "issues"."id" desc
 limit 20 offset 40;
 
-\echo '-- verdict: the three pages, concatenated, versus the first 60 rows of the whole order'
+\echo '-- verdict: pages 1-3, concatenated, versus rows 1-60 of the whole order'
+\set first_page 1
 with page as (
 	-- the three page reads, each exactly as the loader issues it, tagged with page and position
 	select p.page, row_number() over (partition by p.page) as pos, r.id, r.affected_user_count, r.last_seen
-	from (values (1, 0), (2, 20), (3, 40)) as p(page, off)
+	from (values (:first_page, (:first_page - 1) * 20), (:first_page + 1, :first_page * 20), (:first_page + 2, (:first_page + 1) * 20)) as p(page, off)
 	cross join lateral (
 		select "id", "affected_user_count", "last_seen"
 		from "issues"
@@ -113,13 +114,87 @@ ordered as (
 		from paged
 	) s
 )
-select 'rows across pages 1-3'                                         as check, (select count(*) from paged)::text as value
+select 'rows across the three pages'                                    as check, (select count(*) from paged)::text as value
 union all
-select 'distinct ids across pages 1-3 (60 = no repeated id)',          (select count(distinct id) from paged)::text
+select 'distinct ids across the three pages (60 = no repeated id)',     (select count(distinct id) from paged)::text
 union all
-select 'ids that are not among the first 60 of the whole order',        (select count(*) from paged p where not exists (select 1 from whole w where w.id = p.id and w.seq <= 60))::text
+select 'ids outside the whole order''s window for these pages',         (select count(*) from paged p where not exists (select 1 from whole w where w.id = p.id and w.seq between (:first_page - 1) * 20 + 1 and (:first_page + 2) * 20))::text
 union all
-select 'first-60 ids missing from the pages (0 = no skipped id)',       (select count(*) from whole w where w.seq <= 60 and not exists (select 1 from paged p where p.id = w.id))::text
+select 'window ids missing from the pages (0 = no skipped id)',         (select count(*) from whole w where w.seq between (:first_page - 1) * 20 + 1 and (:first_page + 2) * 20 and not exists (select 1 from paged p where p.id = w.id))::text
+union all
+select 'rows at the wrong position versus the whole order',             (select count(*) from paged p join whole w on w.id = p.id where w.seq <> p.seq)::text
+union all
+select 'adjacent pairs violating count DESC, last_seen DESC, id DESC',  (select out_of_order from ordered)::text
+union all
+select 'tie groups on (count, last_seen) inside the 60 (id DESC load-bearing)', (select count(*) from (select 1 from paged group by affected_user_count, last_seen having count(*) > 1) t)::text;
+
+
+-- The seed's ties on (affected_user_count, last_seen) — the reason id DESC exists (decision 22) —
+-- all sit in the 0–3 band, below the 200 distinct-valued issues of the 10–100 and 500–5,000 bands,
+-- so pages 1–3 contain none of them (the last verdict line above says how many). The third key
+-- is load-bearing on the first pages that DO contain a tie group; find them and run the same
+-- verdict there, beside the criterion's pages, so the tiebreak is exercised by data and not only
+-- by the query text.
+\echo '-- beside: the first three pages that contain a (count, last_seen) tie group'
+with whole as (
+	select id, affected_user_count, last_seen, row_number() over (
+		order by "issues"."affected_user_count" desc, "issues"."last_seen" desc, "issues"."id" desc
+	) as seq
+	from "issues"
+	where ("issues"."project_id" = '00000000-0000-4000-8000-0000000000a2'
+	   and "issues"."project_id" in ('00000000-0000-4000-8000-0000000000a2', '00000000-0000-4000-8000-0000000000a3'))
+)
+select ceil(min(w.seq) / 20.0)::int as first_page
+from whole w
+where exists (select 1 from whole x where x.affected_user_count = w.affected_user_count and x.last_seen = w.last_seen and x.id <> w.id)
+\gset
+\echo '   first tie group is on page' :first_page
+with page as (
+	-- the three page reads, each exactly as the loader issues it, tagged with page and position
+	select p.page, row_number() over (partition by p.page) as pos, r.id, r.affected_user_count, r.last_seen
+	from (values (:first_page, (:first_page - 1) * 20), (:first_page + 1, :first_page * 20), (:first_page + 2, (:first_page + 1) * 20)) as p(page, off)
+	cross join lateral (
+		select "id", "affected_user_count", "last_seen"
+		from "issues"
+		where ("issues"."project_id" = '00000000-0000-4000-8000-0000000000a2'
+		   and "issues"."project_id" in ('00000000-0000-4000-8000-0000000000a2', '00000000-0000-4000-8000-0000000000a3'))
+		order by "issues"."affected_user_count" desc, "issues"."last_seen" desc, "issues"."id" desc
+		limit 20 offset p.off
+	) r
+),
+paged as (
+	select id, affected_user_count, last_seen, (page - 1) * 20 + pos as seq from page
+),
+whole as (
+	select "id", row_number() over (
+		order by "issues"."affected_user_count" desc, "issues"."last_seen" desc, "issues"."id" desc
+	) as seq
+	from "issues"
+	where ("issues"."project_id" = '00000000-0000-4000-8000-0000000000a2'
+	   and "issues"."project_id" in ('00000000-0000-4000-8000-0000000000a2', '00000000-0000-4000-8000-0000000000a3'))
+),
+ordered as (
+	select
+		count(*) filter (where prev_count is not null and (
+			affected_user_count > prev_count
+			or (affected_user_count = prev_count and last_seen > prev_seen)
+			or (affected_user_count = prev_count and last_seen = prev_seen and id > prev_id)
+		)) as out_of_order
+	from (
+		select id, affected_user_count, last_seen,
+			lag(affected_user_count) over (order by seq) as prev_count,
+			lag(last_seen) over (order by seq) as prev_seen,
+			lag(id) over (order by seq) as prev_id
+		from paged
+	) s
+)
+select 'rows across the three pages'                                    as check, (select count(*) from paged)::text as value
+union all
+select 'distinct ids across the three pages (60 = no repeated id)',     (select count(distinct id) from paged)::text
+union all
+select 'ids outside the whole order''s window for these pages',         (select count(*) from paged p where not exists (select 1 from whole w where w.id = p.id and w.seq between (:first_page - 1) * 20 + 1 and (:first_page + 2) * 20))::text
+union all
+select 'window ids missing from the pages (0 = no skipped id)',         (select count(*) from whole w where w.seq between (:first_page - 1) * 20 + 1 and (:first_page + 2) * 20 and not exists (select 1 from paged p where p.id = w.id))::text
 union all
 select 'rows at the wrong position versus the whole order',             (select count(*) from paged p join whole w on w.id = p.id where w.seq <> p.seq)::text
 union all
