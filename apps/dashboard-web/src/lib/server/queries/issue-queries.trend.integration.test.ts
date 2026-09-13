@@ -295,7 +295,10 @@ describe.skipIf(!dbReachable)('listIssues / countIssues / bucket readers (sentin
 				values (${issueId}, ${bucketStart.toISOString()}, ${count})
 			`;
 		}
-	});
+		// 120 s, as every other holder of RETENTION_FAMILY_LOCK sets it: under the full parallel run
+		// this hook queues behind a sibling file's entire seed-and-sweep run, and vitest's default
+		// 10 s hook timeout turned that wait into "Hook timed out" one run in two.
+	}, 120_000);
 
 	afterAll(async () => {
 		if (!sql) return;

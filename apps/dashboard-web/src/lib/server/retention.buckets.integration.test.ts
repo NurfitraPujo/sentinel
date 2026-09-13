@@ -488,7 +488,10 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 				'',
 			].join('\n')
 		);
-	});
+		// The sweep locks every touched `issues` row and waits on any held by another file's
+		// transaction, so under the full parallel run this case can sit well past vitest's 5 s
+		// default; 120 s, like the family's hooks.
+	}, 120_000);
 });
 
 describe.skipIf(!measure)(
