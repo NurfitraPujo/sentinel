@@ -1107,6 +1107,43 @@ func TestStoreEvent_RedeliveryWritesNoAffectedRowNoBumpNoMetric(t *testing.T) {
 		"%s must not move on a redelivery: the counter is recorded after commit and a duplicate never commits", obs.MetricAffectedRollupSkipped)
 }
 
+// TestStoreEvent_RedeliveryWritesNoBucketRowNoIncrement is sentinel-issue-trend flow I5, beside
+// TestStoreEvent_RedeliveryInOneEnvironmentAdvancesNeitherCounter as contract §11 places it: a
+// redelivered (issue_id, event_id) is rolled back at step 3 of StoreEvent, BEFORE step 4b's bucket
+// upsert runs — so the bucket table is byte-for-byte what the first delivery left: one row, count 1,
+// even when the redelivery carries a LATER timestamp in a DIFFERENT hour (a leaked upsert would
+// show as a second row, a leaked increment as count 2).
+func TestStoreEvent_RedeliveryWritesNoBucketRowNoIncrement(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "bucketredeliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "bucketredeliver")
+	eventID := "evt-bucketredeliver-" + uuid.New().String()
+	hour := time.Date(2026, 9, 13, 14, 0, 0, 0, time.UTC)
+
+	first := eidOccurrenceIn("production", eventID)
+	first.CreatedAt = hour.Add(10 * time.Minute)
+	issue := eidIssueIn(projectID, "production", fp)
+	_, stored1, err := s.StoreEvent(ctx, issue, first, "")
+	require.NoError(t, err)
+	require.True(t, stored1)
+
+	before := trendBuckets(t, ctx, pool, issue.ID)
+	require.Equal(t, []trendBucket{{Start: hour, Count: 1}}, before)
+
+	redelivered := eidOccurrenceIn("production", eventID)
+	redelivered.CreatedAt = hour.Add(2 * time.Hour) // a different hour: a leaked upsert would INSERT
+	_, stored2, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp), redelivered, "")
+	require.NoError(t, err, "a redelivery ACKs as a no-op, it does not error")
+	require.False(t, stored2)
+
+	assert.Equal(t, before, trendBuckets(t, ctx, pool, issue.ID),
+		"I5: a redelivered (issue_id, event_id) is rolled back before step 4b — no row, no increment")
+}
+
 // TestStoreEvent_RegistryTouchUpdatesDeclaredEnvironmentOnly covers contract §4.8's registry touch,
 // all four of its properties in one place because each of them fails SILENTLY:
 //
