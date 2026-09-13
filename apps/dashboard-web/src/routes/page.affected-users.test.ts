@@ -24,6 +24,12 @@ function issue(overrides: Record<string, unknown> = {}) {
 		status: 'open',
 		affectedUserCount: 1234,
 		affectedTenantCount: 3,
+		// sentinel-issue-trend §4.1 — the projection and the per-card series the template now reads
+		// on every row (`trend24h` is dense, never absent). Not this file's subject; see
+		// `page.issue-trend.test.ts`.
+		regressionStatus: 'none',
+		lastRegressedAt: null,
+		trend24h: new Array(24).fill(0),
 		...overrides,
 	};
 }
@@ -37,7 +43,7 @@ function pageData(overrides: Record<string, unknown> = {}) {
 			{ id: 'proj-2', name: 'Billing' },
 		],
 		environments: [],
-		filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'last_seen' },
+		filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'last_seen', new: 'all' },
 		retentionDays: 30,
 		pagination: { page: 1, limit: 20, total: 1, totalPages: 1 },
 		...overrides,
@@ -114,7 +120,7 @@ describe('/ affected users and tenants on the card (contract §4.1, flow L1)', (
 		render(Page, {
 			data: pageData({
 				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
-				filters: { status: 'all', project: 'proj-1', environment: 'production', sort: 'last_seen' },
+				filters: { status: 'all', project: 'proj-1', environment: 'production', sort: 'last_seen', new: 'all' },
 			}) as unknown as PageData,
 		});
 
@@ -147,7 +153,7 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 
 		render(Page, {
 			data: pageData({
-				filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'affected_users' },
+				filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'affected_users', new: 'all' },
 			}) as unknown as PageData,
 		});
 		expect(screen.getByTestId('sort-affected_users').classList.contains('active')).toBe(true);
@@ -181,6 +187,7 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 					project: 'proj-1',
 					environment: 'production',
 					sort: 'affected_users',
+					new: 'all',
 				},
 				pagination: { page: 2, limit: 20, total: 60, totalPages: 3 },
 			}) as unknown as PageData,
@@ -215,7 +222,7 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 		render(Page, {
 			data: pageData({
 				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
-				filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'last_seen' },
+				filters: { status: 'all', project: 'proj-1', environment: 'all', sort: 'last_seen', new: 'all' },
 				pagination: { page: 1, limit: 20, total: 60, totalPages: 3 },
 			}) as unknown as PageData,
 		});
@@ -229,8 +236,10 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 			expect(h).not.toContain('banana');
 			expect(h).not.toContain('sort=last_seen');
 		}
-		// Only the one anchor that selects the other order carries `sort`.
-		expect(hrefs.filter((h) => h?.includes('sort=')).length).toBe(1);
+		// Only the anchors that select ANOTHER order carry `sort` — one per non-default entry of
+		// `sortOptions`: `affected_users`, and since sentinel-issue-trend decision 5, `count` and
+		// `first_seen`.
+		expect(hrefs.filter((h) => h?.includes('sort=')).length).toBe(3);
 		expect(screen.getByRole('link', { name: 'Next' }).getAttribute('href')).toBe(
 			'?status=all&project=proj-1&page=2'
 		);

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
+	import TrendSparkline from '$lib/components/issues/TrendSparkline.svelte';
 
 	let { data } = $props();
 
@@ -14,10 +15,29 @@
 		});
 	}
 
-	function isNew(lastSeen: string | Date | null): boolean {
-		if (!lastSeen) return false;
-		const diff = Date.now() - new Date(lastSeen).getTime();
+	// sentinel-issue-trend §4.1, flow `L9`, decisions 12 and 22 — ONE 24-hour rule for both badges,
+	// against `Date.now()` as the card always did, client-side from page data.
+	//
+	// `NEW` fires on `firstSeen` (decision 12; it used to read `lastSeen`), so the badged cards and
+	// the `new=24h` set are the same set — `first_seen >= now − 24h` is the filter's predicate.
+	//
+	// `REGRESSED` (decision 22) exists because `first_seen` is never reset on regression: an issue
+	// resolved months ago that re-fired an hour ago — the card the dispatcher's alert sends the
+	// triager to — would lose the `NEW` badge it wore under the old rule and get nothing in its
+	// place. `regressionStatus` and `lastRegressedAt` are two existing `issues` columns the loader's
+	// projection now carries; nothing is computed from anything else. Both may show on one card.
+	function isRecent(timestamp: string | Date | null): boolean {
+		if (!timestamp) return false;
+		const diff = Date.now() - new Date(timestamp).getTime();
 		return diff < 24 * 60 * 60 * 1000;
+	}
+
+	function isNew(firstSeen: string | Date | null): boolean {
+		return isRecent(firstSeen);
+	}
+
+	function isRegressed(issue: { regressionStatus: string; lastRegressedAt: string | Date | null }): boolean {
+		return issue.regressionStatus === 'regressed' && isRecent(issue.lastRegressedAt);
 	}
 
 	// sentinel-project-environments §4.1 — the shape `data.environments` carries. `displayName` is
@@ -69,12 +89,20 @@
 	 * feature keeps meaning what it said, and a page loaded as `/?sort=banana` — which the loader
 	 * echoes as `last_seen` — builds anchors that carry nothing (flow `L7`). The sort anchors do not
 	 * carry `page`: a change of order starts again from page 1.
+	 *
+	 * `new` (sentinel-issue-trend §4.1, decision 6) rides exactly the way `sort` does: it SURVIVES a
+	 * project change (age is not project-scoped — the same decision-17 reasoning), it is OMITTED
+	 * when it is `all` (the default is the absence, so `/?new=banana` — echoed by the loader as
+	 * `all` — builds anchors that carry nothing, flow `L7`), and the `new` anchors do not carry
+	 * `page`: a change of filter starts again from page 1. Unlike `sort` it IS a filter, so the
+	 * loader narrows `pagination.total` with it; nothing here needs to know that.
 	 */
 	function href(params: {
 		status?: string;
 		project?: string;
 		environment?: string;
 		sort?: IssueSortValue;
+		new?: IssueNewValue;
 		page?: number;
 	}) {
 		const status = params.status ?? data.filters.status;
@@ -85,12 +113,14 @@
 				? 'all'
 				: (params.environment ?? data.filters.environment);
 		const sort = params.sort ?? data.filters.sort;
+		const newFilter = params.new ?? data.filters.new;
 
 		const q = new URLSearchParams();
 		q.set('status', status);
 		q.set('project', project);
 		if (environment && environment !== 'all') q.set('environment', environment);
 		if (sort && sort !== 'last_seen') q.set('sort', sort);
+		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
 		if (params.page && params.page > 1) q.set('page', String(params.page));
 		return `?${q.toString()}`;
 	}
@@ -99,10 +129,24 @@
 	// hard-coded anchors, because `sentinel-occurrence-histogram` adds more later and that must be
 	// a data change here. The template never validates `sort`: the loader coerces an unknown value
 	// to `last_seen` and echoes it on `filters.sort`, which is all the active state reads.
+	//
+	// sentinel-issue-trend §4.1, flows `L2`/`L3`, decision 5 — the extension that comment reserved:
+	// two more entries after Affected users. `href()` already carries `sort`; nothing else changes.
 	type IssueSortValue = typeof data.filters.sort;
 	const sortOptions: { value: IssueSortValue; label: string }[] = [
 		{ value: 'last_seen', label: 'Last seen' },
 		{ value: 'affected_users', label: 'Affected users' },
+		{ value: 'count', label: 'Occurrences' },
+		{ value: 'first_seen', label: 'First seen' },
+	];
+
+	// sentinel-issue-trend §4.1, flows `L4`–`L7`, decision 6. Same idiom as `sortOptions`: a data
+	// list, the template never validates the value — the loader coerces an unknown `new` to `all`
+	// and echoes it on `filters.new`, which is all the active state and `href()` read.
+	type IssueNewValue = typeof data.filters.new;
+	const newOptions: { value: IssueNewValue; label: string }[] = [
+		{ value: 'all', label: 'All' },
+		{ value: '24h', label: 'New in the last 24 hours' },
 	];
 </script>
 
@@ -147,6 +191,26 @@
 				<a href={href({ status: 'ignored' })}
 				   class:active={data.filters.status === 'ignored'}>Ignored</a>
 			</li>
+		</ul>
+
+		<!--
+			sentinel-issue-trend §4.1, flows `L4`–`L7` (decision 6). Its OWN group after Status and
+			before Sort, not a third row of Status: `new` is a filter on `first_seen`, orthogonal to
+			`status` — a reader can want "new AND resolved" — and a row inside the Status group would
+			read as a fourth status. Anchors on the query string like every group here; `href()`
+			carries `new` across paging, status, sort and project changes and drops it on `all`.
+		-->
+		<h2>Age</h2>
+		<ul data-testid="new-control">
+			{#each newOptions as option (option.value)}
+				<li>
+					<a href={href({ new: option.value })}
+					   class:active={data.filters.new === option.value}
+					   data-testid="new-{option.value}">
+						{option.label}
+					</a>
+				</li>
+			{/each}
 		</ul>
 
 		<!--
@@ -224,11 +288,26 @@
 				<a href="/issues/{issue.id}" class="issue-card">
 					<div class="card-header">
 						<span class="error-class">{issue.errorClass}</span>
-						{#if isNew(issue.lastSeen)}
-							<span class="badge new">NEW</span>
-						{/if}
+						<!-- Flow `L9`: `NEW` on `firstSeen`, `REGRESSED` after it when both apply (see `isRecent`). -->
+						<span class="badges">
+							{#if isNew(issue.firstSeen)}
+								<span class="badge new" data-testid="badge-new">NEW</span>
+							{/if}
+							{#if isRegressed(issue)}
+								<span class="badge regressed" data-testid="badge-regressed">REGRESSED</span>
+							{/if}
+						</span>
 					</div>
 					<p class="message">{issue.message.slice(0, 150)}{issue.message.length > 150 ? '...' : ''}</p>
+					<!--
+						sentinel-issue-trend §4.1, flows `L1`/`L10` (decisions 7, 10, 13). Between the
+						message and the footer, full card width: the shape reads as a row of its own
+						rather than crowding the footer's three figures, and the footer's `{count}
+						occurrences` stays the lifetime number beside it — the sparkline's own total is
+						its `aria-label`, and it names its window. `trend24h` is dense from the loader (§3),
+						so the drawing renders on every card; all zeros is a flat baseline, not an absence.
+					-->
+					<TrendSparkline values={issue.trend24h} />
 					<div class="card-footer">
 						<!--
 							Flow `L4`, and it is the INVERSE of what the first draft of this brief asked
@@ -278,8 +357,19 @@
 					</div>
 				</a>
 			{:else}
-				<!-- Flow `L5`: the empty state names THIS environment rather than saying nothing found. -->
-				{#if environmentActive}
+				<!--
+					Flow `L5` (environments): the empty state names THIS environment rather than saying
+					nothing found. sentinel-issue-trend flow `L8`: with `new=24h` active it says WHICH
+					filter came up empty — `No issues found.` under a filter looks like a broken page —
+					composed with the same environment clause.
+				-->
+				{#if data.filters.new === '24h'}
+					{#if environmentActive}
+						<p class="empty">No new issues in the last 24 hours in {activeEnvironmentLabel}.</p>
+					{:else}
+						<p class="empty">No new issues in the last 24 hours.</p>
+					{/if}
+				{:else if environmentActive}
 					<p class="empty">No issues found in {activeEnvironmentLabel}.</p>
 				{:else}
 					<p class="empty">No issues found.</p>
@@ -431,16 +521,31 @@
 		font-size: 0.875rem;
 	}
 
-	.badge.new {
-		background: var(--severity-critical-bg);
-		color: var(--severity-critical-text);
-		border: 1px solid var(--severity-critical-border);
+	.badges {
+		display: inline-flex;
+		gap: 0.375rem;
+	}
+
+	.badge {
 		font-family: var(--font-mono);
 		font-size: 0.6875rem;
 		font-weight: 700;
 		padding: 0.125rem 0.375rem;
 		border-radius: var(--radius-sm);
 		letter-spacing: 0.05em;
+	}
+
+	.badge.new {
+		background: var(--severity-critical-bg);
+		color: var(--severity-critical-text);
+		border: 1px solid var(--severity-critical-border);
+	}
+
+	/* Same family as `NEW` (decision 22); the open-status trio so the two read as different words. */
+	.badge.regressed {
+		background: var(--status-open-bg);
+		color: var(--status-open-text);
+		border: 1px solid var(--status-open-bg);
 	}
 
 	.message {
