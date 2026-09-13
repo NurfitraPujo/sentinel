@@ -172,6 +172,32 @@ export const issueAffectedTenants = pgTable('issue_affected_tenants', {
 	byLastSeen: index('idx_issue_affected_tenants_last_seen').on(table.lastSeen),
 }));
 
+// sentinel-issue-trend §4.6 (1724700000_add_issue_occurrence_buckets.sql): one row per (issue, UTC
+// hour) that saw at least one occurrence, `count` being how many. The composite primary key is the ON
+// CONFLICT target of the processor's upsert (§4.3, inside StoreEvent's transaction -- decision 1) and
+// the range scan both readers make (`issue_id = … AND bucket_start BETWEEN …`); nothing on `issues`
+// is denormalised from it (decision 3), so the series is always read from here. Written by the
+// processor (store.go) and once by the backfill migration (1724800000); swept by retention.ts (§4.5,
+// `bucket_start < cutoff`, which is what the `bucket_start` index serves); the dashboard never
+// inserts here.
+//
+// `bucketStart` is the occurrence's event timestamp truncated to the UTC hour IN GO
+// (`occ.CreatedAt.UTC().Truncate(time.Hour)`, §3 / decision 2), never now() and never a SQL
+// date_trunc on a timestamptz (session-zone dependent) -- the same clock as `issues.lastSeen` and
+// as retention's `errorOccurrences.createdAt` comparison, so buckets and the occurrences behind them
+// age out together. `withTimezone: true` mirrors the migrated TIMESTAMPTZ so `< cutoff` is the same
+// comparison retention makes on error_occurrences. `count` is INTEGER NOT NULL with a migrated CHECK
+// (count > 0): a row exists because an occurrence did; a series entry may be 0, a row may not. No
+// default on purpose -- a row is written with its count or not at all.
+export const issueOccurrenceBuckets = pgTable('issue_occurrence_buckets', {
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	bucketStart: timestamp('bucket_start', { withTimezone: true }).notNull(),
+	count: integer('count').notNull(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.issueId, table.bucketStart] }),
+	byBucketStart: index('idx_issue_occurrence_buckets_bucket_start').on(table.bucketStart),
+}));
+
 // Matches packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql — the table
 // has old_value/new_value JSONB columns, NOT a single `metadata` column. actor_type/actor_id are NOT NULL
 // with a CHECK on actor_type ('user'|'agent'|'system'). event_type CHECK allows
