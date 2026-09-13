@@ -65,6 +65,13 @@ export const IssueRowSchema = z
 		// N7e (A07): when the CURRENT claim (assigneeType/assignedTo) was made -- null if unclaimed
 		// or claimed before the 1723500000_add_claimed_at.sql backfill (N7c).
 		claimedAt: z.coerce.date().nullable(),
+		// sentinel-affected-users decision 14: how many DISTINCT users / tenants this issue's
+		// occurrences have touched within the retention window (contract §4.4, §4.6). Integers,
+		// >= 0, never null -- the column is NOT NULL DEFAULT 0, so an issue that predates the count
+		// or whose events carry no id reads 0, not null. The count can go DOWN: the hourly retention
+		// sweep recomputes it from what remains (decision 12).
+		affectedUserCount: z.number().int().nonnegative(),
+		affectedTenantCount: z.number().int().nonnegative(),
 	})
 	.strict();
 
@@ -104,6 +111,11 @@ export const AgentIssueListItemSchema = z
 		waitingSince: z.coerce.date().nullable(),
 		// N7e (A07): see IssueRowSchema's claimedAt note.
 		claimedAt: z.coerce.date().nullable(),
+		// sentinel-affected-users decision 14: see IssueRowSchema's note. Named in
+		// listAgentIssues's projection (agent-work.ts), so the list carries the same two integers
+		// the detail does.
+		affectedUserCount: z.number().int().nonnegative(),
+		affectedTenantCount: z.number().int().nonnegative(),
 	})
 	.strict();
 

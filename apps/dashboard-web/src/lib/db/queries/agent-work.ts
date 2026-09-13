@@ -110,6 +110,11 @@ export interface AgentIssueListItem {
 	firstSeen: Date | null;
 	lastSeen: Date | null;
 	count: number;
+	/** sentinel-affected-users decision 14: distinct users / tenants this issue's occurrences have
+	 *  touched within the retention window (§4.6). Integers >= 0, never null; recomputed downward
+	 *  by the hourly sweep (decision 12). */
+	affectedUserCount: number;
+	affectedTenantCount: number;
 	severity: string | null;
 	/** The reporting `"user".id`. Stays `null` for an external report -- see `reporterKind`. */
 	reporterId: string | null;
@@ -235,6 +240,11 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 			firstSeen: issues.firstSeen,
 			lastSeen: issues.lastSeen,
 			count: issues.count,
+			// sentinel-affected-users decision 14: published on the agent contract beside `count`
+			// (AgentIssueListItemSchema declares both; the decision-54 contract test refuses the
+			// column otherwise).
+			affectedUserCount: issues.affectedUserCount,
+			affectedTenantCount: issues.affectedTenantCount,
 			sourceChannel: issues.sourceChannel,
 			// Reports only: null for system_error rows (left joins). SR-6 / §4.2's correction --
 			// reading only `manual_issue_reports` here made `severity` and `reporterId` silently
