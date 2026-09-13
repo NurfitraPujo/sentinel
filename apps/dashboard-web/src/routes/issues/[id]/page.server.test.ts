@@ -27,6 +27,21 @@ const getOccurrencesByIssueIdMock = vi.fn();
 const countOccurrencesByIssueIdMock = vi.fn();
 const getIssueRelationsMock = vi.fn();
 
+// sentinel-affected-users decision 21: `retentionDays` comes from `$lib/server/retention-window`,
+// which reads `DATA_RETENTION_DAYS` fresh from `$env/dynamic/private` on every call — a mutable env
+// object varied per test, and the helper spied on (not replaced) so the assertion is that the loader
+// asked the SHARED helper the cron route and `/` read.
+const mockEnv: Record<string, string | undefined> = {};
+vi.mock('$env/dynamic/private', () => ({ env: mockEnv }));
+const getRetentionDaysSpy = vi.fn();
+vi.mock('$lib/server/retention-window', async () => {
+	const actual = await vi.importActual<typeof import('$lib/server/retention-window')>(
+		'$lib/server/retention-window'
+	);
+	getRetentionDaysSpy.mockImplementation(actual.getRetentionDays);
+	return { ...actual, getRetentionDays: getRetentionDaysSpy };
+});
+
 vi.mock('$lib/server/issue-access', () => ({
 	requireProjectAccess: requireProjectAccessMock,
 }));
@@ -83,6 +98,7 @@ async function catchLoad(userId: string | null) {
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	delete mockEnv.DATA_RETENTION_DAYS;
 	getIssueByIdMock.mockResolvedValue(ISSUE);
 	getProjectByIdMock.mockResolvedValue({ id: 'proj-1', name: 'My Project' });
 	getOccurrencesByIssueIdMock.mockResolvedValue([]);
@@ -165,5 +181,26 @@ describe('/issues/[id] load (§4.5a)', () => {
 
 		expect(resolveEnvironmentDisplayNameMock).toHaveBeenCalledWith('proj-1', 'production');
 		expect(result.environmentDisplayName).toBe('Production');
+	});
+});
+
+// sentinel-affected-users §4.2, decision 21 — flow `D1`'s number. The two counts arrive on `issue`
+// with the row (`getIssueById` has no projection); the loader's one change is `retentionDays`.
+describe('/issues/[id] load — retentionDays (sentinel-affected-users §4.2)', () => {
+	it('returns retentionDays 30 beside issue when DATA_RETENTION_DAYS is unset, from the shared helper', async () => {
+		const result: any = await loadAs('user-1');
+
+		expect(result.retentionDays).toBe(30);
+		expect(result.issue).toEqual(ISSUE);
+		expect(getRetentionDaysSpy).toHaveBeenCalled();
+	});
+
+	it('returns the parsed DATA_RETENTION_DAYS when it is set, as an integer', async () => {
+		mockEnv.DATA_RETENTION_DAYS = '90';
+
+		const result: any = await loadAs('user-1');
+
+		expect(result.retentionDays).toBe(90);
+		expect(Number.isInteger(result.retentionDays)).toBe(true);
 	});
 });

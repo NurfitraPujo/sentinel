@@ -19,6 +19,21 @@ const listIssuesMock = vi.fn();
 const countIssuesMock = vi.fn();
 const listProjectsMock = vi.fn();
 
+// sentinel-affected-users decision 21: `retentionDays` is read through `$lib/server/retention-window`,
+// which reads `DATA_RETENTION_DAYS` fresh from `$env/dynamic/private` on every call — so the env is a
+// mutable object varied per test (email.test.ts's pattern), and the helper is spied on rather than
+// replaced so the assertion is "the loader asked the SHARED helper", not "some number came back".
+const mockEnv: Record<string, string | undefined> = {};
+vi.mock('$env/dynamic/private', () => ({ env: mockEnv }));
+const getRetentionDaysSpy = vi.fn();
+vi.mock('$lib/server/retention-window', async () => {
+	const actual = await vi.importActual<typeof import('$lib/server/retention-window')>(
+		'$lib/server/retention-window'
+	);
+	getRetentionDaysSpy.mockImplementation(actual.getRetentionDays);
+	return { ...actual, getRetentionDays: getRetentionDaysSpy };
+});
+
 vi.mock('$lib/server/auth', () => ({ getUser: getUserMock }));
 vi.mock('$lib/server/issue-access', () => ({ getAccessibleProjects: getAccessibleProjectsMock }));
 vi.mock('$lib/server/environment-access', async () => {
@@ -74,6 +89,7 @@ async function loadWith(query: string) {
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	delete mockEnv.DATA_RETENTION_DAYS;
 	getUserMock.mockResolvedValue({ id: 'user-1' });
 	getAccessibleProjectsMock.mockResolvedValue([
 		{ id: PROJECT_A, name: 'Alpha', organizationId: 'org-1' },
@@ -204,5 +220,65 @@ describe('GET / page load (§4.4)', () => {
 		expect(listIssuesMock).not.toHaveBeenCalled();
 		expect(countIssuesMock).not.toHaveBeenCalled();
 		expect(listProjectsMock).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * sentinel-affected-users §4.1 — the `sort` parameter (decision 10) and `retentionDays` (decision 21),
+ * the loader half of flows `L1`–`L7`. What the QUERY does with `sort` is asserted against a real
+ * Postgres in `src/lib/server/queries/issue-queries.sort.integration.test.ts`; this file owns the
+ * parse, the coercion, the echo, and which query receives it.
+ */
+describe('GET / page load — sort and retentionDays (sentinel-affected-users §4.1)', () => {
+	it('passes sort=affected_users to listIssues and echoes it on filters.sort', async () => {
+		const data = await loadWith('?sort=affected_users');
+
+		expect(data.filters.sort).toBe('affected_users');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ sort: 'affected_users' });
+	});
+
+	// `sort` changes the ORDER BY of the guarded query and nothing about its WHERE; `pagination.total`
+	// does not change with the order the same rows are listed in, so the count never sees it.
+	it('does not pass sort to countIssues — the total does not depend on the order', async () => {
+		await loadWith('?sort=affected_users');
+
+		expect(countIssuesMock).toHaveBeenCalledTimes(1);
+		expect(countIssuesMock.mock.calls[0][0]).not.toHaveProperty('sort');
+		// And the list still got everything the count got — the same filters, plus the sort.
+		const { sort: _sort, ...listFilters } = listIssuesMock.mock.calls[0][0];
+		expect(listFilters).toEqual(countIssuesMock.mock.calls[0][0]);
+	});
+
+	it('defaults to last_seen — today’s order — when sort is absent', async () => {
+		const data = await loadWith('');
+
+		expect(data.filters.sort).toBe('last_seen');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ sort: 'last_seen' });
+	});
+
+	// Flow `L7`: the echo is what `href()` builds every anchor from, so echoing `banana` would keep
+	// it riding on links the reader has no control to clear it from — the same rule the environment
+	// echo follows on `project=all`.
+	it('coerces an unknown sort to last_seen for the query AND the echo, never the bad string', async () => {
+		const data = await loadWith('?sort=banana');
+
+		expect(data.filters.sort).toBe('last_seen');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ sort: 'last_seen' });
+	});
+
+	it('returns retentionDays 30 when DATA_RETENTION_DAYS is unset, from the shared helper', async () => {
+		const data = await loadWith('');
+
+		expect(data.retentionDays).toBe(30);
+		expect(getRetentionDaysSpy).toHaveBeenCalled();
+	});
+
+	it('returns the parsed DATA_RETENTION_DAYS when it is set, as an integer', async () => {
+		mockEnv.DATA_RETENTION_DAYS = '45';
+
+		const data = await loadWith('');
+
+		expect(data.retentionDays).toBe(45);
+		expect(Number.isInteger(data.retentionDays)).toBe(true);
 	});
 });
