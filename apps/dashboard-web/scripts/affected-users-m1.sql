@@ -24,8 +24,12 @@
 --   1. PRIMARY   — pages 1–3 (20 rows each) with `sort=affected_users`, then a verdict: the 60 ids
 --                  are in `affected_user_count DESC, last_seen DESC, id DESC`, and they are exactly
 --                  the first 60 of the whole order — no repeated id, no skipped id.
---   2. SECONDARY — `EXPLAIN (ANALYZE, BUFFERS)` of page 1 and page 3, and one line stating whether
---                  `idx_issues_project_env_affected_users` is used.
+--   2. SECONDARY — `EXPLAIN (ANALYZE, BUFFERS)` of page 1 and page 3, and one line naming which
+--                  index serves each form: the request as specified (environment=all) should be
+--                  `idx_issues_project_affected_users` (1724600000, BUG-01 — no `environment` key,
+--                  so the ORDER BY is the index order with only `project_id` pinned); the
+--                  environment-filtered variant should be `idx_issues_project_env_affected_users`
+--                  (1724500000, §4.6).
 --   3. TERTIARY  — p50/p95 over `:runs` executions (default 40, ≥ 30) of page 1 under
 --                  `sort=affected_users` beside the same request under `sort=last_seen`, and the
 --                  ratio. Each execution goes through `EXECUTE … USING` so it is planned with
@@ -264,15 +268,19 @@ begin
 	$q$ loop
 		plan_env := plan_env || line || E'\n';
 	end loop;
-	if plan like '%idx_issues_project_env_affected_users%' then
-		raise notice 'VERDICT: idx_issues_project_env_affected_users IS used by the page-1 plan (project=<A>, status=all, sort=affected_users)';
+	if plan like '%idx_issues_project_affected_users%' then
+		raise notice 'VERDICT: idx_issues_project_affected_users IS used by the page-1 plan (project=<A>, status=all, sort=affected_users) — BUG-01 resolved';
+	elsif plan like '%idx_issues_project_env_affected_users%' then
+		raise notice 'VERDICT: idx_issues_project_env_affected_users is used by the page-1 plan (project=<A>, status=all, sort=affected_users) — unexpected without an environment equality; paste the plan';
 	else
-		raise notice 'VERDICT: idx_issues_project_env_affected_users is NOT used by the page-1 plan (project=<A>, status=all, sort=affected_users) — §4.6: the architect decides whether it stays';
+		raise notice 'VERDICT: NEITHER affected_users index is used by the page-1 plan (project=<A>, status=all, sort=affected_users) — BUG-01''s shape; is 1724600000 applied?';
 	end if;
 	if plan_env like '%idx_issues_project_env_affected_users%' then
-		raise notice 'BESIDE: with environment=production added, the index IS used';
+		raise notice 'BESIDE: with environment=production added, idx_issues_project_env_affected_users IS used';
+	elsif plan_env like '%idx_issues_project_affected_users%' then
+		raise notice 'BESIDE: with environment=production added, idx_issues_project_affected_users is used (environment as a row filter, not an index key)';
 	else
-		raise notice 'BESIDE: with environment=production added, the index is NOT used either';
+		raise notice 'BESIDE: with environment=production added, neither index is used';
 	end if;
 end $$;
 

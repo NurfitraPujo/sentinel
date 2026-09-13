@@ -15,12 +15,15 @@ package dbmigrations
 // PK (that is what makes "distinct" a database fact), an empty id is rejected by the CHECK
 // (decision 5's tripwire), and deleting an issue cascades its side rows.
 //
+// BUG-01's follow-on, migrations/1724600000_add_issues_project_affected_users_index.sql, is covered
+// at the end of this file: its replay, and the PLAN of §4.1's query in both environment forms.
+//
 // Same database contract as migrations_oncall_weekday_test.go: MIGRATIONS_TEST_DB_URL at a
 // DISPOSABLE Postgres whose role may CREATE DATABASE, self-skipping without one,
 // MIGRATIONS_TEST_REQUIRED=1 to make the skip a failure. Never the shared dev database.
 //
 //	MIGRATIONS_TEST_DB_URL='postgres://sentinel:changeme@localhost:55432/sentinel?sslmode=disable' \
-//	  GOWORK=off go test ./... -run AffectedRollup -count=1 -v
+//	  GOWORK=off go test ./... -run 'AffectedRollup|AffectedUsers' -count=1 -v
 
 import (
 	"context"
@@ -286,5 +289,161 @@ func assertConstraint(t *testing.T, db *sql.DB, table, name, wantDef string) {
 	}
 	if def != wantDef {
 		t.Errorf("constraint %s on %s is %q, want %q", name, table, def, wantDef)
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// BUG-01 — migrations/1724600000_add_issues_project_affected_users_index.sql.
+//
+// Review finding R1 on 1724500000:74: `idx_issues_project_env_affected_users` cannot serve §13 M1's
+// named request (`?project=<id>&status=all&sort=affected_users`, i.e. environment=all) because a
+// btree needs an equality on its second key before its order is the ORDER BY; without one the
+// planner scans the project's rows and top-N sorts them at any size. 1724600000 adds
+// `idx_issues_project_affected_users (project_id, affected_user_count DESC, last_seen DESC, id DESC)`
+// and keeps the env-keyed one. Two things are pinned here: the schema (up -> down -> up, then the
+// second-ledger replay, as above) and THE PLAN — the thing the finding is about — for both request
+// shapes, on a seed large enough that the planner has a real choice.
+// ---------------------------------------------------------------------------------------------
+
+const affectedUsersProjectIndexVersion int64 = 1724600000
+
+// TestAffectedUsersProjectIndexReplay drives 1724600000 up -> down -> up and asserts the index in
+// each state, then replays the directory under a second ledger.
+func TestAffectedUsersProjectIndexReplay(t *testing.T) {
+	db, cleanup := freshMigrationDatabase(t, "affected_projidx")
+	defer cleanup()
+
+	ctx := context.Background()
+	migrateTo(t, db, affectedRollupVersion)
+	assertIndexExists(t, db, "idx_issues_project_affected_users", false)
+
+	migrateTo(t, db, affectedUsersProjectIndexVersion)
+	assertAffectedUsersProjectIndexShape(t, db, true)
+
+	if err := goose.DownToContext(ctx, db, migrationsDir(), affectedRollupVersion); err != nil {
+		t.Fatalf("goose down to %d failed: %v", affectedRollupVersion, err)
+	}
+	assertAffectedUsersProjectIndexShape(t, db, false)
+	// The down of 1724600000 removes ONLY its own index; 1724500000's stays.
+	assertAffectedRollupShape(t, db, true)
+
+	migrateTo(t, db, affectedUsersProjectIndexVersion)
+	assertAffectedUsersProjectIndexShape(t, db, true)
+
+	goose.SetTableName("dashboard_migrations")
+	defer goose.SetTableName("schema_migrations")
+	if err := goose.UpToContext(ctx, db, migrationsDir(), affectedUsersProjectIndexVersion); err != nil {
+		t.Fatalf("replaying the directory under a second goose ledger failed -- an unguarded statement in 1724600000: %v", err)
+	}
+	assertAffectedUsersProjectIndexShape(t, db, true)
+}
+
+// TestAffectedUsersSortPlanBothEnvironmentForms is the finding itself as a test. On one project
+// with 2,000 issues spread over two environments (the committed seed's size), the §4.1 loader's
+// query in BOTH shapes must be an ordered index scan with NO Sort node: the environment=all form
+// on idx_issues_project_affected_users, the environment=<x> form on
+// idx_issues_project_env_affected_users. Delete the CREATE INDEX in 1724600000 and the first
+// assertion goes red with the finding's exact plan (idx_issues_project_id + Sort).
+//
+// `enable_seqscan = off` for the session: the finding recorded that the fallback was Seq Scan +
+// top-N heapsort even with it off, so the assertion is about whether an index CAN serve the
+// ORDER BY, not about the seq-scan/index-scan cost crossover at this row count.
+func TestAffectedUsersSortPlanBothEnvironmentForms(t *testing.T) {
+	db, cleanup := freshMigrationDatabase(t, "affected_plan")
+	defer cleanup()
+
+	migrateTo(t, db, affectedUsersProjectIndexVersion)
+	projectID := seedProjectWithIssues(t, db, "plan", 2000)
+	mustExec(t, db, `ANALYZE issues`)
+	mustExec(t, db, `SET enable_seqscan = off`)
+
+	// The SELECT list, predicate and ORDER BY are the loader's own, as captured in
+	// apps/dashboard-web/scripts/affected-users-m1.sql: `project_id = $1 AND project_id IN (...)`
+	// is the filter plus the tenancy guard, `status=all` adds nothing.
+	const columns = `"id", "project_id", "fingerprint", "message", "error_class", "environment", "status", "first_seen", "last_seen", "count", "affected_user_count", "affected_tenant_count"`
+	const order = ` order by "issues"."affected_user_count" desc, "issues"."last_seen" desc, "issues"."id" desc limit 20`
+
+	environmentAll := `select ` + columns + ` from "issues" where ("issues"."project_id" = '` + projectID +
+		`' and "issues"."project_id" in ('` + projectID + `'))` + order
+	environmentOne := `select ` + columns + ` from "issues" where ("issues"."project_id" = '` + projectID +
+		`' and "issues"."project_id" in ('` + projectID + `') and "issues"."environment" = 'production')` + order
+
+	assertPlanIsOrderedIndexScan(t, db, "environment=all", environmentAll, "idx_issues_project_affected_users")
+	assertPlanIsOrderedIndexScan(t, db, "environment=production", environmentOne, "idx_issues_project_env_affected_users")
+}
+
+func assertAffectedUsersProjectIndexShape(t *testing.T, db *sql.DB, want bool) {
+	t.Helper()
+
+	assertIndexExists(t, db, "idx_issues_project_affected_users", want)
+	if want {
+		// §4.1's ORDER BY in full, `id DESC` last (decision 22), under `project_id` alone.
+		assertIndexDefinition(t, db, "idx_issues_project_affected_users",
+			"(project_id, affected_user_count DESC, last_seen DESC, id DESC)")
+	}
+}
+
+// seedProjectWithIssues creates one organization and project and n issues in it, alternating
+// between two environments, with a skewed affected_user_count (most at 0-3, a few high) and a
+// last_seen from generate_series so ties on (affected_user_count, last_seen) exist -- the
+// committed seed's shape, small enough for a test.
+func seedProjectWithIssues(t *testing.T, db *sql.DB, name string, n int) string {
+	t.Helper()
+
+	var orgID, projectID string
+	if err := db.QueryRow(
+		`INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id`, name,
+	).Scan(&orgID); err != nil {
+		t.Fatalf("seed organization %s: %v", name, err)
+	}
+	if err := db.QueryRow(
+		`INSERT INTO projects (name, organization_id, api_key, api_key_hash) VALUES ($1, $2, $3, $4) RETURNING id`,
+		name, orgID, name, name,
+	).Scan(&projectID); err != nil {
+		t.Fatalf("seed project %s: %v", name, err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO issues (project_id, environment, fingerprint, message, error_class, last_seen, affected_user_count)
+		SELECT $1,
+		       CASE WHEN i % 2 = 0 THEN 'production' ELSE 'staging' END,
+		       'fp-' || i, 'issue ' || i, 'Error',
+		       now() - ((i % 60) || ' days')::interval,
+		       CASE WHEN i % 100 = 0 THEN 500 + i WHEN i % 10 = 0 THEN 10 + (i % 90) ELSE i % 4 END
+		FROM generate_series(1, $2) AS i`, projectID, n); err != nil {
+		t.Fatalf("seed %d issues in %s: %v", n, name, err)
+	}
+	return projectID
+}
+
+// assertPlanIsOrderedIndexScan runs EXPLAIN on query and requires that the plan reads `issues`
+// through index (an Index Scan or Index Only Scan naming it) and contains no Sort node -- the
+// ORDER BY is produced by the index order, which is what makes the paginated read a range scan.
+func assertPlanIsOrderedIndexScan(t *testing.T, db *sql.DB, label, query, index string) {
+	t.Helper()
+
+	rows, err := db.Query(`EXPLAIN ` + query)
+	if err != nil {
+		t.Fatalf("%s: EXPLAIN failed: %v", label, err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("%s: read plan: %v", label, err)
+		}
+		plan = append(plan, line)
+	}
+	text := strings.Join(plan, "\n")
+	t.Logf("%s plan:\n%s", label, text)
+
+	if !strings.Contains(text, "Index Scan using "+index) && !strings.Contains(text, "Index Only Scan using "+index) {
+		t.Errorf("%s: plan does not read issues through %s:\n%s", label, index, text)
+	}
+	for _, line := range plan {
+		if strings.Contains(line, "Sort") {
+			t.Errorf("%s: plan has a Sort node -- the ORDER BY is not served by an index:\n%s", label, text)
+			break
+		}
 	}
 }

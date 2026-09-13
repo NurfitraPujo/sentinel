@@ -114,9 +114,10 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
  * are common (every pre-existing issue is `0`, decision 4) and ties on the first TWO are likely
  * wherever `last_seen` is set in bulk — a seed from `generate_series`, a burst ingested in one
  * second — so `id DESC` is the third, UNIQUE key. Without a unique final key an offset page
- * boundary can repeat or skip a row. It is also the key order of
- * `idx_issues_project_env_affected_users` (§4.6), in full, so the sorted read can be an index range
- * scan under the project/environment predicate.
+ * boundary can repeat or skip a row. It is also the key order of BOTH indexes that serve it, in
+ * full: `idx_issues_project_env_affected_users` (§4.6) under a project AND environment equality,
+ * and `idx_issues_project_affected_users` (1724600000, BUG-01) under `project_id` alone — the
+ * `environment=all` form, which a btree keyed on `environment` second cannot order without a Sort.
  *
  * `last_seen` is `last_seen DESC` and nothing else — unchanged, deliberately: the default must be
  * exactly today's order, ties included.
