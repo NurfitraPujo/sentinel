@@ -2,6 +2,7 @@ import { db } from "$lib/server/db";
 import { issues, errorOccurrences, projects } from "$lib/db/schema";
 import { eq, desc, sql, and, inArray, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
+import { coerceIssueSort } from "$lib/server/issue-sort";
 
 export interface IssueFilters {
     status?: string;
@@ -37,6 +38,17 @@ export interface IssueFilters {
      * map is unrestricted; an empty map is no predicate at all.
      */
     environmentScopes?: Map<string, string[]>;
+    /**
+     * sentinel-affected-users §4.1, decision 10 — the ORDER, and only the order. `last_seen` (the
+     * default, and today's order) or `affected_users`; anything else is coerced to `last_seen` by
+     * `coerceIssueSort`, so a `string` is accepted here rather than `IssueSort` — the loader passes
+     * what the URL said and the coercion happens in exactly one place.
+     *
+     * Read by `listIssues` ONLY. `buildIssueConditions` never sees it — a sort is not a read path
+     * around a guard (§2) — and `countIssues` ignores it: `pagination.total` does not change with
+     * the order the same rows are listed in.
+     */
+    sort?: string;
 }
 
 /**
@@ -95,6 +107,29 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
     return conditions;
 }
 
+/**
+ * §4.1's `ORDER BY` per `sort` (decisions 10 and 22).
+ *
+ * `affected_users` is `affected_user_count DESC, last_seen DESC, id DESC`: ties on the first key
+ * are common (every pre-existing issue is `0`, decision 4) and ties on the first TWO are likely
+ * wherever `last_seen` is set in bulk — a seed from `generate_series`, a burst ingested in one
+ * second — so `id DESC` is the third, UNIQUE key. Without a unique final key an offset page
+ * boundary can repeat or skip a row. It is also the key order of
+ * `idx_issues_project_env_affected_users` (§4.6), in full, so the sorted read can be an index range
+ * scan under the project/environment predicate.
+ *
+ * `last_seen` is `last_seen DESC` and nothing else — unchanged, deliberately: the default must be
+ * exactly today's order, ties included.
+ */
+function issueOrder(sort: string | undefined): SQL[] {
+    switch (coerceIssueSort(sort)) {
+        case "affected_users":
+            return [desc(issues.affectedUserCount), desc(issues.lastSeen), desc(issues.id)];
+        case "last_seen":
+            return [desc(issues.lastSeen)];
+    }
+}
+
 export const issueQueries = {
     async getIssueById(id: string) {
         const [issue] = await db
@@ -145,10 +180,13 @@ export const issueQueries = {
                 firstSeen: issues.firstSeen,
                 lastSeen: issues.lastSeen,
                 count: issues.count,
+                // §4.1 page data: `0` is `0`, never omitted — NOT NULL DEFAULT 0 on the column.
+                affectedUserCount: issues.affectedUserCount,
+                affectedTenantCount: issues.affectedTenantCount,
             })
             .from(issues)
             .where(and(...conditions))
-            .orderBy(desc(issues.lastSeen))
+            .orderBy(...issueOrder(filters.sort))
             .limit(limit)
             .offset(offset);
 

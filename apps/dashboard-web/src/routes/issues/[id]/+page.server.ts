@@ -8,6 +8,7 @@ import {
 import { resolveEnvironmentDisplayName } from '$lib/db/queries/environments';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getIssueRelations } from '$lib/db/queries/issues';
+import { getRetentionDays } from '$lib/server/retention-window';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -74,5 +75,9 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		occurrenceTotal,
 		environmentDisplayName,
 		relations,
+		// sentinel-affected-users §4.2, decision 21 — top level beside `issue`, the same number `/`
+		// returns and the retention sweep uses: `Affected users (last {retentionDays} days)`. The two
+		// counts themselves need no loader change; `getIssueById` selects the whole row.
+		retentionDays: getRetentionDays(),
 	};
 };

@@ -5,6 +5,8 @@ import { getUser } from '$lib/server/auth';
 import { getAccessibleProjects } from '$lib/server/issue-access';
 import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
 import { listProjectEnvironments, toEnvironmentApiShape } from '$lib/db/queries/environments';
+import { coerceIssueSort } from '$lib/server/issue-sort';
+import { getRetentionDays } from '$lib/server/retention-window';
 
 export const load: PageServerLoad = async ({ url, locals }) => {
 	const user = await getUser({ locals } as any);
@@ -55,6 +57,13 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	// The GUARD (`environmentScopes`) is unaffected; only the offered FILTER is dropped.
 	const effectiveEnvironment = projectIdFilter === 'all' ? 'all' : environmentFilter;
 
+	// sentinel-affected-users §4.1, decision 10 — `sort` follows the same rule as `environment`
+	// above: the loader coerces, and the COERCED value is what the queries see and what the echo
+	// says. `last_seen` is today's order and the default; `affected_users` is the new one; anything
+	// else is `last_seen`, never the bad string — a typo in a bookmark must not 500 and must not
+	// keep riding on links (`href()` builds every anchor from `filters.sort`).
+	const sort = coerceIssueSort(url.searchParams.get('sort'));
+
 	const filters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
@@ -64,7 +73,10 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	};
 
 	const [results, userProjects, total] = await Promise.all([
-		issueQueries.listIssues(filters, page, limit),
+		// `sort` goes to the list ONLY. It changes the `ORDER BY` of the guarded query and nothing
+		// about its `WHERE` — `buildIssueConditions` never reads it — and `countIssues` takes the
+		// filters WITHOUT it: `pagination.total` does not change with the order.
+		issueQueries.listIssues({ ...filters, sort }, page, limit),
 		issueQueries.listProjects(authorizedProjectIds),
 		issueQueries.countIssues(filters)
 	]);
@@ -101,7 +113,13 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			// (`href()` in `+page.svelte`), so echoing `production` here would keep the parameter
 			// riding on links the reader has no control to clear it from (decision 55, flow `L7`).
 			environment: effectiveEnvironment,
+			// The coerced value again (§4.1): `banana` echoes `last_seen`.
+			sort,
 		},
+		// §4.1, decision 21 — top level, beside `filters`. The window every count label carries
+		// ("in the last N days"); a template cannot read `$env/dynamic/private`, and the number has
+		// to be the one the retention sweep uses, so it comes from the helper the cron route reads.
+		retentionDays: getRetentionDays(),
 		pagination: {
 			page,
 			limit,

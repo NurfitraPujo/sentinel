@@ -10,6 +10,7 @@ import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
 import { env } from '$env/dynamic/private';
 import { log } from '$lib/server/observability/log';
+import { getRetentionDays } from '$lib/server/retention-window';
 
 const CRON_SECRET_HEADER = 'x-cron-secret';
 
@@ -31,7 +32,10 @@ export const POST: RequestHandler = async ({ request }) => {
 		return json({ error: 'Invalid cron secret' }, { status: 401 });
 	}
 
-	const retentionDays = parseInt(env.DATA_RETENTION_DAYS ?? '30', 10);
+	// sentinel-affected-users decision 21: the ONE reading of DATA_RETENTION_DAYS, shared with the
+	// `/` and `/issues/{id}` loaders so the window on every count label is the window this sweep
+	// enforces.
+	const retentionDays = getRetentionDays();
 	const manualRetentionDays = parseInt(env.MANUAL_ISSUE_RETENTION_DAYS ?? '365', 10);
 	const tombstoneRetentionDays = parseInt(env.TOMBSTONE_RETENTION_DAYS ?? '30', 10);
 	const claimStaleHours = parseInt(env.CLAIM_STALE_HOURS ?? '24', 10);
