@@ -21,8 +21,9 @@ const retention = {
 vi.mock('$lib/server/retention', () => retention);
 vi.mock('$lib/db/queries/organizations', () => ({ reapAllExpiredInvitations: vi.fn(async () => 0) }));
 vi.mock('$lib/server/attachment-reaper', () => ({ reapAllOrphanAttachments: vi.fn(async () => 0) }));
+const logInfo = vi.fn();
 vi.mock('$lib/server/observability/log', () => ({
-	log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+	log: { info: logInfo, error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
 }));
 
 const dynamicEnv: Record<string, string | undefined> = {};
@@ -55,6 +56,8 @@ beforeEach(() => {
 	retention.cleanupRetainedData.mockImplementation(
 		async (retentionDays: number, manualRetentionDays: number, tombstoneRetentionDays: number) => ({
 			deletedOccurrences: 0,
+			deletedAffectedUsers: 0,
+			deletedAffectedTenants: 0,
 			deletedOrphanedIssues: 0,
 			tombstonesWritten: 0,
 			deletedTombstones: 0,
@@ -86,5 +89,41 @@ describe('POST /api/cron/retention — retentionDays comes from the shared helpe
 
 		expect(retention.cleanupRetainedData).toHaveBeenCalledWith(45, 365, 30);
 		expect((await response.json()).result.retentionDays).toBe(45);
+	});
+});
+
+describe('POST /api/cron/retention — the side-table counts reach the response and the log line (§4.5, flow R3)', () => {
+	it('carries deletedAffectedUsers / deletedAffectedTenants as the integers the sweep returned', async () => {
+		retention.cleanupRetainedData.mockResolvedValueOnce({
+			deletedOccurrences: 11,
+			deletedAffectedUsers: 5,
+			deletedAffectedTenants: 3,
+			deletedOrphanedIssues: 0,
+			tombstonesWritten: 0,
+			deletedTombstones: 0,
+			retentionDays: 30,
+			manualRetentionDays: 365,
+			tombstoneRetentionDays: 30,
+			cutoffDate: new Date('2026-01-01T00:00:00Z'),
+		});
+
+		const response = await POST(cronRequest('s3cret'));
+
+		expect(response.status).toBe(200);
+		const { result } = await response.json();
+		expect(result.deletedAffectedUsers).toBe(5);
+		expect(result.deletedAffectedTenants).toBe(3);
+		// Beside deletedOccurrences, as the contract puts them -- and distinct from it, so a route
+		// that copied the wrong field would fail here.
+		expect(result.deletedOccurrences).toBe(11);
+
+		expect(logInfo).toHaveBeenCalledWith(
+			'retention_cron.completed',
+			expect.objectContaining({
+				deletedOccurrences: 11,
+				deletedAffectedUsers: 5,
+				deletedAffectedTenants: 3,
+			})
+		);
 	});
 });

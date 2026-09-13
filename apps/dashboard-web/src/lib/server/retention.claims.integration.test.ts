@@ -69,6 +69,11 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 
 	beforeAll(async () => {
 		sql = postgres(connectionString, { connect_timeout: 5, max: 1 });
+		// sentinel-affected-users: the retention.*.integration family sweeps the WHOLE database
+		// (`cleanupRetainedData` / `reapStaleClaims`) from parallel vitest workers, so it serialises
+		// on one session-level advisory lock -- same key in every member (see
+		// retention.affected.integration.test.ts, which explains the race). Released in afterAll.
+		await sql`select pg_advisory_lock(hashtext('sentinel.retention.integration'))`;
 		await sql`
 			insert into organizations (id, name, slug)
 			values (${orgId}, ${'claim-retention-it-' + suffix}, ${'claim-retention-it-' + suffix})
@@ -78,7 +83,7 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 			values (${projectId}, ${'claim-retention-it-' + suffix}, ${orgId},
 			        ${'k_' + suffix}, ${'h_' + suffix})
 		`;
-	});
+	}, 120_000);
 
 	afterAll(async () => {
 		if (!sql) return;
@@ -89,6 +94,7 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 			await sql`delete from projects where id = ${projectId}`;
 			await sql`delete from organizations where id = ${orgId}`;
 		} finally {
+			await sql`select pg_advisory_unlock_all()`.catch(() => {});
 			await sql.end({ timeout: 5 }).catch(() => {});
 		}
 	});
