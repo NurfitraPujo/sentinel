@@ -84,6 +84,8 @@ export const POST: RequestHandler = async ({ request }) => {
 			// sentinel-affected-users §4.5 (flow R3): side rows deleted, NOT issues touched.
 			deletedAffectedUsers: result.deletedAffectedUsers,
 			deletedAffectedTenants: result.deletedAffectedTenants,
+			// sentinel-issue-trend §4.5 (flow R3): bucket rows deleted, beside the side-table counts.
+			deletedOccurrenceBuckets: result.deletedOccurrenceBuckets,
 			deletedOrphanedIssues: result.deletedOrphanedIssues,
 			tombstonesWritten: result.tombstonesWritten,
 			deletedTombstones: result.deletedTombstones,
@@ -101,6 +103,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				deletedOccurrences: result.deletedOccurrences,
 				deletedAffectedUsers: result.deletedAffectedUsers,
 				deletedAffectedTenants: result.deletedAffectedTenants,
+				deletedOccurrenceBuckets: result.deletedOccurrenceBuckets,
 				deletedOrphanedIssues: result.deletedOrphanedIssues,
 				tombstonesWritten: result.tombstonesWritten,
 				deletedTombstones: result.deletedTombstones,

@@ -48,7 +48,43 @@
 	}
 
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
+	import TrendBarChart from '$lib/components/issues/TrendBarChart.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
+
+	// sentinel-issue-trend §3 "chart clocks", decision 11. The HOURLY chart writes each bucket's
+	// start in the viewer's local time through `formatDate` above — a UTC hour bucket rendered
+	// locally is still that hour's start, so no "UTC" word appears on it. The DAILY chart is UTC
+	// calendar days and says so: its heading carries "(UTC)" and every title and label is the UTC
+	// date — NEVER `formatDate`, which is `toLocaleString` with a time of day and renders
+	// `2026-09-13T00:00:00Z` as `Sep 12, 2026, 7:00 PM` for a UTC−5 viewer: every bar one date early.
+	function formatUtcDate(start: string): string {
+		return new Date(start).toLocaleDateString('en-US', {
+			timeZone: 'UTC',
+			month: 'short',
+			day: 'numeric',
+			year: 'numeric',
+		});
+	}
+
+	// Guidance, not acceptance (§4.2): the short axis labels — the local hour, the UTC day.
+	function formatLocalHour(start: string): string {
+		return new Date(start).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+	}
+
+	function formatUtcDay(start: string): string {
+		return new Date(start).toLocaleDateString('en-US', {
+			timeZone: 'UTC',
+			month: 'short',
+			day: 'numeric',
+		});
+	}
+
+	// Decision 16: below 30 days of retention the leading days are zero by construction and the day
+	// the cutoff falls in is partial; the heading says so, after the sum. `retentionDays` is page
+	// data (affected-users decision 21) — never a literal 30 here.
+	let dailyHeadingSuffix = $derived(
+		data.retentionDays < 30 ? ` (data kept for ${data.retentionDays} days)` : ''
+	);
 
 	interface StackFrame {
 		file: string;
@@ -145,6 +181,39 @@
 			<span class="meta-item" data-testid="issue-affected-tenants"><strong class="meta-label">Affected tenants (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedTenantCount, 'tenant')}</span>
 		</div>
 	</div>
+
+	<!--
+		sentinel-issue-trend §4.2, flows `D1`–`D6` (decisions 7, 11, 13, 16). Between `.issue-info` and
+		the Occurrence History: the two windowed series read as a summary of what the list below
+		details. Each heading names its window — `Last 24 hours: n`, `Last 30 days (UTC): n` — so the
+		three numbers on this page (those two and the lifetime `Occurrences:` above) can differ on
+		screen without any of them lying (`D6`). Both series arrive dense from the loader; the daily
+		one is already summed per UTC day; nothing is computed here but the sums in the headings.
+		Side by side, stacking under the page's narrow breakpoint — guidance, not acceptance.
+	-->
+	<section class="trend" data-testid="issue-trend">
+		<h2 class="section-title">Trend</h2>
+		<div class="trend-charts">
+			<TrendBarChart
+				heading="Last 24 hours"
+				points={data.trend.hourly}
+				formatStart={formatDate}
+				formatLabel={formatLocalHour}
+				lastSuffix=" (current hour)"
+				labelEvery={6}
+				testId="trend-hourly"
+			/>
+			<TrendBarChart
+				heading="Last 30 days (UTC)"
+				headingSuffix={dailyHeadingSuffix}
+				points={data.trend.daily}
+				formatStart={formatUtcDate}
+				formatLabel={formatUtcDay}
+				labelEvery={7}
+				testId="trend-daily"
+			/>
+		</div>
+	</section>
 
 	<IssueRelations
 		currentIssueId={data.issue.id}
@@ -297,6 +366,26 @@
 		font-weight: 600;
 		color: var(--text-primary);
 		margin-bottom: 1rem;
+	}
+
+	.trend {
+		margin-bottom: 2rem;
+	}
+
+	.trend-charts {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1.5rem;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 1.25rem;
+	}
+
+	@media (max-width: 768px) {
+		.trend-charts {
+			grid-template-columns: 1fr;
+		}
 	}
 
 	.occurrence-window {

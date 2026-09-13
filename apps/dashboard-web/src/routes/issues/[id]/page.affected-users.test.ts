@@ -29,6 +29,18 @@ function pageData(overrides: Record<string, unknown> = {}) {
 		occurrenceTotal: 12,
 		relations: [],
 		retentionDays: 30,
+		// sentinel-issue-trend §4.2 — the two dense series the template now reads (never absent). Not
+		// this file's subject; see `page.issue-trend.test.ts` beside it.
+		trend: {
+			hourly: Array.from({ length: 24 }, (_, i) => ({
+				start: new Date(Date.UTC(2026, 8, 12, 15 + i)).toISOString().slice(0, 19) + 'Z',
+				count: 0,
+			})),
+			daily: Array.from({ length: 30 }, (_, i) => ({
+				start: new Date(Date.UTC(2026, 7, 15 + i)).toISOString().slice(0, 19) + 'Z',
+				count: 0,
+			})),
+		},
 		...overrides,
 	};
 }

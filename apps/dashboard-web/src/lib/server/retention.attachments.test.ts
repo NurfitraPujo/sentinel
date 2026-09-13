@@ -29,6 +29,9 @@ vi.mock('$lib/db/schema', () => ({
 	// deletes from (raw SQL, so only their identity matters to the mock).
 	issueAffectedUsers: { issueId: 'issueId', lastSeen: 'lastSeen' },
 	issueAffectedTenants: { issueId: 'issueId', lastSeen: 'lastSeen' },
+	// sentinel-issue-trend §4.5: the bucket rollup the sweep deletes from with one raw `db.execute`
+	// (again only its identity matters to the mock).
+	issueOccurrenceBuckets: { issueId: 'issueId', bucketStart: 'bucketStart' },
 	issueComments: { id: 'id', issueId: 'issueId' },
 	attachments: { id: 'id', issueId: 'issueId', commentId: 'commentId', storageKey: 'storageKey' },
 	// N8: retention now also joins projects (for organization_id) and writes/prunes issueTombstones.
@@ -57,6 +60,10 @@ function makeQueueableDb() {
 	// the result queue (the sequence below is the autocommit calls only).
 	const tx = { execute: vi.fn(() => Promise.resolve([])) };
 	chain.transaction = vi.fn((callback: (tx: unknown) => unknown) => callback(tx));
+	// sentinel-issue-trend §4.5: the bucket delete is one raw top-level `db.execute` between the
+	// side-table transactions and the candidate select; always-empty here for the same reason
+	// (retention.buckets.integration.test.ts proves it against real Postgres).
+	chain.execute = vi.fn(() => Promise.resolve([]));
 	return { db: chain, resultQueue };
 }
 
@@ -73,8 +80,9 @@ beforeEach(() => {
 
 describe('cleanupRetainedData attachment cleanup (R6)', () => {
 	it('deletes storage objects for both issue-attached and comment-attached files on retention delete', async () => {
-		// Call sequence inside cleanupRetainedData (the two §4.5 side-table transactions between 1
-		// and 2 go through the pass-through `transaction` stub and never touch this queue):
+		// Call sequence inside cleanupRetainedData (the two §4.5 side-table transactions and the
+		// bucket delete's `execute` between 1 and 2 go through the pass-through `transaction` /
+		// `execute` stubs and never touch this queue):
 		// 1) delete errorOccurrences .returning()
 		// 2) select candidate issues (+innerJoin projects) .where() (thenable)
 		// 3) select comment ids for those issues .where() (thenable)

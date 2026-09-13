@@ -208,6 +208,16 @@ const (
 	affectedTenantsBumpQuery = `UPDATE issues SET affected_tenant_count = affected_tenant_count + 1 WHERE id = $1`
 )
 
+// occurrenceBucketUpsertQuery is sentinel-issue-trend §4.3's one statement, verbatim: $1 = issue.ID,
+// $2 = occ.CreatedAt.UTC().Truncate(time.Hour) (the UTC hour, computed in Go — §3, decision 2). The
+// conflict target is the table's composite PRIMARY KEY (issue_id, bucket_start).
+const occurrenceBucketUpsertQuery = `
+		INSERT INTO issue_occurrence_buckets (issue_id, bucket_start, count)
+		VALUES ($1, $2, 1)
+		ON CONFLICT (issue_id, bucket_start) DO UPDATE
+		   SET count = issue_occurrence_buckets.count + 1
+	`
+
 // rollupAffected runs one side table's pair of §4.3 statements inside tx: the upsert, then — only
 // when the upsert INSERTed — the count bump. Not savepointed (decision 8): unlike the registry touch,
 // the counts are a first-class fact, and a genuine error here (connection, constraint, disk) fails
@@ -415,13 +425,20 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     that upsert INSERTed (RETURNING xmax = 0) — a +1 on issues.affected_user_count /
 //     affected_tenant_count. After the duplicate check so a deduplicated redelivery never reaches it;
 //     before the registry touch; NOT savepointed (decision 8).
+//     4b. The occurrence bucket upsert (sentinel-issue-trend §4.3): one tx.Exec of
+//     INSERT INTO issue_occurrence_buckets … ON CONFLICT (issue_id, bucket_start) DO UPDATE SET
+//     count = count + 1, keyed on issue.ID and occ.CreatedAt.UTC().Truncate(time.Hour) computed in
+//     Go (§3, decision 2 — never date_trunc on a timestamptz, which truncates in the session's
+//     TimeZone). After step 4 and before the registry touch, so a deduplicated redelivery never
+//     reaches it; NOT savepointed (decision 1); behind the compile-time constant
+//     writeOccurrenceBucket (decision 20, bucket_write.go / bucket_write_off.go).
 //  5. The project_environments registry touch (sentinel-project-environments §4.8), savepointed.
 //     Then commit.
 //
 // Deadlock-freedom depends on this transaction acquiring its ONE contended lock (the issues row, via
 // ON CONFLICT DO UPDATE / the plain UPDATE) FIRST and holding it to commit — do not add audit
 // persistence, indexing, or any network I/O inside this transaction; move it after commit instead
-// (D-d). Two writes are the DELIBERATE exceptions to that sentence, and both were added knowing it:
+// (D-d). Three writes are the DELIBERATE exceptions to that sentence, and all three were added knowing it:
 //
 //   - the registry touch of step 5 (sentinel-project-environments decision 9) — the first exception,
 //     best-effort behind a savepoint; see its own block comment below.
@@ -437,6 +454,18 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     takes the same order (issues FOR UPDATE, then the side table — §4.5, decision 23). No cycle is
 //     possible between any two of these transactions. Cost, stated: an occurrence from a NEW user
 //     writes the issues row twice in one transaction (the upsert, then the bump).
+//   - the occurrence bucket upsert of step 4b (sentinel-issue-trend decision 1) — the THIRD
+//     deliberate exception, for the same reason as the second: a bucket that can move without an
+//     occurrence behind it is the S18 defect again, on a chart. Written after commit, a NAK between
+//     the occurrence commit and the bucket write would either lose the increment or, on retry, find
+//     the occurrence deduplicated and never count it. Inside, both land or neither does. The "one
+//     lock" property survives exactly as it does for the second exception: the issues row lock is
+//     still taken FIRST and held to commit, so two deliveries for the same issue are serialised
+//     before either touches a bucket row, two deliveries for different issues share no bucket row
+//     (the key includes issue_id), and the retention sweep takes bucket rows only — it never locks
+//     issues in that step — so ingest (issues → bucket) versus sweep (bucket only) has no cycle.
+//     Cost, stated: every stored occurrence writes one more row version — its hour's bucket row —
+//     on top of the issues row version it already writes; sentinel-issue-trend §13 M2 reports it.
 //
 // The IssueOutcome return is BEST-EFFORT and currently consumed by nobody — every call site discards
 // it (verified at ship time). Its New/Existing distinction comes from a plain SELECT before the
@@ -663,6 +692,22 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	if occ.AffectedTenantID != "" {
 		if err := rollupAffected(ctx, tx, affectedTenantsUpsertQuery, affectedTenantsBumpQuery, issue.ID, occ.AffectedTenantID, occ.CreatedAt); err != nil {
 			return IssueOutcomeExisting, false, err
+		}
+	}
+
+	// --- 4b. Occurrence bucket upsert (sentinel-issue-trend §4.3, decisions 1, 2, 9, 20) ---
+	//
+	// The third deliberate in-transaction exception named in this method's doc comment. Same
+	// position rules as step 4, for the same reasons: AFTER the duplicate rollback (flow I5), BEFORE
+	// the registry touch, NOT savepointed (decision 1) — a genuine error here fails the transaction
+	// and NATS redelivers. No RETURNING and no branch: nothing on issues is bumped for a new bucket.
+	// bucket_start is computed in Go, in UTC (§3, decision 2): PostgreSQL's date_trunc on a
+	// timestamptz truncates in the session's TimeZone, and a +05:30 session would put 20:29:59+05:30
+	// in a different hour than 14:00Z. Behind the compile-time constant so §13 M2's baseline build
+	// (-tags m2_nobucket) is this exact path minus this statement (decision 20).
+	if writeOccurrenceBucket {
+		if _, err := tx.Exec(ctx, occurrenceBucketUpsertQuery, issue.ID, occ.CreatedAt.UTC().Truncate(time.Hour)); err != nil {
+			return IssueOutcomeExisting, false, fmt.Errorf("occurrence bucket upsert failed for issue id=%s: %w", issue.ID, err)
 		}
 	}
 

@@ -13,6 +13,7 @@ import {
 	externalReporters,
 	issueAffectedUsers,
 	issueAffectedTenants,
+	issueOccurrenceBuckets,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
 import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
@@ -65,6 +66,10 @@ export interface RetentionResult {
 	// number of issues whose count was recomputed. Written by `sweepAffectedSideTable` below.
 	deletedAffectedUsers: number;
 	deletedAffectedTenants: number;
+	// sentinel-issue-trend §4.5 (flow R3): the number of `issue_occurrence_buckets` rows the sweep
+	// removed this run -- the length of the bucket DELETE's RETURNING, beside `deletedOccurrences`
+	// exactly as the two side-table counts are. Written by the bucket step in `cleanupRetainedData`.
+	deletedOccurrenceBuckets: number;
 }
 
 // sentinel-affected-users §4.5: one side table of the affected users/tenants rollup, as the sweep
@@ -228,6 +233,29 @@ export async function cleanupRetainedData(
 		AFFECTED_TENANTS_SIDE_TABLE,
 		cutoffDate
 	);
+
+	// sentinel-issue-trend §4.5 (flows R1, R3; decision 4): the hourly bucket rollup's aged rows go
+	// HERE -- immediately after the two side-table sweeps and before the orphan-issue delete, for
+	// readability with the other rollup step. Unlike that step it is ONE autocommit statement, in no
+	// transaction and taking no `issues` lock, because there is no count on `issues` to recompute
+	// from what remains: the delete either lands or throws (the route logs and returns non-2xx, and
+	// the next hourly run does the same work), and there is no invariant between this table and any
+	// other row, so there is no stale window. No `issues` lock also means no cycle with
+	// `StoreEvent`'s bucket upsert is possible (§4.3); an ingest with an old event clock that races
+	// this delete commits its row and is removed by the next run, as its occurrence row is (R4).
+	//
+	// `bucket_start < cutoff`, the same `cutoffDate` the occurrence delete used: a bucket whose hour
+	// starts before the cutoff holds occurrences that are all (or, for the ONE straddling bucket,
+	// partly) gone by now. The straddling bucket is removed up to an hour early -- at most 1 of 720
+	// hours, and outside the 30-day window at DATA_RETENTION_DAYS >= 30. `::timestamptz`, never
+	// `::timestamp`, for the reason `sweepAffectedSideTable` gives. An orphaned issue's buckets are
+	// NOT this statement's concern: they go with the issue through `ON DELETE CASCADE` (R2, §4.6).
+	const deletedOccurrenceBucketsResult = await db.execute<{ issue_id: string }>(sql`
+		DELETE FROM ${issueOccurrenceBuckets}
+		WHERE ${issueOccurrenceBuckets.bucketStart} < ${cutoffDate.toISOString()}::timestamptz
+		RETURNING issue_id
+	`);
+	const deletedOccurrenceBuckets = deletedOccurrenceBucketsResult.length;
 
 	// DEFECT FIX: this delete previously had no age check at all — it removed ANY zero-occurrence
 	// issue immediately, including one created moments ago whose first (and only) occurrence had
@@ -404,6 +432,7 @@ export async function cleanupRetainedData(
 		deletedExternalReporters,
 		deletedAffectedUsers,
 		deletedAffectedTenants,
+		deletedOccurrenceBuckets,
 	};
 }
 

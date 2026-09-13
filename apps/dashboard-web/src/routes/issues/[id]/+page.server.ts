@@ -9,6 +9,7 @@ import { resolveEnvironmentDisplayName } from '$lib/db/queries/environments';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getIssueRelations } from '$lib/db/queries/issues';
 import { getRetentionDays } from '$lib/server/retention-window';
+import { detailTrendWindow } from '$lib/server/trend-window';
 
 export const load: PageServerLoad = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -50,6 +51,12 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	}
 
 	const project = await issueQueries.getProjectById(issue.projectId);
+	// sentinel-issue-trend §4.2, decision 11 — AFTER both access checks above, keyed on the same
+	// `issueId` the loader has just been allowed to read (§2). One PK range query over the 30 UTC
+	// calendar days ending today, bounded at both ends, densified by the reader into `hourly` (24)
+	// and `daily` (30). The window is taken from one instant so the two headings agree on "now".
+	const { windowStart, windowEnd } = detailTrendWindow(new Date());
+	const trend = await issueQueries.trendForIssue(issueId, windowStart, windowEnd);
 	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
 	// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
 	// `getOccurrencesByIssueId` caps at 100. The heading takes this real `COUNT(*)`; the list below
@@ -75,6 +82,9 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		occurrenceTotal,
 		environmentDisplayName,
 		relations,
+		// sentinel-issue-trend §4.2 — top level beside `issue`: `{ hourly: TrendPoint[24], daily:
+		// TrendPoint[30] }`, dense, oldest first, the last entry of each the current partial slot.
+		trend,
 		// sentinel-affected-users §4.2, decision 21 — top level beside `issue`, the same number `/`
 		// returns and the retention sweep uses: `Affected users (last {retentionDays} days)`. The two
 		// counts themselves need no loader change; `getIssueById` selects the whole row.

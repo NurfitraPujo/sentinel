@@ -1,8 +1,9 @@
 import { db } from "$lib/server/db";
-import { issues, errorOccurrences, projects } from "$lib/db/schema";
-import { eq, desc, sql, and, inArray, type SQL } from "drizzle-orm";
+import { issues, errorOccurrences, projects, issueOccurrenceBuckets } from "$lib/db/schema";
+import { eq, gte, lte, desc, asc, sql, and, inArray, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort } from "$lib/server/issue-sort";
+import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
 
 export interface IssueFilters {
     status?: string;
@@ -49,6 +50,39 @@ export interface IssueFilters {
      * the order the same rows are listed in.
      */
     sort?: string;
+    /**
+     * sentinel-issue-trend §4.1, decision 6 — the `new=24h` FILTER, as the instant it stands for:
+     * `first_seen >= firstSeenAfter`. Unlike `sort` this IS a predicate and goes through
+     * `buildIssueConditions`, so `pagination.total` narrows with it. The loader coerces `new` and
+     * takes `now` ONCE (`firstSeenLowerBound`), then passes the same `Date` to `listIssues` and
+     * `countIssues`; `undefined` (the `all` case) adds nothing.
+     */
+    firstSeenAfter?: Date;
+}
+
+/**
+ * sentinel-issue-trend §4.2 — one point of a dense series: the bucket's (hourly) or the UTC day's
+ * (daily) start as RFC 3339 UTC with a `Z`, and a count that is `≥ 0` and never `null`.
+ */
+export interface TrendPoint {
+    start: string;
+    count: number;
+}
+
+/** §4.2's `trend` page-data key: `hourly` is 24 long, `daily` is 30 long, both dense, oldest first. */
+export interface IssueTrend {
+    hourly: TrendPoint[];
+    daily: TrendPoint[];
+}
+
+/** The slot's start as the contract writes it: `2026-09-13T14:00:00Z` — second precision, `Z`. */
+function slotStartIso(ms: number): string {
+    return new Date(ms).toISOString().slice(0, 19) + "Z";
+}
+
+/** The number of hourly slots in `[windowStart … windowEnd]`, both ends inclusive. */
+function hourlySlotCount(windowStart: Date, windowEnd: Date): number {
+    return Math.floor((windowEnd.getTime() - windowStart.getTime()) / HOUR_MS) + 1;
 }
 
 /**
@@ -104,6 +138,13 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
         conditions.push(guard);
     }
 
+    // sentinel-issue-trend §4.1 (decision 6): `new=24h`, ANDed inside the guards above — one more
+    // condition on the same query, never a read path around them. Here rather than in `listIssues`
+    // so the count narrows with the list by construction.
+    if (filters.firstSeenAfter) {
+        conditions.push(gte(issues.firstSeen, filters.firstSeenAfter));
+    }
+
     return conditions;
 }
 
@@ -121,11 +162,26 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
  *
  * `last_seen` is `last_seen DESC` and nothing else — unchanged, deliberately: the default must be
  * exactly today's order, ties included.
+ *
+ * sentinel-issue-trend §4.1 (decision 5) adds two, both ending in the unique key:
+ *
+ *  - `count` is `count DESC, last_seen DESC, id DESC`: ties on `count` are common at the low end
+ *    (every fresh issue is `1`), `last_seen` breaks most of them, `id` is the unique final key. The
+ *    key order of `idx_issues_project_count` (1724700000).
+ *  - `first_seen` is `first_seen DESC NULLS LAST, id DESC`, and the `NULLS LAST` is spelled out on
+ *    purpose: the column is nullable in the DDL (`1716508800_init.sql`: `first_seen TIMESTAMP WITH
+ *    TIME ZONE DEFAULT NOW()`, no `NOT NULL`) and PostgreSQL's default for `DESC` is `NULLS FIRST`,
+ *    so Drizzle's `desc()` — a bare `DESC` — would put a null-`first_seen` row at the TOP of
+ *    "newest first". The key order of `idx_issues_project_first_seen`.
  */
 function issueOrder(sort: string | undefined): SQL[] {
     switch (coerceIssueSort(sort)) {
         case "affected_users":
             return [desc(issues.affectedUserCount), desc(issues.lastSeen), desc(issues.id)];
+        case "count":
+            return [desc(issues.count), desc(issues.lastSeen), desc(issues.id)];
+        case "first_seen":
+            return [sql`${issues.firstSeen} DESC NULLS LAST`, desc(issues.id)];
         case "last_seen":
             return [desc(issues.lastSeen)];
     }
@@ -184,6 +240,12 @@ export const issueQueries = {
                 // §4.1 page data: `0` is `0`, never omitted — NOT NULL DEFAULT 0 on the column.
                 affectedUserCount: issues.affectedUserCount,
                 affectedTenantCount: issues.affectedTenantCount,
+                // sentinel-issue-trend §4.1, decision 22 — two EXISTING columns added to the
+                // projection for the card's `REGRESSED` badge; nothing on the schema changes.
+                // `regression_status` is `NOT NULL DEFAULT 'none'` (`none | regressed` by CHECK);
+                // `last_regressed_at` is null until the processor's regression UPDATE has run.
+                regressionStatus: issues.regressionStatus,
+                lastRegressedAt: issues.lastRegressedAt,
             })
             .from(issues)
             .where(and(...conditions))
@@ -203,6 +265,117 @@ export const issueQueries = {
             .where(and(...conditions));
 
         return Number(totalResult[0]?.count ?? 0);
+    },
+
+    /**
+     * sentinel-issue-trend §4.1 — the per-card series for one page of the list, in ONE query.
+     *
+     * Keyed on the ids `listIssues` already returned under the project and environment guards — it
+     * takes ids, never a project or a user, so it cannot widen the set (§2): an id outside `ids`
+     * contributes nothing even when it has rows. Bounded at BOTH ends (§3, decision 18): a row past
+     * `windowEnd` — a future-dated event timestamp — neither extends a series nor lands in its last
+     * slot.
+     *
+     * Dense by construction: every id in `ids` maps to `hourlySlotCount` zeros before any row is
+     * placed, so a quiet issue is `[0 × 24]`, never absent and never shorter. Rows are placed by
+     * slot index; the query's bounds guarantee every row has a slot, so nothing is dropped.
+     *
+     * **`ids = []` returns an empty `Map` and issues NO query.** `drizzle-orm@0.30.10`'s `inArray`
+     * throws on an empty array (`inArray requires at least one value` — the hazard this file's
+     * header documents for the project guard), and an empty page (`new=24h` with nothing new, a
+     * page past the end) has nothing to attach a series to and must not 500.
+     */
+    async trendForIssues(ids: string[], windowStart: Date, windowEnd: Date): Promise<Map<string, number[]>> {
+        const slots = hourlySlotCount(windowStart, windowEnd);
+        const series = new Map<string, number[]>();
+        for (const id of ids) {
+            series.set(id, new Array<number>(slots).fill(0));
+        }
+        if (ids.length === 0) {
+            return series;
+        }
+
+        const rows = await db
+            .select({
+                issueId: issueOccurrenceBuckets.issueId,
+                bucketStart: issueOccurrenceBuckets.bucketStart,
+                count: issueOccurrenceBuckets.count,
+            })
+            .from(issueOccurrenceBuckets)
+            .where(
+                and(
+                    inArray(issueOccurrenceBuckets.issueId, ids),
+                    gte(issueOccurrenceBuckets.bucketStart, windowStart),
+                    lte(issueOccurrenceBuckets.bucketStart, windowEnd)
+                )
+            );
+
+        for (const row of rows) {
+            const points = series.get(row.issueId);
+            const slot = Math.floor((row.bucketStart.getTime() - windowStart.getTime()) / HOUR_MS);
+            // Neither branch is reachable — the query is keyed on `ids` and bounded on both ends —
+            // but a densifier that could write past its array would silently grow a series.
+            if (!points || slot < 0 || slot >= slots) continue;
+            points[slot] += row.count;
+        }
+        return series;
+    },
+
+    /**
+     * sentinel-issue-trend §4.2, decision 11 — both detail series from ONE query over the 30-day
+     * CALENDAR window: `windowStart` = `00:00:00Z` of (UTC today − 29 days), `windowEnd` =
+     * `trunc(now)`, ≤ 720 rows. Densified here, not in the template (decision 7):
+     *
+     *  - `hourly`: the 24 slots ending at `windowEnd` — `[0].start = windowEnd − 23h`,
+     *    `[23].start = windowEnd`, the current partial hour.
+     *  - `daily`: one entry per UTC calendar day from `windowStart` to `windowEnd`'s day, so
+     *    `daily[i].start = windowStart + i days` and the last entry is today (UTC), partial. Each
+     *    day's count is the sum of the hourly rows whose `bucket_start` falls in that UTC day.
+     *
+     * Bounded at both ends for the same reason as `trendForIssues`; the densifier never grows an
+     * array, and the bounds mean it is never handed a row it would have to drop.
+     */
+    async trendForIssue(issueId: string, windowStart: Date, windowEnd: Date): Promise<IssueTrend> {
+        const rows = await db
+            .select({
+                bucketStart: issueOccurrenceBuckets.bucketStart,
+                count: issueOccurrenceBuckets.count,
+            })
+            .from(issueOccurrenceBuckets)
+            .where(
+                and(
+                    eq(issueOccurrenceBuckets.issueId, issueId),
+                    gte(issueOccurrenceBuckets.bucketStart, windowStart),
+                    lte(issueOccurrenceBuckets.bucketStart, windowEnd)
+                )
+            )
+            .orderBy(asc(issueOccurrenceBuckets.bucketStart));
+
+        const hourlyStartMs = windowEnd.getTime() - (TREND_HOURLY_SLOTS - 1) * HOUR_MS;
+        const hourly: TrendPoint[] = Array.from({ length: TREND_HOURLY_SLOTS }, (_, i) => ({
+            start: slotStartIso(hourlyStartMs + i * HOUR_MS),
+            count: 0,
+        }));
+
+        const dailyStartMs = windowStart.getTime();
+        const dayCount = Math.floor((utcDayStart(windowEnd).getTime() - dailyStartMs) / DAY_MS) + 1;
+        const daily: TrendPoint[] = Array.from({ length: dayCount }, (_, i) => ({
+            start: slotStartIso(dailyStartMs + i * DAY_MS),
+            count: 0,
+        }));
+
+        for (const row of rows) {
+            const at = row.bucketStart.getTime();
+            const hour = Math.floor((at - hourlyStartMs) / HOUR_MS);
+            if (hour >= 0 && hour < TREND_HOURLY_SLOTS) {
+                hourly[hour].count += row.count;
+            }
+            const day = Math.floor((at - dailyStartMs) / DAY_MS);
+            if (day >= 0 && day < dayCount) {
+                daily[day].count += row.count;
+            }
+        }
+        return { hourly, daily };
     },
 
     /**

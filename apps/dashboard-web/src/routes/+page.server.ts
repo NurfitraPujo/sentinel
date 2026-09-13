@@ -5,8 +5,9 @@ import { getUser } from '$lib/server/auth';
 import { getAccessibleProjects } from '$lib/server/issue-access';
 import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
 import { listProjectEnvironments, toEnvironmentApiShape } from '$lib/db/queries/environments';
-import { coerceIssueSort } from '$lib/server/issue-sort';
+import { coerceIssueNewFilter, coerceIssueSort, firstSeenLowerBound } from '$lib/server/issue-sort';
 import { getRetentionDays } from '$lib/server/retention-window';
+import { listTrendWindow, TREND_HOURLY_SLOTS } from '$lib/server/trend-window';
 
 export const load: PageServerLoad = async ({ url, locals }) => {
 	const user = await getUser({ locals } as any);
@@ -64,12 +65,23 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	// keep riding on links (`href()` builds every anchor from `filters.sort`).
 	const sort = coerceIssueSort(url.searchParams.get('sort'));
 
+	// sentinel-issue-trend §4.1, decision 6 — `new` is coerced the same way (`banana` → `all`, and
+	// `all` is what the echo says), but unlike `sort` it is a FILTER: `24h` becomes a `first_seen`
+	// lower bound inside the shared condition builder, so the list and `pagination.total` narrow
+	// together. ONE instant for the whole request: the bound and the sparkline window below are
+	// both taken from it, so the list, the count and the 24 series agree on what "now" is.
+	const now = new Date();
+	const newFilter = coerceIssueNewFilter(url.searchParams.get('new'));
+	const firstSeenAfter = firstSeenLowerBound(newFilter, now);
+
 	const filters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
 		projectIds: authorizedProjectIds,
 		environment: effectiveEnvironment,
 		environmentScopes,
+		// The SAME `Date` to both queries (below), never recomputed per call.
+		firstSeenAfter,
 	};
 
 	const [results, userProjects, total] = await Promise.all([
@@ -94,11 +106,30 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 				)
 			: [];
 
+	// §4.1's per-card series, decision 10: ONE query for the whole page, keyed on exactly the ids
+	// `listIssues` returned under the guards — it takes ids, never a project or a user, so it cannot
+	// widen the set (§2). Skipped outright when the page is empty: there is nothing to attach a
+	// series to, and `inArray([])` throws in this Drizzle version (the reader guards it too; the
+	// loader simply never asks).
+	const { windowStart, windowEnd } = listTrendWindow(now);
+	const trends =
+		results.length > 0
+			? await issueQueries.trendForIssues(
+					results.map((issue) => issue.id),
+					windowStart,
+					windowEnd
+				)
+			: new Map<string, number[]>();
+
 	const issuesWithProject = results.map((issue) => {
 		const project = userProjects.find(p => p.id === issue.projectId);
 		return {
 			...issue,
 			projectName: project?.name ?? 'Unknown Project',
+			// Dense, oldest first, `[23]` = the current partial UTC hour; `[0 × 24]` for a quiet
+			// issue — never `null`, never shorter (§3). The reader returns an entry for every id it
+			// was given; the fallback only says what shape the page data has, not where it came from.
+			trend24h: trends.get(issue.id) ?? new Array<number>(TREND_HOURLY_SLOTS).fill(0),
 		};
 	});
 
@@ -115,6 +146,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			environment: effectiveEnvironment,
 			// The coerced value again (§4.1): `banana` echoes `last_seen`.
 			sort,
+			// sentinel-issue-trend §4.1: the coerced value, for the same reason — `href()` builds
+			// every anchor from this echo, so `banana` echoes `all`, never the bad string.
+			new: newFilter,
 		},
 		// §4.1, decision 21 — top level, beside `filters`. The window every count label carries
 		// ("in the last N days"); a template cannot read `$env/dynamic/private`, and the number has
