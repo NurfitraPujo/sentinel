@@ -105,6 +105,9 @@
 	}
 </script>
 
+<!-- Decision 16's zero shape, the same as the list card's: the dash replaces the number only. -->
+{#snippet affectedFigure(count: number, kind: 'user' | 'tenant')}{#if count === 0}<span class="zero" title="no {kind} id reported in the last {data.retentionDays} days">—</span>{:else}{Number(count).toLocaleString()}{/if}{/snippet}
+
 <div class="issue-detail">
 	<header class="detail-nav">
 		<a href="/" class="back-link">&larr; Back to Issues</a>
@@ -131,6 +134,15 @@
 			<span class="meta-item"><strong class="meta-label">First seen:</strong> {formatDate(data.issue.firstSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Last seen:</strong> {formatDate(data.issue.lastSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>
+			<!--
+				sentinel-affected-users §4.2, flow `D1` (decisions 12, 15, 16, 21). Two more items after
+				Occurrences, each label carrying the window — `retentionDays` is page data from the
+				loader, never a literal 30, because a template cannot read `$env/dynamic/private`. A `0`
+				takes the list card's zero shape: the dash replaces only the number, on its own span, and
+				its `title` says why — no usable id inside the window is not "nobody was affected".
+			-->
+			<span class="meta-item" data-testid="issue-affected-users"><strong class="meta-label">Affected users (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedUserCount, 'user')}</span>
+			<span class="meta-item" data-testid="issue-affected-tenants"><strong class="meta-label">Affected tenants (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedTenantCount, 'tenant')}</span>
 		</div>
 	</div>
 
@@ -274,6 +286,10 @@
 	.meta-label {
 		color: var(--text-subtle);
 		font-weight: 500;
+	}
+
+	.meta-item .zero {
+		cursor: help;
 	}
 
 	.section-title {

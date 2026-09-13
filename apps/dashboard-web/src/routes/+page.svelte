@@ -61,8 +61,22 @@
 	 * changing. On `project=all` the control is not rendered (`data.environments` is `[]`), so that
 	 * anchor is the only way out of the filter — it cannot be the link that preserves it. The loader
 	 * coerces the echo to `all` there as well, which is what normally keeps this branch unreachable.
+	 *
+	 * `sort` (sentinel-affected-users §4.1) rides on every anchor the way `environment` does, with
+	 * one difference: it SURVIVES a project change (decision 17) — an order is not project-scoped
+	 * the way an environment name is, so only `environment` resets. It is OMITTED from the query
+	 * string when it is `last_seen`: the default is the absence, so a bookmark made before this
+	 * feature keeps meaning what it said, and a page loaded as `/?sort=banana` — which the loader
+	 * echoes as `last_seen` — builds anchors that carry nothing (flow `L7`). The sort anchors do not
+	 * carry `page`: a change of order starts again from page 1.
 	 */
-	function href(params: { status?: string; project?: string; environment?: string; page?: number }) {
+	function href(params: {
+		status?: string;
+		project?: string;
+		environment?: string;
+		sort?: IssueSortValue;
+		page?: number;
+	}) {
 		const status = params.status ?? data.filters.status;
 		const project = params.project ?? data.filters.project;
 		const environment =
@@ -70,15 +84,30 @@
 			(params.project !== undefined && params.project !== data.filters.project)
 				? 'all'
 				: (params.environment ?? data.filters.environment);
+		const sort = params.sort ?? data.filters.sort;
 
 		const q = new URLSearchParams();
 		q.set('status', status);
 		q.set('project', project);
 		if (environment && environment !== 'all') q.set('environment', environment);
+		if (sort && sort !== 'last_seen') q.set('sort', sort);
 		if (params.page && params.page > 1) q.set('page', String(params.page));
 		return `?${q.toString()}`;
 	}
+
+	// sentinel-affected-users §4.1, flows `L2`/`L3`. The Sort group is a LIST of entries, not two
+	// hard-coded anchors, because `sentinel-occurrence-histogram` adds more later and that must be
+	// a data change here. The template never validates `sort`: the loader coerces an unknown value
+	// to `last_seen` and echoes it on `filters.sort`, which is all the active state reads.
+	type IssueSortValue = typeof data.filters.sort;
+	const sortOptions: { value: IssueSortValue; label: string }[] = [
+		{ value: 'last_seen', label: 'Last seen' },
+		{ value: 'affected_users', label: 'Affected users' },
+	];
 </script>
+
+<!-- Decision 16's zero shape, stated once: the dash replaces the number only, on its own span. -->
+{#snippet affectedFigure(count: number, kind: 'user' | 'tenant')}{#if count === 0}<span class="zero" title="no {kind} id reported in the last {data.retentionDays} days">—</span>{:else}{Number(count).toLocaleString()}{/if}{/snippet}
 
 <div class="dashboard">
 	<aside class="filters">
@@ -118,6 +147,25 @@
 				<a href={href({ status: 'ignored' })}
 				   class:active={data.filters.status === 'ignored'}>Ignored</a>
 			</li>
+		</ul>
+
+		<!--
+			sentinel-affected-users §4.1, flows `L2`-`L7`. After Status, before Environment: status and
+			order are the two things a triager sets first, and the environment group below is absent
+			on `project=all`, so this keeps the top of the aside stable across that change. Anchors on
+			the query string in the same idiom as the groups above — the order is the server's.
+		-->
+		<h2>Sort</h2>
+		<ul data-testid="sort-control">
+			{#each sortOptions as option (option.value)}
+				<li>
+					<a href={href({ sort: option.value })}
+					   class:active={data.filters.sort === option.value}
+					   data-testid="sort-{option.value}">
+						{option.label}
+					</a>
+				</li>
+			{/each}
 		</ul>
 
 		<!--
@@ -191,10 +239,29 @@
 							filter active, because that is when a reader might otherwise take the number
 							for a project-wide one.
 						-->
-						<span class="count">
-							{Number(issue.count).toLocaleString()} occurrences{#if environmentActive}
-								<span class="count-scope">in {activeEnvironmentLabel}</span>
-							{/if}
+						<span class="impact">
+							<span class="count">
+								{Number(issue.count).toLocaleString()} occurrences{#if environmentActive}
+									<span class="count-scope">in {activeEnvironmentLabel}</span>
+								{/if}
+							</span>
+							<!--
+								sentinel-affected-users §4.1, flow `L1` (decisions 12, 15, 16, 21). Two more
+								impact numbers beside the occurrence count, ONE window suffix after the
+								tenant figure, the window being page data (`retentionDays`) and never a
+								literal 30. The scope note above applies to these equally — an `issues` row
+								IS one environment (§3) — and is kept on the occurrence span (flow `L8`, the
+								second of the two allowed compositions) so nothing here moves. A `0` means
+								"no usable id inside the window", not "nobody was affected", so the dash
+								replaces ONLY the number and says why on its `title`.
+							-->
+							·
+							<span class="affected" data-testid="issue-affected">
+								<span data-testid="issue-affected-users">{@render affectedFigure(issue.affectedUserCount, 'user')} users</span>
+								·
+								<span data-testid="issue-affected-tenants">{@render affectedFigure(issue.affectedTenantCount, 'tenant')} tenants</span>
+								in the last {data.retentionDays} days
+							</span>
 						</span>
 						<span class="last-seen">Last seen: {formatDate(issue.lastSeen)}</span>
 					</div>
@@ -421,6 +488,17 @@
 	.count-scope {
 		margin-left: 0.375rem;
 		color: var(--text-muted);
+	}
+
+	.impact {
+		display: inline-flex;
+		flex-wrap: wrap;
+		column-gap: 0.375rem;
+	}
+
+	.affected .zero {
+		color: var(--text-muted);
+		cursor: help;
 	}
 
 	.environment-empty {
