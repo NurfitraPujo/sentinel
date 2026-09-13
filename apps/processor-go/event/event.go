@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/fingerprint"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/normalizer"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
@@ -20,6 +21,12 @@ import (
 // service.go's maxEventIDLength / the proto's "error_event.event_id" CEL rule
 // (docs/plans/IDEMPOTENCY_PLAN.md D-g).
 const maxEventIDLength = 64
+
+// maxAffectedIDBytes is sentinel-affected-users §4.3's decision-5 bound on a user/tenant identifier:
+// issue_affected_users.user_id and issue_affected_tenants.tenant_id are VARCHAR(255), matching
+// error_search_index.user_id / tenant_id. Counted in BYTES, as the contract states it — stricter
+// than the column (which counts characters), never looser, so a value that passes here always fits.
+const maxAffectedIDBytes = 255
 
 type ErrorEvent struct {
 	Fingerprint string `json:"fingerprint"`
@@ -52,6 +59,29 @@ type ErrorEvent struct {
 	// exactly the bug this comment exists to prevent, and it is pinned by a unit test that must fail
 	// if EventID is ever added to Normalize's field list.
 	EventID string `json:"event_id"`
+	// AffectedUserID / AffectedTenantID feed the per-issue affected users/tenants rollup
+	// (sentinel-affected-users §4.3, decision 3) and, from the same release, error_search_index's
+	// user_id/tenant_id columns (decisions 13/19). They are read in Normalize BEFORE
+	// `e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))` runs — exactly where the
+	// release_version fallback is read, and for the same reason (VERIFIED_STATE.md S5 / B6): the
+	// normalizer rewrites every UUID in the map to the literal "<UUID>", every run of >= 6 digits to
+	// "<NUMERIC_ID>" and every email to "<EMAIL>", so a rollup fed from the post-normalisation map
+	// would count exactly one affected user — "<UUID>" — per issue (contract §1's second fact). The
+	// key precedence is indexer.UserIDFromMetadata / TenantIDFromMetadata, the search index's own,
+	// verbatim (decision 24). The value here is decision-5-bounded by BoundAffectedID (non-empty,
+	// <= 255 bytes, no control character; "" means "nothing usable") and the matching *SkipReason
+	// field says why it is "" when a key WAS present — the closed set obs.AffectedRollupReason*, ""
+	// when the value was usable or no key existed at all.
+	//
+	// Like EventID above, these MUST NEVER be passed through normalizer.NormalizeString or
+	// masker.MaskString: identity is the exact byte string (decision 6), and a normalised id is the
+	// bug this feature exists to route around. If you are tempted to add a line normalising or
+	// masking either field in Normalize, don't — tests/unit/processor_event_test.go's
+	// TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical fails the moment you do.
+	AffectedUserID           string `json:"affected_user_id"`
+	AffectedUserSkipReason   string `json:"affected_user_skip_reason,omitempty"`
+	AffectedTenantID         string `json:"affected_tenant_id"`
+	AffectedTenantSkipReason string `json:"affected_tenant_skip_reason,omitempty"`
 }
 
 type StackFrame struct {
@@ -82,8 +112,46 @@ func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker
 				e.ReleaseVersion = rv
 			}
 		}
+		// sentinel-affected-users §4.3 (decision 3): the affected user/tenant identifiers, read here
+		// for the same reason release_version is — after the next line a UUID reads "<UUID>". See the
+		// AffectedUserID field comment. Bounded at the read (decision 5) so every consumer — the
+		// side tables in store.StoreEvent and the index overwrite in processEventInternal — sees one
+		// value; "present but unusable" is what the *SkipReason fields carry to the after-commit
+		// counter. Never normalised, never masked (pinned by a unit test — see the field comment).
+		if raw, present := indexer.UserIDFromMetadata(e.Metadata); present {
+			e.AffectedUserID, e.AffectedUserSkipReason = BoundAffectedID(raw)
+		}
+		if raw, present := indexer.TenantIDFromMetadata(e.Metadata); present {
+			e.AffectedTenantID, e.AffectedTenantSkipReason = BoundAffectedID(raw)
+		}
 		e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))
 	}
+}
+
+// BoundAffectedID is sentinel-affected-users decision 5, modelled on the D-g event_id clamp in
+// Deserialize below: a user/tenant identifier is USABLE when it is non-empty, at most
+// maxAffectedIDBytes bytes and carries no control character (rune < 0x20 or 0x7f — the same
+// predicate D-g applies). A usable value is returned verbatim with reason "". An unusable value is
+// returned as "" — treated as absent: no side-table row, no count bump, the event is still stored —
+// with the reason from the CLOSED set obs.AffectedRollupReasonEmpty / TooLong / ControlChar, which
+// store.StoreEvent records on sentinel_affected_rollup_skipped_total after commit.
+//
+// Why drop rather than truncate or fail: a truncated identifier is a DIFFERENT identifier and would
+// manufacture users; and letting the value reach the VARCHAR(255) / CHECK (<> ”) statements would
+// raise a class-22/23 error inside StoreEvent's transaction, which classifyStoreError treats as
+// Permanent — dead-lettering a perfectly storable occurrence over a metadata field (the exact
+// failure D-g exists to prevent for event_id). Length is counted in bytes, as the contract states
+// the bound; NUL in particular cannot be stored in a Postgres varchar at all.
+func BoundAffectedID(id string) (string, string) {
+	switch {
+	case id == "":
+		return "", obs.AffectedRollupReasonEmpty
+	case len(id) > maxAffectedIDBytes:
+		return "", obs.AffectedRollupReasonTooLong
+	case strings.ContainsFunc(id, func(r rune) bool { return r < 0x20 || r == 0x7f }):
+		return "", obs.AffectedRollupReasonControlChar
+	}
+	return id, ""
 }
 
 func Deserialize(data []byte) (*ErrorEvent, error) {

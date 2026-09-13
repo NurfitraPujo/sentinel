@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/fingerprint"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
@@ -26,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // This file is W3 of docs/plans/IDEMPOTENCY_PLAN.md (P9-3): the (a)-(g) proof suite for the
@@ -576,6 +579,142 @@ func TestEventIdempotency_DuplicateDoesNotFeedAlertsOrSearchIndex(t *testing.T) 
 	assert.Equal(t, projectID, got[0].alert.ProjectID)
 }
 
+// TestAffectedRollup_WireIDsLandVerbatimInIndexAndSideTables is sentinel-affected-users contract
+// §11's second boundary — ProcessEvent with only a pgx pool, exactly as the test above — and the
+// decision-19 / decision-3 proof on the WIRE: a UUID `user_id`, a 7-digit `tenant_id` and an email
+// `user` go through Deserialize -> Normalize -> StoreEvent -> IndexOccurrence and land VERBATIM in
+// error_search_index.user_id / tenant_id (flow I8) and in issue_affected_users /
+// issue_affected_tenants (flow I1/I2). It sits beside the search-index test above because that is
+// the one place this suite already reads the index after commit.
+//
+// It fails at the branch point by construction: there, ExtractSearchFields reads the
+// POST-normalisation map and error_search_index.user_id holds the literal "<UUID>" (contract §1's
+// second fact), and nothing writes the side tables at all. The 300-byte id is the decision-5 half of
+// I8: it lands as NULL in the index — absent, not a failed VARCHAR(255) insert — and the event is
+// still stored.
+func TestAffectedRollup_WireIDsLandVerbatimInIndexAndSideTables(t *testing.T) {
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+	}
+	pool := newPostgresPool(t, cfg)
+	t.Cleanup(func() { pool.Close() })
+
+	projectName := uniqueProjectName("aff-wire")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("aff-wire"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	svc := service.NewProcessorService(pool)
+
+	const (
+		uuidUser     = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+		digitsTenant = "1234567"
+		emailUser    = "alice@example.com"
+	)
+	tooLongUser := strings.Repeat("x", 300)
+
+	// One issue (one fingerprint), three deliveries: UUID user + 7-digit tenant, then an email under
+	// the `user` key, then a 300-byte user_id.
+	fp := "fp-aff-wire-" + uuid.New().String()
+	deliver := func(eventID string, metadata map[string]interface{}) {
+		t.Helper()
+		data, err := proto.Marshal(affectedProtoEvent(t, projectName, fp, eventID, metadata))
+		require.NoError(t, err)
+		require.NoError(t, svc.ProcessEvent(ctx, data))
+	}
+	deliver("evt-aff-wire-uuid-"+uuid.New().String(), map[string]interface{}{"user_id": uuidUser, "tenant_id": digitsTenant})
+	deliver("evt-aff-wire-email-"+uuid.New().String(), map[string]interface{}{"user": emailUser})
+	deliver("evt-aff-wire-long-"+uuid.New().String(), map[string]interface{}{"user_id": tooLongUser})
+
+	var issueID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND fingerprint = $2`, projectID, fp).Scan(&issueID))
+
+	// --- The index (decision 19, flow I8): the raw ids, and NULL for the unusable one.
+	var indexed []struct{ user, tenant *string }
+	rows, err := pool.Query(ctx,
+		`SELECT s.user_id, s.tenant_id FROM error_search_index s
+		   JOIN error_occurrences eo ON eo.id = s.occurrence_id
+		  WHERE eo.issue_id = $1 ORDER BY eo.created_at, eo.id`, issueID)
+	require.NoError(t, err)
+	for rows.Next() {
+		var u, tn *string
+		require.NoError(t, rows.Scan(&u, &tn))
+		indexed = append(indexed, struct{ user, tenant *string }{u, tn})
+	}
+	rows.Close()
+	// assert, not require: at the branch point this is 2 (the 300-byte id fails the after-commit
+	// VARCHAR(255) insert), and the verbatim-value assertions below are the ones criterion 1 wants
+	// to see fail with "<UUID>".
+	assert.Len(t, indexed, 3, "all three occurrences are stored AND indexed — the 300-byte id must not fail the after-commit insert")
+
+	var userIDs, tenantIDs []string
+	for _, r := range indexed {
+		if r.user != nil {
+			userIDs = append(userIDs, *r.user)
+		}
+		if r.tenant != nil {
+			tenantIDs = append(tenantIDs, *r.tenant)
+		}
+	}
+	assert.ElementsMatch(t, []string{uuidUser, emailUser}, userIDs,
+		"error_search_index.user_id must hold the UUID and the email VERBATIM — \"<UUID>\" / \"<EMAIL>\" means the "+
+			"index was fed from the post-normalisation map (decision 19 regression); the 300-byte id must be NULL, not present")
+	assert.Equal(t, []string{digitsTenant}, tenantIDs,
+		"error_search_index.tenant_id must hold the 7-digit id VERBATIM — \"<NUMERIC_ID>\" means it was normalised")
+
+	// --- The side tables (decision 3, flows I1/I2): the same verbatim values, the 300-byte id absent.
+	var sideUsers []string
+	rows, err = pool.Query(ctx, `SELECT user_id FROM issue_affected_users WHERE issue_id = $1 ORDER BY user_id`, issueID)
+	require.NoError(t, err)
+	for rows.Next() {
+		var u string
+		require.NoError(t, rows.Scan(&u))
+		sideUsers = append(sideUsers, u)
+	}
+	rows.Close()
+	assert.Equal(t, []string{uuidUser, emailUser}, sideUsers,
+		"issue_affected_users must hold the UUID and the email as those EXACT strings, and no row for the 300-byte id")
+
+	var sideTenants []string
+	rows, err = pool.Query(ctx, `SELECT tenant_id FROM issue_affected_tenants WHERE issue_id = $1`, issueID)
+	require.NoError(t, err)
+	for rows.Next() {
+		var tn string
+		require.NoError(t, rows.Scan(&tn))
+		sideTenants = append(sideTenants, tn)
+	}
+	rows.Close()
+	assert.Equal(t, []string{digitsTenant}, sideTenants)
+
+	var userCount, tenantCount, occCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT affected_user_count, affected_tenant_count, count FROM issues WHERE id = $1`, issueID).
+		Scan(&userCount, &tenantCount, &occCount))
+	assert.Equal(t, 2, userCount, "two distinct usable users (UUID, email); the 300-byte one is skipped")
+	assert.Equal(t, 1, tenantCount)
+	assert.Equal(t, 3, occCount, "all three occurrences counted — an unusable id never fails the event")
+}
+
+// affectedProtoEvent builds a valid proto event for projectKey carrying a fixed client fingerprint
+// (so several deliveries share one issue), an explicit event_id and the given metadata. It is
+// buildValidProtoEvent's shape with the three things the rollup tests need to control.
+func affectedProtoEvent(t *testing.T, projectKey, fp, eventID string, metadata map[string]interface{}) *sentinelv1.ErrorEvent {
+	t.Helper()
+	protoEvent := buildValidProtoEvent(projectKey)
+	protoEvent.Fingerprint = fp
+	protoEvent.EventId = eventID
+	md, err := structpb.NewStruct(metadata)
+	require.NoError(t, err)
+	protoEvent.Metadata = md
+	return protoEvent
+}
+
 // ---------------------------------------------------------------------------------------------------
 // (g) outcome-sum invariant + isolation level
 // ---------------------------------------------------------------------------------------------------
@@ -905,6 +1044,69 @@ func TestStoreEvent_RedeliveryInOneEnvironmentAdvancesNeitherCounter(t *testing.
 	assert.WithinDuration(t, lastSeenBefore, lastSeenAfter, 0, "a redelivery must not advance last_seen")
 }
 
+// TestStoreEvent_RedeliveryWritesNoAffectedRowNoBumpNoMetric is sentinel-affected-users flow I5,
+// beside the redelivery test above: a redelivered (issue_id, event_id) is rolled back at step 3 of
+// StoreEvent, BEFORE the rollup of step 4 runs — so it writes no side row, bumps neither count,
+// moves neither last_seen, and (decision 8's "never reached" property, the same one the registry
+// touch holds) records nothing on sentinel_affected_rollup_skipped_total even when the redelivery
+// carries an unusable id, because no rollback can un-increment a counter.
+func TestStoreEvent_RedeliveryWritesNoAffectedRowNoBumpNoMetric(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "affredeliver")
+	reader := eidManualReader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "affredeliver")
+	eventID := "evt-affredeliver-" + uuid.New().String()
+	t1 := time.Now().UTC().Truncate(time.Second)
+
+	first := eidOccurrenceIn("production", eventID)
+	first.CreatedAt = t1
+	first.AffectedUserID = "user-affredeliver"
+	first.AffectedTenantID = "tenant-affredeliver"
+	issue := eidIssueIn(projectID, "production", fp)
+	_, stored1, err := s.StoreEvent(ctx, issue, first, "")
+	require.NoError(t, err)
+	require.True(t, stored1)
+
+	skippedBefore := collectAffectedSkipped(t, ctx, reader)
+
+	// The redelivery: same event_id, a LATER timestamp (so a leaked write would be visible on
+	// last_seen), the same user, and a tenant that decision 5 would drop — a leaked metric would be
+	// visible on {tenant, empty}.
+	redelivered := eidOccurrenceIn("production", eventID)
+	redelivered.CreatedAt = t1.Add(time.Hour)
+	redelivered.AffectedUserID = "user-affredeliver"
+	redelivered.AffectedTenantID = ""
+	redelivered.AffectedTenantSkipReason = obs.AffectedRollupReasonEmpty
+	_, stored2, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp), redelivered, "")
+	require.NoError(t, err, "a redelivery ACKs as a no-op, it does not error")
+	require.False(t, stored2)
+
+	var userCount, tenantCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT affected_user_count, affected_tenant_count FROM issues WHERE id = $1`, issue.ID).
+		Scan(&userCount, &tenantCount))
+	assert.Equal(t, 1, userCount, "a redelivery must not bump affected_user_count")
+	assert.Equal(t, 1, tenantCount, "a redelivery must not bump affected_tenant_count")
+
+	var userRows, tenantRows int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_users WHERE issue_id = $1`, issue.ID).Scan(&userRows))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_tenants WHERE issue_id = $1`, issue.ID).Scan(&tenantRows))
+	assert.Equal(t, 1, userRows)
+	assert.Equal(t, 1, tenantRows)
+
+	var lastSeen time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT last_seen FROM issue_affected_users WHERE issue_id = $1 AND user_id = 'user-affredeliver'`, issue.ID).Scan(&lastSeen))
+	assert.WithinDuration(t, t1, lastSeen, 0, "a redelivery must not move the side row's last_seen — the rollup is never reached")
+
+	assert.Equal(t, skippedBefore, collectAffectedSkipped(t, ctx, reader),
+		"%s must not move on a redelivery: the counter is recorded after commit and a duplicate never commits", obs.MetricAffectedRollupSkipped)
+}
+
 // TestStoreEvent_RegistryTouchUpdatesDeclaredEnvironmentOnly covers contract §4.8's registry touch,
 // all four of its properties in one place because each of them fails SILENTLY:
 //
@@ -1177,4 +1379,383 @@ func TestStoreEvent_UnregisteredEnvironmentIsCounted(t *testing.T) {
 	require.True(t, storedShadow, "the occurrence is stored regardless of the registry")
 	assert.Equal(t, before+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricUnregisteredEnvironmentEvents),
 		"%s must increment once per stored occurrence in an undeclared environment", obs.MetricUnregisteredEnvironmentEvents)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-affected-users §4.3 — the affected users / tenants rollup (flows I1–I8)
+// ---------------------------------------------------------------------------------------------------
+//
+// Contract §11, boundary 1: "store.StoreEvent through this file (a real Postgres via the suite's
+// TestMain)" — the feature's ingest properties are TRANSACTION properties and this is the highest
+// boundary that still sees a rollback. I5 sits beside the redelivery test above and I8 beside the
+// search-index test; the rest are here.
+
+// collectAffectedSkipped snapshots sentinel_affected_rollup_skipped_total as a map keyed
+// "<kind>/<reason>". A family the binary has not recorded to yet is an empty map, not an error.
+func collectAffectedSkipped(t *testing.T, ctx context.Context, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != obs.MetricAffectedRollupSkipped {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "expected %s to be an int64 Sum, got %T", obs.MetricAffectedRollupSkipped, m.Data)
+			for _, dp := range sum.DataPoints {
+				kind, _ := dp.Attributes.Value(attribute.Key(obs.LabelKind))
+				reason, _ := dp.Attributes.Value(attribute.Key(obs.LabelReason))
+				out[kind.AsString()+"/"+reason.AsString()] += dp.Value
+			}
+		}
+	}
+	return out
+}
+
+// affectedCounts reads the two projection columns for issueID.
+func affectedCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, issueID string) (users, tenants int) {
+	t.Helper()
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT affected_user_count, affected_tenant_count FROM issues WHERE id = $1`, issueID).Scan(&users, &tenants))
+	return users, tenants
+}
+
+// affectedUserRow reads one issue_affected_users row; found=false when there is none.
+func affectedUserRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, issueID, userID string) (firstSeen, lastSeen time.Time, found bool) {
+	t.Helper()
+	err := pool.QueryRow(ctx,
+		`SELECT first_seen, last_seen FROM issue_affected_users WHERE issue_id = $1 AND user_id = $2`,
+		issueID, userID).Scan(&firstSeen, &lastSeen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return firstSeen, lastSeen, false
+	}
+	require.NoError(t, err)
+	return firstSeen, lastSeen, true
+}
+
+// eidOccurrenceAffected is eidOccurrenceIn carrying the rollup's two identifiers and an explicit
+// created_at (decision 9: the side-table timestamps come from it, never from now()).
+func eidOccurrenceAffected(environment, eventID, userID, tenantID string, at time.Time) *store.ErrorOccurrence {
+	occ := eidOccurrenceIn(environment, eventID)
+	occ.CreatedAt = at
+	occ.AffectedUserID = userID
+	occ.AffectedTenantID = tenantID
+	return occ
+}
+
+// TestAffectedRollup_VerbatimIDsLandInSideTablesThroughStoreEvent is the decision-3 test at the
+// StoreEvent boundary (flows I1, I2): a UUID user_id, a 7-digit tenant_id and an email user land in
+// issue_affected_users / issue_affected_tenants as those EXACT strings; the count is bumped once per
+// NEW pair and never again; the second event from a known user moves last_seen (GREATEST) and
+// leaves first_seen alone (LEAST); an out-of-order older event moves first_seen back. Timestamps are
+// the occurrence's created_at, never now().
+//
+// (This test cannot compile at the branch point — ErrorOccurrence has no Affected* fields there —
+// which is why the wire-driven twin, TestAffectedRollup_WireIDsLandVerbatimInIndexAndSideTables,
+// is the one run against the branch point for criterion 1.)
+func TestAffectedRollup_VerbatimIDsLandInSideTablesThroughStoreEvent(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "affverbatim")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const (
+		uuidUser     = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+		digitsTenant = "1234567"
+		emailUser    = "alice@example.com"
+	)
+	fp := eidFingerprint(t, "affverbatim")
+	t1 := time.Now().UTC().Truncate(time.Second)
+	t2 := t1.Add(10 * time.Minute)
+	t0 := t1.Add(-10 * time.Minute)
+
+	// Event 1: the UUID user and the 7-digit tenant, at t1.
+	issue := eidIssueIn(projectID, "production", fp)
+	_, stored, err := s.StoreEvent(ctx, issue,
+		eidOccurrenceAffected("production", "evt-affverbatim-1-"+uuid.New().String(), uuidUser, digitsTenant, t1), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	users, tenants := affectedCounts(t, ctx, pool, issue.ID)
+	assert.Equal(t, 1, users, "a new user bumps affected_user_count once")
+	assert.Equal(t, 1, tenants, "a new tenant bumps affected_tenant_count once")
+
+	firstSeen, lastSeen, found := affectedUserRow(t, ctx, pool, issue.ID, uuidUser)
+	require.True(t, found, "the UUID must land in issue_affected_users as that EXACT string, not \"<UUID>\"")
+	assert.WithinDuration(t, t1, firstSeen, 0, "first_seen is the occurrence's created_at (decision 9)")
+	assert.WithinDuration(t, t1, lastSeen, 0)
+
+	var tenantID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT tenant_id FROM issue_affected_tenants WHERE issue_id = $1`, issue.ID).Scan(&tenantID))
+	assert.Equal(t, digitsTenant, tenantID, "the 7-digit tenant must land verbatim, not \"<NUMERIC_ID>\"")
+
+	// Event 2: the SAME user and tenant, later (t2): no bump, last_seen moves, first_seen stays.
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp),
+		eidOccurrenceAffected("production", "evt-affverbatim-2-"+uuid.New().String(), uuidUser, digitsTenant, t2), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	users, tenants = affectedCounts(t, ctx, pool, issue.ID)
+	assert.Equal(t, 1, users, "a known user must NOT bump the count again — bumped only on a new pair")
+	assert.Equal(t, 1, tenants)
+
+	firstSeen, lastSeen, found = affectedUserRow(t, ctx, pool, issue.ID, uuidUser)
+	require.True(t, found)
+	assert.WithinDuration(t, t1, firstSeen, 0, "first_seen must not move forward")
+	assert.WithinDuration(t, t2, lastSeen, 0, "last_seen must move to the second event's created_at")
+
+	var userRows int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_users WHERE issue_id = $1`, issue.ID).Scan(&userRows))
+	assert.Equal(t, 1, userRows, "one row per DISTINCT (issue, user) pair")
+
+	// Event 3: an email under `user`, at t1: a second distinct user, so one more bump.
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp),
+		eidOccurrenceAffected("production", "evt-affverbatim-3-"+uuid.New().String(), emailUser, "", t1), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	users, tenants = affectedCounts(t, ctx, pool, issue.ID)
+	assert.Equal(t, 2, users, "a second distinct user bumps once more")
+	assert.Equal(t, 1, tenants, "an event with no tenant id leaves affected_tenant_count alone")
+	_, _, found = affectedUserRow(t, ctx, pool, issue.ID, emailUser)
+	assert.True(t, found, "the email must land in issue_affected_users as that EXACT string, not \"<EMAIL>\"")
+
+	// Event 4: the UUID user again with an OLDER timestamp (t0) — client clocks: first_seen moves
+	// back (LEAST), last_seen stays at t2 (GREATEST).
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp),
+		eidOccurrenceAffected("production", "evt-affverbatim-4-"+uuid.New().String(), uuidUser, "", t0), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	firstSeen, lastSeen, _ = affectedUserRow(t, ctx, pool, issue.ID, uuidUser)
+	assert.WithinDuration(t, t0, firstSeen, 0, "an out-of-order older event moves first_seen back (LEAST)")
+	assert.WithinDuration(t, t2, lastSeen, 0, "and leaves last_seen at the latest (GREATEST)")
+
+	users, _ = affectedCounts(t, ctx, pool, issue.ID)
+	assert.Equal(t, 2, users)
+
+	// §4.6's invariant, stated once: the count IS the side table's cardinality.
+	var mismatched int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM issues i
+		  WHERE i.id = $1
+		    AND (affected_user_count   <> (SELECT count(*) FROM issue_affected_users   a WHERE a.issue_id = i.id)
+		      OR affected_tenant_count <> (SELECT count(*) FROM issue_affected_tenants a WHERE a.issue_id = i.id))`,
+		issue.ID).Scan(&mismatched))
+	assert.Equal(t, 0, mismatched, "affected_*_count must equal the side table's cardinality after every commit")
+}
+
+// TestAffectedRollup_NoIDWritesNothing is flow I3: an event with neither identifier runs no
+// side-table statement, moves no count, records no metric, and is stored exactly as today.
+func TestAffectedRollup_NoIDWritesNothing(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "affnoid")
+	reader := eidManualReader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	skippedBefore := collectAffectedSkipped(t, ctx, reader)
+
+	issue := eidIssueIn(projectID, "production", eidFingerprint(t, "affnoid"))
+	_, stored, err := s.StoreEvent(ctx, issue, eidOccurrenceIn("production", "evt-affnoid-"+uuid.New().String()), "")
+	require.NoError(t, err)
+	require.True(t, stored, "an event with no ids is stored as today")
+
+	users, tenants := affectedCounts(t, ctx, pool, issue.ID)
+	assert.Equal(t, 0, users)
+	assert.Equal(t, 0, tenants)
+
+	var userRows, tenantRows int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_users WHERE issue_id = $1`, issue.ID).Scan(&userRows))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_tenants WHERE issue_id = $1`, issue.ID).Scan(&tenantRows))
+	assert.Equal(t, 0, userRows)
+	assert.Equal(t, 0, tenantRows)
+
+	assert.Equal(t, skippedBefore, collectAffectedSkipped(t, ctx, reader),
+		"no key at all increments nothing — only a PRESENT unusable value is counted (decision 24)")
+}
+
+// TestAffectedRollup_SameUserTwoEnvironmentsTwoRows is flow I6: identity is per environment by
+// construction (decision 7 — an issue IS one (project, environment, fingerprint)), so one user seen
+// in two environments is two issues, two side rows and two counts of 1. No cross-environment total.
+func TestAffectedRollup_SameUserTwoEnvironmentsTwoRows(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "affenv")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	shared := eidFingerprint(t, "affenv") // a client-chosen fingerprint, identical in both environments
+	const user = "usr_7712"
+	now := time.Now().UTC().Truncate(time.Second)
+
+	prod := eidIssueIn(projectID, "production", shared)
+	_, stored, err := s.StoreEvent(ctx, prod, eidOccurrenceAffected("production", "evt-affenv-prod-"+uuid.New().String(), user, "", now), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	stag := eidIssueIn(projectID, "staging", shared)
+	_, stored, err = s.StoreEvent(ctx, stag, eidOccurrenceAffected("staging", "evt-affenv-stag-"+uuid.New().String(), user, "", now), "")
+	require.NoError(t, err)
+	require.True(t, stored)
+	require.NotEqual(t, prod.ID, stag.ID, "two environments are two issues (§4.9)")
+
+	var rowsForUser int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_affected_users a JOIN issues i ON i.id = a.issue_id
+		  WHERE i.project_id = $1 AND a.user_id = $2`, projectID, user).Scan(&rowsForUser))
+	assert.Equal(t, 2, rowsForUser, "one user in two environments is two side rows, one per issue")
+
+	prodUsers, _ := affectedCounts(t, ctx, pool, prod.ID)
+	stagUsers, _ := affectedCounts(t, ctx, pool, stag.ID)
+	assert.Equal(t, 1, prodUsers)
+	assert.Equal(t, 1, stagUsers)
+}
+
+// TestAffectedRollup_ConcurrentSameNewUserBumpsOnce is flow I7 and the lock-order claim of §4.3
+// under a real race: N deliveries for one issue, each a DISTINCT event_id (so none is a duplicate),
+// all carrying the same NEW user, in parallel. The issues row lock is taken first by every
+// transaction and held to commit, so they serialise before touching the side table; the first
+// upsert INSERTs (xmax = 0, bump), every later one hits DO UPDATE (inserted = false, no bump).
+// Exactly one row, exactly one bump, N occurrences — and no 40P01, which would be a lock-order
+// regression.
+func TestAffectedRollup_ConcurrentSameNewUserBumpsOnce(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "affrace")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "affrace")
+	const (
+		user = "usr-race-" + "7c9e6679"
+		n    = 8
+	)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	var wg sync.WaitGroup
+	var storedCount atomic.Int32
+	errs := make(chan error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, stored, err := s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp),
+				eidOccurrenceAffected("production", fmt.Sprintf("evt-affrace-%d-%s", i, uuid.New().String()), user, "", now), "")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if stored {
+				storedCount.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err, "no delivery may fail — a 40P01 here is a lock-order regression")
+	}
+	require.Equal(t, int32(n), storedCount.Load(), "every delivery has a distinct event_id, so all %d store", n)
+
+	var issueID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND environment = 'production' AND fingerprint = $2`,
+		projectID, fp).Scan(&issueID))
+
+	users, _ := affectedCounts(t, ctx, pool, issueID)
+	assert.Equal(t, 1, users, "the same new user delivered %d times concurrently must bump exactly once", n)
+
+	var userRows, occRows int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_users WHERE issue_id = $1`, issueID).Scan(&userRows))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM error_occurrences WHERE issue_id = $1`, issueID).Scan(&occRows))
+	assert.Equal(t, 1, userRows, "exactly one side row")
+	assert.Equal(t, n, occRows)
+}
+
+// TestAffectedRollup_UnusableIDsStoreTheEventAndCountTheSkip is flow I4 / be.md AC 6 at the wire
+// boundary (ProcessEvent with a pgx pool only): a 300-byte id (too_long), an empty id (empty) and an
+// id with a control character (control_char) each STORE the event, write no side row, leave the
+// counts at 0, land as NULL in error_search_index, and increment
+// sentinel_affected_rollup_skipped_total{kind,reason} with exactly that reason — read through the
+// same ManualReader the D-e invariant test uses, as before/after deltas. An empty string at a
+// higher-precedence key beside a good lower one is `empty`, not the good value (decision 24).
+//
+// The control character is \x01, not NUL: the occurrence's METADATA is written to a jsonb column,
+// and jsonb rejects \u0000 outright ("unsupported Unicode escape sequence") — so an event carrying
+// NUL anywhere in its metadata fails at the occurrence insert today, before the rollup is a factor.
+// That is a pre-existing property of storing metadata as jsonb and not this feature's; NUL is
+// covered by the unit test of event.BoundAffectedID, which is the function that classifies it.
+func TestAffectedRollup_UnusableIDsStoreTheEventAndCountTheSkip(t *testing.T) {
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+	}
+	pool := newPostgresPool(t, cfg)
+	t.Cleanup(func() { pool.Close() })
+
+	projectName := uniqueProjectName("aff-skip")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("aff-skip"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+	reader := eidManualReader()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	svc := service.NewProcessorService(pool)
+	fp := "fp-aff-skip-" + uuid.New().String()
+
+	before := collectAffectedSkipped(t, ctx, reader)
+
+	deliver := func(metadata map[string]interface{}) {
+		t.Helper()
+		data, err := proto.Marshal(affectedProtoEvent(t, projectName, fp, "evt-aff-skip-"+uuid.New().String(), metadata))
+		require.NoError(t, err)
+		require.NoError(t, svc.ProcessEvent(ctx, data), "an unusable id must never fail the event")
+	}
+	deliver(map[string]interface{}{"user_id": strings.Repeat("x", 300), "tenant_id": ""})              // user/too_long, tenant/empty
+	deliver(map[string]interface{}{"user_id": "", "userId": "u1", "tenant_id": "acme\x01"})            // user/empty (decision 24), tenant/control_char
+	deliver(map[string]interface{}{"user_id": "usr\x01", "organization_id": strings.Repeat("y", 256)}) // user/control_char, tenant/too_long
+
+	after := collectAffectedSkipped(t, ctx, reader)
+	delta := func(kind, reason string) int64 { return after[kind+"/"+reason] - before[kind+"/"+reason] }
+	assert.Equal(t, int64(1), delta(obs.AffectedKindUser, obs.AffectedRollupReasonTooLong), "user/too_long")
+	assert.Equal(t, int64(1), delta(obs.AffectedKindUser, obs.AffectedRollupReasonEmpty), "user/empty — the empty user_id wins the precedence over userId")
+	assert.Equal(t, int64(1), delta(obs.AffectedKindUser, obs.AffectedRollupReasonControlChar), "user/control_char")
+	assert.Equal(t, int64(1), delta(obs.AffectedKindTenant, obs.AffectedRollupReasonEmpty), "tenant/empty")
+	assert.Equal(t, int64(1), delta(obs.AffectedKindTenant, obs.AffectedRollupReasonControlChar), "tenant/control_char")
+	assert.Equal(t, int64(1), delta(obs.AffectedKindTenant, obs.AffectedRollupReasonTooLong), "tenant/too_long")
+
+	var issueID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND fingerprint = $2`, projectID, fp).Scan(&issueID))
+
+	var occRows, userRows, tenantRows, indexedNonNull int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM error_occurrences WHERE issue_id = $1`, issueID).Scan(&occRows))
+	assert.Equal(t, 3, occRows, "all three events are STORED — dropped id, kept event")
+
+	users, tenants := affectedCounts(t, ctx, pool, issueID)
+	assert.Equal(t, 0, users, "no usable user id, so the count stays 0 (\"0\" means no usable id, not no user)")
+	assert.Equal(t, 0, tenants)
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_users WHERE issue_id = $1`, issueID).Scan(&userRows))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_affected_tenants WHERE issue_id = $1`, issueID).Scan(&tenantRows))
+	assert.Equal(t, 0, userRows, "an unusable value writes no side row — never truncated into a phantom user")
+	assert.Equal(t, 0, tenantRows)
+
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM error_search_index s JOIN error_occurrences eo ON eo.id = s.occurrence_id
+		  WHERE eo.issue_id = $1 AND (s.user_id IS NOT NULL OR s.tenant_id IS NOT NULL)`, issueID).Scan(&indexedNonNull))
+	assert.Equal(t, 0, indexedNonNull, "an unusable id is NULL in error_search_index (flow I8), never the value and never \"u1\"")
 }

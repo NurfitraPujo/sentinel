@@ -28,6 +28,13 @@ type LoadTestConfig struct {
 	// an environment it has not (the UPDATE matches zero) — and the difference between those two
 	// runs is the whole measurement.
 	Environment string
+	// UserPool is sentinel-affected-users §13's `SENTINEL_LOAD_USER_POOL`: when > 0, event n carries
+	// `user_id` = "load-user-<n mod pool>" and `tenant_id` = "load-tenant-<n mod pool>" in its
+	// metadata, so the §4.3 rollup runs on the full stack; 0 (the default) sends neither key, which
+	// is exactly what this harness sent before it was configurable. It is an OPTIONAL full-stack
+	// extra (decision 29): §13's M2 criterion is read on the store-boundary loop in
+	// tests/integration/affected_m2_timing_test.go, not on anything this harness produces.
+	UserPool int
 }
 
 // defaultLoadEnvironment preserves the value this harness sent before it was configurable.
@@ -97,28 +104,17 @@ func RunLoadTest(cfg LoadTestConfig) (*LoadResult, error) {
 		environment = defaultLoadEnvironment
 	}
 
-	payload := ErrorPayload{
-		ProjectKey:  cfg.ProjectKey,
-		Platform:    "golang",
-		Environment: environment,
-		Message:     "Load test error message",
-		ErrorClass:  "LoadTestError",
-		TraceID:     "load-test-trace",
-		SpanID:      "load-test-span",
-		Stacktrace: []StackFrame{
-			{File: "load_test.go", Line: 100, Function: "RunLoadTest", InApp: true},
-			{File: "processor.go", Line: 50, Function: "ProcessEvent", InApp: true},
-			{File: "handler.go", Line: 25, Function: "HandleRequest", InApp: true},
-		},
-		Metadata:   map[string]interface{}{"load_test": true},
-		Timestamp:  time.Now(),
-		TraceFlags: 0,
+	// With no user pool every event is byte-identical, so it is marshalled once; with a pool each
+	// event's ids depend on its sequence number and it is marshalled per send (loadPayload).
+	var payloadBytes []byte
+	if cfg.UserPool <= 0 {
+		var err error
+		payloadBytes, err = json.Marshal(loadPayload(cfg, environment, 0))
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal payload: %w", err)
+		}
 	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
-	}
+	var seq int64 // the per-event sequence number the pool draws from, shared by every worker
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
@@ -141,9 +137,20 @@ func RunLoadTest(cfg LoadTestConfig) (*LoadResult, error) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					body := payloadBytes
+					if cfg.UserPool > 0 {
+						n := atomic.AddInt64(&seq, 1) - 1
+						var mErr error
+						body, mErr = json.Marshal(loadPayload(cfg, environment, n))
+						if mErr != nil {
+							atomic.AddInt64(&errors, 1)
+							continue
+						}
+					}
+
 					start := time.Now()
 
-					req, err := http.NewRequest(http.MethodPost, cfg.IngesterURL+"/ingest", bytes.NewReader(payloadBytes))
+					req, err := http.NewRequest(http.MethodPost, cfg.IngesterURL+"/ingest", bytes.NewReader(body))
 					if err != nil {
 						atomic.AddInt64(&errors, 1)
 						continue
@@ -242,6 +249,39 @@ func RunLoadTest(cfg LoadTestConfig) (*LoadResult, error) {
 	}, nil
 }
 
+// loadPayload is the event this harness sends. Everything but the metadata is constant — one
+// fingerprint, one environment — so every event lands on the same issue and the only thing a run
+// varies is what §4.3's rollup sees. With cfg.UserPool > 0 the metadata carries `user_id` and
+// `tenant_id` drawn from the pool by seq (the keys indexer.ExtractSearchFields reads first, so the
+// precedence is the indexer's); the values stay under six digits so the normaliser's
+// <NUMERIC_ID> rule is not what a reader of error_search_index sees. With a pool of 0 neither key
+// is present — not empty, ABSENT — so decision 5's `empty` counter does not move either.
+func loadPayload(cfg LoadTestConfig, environment string, seq int64) ErrorPayload {
+	metadata := map[string]interface{}{"load_test": true}
+	if cfg.UserPool > 0 {
+		n := seq % int64(cfg.UserPool)
+		metadata["user_id"] = fmt.Sprintf("load-user-%d", n)
+		metadata["tenant_id"] = fmt.Sprintf("load-tenant-%d", n)
+	}
+	return ErrorPayload{
+		ProjectKey:  cfg.ProjectKey,
+		Platform:    "golang",
+		Environment: environment,
+		Message:     "Load test error message",
+		ErrorClass:  "LoadTestError",
+		TraceID:     "load-test-trace",
+		SpanID:      "load-test-span",
+		Stacktrace: []StackFrame{
+			{File: "load_test.go", Line: 100, Function: "RunLoadTest", InApp: true},
+			{File: "processor.go", Line: 50, Function: "ProcessEvent", InApp: true},
+			{File: "handler.go", Line: 25, Function: "HandleRequest", InApp: true},
+		},
+		Metadata:   metadata,
+		Timestamp:  time.Now(),
+		TraceFlags: 0,
+	}
+}
+
 func PrintResult(r *LoadResult) {
 	fmt.Println("=== Load Test Results ===")
 	fmt.Printf("Total Sent:       %d\n", r.TotalSent)
@@ -296,6 +336,7 @@ func TestLoadIngest(t *testing.T) {
 		EventsPerSec: loadEnvInt(t, "SENTINEL_LOAD_EVENTS_PER_SEC", 200),
 		DurationSec:  loadEnvInt(t, "SENTINEL_LOAD_DURATION_SEC", 50),
 		Environment:  os.Getenv("SENTINEL_LOAD_ENVIRONMENT"),
+		UserPool:     loadEnvNonNegInt(t, "SENTINEL_LOAD_USER_POOL", 0),
 	}
 
 	result, err := RunLoadTest(cfg)
@@ -303,6 +344,21 @@ func TestLoadIngest(t *testing.T) {
 		t.Fatalf("RunLoadTest: %v", err)
 	}
 	PrintResult(result)
+}
+
+// loadEnvNonNegInt is loadEnvInt for a value whose zero is meaningful: SENTINEL_LOAD_USER_POOL=0 is
+// "send no ids" (§13's pool (i)), not a typo, so only a negative or malformed value fails.
+func loadEnvNonNegInt(t *testing.T, name string, def int) int {
+	t.Helper()
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		t.Fatalf("%s must be a non-negative integer, got %q", name, raw)
+	}
+	return v
 }
 
 // loadEnvInt reads a positive integer override, falling back to def. A malformed or non-positive

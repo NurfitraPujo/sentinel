@@ -11,8 +11,11 @@ import {
 	reportIdempotencyKeys,
 	externalIssueReports,
 	externalReporters,
+	issueAffectedUsers,
+	issueAffectedTenants,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
+import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency';
 import { REPORT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/report-idempotency';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
@@ -56,6 +59,118 @@ export interface RetentionResult {
 	// the `external_reporters` row, which has no cascade from `issues` at all and would otherwise
 	// outlive every report it ever made, forever. This counts the reporters reaped for that reason.
 	deletedExternalReporters: number;
+	// sentinel-affected-users §4.5 (decision 23): the number of `issue_affected_users` /
+	// `issue_affected_tenants` rows the sweep removed this run -- the length of each side-table
+	// DELETE's RETURNING, exactly as `deletedOccurrences` is the occurrence delete's -- and NOT the
+	// number of issues whose count was recomputed. Written by `sweepAffectedSideTable` below.
+	deletedAffectedUsers: number;
+	deletedAffectedTenants: number;
+}
+
+// sentinel-affected-users §4.5: one side table of the affected users/tenants rollup, as the sweep
+// sees it -- the table whose aged rows go, and the `issues` column that is its cardinality
+// (decision 12). Two of them; the SQL is identical, only the names differ.
+interface AffectedSideTable {
+	table: PgTable;
+	// `sql.identifier(countColumn.name)` is what the UPDATE's SET uses: `${issues.affectedUserCount}`
+	// would render the qualified `"issues"."affected_user_count"`, which Postgres rejects on the
+	// left of a SET.
+	countColumn: PgColumn;
+}
+
+const AFFECTED_USERS_SIDE_TABLE: AffectedSideTable = {
+	table: issueAffectedUsers,
+	countColumn: issues.affectedUserCount,
+};
+const AFFECTED_TENANTS_SIDE_TABLE: AffectedSideTable = {
+	table: issueAffectedTenants,
+	countColumn: issues.affectedTenantCount,
+};
+
+/**
+ * sentinel-affected-users §4.5 (decisions 12, 23, 28): the retention sweep's step for ONE side
+ * table -- three statements in ONE transaction, in this order and no other:
+ *
+ *   1. `SELECT id FROM issues WHERE id IN (aged side rows' issue_ids) ORDER BY id FOR UPDATE` --
+ *      the touched `issues` rows are locked FIRST, in id order. This is the same lock order
+ *      `StoreEvent` takes (apps/processor-go/store/store.go: the issues upsert, then the side
+ *      table), so an ingest for a touched issue queues on the row lock and proceeds when this
+ *      commits; neither transaction can hold a side-table lock the other is waiting for, so `40P01`
+ *      is impossible by construction. The first draft locked the side rows first and would have
+ *      deadlocked against ingest once an hour under load.
+ *   2. `DELETE … WHERE last_seen < cutoff AND issue_id = ANY(locked ids) RETURNING issue_id` --
+ *      decision 28: scoped to the set statement 1 locked. An aged row on an issue statement 1 did
+ *      not see (an ingest that committed between the two statements with a client `created_at`
+ *      older than the cutoff) survives one more hour and is swept by the next run, which locks its
+ *      issue first. Its RETURNING length is the result field.
+ *   3. `UPDATE issues SET <count> = (SELECT count(*) FROM <side table> …) WHERE id = ANY(locked
+ *      ids)` -- the recompute, over the locked set only (an untouched issue's count is not
+ *      rewritten). Windowed counts (decision 12): this is where a count goes DOWN.
+ *
+ * Three statements and NOT one data-modifying CTE, on purpose: a CTE and the query that references
+ * it run on the same snapshot ("cannot see one another's effects on the target tables"), so a
+ * `count(*)` in the UPDATE half of one statement would count the side rows BEFORE the DELETE half
+ * removed them and the recompute would be a no-op after every sweep. Separate statements in one
+ * transaction see each other.
+ *
+ * A transaction -- unlike every other step of `cleanupRetainedData`, which are autocommit
+ * statements -- because a row lock lasts exactly as long as its transaction, and because failure
+ * must be atomic (flow R4): if any statement throws, Drizzle rolls the transaction back and
+ * neither rows nor counts for this side table have moved; the route logs and returns non-2xx and
+ * the next hourly run does the same work. There is no window in which rows are gone and the count
+ * is stale. D18: nothing in here `return`s early to signal a failure -- an error propagates as a
+ * throw so the rollback actually happens. With no aged rows at all the three statements still run
+ * (an empty locked set locks, deletes and recomputes nothing) rather than short-circuiting, so the
+ * callback has exactly one exit and it is the commit.
+ *
+ * Returns the number of side rows deleted.
+ */
+async function sweepAffectedSideTable(
+	{ table, countColumn }: AffectedSideTable,
+	cutoffDate: Date
+): Promise<number> {
+	// `::timestamptz`, not `::timestamp`: `last_seen` is TIMESTAMP WITH TIME ZONE (§4.6), and a
+	// `::timestamp` cast would drop the ISO literal's `Z` and re-read it in the session's TimeZone,
+	// sliding the window by the server's UTC offset -- the same trap triage.ts's window query names.
+	const cutoffIso = cutoffDate.toISOString();
+
+	return await db.transaction(async (tx) => {
+		// 1. Lock the touched issues rows first, in id order (decision 23).
+		const locked = await tx.execute<{ id: string }>(sql`
+			SELECT ${issues.id} AS id
+			FROM ${issues}
+			WHERE ${issues.id} IN (
+				SELECT DISTINCT issue_id FROM ${table} WHERE last_seen < ${cutoffIso}::timestamptz
+			)
+			ORDER BY ${issues.id}
+			FOR UPDATE
+		`);
+		// `sql.param`, not a bare `${lockedIds}`: Drizzle expands a bare JS array into a `(a, b, c)`
+		// tuple, which Postgres cannot cast to `uuid[]`; a Param goes through as ONE `$n` bound to
+		// the whole array (postgres-js encodes it as a PG array), which is what `= ANY($2)` needs.
+		const lockedIds = sql.param(locked.map((row) => row.id));
+
+		// 2. Delete the aged side rows, scoped to the locked set (decision 28); the returned row
+		//    count IS the result field.
+		const deleted = await tx.execute(sql`
+			DELETE FROM ${table}
+			WHERE last_seen < ${cutoffIso}::timestamptz
+			  AND issue_id = ANY(${lockedIds}::uuid[])
+			RETURNING issue_id
+		`);
+
+		// 3. Recompute every touched issue from what remains -- a separate statement, so it sees
+		//    statement 2's effect.
+		await tx.execute(sql`
+			UPDATE ${issues}
+			   SET ${sql.identifier(countColumn.name)} = (
+			       SELECT count(*) FROM ${table} a WHERE a.issue_id = ${issues.id}
+			   )
+			 WHERE ${issues.id} = ANY(${lockedIds}::uuid[])
+		`);
+
+		return deleted.length;
+	});
 }
 
 /**
@@ -102,6 +217,17 @@ export async function cleanupRetainedData(
 		.returning({ id: errorOccurrences.id });
 
 	const deletedOccurrences = deletedOccurrencesResult.length;
+
+	// sentinel-affected-users §4.5: the side-table step sits HERE -- after the occurrence delete
+	// (so it uses the same `cutoffDate`) and BEFORE the orphan-issue delete below, so an issue whose
+	// occurrences all aged out is still present for the count recompute and is then removed by the
+	// existing orphan rule with its side rows cascading (flow R2; `ON DELETE CASCADE`, §4.6 -- no
+	// statement here). One transaction per side table; see `sweepAffectedSideTable`.
+	const deletedAffectedUsers = await sweepAffectedSideTable(AFFECTED_USERS_SIDE_TABLE, cutoffDate);
+	const deletedAffectedTenants = await sweepAffectedSideTable(
+		AFFECTED_TENANTS_SIDE_TABLE,
+		cutoffDate
+	);
 
 	// DEFECT FIX: this delete previously had no age check at all — it removed ANY zero-occurrence
 	// issue immediately, including one created moments ago whose first (and only) occurrence had
@@ -276,6 +402,8 @@ export async function cleanupRetainedData(
 		deletedTombstones,
 		tombstoneRetentionDays,
 		deletedExternalReporters,
+		deletedAffectedUsers,
+		deletedAffectedTenants,
 	};
 }
 

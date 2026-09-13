@@ -123,7 +123,54 @@ export const issues = pgTable('issues', {
 	// waitingOn (comments.ts blocking branch), cleared to NULL alongside it (human reply, or
 	// resolve/ignore in issues.ts). Only meaningful while waitingOn is non-NULL.
 	waitingSince: timestamp('waiting_since', { withTimezone: true }),
+	// sentinel-affected-users §4.6 (1724500000_add_issue_affected_rollup.sql). By definition
+	// (decision 12) the cardinality of issueAffectedUsers / issueAffectedTenants for this issue,
+	// within the retention window: the processor bumps it only when its side-table upsert INSERTs
+	// (§4.3) and the retention sweep recomputes it in the same transaction as its DELETE (§4.5), so
+	// the counts can go down. `.default(0)` mirrors the migrated DEFAULT 0 and is deliberately KEPT
+	// (unlike `environment`'s): 0 is the correct value for every row that predates the count
+	// (decision 4 -- no backfill) and for every INSERT path that does not know about it
+	// (reports.ts's manual/external issues). Integer, never null: the agent API declares both as
+	// `z.number().int()` (IssueRowSchema / AgentIssueListItemSchema, decision 14).
+	affectedUserCount: integer('affected_user_count').notNull().default(0),
+	affectedTenantCount: integer('affected_tenant_count').notNull().default(0),
 });
+
+// sentinel-affected-users §4.6: one row per DISTINCT (issue, user) pair seen within the retention
+// window. The composite primary key is what makes "distinct" a database fact and is the ON
+// CONFLICT target of the processor's upsert (§4.3); `issues.affectedUserCount` is its cardinality
+// (decision 12). Written by the processor (store.go) and swept by retention.ts (§4.5, `last_seen <
+// cutoff`, which is what the `last_seen` index serves); the dashboard never inserts here.
+//
+// `userId` is the exact byte string the SDK put in event metadata (decision 6 -- no
+// normalisation), read BEFORE event.Normalize replaces it with `<UUID>`/`<EMAIL>` (decision 3),
+// and bounded by decision 5 before the statement (non-empty, <= 255 bytes, no control characters);
+// the migrated CHECK (user_id <> '') is the tripwire for a regression of that. VARCHAR(255) matches
+// errorSearchIndex.userId, the column these values were always meant for. Timestamps are the
+// occurrence's created_at, not now() (decision 9), so the sweep's cutoff means the same thing here
+// as on error_occurrences.
+export const issueAffectedUsers = pgTable('issue_affected_users', {
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	userId: varchar('user_id', { length: 255 }).notNull(),
+	firstSeen: timestamp('first_seen', { withTimezone: true }).notNull(),
+	lastSeen: timestamp('last_seen', { withTimezone: true }).notNull(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.issueId, table.userId] }),
+	byLastSeen: index('idx_issue_affected_users_last_seen').on(table.lastSeen),
+}));
+
+// The tenant twin of issueAffectedUsers -- same shape, same writers, same sweep, keyed on the
+// reporting application's tenant string (packages/sdk-go/context.go: WithTenant), which is NOT
+// Sentinel's own organization/project tenancy (contract header).
+export const issueAffectedTenants = pgTable('issue_affected_tenants', {
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	tenantId: varchar('tenant_id', { length: 255 }).notNull(),
+	firstSeen: timestamp('first_seen', { withTimezone: true }).notNull(),
+	lastSeen: timestamp('last_seen', { withTimezone: true }).notNull(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.issueId, table.tenantId] }),
+	byLastSeen: index('idx_issue_affected_tenants_last_seen').on(table.lastSeen),
+}));
 
 // Matches packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql — the table
 // has old_value/new_value JSONB columns, NOT a single `metadata` column. actor_type/actor_id are NOT NULL

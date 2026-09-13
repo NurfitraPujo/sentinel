@@ -159,6 +159,12 @@ paths:
                             - string
                             - "null"
                           format: date-time
+                        affectedUserCount:
+                          type: integer
+                          minimum: 0
+                        affectedTenantCount:
+                          type: integer
+                          minimum: 0
                       required:
                         - id
                         - projectId
@@ -180,6 +186,8 @@ paths:
                         - environment
                         - waitingSince
                         - claimedAt
+                        - affectedUserCount
+                        - affectedTenantCount
                       additionalProperties: false
                   nextCursor:
                     type: string
@@ -308,6 +316,12 @@ paths:
                           - string
                           - "null"
                         format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
                     required:
                       - id
                       - projectId
@@ -332,6 +346,8 @@ paths:
                       - count
                       - waitingOn
                       - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
                     additionalProperties: false
                   report:
                     type:
@@ -672,6 +688,12 @@ paths:
                           - string
                           - "null"
                         format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
                     required:
                       - id
                       - projectId
@@ -696,6 +718,8 @@ paths:
                       - count
                       - waitingOn
                       - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
                     additionalProperties: false
                   alreadyClaimed:
                     type: boolean
@@ -852,6 +876,12 @@ paths:
                           - string
                           - "null"
                         format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
                     required:
                       - id
                       - projectId
@@ -876,6 +906,8 @@ paths:
                       - count
                       - waitingOn
                       - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
                     additionalProperties: false
                 required:
                   - success

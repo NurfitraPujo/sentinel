@@ -52,6 +52,8 @@ vi.mock('$lib/db/schema', () => ({
 		firstSeen: 'firstSeen',
 		lastSeen: 'lastSeen',
 		count: 'count',
+		affectedUserCount: 'affectedUserCount',
+		affectedTenantCount: 'affectedTenantCount',
 	},
 	projects: { id: 'id', organizationId: 'organizationId', isInbox: 'isInbox', name: 'name' },
 	manualIssueReports: { issueId: 'issueId', severity: 'severity', reporterId: 'reporterId' },
@@ -140,6 +142,26 @@ describe('listAgentIssues', () => {
 			expect.objectContaining({ environment: issues.environment })
 		);
 		expect(result.issues[0].environment).toBe('staging');
+	});
+
+	// sentinel-affected-users decision 14: the two §4.6 counters are PUBLISHED on the list, not only
+	// on the detail. Same two halves as the decision-54 case above: delete either column from the
+	// select and the first expectation goes red; the spread carries them to the list item.
+	it('decision 14: selects issues.affectedUserCount / affectedTenantCount and passes them through', async () => {
+		dbMock.__result = [
+			{ id: 'i1', affectedUserCount: 612, affectedTenantCount: 7, waitingOn: null, firstSeen: null, lastSeen: null },
+		];
+
+		const result = await listAgentIssues({ organizationId: 'org-1' });
+
+		expect(dbMock.select).toHaveBeenCalledWith(
+			expect.objectContaining({
+				affectedUserCount: issues.affectedUserCount,
+				affectedTenantCount: issues.affectedTenantCount,
+			})
+		);
+		expect(result.issues[0].affectedUserCount).toBe(612);
+		expect(result.issues[0].affectedTenantCount).toBe(7);
 	});
 
 	it('N9 (C12): claimed=me pushes assigneeType=agent AND assignedTo=agentId conditions', async () => {

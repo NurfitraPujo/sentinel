@@ -47,24 +47,51 @@ func (i *Indexer) IndexOccurrence(ctx context.Context, entry *SearchIndexEntry) 
 	return err
 }
 
+// UserIDFromMetadata is the user-identifier key precedence ExtractSearchFields has always used —
+// `user_id`, then `userId`, then `user`; a value counts only if it is a JSON string — lifted out so
+// event.Normalize (sentinel-affected-users §4.3, decision 3) reads the SAME precedence for the
+// affected-users rollup instead of carrying a second copy that could drift (B5). The bool reports
+// whether ANY of the three keys held a string, which is what lets the rollup tell "key present with
+// value """ (counted as reason=empty) from "no key at all" (nothing counted).
+//
+// The precedence is NOT corrected here and must not be (decision 24): an empty string at a
+// higher-precedence key WINS — a producer sending `user_id: ""` beside a good `userId` is read as
+// "", exactly as ExtractSearchFields has always read it. Changing that is a change to the search
+// index's semantics, and belongs to a change that says so.
+func UserIDFromMetadata(metadata map[string]interface{}) (string, bool) {
+	if userID, ok := metadata["user_id"].(string); ok {
+		return userID, true
+	} else if userID, ok := metadata["userId"].(string); ok {
+		return userID, true
+	} else if userID, ok := metadata["user"].(string); ok {
+		return userID, true
+	}
+	return "", false
+}
+
+// TenantIDFromMetadata is UserIDFromMetadata's tenant twin: `tenant_id`, then `tenantId`, then
+// `organization_id`. Same rules, same caveat.
+func TenantIDFromMetadata(metadata map[string]interface{}) (string, bool) {
+	if tenantID, ok := metadata["tenant_id"].(string); ok {
+		return tenantID, true
+	} else if tenantID, ok := metadata["tenantId"].(string); ok {
+		return tenantID, true
+	} else if tenantID, ok := metadata["organization_id"].(string); ok {
+		return tenantID, true
+	}
+	return "", false
+}
+
 func ExtractSearchFields(metadata map[string]interface{}) *SearchIndexEntry {
 	entry := &SearchIndexEntry{}
 
-	if userID, ok := metadata["user_id"].(string); ok {
-		entry.UserID = userID
-	} else if userID, ok := metadata["userId"].(string); ok {
-		entry.UserID = userID
-	} else if userID, ok := metadata["user"].(string); ok {
-		entry.UserID = userID
-	}
-
-	if tenantID, ok := metadata["tenant_id"].(string); ok {
-		entry.TenantID = tenantID
-	} else if tenantID, ok := metadata["tenantId"].(string); ok {
-		entry.TenantID = tenantID
-	} else if tenantID, ok := metadata["organization_id"].(string); ok {
-		entry.TenantID = tenantID
-	}
+	// The user/tenant precedence lives in the two functions above so the rollup reads the identical
+	// list. Note what the caller does with these two fields: processEventInternal OVERWRITES
+	// entry.UserID / entry.TenantID with the event's pre-normalisation, decision-5-bounded values
+	// right after this call (contract §4.3, last paragraph), because by the time this function runs
+	// the metadata map has been through normalizer.NormalizeMap and a UUID here reads "<UUID>".
+	entry.UserID, _ = UserIDFromMetadata(metadata)
+	entry.TenantID, _ = TenantIDFromMetadata(metadata)
 
 	if traceID, ok := metadata["trace_id"].(string); ok {
 		entry.TraceID = traceID

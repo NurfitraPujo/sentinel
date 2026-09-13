@@ -50,6 +50,9 @@ const ISSUE_ROW = {
 	count: 1,
 	waitingOn: null,
 	claimedAt: null,
+	// sentinel-affected-users decision 14: NOT NULL DEFAULT 0 on the row, declared on the schema.
+	affectedUserCount: 0,
+	affectedTenantCount: 0,
 };
 
 const COMMENT_ROW = {
@@ -217,6 +220,8 @@ describe('GET /api/agent/issues', () => {
 					environment: 'production',
 					waitingSince: null,
 					claimedAt: null,
+					affectedUserCount: 0,
+					affectedTenantCount: 0,
 				},
 			],
 		});
@@ -655,10 +660,61 @@ describe('IssueRowSchema vs. the real `issues` table (decision 54)', () => {
 		const { environment, ...withoutEnvironment } = ISSUE_ROW;
 		expect(S.IssueRowSchema.safeParse(withoutEnvironment).success).toBe(false);
 	});
+
+	// sentinel-affected-users decision 14 (contract §4.4): the two §4.6 counters reach this
+	// response by the same full-row select, so they are declared -- as non-null integers, because
+	// the column is NOT NULL DEFAULT 0 -- and NOT appended to KNOWN_UNDECLARED (decision 27).
+	it('decision 14: declares affectedUserCount / affectedTenantCount as non-null integers', () => {
+		expect(schemaKeys).toContain('affectedUserCount');
+		expect(schemaKeys).toContain('affectedTenantCount');
+		expect(KNOWN_UNDECLARED).not.toContain('affectedUserCount');
+		expect(KNOWN_UNDECLARED).not.toContain('affectedTenantCount');
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: 600, affectedTenantCount: 4 }).success).toBe(true);
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: null }).success).toBe(false);
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedTenantCount: -1 }).success).toBe(false);
+	});
 });
 
 describe('AgentIssueListItemSchema (decision 54)', () => {
 	it('requires `environment` -- the only field that tells two decision-7 siblings apart', () => {
 		expect(Object.keys(S.AgentIssueListItemSchema.shape)).toContain('environment');
+	});
+
+	// sentinel-affected-users decision 14 (contract §4.4): the list carries the same two integers
+	// the detail does. Declared here AND named in listAgentIssues's projection -- the projection
+	// half is pinned in agent-work.test.ts, this half pins the wire shape: an integer >= 0, never
+	// null, and never absent (the schema is `.strict()` and the keys are required).
+	it('decision 14: declares affectedUserCount / affectedTenantCount as non-null integers', () => {
+		const keys = Object.keys(S.AgentIssueListItemSchema.shape);
+		expect(keys).toContain('affectedUserCount');
+		expect(keys).toContain('affectedTenantCount');
+
+		const base = {
+			id: 'issue-1',
+			projectId: 'project-1',
+			projectName: 'Inbox',
+			isInbox: false,
+			issueType: 'system_error',
+			message: 'x',
+			errorClass: 'Error',
+			status: 'unresolved',
+			assigneeType: null,
+			assignedTo: null,
+			waitingOn: null,
+			firstSeen: null,
+			lastSeen: null,
+			count: 1,
+			severity: null,
+			reporterId: null,
+			isWaiting: false,
+			environment: 'production',
+			waitingSince: null,
+			claimedAt: null,
+		};
+		expect(S.AgentIssueListItemSchema.safeParse({ ...base, affectedUserCount: 3, affectedTenantCount: 0 }).success).toBe(true);
+		expect(S.AgentIssueListItemSchema.safeParse(base).success).toBe(false);
+		expect(S.AgentIssueListItemSchema.safeParse({ ...base, affectedUserCount: null, affectedTenantCount: 0 }).success).toBe(false);
+		expect(S.AgentIssueListItemSchema.safeParse({ ...base, affectedUserCount: 1.5, affectedTenantCount: 0 }).success).toBe(false);
+		expect(S.AgentIssueListItemSchema.safeParse({ ...base, affectedUserCount: -1, affectedTenantCount: 0 }).success).toBe(false);
 	});
 });

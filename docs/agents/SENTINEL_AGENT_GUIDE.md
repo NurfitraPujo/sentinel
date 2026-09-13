@@ -288,12 +288,18 @@ A minimal, working loop:
 3. **Get full detail** — `GET /api/agent/issues/:id` returns:
    ```json
    {
-     "issue": { "id": "...", "issueType": "system_error", "status": "unresolved", "message": "...", "waitingOn": null, ... },
+     "issue": { "id": "...", "issueType": "system_error", "status": "unresolved", "message": "...", "waitingOn": null, "affectedUserCount": 612, "affectedTenantCount": 7, ... },
      "report": null,
      "latestOccurrence": { "stacktrace": {...}, "metadata": {...}, "environment": "...", "platform": "...", "traceId": "...", "createdAt": "..." },
      "relations": [ ... ]
    }
    ```
+   - `affectedUserCount` / `affectedTenantCount` (also on every row of `GET /api/agent/issues`)
+     are how many **distinct** users and tenants this issue's occurrences have touched within the
+     retention window — the blast radius, as opposed to `count`, which is how many times it fired.
+     A loop hitting one user ten thousand times has `count: 10000, affectedUserCount: 1`; an outage
+     hitting six hundred users once has `count: 600, affectedUserCount: 600`. Both are integers,
+     never null; `0` means no occurrence in the window carried a `user_id` / `tenant_id`. See §15.
    - For `issueType: "system_error"`: `report` is `null`; read `latestOccurrence.stacktrace` (and
      `.metadata`, `.traceId`) for the crash detail. Page further back with
      `GET /api/agent/issues/:id/occurrences?limit=&before=` (newest-first, `limit` clamped to
@@ -757,6 +763,27 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### `affectedUserCount` / `affectedTenantCount` (sentinel-affected-users, decision 14)
+
+- **Two new integer fields on every issue shape.** `affectedUserCount` and `affectedTenantCount`
+  appear on the issue object returned by `GET /api/agent/issues/{issueId}`,
+  `POST /api/agent/issues/{issueId}/claim` and `DELETE /api/agent/issues/{issueId}/claim`, and
+  on every row of `GET /api/agent/issues`. Each is an integer `>= 0` and is never `null`.
+  Additive: nothing existing changes shape or meaning.
+- **What they count.** The number of **distinct** `user_id` / `tenant_id` values (as the SDK put
+  them in event metadata — `WithUser` / `WithTenant`) seen on this issue's occurrences **within
+  the retention window**, per environment (an issue already belongs to exactly one). They are
+  exact as of the last committed event: an occurrence from a user already counted moves nothing.
+- **They can go down.** The hourly retention sweep drops users and tenants whose newest
+  occurrence has aged out of the window and recomputes both counts from what remains, so a value
+  read now may be lower later. Treat them as "in the last N days", not lifetime totals.
+- **`0` is a real value, not "unknown".** An issue whose occurrences carry no `user_id` /
+  `tenant_id` (or only unusable ones — empty, over 255 bytes, or containing control characters,
+  which the processor drops rather than stores) reads `0`. Issues that predate this field also
+  read `0`; there is no backfill.
+- **No sort on this surface.** `GET /api/agent/issues?sort=` still accepts only `firstSeen` and
+  `lastSeen`; rank by these fields client-side if you want blast radius first.
 
 ### `environment` (sentinel-project-environments, decision 54)
 
