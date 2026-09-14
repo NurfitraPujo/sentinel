@@ -380,8 +380,13 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 		// Decision 23's statement order, read off the transactions the sweep actually opened: one
 		// per side table, three statements each, the lock SELECT first, then the DELETE, then the
 		// recompute UPDATE -- and the DELETE and UPDATE both scoped to the locked ids (decision 28).
-		expect(recordedTransactions).toHaveLength(2);
-		for (const statements of recordedTransactions) {
+		// Three transactions: the two side-table steps, then -- LAST, sentinel-releases-snooze §4.3 --
+		// the one-statement `next` catch-up, which retention.next-catchup.integration.test.ts proves
+		// and which is only recognised here so the two side-table steps can still be asserted alone.
+		expect(recordedTransactions).toHaveLength(3);
+		expect(recordedTransactions[2]).toHaveLength(1);
+		expect(recordedTransactions[2][0]).toMatch(/^update "issues" i set resolved_in_version = r\.version/i);
+		for (const statements of recordedTransactions.slice(0, 2)) {
 			expect(statements).toHaveLength(3);
 			expect(statements[0]).toMatch(
 				/^select "issues"\."id" as id from "issues" where "issues"\."id" in \( ?select distinct issue_id from "issue_affected_(users|tenants)" where last_seen < \$\d+::timestamptz ?\) order by "issues"\."id" for update$/i
