@@ -37,7 +37,7 @@ import (
 	"testing"
 	"time"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 // sdkNewClient builds a *sentinel.Client wired at the live ingestor for fixture f, with low-latency

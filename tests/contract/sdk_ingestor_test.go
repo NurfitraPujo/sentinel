@@ -39,7 +39,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 // buildFullyPopulatedEvent constructs a *sentinel.Event using only the real,

@@ -3,8 +3,8 @@ package sentinelzerolog
 import (
 	"errors"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
 	"github.com/rs/zerolog"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 type Hook struct{}

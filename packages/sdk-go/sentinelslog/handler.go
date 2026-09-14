@@ -5,7 +5,7 @@ import (
 	"errors"
 	"log/slog"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 type Handler struct {

@@ -1,9 +1,9 @@
 # Sentinel Go Client SDK (`sdk-go`)
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/NurfitraPujo/sentinel/packages/sdk-go.svg)](https://pkg.go.dev/github.com/NurfitraPujo/sentinel/packages/sdk-go)
-[![Go Report Card](https://goreportcard.com/badge/github.com/NurfitraPujo/sentinel/packages/sdk-go)](https://goreportcard.com/report/github.com/NurfitraPujo/sentinel/packages/sdk-go)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tuju-ai/sentinel/packages/sdk-go.svg)](https://pkg.go.dev/github.com/tuju-ai/sentinel/packages/sdk-go)
+[![Go Report Card](https://goreportcard.com/badge/github.com/tuju-ai/sentinel/packages/sdk-go)](https://goreportcard.com/report/github.com/tuju-ai/sentinel/packages/sdk-go)
 
-The official **Go Client SDK** for [Sentinel](https://github.com/NurfitraPujo/sentinel) — a high-performance, real-time error monitoring platform. `packages/sdk-go` provides non-blocking asynchronous error capture (< 50 µs latency), high-throughput batching, automatic OpenTelemetry trace extraction, PII scrubbing, panic recovery middleware, and logging adapters for `slog`, `zerolog`, and `log.Logger`.
+The official **Go Client SDK** for [Sentinel](https://github.com/tuju-ai/sentinel) — a high-performance, real-time error monitoring platform. `packages/sdk-go` provides non-blocking asynchronous error capture (< 50 µs latency), high-throughput batching, automatic OpenTelemetry trace extraction, PII scrubbing, panic recovery middleware, and logging adapters for `slog`, `zerolog`, and `log.Logger`.
 
 > [!WARNING]
 > **v0.2.0 is a breaking wire-format change.** Every prior version had its payload rejected by the ingestor
@@ -29,7 +29,7 @@ The official **Go Client SDK** for [Sentinel](https://github.com/NurfitraPujo/se
 ## Installation
 
 ```bash
-go get github.com/NurfitraPujo/sentinel/packages/sdk-go@latest
+go get github.com/tuju-ai/sentinel/packages/sdk-go@latest
 ```
 
 ---
@@ -45,7 +45,7 @@ import (
 	"errors"
 	"time"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 func main() {
@@ -111,7 +111,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/NurfitraPujo/sentinel/packages/sdk-go/sentinelslog"
+	"github.com/tuju-ai/sentinel/packages/sdk-go/sentinelslog"
 )
 
 slogHandler := sentinelslog.NewHandler(slog.NewJSONHandler(os.Stdout, nil))
@@ -128,7 +128,7 @@ import (
 	"os"
 
 	"github.com/rs/zerolog"
-	"github.com/NurfitraPujo/sentinel/packages/sdk-go/sentinelzerolog"
+	"github.com/tuju-ai/sentinel/packages/sdk-go/sentinelzerolog"
 )
 
 logger := zerolog.New(os.Stdout).Hook(sentinelzerolog.NewHook())
@@ -143,7 +143,7 @@ logger.Error().Msg("cache cluster unreachable")
 import (
 	"net/http"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 mux := http.NewServeMux()
