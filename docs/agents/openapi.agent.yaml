@@ -1050,6 +1050,16 @@ paths:
                     - ignored
                 resolved_in_version:
                   type: string
+                  description: 'Free text, trimmed, at most 100 characters; meaningful only with status=resolved. The literal `next` is reserved: "resolved in the next release, whichever it turns out to be" -- rewritten to the first release the PROJECT sees after the resolve (project-level, any environment: a version already seen on staging is not the next release). Compared byte-for-byte after trimming (`Next` is a version).'
+                snoozed_until:
+                  type: string
+                  format: date-time
+                  description: "Only with status=ignored: ignore until this instant (full ISO 8601 date-time with seconds and a zone -- `Z` or `±hh:mm`; offsets accepted). Must be strictly in the future. 400 `snoozedUntil is only valid with status ignored` / `snoozedUntil must be a future timestamp`. An empty string is treated as omitted."
+                snooze_occurrences:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000000
+                  description: "Only with status=ignored: ignore until this many MORE occurrences have been stored (stored as snoozeOccurrenceTarget, with snoozeCountAt = the count at the time). 400 `snoozeOccurrences is only valid with status ignored` / `snoozeOccurrences must be an integer between 1 and 1000000`. An empty string is treated as omitted."
               required:
                 - status
               additionalProperties: false

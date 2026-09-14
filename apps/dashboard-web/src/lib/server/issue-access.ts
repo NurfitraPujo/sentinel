@@ -359,3 +359,94 @@ export function validateResolvedInVersion(value: unknown): string | null {
 	}
 	return trimmed;
 }
+
+/**
+ * sentinel-releases-snooze §4.2 (decisions 33, 38): the ISO 8601 date-time SHAPE `snoozedUntil`
+ * must have -- a calendar date, `T`, a time with seconds, optional fractional seconds, and `Z` or
+ * `±hh:mm`. Checked BEFORE `Date.parse`, because `Date.parse` alone accepts what the agent
+ * OpenAPI (`z.string().datetime({ offset: true })`) declares refused: a date-only `2026-09-20`
+ * (as UTC midnight) and a zone-less `2026-09-20T09:00` (as server-local time). That schema is
+ * declaration-only (nothing runs a `.parse()` on it), so this regex is what actually enforces the
+ * declared shape, on both routes.
+ */
+const ISO_8601_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+const SNOOZED_UNTIL_ONLY_WITH_IGNORED = 'snoozedUntil is only valid with status ignored';
+const SNOOZED_UNTIL_MUST_BE_FUTURE = 'snoozedUntil must be a future timestamp';
+const SNOOZE_OCCURRENCES_ONLY_WITH_IGNORED = 'snoozeOccurrences is only valid with status ignored';
+const SNOOZE_OCCURRENCES_RANGE = 'snoozeOccurrences must be an integer between 1 and 1000000';
+
+// sentinel-releases-snooze §4.2: `1 ≤ n ≤ 1000000`.
+const SNOOZE_OCCURRENCES_MIN = 1;
+const SNOOZE_OCCURRENCES_MAX = 1000000;
+
+/**
+ * sentinel-releases-snooze §4.2 -- validates a client-supplied `snoozedUntil` (human route) /
+ * `snoozed_until` (agent route and the batch op's `issues.status`). ONE validator for both routes
+ * (decision 38), so they refuse the same inputs with the same words.
+ *
+ * Returns the instant as a `Date`, or `null` when omitted: `undefined`, `null` and a trimmed-empty
+ * string are all "no condition of that kind" (§3), exactly as `validateResolvedInVersion` treats a
+ * blank string. Throws SvelteKit `error(400, ...)` with one of the two §4.2 strings:
+ *
+ * - `snoozedUntil is only valid with status ignored` -- a present value with any other status;
+ * - `snoozedUntil must be a future timestamp` -- ONE string for a wrong-shaped value (the regex
+ *   above; a non-string counts as wrong-shaped), an unparseable one (`'tomorrow'`), and one that
+ *   is not STRICTLY after the server's now (decision 33).
+ *
+ * An offset is accepted and normalised: `2026-09-20T16:00:00+07:00` and `2026-09-20T09:00:00Z`
+ * are the same instant and produce the same `Date`.
+ */
+export function validateSnoozedUntil(value: unknown, status: string): Date | null {
+	if (value === undefined || value === null) {
+		return null;
+	}
+	if (typeof value === 'string' && value.trim().length === 0) {
+		return null;
+	}
+	if (status !== 'ignored') {
+		throw error(400, SNOOZED_UNTIL_ONLY_WITH_IGNORED);
+	}
+	if (typeof value !== 'string') {
+		throw error(400, SNOOZED_UNTIL_MUST_BE_FUTURE);
+	}
+	const trimmed = value.trim();
+	if (!ISO_8601_DATE_TIME.test(trimmed)) {
+		throw error(400, SNOOZED_UNTIL_MUST_BE_FUTURE);
+	}
+	const ms = Date.parse(trimmed);
+	if (Number.isNaN(ms) || ms <= Date.now()) {
+		throw error(400, SNOOZED_UNTIL_MUST_BE_FUTURE);
+	}
+	return new Date(ms);
+}
+
+/**
+ * sentinel-releases-snooze §4.2 -- validates a client-supplied `snoozeOccurrences` (human route)
+ * / `snooze_occurrences` (agent route). The same one-validator-both-routes rule as
+ * `validateSnoozedUntil`.
+ *
+ * Returns the integer, or `null` when omitted (`undefined`, `null`, or a trimmed-empty string --
+ * §3). Any OTHER string (`'12'`) is refused: the value must be a JSON integer in
+ * `[1, 1000000]`. Throws SvelteKit `error(400, ...)` with one of the two §4.2 strings.
+ */
+export function validateSnoozeOccurrences(value: unknown, status: string): number | null {
+	if (value === undefined || value === null) {
+		return null;
+	}
+	if (typeof value === 'string' && value.trim().length === 0) {
+		return null;
+	}
+	if (status !== 'ignored') {
+		throw error(400, SNOOZE_OCCURRENCES_ONLY_WITH_IGNORED);
+	}
+	if (
+		typeof value !== 'number' ||
+		!Number.isInteger(value) ||
+		value < SNOOZE_OCCURRENCES_MIN ||
+		value > SNOOZE_OCCURRENCES_MAX
+	) {
+		throw error(400, SNOOZE_OCCURRENCES_RANGE);
+	}
+	return value;
+}

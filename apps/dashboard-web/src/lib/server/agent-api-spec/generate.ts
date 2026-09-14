@@ -48,7 +48,14 @@ function unwrap(schema: z.ZodTypeAny): { inner: z.ZodTypeAny; nullable: boolean;
 
 function zodToJsonSchema(schemaIn: z.ZodTypeAny): JsonSchema {
 	const { inner, nullable } = unwrap(schemaIn);
-	const base = zodTypeToJsonSchema(inner);
+	const typed = withNullability(zodTypeToJsonSchema(inner), nullable);
+	// A `.describe()` on the field (on the outer optional/nullable wrapper or on the inner type)
+	// becomes the property's `description`, appended LAST so the fixed key order above is kept.
+	const description = schemaIn.description ?? inner.description;
+	return description === undefined ? typed : { ...typed, description };
+}
+
+function withNullability(base: JsonSchema, nullable: boolean): JsonSchema {
 	if (!nullable) return base;
 	// OpenAPI 3.1 / JSON Schema 2020-12: nullable is expressed via a type union.
 	if (typeof base.type === 'string') {

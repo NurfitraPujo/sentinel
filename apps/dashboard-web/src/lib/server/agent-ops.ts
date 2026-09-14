@@ -4,7 +4,11 @@ import { authenticateAgentRequest, type AgentAuthContext } from '$lib/server/age
 import { resolveAgentIssueScope } from '$lib/server/agent-issue-scope';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
 import { updateIssueStatus } from '$lib/db/queries/issues';
-import { validateResolvedInVersion } from '$lib/server/issue-access';
+import {
+	validateResolvedInVersion,
+	validateSnoozedUntil,
+	validateSnoozeOccurrences,
+} from '$lib/server/issue-access';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
 import { claimIssue, releaseClaim, updateManualIssueReport, ClaimConflictError } from '$lib/db/queries/reports';
 import type { ReportSeverity } from '$lib/db/queries/reports';
@@ -139,17 +143,25 @@ const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => 
 	}
 
 	const validatedResolvedInVersion = validateResolvedInVersion(body.resolved_in_version);
+	// sentinel-releases-snooze §4.2: `snoozed_until` / `snooze_occurrences` (snake_case on this
+	// route), only with `status: 'ignored'`. The SAME two validators the human route calls
+	// (decision 38) -- `StatusBodySchema` documents the shape and enforces nothing at runtime, so
+	// this is where the declared refusals actually happen, with the same four strings.
+	const validatedSnoozedUntil = validateSnoozedUntil(body.snoozed_until, status);
+	const validatedSnoozeOccurrences = validateSnoozeOccurrences(body.snooze_occurrences, status);
 	warnIfMutatingSomeoneElsesClaim(ctx, issue, 'issues.status');
 
 	// A05-status: `changed:false` means updateIssueStatus recognized this as an exact retry of the
-	// already-applied status (same status AND same resolved_in_version) -- no activity row, no
-	// notification. Notification emails are only ever sent on the `changed:true` path.
+	// already-applied status (same status, same resolved_in_version and -- §4.2 -- the same snooze
+	// conditions) -- no activity row, no notification. Notification emails are only ever sent on
+	// the `changed:true` path.
 	const { changed, notified } = await updateIssueStatus(
 		issue.issueId,
 		status,
 		validatedResolvedInVersion ?? undefined,
 		'agent',
-		ctx.agentId
+		ctx.agentId,
+		{ snoozedUntil: validatedSnoozedUntil, snoozeOccurrences: validatedSnoozeOccurrences }
 	);
 	if (changed) {
 		await sendIssueNotificationEmails(notified, { issueId: issue.issueId, origin: originUrl });
@@ -162,7 +174,15 @@ const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => 
 			action: 'agent.issue.status_changed',
 			resourceType: 'issue',
 			resourceId: issue.issueId,
-			metadata: { status, resolvedInVersion: validatedResolvedInVersion ?? undefined, changed },
+			metadata: {
+				status,
+				resolvedInVersion: validatedResolvedInVersion ?? undefined,
+				// The audit row carries the two keys as the write did: the UTC instant (decision 40)
+				// and the integer, absent when not given.
+				snoozedUntil: validatedSnoozedUntil?.toISOString(),
+				snoozeOccurrences: validatedSnoozeOccurrences ?? undefined,
+				changed,
+			},
 		},
 	};
 };
