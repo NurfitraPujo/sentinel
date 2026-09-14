@@ -450,7 +450,12 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 		const transactionIndexes = recorded
 			.map((r, i) => (r.kind === 'transaction' ? i : -1))
 			.filter((i) => i >= 0);
-		expect(transactionIndexes, `expected two side-table transactions in: ${order.join(' → ')}`).toHaveLength(2);
+		// Three transactions: the two side-table steps and -- LAST, after everything else the sweep
+		// does -- sentinel-releases-snooze §4.3's one-statement `next` catch-up, proven by
+		// retention.next-catchup.integration.test.ts. Only the first two are the side-table steps the
+		// bucket delete is ordered against.
+		expect(transactionIndexes, `expected three transactions in: ${order.join(' → ')}`).toHaveLength(3);
+		expect(transactionIndexes[2]).toBe(recorded.length - 1);
 		const orphanSelectIndex = recorded.findIndex((r) => r.kind === 'select' && r.table === 'issues');
 		expect(orphanSelectIndex, `orphan candidate select not found in: ${order.join(' → ')}`).toBeGreaterThan(-1);
 
@@ -469,12 +474,19 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 		for (const r of recorded) {
 			if (r.kind === 'execute') expect(r.sql).not.toMatch(/for update/i);
 		}
-		for (const r of recorded) {
-			if (r.kind === 'transaction') {
-				expect(r.statements).toHaveLength(3);
-				expect(r.statements[0]).toMatch(/for update$/i);
-				expect(r.statements.some((s) => BUCKET_DELETE_SQL.test(s))).toBe(false);
+		for (const [i, r] of recorded.entries()) {
+			if (r.kind !== 'transaction') continue;
+			if (i === transactionIndexes[2]) {
+				// The last transaction is sentinel-releases-snooze §4.3's `next` catch-up: one
+				// statement, no lock, proven in retention.next-catchup.integration.test.ts.
+				expect(r.statements).toHaveLength(1);
+				expect(r.statements[0]).toMatch(/^update "issues" i set resolved_in_version = r\.version/i);
+				expect(r.statements[0]).not.toMatch(/for update/i);
+				continue;
 			}
+			expect(r.statements).toHaveLength(3);
+			expect(r.statements[0]).toMatch(/for update$/i);
+			expect(r.statements.some((s) => BUCKET_DELETE_SQL.test(s))).toBe(false);
 		}
 
 		// The order, pasted (criterion 1 asks for the recorded order in the output).

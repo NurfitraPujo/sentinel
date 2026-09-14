@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
+	import { untrack } from 'svelte';
 
 	let { data } = $props();
 
@@ -127,18 +128,185 @@
 	// logging) anything unrecognized rather than casting it through.
 	let knownRelations = $derived(filterKnownRelationTypes(data.relations || []));
 
-	async function handleStatusChangeRequest(newStatus: 'resolved') {
+	// sentinel-releases-snooze §4.1 "The controls", flows `D3`–`D12`. ONE submit helper for every
+	// status write on this page — the three controls below and `IssueRelations.svelte`'s "Mark
+	// Resolved" prompt (`D12`, which keeps sending `{ status: 'resolved' }` and nothing else).
+	//
+	// It reloads ONLY on a `2xx`. The helper this replaced reloaded after ANY response and only
+	// `console.error`ed a rejected fetch, so a refused write (`400 snoozedUntil must be a future
+	// timestamp`) looked exactly like a no-op. Three failure branches, none reloading (`D11`): a
+	// non-`2xx` whose body is JSON with a string `message` (SvelteKit's `error()` shape, §7 — every
+	// `4xx` here) renders that string verbatim and is never matched on; a non-`2xx` with any other
+	// body (a `5xx` HTML page, an empty body, non-JSON) renders `Request failed (HTTP {status})`; a
+	// rejected `fetch` (network down, aborted) renders `Network error`. The reload itself is kept on
+	// purpose — it goes back through the loader's guards and picks up the fresh row.
+	type StatusBody = {
+		status: 'unresolved' | 'resolved' | 'ignored';
+		resolvedInVersion?: string;
+		snoozedUntil?: string;
+		snoozeOccurrences?: number;
+	};
+
+	let openDialog = $state<'resolve' | 'ignore' | null>(null);
+	let submitting = $state(false);
+	let submitError = $state<string | null>(null);
+
+	async function failureMessage(response: Response): Promise<string> {
 		try {
-			await fetch(`/api/issues/${data.issue.id}/status`, {
+			const parsed: unknown = await response.json();
+			const message = (parsed as { message?: unknown } | null)?.message;
+			if (typeof message === 'string') return message;
+		} catch {
+			// not JSON — fall through to the generic string
+		}
+		return `Request failed (HTTP ${response.status})`;
+	}
+
+	async function submitStatus(body: StatusBody): Promise<void> {
+		// Pinned at submit time: the issue this write is FOR. Same-route navigation reuses this
+		// component (see the reset effect below), so by the time the response lands `data.issue.id`
+		// may already be another issue's — its outcome is then not this page's to render or reload.
+		const issueId = data.issue.id;
+		submitting = true;
+		submitError = null;
+		let response: Response;
+		try {
+			response = await fetch(`/api/issues/${issueId}/status`, {
 				method: 'PATCH',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ status: newStatus }),
+				body: JSON.stringify(body),
 			});
-			window.location.reload();
-		} catch (err) {
-			console.error('Failed to update status:', err);
+		} catch {
+			if (data.issue.id === issueId) submitError = 'Network error';
+			submitting = false;
+			return;
 		}
+		if (data.issue.id !== issueId) {
+			submitting = false;
+			return;
+		}
+		if (response.ok) {
+			window.location.reload();
+			return;
+		}
+		submitError = await failureMessage(response);
+		submitting = false;
 	}
+
+	// §4.1: the control block renders for `canWrite` callers only — a UX nicety, the endpoint
+	// re-checks. `releases` is the picker's list. Both are guarded against ABSENCE (a stale loader
+	// build): `pnpm build` does not type-check, so a missing key would `500` the page rather than
+	// fail a gate — no controls / a disabled select, never a throw.
+	let canWrite = $derived(data.canWrite === true);
+	let pickerReleases = $derived(data.releases ?? []);
+	// Decision 43: a manual (`user_report`) issue has no occurrences and never passes `StoreEvent`,
+	// and the processor is the only thing that ends a snooze (decision 19) — so a snooze on it
+	// could never end. Ignore there is a plain ignore and the dialog offers neither condition.
+	let snoozeable = $derived(data.issue.issueType !== 'user_report');
+
+	// The Resolve dialog (`D3`–`D6`): *next release* by default.
+	let resolveChoice = $state<'next' | 'release' | 'typed'>('next');
+	let resolveRelease = $state('');
+	let resolveTyped = $state('');
+	// The Ignore dialog (`D7`–`D9`): both optional, neither = indefinitely.
+	let ignoreUntil = $state('');
+	// `bind:value` on a `type="number"` input is a number, and `null` while the input is blank.
+	let ignoreOccurrences = $state<number | null>(null);
+
+	function resetDrafts() {
+		submitError = null;
+		resolveChoice = 'next';
+		resolveRelease = pickerReleases[0]?.version ?? '';
+		resolveTyped = '';
+		ignoreUntil = '';
+		ignoreOccurrences = null;
+	}
+
+	function showDialog(which: 'resolve' | 'ignore') {
+		resetDrafts();
+		openDialog = which;
+	}
+
+	function closeDialog() {
+		openDialog = null;
+		submitError = null;
+	}
+
+	// The dialogs are non-modal (`<dialog open>`, no `showModal()`), and `IssueRelations` renders
+	// same-route `<a href="/issues/{id}">` links that SvelteKit serves by REUSING this component
+	// with new `data` — so a draft opened on issue A would otherwise survive the click on a related
+	// issue behind it, sit open on B, and its confirm would PATCH B with A's picked version (B may
+	// be in another project, whose picker never offered it). Every dialog and draft belongs to ONE
+	// issue: when `data.issue.id` changes, close what is open and discard the draft. `data` is
+	// replaced wholesale on every navigation, including one that lands on the SAME issue with a
+	// refreshed row, so the id is compared against the one last shown, not merely tracked; the
+	// resets are untracked so this never re-runs on the state it writes. The initial capture is
+	// deliberately a snapshot (`untrack`), not a reactive reference: it is the "last shown" memo.
+	let shownIssueId = untrack(() => data.issue.id);
+	$effect(() => {
+		const issueId = data.issue.id;
+		if (issueId === shownIssueId) return;
+		shownIssueId = issueId;
+		untrack(() => {
+			openDialog = null;
+			submitting = false;
+			resetDrafts();
+		});
+	});
+
+	// §4.1's table, exactly: `next`, a picked version, a typed version — and an EMPTY typed value
+	// sends no `resolvedInVersion` at all (today's write; the dialog says it regresses on the next
+	// occurrence). Trimmed here as `validateResolvedInVersion` would trim it, so blank is blank.
+	function submitResolve() {
+		const body: StatusBody = { status: 'resolved' };
+		if (resolveChoice === 'next') {
+			body.resolvedInVersion = 'next';
+		} else if (resolveChoice === 'release') {
+			body.resolvedInVersion = resolveRelease;
+		} else {
+			const typed = resolveTyped.trim();
+			if (typed !== '') body.resolvedInVersion = typed;
+		}
+		void submitStatus(body);
+	}
+
+	// A `datetime-local` value is a zone-less wall-clock string (`2026-09-20T16:00`); the endpoint
+	// refuses exactly that shape (decision 38), so it is converted to the full UTC instant with `Z`
+	// through `new Date(value).toISOString()` — the viewer's own zone, as they read the picker. A
+	// blank input's key is OMITTED, never sent as `''` (§3 treats a blank as omitted too, but the
+	// body §4.1 shows is the one without the key). On a `user_report` issue neither input exists,
+	// so this is the plain `{ status: 'ignored' }`.
+	function submitIgnore() {
+		const body: StatusBody = { status: 'ignored' };
+		if (snoozeable) {
+			if (ignoreUntil !== '') body.snoozedUntil = new Date(ignoreUntil).toISOString();
+			if (ignoreOccurrences !== null && Number.isFinite(ignoreOccurrences)) {
+				body.snoozeOccurrences = ignoreOccurrences;
+			}
+		}
+		void submitStatus(body);
+	}
+
+	// The three facts (`D1`), strings verbatim from §4.1. `Resolved in:` only while `resolved`,
+	// `Ignored:` only while `ignored`; the `{#if}`s are in the markup. Numbers through
+	// `toLocaleString()` like `Occurrences:`; `snooze_count_at` is `NULL` iff the target is (the
+	// migrated `check_snooze_pair`), so the subtraction never sees a lone null.
+	let resolvedInFact = $derived(
+		data.issue.resolvedInVersion === 'next'
+			? 'next release (waiting for it)'
+			: (data.issue.resolvedInVersion ?? 'no version')
+	);
+	let ignoredFact = $derived.by(() => {
+		const parts: string[] = [];
+		if (data.issue.snoozedUntil) parts.push(`until ${formatDate(data.issue.snoozedUntil)}`);
+		if (data.issue.snoozeOccurrenceTarget != null) {
+			const soFar = Number(data.issue.count) - Number(data.issue.snoozeCountAt ?? 0);
+			parts.push(
+				`for ${Number(data.issue.snoozeOccurrenceTarget).toLocaleString()} more occurrences (${soFar.toLocaleString()} so far)`
+			);
+		}
+		return parts.length === 0 ? 'indefinitely' : parts.join(' or ');
+	});
 </script>
 
 <!-- Decision 16's zero shape, the same as the list card's: the dash replaces the number only. -->
@@ -151,8 +319,122 @@
 
 	<div class="issue-header">
 		<h1 class="error-title">{data.issue.errorClass}</h1>
-		<span class="status {data.issue.status}">{data.issue.status}</span>
+		<!--
+			sentinel-releases-snooze §4.1 "The controls", flows `D2`–`D11`. Right of the chip: the chip
+			is the state, the controls change it. Rendered iff `canWrite` (`D2`); each button's
+			visibility follows §4.1's table. The dialogs are plain `<dialog>`/form markup in this page's
+			own CSS (§5) — their FIELDS, STRINGS and BODIES are acceptance; their arrangement is the
+			delegated visual decision. A failure string sits beside the open dialog; when no dialog is
+			open (the relations panel's prompt, `D12`) it sits here beside the buttons.
+		-->
+		<div class="status-block">
+			<span class="status {data.issue.status}">{data.issue.status}</span>
+			{#if canWrite}
+				<div class="status-controls" data-testid="status-controls">
+					{#if data.issue.status !== 'resolved'}
+						<button type="button" class="btn-status btn-resolve" onclick={() => showDialog('resolve')}>Resolve</button>
+					{/if}
+					{#if data.issue.status !== 'ignored'}
+						<button type="button" class="btn-status btn-ignore" onclick={() => showDialog('ignore')}>Ignore</button>
+					{/if}
+					{#if data.issue.status !== 'unresolved'}
+						<button type="button" class="btn-status btn-reopen" disabled={submitting} onclick={() => submitStatus({ status: 'unresolved' })}>Reopen</button>
+					{/if}
+				</div>
+			{/if}
+			{#if submitError && openDialog === null}
+				<p class="status-error" role="alert" data-testid="status-error">{submitError}</p>
+			{/if}
+		</div>
 	</div>
+
+	{#if openDialog === 'resolve'}
+		<dialog class="status-dialog" open aria-labelledby="resolve-dialog-title" data-testid="resolve-dialog">
+			<form class="dialog-form" onsubmit={(e) => { e.preventDefault(); submitResolve(); }}>
+				<h2 class="dialog-title" id="resolve-dialog-title">Resolve issue</h2>
+				<fieldset class="dialog-fieldset">
+					<legend class="visually-hidden">Resolved in</legend>
+					<label class="choice">
+						<input type="radio" name="resolveChoice" value="next" bind:group={resolveChoice} />
+						<span class="choice-label">next release</span>
+						<span class="choice-hint">the first release this project has not seen yet, in any environment</span>
+					</label>
+					<label class="choice">
+						<input type="radio" name="resolveChoice" value="release" bind:group={resolveChoice} disabled={pickerReleases.length === 0} />
+						<span class="choice-label">a release</span>
+						<select
+							class="choice-input"
+							aria-label="Release"
+							bind:value={resolveRelease}
+							disabled={pickerReleases.length === 0}
+							onfocus={() => (resolveChoice = 'release')}
+							onchange={() => (resolveChoice = 'release')}
+						>
+							{#each pickerReleases as release (release.version)}
+								<option value={release.version}>{release.version}</option>
+							{/each}
+						</select>
+						{#if pickerReleases.length === 0}
+							<span class="choice-hint">No releases seen for this project yet — pick next release or type a version</span>
+						{/if}
+					</label>
+					<label class="choice">
+						<input type="radio" name="resolveChoice" value="typed" bind:group={resolveChoice} />
+						<span class="choice-label">type a version</span>
+						<input
+							type="text"
+							class="choice-input"
+							aria-label="Version"
+							maxlength="100"
+							placeholder="2.0.0-rc1"
+							bind:value={resolveTyped}
+							onfocus={() => (resolveChoice = 'typed')}
+							oninput={() => (resolveChoice = 'typed')}
+						/>
+						<span class="choice-hint">left empty, the issue regresses on the next occurrence</span>
+					</label>
+				</fieldset>
+				{#if submitError}
+					<p class="status-error" role="alert" data-testid="dialog-error">{submitError}</p>
+				{/if}
+				<div class="dialog-actions">
+					<button type="submit" class="btn-status btn-resolve" disabled={submitting}>Resolve</button>
+					<button type="button" class="btn-status btn-cancel" onclick={closeDialog}>Cancel</button>
+				</div>
+			</form>
+		</dialog>
+	{/if}
+
+	{#if openDialog === 'ignore'}
+		<dialog class="status-dialog" open aria-labelledby="ignore-dialog-title" data-testid="ignore-dialog">
+			<form class="dialog-form" onsubmit={(e) => { e.preventDefault(); submitIgnore(); }}>
+				<h2 class="dialog-title" id="ignore-dialog-title">Ignore issue</h2>
+				{#if snoozeable}
+					<fieldset class="dialog-fieldset">
+						<legend class="visually-hidden">Ignore conditions</legend>
+						<label class="choice">
+							<span class="choice-label">until</span>
+							<input type="datetime-local" class="choice-input" aria-label="Ignore until" bind:value={ignoreUntil} />
+						</label>
+						<label class="choice">
+							<span class="choice-label">for N more occurrences</span>
+							<input type="number" class="choice-input" aria-label="Ignore for N more occurrences" min="1" max="1000000" step="1" placeholder="100" bind:value={ignoreOccurrences} />
+						</label>
+						<p class="choice-hint">Leave both empty to ignore indefinitely. Either condition ends the ignore.</p>
+					</fieldset>
+				{:else}
+					<p class="choice-hint" data-testid="ignore-manual-note">A manual issue has no occurrences, so it is ignored until someone reopens it.</p>
+				{/if}
+				{#if submitError}
+					<p class="status-error" role="alert" data-testid="dialog-error">{submitError}</p>
+				{/if}
+				<div class="dialog-actions">
+					<button type="submit" class="btn-status btn-ignore" disabled={submitting}>Ignore</button>
+					<button type="button" class="btn-status btn-cancel" onclick={closeDialog}>Cancel</button>
+				</div>
+			</form>
+		</dialog>
+	{/if}
 
 	<div class="issue-info">
 		<p class="message">{data.issue.message}</p>
@@ -179,6 +461,21 @@
 			-->
 			<span class="meta-item" data-testid="issue-affected-users"><strong class="meta-label">Affected users (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedUserCount, 'user')}</span>
 			<span class="meta-item" data-testid="issue-affected-tenants"><strong class="meta-label">Affected tenants (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedTenantCount, 'tenant')}</span>
+			<!--
+				sentinel-releases-snooze §4.1, flow `D1`. Three facts after the two affected counts, in
+				this order. `Introduced in:` is always there (`—` when the issue's first occurrence
+				carried no version, or retention swept it before the backfill ran — decision 22).
+				`Resolved in:` only while `resolved`: the version, *next release (waiting for it)* for the
+				reserved literal (decision 21), *no version* for `null`. `Ignored:` only while `ignored`:
+				*until …*, *for N more occurrences (n so far)*, both joined with *or*, or *indefinitely*.
+			-->
+			<span class="meta-item" data-testid="issue-introduced-in"><strong class="meta-label">Introduced in:</strong> {data.issue.firstReleaseVersion ?? '—'}</span>
+			{#if data.issue.status === 'resolved'}
+				<span class="meta-item" data-testid="issue-resolved-in"><strong class="meta-label">Resolved in:</strong> {resolvedInFact}</span>
+			{/if}
+			{#if data.issue.status === 'ignored'}
+				<span class="meta-item" data-testid="issue-ignored"><strong class="meta-label">Ignored:</strong> {ignoredFact}</span>
+			{/if}
 		</div>
 	</div>
 
@@ -218,7 +515,7 @@
 	<IssueRelations
 		currentIssueId={data.issue.id}
 		initialRelations={knownRelations}
-		onStatusChangeRequest={handleStatusChangeRequest}
+		onStatusChangeRequest={(status) => submitStatus({ status })}
 	/>
 
 	<section class="occurrences">
@@ -328,6 +625,154 @@
 	.status.open { background: var(--status-open-bg); color: var(--status-open-text); }
 	.status.resolved { background: var(--status-resolved-bg); color: var(--status-resolved-text); }
 	.status.ignored { background: var(--status-ignored-bg); color: var(--status-ignored-text); }
+
+	/* sentinel-releases-snooze §4.1 — the control block beside the chip, and its two dialogs (§5). */
+	.status-block {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+	}
+
+	.status-controls {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.btn-status {
+		padding: 0.375rem 0.75rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		font-size: 0.75rem;
+		font-weight: 500;
+		cursor: pointer;
+		transition: background 0.15s ease, color 0.15s ease;
+	}
+
+	.btn-status:hover:not(:disabled) {
+		background: var(--bg-surface-hover);
+	}
+
+	.btn-status:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.btn-resolve { border-color: var(--status-resolved-text); color: var(--status-resolved-text); }
+	.btn-resolve:hover:not(:disabled) { background: var(--status-resolved-bg); }
+	.btn-ignore { border-color: var(--status-ignored-text); color: var(--status-ignored-text); }
+	.btn-ignore:hover:not(:disabled) { background: var(--status-ignored-bg); }
+	.btn-reopen { border-color: var(--status-open-text); color: var(--status-open-text); }
+	.btn-reopen:hover:not(:disabled) { background: var(--status-open-bg); }
+	.btn-cancel { color: var(--text-muted); }
+
+	.status-error {
+		flex-basis: 100%;
+		text-align: right;
+		font-size: 0.8125rem;
+		color: var(--severity-critical-text);
+	}
+
+	.status-dialog {
+		position: fixed;
+		inset: 0;
+		margin: auto;
+		width: min(28rem, calc(100vw - 2rem));
+		max-height: calc(100vh - 2rem);
+		overflow: auto;
+		padding: 1.25rem;
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+		z-index: 50;
+	}
+
+	.dialog-title {
+		font-size: 1rem;
+		font-weight: 600;
+		margin-bottom: 1rem;
+	}
+
+	.dialog-fieldset {
+		border: none;
+		padding: 0;
+		margin: 0 0 1rem 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.875rem;
+	}
+
+	.choice {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		column-gap: 0.5rem;
+		row-gap: 0.25rem;
+		align-items: center;
+		font-size: 0.8125rem;
+	}
+
+	.choice > input[type='radio'] {
+		grid-column: 1;
+		margin: 0;
+	}
+
+	.choice-label {
+		grid-column: 2;
+		font-weight: 500;
+		color: var(--text-primary);
+	}
+
+	.choice-input {
+		grid-column: 2;
+		width: 100%;
+		padding: 0.375rem 0.5rem;
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		font-family: var(--font-mono);
+	}
+
+	.choice-input:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.choice-hint {
+		grid-column: 2;
+		font-size: 0.75rem;
+		color: var(--text-subtle);
+		line-height: 1.4;
+	}
+
+	.dialog-actions {
+		display: flex;
+		gap: 0.5rem;
+		justify-content: flex-end;
+	}
+
+	.dialog-form .status-error {
+		text-align: left;
+		margin-bottom: 0.75rem;
+	}
+
+	.visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
 
 	.issue-info {
 		background: var(--bg-surface);

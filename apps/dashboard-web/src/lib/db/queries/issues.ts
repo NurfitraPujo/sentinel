@@ -30,12 +30,31 @@ function isRegression(releaseVersion: string, resolvedInVersion: string): boolea
 	return releaseVersion.localeCompare(resolvedInVersion) >= 0;
 }
 
+/**
+ * sentinel-releases-snooze §4.2: the two optional snooze conditions a status write may carry,
+ * already validated by the route (`issue-access.ts: validateSnoozedUntil` /
+ * `validateSnoozeOccurrences` -- one validator for the human route and the agent op alike).
+ * `null`/absent means "no condition of that kind"; either condition ends the snooze (§4.3).
+ */
+export interface SnoozeOptions {
+	snoozedUntil?: Date | null;
+	snoozeOccurrences?: number | null;
+}
+
+// The no-op guard compares `snoozedUntil` as an INSTANT (`getTime()`), never as a string: a
+// `+07:00` request and the stored `timestamptz` (read back as a `Date`) are the same value.
+function sameInstant(a: Date | null | undefined, b: Date | null | undefined): boolean {
+	if (a == null || b == null) return a == null && b == null;
+	return a.getTime() === b.getTime();
+}
+
 export async function updateIssueStatus(
 	issueId: string,
 	status: 'unresolved' | 'resolved' | 'ignored',
 	resolvedInVersion?: string,
 	actorType?: 'user' | 'agent',
-	actorId?: string
+	actorId?: string,
+	snooze?: SnoozeOptions
 ): Promise<{ changed: boolean; notified: NotifiedUser[] }> {
 	return await db.transaction(async (tx) => {
 		const [existing] = await tx
@@ -43,6 +62,10 @@ export async function updateIssueStatus(
 				status: issues.status,
 				waitingOn: issues.waitingOn,
 				resolvedInVersion: issues.resolvedInVersion,
+				count: issues.count,
+				snoozedUntil: issues.snoozedUntil,
+				snoozeOccurrenceTarget: issues.snoozeOccurrenceTarget,
+				snoozeCountAt: issues.snoozeCountAt,
 			})
 			.from(issues)
 			.where(eq(issues.id, issueId));
@@ -50,14 +73,24 @@ export async function updateIssueStatus(
 		// A05-status (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): a retried PATCH .../status
 		// with the SAME status AND the same resolved_in_version is a natural no-op guard against a
 		// dropped-response retry -- it must not insert a second `status_changed` activity row or
-		// re-fire the resolved-notification email. Only `status` + `resolvedInVersion` are compared:
-		// a different actor re-sending the identical transition is still a no-op by this contract
+		// re-fire the resolved-notification email. Only the transition itself is compared: a
+		// different actor re-sending the identical transition is still a no-op by this contract
 		// (the activity trail already has the original actor on the first, real write).
+		//
+		// sentinel-releases-snooze §4.2 widens the guard: `snoozedUntil` (as an instant) and
+		// `snoozeOccurrences` are compared too, so a re-snooze with a DIFFERENT condition is a real
+		// change. Both are normalised the way the write below normalises them -- a snooze exists
+		// only on an ignored issue (`check_snooze_only_when_ignored`), so for any other status the
+		// target state is "no snooze", whatever the caller passed.
 		const normalizedResolvedInVersion = status === 'resolved' ? resolvedInVersion || null : null;
+		const nextSnoozedUntil = status === 'ignored' ? (snooze?.snoozedUntil ?? null) : null;
+		const nextSnoozeTarget = status === 'ignored' ? (snooze?.snoozeOccurrences ?? null) : null;
 		if (
 			existing &&
 			existing.status === status &&
-			(existing.resolvedInVersion ?? null) === normalizedResolvedInVersion
+			(existing.resolvedInVersion ?? null) === normalizedResolvedInVersion &&
+			sameInstant(existing.snoozedUntil, nextSnoozedUntil) &&
+			(existing.snoozeOccurrenceTarget ?? null) === nextSnoozeTarget
 		) {
 			return { changed: false, notified: [] };
 		}
@@ -76,6 +109,25 @@ export async function updateIssueStatus(
 			updateData.resolvedBy = null;
 		}
 
+		// sentinel-releases-snooze §4.2: the three snooze columns, in the SAME statement as the
+		// status -- `check_snooze_only_when_ignored` is enforced on every UPDATE, so a resolve or a
+		// reopen that forgot to null them would be refused by the database, not silently wrong.
+		//
+		//   - `ignored`: the two conditions as given (`NULL` = no condition of that kind; neither =
+		//     the indefinite ignore, exactly today's write). `snooze_count_at` is stamped from
+		//     `issues.count` only when the target changes or was NULL, and CARRIED OVER (left
+		//     untouched) when the stored target equals the new one (decision 39) -- adding a date to
+		//     a running count snooze keeps "37 so far" at 37 and the end at the same N, while a new
+		//     N restarts the count from now. NULL when there is no target (`check_snooze_pair`).
+		//   - `resolved` / `unresolved`: all three NULL -- a resolve or a reopen ends a snooze.
+		updateData.snoozedUntil = nextSnoozedUntil;
+		updateData.snoozeOccurrenceTarget = nextSnoozeTarget;
+		if (nextSnoozeTarget === null) {
+			updateData.snoozeCountAt = null;
+		} else if ((existing?.snoozeOccurrenceTarget ?? null) !== nextSnoozeTarget) {
+			updateData.snoozeCountAt = existing?.count ?? 0;
+		}
+
 		// R7 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): resolving or ignoring an issue that was
 		// `waiting_on` someone left it stuck in the "Needs input" tab forever -- nothing else ever
 		// clears `waiting_on` once the issue leaves the unresolved state. Clearing it here mirrors
@@ -92,13 +144,23 @@ export async function updateIssueStatus(
 			.where(eq(issues.id, issueId));
 
 		// event_type CHECK on issue_activity requires 'status_changed', not 'status_change'.
+		//
+		// sentinel-releases-snooze §4.2 / decision 40: `new_value` carries the two snooze keys ONLY
+		// when present, so a pre-feature reader sees an unchanged payload for an unchanged call;
+		// `snoozedUntil` is `toISOString()` -- the normalised UTC instant with `Z` and milliseconds,
+		// whatever offset the request carried. Readers parse it as an instant, never compare strings.
 		await tx.insert(issueActivity).values({
 			issueId,
 			eventType: 'status_changed',
 			actorType: actorType || 'system',
 			actorId: actorId || 'system',
 			oldValue: existing ? { status: existing.status, waitingOn: existing.waitingOn } : null,
-			newValue: { status, resolvedInVersion },
+			newValue: {
+				status,
+				resolvedInVersion,
+				...(nextSnoozedUntil !== null ? { snoozedUntil: nextSnoozedUntil.toISOString() } : {}),
+				...(nextSnoozeTarget !== null ? { snoozeOccurrences: nextSnoozeTarget } : {}),
+			},
 		});
 
 		// §8: 'resolved' gets its own notification kind (design's email-policy table lists it
@@ -197,13 +259,42 @@ export async function batchUpdateIssues(
 				if (options.resolvedInVersion) {
 					updateData.resolvedInVersion = options.resolvedInVersion;
 				}
+				// sentinel-releases-snooze decision 27: the batch resolve stamps the clock and the actor
+				// exactly as updateIssueStatus's resolve does (it used to write `status` and
+				// `resolved_in_version` only). Every `next` written anywhere therefore has a
+				// `resolved_at` for §4.3's rewrite and catch-up to compare a release's `first_seen`
+				// against -- a `next` with no clock is a regression on its next occurrence, forever.
+				// `now()` is the database's clock (§3 Clocks), one value for every row in the statement.
+				updateData.resolvedAt = sql`now()`;
+				if (options.actorType) updateData.resolvedByType = options.actorType;
+				if (options.actorId) updateData.resolvedBy = options.actorId;
+				// A resolve ends a snooze -- and `check_snooze_only_when_ignored` refuses the status
+				// change outright unless the snooze columns are nulled in the same statement.
+				updateData.snoozedUntil = null;
+				updateData.snoozeOccurrenceTarget = null;
+				updateData.snoozeCountAt = null;
 				break;
 			case 'ignore':
+				// sentinel-releases-snooze decision 44: UNTOUCHED, on purpose. The arm writes `status`
+				// and nothing else -- it nulls neither the resolve columns nor the snooze columns. So a
+				// batch ignore of a snoozed issue keeps the snooze running (the ignore was redundant;
+				// the CHECK holds because the status is `ignored`), and a batch ignore of anything else
+				// is the indefinite ignore it always was. The arm takes no snooze key, and nulling a
+				// running condition from a bulk action nobody gave a condition to would end a snooze
+				// silently. Do not "fix" this in passing.
 				updateData.status = 'ignored';
 				break;
 			case 'unresolve':
 				updateData.status = 'unresolved';
 				updateData.resolvedInVersion = null;
+				// decision 27: the reopen nulls the clock and the actor as updateIssueStatus does...
+				updateData.resolvedAt = null;
+				updateData.resolvedByType = null;
+				updateData.resolvedBy = null;
+				// ...and the snooze (§4.2: a reopen ends one; the CHECK refuses the write otherwise).
+				updateData.snoozedUntil = null;
+				updateData.snoozeOccurrenceTarget = null;
+				updateData.snoozeCountAt = null;
 				break;
 			case 'assign':
 				updateData.assigneeType = options.assigneeType;

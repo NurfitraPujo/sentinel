@@ -1,6 +1,9 @@
 // Package e2e — this file covers matrix rows U11, U12, U13 (docs/plans/E2E_RECOVERY_PLAN.md, "P7 — The
 // E2E proof harness"): issue-lifecycle regression detection and issue relations, driven against the real
-// compose stack via the harness in main_test.go/harness_test.go.
+// compose stack via the harness in main_test.go/harness_test.go. sentinel-releases-snooze's row beside
+// U12 — resolve in `next`, the next SHA names the release (U12b) — lives in lifecycle_next_test.go,
+// because it drives the agent API through agent_work_loop_test.go's seedAgent/agentRequest helpers,
+// which are `//go:build e2e`, and this file is compiled by the plain build too.
 //
 // # History
 //
@@ -171,30 +174,55 @@ func TestU11_NewerReleaseRecurrenceRegresses(t *testing.T) {
 // issue_activity row appears. Per the plan, this is the half of the feature "nothing has ever tested" and
 // "easy to get wrong by comparing versions with a plain string comparison" (a naive lexical/string compare
 // of "1.9.0" vs "1.10.0" gets this backwards). Proving a negative requires a positive synchronization
-// point first: wait for the occurrence count to reach 2 (proving the second event was actually
+// point first: wait for the occurrence count to reach 3 (proving the third event was actually
 // processed), THEN assert the regression fields are still unset — never just sleep-and-hope.
+//
+// RE-SEQUENCED for sentinel-releases-snooze (contract §6, decisions 1 and 14). As first written this
+// row ingested 2.0.0, resolved in 2.0.0, and then let 1.0.0 arrive — which encoded SEMVER ordering:
+// "1.0.0 is older than 2.0.0 because the numbers say so". Under the releases entity "older" is decided
+// by `releases.first_seen`, never by parsing the version (decision 1), and a version this project has
+// never seen before is the NEWEST by definition (decision 14: a first sighting is newest). So the old
+// sequence now regresses the issue — 1.0.0 had never been seen — and the row would fail for a reason
+// that is not the bug it guards. The sequence below makes BOTH orderings agree: 1.0.0 is ingested
+// FIRST (first seen earliest), then 2.0.0 (first seen later), the issue is resolved in 2.0.0, and
+// 1.0.0 recurs — older by first_seen AND older by semver — so a regression here would be wrong under
+// either rule, which is exactly what the row exists to catch.
 func TestU12_OlderReleaseRecurrenceDoesNotRegress(t *testing.T) {
 	requireStack(t)
 	f := newFixture(t)
 
-	first := f.newEvent().with(map[string]any{"release_version": "2.0.0"})
+	// 1.0.0 first: this project's earliest-seen release.
+	first := f.newEvent().with(map[string]any{"release_version": "1.0.0"})
 	if res := f.ingest(first); res.Status != http.StatusAccepted {
-		t.Fatalf("U12: first ingest: got %d, want 202\n  body: %s", res.Status, res.Body)
+		t.Fatalf("U12: first ingest (1.0.0): got %d, want 202\n  body: %s", res.Status, res.Body)
 	}
 	f.waitForOccurrences(1)
 	f.waitForIssues(1)
 
+	// 2.0.0 second: first seen AFTER 1.0.0, so it is the newer release by first_seen as well as by number.
+	second := f.newEvent().with(map[string]any{"release_version": "2.0.0"})
+	if res := f.ingest(second); res.Status != http.StatusAccepted {
+		t.Fatalf("U12: second ingest (2.0.0): got %d, want 202\n  body: %s", res.Status, res.Body)
+	}
+	f.waitForOccurrences(2)
+	f.waitForIssues(1)
+
 	fresh := f.onlyIssue()
+	if fresh.RegressionStatus != "none" || fresh.RegressionCount != 0 {
+		t.Fatalf("U12: issue already looks regressed before it was ever resolved: status=%q count=%d",
+			fresh.RegressionStatus, fresh.RegressionCount)
+	}
 	f.resolve(fresh.ID, "2.0.0")
 
-	second := f.newEvent().with(map[string]any{"release_version": "1.0.0"})
-	if res := f.ingest(second); res.Status != http.StatusAccepted {
-		t.Fatalf("U12: second (older-release recurrence) ingest: got %d, want 202\n  body: %s", res.Status, res.Body)
+	// 1.0.0 recurs: older than the resolving release under both orderings.
+	third := f.newEvent().with(map[string]any{"release_version": "1.0.0"})
+	if res := f.ingest(third); res.Status != http.StatusAccepted {
+		t.Fatalf("U12: third (older-release recurrence) ingest: got %d, want 202\n  body: %s", res.Status, res.Body)
 	}
-	// The positive synchronization point: prove the second event was actually processed (occurrence
-	// count reaches 2, and remains 2 — waitForOccurrences also guards against a duplicate arriving late)
+	// The positive synchronization point: prove the third event was actually processed (occurrence
+	// count reaches 3, and remains 3 — waitForOccurrences also guards against a duplicate arriving late)
 	// before asserting on the negative (no regression fields changed).
-	f.waitForOccurrences(2)
+	f.waitForOccurrences(3)
 	f.waitForIssues(1) // still the same issue by fingerprint — no second issue row was created
 
 	got := f.onlyIssue()
@@ -208,8 +236,14 @@ func TestU12_OlderReleaseRecurrenceDoesNotRegress(t *testing.T) {
 	if got.LastRegressedAt != nil {
 		t.Fatalf("U12: last_regressed_at = %v, want NULL (issue %s)", *got.LastRegressedAt, got.ID)
 	}
-	if got.Count != 2 {
-		t.Fatalf("U12: issue count = %d, want 2 — the older-release occurrence must still be recorded against the issue", got.Count)
+	if got.Status != "resolved" {
+		t.Fatalf("U12: status = %q, want %q — a non-regressing recurrence must leave the resolution in place", got.Status, "resolved")
+	}
+	if got.ResolvedInVersion == nil || *got.ResolvedInVersion != "2.0.0" {
+		t.Fatalf("U12: resolved_in_version = %v, want %q — untouched by the older recurrence", got.ResolvedInVersion, "2.0.0")
+	}
+	if got.Count != 3 {
+		t.Fatalf("U12: issue count = %d, want 3 — the older-release occurrence must still be recorded against the issue", got.Count)
 	}
 
 	activity := f.activity("regressed")

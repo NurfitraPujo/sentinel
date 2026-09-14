@@ -20,7 +20,16 @@ const sendIssueNotificationEmails = vi.fn();
 vi.mock('$lib/server/notify', () => ({ sendIssueNotificationEmails }));
 
 const validateResolvedInVersion = vi.fn((v: unknown) => v ?? null);
-vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion }));
+// sentinel-releases-snooze §4.2: `issuesStatus` now also calls the two snooze validators. Stubbed
+// as "omitted" here; their behaviour is proved by `agent-api-spec/contract.test.ts` (real
+// validators, both routes) and `routes/api/issues/status.test.ts`.
+const validateSnoozedUntil = vi.fn(() => null);
+const validateSnoozeOccurrences = vi.fn(() => null);
+vi.mock('$lib/server/issue-access', () => ({
+	validateResolvedInVersion,
+	validateSnoozedUntil,
+	validateSnoozeOccurrences,
+}));
 
 const updateIssueStatus = vi.fn();
 const createIssueRelation = vi.fn();
@@ -123,7 +132,10 @@ describe('POST /api/agent/batch', () => {
 		expect(data.results[0]).toMatchObject({ ok: true, status: 200 });
 		expect(data.results[1]).toMatchObject({ ok: true, status: 201 });
 		expect(data.results[2]).toMatchObject({ ok: true, status: 201 });
-		expect(updateIssueStatus).toHaveBeenCalledWith('issue-1', 'resolved', undefined, 'agent', 'agent-1');
+		expect(updateIssueStatus).toHaveBeenCalledWith('issue-1', 'resolved', undefined, 'agent', 'agent-1', {
+			snoozedUntil: null,
+			snoozeOccurrences: null,
+		});
 		// N9 (D21): the op now forwards an optional idempotency key (undefined when absent).
 		expect(recordAgentProgress).toHaveBeenCalledWith('issue-1', 'agent-1', 'working on it', undefined);
 		expect(createComment).toHaveBeenCalledTimes(1);

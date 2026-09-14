@@ -72,6 +72,19 @@ export const IssueRowSchema = z
 		// sweep recomputes it from what remains (decision 12).
 		affectedUserCount: z.number().int().nonnegative(),
 		affectedTenantCount: z.number().int().nonnegative(),
+		// sentinel-releases-snooze decision 9: the four §4.5 columns reach this response by the same
+		// full-row select, so they are declared -- not excused via KNOWN_UNDECLARED. All four are
+		// nullable with no default (§4.5): NULL for every pre-feature row, for a plain indefinite
+		// ignore, and for an issue whose first occurrence carried no version. A snooze is
+		// `status: 'ignored'` with `snoozedUntil` and/or `snoozeOccurrenceTarget` set (no fourth
+		// status -- decision 2); `snoozeCountAt` is the `count` the target was set at and travels
+		// with it (the migrated check_snooze_pair). The three snooze keys are non-null ONLY while
+		// `status` is `ignored` (check_snooze_only_when_ignored). Dates render as ISO strings on
+		// the wire like every other timestamp here.
+		snoozedUntil: z.coerce.date().nullable(),
+		snoozeOccurrenceTarget: z.number().int().positive().nullable(),
+		snoozeCountAt: z.number().int().nullable(),
+		firstReleaseVersion: z.string().nullable(),
 	})
 	.strict();
 
@@ -234,10 +247,53 @@ export const ClaimConflictErrorSchema = z
 // PATCH /api/agent/issues/{issueId}/status -- agent-ops.ts's `issuesStatus`
 // ---------------------------------------------------------------------------
 
+// sentinel-releases-snooze §4.2 / decision 38: this schema is DECLARATION-ONLY. It is referenced by
+// registry.ts (the OpenAPI) and by nothing that runs -- `agent-ops.ts: issuesStatus` hand-validates
+// through `asRecord` and the `issue-access.ts` validators (`validateSnoozedUntil`,
+// `validateSnoozeOccurrences`), and no runtime `.parse()` of it is to be added. So the schema
+// documents and the validator enforces: whatever `snoozed_until` declares refused here (a date-only
+// `2026-09-20`, a zone-less `2026-09-20T09:00`) is what the validator's ISO 8601 shape check
+// refuses, with §4.2's single `snoozedUntil must be a future timestamp` string; the future check is
+// the validator's, not the schema's.
 export const StatusBodySchema = z
 	.object({
 		status: z.enum(['unresolved', 'resolved', 'ignored']),
-		resolved_in_version: z.string().optional(),
+		resolved_in_version: z
+			.string()
+			.optional()
+			.describe(
+				'Free text, trimmed, at most 100 characters; meaningful only with status=resolved. ' +
+					'The literal `next` is reserved: "resolved in the next release, whichever it turns ' +
+					'out to be" -- rewritten to the first release the PROJECT sees after the resolve ' +
+					'(project-level, any environment: a version already seen on staging is not the ' +
+					'next release). Compared byte-for-byte after trimming (`Next` is a version).'
+			),
+		// Offsets accepted, as `before` on the occurrences query already does; `2026-09-20T09:00:00Z`
+		// and `2026-09-20T16:00:00+07:00` are the same instant. Must be strictly in the future
+		// (the validator's check). Only with status=ignored. `''` is treated as omitted (§3).
+		snoozed_until: z
+			.string()
+			.datetime({ offset: true })
+			.optional()
+			.describe(
+				'Only with status=ignored: ignore until this instant (full ISO 8601 date-time with ' +
+					'seconds and a zone -- `Z` or `±hh:mm`; offsets accepted). Must be strictly in ' +
+					'the future. 400 `snoozedUntil is only valid with status ignored` / `snoozedUntil ' +
+					'must be a future timestamp`. An empty string is treated as omitted.'
+			),
+		// A JSON integer in [1, 1000000]; any string other than '' is refused. Only with status=ignored.
+		snooze_occurrences: z
+			.number()
+			.int()
+			.min(1)
+			.max(1000000)
+			.optional()
+			.describe(
+				'Only with status=ignored: ignore until this many MORE occurrences have been stored ' +
+					'(stored as snoozeOccurrenceTarget, with snoozeCountAt = the count at the time). ' +
+					'400 `snoozeOccurrences is only valid with status ignored` / `snoozeOccurrences ' +
+					'must be an integer between 1 and 1000000`. An empty string is treated as omitted.'
+			),
 	})
 	.strict();
 

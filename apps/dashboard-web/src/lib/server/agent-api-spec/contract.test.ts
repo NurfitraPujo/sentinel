@@ -53,6 +53,12 @@ const ISSUE_ROW = {
 	// sentinel-affected-users decision 14: NOT NULL DEFAULT 0 on the row, declared on the schema.
 	affectedUserCount: 0,
 	affectedTenantCount: 0,
+	// sentinel-releases-snooze decision 9: the four §4.5 columns, nullable with no default, declared
+	// on the schema -- null is what every pre-feature row and every plain indefinite ignore reads.
+	snoozedUntil: null,
+	snoozeOccurrenceTarget: null,
+	snoozeCountAt: null,
+	firstReleaseVersion: null,
 };
 
 const COMMENT_ROW = {
@@ -94,7 +100,14 @@ const sendIssueNotificationEmails = vi.fn();
 vi.mock('$lib/server/notify', () => ({ sendIssueNotificationEmails }));
 
 const validateResolvedInVersion = vi.fn((v: unknown) => v ?? null);
-vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion }));
+// sentinel-releases-snooze decision 38: `validateSnoozedUntil` / `validateSnoozeOccurrences` are
+// the REAL ones, deliberately -- the whole point of the status cases below is that the ONE
+// validator both routes call refuses, through the agent route, exactly what §4.2 declares
+// (`StatusBodySchema` documents; nothing runs a `.parse()` on it). A stub here would prove nothing.
+vi.mock('$lib/server/issue-access', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$lib/server/issue-access')>();
+	return { ...actual, validateResolvedInVersion };
+});
 
 class ClaimConflictError extends Error {
 	constructor(message = 'Claim conflict') {
@@ -345,6 +358,139 @@ describe('PATCH /api/agent/issues/{issueId}/status', () => {
 				})
 			)
 		).rejects.toMatchObject({ status: 400 });
+	});
+
+	// -------------------------------------------------------------------------------------------
+	// sentinel-releases-snooze §4.2 (decisions 33, 38, 40): `snoozed_until` / `snooze_occurrences`
+	// through the agent route. The validators are REAL here (see the issue-access mock), so these
+	// cases prove the same set `routes/api/issues/status.test.ts` proves for the human route --
+	// one validator, both routes, the same four strings.
+	// -------------------------------------------------------------------------------------------
+	describe('snoozed_until / snooze_occurrences (sentinel-releases-snooze §4.2)', () => {
+		const FUTURE_Z = '2099-09-20T09:00:00Z';
+		const FUTURE_OFFSET = '2099-09-20T16:00:00+07:00'; // the same instant as FUTURE_Z
+		const patch = (body: unknown) =>
+			statusRoute.PATCH(
+				makeEvent('http://localhost/api/agent/issues/issue-1/status', {
+					method: 'PATCH',
+					issueId: 'issue-1',
+					body,
+				})
+			);
+		const lastSnooze = () => updateIssueStatus.mock.calls.at(-1)?.[5];
+
+		beforeEach(() => {
+			updateIssueStatus.mockResolvedValue({ changed: true, notified: [] });
+		});
+
+		it('200: forwards both conditions to updateIssueStatus, the instant parsed', async () => {
+			const res = await patch({ status: 'ignored', snoozed_until: FUTURE_Z, snooze_occurrences: 100 });
+			expect(res.status).toBe(200);
+			expect(S.StatusResponseSchema.parse(await res.json())).toBeTruthy();
+			expect(updateIssueStatus).toHaveBeenCalledWith('issue-1', 'ignored', undefined, 'agent', 'agent-1', {
+				snoozedUntil: new Date(FUTURE_Z),
+				snoozeOccurrences: 100,
+			});
+		});
+
+		it('200: an offset timestamp is accepted and normalised to the same instant as its Z form', async () => {
+			const res = await patch({ status: 'ignored', snoozed_until: FUTURE_OFFSET });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: new Date(FUTURE_Z), snoozeOccurrences: null });
+			expect((lastSnooze().snoozedUntil as Date).getTime()).toBe(Date.parse(FUTURE_Z));
+		});
+
+		it('200: `\'\'` on either key is omitted -- the indefinite ignore (§3)', async () => {
+			const res = await patch({ status: 'ignored', snoozed_until: '', snooze_occurrences: '' });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: null });
+		});
+
+		it('200: a body without the keys forwards both as null -- the pre-feature call is unchanged', async () => {
+			const res = await patch({ status: 'ignored' });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: null });
+		});
+
+		it.each([
+			['a past instant', '2020-01-01T00:00:00Z'],
+			['an unparseable string', 'tomorrow'],
+			['a date-only value (Date.parse alone would take it as UTC midnight)', '2099-09-20'],
+			['a zone-less value (Date.parse alone would take it as server-local time)', '2099-09-20T09:00'],
+		])('400 `snoozedUntil must be a future timestamp`: %s', async (_label, snoozed_until) => {
+			await expect(patch({ status: 'ignored', snoozed_until })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozedUntil must be a future timestamp' },
+			});
+			expect(updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		it.each([0, 1000001, '12', 1.5])(
+			'400 `snoozeOccurrences must be an integer between 1 and 1000000`: %j',
+			async (snooze_occurrences) => {
+				await expect(patch({ status: 'ignored', snooze_occurrences })).rejects.toMatchObject({
+					status: 400,
+					body: { message: 'snoozeOccurrences must be an integer between 1 and 1000000' },
+				});
+				expect(updateIssueStatus).not.toHaveBeenCalled();
+			}
+		);
+
+		it('400: a snooze key with status resolved -- each key has its own string', async () => {
+			await expect(patch({ status: 'resolved', snoozed_until: FUTURE_Z })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozedUntil is only valid with status ignored' },
+			});
+			await expect(patch({ status: 'resolved', snooze_occurrences: 5 })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozeOccurrences is only valid with status ignored' },
+			});
+			await expect(patch({ status: 'unresolved', snooze_occurrences: 5 })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozeOccurrences is only valid with status ignored' },
+			});
+			expect(updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		it('200: the batch op `issues.status` goes through the same validator and forwards the same shape', async () => {
+			const res = await batchRoute.POST(
+				makeEvent('http://localhost/api/agent/batch', {
+					method: 'POST',
+					body: {
+						operations: [
+							{
+								op: 'issues.status',
+								issueId: 'issue-1',
+								params: { status: 'ignored', snoozed_until: FUTURE_OFFSET, snooze_occurrences: 100 },
+							},
+						],
+					},
+				})
+			);
+			expect(res.status).toBe(200);
+			expect(S.BatchResponseSchema.parse(await res.json())).toBeTruthy();
+			expect(lastSnooze()).toEqual({ snoozedUntil: new Date(FUTURE_Z), snoozeOccurrences: 100 });
+		});
+
+		it('batch op: a past snoozed_until is the same 400 string, reported per-operation', async () => {
+			const res = await batchRoute.POST(
+				makeEvent('http://localhost/api/agent/batch', {
+					method: 'POST',
+					body: {
+						operations: [
+							{
+								op: 'issues.status',
+								issueId: 'issue-1',
+								params: { status: 'ignored', snoozed_until: '2020-01-01T00:00:00Z' },
+							},
+						],
+					},
+				})
+			);
+			const parsed = S.BatchResponseSchema.parse(await res.json());
+			expect(JSON.stringify(parsed)).toContain('snoozedUntil must be a future timestamp');
+			expect(updateIssueStatus).not.toHaveBeenCalled();
+		});
 	});
 });
 
@@ -672,6 +818,41 @@ describe('IssueRowSchema vs. the real `issues` table (decision 54)', () => {
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: 600, affectedTenantCount: 4 }).success).toBe(true);
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: null }).success).toBe(false);
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedTenantCount: -1 }).success).toBe(false);
+	});
+
+	// sentinel-releases-snooze decision 9 (contract §4.5): the four snooze / release columns reach
+	// this response by the same full-row select, so they are declared -- nullable, because every
+	// pre-feature row and every plain indefinite ignore reads NULL -- and NOT appended to
+	// KNOWN_UNDECLARED, which stays exactly `['waitingSince']`; a fifth entry there is a finding.
+	it('decision 9: declares the four §4.5 columns as nullable and leaves KNOWN_UNDECLARED alone', () => {
+		const four = ['snoozedUntil', 'snoozeOccurrenceTarget', 'snoozeCountAt', 'firstReleaseVersion'];
+		for (const key of four) {
+			expect(schemaKeys).toContain(key);
+			expect(columnNames).toContain(key);
+			expect(KNOWN_UNDECLARED).not.toContain(key);
+		}
+		expect(KNOWN_UNDECLARED).toEqual(['waitingSince']);
+		// A snoozed ignore: a date and an occurrence target with the count it was set at.
+		expect(
+			S.IssueRowSchema.safeParse({
+				...ISSUE_ROW,
+				status: 'ignored',
+				snoozedUntil: '2026-09-20T09:00:00.000Z',
+				snoozeOccurrenceTarget: 100,
+				snoozeCountAt: 37,
+				firstReleaseVersion: 'v1.2.3',
+			}).success
+		).toBe(true);
+		// A pre-feature row / plain ignore: all four null.
+		expect(S.IssueRowSchema.safeParse(ISSUE_ROW).success).toBe(true);
+		// The migrated tripwire, mirrored: a target of 0 is not a row the database can hold
+		// (check_snooze_target_positive), so the schema does not admit it either. `snoozeCountAt`
+		// carries no CHECK of its own and is described as the plain integer it is.
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, snoozeOccurrenceTarget: 0, snoozeCountAt: 0 }).success).toBe(false);
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, snoozeOccurrenceTarget: 1, snoozeCountAt: 0 }).success).toBe(true);
+		// The keys are required (the schema is `.strict()` and a full-row select always carries them).
+		const { snoozedUntil, ...withoutSnoozedUntil } = ISSUE_ROW;
+		expect(S.IssueRowSchema.safeParse(withoutSnoozedUntil).success).toBe(false);
 	});
 });
 

@@ -50,6 +50,12 @@ var (
 	// above, but only with the two CLOSED sets obs.go declares (kind ∈ {user, tenant}, reason ∈
 	// {empty, too_long, control_char}) — never the identifier itself.
 	affectedRollupSkipped metric.Int64Counter
+
+	// sentinel-releases-snooze §12: the one instrument that feature adds to the processor. UNLABELLED,
+	// like the four environment instruments — and unlike them it has a twin of the same name in the
+	// dashboard's registry (metrics.ts), which is why a label would be wrong rather than merely
+	// unnecessary: the two series are meant to sum by name at the scrape (decision 30).
+	releaseNextRewriteFailed metric.Int64Counter
 )
 
 func init() {
@@ -132,6 +138,15 @@ func init() {
 		slog.Error("procmetrics: failed to create affected rollup skipped counter", slog.String("error", err.Error()))
 		affectedRollupSkipped = nil
 	}
+
+	releaseNextRewriteFailed, err = meter.Int64Counter(
+		obs.MetricReleaseNextRewriteFailures,
+		metric.WithDescription("Count of failures of the post-commit rewrite of resolved_in_version = 'next' to a newly seen release version; the event itself was stored and the hourly catch-up self-heals"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create release next rewrite failure counter", slog.String("error", err.Error()))
+		releaseNextRewriteFailed = nil
+	}
 }
 
 // RecordProcessed records one ProcessEvent completion: MetricProcessDuration (seconds) and
@@ -204,6 +219,23 @@ func RecordAffectedRollupSkipped(ctx context.Context, kind, reason string) {
 			attribute.String(obs.LabelKind, kind),
 			attribute.String(obs.LabelReason, reason),
 		))
+	}
+}
+
+// RecordReleaseNextRewriteFailure records one failed post-commit `next` rewrite (sentinel-releases-
+// snooze §4.3, decision 15): the UPDATE that fans a newly inserted release's version out onto the
+// project's `resolved_in_version = 'next'` issues did not commit. No label — the counter's twin in
+// the dashboard's registry carries the same name for the hourly catch-up's failures and the two sum
+// at the scrape (decision 30); the SQLSTATE goes on the log line beside the call, never here.
+//
+// Its single caller is service.(*ProcessorService).rewriteNextIssues, which runs only after
+// store.StoreEvent has COMMITTED with occ.ReleaseInserted = true — so, like RecordAffectedRollupSkipped
+// above, a delivery that rolled back can never reach it. tests/integration's
+// TestProcessorService_NextRewriteFailureIsCountedAndNeverFailsTheEvent pins the increment against a
+// real failing UPDATE and goes red when this call is removed from the service.
+func RecordReleaseNextRewriteFailure(ctx context.Context) {
+	if releaseNextRewriteFailed != nil {
+		releaseNextRewriteFailed.Add(ctx, 1)
 	}
 }
 

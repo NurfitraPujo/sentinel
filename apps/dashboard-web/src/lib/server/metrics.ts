@@ -105,6 +105,7 @@ interface MetricsState {
 	escalationsExhausted: Counter<string> | null;
 	escalationsUnscoped: Counter<string> | null;
 	oncallUnresolved: Counter<string> | null;
+	releaseNextRewriteFailures: Counter<string> | null;
 }
 
 const GLOBAL_KEY = Symbol.for('sentinel.dashboard.metrics');
@@ -134,6 +135,26 @@ function createState(): MetricsState {
 		// can happen with the fixed literal above -- but degrading to "this metric stops recording"
 		// is still strictly better than failing an intake request. Mirrors procmetrics' nil guard.
 		reportsReceived = null;
+	}
+
+	// sentinel-releases-snooze §4.3 "Hourly" / §12 (decisions 15, 30): the dashboard's half of
+	// `sentinel_release_next_rewrite_failures_total`. The processor registers a counter of the SAME
+	// NAME in `packages/shared-go/obs/obs.go` for the post-commit fan-out's failures; this one counts
+	// the hourly catch-up statement in `retention.ts` failing. Deliberately NO label -- not even a
+	// `source` -- because the two processes' series are meant to sum by name at the scrape, and a
+	// label on one side would make them two metrics. Initialised to zero for the same reason the
+	// escalation counters are: a `> 0` alert over an absent series does not evaluate. Registered in
+	// its own try so a failure here cannot take `sentinel_reports_received_total` down with it.
+	let releaseNextRewriteFailures: Counter<string> | null = null;
+	try {
+		releaseNextRewriteFailures = new Counter({
+			name: 'sentinel_release_next_rewrite_failures_total',
+			help: "Failures of the hourly catch-up that rewrites resolved_in_version = 'next' to the earliest newer release (sentinel-releases-snooze §4.3); the processor's post-commit fan-out counts its failures under the same name.",
+			registers: [registry],
+		});
+		releaseNextRewriteFailures.inc(0);
+	} catch {
+		releaseNextRewriteFailures = null;
 	}
 
 	// §12's three escalation signals. Two of them are the ONLY thing that notices a designed
@@ -194,6 +215,7 @@ function createState(): MetricsState {
 		escalationsExhausted,
 		escalationsUnscoped,
 		oncallUnresolved,
+		releaseNextRewriteFailures,
 	};
 }
 
@@ -263,6 +285,17 @@ export function recordEscalationUnscoped(): void {
  */
 export function recordOncallScheduleUnresolved(): void {
 	state().oncallUnresolved?.inc();
+}
+
+/**
+ * sentinel-releases-snooze §4.3 "Hourly" (decision 30): above zero -- the retention sweep's
+ * catch-up statement threw, so `next` issues wait one more hour for their version. Unlabelled by
+ * contract (the processor's same-named counter and this one sum at the scrape); the SQLSTATE that
+ * would have been the label goes on the `retention_cron.next_catchup_failed` log line instead.
+ * Never throws: the sweep's other results must not depend on a counter.
+ */
+export function recordReleaseNextRewriteFailure(): void {
+	state().releaseNextRewriteFailures?.inc();
 }
 
 /** Renders the Prometheus text exposition format, with the content type a scraper expects. */

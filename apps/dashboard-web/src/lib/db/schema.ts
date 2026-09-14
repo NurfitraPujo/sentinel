@@ -134,7 +134,57 @@ export const issues = pgTable('issues', {
 	// `z.number().int()` (IssueRowSchema / AgentIssueListItemSchema, decision 14).
 	affectedUserCount: integer('affected_user_count').notNull().default(0),
 	affectedTenantCount: integer('affected_tenant_count').notNull().default(0),
+	// sentinel-releases-snooze §4.5 (1724900000_add_releases_and_issue_snooze.sql). A snooze is
+	// `status = 'ignored'` with a condition -- there is no fourth status (decision 2): a date
+	// (`snoozedUntil`) and/or an occurrence target (`snoozeOccurrenceTarget`, with the `count` it
+	// was set at in `snoozeCountAt` -- the migrated CHECK check_snooze_pair makes them travel
+	// together, and check_snooze_target_positive rejects a target of 0). The migrated CHECK
+	// check_snooze_only_when_ignored is enforced on every UPDATE: a write that changes `status` off
+	// `ignored` must null all three IN THE SAME STATEMENT (§4.2's resolve/unresolve arms, §4.3's
+	// regression arm) or it is a class-23 error. Nullable with NO `.default()` deliberately (unlike
+	// `affectedUserCount`'s): NULL is the correct value for every pre-feature row and for every
+	// write path that does not know about them (reports.ts's manual/external issues), and a default
+	// here would let a new write path invent a condition and still compile. TIMESTAMPTZ / BIGINT
+	// mirror the migrated types (`snoozeOccurrenceTarget` compares against `count`, a bigint).
+	snoozedUntil: timestamp('snoozed_until', { withTimezone: true }),
+	snoozeOccurrenceTarget: bigint('snooze_occurrence_target', { mode: 'number' }),
+	snoozeCountAt: bigint('snooze_count_at', { mode: 'number' }),
+	// sentinel-releases-snooze §4.5: the release the issue's FIRST occurrence carried, set once by
+	// the processor on insert (§4.3) and once by the 1725000000 backfill from the earliest
+	// RETAINED occurrence (decision 31 -- regardless of version, kept only if it had one). NULL
+	// when that occurrence carried no version, and NULL for good for an issue created by an
+	// old-tag pod in the rollout window (§8); the detail page renders `—`. Never rewritten. The
+	// releases page counts "issues introduced" on it (§4.4, idx_issues_project_first_release).
+	firstReleaseVersion: varchar('first_release_version', { length: 100 }),
 });
+
+// sentinel-releases-snooze §4.5 (1724900000_add_releases_and_issue_snooze.sql): one row per
+// (project, version) the processor has seen an occurrence for. The composite primary key is the ON
+// CONFLICT target of the processor's upsert (§4.3, inside StoreEvent's transaction -- decision 5)
+// and the lookup both readers make; ordered by `firstSeen`, never by parsing the version (decision
+// 1), which is what idx_releases_project_first_seen serves for the detail page's picker (§4.1, the
+// 50 newest) and the releases page (§4.4, the 200 most recent). Written by the processor
+// (store.go) and once by the backfill migration (1725000000); the dashboard never inserts here.
+//
+// `version` is the exact string the occurrence carried (§1's empty-version rules stay: the
+// processor maps '' to "absent" BEFORE the statement, and the migrated CHECK (version <> '') is the
+// tripwire for a regression of that). VARCHAR(100) matches errorOccurrences.releaseVersion and
+// issues.resolvedInVersion. `firstSeen`/`lastSeen` are the occurrence's event timestamp (decision
+// 7), TIMESTAMPTZ like errorOccurrences.createdAt -- and backfilled `firstSeen` is exact only
+// inside the retention window (decision 31). `occurrenceCount` is lifetime: nothing cascades from
+// issues or error_occurrences, so a release outlives every occurrence that carried it and retention
+// never decrements it (§4.4, §12); ON DELETE CASCADE from projects only. `.default(0)` mirrors the
+// migrated DEFAULT 0.
+export const releases = pgTable('releases', {
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	version: varchar('version', { length: 100 }).notNull(),
+	firstSeen: timestamp('first_seen', { withTimezone: true }).notNull(),
+	lastSeen: timestamp('last_seen', { withTimezone: true }).notNull(),
+	occurrenceCount: bigint('occurrence_count', { mode: 'number' }).notNull().default(0),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.projectId, table.version] }),
+	byProjectFirstSeen: index('idx_releases_project_first_seen').on(table.projectId, table.firstSeen),
+}));
 
 // sentinel-affected-users §4.6: one row per DISTINCT (issue, user) pair seen within the retention
 // window. The composite primary key is what makes "distinct" a database fact and is the ON

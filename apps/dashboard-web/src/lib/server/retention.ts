@@ -14,6 +14,7 @@ import {
 	issueAffectedUsers,
 	issueAffectedTenants,
 	issueOccurrenceBuckets,
+	releases,
 } from '$lib/db/schema';
 import { sql, lt, gte, eq, and, inArray, or, isNull } from 'drizzle-orm';
 import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
@@ -21,6 +22,7 @@ import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency'
 import { REPORT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/report-idempotency';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
+import { recordReleaseNextRewriteFailure } from '$lib/server/metrics';
 
 // There is deliberately no "stale issue" count here any more. The stale-marking step this module used to
 // run never did anything, and could not have: it set `status: 'stale'`, which issues.check_status does not
@@ -420,6 +422,10 @@ export async function cleanupRetainedData(
 		.returning({ id: externalReporters.id });
 	const deletedExternalReporters = deletedExternalReportersResult.length;
 
+	// sentinel-releases-snooze §4.3 "Hourly" (decisions 8, 15, 27, 30, 41, 42): the `next` catch-up,
+	// LAST, in its own transaction, once across all projects. See `catchUpNextReleases`.
+	await catchUpNextReleases();
+
 	return {
 		deletedOccurrences,
 		deletedOrphanedIssues,
@@ -434,6 +440,84 @@ export async function cleanupRetainedData(
 		deletedAffectedTenants,
 		deletedOccurrenceBuckets,
 	};
+}
+
+/**
+ * sentinel-releases-snooze §4.3 "Hourly" -- the `next` catch-up, the post-commit fan-out's rule from
+ * the other end (decisions 15, 30). The processor rewrites `resolved_in_version = 'next'` to a
+ * release's version the moment that release is first seen, best-effort and outside its ingest
+ * transaction; when that rewrite fails or the pod dies inside its window, the `next` issues keep
+ * reading `next`. This statement rewrites them to the row the fan-out would have written: for every
+ * `resolved` issue waiting on `next`, the EARLIEST release of its project whose `first_seen` is
+ * strictly after its `resolved_at` (ties on `first_seen` broken by `version`, so the statement is
+ * deterministic). One statement, once across all projects, `DISTINCT ON (n.id)` ordered by
+ * `first_seen ASC, version ASC` picking that earliest release per issue. Verbatim from §4.3.
+ *
+ * What it leaves alone, by construction: a `next` issue whose only releases are older than its
+ * `resolved_at` (the join finds nothing); a `next` issue with `resolved_at IS NULL` (decision 27 --
+ * `r2.first_seen > NULL` is not true, so it joins nothing); every issue that is not `resolved` +
+ * `next` (the outer WHERE, re-checked on the UPDATE's own WHERE so a row that stopped waiting between
+ * the subquery and the write is not rewritten). Project-wide across environments (decision 41): the
+ * version written may have been first seen in an environment the issue's readers cannot see, and
+ * that is the contract's stated cost, not this statement's to fix. Driven by
+ * `idx_issues_project_resolved_next` -- the partial index covers `resolved_in_version = 'next'` for
+ * every project, so the outer scan is the handful of waiting issues, not `issues`.
+ *
+ * NO `issue_activity` row (decision 8, extended by decision 30): the resolution did not change, its
+ * version became known -- exactly what the fan-out writes, and the fan-out writes no row either.
+ *
+ * LAST in `cleanupRetainedData`, in its OWN transaction -- not inside any side-table step's -- and
+ * its failure does not fail the sweep. Lock order: it takes `issues` row locks only and reads
+ * `releases` without one. Against an ingest -- which holds its `issues` row FIRST and wants the
+ * `releases` row AFTER it -- there is no cycle. Against the sweep's own side-table steps
+ * (`sweepAffectedSideTable`'s `SELECT id … ORDER BY id FOR UPDATE`) it holds nothing those steps
+ * wait on, because it runs after them in a transaction of its own; their lock-first protocol is
+ * not extended to it and does not need to be. What CAN deadlock is `batchUpdateIssues` over a set
+ * containing the same `next` issues in the same second (decision 42): Postgres kills one side with
+ * `40P01`; if it is this one, the SQLSTATE goes on the log line and the counter moves, and the next
+ * hourly run redoes the work by construction (idempotent -- a rewritten row no longer matches).
+ *
+ * The failure path is the whole reason this is its own function with a try/catch rather than one
+ * more statement in the caller: the sweep's deletes and recomputes are already committed by the
+ * time this runs (every earlier step is autocommit or its own transaction), so throwing here would
+ * turn a fully successful sweep into a non-2xx route response over a statement whose failure costs
+ * exactly one hour. Logged as `retention_cron.next_catchup_failed` with the SQLSTATE
+ * (`postgres-js` surfaces it as `code`), and counted on `sentinel_release_next_rewrite_failures_total`
+ * in this process's registry -- the SAME name the processor's fan-out counter carries, no label,
+ * summed by name at the scrape (§12). D18 does not bite: the transaction body has one statement and
+ * exactly one exit, its commit; a throw propagates out of `db.transaction` (which rolls back) and is
+ * caught here, outside it.
+ *
+ * Returns the number of issues rewritten -- for the log line and for tests; nothing on
+ * `RetentionResult` carries it, because the contract adds no field there (the sweep's other results
+ * are unchanged by this statement's presence).
+ */
+async function catchUpNextReleases(): Promise<number> {
+	try {
+		const rewritten = await db.transaction(async (tx) => {
+			const result = await tx.execute<{ id: string }>(sql`
+				UPDATE ${issues} i SET resolved_in_version = r.version
+				  FROM (SELECT DISTINCT ON (n.id) n.id, r2.version
+				          FROM ${issues} n
+				          JOIN ${releases} r2 ON r2.project_id = n.project_id AND r2.first_seen > n.resolved_at
+				         WHERE n.status = 'resolved' AND n.resolved_in_version = 'next'
+				         ORDER BY n.id, r2.first_seen ASC, r2.version ASC) r
+				 WHERE i.id = r.id AND i.status = 'resolved' AND i.resolved_in_version = 'next'
+				RETURNING i.id
+			`);
+			return result.length;
+		});
+		log.info('retention_cron.next_catchup', { rewritten });
+		return rewritten;
+	} catch (err) {
+		const sqlstate = (err as { code?: unknown } | null)?.code;
+		log.error('retention_cron.next_catchup_failed', {
+			sqlstate: typeof sqlstate === 'string' ? sqlstate : null,
+			error: err,
+		});
+		recordReleaseNextRewriteFailure();
+		return 0;
+	}
 }
 
 /**

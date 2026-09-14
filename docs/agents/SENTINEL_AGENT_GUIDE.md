@@ -320,6 +320,47 @@ A minimal, working loop:
 6. **Set status** — `PATCH /api/agent/issues/:id/status` with
    `{"status": "resolved"|"unresolved"|"ignored", "resolved_in_version": "v1.2.3"}` (the version
    field is optional and only meaningful when resolving).
+   - **`resolved_in_version: "next"` is reserved** — "resolved in the next release, whichever it
+     turns out to be". Sentinel rewrites it to the first release the **project** sees after the
+     resolve (releases are recorded from `release_version` on ingested events, ordered by when
+     they were first seen — never by parsing the version). **A release is a project-level fact**,
+     not a per-environment one: a version that was already on staging when you resolved is *not*
+     the next release, and the version `next` becomes may have been first seen in an environment
+     you cannot list issues for. The value is trimmed and compared byte-for-byte after trimming:
+     `Next` is an ordinary version, `next ` is `next`. A project that literally names a release
+     `next` cannot resolve "in `next`" — the literal is documented, never validated against.
+     Until the release arrives, `GET /api/agent/issues/:id` reads `resolvedInVersion: "next"`; a
+     consumer that parsed this field as semver must expect a non-version string (it was always free
+     text). The same literal works on the dashboard's bulk resolve.
+   - **Snooze — an ignore with a condition.** `status: "ignored"` takes two optional keys, both only
+     valid with `ignored` (any other status → `400 snoozedUntil is only valid with status ignored` /
+     `400 snoozeOccurrences is only valid with status ignored`):
+     - `snoozed_until`: ignore until this instant. It must be a **full ISO 8601
+       date-time with seconds and a zone** — `2026-09-20T09:00:00Z` or
+       `2026-09-20T16:00:00+07:00` (offsets are accepted; both are the same instant) — and be
+       strictly in the future. A date-only `2026-09-20`, a zone-less `2026-09-20T09:00`, an
+       unparseable value and a past one all get the one string
+       `400 snoozedUntil must be a future timestamp`. On the events feed and in the issue's
+       activity, `new_value.snoozedUntil` is **always the normalised UTC instant with `Z`**
+       (`2026-09-20T09:00:00.000Z`), whatever offset you sent — parse it, never string-compare it.
+     - `snooze_occurrences`: ignore until this many **more** occurrences have been stored — a JSON
+       integer in `[1, 1000000]` (`0`, `1000001` and the string `"12"` are refused with
+       `400 snoozeOccurrences must be an integer between 1 and 1000000`). Stored as
+       `snoozeOccurrenceTarget` with `snoozeCountAt` = the issue's `count` at the time, so the
+       detail can read "100 more · 37 so far".
+     - Either condition ends the snooze; both may be sent together. Neither present (or `""` for
+       either — an empty string is treated as omitted) is the indefinite ignore it always was. When
+       a snooze ends, the issue goes back to `unresolved` and a `status_changed` activity row is
+       written with a `reason` (`snoozed_until_passed` / `snooze_occurrences_reached`) — **no
+       notification is sent** for the ending (subscribers were told "ignored"; they are not told
+       "back"; watch `/api/agent/events` for it). A resolve or a reopen also ends a snooze.
+     - **A snooze on a manual (`user_report`) issue never ends** — nothing ingests for it, so
+       neither condition can ever be met. Use a plain ignore on one and reopen it by hand; the
+       endpoint does not stop you, it just cannot help you.
+   - **Ignored issues no longer page.** An ignored issue's occurrences — snoozed or not, ignored
+     before this shipped or after — do not reach alert configs at all, and the alert dispatcher's
+     frequency window is not fed during a snooze: the occurrence that ends one starts that window
+     cold.
 7. **Release your claim** once the issue is resolved/ignored, or immediately if you're now
    blocked and waiting on someone else.
 
@@ -397,7 +438,7 @@ your own client-side idempotency key or dedupe layer for these:
 
 | Endpoint | Retry-safe how |
 |---|---|
-| `PATCH /api/agent/issues/:id/status` | An exact retry (same `status` **and** the same `resolved_in_version`) is recognized as a no-op: no second `status_changed` activity row, no repeat notification email. The response gains a `changed` field — `false` on the no-op path, `true` when a real transition happened — so you can tell the two apart if you care. A retry with a *different* `resolved_in_version` is treated as a real change, not a no-op. |
+| `PATCH /api/agent/issues/:id/status` | An exact retry (same `status`, the same `resolved_in_version`, **and the same `snoozed_until` instant and `snooze_occurrences`**) is recognized as a no-op: no second `status_changed` activity row, no repeat notification email. The response gains a `changed` field — `false` on the no-op path, `true` when a real transition happened — so you can tell the two apart if you care. A retry with a *different* `resolved_in_version` or a different snooze condition is treated as a real change, not a no-op (a different `snooze_occurrences` restarts the count from the current `count`; the same one with a new date keeps the count it had). |
 | `POST /api/agent/issues/:id/comments` (plain, non-blocking only) | An identical retry (same issue, same author, same `body_md`, within a short window) returns the existing comment instead of inserting a duplicate. **Blocking questions (`POST .../questions`) are deliberately excluded from this** — a question's `waiting_on` side effect must be predictable on every call, so it is never silently skipped. |
 | `POST /api/agent/issues/:id/progress` | Same natural-key dedupe as plain comments (same issue, same agent, same `message_md`, within the window). |
 | `DELETE /api/agent/issues/:id/claim` | See §4 — releasing an already-unclaimed issue is 200, not 409. |
@@ -720,6 +761,13 @@ curl -s -X DELETE "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/claim" -H "$AUTH"
 # Status
 curl -s -X PATCH "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/status" -H "$AUTH" \
   -H 'Content-Type: application/json' -d '{"status":"resolved","resolved_in_version":"v1.2.3"}'
+# ... in the next release, whichever it turns out to be (§5 step 6)
+curl -s -X PATCH "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/status" -H "$AUTH" \
+  -H 'Content-Type: application/json' -d '{"status":"resolved","resolved_in_version":"next"}'
+# ... snooze: ignore until an instant and/or until N more occurrences (§5 step 6)
+curl -s -X PATCH "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/status" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"ignored","snoozed_until":"2026-09-20T09:00:00Z","snooze_occurrences":100}'
 
 # Comment
 curl -s -X POST "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/comments" -H "$AUTH" \
@@ -763,6 +811,27 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### Releases, snooze and `resolved_in_version: "next"` (sentinel-releases-snooze)
+
+- **Two optional request keys on `PATCH /api/agent/issues/{issueId}/status`** (and the batch op
+  `issues.status`): `snoozed_until` and `snooze_occurrences`, both only with `status: "ignored"`.
+  See §5 step 6 for the rules and the four `400` strings. Additive: a body without them is
+  byte-identical in effect to before, except that the retry no-op now also compares the two keys.
+- **`resolved_in_version: "next"` means something.** The field accepts what it always accepted; this
+  one value is now rewritten to the first release the project sees after the resolve (§5 step 6).
+  Any consumer reading `resolvedInVersion` back should expect the string `next` as a possible value.
+- **Four new nullable fields on every full issue row** (`GET /api/agent/issues/{issueId}`, the
+  claim/release responses): `snoozedUntil`, `snoozeOccurrenceTarget`, `snoozeCountAt`,
+  `firstReleaseVersion` — `null` when unset, never absent. `GET /api/agent/issues` rows are
+  unchanged.
+- **A snooze ending is a `status_changed` event** on `GET /api/agent/events` whose `new_value`
+  carries `reason`; no new event type. `new_value.snoozedUntil`, from any writer, is the UTC
+  instant with `Z`.
+- **Behaviour change, no request change: ignored issues stop paging.** Occurrences of an ignored
+  issue (snoozed or plain, including issues ignored before this shipped) no longer reach alert
+  configs, and the dispatcher's frequency window is not fed during a snooze. A snooze ending sends
+  no notification.
 
 ### `affectedUserCount` / `affectedTenantCount` (sentinel-affected-users, decision 14)
 

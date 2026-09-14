@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
@@ -237,6 +239,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	}
 
 	var stored bool
+	// outcome is the class of the issue row's status AFTER the write (store.IssueOutcome, decision
+	// 29). It used to be discarded here with `_`; sentinel-releases-snooze §4.3 / decision 16 makes
+	// the service read it, for exactly one purpose — the dispatchAlert gate below.
+	var outcome store.IssueOutcome
 	storeErr := withSpan(ctx, "processor.store", func(ctx context.Context) error {
 		var err error
 		projectID, err = s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
@@ -253,12 +259,13 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// was the exact S18 count-inflation window (IDEMPOTENCY_PLAN.md §1). Audit persistence,
 		// alert dispatch, and search indexing all move to AFTER this call returns, gated on
 		// stored==true (D-d) — see below.
-		_, storeResult, err := s.store.StoreEvent(ctx, issue, occ, evt.ReleaseVersion)
+		storeOutcome, storeResult, err := s.store.StoreEvent(ctx, issue, occ, evt.ReleaseVersion)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to store event", slog.String("error", err.Error()))
 			return classifyStoreError(err)
 		}
 		stored = storeResult
+		outcome = storeOutcome
 		return nil
 	})
 	if storeErr != nil {
@@ -308,7 +315,27 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
 	})
 
-	// Dispatch on EVERY occurrence, not only new/regressed issues.
+	// sentinel-releases-snooze §4.3 "After commit" (decisions 15, 41): the `next` rewrite, only when
+	// step 4c's RETURNING inserted was true — this delivery is the FIRST sighting of (project, R), so
+	// every resolved issue of the project waiting on `next` with resolved_at < first_seen now knows its
+	// version. Here — after the audit rows, before alert dispatch and indexing — because it is one
+	// more best-effort post-commit call of exactly their kind: its own short transaction, never inside
+	// StoreEvent's (it wants nothing an ingest holds after its issues row, so it can never deadlock
+	// with one), its failure logged and counted and never returned. occ.ReleaseInserted is written
+	// back by StoreEvent only after tx.Commit, so a rolled-back first sighting never reaches this.
+	// The clock it compares resolved_at against is occ.ReleaseFirstSeen — the first_seen step 4c
+	// RETURNED, i.e. LEAST(occ.CreatedAt, now()) (decision 50) — never occ.CreatedAt itself: a
+	// client clock a year ahead would otherwise rewrite every waiting `next` issue of the project
+	// to this version on the strength of a first_seen the `releases` row does not hold.
+	if occ.ReleaseInserted {
+		_ = withSpan(ctx, "processor.release_next_rewrite", func(ctx context.Context) error {
+			s.rewriteNextIssues(ctx, projectID, occ.ReleaseVersion, occ.ReleaseFirstSeen)
+			return nil
+		})
+	}
+
+	// Dispatch on EVERY occurrence, not only new/regressed issues — EXCEPT an occurrence whose issue
+	// is `ignored` after the write (sentinel-releases-snooze decision 16, the gate below).
 	//
 	// Dispatcher.Dispatch is itself the rate limiter: it increments a per-project:issue counter
 	// inside a frequency window and only sends once the count reaches alert_configs
@@ -331,13 +358,29 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	// Dispatch now runs AFTER StoreEvent's commit (D-d), fixing the §1 double-feed: a redelivery that
 	// used to feed the alert frequency counter for an event that was then rolled back at the
 	// occurrence step can no longer happen, because dispatch does not run at all when stored==false.
-	_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
-		// issue.Environment, not occ.Environment: they are the same value on this path (both come
-		// from the event), but the alert scope in §4.7 is a decision about the ISSUE's environment,
-		// which decision 7 made part of its identity.
-		s.dispatchAlert(ctx, issue.ID, projectID, issue.Environment, evt.ErrorClass, evt.Message)
-		return nil
-	})
+	//
+	// The gate (sentinel-releases-snooze §4.3 "The outcome", decisions 16, 17, 29): dispatch is
+	// skipped iff the outcome is IssueOutcomeIgnored — the row's status after the write is `ignored`,
+	// a snooze still running or a plain indefinite ignore. The occurrence is stored, counted and
+	// bucketed (StoreEvent already did all of that); it simply never reaches the dispatcher's
+	// threshold counters, which is what "ignore" means. Every other outcome dispatches exactly as
+	// before — including IssueOutcomeUnsnoozed, the occurrence that ENDED a snooze: its row is
+	// `unresolved` now and it goes through the threshold normally, neither bypassed nor withheld
+	// (decision 17 forbids an immediate alert, not the ordinary one). `!= Ignored` rather than an
+	// allow-list of the other four, so a sixth outcome added later dispatches by default — silence is
+	// the failure mode this gate must never widen into by accident.
+	if outcome != store.IssueOutcomeIgnored {
+		_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
+			// issue.Environment, not occ.Environment: they are the same value on this path (both come
+			// from the event), but the alert scope in §4.7 is a decision about the ISSUE's environment,
+			// which decision 7 made part of its identity.
+			s.dispatchAlert(ctx, issue.ID, projectID, issue.Environment, evt.ErrorClass, evt.Message)
+			return nil
+		})
+	} else {
+		slog.InfoContext(ctx, "Alert dispatch skipped: issue is ignored after the write (decision 16)",
+			slog.String("issue_id", issue.ID), slog.String("project_id", projectID))
+	}
 
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
@@ -367,6 +410,79 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	})
 
 	return true, nil
+}
+
+// releaseNextRewriteQuery is sentinel-releases-snooze §4.3's "After commit" statement plus decision
+// 49's NOT EXISTS clause: $1 = project_id, $2 = the newly inserted release's version, $3 = its
+// first_seen (occ.ReleaseFirstSeen — the value step 4c's INSERT arm RETURNED, occ.CreatedAt clamped
+// to the ingest transaction's now() by decision 50). The comparison is STRICT
+// (`first_seen > resolved_at`), and a row with resolved_at IS NULL never matches because `NULL < x` is
+// not true — decision 27's rows are left alone, exactly as the dashboard's hourly catch-up leaves
+// them. Project-wide across environments (decision 41). `idx_issues_project_resolved_next` (a
+// partial index on project_id WHERE resolved_in_version = 'next') makes this an index scan over
+// exactly the waiting issues.
+//
+// The NOT EXISTS (decision 49, `fanout-earliest-newer`) makes the fan-out write ONLY the earliest
+// release newer than the row's resolved_at: a `next` issue for which some OTHER release of the
+// project was already first seen strictly between its resolved_at and this release's first_seen is
+// skipped — that earlier release's own fan-out failed (the pod died, or decision 42's accepted 40P01)
+// and the row belongs to the hourly catch-up, which picks earliest-newer by construction. Without it
+// the following release would write a version LATER than the truth, and an occurrence of the issue
+// in the earlier release would then be judged rowR.first_seen < rowX.first_seen → not a regression
+// (decision 13) — the issue would stay resolved on a release that still throws it. §8's "the
+// following new release can never write a later version than the truth" is true only with this
+// clause. `r.first_seen < $3` is strict so the release being fanned out never excludes itself.
+const releaseNextRewriteQuery = `
+	UPDATE issues SET resolved_in_version = $2
+	WHERE project_id = $1 AND status = 'resolved' AND resolved_in_version = 'next'
+	  AND resolved_at < $3
+	  AND NOT EXISTS (
+	    SELECT 1 FROM releases r
+	    WHERE r.project_id = $1 AND r.first_seen > issues.resolved_at AND r.first_seen < $3
+	  )
+`
+
+// rewriteNextIssues runs the post-commit `next` rewrite for a release this delivery was the first to
+// see (sentinel-releases-snooze §4.3 "After commit", decisions 8, 15, 42). It is best-effort in the
+// same sense PersistAuditLog and dispatchAlert are: it never returns an error, never panics out, and
+// never affects the Ack — the event is stored already, and a `next` issue this call fails to rewrite
+// keeps reading `next` until the dashboard's hourly catch-up (cleanupRetainedData's last statement)
+// rewrites it to the same earliest-newer release this call would have. The window is one hour, and
+// it is the release note's to state, not this function's to close.
+//
+// Its OWN short transaction — one autocommit UPDATE on the pool, never StoreEvent's transaction:
+// inside it the fan-out would take every waiting issues row of the project under the ingest lock
+// order and hold them to commit; outside it holds those rows for one statement and wants nothing an
+// ingest transaction holds AFTER its issues row (it takes no releases row), so ingest-vs-rewrite has
+// no cycle. What CAN deadlock is a batchUpdateIssues call over a set containing this project's
+// `next` issues in the same second (three multi-row writers on issues with unspecified relative
+// order, decision 42): Postgres kills one side with 40P01, and if it is this one the log line below
+// names that SQLSTATE so the cause is legible without a metric label. No activity row per rewritten
+// issue (decision 8): the resolution did not change, its version became known.
+func (s *ProcessorService) rewriteNextIssues(ctx context.Context, projectID, version string, firstSeen time.Time) {
+	tag, err := s.db.Exec(ctx, releaseNextRewriteQuery, projectID, version, firstSeen)
+	if err != nil {
+		// The SQLSTATE is the one field that tells a 40P01 (decision 42's accepted deadlock, self-
+		// healing) from a 42703/42P01 (a migration not applied — §12's rollout-order failure) from a
+		// connection failure (no *pgconn.PgError at all, "" here). It goes on the log line, never on
+		// the counter: the counter is unlabelled by contract (decision 30).
+		sqlstate := ""
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			sqlstate = pgErr.Code
+		}
+		slog.ErrorContext(ctx, "release next rewrite failed; the event is stored and the hourly catch-up will rewrite (contract §4.3)",
+			slog.String("project_id", projectID),
+			slog.String("release_version", version),
+			slog.String("sqlstate", sqlstate),
+			slog.String("error", err.Error()))
+		procmetrics.RecordReleaseNextRewriteFailure(ctx)
+		return
+	}
+	slog.InfoContext(ctx, "release next rewrite committed",
+		slog.String("project_id", projectID),
+		slog.String("release_version", version),
+		slog.Int64("issues_rewritten", tag.RowsAffected()))
 }
 
 // dispatchAlert calls the alert dispatcher and guarantees it can never fail

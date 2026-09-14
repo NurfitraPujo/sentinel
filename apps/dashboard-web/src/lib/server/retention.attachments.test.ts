@@ -13,14 +13,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * `tx.execute`s each, between the occurrence delete and the candidate select): it is stubbed here
  * as a pass-through whose every `execute` resolves to no rows, so it neither consumes the queue nor
  * proves anything -- `retention.affected.integration.test.ts` proves it against real Postgres.
+ * sentinel-releases-snooze §4.3's `next` catch-up (one more `db.transaction`, one raw `tx.execute`,
+ * LAST) goes through the same stub; `retention.next-catchup.integration.test.ts` proves it.
  */
 
 const deleteObject = vi.fn();
 const isStorageConfigured = vi.fn(() => true);
 const logError = vi.fn();
+// sentinel-releases-snooze §4.3: the `next` catch-up (the sweep's last statement, its own
+// pass-through `transaction` here) logs `retention_cron.next_catchup` on success; without `info` the
+// call would throw inside its try and the mock would exercise the FAILURE path instead.
+const logInfo = vi.fn();
 
 vi.mock('$lib/server/storage', () => ({ deleteObject, isStorageConfigured }));
-vi.mock('$lib/server/observability/log', () => ({ log: { error: logError } }));
+vi.mock('$lib/server/observability/log', () => ({ log: { error: logError, info: logInfo } }));
 
 vi.mock('$lib/db/schema', () => ({
 	errorOccurrences: { id: 'id', issueId: 'issueId', createdAt: 'createdAt' },
@@ -44,6 +50,9 @@ vi.mock('$lib/db/schema', () => ({
 	agentIdempotencyKeys: { id: 'id', createdAt: 'createdAt' },
 	reportIdempotencyKeys: { id: 'id', createdAt: 'createdAt' },
 	issueActivity: { id: 'id', issueId: 'issueId' },
+	// sentinel-releases-snooze §4.3: the `next` catch-up joins `releases` in one raw `tx.execute`
+	// (again only its identity matters to the mock).
+	releases: { projectId: 'projectId', version: 'version', firstSeen: 'firstSeen' },
 }));
 
 function makeQueueableDb() {
