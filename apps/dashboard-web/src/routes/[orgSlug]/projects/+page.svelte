@@ -83,6 +83,13 @@
 					<span class="project-links">
 						<a href="/{data.org.slug}/projects/{project.id}/settings/keys">API keys</a>
 						<a href="/{data.org.slug}/projects/{project.id}/settings">Settings</a>
+						<!--
+							sentinel-releases-snooze §4.4, flow `R1` (decision 25). Unconditional, for every row
+							and every member: there is no `releasesVisible` on page data and none is coming
+							(decision 28) — an environment-scoped member sees the link and the page answers
+							`404 Project not found` (decision 20). The loader decides who gets the page.
+						-->
+						<a href="/{data.org.slug}/projects/{project.id}/releases">Releases</a>
 					</span>
 				</li>
 			{/each}
