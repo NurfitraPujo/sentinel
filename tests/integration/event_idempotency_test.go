@@ -2003,7 +2003,10 @@ func TestStoreEvent_ReleaseFirstOccurrenceInsertsRowAndStampsIssue(t *testing.T)
 
 	fp := eidFingerprint(t, "rel1")
 	const release = "v1.2.3"
-	t1 := time.Date(2026, 9, 14, 9, 30, 15, 0, time.UTC)
+	// A PAST instant on purpose: decision 50 clamps a future client clock to now() on the INSERT
+	// arm, so a literal that lands ahead of the machine's clock would read now() here instead of
+	// occ.CreatedAt (TestStoreEvent_ReleaseFutureClientClockIsClampedAtWrite is that case).
+	t1 := time.Date(2026, 9, 1, 9, 30, 15, 0, time.UTC)
 
 	require.False(t, releaseRowOf(t, ctx, pool, projectID, release).found, "no releases row before the first sighting")
 
@@ -2057,6 +2060,84 @@ func TestStoreEvent_ReleaseFirstOccurrenceInsertsRowAndStampsIssue(t *testing.T)
 	require.NotNil(t, st.firstReleaseVersion)
 	assert.Equal(t, release, *st.firstReleaseVersion, "I2: the DO UPDATE arm never touches first_release_version")
 	assert.EqualValues(t, 1, releaseRowOf(t, ctx, pool, projectID, "v1.2.4").occurrenceCount)
+}
+
+// (1), decision 50 (`release-first-seen-clock-guard`): a first sighting whose client clock is in the
+// FUTURE is clamped at write — first_seen = last_seen = LEAST(occ.CreatedAt, now()) ≤ the server's
+// clock, never the year-ahead timestamp — and occ.ReleaseFirstSeen carries the value the row holds,
+// not occ.CreatedAt. The mode it closes: a future first_seen makes that version "newest" for every
+// `next` resolution of the project and every later real release reads first_seen < it → not a
+// regression, on a row that is never swept. The DO UPDATE arm is the contract's GREATEST over
+// EXCLUDED.last_seen — and EXCLUDED is the clamped value, so last_seen never passes now() either.
+// A past clock is not clamped: an "oldest" row is harmless. Change step 4c's INSERT arm back to
+// `$3, $3` and the
+// first assertion reads 2027; pass occ.CreatedAt to the fan-out instead of RETURNING first_seen and
+// the ReleaseFirstSeen assertion goes red.
+func TestStoreEvent_ReleaseFutureClientClockIsClampedAtWrite(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "rel-clock")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "rel-clock")
+	const release = "v9.9.9-future"
+	before := time.Now().UTC().Truncate(time.Microsecond) // timestamptz precision
+	yearAhead := before.Add(365 * 24 * time.Hour)
+
+	first := releaseOccurrence(release, yearAhead)
+	issue := eidIssueIn(projectID, "production", fp)
+	outcome, stored, err := s.StoreEvent(ctx, issue, first, release)
+	require.NoError(t, err)
+	require.True(t, stored)
+	assert.Equal(t, store.IssueOutcomeNew, outcome)
+	require.True(t, first.ReleaseInserted, "a first sighting, clamped or not, is still a first sighting")
+	after := time.Now().UTC()
+
+	row := releaseRowOf(t, ctx, pool, projectID, release)
+	require.True(t, row.found)
+	assert.False(t, row.firstSeen.After(after), "decision 50: first_seen %s must be ≤ now() — a future client clock (%s) is clamped at write", row.firstSeen, yearAhead)
+	assert.False(t, row.firstSeen.Before(before.Add(-time.Minute)), "the clamp writes the transaction's now(), not some older value: got %s, test started %s", row.firstSeen, before)
+	assert.True(t, row.lastSeen.Equal(row.firstSeen), "last_seen is clamped likewise on the INSERT arm, so first_seen = last_seen still holds")
+	assert.EqualValues(t, 1, row.occurrenceCount)
+	assert.True(t, first.ReleaseFirstSeen.Equal(row.firstSeen),
+		"occ.ReleaseFirstSeen %s must be the first_seen the row holds %s (RETURNING first_seen), never occ.CreatedAt %s — it is what the post-commit `next` rewrite compares resolved_at against",
+		first.ReleaseFirstSeen, row.firstSeen, yearAhead)
+	assert.False(t, first.ReleaseFirstSeen.Equal(yearAhead), "the fan-out clock is not the unclamped client clock")
+
+	// The occurrence itself keeps the client clock (decision 7 is narrowed for `releases` only):
+	// error_occurrences.created_at is untouched by the clamp.
+	var occCreatedAt time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT created_at FROM error_occurrences WHERE id = $1`, first.ID).Scan(&occCreatedAt))
+	assert.True(t, occCreatedAt.Equal(yearAhead), "the clamp is `releases` only — the occurrence's created_at is still the event's clock, got %s", occCreatedAt)
+
+	// The DO UPDATE arm: a second future-clock occurrence in the same release. first_seen does not
+	// move; GREATEST(releases.last_seen, EXCLUDED.last_seen) sees the CLAMPED proposed row, so
+	// last_seen advances to this ingest's now() and no further. ReleaseFirstSeen is not written back
+	// on this arm (not inserted).
+	second := releaseOccurrence(release, yearAhead.Add(time.Hour))
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp), second, release)
+	require.NoError(t, err)
+	require.True(t, stored)
+	after2 := time.Now().UTC()
+	assert.False(t, second.ReleaseInserted)
+	assert.True(t, second.ReleaseFirstSeen.IsZero(), "ReleaseFirstSeen is written back only beside ReleaseInserted = true")
+	row2 := releaseRowOf(t, ctx, pool, projectID, release)
+	assert.EqualValues(t, 2, row2.occurrenceCount)
+	assert.True(t, row2.firstSeen.Equal(row.firstSeen), "the DO UPDATE arm never moves first_seen, so the clamp holds: got %s", row2.firstSeen)
+	assert.False(t, row2.lastSeen.Before(row.lastSeen), "GREATEST: last_seen never moves back, got %s", row2.lastSeen)
+	assert.False(t, row2.lastSeen.After(after2), "EXCLUDED.last_seen is the clamped value, so last_seen never passes now() either: got %s", row2.lastSeen)
+
+	// A past clock on a fresh release is NOT clamped: LEAST($3, now()) is $3.
+	past := before.Add(-48 * time.Hour)
+	older := releaseOccurrence("v0.0.1-past", past)
+	_, stored, err = s.StoreEvent(ctx, eidIssueIn(projectID, "production", fp), older, "v0.0.1-past")
+	require.NoError(t, err)
+	require.True(t, stored)
+	require.True(t, older.ReleaseInserted)
+	row = releaseRowOf(t, ctx, pool, projectID, "v0.0.1-past")
+	assert.True(t, row.firstSeen.Equal(past), "a past client clock still writes first_seen = occ.CreatedAt (decision 7), got %s", row.firstSeen)
+	assert.True(t, older.ReleaseFirstSeen.Equal(past), "and ReleaseFirstSeen is that same value")
 }
 
 // (2) R = ” writes no `releases` row and stamps NULL (flow I3): step 0 and step 4c are skipped
@@ -2923,4 +3004,52 @@ func TestProcessorService_NextRewriteWritesOnlyTheEarliestNewerRelease(t *testin
 	assert.Equal(t, "vB", riv, "decision 49: B is the earliest release newer than J's resolved_at, so B's fan-out rewrites J")
 	assert.Equal(t, failuresBefore, collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures),
 		"skipping I is not a failure — %s must not move", obs.MetricReleaseNextRewriteFailures)
+}
+
+// TestProcessorService_NextRewriteUsesTheClampedFirstSeen is decision 50's service-level half: the
+// post-commit `next` rewrite compares resolved_at against the first_seen step 4c actually WROTE
+// (LEAST(occ.CreatedAt, now()), RETURNING first_seen), never against the unclamped occ.CreatedAt.
+//
+// I is resolved `next` with resolved_at ONE HOUR AHEAD of the processor's clock (a dashboard host
+// whose clock runs ahead — decision 6's clocks are independent by contract). A first sighting of
+// release F arrives with a client clock a YEAR ahead. The row is written with first_seen = now();
+// now() < resolved_at, so the STRICT `resolved_at < first_seen` matches nothing and I keeps `next`.
+// Pass occ.CreatedAt to rewriteNextIssues instead and `resolved_at < 2027` is true: I reads F — a
+// version the `releases` row itself says was first seen BEFORE the resolution, and the hourly
+// catch-up (which reads the row) would never have written. J, resolved `next` in the past, is
+// rewritten to F as usual: the clamp changes the clock, not whether a genuinely newer release fans
+// out.
+func TestProcessorService_NextRewriteUsesTheClampedFirstSeen(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+
+	projectName := uniqueProjectName("rel-clock-fanout")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("rel-clock-fanout"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC()
+	fpI, fpJ, fpY := "fp-i-"+uuid.New().String(), "fp-j-"+uuid.New().String(), "fp-y-"+uuid.New().String()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpI, "v1.0.0", now.Add(-2*time.Hour)))
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpJ, "v1.0.0", now.Add(-2*time.Hour)))
+	iID := issueIDByFingerprint(t, ctx, pool, projectID, fpI)
+	jID := issueIDByFingerprint(t, ctx, pool, projectID, fpJ)
+	for id, resolvedAt := range map[string]time.Time{iID: now.Add(time.Hour), jID: now.Add(-time.Hour)} {
+		_, err := pool.Exec(ctx,
+			`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = $2,
+			        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`, id, resolvedAt)
+		require.NoError(t, err)
+	}
+
+	const future = "v9.9.9-future"
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, future, now.Add(365*24*time.Hour)))
+	row := releaseRowOf(t, ctx, pool, projectID, future)
+	require.True(t, row.found, "precondition: the future-clock occurrence was a first sighting")
+	require.False(t, row.firstSeen.After(time.Now().UTC()), "precondition (decision 50): first_seen %s was clamped to now()", row.firstSeen)
+
+	_, riv := resolvedInVersionOf(t, ctx, pool, iID)
+	assert.Equal(t, "next", riv, "the fan-out must compare against the WRITTEN first_seen (≤ now < I.resolved_at), not occ.CreatedAt (a year ahead) — I stays `next`")
+	_, riv = resolvedInVersionOf(t, ctx, pool, jID)
+	assert.Equal(t, future, riv, "J was resolved before the clamped first_seen, so the release is genuinely its next one")
 }

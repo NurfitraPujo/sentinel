@@ -323,9 +323,13 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	// StoreEvent's (it wants nothing an ingest holds after its issues row, so it can never deadlock
 	// with one), its failure logged and counted and never returned. occ.ReleaseInserted is written
 	// back by StoreEvent only after tx.Commit, so a rolled-back first sighting never reaches this.
+	// The clock it compares resolved_at against is occ.ReleaseFirstSeen — the first_seen step 4c
+	// RETURNED, i.e. LEAST(occ.CreatedAt, now()) (decision 50) — never occ.CreatedAt itself: a
+	// client clock a year ahead would otherwise rewrite every waiting `next` issue of the project
+	// to this version on the strength of a first_seen the `releases` row does not hold.
 	if occ.ReleaseInserted {
 		_ = withSpan(ctx, "processor.release_next_rewrite", func(ctx context.Context) error {
-			s.rewriteNextIssues(ctx, projectID, occ.ReleaseVersion, occ.CreatedAt)
+			s.rewriteNextIssues(ctx, projectID, occ.ReleaseVersion, occ.ReleaseFirstSeen)
 			return nil
 		})
 	}
@@ -410,7 +414,8 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 
 // releaseNextRewriteQuery is sentinel-releases-snooze §4.3's "After commit" statement plus decision
 // 49's NOT EXISTS clause: $1 = project_id, $2 = the newly inserted release's version, $3 = its
-// first_seen (occ.CreatedAt — the value step 4c's INSERT arm wrote). The comparison is STRICT
+// first_seen (occ.ReleaseFirstSeen — the value step 4c's INSERT arm RETURNED, occ.CreatedAt clamped
+// to the ingest transaction's now() by decision 50). The comparison is STRICT
 // (`first_seen > resolved_at`), and a row with resolved_at IS NULL never matches because `NULL < x` is
 // not true — decision 27's rows are left alone, exactly as the dashboard's hourly catch-up leaves
 // them. Project-wide across environments (decision 41). `idx_issues_project_resolved_next` (a

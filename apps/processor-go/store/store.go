@@ -190,13 +190,21 @@ type ErrorOccurrence struct {
 	// ReleaseInserted is WRITTEN BACK by StoreEvent, never read by it — the same idiom as IssueID
 	// above. It is true exactly when this delivery committed and step 4c's `releases` upsert INSERTed
 	// the (project_id, ReleaseVersion) row (RETURNING xmax = 0): a first sighting of that version by
-	// the project, with first_seen = CreatedAt. It is the signal sentinel-releases-snooze §4.3's
-	// post-commit `next` rewrite runs on (decision 15) — surfaced here rather than as a fourth return
-	// value so the CommandStore signature and its ~40 call sites stay as they are. False on every
-	// other path: an empty ReleaseVersion, a duplicate (stored = false), an error, or the DO UPDATE
-	// arm (the version was seen before). Under concurrent first sightings ON CONFLICT arbitrates and
-	// exactly one delivery reads true (decision 4).
+	// the project, with first_seen = LEAST(CreatedAt, now()) (decision 50). It is the signal
+	// sentinel-releases-snooze §4.3's post-commit `next` rewrite runs on (decision 15) — surfaced
+	// here rather than as a fourth return value so the CommandStore signature and its ~40 call sites
+	// stay as they are. False on every other path: an empty ReleaseVersion, a duplicate
+	// (stored = false), an error, or the DO UPDATE arm (the version was seen before). Under
+	// concurrent first sightings ON CONFLICT arbitrates and exactly one delivery reads true
+	// (decision 4).
 	ReleaseInserted bool
+	// ReleaseFirstSeen is WRITTEN BACK beside ReleaseInserted and meaningful only when it is true:
+	// the `releases` row's first_seen as step 4c actually wrote it (RETURNING first_seen), which is
+	// CreatedAt clamped to the transaction's now() (decision 50). The post-commit `next` rewrite
+	// MUST compare resolved_at against this, never against CreatedAt: a future client clock would
+	// otherwise fan a version out to every waiting `next` issue of the project on the strength of a
+	// first_seen the row does not hold. Zero on every path where ReleaseInserted is false.
+	ReleaseFirstSeen time.Time
 }
 
 // The §4.3 rollup statements, one pair per side table. RETURNING (xmax = 0) AS inserted is the same
@@ -245,19 +253,37 @@ const occurrenceBucketUpsertQuery = `
 // would hold the project's hottest row for the whole transaction and invert the lock order every
 // other side-table write follows (decision 4). Two concurrent first sightings both reading "absent"
 // is harmless: the upsert's ON CONFLICT arbitrates and RETURNING inserted says who fans out.
-// releaseUpsertQuery is step 4c, verbatim: $3 = occ.CreatedAt (§3, decision 7 — the event's own
-// clock, exactly as issues.first_seen/last_seen are), so first_seen = last_seen on the INSERT arm;
+// releaseUpsertQuery is step 4c: $3 = occ.CreatedAt (§3, decision 7 — the event's own clock,
+// exactly as issues.first_seen/last_seen are), so first_seen = last_seen on the INSERT arm;
 // GREATEST on last_seen mirrors issues.last_seen for out-of-order client timestamps.
+//
+// The INSERT arm clamps both to LEAST($3, now()) (decision 50, `release-first-seen-clock-guard`,
+// which narrows decision 7 for `releases` only). Without it one event whose client clock runs a
+// year ahead creates a (project, version) row whose first_seen is in the future: every `next`
+// resolution of the project is then rewritten to that version (it is "first seen" after any
+// resolved_at), and when the real next release arrives an occurrence in it reads
+// rowR.first_seen < rowX.first_seen → not a regression — regression detection silently off until
+// the clock catches up, on a row that is never swept (§12). A past/zero clock still creates an
+// "oldest" row, which is harmless, so only the future side is clamped. now() is the transaction's
+// start timestamp, so the clamp is stable across the statement and reads as "no later than this
+// ingest". The DO UPDATE arm is the contract's, unchanged — but EXCLUDED.last_seen is the row
+// proposed for insertion, i.e. the clamped value, so GREATEST can never move last_seen past now()
+// either: a release's last_seen is "latest occurrence we stored, no later than this ingest", and
+// nothing compares it against occurrence clocks (releases are never swept, §12) — unlike the
+// affected-users rollup above, whose last_seen retention does compare. RETURNING first_seen hands
+// the value ACTUALLY written to the caller, so the post-commit `next` rewrite (§4.3 "After commit")
+// compares against the row, never against the unclamped occ.CreatedAt — the two differ exactly
+// when the clamp fired.
 const (
 	releaseFirstSeenQuery = `SELECT first_seen FROM releases WHERE project_id = $1 AND version = $2`
 
 	releaseUpsertQuery = `
 		INSERT INTO releases (project_id, version, first_seen, last_seen, occurrence_count)
-		VALUES ($1, $2, $3, $3, 1)
+		VALUES ($1, $2, LEAST($3, now()), LEAST($3, now()), 1)
 		ON CONFLICT (project_id, version) DO UPDATE SET
 		   last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen),
 		   occurrence_count = releases.occurrence_count + 1
-		RETURNING (xmax = 0) AS inserted
+		RETURNING (xmax = 0) AS inserted, first_seen
 	`
 )
 
@@ -569,11 +595,14 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     writeOccurrenceBucket (decision 20, bucket_write.go / bucket_write_off.go).
 //     4c. The release upsert (sentinel-releases-snooze §4.3): one QueryRow of INSERT INTO releases …
 //     ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(…), occurrence_count + 1
-//     RETURNING (xmax = 0) AS inserted, keyed on issue.ProjectID and R with occ.CreatedAt as the
-//     clock (§3, decision 7). Only when R <> ”. After step 4b and before the registry touch, so a
-//     deduplicated redelivery never reaches it (flow I10); NOT savepointed (decision 5); behind the
-//     compile-time constant writeRelease (decision 11). `inserted` is written back to
-//     occ.ReleaseInserted after commit — the post-commit `next` rewrite's signal (decision 15).
+//     RETURNING (xmax = 0) AS inserted, first_seen, keyed on issue.ProjectID and R with
+//     LEAST(occ.CreatedAt, now()) as the clock (§3, decision 7 narrowed by decision 50: a future
+//     client clock is clamped to the transaction's now() on the INSERT arm). Only when R <> ”. After
+//     step 4b and before the registry touch, so a deduplicated redelivery never reaches it (flow
+//     I10); NOT savepointed (decision 5); behind the compile-time constant writeRelease (decision
+//     11). `inserted` and the written first_seen are written back to occ.ReleaseInserted /
+//     occ.ReleaseFirstSeen after commit — the post-commit `next` rewrite's signal and clock
+//     (decision 15).
 //  5. The project_environments registry touch (sentinel-project-environments §4.8), savepointed.
 //     Then commit.
 //
@@ -1009,8 +1038,9 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	// table's CHECK is the tripwire). Behind the compile-time constant so §13 M1's baseline build
 	// (-tags m1_norelease) is this exact path minus this statement and step 0 (decision 11).
 	releaseInserted := false
+	var releaseFirstSeen time.Time
 	if writeRelease && R != "" {
-		if err := tx.QueryRow(ctx, releaseUpsertQuery, issue.ProjectID, R, occ.CreatedAt).Scan(&releaseInserted); err != nil {
+		if err := tx.QueryRow(ctx, releaseUpsertQuery, issue.ProjectID, R, occ.CreatedAt).Scan(&releaseInserted, &releaseFirstSeen); err != nil {
 			return IssueOutcomeExisting, false, fmt.Errorf("release upsert failed for project=%s version=%q: %w", issue.ProjectID, R, err)
 		}
 	}
@@ -1090,8 +1120,13 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	}
 
 	// Written back only once the transaction is durable: a first sighting that did not commit is not
-	// a first sighting, and the post-commit rewrite must never run on one (decision 15).
+	// a first sighting, and the post-commit rewrite must never run on one (decision 15). The clock
+	// travels with the signal: on the DO UPDATE arm RETURNING first_seen is the EXISTING row's value,
+	// which is not this delivery's to fan out, so it is written back only when inserted (decision 50).
 	occ.ReleaseInserted = releaseInserted
+	if releaseInserted {
+		occ.ReleaseFirstSeen = releaseFirstSeen
+	}
 
 	// Recorded after the commit: the metric counts occurrences that were STORED for an environment
 	// nobody declared, so an event that failed to commit must not appear on it.
