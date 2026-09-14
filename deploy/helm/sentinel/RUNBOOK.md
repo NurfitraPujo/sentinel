@@ -96,6 +96,100 @@ new-tag pods attached: dropping a table the running processor and dashboard
 read turns into an ingest outage (every `StoreEvent` fails, is retried, then
 dead-lettered), not a broken chart.
 
+### Rolling back sentinel-releases-snooze to the pre-feature tag — TWO steps, in this order
+
+`1724900000_add_releases_and_issue_snooze.sql` keeps its CHECK
+`check_snooze_only_when_ignored` on `issues` (contract decision 37): a row may
+carry `snoozed_until` / `snooze_occurrence_target` only while `status = 'ignored'`.
+A pre-feature dashboard's `updateIssueStatus` and `batchUpdateIssues` change
+`status` without nulling columns they do not know exist, so **an old-tag resolve
+or reopen of a still-snoozed issue is a class-23 constraint error — a `500` to
+that caller, no data change — until the snooze columns are nulled.** That is why
+the image roll-back is step 2, never step 1.
+
+**Step 1 — against the shared database, with the new-tag pods still running:**
+
+```sql
+UPDATE issues SET snoozed_until = NULL, snooze_occurrence_target = NULL, snooze_count_at = NULL
+ WHERE snoozed_until IS NOT NULL OR snooze_occurrence_target IS NOT NULL;
+```
+
+New-tag pods are correct with the nulls: every running snooze degrades to a
+plain indefinite ignore — the ignore survives, the condition does not.
+
+**Step 2 — the image roll-back** (the `argocd app set … image.tag=<previous-tag>`
++ `sync` above, for `processor` and `dashboard` alike).
+
+After both steps the old processor stores occurrences without writing `releases`
+or `first_release_version` and evaluates regressions with the old compare; the
+old dashboard resolves and reopens without error; the old service still
+dispatches alerts for ignored issues. Releases first seen during the rollback are
+never recorded: `1725000000`'s backfill is a goose version like every other and
+does not re-run on the next roll-forward (contract decision 22). The dashboard's
+`RollingUpdate` minutes apply to the roll-back too (see the rollout note below).
+
+No `migrate down` is needed for this rollback and none should be run while
+new-tag pods are attached (§3 above): `1724900000`'s Down drops `releases` and the
+four `issues` columns the running new-tag processor and dashboard read.
+
+### Rolling out sentinel-releases-snooze (release note)
+
+Rollout order is the chart's existing one and it is load-bearing here (contract
+§8): **`db-migrate` runs before `processor` and `dashboard` come up on the new
+tag.** A new-tag processor against a database without `1724900000` fails every
+event (`42703` / `42P01`, retried then dead-lettered); a new-tag dashboard's
+`issues` select fails on the four missing columns. The reverse — a migrated
+database under old-tag pods — is correct: they simply write no releases. There is
+no feature flag: an empty `releases` table and all-`NULL` columns render today's
+page and decide today's regressions.
+
+- **File 2's `UPDATE` takes a row lock on every issue it rewrites** while the
+  old-tag pods are still ingesting at wave 1. Under its `lock_timeout = '5s'` a
+  busy row fails the migrate Job, the sync stalls at wave 1 and the old pods keep
+  running — safe. Re-sync: the file re-runs and its `WHERE NOT EXISTS` guards skip
+  what the first attempt finished (contract decision 42).
+- **Backfilled `first_seen` is exact only inside the retention window**: a release
+  whose earliest occurrences were swept before the backfill ran reads the earliest
+  *retained* one, later than the truth, and every ordering by `first_seen`
+  inherits that for pre-feature releases (contract decision 31).
+- **The `RollingUpdate` minutes — processor.** The processor Deployment has no
+  `strategy:` and rolls over `replicaCount: 2`; for the minutes the old-tag pod is
+  still draining, its occurrences are stored **without** a `releases` row or a
+  `first_release_version`, after the backfill has already looked. They never
+  count on `releases`, and an issue *created* in that window reads `—` for good —
+  unlike the trend's bucket gaps, these do NOT age out with retention. Accepted
+  (contract decision 34); `strategy: Recreate` on the processor Deployment for
+  this one release is the operator's alternative if the permanent gap matters.
+- **The `RollingUpdate` minutes — dashboard.** The dashboard Deployment has no
+  `strategy:` either. For its minutes an old-tag dashboard pod serves
+  `/issues/{id}` with no control block and no facts (nothing 500s on read), and a
+  status write it makes on a row a new-tag pod has already snoozed is refused by
+  `check_snooze_only_when_ignored` — a `500` to that one caller, no data change.
+  The window holds only rows snoozed in those same minutes and closes when the
+  last old pod is gone. Accepted (contract decision 37); `strategy: Recreate` on
+  the dashboard Deployment for this one release is the named alternative.
+- **Rollback is the two-step recipe above** — the nulling `UPDATE` first, the
+  image roll-back second.
+- **`next` becomes a version by a post-commit rewrite, with an hourly catch-up.**
+  For a window of milliseconds a new release exists and a `next` issue still
+  reads `next`; a crash inside that window leaves it `next` until the retention
+  cron's catch-up rewrites it — so the window is **at most one hour** (contract
+  §8, decision 15).
+- **`next` is project-level and its rewrite crosses environments**: a release
+  first seen in any environment of the project resolves every `next` issue of
+  that project, whichever environment the issue is in (contract decisions 32, 41).
+- **Every plain-ignored issue stops paging, and the alert frequency window is not
+  fed during a snooze**: the processor skips alert dispatch for an `ignored`
+  outcome (contract decision 16, §6), so the occurrence that ends a snooze is
+  dispatched normally and starts its window cold (decision 17). **A snooze ending
+  sends no notification** — the issue returns to `unresolved` with a
+  `status_changed` activity row; subscribers see it on `/`, in the activity feed
+  and on `GET /api/agent/events` (contract decision 45).
+- **A release's *Issues introduced* decays with retention while its
+  *Occurrences* is lifetime** (contract §4.4): the count reads
+  `issues.first_release_version`, which retention can delete with the issue;
+  `releases.occurrence_count` is never decremented.
+
 ### Re-running the issue_occurrence_buckets backfill (sentinel-issue-trend)
 
 `1724800000_backfill_issue_occurrence_buckets.sql` fills `issue_occurrence_buckets`
