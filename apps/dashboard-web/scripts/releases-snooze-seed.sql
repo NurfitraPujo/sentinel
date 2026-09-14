@@ -15,7 +15,7 @@
 -- them because it ran first:
 --
 --   * one organization, three projects and three users (decision 47):
---       A `checkout` (semver)  300 `releases` rows v0.1.0 … v3.10.7, `first_seen` spread over
+--       A `checkout` (semver)  300 `releases` rows v0.1.0 … v3.8.3 (minor 1–10, patch 0–7), `first_seen` spread over
 --                              180 days ending YESTERDAY (n = 1 oldest, n = 300 newest, 14 h 24 min
 --                              apart), ONE pair with identical `first_seen` and different versions
 --                              (n = 150 and n = 151 — the tie case, decision 3), `occurrence_count`
@@ -206,7 +206,7 @@ VALUES ('00000000-0000-4000-8000-0000000000c2', 'production', 'Production', true
        ('00000000-0000-4000-8000-0000000000c4', 'production', 'Production', true);
 
 -- Project A's 300 releases, n = 1..300. version = 'v' || major.minor.patch with major = (n − 1) / 80
--- (0..3), minor = 1 + ((n − 1) % 80) / 8 (1..10), patch = (n − 1) % 8 — v0.1.0 for n = 1, v3.10.7
+-- (0..3), minor = 1 + ((n − 1) % 80) / 8 (1..10), patch = (n − 1) % 8 — v0.1.0 for n = 1, v3.8.3
 -- for n = 300, every one distinct. first_seen = yesterday − (300 − n) × 14 h 24 min: n = 300 is the
 -- newest (load − 1 day), n = 1 the oldest (load − 180.4 days); n = 151 takes n = 150's instant —
 -- the tie pair. last_seen = first_seen + (n % 40) days, clamped to a minute before load time.
