@@ -6,6 +6,7 @@ import { projects } from '$lib/db/schema';
 import { requireProjectAccess } from '$lib/server/issue-access';
 import { resolveEnvironmentScope } from '$lib/server/environment-access';
 import { listProjectReleases } from '$lib/db/queries/releases';
+import { countSourcemapsByRelease } from '$lib/db/queries/sourcemaps';
 
 // sentinel-releases-snooze §4.4 — the project's releases (flows R1–R5), reached by the third link on
 // each row of the projects list (decision 25). Guards are §2's, in the settings loader's order
@@ -29,6 +30,14 @@ import { listProjectReleases } from '$lib/db/queries/releases';
 //
 // No caller with a non-null scope reaches the query, which is why `issuesIntroduced` is counted
 // across every environment with no scope clause (releases.ts, decision 36).
+//
+// sentinel-sourcemaps §4.6 adds `sourcemapCount` to every row (one grouped count over `sourcemaps`
+// for the page's versions, `0` never absent — decision 16: a version with maps but no `releases`
+// row is not listed) and `id` to `org`: the page fetches §4.2 on demand at
+// `/api/organizations/{orgId}/projects/{projectId}/sourcemaps`, and neither this loader nor the
+// root layout handed it an id before (the precedent is settings/keys/+page.server.ts's `org`).
+// A sourcemap is a project-level fact like a release (§2.2 — the table has no environment
+// column), so the scoped-member `404` above withholds the counts with the page, unchanged.
 export const load: PageServerLoad = async ({ params, locals }) => {
 	const { orgSlug, projectId } = params;
 
@@ -67,12 +76,20 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	}
 
 	const { releases, truncated } = await listProjectReleases(projectId);
+	const sourcemapCounts = await countSourcemapsByRelease(
+		projectId,
+		releases.map((release) => release.version)
+	);
 
 	return {
-		org: { slug: currentOrg.slug, name: currentOrg.name },
+		org: { id: currentOrg.id, slug: currentOrg.slug, name: currentOrg.name },
 		project: { id: project.id, name: project.name },
 		// §4.4: `first_seen DESC`, at most 200 (decision 24); `[]` when none — shown, never `null`.
-		releases,
+		// sentinel-sourcemaps §4.6: `sourcemapCount` on every row, `0` — not absent — when none.
+		releases: releases.map((release) => ({
+			...release,
+			sourcemapCount: sourcemapCounts.get(release.version) ?? 0,
+		})),
 		// `true` iff the project has more than 200 releases; the page says *Showing the 200 most recent*.
 		truncated,
 	};

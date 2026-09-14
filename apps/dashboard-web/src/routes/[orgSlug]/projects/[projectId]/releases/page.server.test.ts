@@ -20,6 +20,11 @@ import { PgDialect } from 'drizzle-orm/pg-core';
  * predicate, grouped or not, how many statements) rather than about a mocked return value. What
  * that SQL does against a real database — the index range scan on `idx_releases_project_first_seen`
  * and the grouped count on `idx_issues_project_first_release` — is item 7's M2, not this file's.
+ *
+ * sentinel-sourcemaps §4.6 (flows R1, R4, R5 on the loader side): `sourcemapCount` on every row from
+ * ONE more grouped statement, over `sourcemaps` this time, `0` — never absent — for a version with no
+ * rows; `org.id` beside `slug` and `name` (the page needs it for §4.2's URL); and the scoped member's
+ * `404` unchanged, with the count withheld along with the page.
  */
 
 interface RecordedStatement {
@@ -33,7 +38,7 @@ interface RecordedStatement {
 
 const statements: RecordedStatement[] = [];
 // Result rows per table, consumed in statement order: `releases` is asked twice (the list, then the
-// COUNT(*)), `projects` and `issues` once each.
+// COUNT(*)), `projects`, `issues` and `sourcemaps` once each.
 const queues: Record<string, unknown[][]> = {};
 
 const dbMock = {
@@ -131,6 +136,7 @@ beforeEach(() => {
 	queues.projects = [[PROJECT]];
 	queues.releases = [[], [{ total: 0 }]];
 	queues.issues = [[]];
+	queues.sourcemaps = [[]];
 	requireProjectAccessMock.mockResolvedValue({ projectId: PROJECT.id, organizationId: ORG.id });
 	resolveEnvironmentScopeMock.mockResolvedValue(null);
 });
@@ -230,6 +236,8 @@ describe('/[orgSlug]/projects/[projectId]/releases load — the guard matrix (§
 		// No scoped caller reaches the query — which is why it carries no scope clause (decision 36).
 		expect(statementsFrom('releases')).toHaveLength(0);
 		expect(statementsFrom('issues')).toHaveLength(0);
+		// sentinel-sourcemaps §2.2: the map counts are withheld with the page, unchanged (flow R4).
+		expect(statementsFrom('sourcemaps')).toHaveLength(0);
 	});
 
 	it('resolves the scope only after requireProjectAccess has passed — the settings loader’s order', async () => {
@@ -256,14 +264,15 @@ describe('/[orgSlug]/projects/[projectId]/releases load — page data (§4.4)', 
 
 		const result: any = await loadWith();
 
-		expect(result.org).toEqual({ slug: ORG.slug, name: ORG.name });
+		expect(result.org).toEqual({ id: ORG.id, slug: ORG.slug, name: ORG.name });
 		expect(result.project).toEqual({ id: PROJECT.id, name: PROJECT.name });
 		expect(Array.isArray(result.releases)).toBe(true);
 		expect(result.releases).toEqual([]);
 		expect(result.releases).not.toBeNull();
 		expect(result.truncated).toBe(false);
-		// Nothing to count against: the grouped statement is not even built for an empty page.
+		// Nothing to count against: neither grouped statement is even built for an empty page.
 		expect(statementsFrom('issues')).toHaveLength(0);
+		expect(statementsFrom('sourcemaps')).toHaveLength(0);
 	});
 
 	it('lists the releases first_seen DESC with a limit of 200 and truncated false at exactly 200', async () => {
@@ -300,13 +309,15 @@ describe('/[orgSlug]/projects/[projectId]/releases load — page data (§4.4)', 
 				result.releases[i].firstSeen.getTime()
 			);
 		}
-		// Every §4.4 key on every row, and `issuesIntroduced` is 0 — not absent — with no matching issue.
+		// Every §4.4 key on every row, and `issuesIntroduced` is 0 — not absent — with no matching
+		// issue; sentinel-sourcemaps §4.6's `sourcemapCount` likewise 0, not absent, with no map.
 		expect(result.releases[0]).toEqual({
 			version: 'v1.200.0',
 			firstSeen: rows[0].firstSeen,
 			lastSeen: rows[0].lastSeen,
 			occurrenceCount: 10,
 			issuesIntroduced: 0,
+			sourcemapCount: 0,
 		});
 	});
 
@@ -352,14 +363,87 @@ describe('/[orgSlug]/projects/[projectId]/releases load — page data (§4.4)', 
 		expect(grouped).toHaveLength(1);
 		expect(render(grouped[0].groupBy!).sql).toBe('"issues"."first_release_version"');
 		expect(render(grouped[0].where!).params).toHaveLength(201);
-		// Four statements for the whole page — the project lookup, the list, its COUNT(*), the
-		// grouped count — whatever the row count.
-		expect(statements).toHaveLength(4);
+		// Five statements for the whole page — the project lookup, the list, its COUNT(*), the
+		// grouped issue count, the grouped map count — whatever the row count.
+		expect(statements).toHaveLength(5);
 		expect(statements.map((s) => getTableName(s.from as any))).toEqual([
 			'projects',
 			'releases',
 			'releases',
 			'issues',
+			'sourcemaps',
 		]);
+	});
+});
+
+describe('/[orgSlug]/projects/[projectId]/releases load — sourcemapCount and org.id (sentinel-sourcemaps §4.6)', () => {
+	it('returns org.id beside slug and name — the page needs it for §4.2’s URL', async () => {
+		const result: any = await loadWith();
+
+		expect(result.org).toEqual({ id: ORG.id, slug: ORG.slug, name: ORG.name });
+		expect(result.org.id).toBe('org-1');
+	});
+
+	it('puts sourcemapCount on every row, 0 — never absent — for a version with no sourcemaps row (flow R1)', async () => {
+		queues.releases = [releaseRows(3), [{ total: 3 }]];
+		queues.issues = [[]];
+		// Two maps on v1.3.0, one on v1.1.0, none on v1.2.0 — the database has already grouped.
+		queues.sourcemaps = [
+			[
+				{ version: 'v1.3.0', sourcemapCount: 2 },
+				{ version: 'v1.1.0', sourcemapCount: 1 },
+			],
+		];
+
+		const result: any = await loadWith();
+
+		expect(result.releases.map((r: any) => [r.version, r.sourcemapCount])).toEqual([
+			['v1.3.0', 2],
+			['v1.2.0', 0],
+			['v1.1.0', 1],
+		]);
+		for (const row of result.releases) {
+			expect(row).toHaveProperty('sourcemapCount');
+			expect(typeof row.sourcemapCount).toBe('number');
+		}
+	});
+
+	it('counts sourcemapCount with ONE grouped statement over the page’s versions, never one per row', async () => {
+		queues.releases = [releaseRows(200), [{ total: 200 }]];
+		queues.issues = [[]];
+		queues.sourcemaps = [[{ version: 'v1.200.0', sourcemapCount: 7 }]];
+
+		const result: any = await loadWith();
+
+		expect(result.releases).toHaveLength(200);
+		expect(result.releases[0].sourcemapCount).toBe(7);
+		expect(result.releases[1].sourcemapCount).toBe(0);
+
+		const grouped = statementsFrom('sourcemaps');
+		expect(grouped).toHaveLength(1);
+		const { sql, params } = render(grouped[0].where!);
+		// `(project_id, release_version)` — `idx_sourcemaps_project_release`'s two columns, and the
+		// page's own versions as the IN list (decision 16: a map-only version is never looked up).
+		expect(sql).toMatch(
+			/^\("sourcemaps"\."project_id" = \$1 and "sourcemaps"\."release_version" in \(\$2(, \$\d+){199}\)\)$/
+		);
+		expect(params).toHaveLength(201);
+		expect(params[0]).toBe(PROJECT.id);
+		expect(params.slice(1)).toEqual(result.releases.map((r: any) => r.version));
+		expect(render(grouped[0].groupBy!).sql).toBe('"sourcemaps"."release_version"');
+		expect(sql).not.toContain('environment');
+	});
+
+	it('does not list a version that has maps but no releases row (decision 16, flow R5)', async () => {
+		queues.releases = [releaseRows(1), [{ total: 1 }]];
+		queues.issues = [[]];
+		// A map-only version could only come back if it had been asked for; the IN list is the page's.
+		queues.sourcemaps = [[{ version: 'v1.1.0', sourcemapCount: 3 }]];
+
+		const result: any = await loadWith();
+
+		expect(result.releases.map((r: any) => r.version)).toEqual(['v1.1.0']);
+		const [grouped] = statementsFrom('sourcemaps');
+		expect(render(grouped.where!).params).toEqual([PROJECT.id, 'v1.1.0']);
 	});
 });
