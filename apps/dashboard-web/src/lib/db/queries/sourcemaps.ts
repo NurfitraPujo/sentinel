@@ -1,12 +1,13 @@
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { db, type Tx } from '$lib/server/db';
 import { sourcemaps } from '$lib/db/schema';
 
 /**
  * sentinel-sourcemaps contract §4.1 (decision 26) -- the `sourcemaps` table's write path, the
- * two reads `POST /api/sourcemaps` makes before it writes anything, and nothing else. The
- * processor reads this table by `(project_id, release_version, minified_path)` (§4.4, Go); §4.2's
- * list and §4.6's grouped count are be.md task 8's and live beside these when they land.
+ * two reads `POST /api/sourcemaps` makes before it writes anything, and the dashboard's two reads
+ * of it: §4.2's per-release list (`listReleaseSourcemaps`) and §4.6's grouped count for the
+ * releases page (`countSourcemapsByRelease`). The processor reads this table by `(project_id,
+ * release_version, minified_path)` (§4.4, Go) and is not a caller of anything here.
  *
  * Three phases, no transaction open while bytes move (decision 26): the route validates and calls
  * `readReleaseState` (phase 1, plain reads, the per-release pre-check answered from them), puts
@@ -187,4 +188,78 @@ async function countReleaseRows(executor: Executor, projectId: string, releaseVe
 		.from(sourcemaps)
 		.where(and(eq(sourcemaps.projectId, projectId), eq(sourcemaps.releaseVersion, releaseVersion)));
 	return Number(row?.count ?? 0);
+}
+
+/** §4.2's `files[]` row, exactly -- `camelCase` (§3) and NO `storageKey`, see {@link listReleaseSourcemaps}. */
+export interface ReleaseSourcemapRow {
+	id: string;
+	minifiedPath: string;
+	sizeBytes: number;
+	sha256: string;
+	uploadedAt: Date;
+}
+
+/**
+ * §4.2: the maps one release has, `minified_path ASC`, returned whole -- a release's list is
+ * bounded by §4.1's per-release cap (OQ-6), so there is no paging (§3). `[]` when the release has
+ * none, which is also the answer for a version this project has never seen: the route echoes the
+ * version and shows an empty list either way.
+ *
+ * `storage_key` is deliberately not selected. §1's *NOT building* says nothing serves map bytes to
+ * a browser, and the only way a client learns where the bytes live is a column that reaches a
+ * response; the columns below are the whole of §4.2's row, so the key cannot leak by accident
+ * (`sourcemaps.test.ts` pins the selected fields).
+ *
+ * `(project_id, release_version)` is `idx_sourcemaps_project_release`'s prefix, and the caller has
+ * already decided who may see the list at all -- the route `404`s an environment-scoped member
+ * (§2.2), the same way the releases loader does, so there is no scope clause here (decision 36's
+ * reasoning, unchanged).
+ */
+export async function listReleaseSourcemaps(
+	projectId: string,
+	releaseVersion: string
+): Promise<ReleaseSourcemapRow[]> {
+	return await db
+		.select({
+			id: sourcemaps.id,
+			minifiedPath: sourcemaps.minifiedPath,
+			sizeBytes: sourcemaps.sizeBytes,
+			sha256: sourcemaps.sha256,
+			uploadedAt: sourcemaps.uploadedAt,
+		})
+		.from(sourcemaps)
+		.where(and(eq(sourcemaps.projectId, projectId), eq(sourcemaps.releaseVersion, releaseVersion)))
+		.orderBy(asc(sourcemaps.minifiedPath));
+}
+
+/**
+ * §4.6's `sourcemapCount`: ONE grouped `COUNT(*)` over `sourcemaps` for the whole releases page,
+ * never one query per row -- `WHERE project_id = $1 AND release_version IN (<the page's versions>)
+ * GROUP BY release_version`, the shape `listProjectReleases` documents for `issuesIntroduced`
+ * (releases.ts), on `idx_sourcemaps_project_release (project_id, release_version)`. The `IN` list is
+ * the page's own versions (≤ `RELEASES_PAGE_LIMIT`), so a version that has maps but no `releases`
+ * row is never looked up -- decision 16: map-only versions are not shown, and the loader is what
+ * keeps them out, not this query.
+ *
+ * Returns a map keyed by version. A version with no rows is ABSENT here; the loader reads `?? 0`,
+ * because §4.6 says `0`, never absent, on the page. An empty `versions` list is answered without a
+ * statement -- there is nothing to count against, and `IN ()` is not SQL.
+ */
+export async function countSourcemapsByRelease(
+	projectId: string,
+	versions: readonly string[]
+): Promise<Map<string, number>> {
+	const counts = new Map<string, number>();
+	if (versions.length === 0) return counts;
+
+	const rows = await db
+		.select({
+			version: sourcemaps.releaseVersion,
+			sourcemapCount: sql<number>`count(*)::int`,
+		})
+		.from(sourcemaps)
+		.where(and(eq(sourcemaps.projectId, projectId), inArray(sourcemaps.releaseVersion, [...versions])))
+		.groupBy(sourcemaps.releaseVersion);
+	for (const row of rows) counts.set(row.version, Number(row.sourcemapCount));
+	return counts;
 }

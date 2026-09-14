@@ -1,37 +1,67 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
-import type { SQL } from 'drizzle-orm';
+import { sql } from 'drizzle-orm';
 
 /**
- * sentinel-sourcemaps §4.1 / decision 26 -- the `sourcemaps` write path.
+ * sentinel-sourcemaps §4.1 / decision 26 -- the `sourcemaps` write path -- and §4.2 / §4.6's two
+ * reads of the table.
  *
- * What is load-bearing: the upsert conflicts on §4.5's unique key `(project_id, release_version,
- * minified_path)` and rewrites exactly the four replace columns; the per-release count is re-read
- * INSIDE the transaction under a per-release lock and a lost race is a thrown `ReleaseFullError`
- * (D18: thrown, never returned) with nothing inserted; and phase 1's read is two plain selects
- * with no transaction open.
+ * What is load-bearing on the write path: the upsert conflicts on §4.5's unique key `(project_id,
+ * release_version, minified_path)` and rewrites exactly the four replace columns; the per-release
+ * count is re-read INSIDE the transaction under a per-release lock and a lost race is a thrown
+ * `ReleaseFullError` (D18: thrown, never returned) with nothing inserted; and phase 1's read is
+ * two plain selects with no transaction open.
+ *
+ * On the reads: `listReleaseSourcemaps` selects §4.2's five columns and NEVER `storage_key`, and
+ * orders `minified_path ASC`; `countSourcemapsByRelease` is ONE grouped statement for the page's
+ * versions on `(project_id, release_version)` -- the same shape `listProjectReleases` runs for
+ * `issuesIntroduced` -- and builds no statement at all for an empty version list.
  */
 
 interface Captured {
 	values: unknown[];
 	conflicts: unknown[];
 	executes: unknown[];
+	selectFields: unknown[];
 	selectWheres: unknown[];
+	orderBys: unknown[];
+	groupBys: unknown[];
 }
 
-const captured: Captured = { values: [], conflicts: [], executes: [], selectWheres: [] };
+const captured: Captured = {
+	values: [],
+	conflicts: [],
+	executes: [],
+	selectFields: [],
+	selectWheres: [],
+	orderBys: [],
+	groupBys: [],
+};
 
-/** Queued results for each `select().from().where()` chain, in call order. */
+/** Queued results for each `select().from().where()[.orderBy()|.groupBy()]` chain, in call order. */
 let selectResults: unknown[][] = [];
 
 function makeExecutor() {
 	const m: any = {};
-	m.select = vi.fn(() => m);
+	m.select = vi.fn((fields: unknown) => {
+		captured.selectFields.push(fields);
+		return m;
+	});
 	m.from = vi.fn(() => m);
 	m.where = vi.fn((w: unknown) => {
 		captured.selectWheres.push(w);
 		const next = selectResults.shift() ?? [];
-		return { then: (resolve: any) => resolve(next) };
+		// The tail of a select: awaitable as-is, or first ordered / grouped (§4.2 / §4.6's reads).
+		const tail: any = { then: (resolve: any) => resolve(next) };
+		tail.orderBy = vi.fn((o: unknown) => {
+			captured.orderBys.push(o);
+			return tail;
+		});
+		tail.groupBy = vi.fn((g: unknown) => {
+			captured.groupBys.push(g);
+			return tail;
+		});
+		return tail;
 	});
 	m.insert = vi.fn(() => m);
 	m.values = vi.fn((v: unknown) => {
@@ -54,12 +84,19 @@ dbMock.transaction = vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => cb(d
 
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
-const { readReleaseState, upsertReleaseSourcemaps, ReleaseFullError } = await import('./sourcemaps');
+const {
+	readReleaseState,
+	upsertReleaseSourcemaps,
+	ReleaseFullError,
+	listReleaseSourcemaps,
+	countSourcemapsByRelease,
+} = await import('./sourcemaps');
 
 const dialect = new PgDialect();
+/** A recorded fragment -- a predicate, an ordering, a column -- as the SQL text Postgres would get. */
 function render(value: unknown): string {
-	const { sql, params } = dialect.sqlToQuery(value as SQL);
-	return `${sql} -- ${params.map(String).join(', ')}`;
+	const q = dialect.sqlToQuery(sql`${value as any}`);
+	return `${q.sql} -- ${q.params.map(String).join(', ')}`;
 }
 
 beforeEach(() => {
@@ -67,7 +104,10 @@ beforeEach(() => {
 	captured.values = [];
 	captured.conflicts = [];
 	captured.executes = [];
+	captured.selectFields = [];
 	captured.selectWheres = [];
+	captured.orderBys = [];
+	captured.groupBys = [];
 	selectResults = [];
 });
 
@@ -168,5 +208,65 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 		expect(err).toBeInstanceOf(Error);
 		expect(err.max).toBe(500);
 		expect(err.current).toBe(499);
+	});
+});
+
+describe('listReleaseSourcemaps (§4.2)', () => {
+	const UPLOADED = new Date('2026-09-14T08:12:44Z');
+	const ROW = { id: '0f2c0000-0000-4000-8000-000000000001', minifiedPath: '/assets/index-3f2a1c.js', sizeBytes: 4193821, sha256: '9'.repeat(64), uploadedAt: UPLOADED };
+
+	it('selects exactly the five §4.2 columns -- never storage_key -- scoped to (project_id, release_version)', async () => {
+		selectResults = [[ROW]];
+		const rows = await listReleaseSourcemaps('proj-1', 'v1');
+		expect(rows).toEqual([ROW]);
+
+		expect(captured.selectFields).toHaveLength(1);
+		const fields = captured.selectFields[0] as Record<string, { name: string }>;
+		expect(Object.keys(fields).sort()).toEqual(['id', 'minifiedPath', 'sha256', 'sizeBytes', 'uploadedAt']);
+		expect(Object.values(fields).map((c) => c.name).sort()).toEqual(['id', 'minified_path', 'sha256', 'size_bytes', 'uploaded_at']);
+		expect(Object.values(fields).map((c) => c.name)).not.toContain('storage_key');
+
+		expect(captured.selectWheres).toHaveLength(1);
+		expect(render(captured.selectWheres[0])).toBe(
+			'("sourcemaps"."project_id" = $1 and "sourcemaps"."release_version" = $2) -- proj-1, v1'
+		);
+		expect(dbMock.transaction).not.toHaveBeenCalled();
+	});
+
+	it('orders minified_path ASC and hands back [] -- not null -- for a release with no rows', async () => {
+		selectResults = [[]];
+		const rows = await listReleaseSourcemaps('proj-1', 'v-none');
+		expect(rows).toEqual([]);
+		expect(rows).not.toBeNull();
+		expect(captured.orderBys).toHaveLength(1);
+		expect(render(captured.orderBys[0])).toBe('"sourcemaps"."minified_path" asc -- ');
+		expect(captured.groupBys).toHaveLength(0);
+	});
+});
+
+describe('countSourcemapsByRelease (§4.6)', () => {
+	it('is ONE grouped COUNT(*) on (project_id, release_version IN <versions>) -- the issuesIntroduced shape', async () => {
+		selectResults = [[{ version: 'v1.3.0', sourcemapCount: 2 }, { version: 'v1.1.0', sourcemapCount: 1 }]];
+		const counts = await countSourcemapsByRelease('proj-1', ['v1.3.0', 'v1.2.0', 'v1.1.0']);
+
+		expect(counts).toEqual(new Map([['v1.3.0', 2], ['v1.1.0', 1]]));
+		// Absent, not 0, for a version with no rows: the loader is what reads `?? 0`.
+		expect(counts.has('v1.2.0')).toBe(false);
+
+		expect(captured.selectWheres).toHaveLength(1);
+		expect(render(captured.selectWheres[0])).toBe(
+			'("sourcemaps"."project_id" = $1 and "sourcemaps"."release_version" in ($2, $3, $4)) -- proj-1, v1.3.0, v1.2.0, v1.1.0'
+		);
+		expect(captured.groupBys).toHaveLength(1);
+		expect(render(captured.groupBys[0])).toBe('"sourcemaps"."release_version" -- ');
+		const fields = captured.selectFields[0] as Record<string, unknown>;
+		expect(render(fields.sourcemapCount)).toBe('count(*)::int -- ');
+		expect(captured.orderBys).toHaveLength(0);
+	});
+
+	it('builds no statement for an empty version list -- IN () is not SQL', async () => {
+		const counts = await countSourcemapsByRelease('proj-1', []);
+		expect(counts.size).toBe(0);
+		expect(dbMock.select).not.toHaveBeenCalled();
 	});
 });
