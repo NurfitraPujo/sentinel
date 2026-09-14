@@ -43,6 +43,19 @@ spec:
             - name: NATS_URL
               value: {{ include "sentinel.natsUrl" . | quote }}
             {{- end }}
+            {{- /*
+              ERROR_EVENTS limits, read by scripts/nats-init.sh as ERROR_EVENTS_MAX_AGE /
+              ERROR_EVENTS_MAX_BYTES. Rendered only when set so an unset value falls through to
+              the script's own defaults (and their derivation) instead of overriding them with "".
+            */}}
+            {{- with .Values.init.nats.errorEvents.maxAge }}
+            - name: ERROR_EVENTS_MAX_AGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.init.nats.errorEvents.maxBytes }}
+            - name: ERROR_EVENTS_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
 {{- end }}
 {{- if .Values.init.minio.enabled }}
 ---

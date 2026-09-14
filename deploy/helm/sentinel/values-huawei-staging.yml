@@ -201,6 +201,14 @@ init:
     enabled: true
     image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-nats-init
     tag: ""
+    # ERROR_EVENTS limits on the shared-cluster JetStream store (infra
+    # k8s/hcs/argocd/cluster/nats/helm-values.staging.yaml: fileStore.pvc.size 50Gi, maxSize 50Gi).
+    # 20 events/s x 5 KiB x 24h = 8.24 GiB <= 10GiB, ~22% of the store with the DLQ and control-plane
+    # streams counted - the derivation is scripts/nats-init.sh's ERROR_EVENTS block. Re-size here
+    # (and re-run the init job) rather than in the script; the script's defaults are the same numbers.
+    errorEvents:
+      maxAge: "24h"
+      maxBytes: "10GiB"
   minio:
     enabled: false
     image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-minio-init

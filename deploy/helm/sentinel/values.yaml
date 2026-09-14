@@ -425,6 +425,15 @@ init:
     enabled: true
     image: ghcr.io/nurfitrapujo/sentinel/nats-init
     tag: ""
+    # ERROR_EVENTS stream limits, passed to scripts/nats-init.sh as ERROR_EVENTS_MAX_AGE /
+    # ERROR_EVENTS_MAX_BYTES so a re-size is a values change, not an image rebuild. Empty means
+    # the script's defaults (24h / 10GiB, derivation in its comment block). Values are what
+    # `nats stream edit --max-age/--max-bytes` accepts, e.g. "24h", "10GiB". Size against the
+    # JetStream store the target cluster actually has - see the script's derivation for the
+    # shared-cluster numbers - before raising maxBytes.
+    errorEvents:
+      maxAge: ""
+      maxBytes: ""
   minio:
     enabled: true
     image: ghcr.io/nurfitrapujo/sentinel/minio-init

@@ -13,22 +13,44 @@ NATS_URL="${NATS_URL:-nats://localhost:4222}"
 STREAM_NAME="ERROR_EVENTS"
 SUBJECT="error_events"
 CONSUMER_NAME="processor-consumer"
-# MaxAge=72h: bounded replay window. Three days of history is enough for debugging/replay without
-# keeping every event forever.
 # Discard=new (unchanged): correct for an ingest stream - rejecting a publish surfaces backpressure to
-# the ingestor, whereas DiscardOld would silently drop events nobody has processed yet. With MaxAge now
+# the ingestor, whereas DiscardOld would silently drop events nobody has processed yet. With MaxAge
 # bounding growth, a DiscardNew rejection becomes a real emergency signal (storage is actually full)
 # instead of an inevitability (storage was never bounded at all).
-# MaxBytes=4GiB: a second, independent bound in case a runaway (bug, retry storm, oversized payloads)
-# fills the 72h window faster than expected. Measured live during this incident: 18,654 real events over
-# ~5h averaged ~290 bytes each (5.4MB total feed via `nats stream info ERROR_EVENTS`) - scaled to a full
-# 72h at that same rate that is well under 100MB. 4GiB leaves >40x headroom over that for events that
-# carry real stack traces/context (multi-KB each) at materially higher throughput, while remaining a
-# fraction of the volume available on this host (13GB free at time of writing) once the other bounded
-# streams below are accounted for.
+#
+# Sizing (re-derived 2026-09-14 for core's events - prd core-sentinel-integration, decision 24):
+# The previous bound (MaxAge=72h, MaxBytes=4GiB) was derived from 18,654 events over ~5h averaging
+# ~290 bytes each, measured during the P0 incident above. Core's events are not that shape: every one
+# carries request metadata (http_route/status, request/tenant/user ids, query, headers, a stack trace -
+# contract §4.7's example) and measures ~5 KiB, 17x the size the 4GiB bound assumed.
+#   event size      5 KiB          contract §4.7 example (request metadata + stack trace)
+#   design rate     20 events/s    decision 24 caps each core process at 20 events/s; this is that
+#                                  bucket held open for the ENTIRE window (or ~24 processes at ~1/s
+#                                  each, a day-long storm) - a ceiling, not normal load. The ingestor's
+#                                  own per-key limit (5,000 req/min x 10 events/batch = 833 events/s)
+#                                  sits far above it, so the byte bound below is the operative ceiling.
+#   store capacity  50Gi           the shared-cluster JetStream file store: infra
+#                                  k8s/hcs/argocd/cluster/nats/helm-values.{staging,production}.yaml
+#                                  config.jetstream.fileStore.pvc.size: 50Gi / fileStore.maxSize: 50Gi.
+#                                  (production's merge.max_file_store 107374182400 = 100 GiB exceeds
+#                                  its own 50Gi PVC, so the disk is the ceiling that actually applies.)
+#   20 events/s x 5 KiB x 24h = 20 x 5120 x 86400 = 8,847,360,000 B = 8.24 GiB  <=  10GiB  <=  50Gi
+# MaxAge=24h: the replay window. 72h at the design rate is 24.7 GiB - half of a store this stream
+# shares with every other tenant's streams (core's own included) - so the window shrinks to a day.
+# The processor consumes continuously, so a day covers a re-process after a bad deploy; the evidence
+# that needs to survive longer is in ERROR_EVENTS_DLQ, which keeps its own 30d window below.
+# MaxBytes=10GiB: the design-rate day (8.24 GiB) with ~20% headroom - it fires only above ~24 events/s
+# sustained for a full day. Sentinel's worst case on the shared store is then 10GiB + 1GiB (DLQ) +
+# 2 x 64MiB (control plane) = 11.1 GiB, ~22% of one server's 50Gi, leaving the rest to the cluster's
+# other tenants. Re-derive against the infra values above before raising it.
+#
+# Both limits are overridable per environment (ERROR_EVENTS_MAX_AGE / ERROR_EVENTS_MAX_BYTES, set from
+# the chart's init.nats.errorEvents.{maxAge,maxBytes} in deploy/helm/sentinel) so a re-size on the
+# shared cluster is a values change and an init-job re-run, never an image rebuild. The values must be
+# what `nats stream edit --max-age/--max-bytes` accepts (e.g. 24h, 10GiB).
 STREAM_DISCARD="new"
-STREAM_MAX_AGE="72h"
-STREAM_MAX_BYTES="4GiB"
+STREAM_MAX_AGE="${ERROR_EVENTS_MAX_AGE:-24h}"
+STREAM_MAX_BYTES="${ERROR_EVENTS_MAX_BYTES:-10GiB}"
 
 # --- ERROR_EVENTS_DLQ --------------------------------------------------------
 #
