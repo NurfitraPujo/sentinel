@@ -46,6 +46,21 @@ func marshalProtoEvent(t *testing.T, protoEvent *sentinelv1.ErrorEvent) []byte {
 	return data
 }
 
+// deserializeAndFingerprint is the processor's order since sentinel-sourcemaps §4.4 (be.md task
+// 4): event.Deserialize, then — after processEventInternal has resolved the project and run the
+// symbolication stage — ErrorEvent.ComputeFingerprint. The TestDeserialize_*Fingerprint* cases
+// below pinned "computed after Normalize, custom fingerprint verbatim, override discards" when
+// the computation was the last thing Deserialize did; they moved to this call with it, none
+// deleted (contract §11's "existing, moved" boundary). nil is the gate set with the stage off —
+// these events are platform `go`, outside it either way, so the hash input is ccc52aa's.
+func deserializeAndFingerprint(t *testing.T, protoEvent *sentinelv1.ErrorEvent) *event.ErrorEvent {
+	t.Helper()
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err)
+	got.ComputeFingerprint(nil)
+	return got
+}
+
 func TestValidateEvent(t *testing.T) {
 	t.Run("fully populated event", func(t *testing.T) {
 		assert.NoError(t, validateEvent(validProtoEvent()))
@@ -281,12 +296,11 @@ func TestDeserialize_ComputesFingerprintWhenMissing(t *testing.T) {
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 	}
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 
-	// sentinel-project-environments §4.9: Deserialize passes event.Environment into the config, so
-	// the expectation carries it too. Without it this assertion would pass for a call site that
-	// silently dropped the environment out of the hash input.
+	// sentinel-project-environments §4.9: ComputeFingerprint passes event.Environment into the
+	// config, so the expectation carries it too. Without it this assertion would pass for a call
+	// site that silently dropped the environment out of the hash input.
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
@@ -301,8 +315,7 @@ func TestDeserialize_UsesProvidedFingerprintWithoutOverride(t *testing.T) {
 	protoEvent.Fingerprint = "provided-fingerprint"
 	protoEvent.FingerprintOverride = false
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, "provided-fingerprint", got.Fingerprint)
 }
 
@@ -336,10 +349,8 @@ func TestDeserialize_CustomFingerprintLeavesTheEnvironmentIntact(t *testing.T) {
 	stagEvent.Environment = "staging"
 	stagEvent.Fingerprint = shared
 
-	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
-	require.NoError(t, err)
-	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
-	require.NoError(t, err)
+	prod := deserializeAndFingerprint(t, prodEvent)
+	stag := deserializeAndFingerprint(t, stagEvent)
 
 	// The client's value survives in both — §4.9 left that early return alone, so the identical
 	// string does arrive from two environments.
@@ -355,8 +366,8 @@ func TestDeserialize_CustomFingerprintLeavesTheEnvironmentIntact(t *testing.T) {
 
 // The companion for the computed path, which decision 7 DOES reach: two events identical but for
 // their environment must not hash to the same fingerprint. Drop `Environment` from the
-// FingerprintConfig at event.go:190 and this fails, while every other fingerprint test here keeps
-// passing — they each assert one environment at a time.
+// FingerprintConfig in event.ComputeFingerprint and this fails, while every other fingerprint
+// test here keeps passing — they each assert one environment at a time.
 func TestDeserialize_ComputedFingerprintDiffersByEnvironment(t *testing.T) {
 	prodEvent := validProtoEvent()
 	prodEvent.Environment = "production"
@@ -366,10 +377,8 @@ func TestDeserialize_ComputedFingerprintDiffersByEnvironment(t *testing.T) {
 	stagEvent.Environment = "staging"
 	stagEvent.Fingerprint = ""
 
-	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
-	require.NoError(t, err)
-	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
-	require.NoError(t, err)
+	prod := deserializeAndFingerprint(t, prodEvent)
+	stag := deserializeAndFingerprint(t, stagEvent)
 
 	require.NotEmpty(t, prod.Fingerprint)
 	assert.NotEqual(t, prod.Fingerprint, stag.Fingerprint,
@@ -381,8 +390,7 @@ func TestDeserialize_ComputesFingerprintWhenOverrideIsTrue(t *testing.T) {
 	protoEvent.Fingerprint = ""
 	protoEvent.FingerprintOverride = true
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
@@ -394,8 +402,7 @@ func TestDeserialize_RecomputesProvidedFingerprintWhenOverrideIsTrue(t *testing.
 	protoEvent.Fingerprint = "provided-fingerprint"
 	protoEvent.FingerprintOverride = true
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
