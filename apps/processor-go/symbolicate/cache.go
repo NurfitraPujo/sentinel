@@ -4,20 +4,23 @@ import (
 	"container/list"
 	"sync"
 	"time"
+
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
 
 // CacheEventKind is the `kind` label of sentinel_sourcemap_cache_events_total (contract §12).
+// Values are obs.SourcemapCache*, never re-typed here.
 type CacheEventKind string
 
 const (
-	CacheHit         CacheEventKind = "hit"
-	CacheMiss        CacheEventKind = "miss"
-	CacheNegativeHit CacheEventKind = "negative_hit"
-	CacheEvict       CacheEventKind = "evict"
+	CacheHit         CacheEventKind = CacheEventKind(obs.SourcemapCacheHit)
+	CacheMiss        CacheEventKind = CacheEventKind(obs.SourcemapCacheMiss)
+	CacheNegativeHit CacheEventKind = CacheEventKind(obs.SourcemapCacheNegativeHit)
+	CacheEvict       CacheEventKind = CacheEventKind(obs.SourcemapCacheEvict)
 	// CacheOversize is a map larger than the CACHE bound: fetched, parsed, handed to the event,
 	// not retained. A row over the PARSE cap is never fetched and is a frame outcome (`oversize`),
 	// not this.
-	CacheOversize CacheEventKind = "oversize"
+	CacheOversize CacheEventKind = CacheEventKind(obs.SourcemapCacheOversize)
 )
 
 // negKey is the negative cache's key (§4.4, cache paragraph): the lookup triple, so a miss on

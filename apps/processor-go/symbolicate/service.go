@@ -24,34 +24,37 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
 
 // Outcome is the per-frame result -- the `outcome` label of sentinel_symbolication_frames_total
-// (§12), and the reason a negative entry carries.
+// (§12), and the reason a negative entry carries. The values are obs.SymbolicationFrame*, never
+// re-typed here (B5: one spelling per state, and obs.go is where it lives).
 type Outcome string
 
 const (
 	// OutcomeApplied: the frame was rewritten (§4.4 step 6).
-	OutcomeApplied Outcome = "applied"
+	OutcomeApplied Outcome = Outcome(obs.SymbolicationFrameApplied)
 	// OutcomeNoColumn: column == 0; a (file, line) lookup with no column would be wrong, not
 	// merely absent (§4.4 step 2).
-	OutcomeNoColumn Outcome = "no_column"
+	OutcomeNoColumn Outcome = Outcome(obs.SymbolicationFrameNoColumn)
 	// OutcomeNoMap: no `sourcemaps` row for (project, release, normalised path). Negatively cached.
-	OutcomeNoMap Outcome = "no_map"
+	OutcomeNoMap Outcome = Outcome(obs.SymbolicationFrameNoMap)
 	// OutcomeNoMapping: the map has no segment at or before the column on that line, or the
 	// segment there carries no source (§4.4 step 5). Not cached -- the map is fine.
-	OutcomeNoMapping Outcome = "no_mapping"
+	OutcomeNoMapping Outcome = Outcome(obs.SymbolicationFrameNoMapping)
 	// OutcomeMapError: a parse error, a sha256 mismatch, or a recovered panic. Negatively cached.
-	OutcomeMapError Outcome = "map_error"
+	OutcomeMapError Outcome = Outcome(obs.SymbolicationFrameMapError)
 	// OutcomeFetchError: the object GET failed (or the Store did). Negatively cached on a GET
 	// failure only.
-	OutcomeFetchError Outcome = "fetch_error"
+	OutcomeFetchError Outcome = Outcome(obs.SymbolicationFrameFetchError)
 	// OutcomeTimeout: the map's fetch + parse had not finished by the event's Deadline; the fill
 	// continues in the background. NEVER negatively cached (decision 37).
-	OutcomeTimeout Outcome = "timeout"
+	OutcomeTimeout Outcome = Outcome(obs.SymbolicationFrameTimeout)
 	// OutcomeOversize: the row's size_bytes exceeds MaxParseBytes; never fetched. Negatively
 	// cached (decision 38).
-	OutcomeOversize Outcome = "oversize"
+	OutcomeOversize Outcome = Outcome(obs.SymbolicationFrameOversize)
 )
 
 // negativelyCacheable is the set §4.4 allows a negative entry to carry: the four step-3/4
@@ -91,16 +94,16 @@ type RawFrame struct {
 }
 
 // EventOutcome is the per-event derivation of §4.4 -- the `outcome` label of
-// sentinel_symbolication_events_total.
+// sentinel_symbolication_events_total. Values are obs.SymbolicationEvent*.
 type EventOutcome string
 
 const (
-	EventAppliedAll       EventOutcome = "applied_all"
-	EventAppliedPartial   EventOutcome = "applied_partial"
-	EventNone             EventOutcome = "none"
-	EventSkippedPlatform  EventOutcome = "skipped_platform"
-	EventSkippedNoRelease EventOutcome = "skipped_no_release"
-	EventSkippedNoFrames  EventOutcome = "skipped_no_frames"
+	EventAppliedAll       EventOutcome = EventOutcome(obs.SymbolicationEventAppliedAll)
+	EventAppliedPartial   EventOutcome = EventOutcome(obs.SymbolicationEventAppliedPartial)
+	EventNone             EventOutcome = EventOutcome(obs.SymbolicationEventNone)
+	EventSkippedPlatform  EventOutcome = EventOutcome(obs.SymbolicationEventSkippedPlatform)
+	EventSkippedNoRelease EventOutcome = EventOutcome(obs.SymbolicationEventSkippedNoRelease)
+	EventSkippedNoFrames  EventOutcome = EventOutcome(obs.SymbolicationEventSkippedNoFrames)
 )
 
 // Gate is §4.4's "which events are symbolicated": all three, else the reason the stage is

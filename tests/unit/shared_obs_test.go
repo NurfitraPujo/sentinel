@@ -380,3 +380,35 @@ func TestObsEnvironmentMetricNames(t *testing.T) {
 func TestObsReleaseNextRewriteMetricName(t *testing.T) {
 	assert.Equal(t, "sentinel_release_next_rewrite_failures_total", obs.MetricReleaseNextRewriteFailures)
 }
+
+// TestObsSourcemapMetricNames pins the exact spelling of sentinel-sourcemaps §12's six metric
+// names and the closed label sets that go with them, for the reasons the two tests above give and
+// one more: the chart's dormant `sentinel-sourcemaps` PrometheusRule group
+// (deploy/helm/sentinel/templates/prometheusrule.yaml) names three of these in its `expr`s today
+// and matches nothing silently if a name drifts; the RUNBOOK's hand-read check greps
+// `sentinel_symbolication`; and the sixth name is registered by the dashboard in TypeScript
+// (`sentinel_sourcemap_uploads_total`, lib/server/metrics.ts), where no constant can be shared.
+// The frames counter's eight outcome values are asserted in full — they are what
+// apps/processor-go/symbolicate's Outcome constants are defined FROM, and the acceptance bar is
+// that the obs constant block carries all eight.
+func TestObsSourcemapMetricNames(t *testing.T) {
+	assert.Equal(t, "sentinel_symbolication_events_total", obs.MetricSymbolicationEvents)
+	assert.Equal(t, "sentinel_symbolication_frames_total", obs.MetricSymbolicationFrames)
+	assert.Equal(t, "sentinel_sourcemap_fetch_duration_seconds", obs.MetricSourcemapFetchDuration)
+	// A GAUGE, so no _total: the cache's current raw-byte cost, which goes down on eviction.
+	assert.Equal(t, "sentinel_sourcemap_cache_bytes", obs.MetricSourcemapCacheBytes)
+	assert.Equal(t, "sentinel_sourcemap_cache_events_total", obs.MetricSourcemapCacheEvents)
+	assert.Equal(t, "sentinel_sourcemap_uploads_total", obs.MetricSourcemapUploads)
+
+	assert.Equal(t, []string{"applied_all", "applied_partial", "none", "skipped_platform", "skipped_no_release", "skipped_no_frames"},
+		[]string{obs.SymbolicationEventAppliedAll, obs.SymbolicationEventAppliedPartial, obs.SymbolicationEventNone,
+			obs.SymbolicationEventSkippedPlatform, obs.SymbolicationEventSkippedNoRelease, obs.SymbolicationEventSkippedNoFrames})
+	assert.Equal(t, []string{"applied", "no_column", "no_map", "no_mapping", "map_error", "fetch_error", "timeout", "oversize"},
+		[]string{obs.SymbolicationFrameApplied, obs.SymbolicationFrameNoColumn, obs.SymbolicationFrameNoMap, obs.SymbolicationFrameNoMapping,
+			obs.SymbolicationFrameMapError, obs.SymbolicationFrameFetchError, obs.SymbolicationFrameTimeout, obs.SymbolicationFrameOversize},
+		"the eight per-frame outcomes of §4.4, in the contract's order")
+	assert.Equal(t, []string{"hit", "miss", "negative_hit", "evict", "oversize"},
+		[]string{obs.SourcemapCacheHit, obs.SourcemapCacheMiss, obs.SourcemapCacheNegativeHit, obs.SourcemapCacheEvict, obs.SourcemapCacheOversize})
+	assert.Equal(t, []string{"created", "replaced", "unchanged", "rejected", "storage_error"},
+		[]string{obs.SourcemapUploadCreated, obs.SourcemapUploadReplaced, obs.SourcemapUploadUnchanged, obs.SourcemapUploadRejected, obs.SourcemapUploadStorageError})
+}
