@@ -33,6 +33,9 @@ package dbmigrations
 //     occurrence regardless of version; NULL when that earliest occurrence carried no version
 //     (NULL or '' -- decision 31, never attributed to a later versioned one); and NOTHING
 //     inserted or rewritten on the second and third ledgers (the WHERE NOT EXISTS guards);
+//   - decision 50's clamp: a retained occurrence whose client clock ran AHEAD backfills a release
+//     whose first_seen and last_seen are LEAST(…, now()) -- never in the future -- while a
+//     release with only past occurrences keeps its exact instants;
 //   - Down removes the two partial indexes, the three constraints, the four columns, the table
 //     and both ledger rows (file 2's Down is empty -- goose still deletes the version), and the
 //     second Up backfills again from scratch, this time seeing what was stored in between;
@@ -160,9 +163,25 @@ func TestReleasesSnoozeReplay(t *testing.T) {
 	}
 	seedVersionedOccurrences(t, db, seeded)
 
+	// Decision 50 (`release-first-seen-clock-guard`): two occurrences of D whose client clock ran
+	// one and two years AHEAD, in a version of their own. Without the backfill's LEAST(…, now())
+	// they would seed Q/v9.9.9 with first_seen in 2027 -- the permanent "newest" release that
+	// rewrites every `next` resolution of the project and reads every genuine later release as
+	// older. Kept out of `seeded` so predictReleases (unclamped, MIN/MAX in Go) stays the oracle
+	// for the past rows; the clamped row is asserted on its own against the database's clock.
+	// In project Q so the cascade below removes it with D.
+	future := []seededOccurrence{
+		{issueD, time.Now().UTC().AddDate(1, 0, 0), versionPtr("v9.9.9")},
+		{issueD, time.Now().UTC().AddDate(2, 0, 0), versionPtr("v9.9.9")},
+	}
+	seedVersionedOccurrences(t, db, future)
+	futureKey := releaseKey{projectQ, "v9.9.9"}
+
 	// Up, both files. File 1 creates everything in its own transaction; file 2 backfills outside
 	// any transaction. The ledger must record both.
+	notBefore := databaseNow(t, db)
 	migrateTo(t, db, releasesSnoozeBackfillVersion)
+	notAfter := databaseNow(t, db)
 	assertReleasesSnoozeShape(t, db, true)
 	assertLedgerHas(t, db, "schema_migrations", releasesSnoozeDDLVersion, true)
 	assertLedgerHas(t, db, "schema_migrations", releasesSnoozeBackfillVersion, true)
@@ -173,7 +192,11 @@ func TestReleasesSnoozeReplay(t *testing.T) {
 	if len(want) != 4 {
 		t.Fatalf("the seed predicts %d releases, want 4 (P/v1.0.0, P/v1.1.0, P/v2.0.0, Q/v1.0.0)", len(want))
 	}
-	if got := readReleases(t, db); !reflect.DeepEqual(got, want) {
+	// Decision 50: Q/v9.9.9 exists, counts both future occurrences, and its first_seen and
+	// last_seen are the backfill's now() -- inside [notBefore, notAfter] -- not 2027 and 2028.
+	// Everything else is exact: the clamp fires only on the future side.
+	got := takeClampedRelease(t, readReleases(t, db), futureKey, notBefore, notAfter, 2)
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("releases after first up:\n got %v\nwant %v", got, want)
 	}
 	// Named: A's two v1.0.0 occurrences and D's one are two rows, not one, and P/v1.1.0 spans A and B.
@@ -241,7 +264,7 @@ func TestReleasesSnoozeReplay(t *testing.T) {
 		replayUnderLedger(t, db, ledger, releasesSnoozeBackfillVersion)
 		assertLedgerHas(t, db, ledger, releasesSnoozeDDLVersion, true)
 		assertLedgerHas(t, db, ledger, releasesSnoozeBackfillVersion, true)
-		got := readReleases(t, db)
+		got := takeClampedRelease(t, readReleases(t, db), futureKey, notBefore, notAfter, 2)
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("after the %s replay the backfill changed releases:\n got %v\nwant %v (WHERE NOT EXISTS must skip a table that has rows)", ledger, got, want)
 		}
@@ -269,8 +292,10 @@ func TestReleasesSnoozeReplay(t *testing.T) {
 	}
 	mustExec(t, db, `DELETE FROM projects WHERE id = '`+projectQ+`'`)
 	delete(want, releaseKey{projectQ, "v1.0.0"})
+	// The clamped row cascades with Q too, so from here every release is exact and readReleases
+	// compares whole.
 	if got := readReleases(t, db); !reflect.DeepEqual(got, want) {
-		t.Errorf("deleting project Q did not cascade its releases: %v", got)
+		t.Errorf("deleting project Q did not cascade its releases (v1.0.0 and the clamped v9.9.9): %v", got)
 	}
 
 	// Down, both files, on the primary ledger. File 2's Down is empty; goose still deletes its
@@ -349,9 +374,12 @@ func TestReleasesSnoozeFilesAreShapedAsDecided(t *testing.T) {
 	// And the backfill IS the two statements with both guards, so the assertions above are not
 	// vacuous.
 	var hasInsert, hasInsertGuard, hasOnConflict, hasUpdate, hasUpdateGuard, hasNullIf bool
+	var hasFirstSeenClamp, hasLastSeenClamp bool
 	for _, line := range sqlLines(t, releasesSnoozeBackfillFile) {
 		u := strings.ToUpper(strings.Join(strings.Fields(line), " "))
 		hasInsert = hasInsert || strings.Contains(u, "INSERT INTO RELEASES")
+		hasFirstSeenClamp = hasFirstSeenClamp || strings.Contains(u, "LEAST(MIN(O.CREATED_AT), NOW())")
+		hasLastSeenClamp = hasLastSeenClamp || strings.Contains(u, "LEAST(MAX(O.CREATED_AT), NOW())")
 		hasInsertGuard = hasInsertGuard || strings.Contains(u, "NOT EXISTS (SELECT 1 FROM RELEASES)")
 		hasOnConflict = hasOnConflict || strings.Contains(u, "ON CONFLICT (PROJECT_ID, VERSION) DO NOTHING")
 		hasUpdate = hasUpdate || strings.Contains(u, "UPDATE ISSUES I SET FIRST_RELEASE_VERSION")
@@ -361,6 +389,11 @@ func TestReleasesSnoozeFilesAreShapedAsDecided(t *testing.T) {
 	if !hasInsert || !hasInsertGuard || !hasOnConflict || !hasUpdate || !hasUpdateGuard || !hasNullIf {
 		t.Errorf("%s: insert=%v, its NOT EXISTS=%v, ON CONFLICT DO NOTHING=%v, update=%v, its NOT EXISTS=%v, NULLIF=%v; all six must be present (decisions 22, 31)",
 			releasesSnoozeBackfillFile, hasInsert, hasInsertGuard, hasOnConflict, hasUpdate, hasUpdateGuard, hasNullIf)
+	}
+	// Decision 50's backfill half: both instants clamped to now(), verbatim from the contract.
+	if !hasFirstSeenClamp || !hasLastSeenClamp {
+		t.Errorf("%s: LEAST(MIN(o.created_at), now())=%v, LEAST(MAX(o.created_at), now())=%v; the INSERT must clamp both first_seen and last_seen (decision 50)",
+			releasesSnoozeBackfillFile, hasFirstSeenClamp, hasLastSeenClamp)
 	}
 }
 
@@ -560,6 +593,46 @@ func readReleases(t *testing.T, db *sql.DB) releaseRows {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate releases: %v", err)
 	}
+	return got
+}
+
+// databaseNow reads the server's clock, so the clamp is bounded by the same clock the backfill's
+// now() came from, not the test process's.
+func databaseNow(t *testing.T, db *sql.DB) time.Time {
+	t.Helper()
+
+	var now time.Time
+	if err := db.QueryRow(`SELECT now()`).Scan(&now); err != nil {
+		t.Fatalf("read now(): %v", err)
+	}
+	return now.UTC()
+}
+
+// takeClampedRelease asserts decision 50 on one row and removes it from got so the remaining rows
+// compare exactly against the unclamped oracle: the row exists, counts wantCount occurrences,
+// and its first_seen and last_seen are the same instant, no earlier than notBefore and no later
+// than notAfter -- the backfill's now(), not the seeded future clock.
+func takeClampedRelease(t *testing.T, got releaseRows, key releaseKey, notBefore, notAfter time.Time, wantCount int64) releaseRows {
+	t.Helper()
+
+	row, ok := got[key]
+	if !ok {
+		t.Fatalf("release %v was not backfilled: a future-dated occurrence must still seed its release", key)
+	}
+	if row.occurrenceCount != wantCount {
+		t.Errorf("release %v counts %d occurrences, want %d", key, row.occurrenceCount, wantCount)
+	}
+	if !row.firstSeen.Equal(row.lastSeen) {
+		t.Errorf("release %v has first_seen %s and last_seen %s; both future instants clamp to the same now()", key, row.firstSeen, row.lastSeen)
+	}
+	if row.firstSeen.Before(notBefore) || row.firstSeen.After(notAfter) {
+		t.Errorf("release %v has first_seen %s, want within [%s, %s]: the backfill must clamp a future client clock to now() (decision 50)",
+			key, row.firstSeen, notBefore, notAfter)
+	}
+	if row.lastSeen.After(notAfter) {
+		t.Errorf("release %v has last_seen %s, want no later than %s (decision 50)", key, row.lastSeen, notAfter)
+	}
+	delete(got, key)
 	return got
 }
 

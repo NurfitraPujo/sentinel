@@ -13,7 +13,15 @@
 -- the next sync re-runs only this file, and the processor may already write.
 --
 -- Two statements, each guarded. The INSERT builds `releases` from every retained versioned
--- occurrence: (project, version) → earliest created_at, latest created_at, count. The UPDATE sets
+-- occurrence: (project, version) → earliest created_at, latest created_at, count — each clamped
+-- to LEAST(…, now()) (decision 50, `release-first-seen-clock-guard`, the backfill half of the
+-- clamp step 4c applies at write). A retained occurrence whose client clock ran ahead would
+-- otherwise seed a permanent "newest" release whose first_seen sits in the future: every `next`
+-- resolution of the project is rewritten to it and a genuine later release reads as older, so
+-- regression detection is silently off until the clock catches up — and `releases` is never
+-- swept (§12). now() is the statement's transaction start, so the clamp is one instant across the
+-- whole scan and reads as "no later than this backfill". A past clock still yields an "oldest"
+-- row, which is harmless, so only the future side is clamped. The UPDATE sets
 -- first_release_version from the EARLIEST retained occurrence of each issue REGARDLESS of version
 -- and keeps its version only if it has one (NULLIF(release_version, '')): an issue whose creating
 -- occurrence carried no version reads `—` as §4.1 says it must, and is never attributed to a later
@@ -56,7 +64,8 @@ SET statement_timeout = '15min';
 -- +goose StatementEnd
 -- +goose StatementBegin
 INSERT INTO releases (project_id, version, first_seen, last_seen, occurrence_count)
-SELECT i.project_id, o.release_version, MIN(o.created_at), MAX(o.created_at), COUNT(*)
+SELECT i.project_id, o.release_version,
+       LEAST(MIN(o.created_at), now()), LEAST(MAX(o.created_at), now()), COUNT(*)
   FROM error_occurrences o JOIN issues i ON i.id = o.issue_id
  WHERE o.release_version IS NOT NULL AND o.release_version <> ''
    AND NOT EXISTS (SELECT 1 FROM releases)
