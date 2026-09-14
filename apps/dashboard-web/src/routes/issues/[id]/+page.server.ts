@@ -8,6 +8,7 @@ import {
 import { resolveEnvironmentDisplayName } from '$lib/db/queries/environments';
 import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getIssueRelations } from '$lib/db/queries/issues';
+import { listPickerReleases, type PickerRelease } from '$lib/db/queries/releases';
 import { getRetentionDays } from '$lib/server/retention-window';
 import { detailTrendWindow } from '$lib/server/trend-window';
 
@@ -40,7 +41,7 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	// helper's own (contract §7). Four are reachable at `'read'` and all four are on the PROJECT
 	// dimension — including its `404 Project not found`, which is NOT the environment-dimension
 	// `404` below.
-	await requireProjectAccess(session.user.id, issue.projectId, 'read');
+	const { organizationId } = await requireProjectAccess(session.user.id, issue.projectId, 'read');
 
 	// §4.5a layer 2 — the ENVIRONMENT dimension. `404`, never `403` (decision 20): a `403` here
 	// tells the caller that a production issue with this id exists, which is the fact the boundary
@@ -48,6 +49,31 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const scope = await resolveEnvironmentScope(session.user.id, issue.projectId);
 	if (scope !== null && !scope.includes(issue.environment)) {
 		throw error(404, 'Issue not found');
+	}
+
+	// sentinel-releases-snooze §4.1, decision 26 — the resolve dialog's picker (flow D5): the
+	// project's 50 newest releases, `first_seen DESC`, and `[]` for a caller whose environment scope
+	// is NON-NULL. The issue is theirs to see (the clause above let it through); the project's
+	// release list is not — a release is a project-level fact with no environment column (§3), so
+	// the list would name versions from environments the grant withholds. The dialog already
+	// handles `[]` (select disabled, *next release* and *type a version* still offered), which is
+	// why this is one clause here and not a scoped query (decision 36).
+	const releases: PickerRelease[] =
+		scope === null ? await listPickerReleases(issue.projectId) : [];
+
+	// §4.1's `canWrite`: `true` iff `requireProjectAccess(…, 'write')` would pass — computed by
+	// CALLING it and catching its `403`, so this is the same answer `PATCH /api/issues/{id}/status`
+	// gives (`requireIssueAccess` at `'write'` is the project half plus the environment half already
+	// passed above), not a re-derivation from a role string. It decides only whether the control
+	// block renders (§2, a UX nicety); the endpoint re-checks and never trusts it. Anything other
+	// than a `403` is a real failure and propagates — `'read'` passed above, so a `404` here is not
+	// "no access", it is the project vanishing between two statements.
+	let canWrite = true;
+	try {
+		await requireProjectAccess(session.user.id, issue.projectId, 'write', { organizationId });
+	} catch (e) {
+		if ((e as { status?: unknown } | null)?.status !== 403) throw e;
+		canWrite = false;
 	}
 
 	const project = await issueQueries.getProjectById(issue.projectId);
@@ -89,5 +115,11 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		// returns and the retention sweep uses: `Affected users (last {retentionDays} days)`. The two
 		// counts themselves need no loader change; `getIssueById` selects the whole row.
 		retentionDays: getRetentionDays(),
+		// sentinel-releases-snooze §4.1 — top level beside `issue`: the picker's `{ version,
+		// firstSeen }[]` (≤ 50, `[]` for a scoped caller — decision 26) and whether the status
+		// control block renders. The four new `issue` columns need no loader change: `getIssueById`
+		// selects the whole row.
+		releases,
+		canWrite,
 	};
 };

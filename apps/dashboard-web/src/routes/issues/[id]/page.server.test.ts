@@ -73,6 +73,14 @@ vi.mock('$lib/db/queries/issues', () => ({
 	getIssueRelations: getIssueRelationsMock,
 }));
 
+// sentinel-releases-snooze §4.1: the picker's reader. What it returns against a real Postgres is
+// releases.ts's own boundary; this file owns WHEN the loader asks it (a null-scope caller only,
+// decision 26) and that its answer arrives as `releases` beside `issue`.
+const listPickerReleasesMock = vi.fn();
+vi.mock('$lib/db/queries/releases', () => ({
+	listPickerReleases: listPickerReleasesMock,
+}));
+
 const { load } = await import('./+page.server');
 
 const ISSUE = {
@@ -130,6 +138,7 @@ beforeEach(() => {
 	requireProjectAccessMock.mockResolvedValue({ projectId: 'proj-1', organizationId: 'org-1' });
 	getIssueRelationsMock.mockResolvedValue([]);
 	trendForIssueMock.mockResolvedValue(emptyTrend());
+	listPickerReleasesMock.mockResolvedValue([]);
 });
 
 describe('/issues/[id] load (§4.5a)', () => {
@@ -287,8 +296,10 @@ describe('/issues/[id] load — trend (sentinel-issue-trend §4.2)', () => {
 
 	it('reads the buckets only once both checks have passed', async () => {
 		const order: string[] = [];
-		requireProjectAccessMock.mockImplementation(async () => {
-			order.push('project');
+		// sentinel-releases-snooze §4.1: the helper is now asked twice — `'read'` as the guard and
+		// `'write'` for `canWrite` — so the permission is recorded to keep the two apart.
+		requireProjectAccessMock.mockImplementation(async (_u: string, _p: string, permission: string) => {
+			order.push(`project:${permission}`);
 			return { projectId: 'proj-1', organizationId: 'org-1' };
 		});
 		resolveEnvironmentScopeMock.mockImplementation(async () => {
@@ -302,6 +313,7 @@ describe('/issues/[id] load — trend (sentinel-issue-trend §4.2)', () => {
 
 		await loadAs('user-1');
 
-		expect(order).toEqual(['project', 'environment', 'trend']);
+		expect(order).toEqual(['project:read', 'environment', 'project:write', 'trend']);
 	});
 });
+
