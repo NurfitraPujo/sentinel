@@ -317,3 +317,114 @@ describe('/issues/[id] load — trend (sentinel-issue-trend §4.2)', () => {
 	});
 });
 
+/**
+ * sentinel-releases-snooze §4.1, decisions 26 and 47 — flow `D5`'s picker data and the control
+ * block's gate. Two keys beside `issue`, and the interesting cases are the ones where they DISAGREE
+ * with each other: the seed's `staging`-only *engineer* may write (so the Resolve dialog renders)
+ * and gets NO release list (the project's releases are not theirs to read), while a *viewer* with a
+ * `project_members` row reads the issue and gets no control block at all.
+ */
+describe('/issues/[id] load — releases and canWrite (sentinel-releases-snooze §4.1)', () => {
+	const NEWEST_50 = Array.from({ length: 50 }, (_, i) => ({
+		version: `v1.${99 - i}.0`,
+		firstSeen: new Date(Date.UTC(2026, 8, 13, 12) - i * HOUR),
+	}));
+
+	it('returns the picker reader’s 50 newest releases, first_seen DESC, for a null-scope caller', async () => {
+		resolveEnvironmentScopeMock.mockResolvedValue(null);
+		listPickerReleasesMock.mockResolvedValue(NEWEST_50);
+
+		const result: any = await loadAs('user-1');
+
+		expect(listPickerReleasesMock).toHaveBeenCalledTimes(1);
+		expect(listPickerReleasesMock).toHaveBeenCalledWith('proj-1');
+		expect(result.releases).toBe(NEWEST_50);
+		expect(result.releases).toHaveLength(50);
+		for (let i = 1; i < result.releases.length; i++) {
+			expect(result.releases[i - 1].firstSeen.getTime()).toBeGreaterThan(
+				result.releases[i].firstSeen.getTime()
+			);
+		}
+		expect(result.releases[0]).toEqual({ version: 'v1.99.0', firstSeen: NEWEST_50[0].firstSeen });
+	});
+
+	// Decision 26, on decision 47's user: the staging-only engineer. The issue is in their grant
+	// (staging), so the loader serves it and the write gate passes — and the release list is `[]`
+	// WITHOUT the reader being asked, because `first_seen DESC` over a project-level table would
+	// name releases from every environment the grant withholds.
+	it('returns releases: [] — and does not ask the reader — for a write-role caller whose scope is non-null, with canWrite true', async () => {
+		getIssueByIdMock.mockResolvedValue({ ...ISSUE, environment: 'staging' });
+		resolveEnvironmentScopeMock.mockResolvedValue(['staging']);
+		listPickerReleasesMock.mockResolvedValue(NEWEST_50);
+
+		const result: any = await loadAs('staging-engineer');
+
+		expect(result.issue.environment).toBe('staging');
+		expect(result.releases).toEqual([]);
+		expect(listPickerReleasesMock).not.toHaveBeenCalled();
+		expect(result.canWrite).toBe(true);
+		expect(requireProjectAccessMock).toHaveBeenCalledWith('staging-engineer', 'proj-1', 'write', {
+			organizationId: 'org-1',
+		});
+	});
+
+	it('returns canWrite true for an org engineer — the write check passes', async () => {
+		const result: any = await loadAs('engineer-1');
+
+		expect(requireProjectAccessMock).toHaveBeenCalledWith('engineer-1', 'proj-1', 'read');
+		expect(requireProjectAccessMock).toHaveBeenCalledWith('engineer-1', 'proj-1', 'write', {
+			organizationId: 'org-1',
+		});
+		expect(result.canWrite).toBe(true);
+	});
+
+	// A `project_members` row conveys read only (issue-access.ts): `'read'` passes, `'write'` is the
+	// helper's `403 Forbidden: Insufficient permissions to modify these issues`, and THAT — not a
+	// role string — is what turns `canWrite` off. The page still loads: the 403 is caught, not
+	// propagated.
+	it('returns canWrite false for a viewer with a project_members row — the write 403 is caught, the page loads', async () => {
+		requireProjectAccessMock.mockImplementation(
+			async (_userId: string, projectId: string, permission: string) => {
+				if (permission === 'write') {
+					throw { status: 403, body: { message: 'Forbidden: Insufficient permissions to modify these issues' } };
+				}
+				return { projectId, organizationId: 'org-1' };
+			}
+		);
+
+		const result: any = await loadAs('viewer-1');
+
+		expect(result.issue).toEqual(ISSUE);
+		expect(result.canWrite).toBe(false);
+		expect(result.releases).toEqual([]);
+		expect(requireProjectAccessMock).toHaveBeenCalledWith('viewer-1', 'proj-1', 'write', {
+			organizationId: 'org-1',
+		});
+	});
+
+	// Only a `403` means "may not write". `'read'` passed a moment ago, so anything else from the
+	// write call is a real failure, and swallowing it into `canWrite: false` would hide it.
+	it('propagates a non-403 failure of the write check rather than reading it as canWrite false', async () => {
+		requireProjectAccessMock.mockImplementation(
+			async (_userId: string, projectId: string, permission: string) => {
+				if (permission === 'write') throw new Error('connection reset');
+				return { projectId, organizationId: 'org-1' };
+			}
+		);
+
+		await expect(loadAs('user-1')).rejects.toThrow('connection reset');
+	});
+
+	// §2: the write check and the picker read both sit AFTER the environment `404`. A caller outside
+	// the grant learns nothing — not even through a side effect on the reader.
+	it('asks neither the write check nor the picker reader on the environment 404', async () => {
+		resolveEnvironmentScopeMock.mockResolvedValue(['staging']);
+
+		const caught = await catchLoad('user-1');
+
+		expect(caught.status).toBe(404);
+		expect(listPickerReleasesMock).not.toHaveBeenCalled();
+		expect(requireProjectAccessMock).toHaveBeenCalledTimes(1);
+		expect(requireProjectAccessMock).toHaveBeenCalledWith('user-1', 'proj-1', 'read');
+	});
+});
