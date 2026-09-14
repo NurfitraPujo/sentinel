@@ -53,6 +53,12 @@ const ISSUE_ROW = {
 	// sentinel-affected-users decision 14: NOT NULL DEFAULT 0 on the row, declared on the schema.
 	affectedUserCount: 0,
 	affectedTenantCount: 0,
+	// sentinel-releases-snooze decision 9: the four §4.5 columns, nullable with no default, declared
+	// on the schema -- null is what every pre-feature row and every plain indefinite ignore reads.
+	snoozedUntil: null,
+	snoozeOccurrenceTarget: null,
+	snoozeCountAt: null,
+	firstReleaseVersion: null,
 };
 
 const COMMENT_ROW = {
@@ -672,6 +678,41 @@ describe('IssueRowSchema vs. the real `issues` table (decision 54)', () => {
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: 600, affectedTenantCount: 4 }).success).toBe(true);
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedUserCount: null }).success).toBe(false);
 		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, affectedTenantCount: -1 }).success).toBe(false);
+	});
+
+	// sentinel-releases-snooze decision 9 (contract §4.5): the four snooze / release columns reach
+	// this response by the same full-row select, so they are declared -- nullable, because every
+	// pre-feature row and every plain indefinite ignore reads NULL -- and NOT appended to
+	// KNOWN_UNDECLARED, which stays exactly `['waitingSince']`; a fifth entry there is a finding.
+	it('decision 9: declares the four §4.5 columns as nullable and leaves KNOWN_UNDECLARED alone', () => {
+		const four = ['snoozedUntil', 'snoozeOccurrenceTarget', 'snoozeCountAt', 'firstReleaseVersion'];
+		for (const key of four) {
+			expect(schemaKeys).toContain(key);
+			expect(columnNames).toContain(key);
+			expect(KNOWN_UNDECLARED).not.toContain(key);
+		}
+		expect(KNOWN_UNDECLARED).toEqual(['waitingSince']);
+		// A snoozed ignore: a date and an occurrence target with the count it was set at.
+		expect(
+			S.IssueRowSchema.safeParse({
+				...ISSUE_ROW,
+				status: 'ignored',
+				snoozedUntil: '2026-09-20T09:00:00.000Z',
+				snoozeOccurrenceTarget: 100,
+				snoozeCountAt: 37,
+				firstReleaseVersion: 'v1.2.3',
+			}).success
+		).toBe(true);
+		// A pre-feature row / plain ignore: all four null.
+		expect(S.IssueRowSchema.safeParse(ISSUE_ROW).success).toBe(true);
+		// The migrated tripwire, mirrored: a target of 0 is not a row the database can hold
+		// (check_snooze_target_positive), so the schema does not admit it either. `snoozeCountAt`
+		// carries no CHECK of its own and is described as the plain integer it is.
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, snoozeOccurrenceTarget: 0, snoozeCountAt: 0 }).success).toBe(false);
+		expect(S.IssueRowSchema.safeParse({ ...ISSUE_ROW, snoozeOccurrenceTarget: 1, snoozeCountAt: 0 }).success).toBe(true);
+		// The keys are required (the schema is `.strict()` and a full-row select always carries them).
+		const { snoozedUntil, ...withoutSnoozedUntil } = ISSUE_ROW;
+		expect(S.IssueRowSchema.safeParse(withoutSnoozedUntil).success).toBe(false);
 	});
 });
 

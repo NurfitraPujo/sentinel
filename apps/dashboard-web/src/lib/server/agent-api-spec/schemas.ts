@@ -72,6 +72,19 @@ export const IssueRowSchema = z
 		// sweep recomputes it from what remains (decision 12).
 		affectedUserCount: z.number().int().nonnegative(),
 		affectedTenantCount: z.number().int().nonnegative(),
+		// sentinel-releases-snooze decision 9: the four §4.5 columns reach this response by the same
+		// full-row select, so they are declared -- not excused via KNOWN_UNDECLARED. All four are
+		// nullable with no default (§4.5): NULL for every pre-feature row, for a plain indefinite
+		// ignore, and for an issue whose first occurrence carried no version. A snooze is
+		// `status: 'ignored'` with `snoozedUntil` and/or `snoozeOccurrenceTarget` set (no fourth
+		// status -- decision 2); `snoozeCountAt` is the `count` the target was set at and travels
+		// with it (the migrated check_snooze_pair). The three snooze keys are non-null ONLY while
+		// `status` is `ignored` (check_snooze_only_when_ignored). Dates render as ISO strings on
+		// the wire like every other timestamp here.
+		snoozedUntil: z.coerce.date().nullable(),
+		snoozeOccurrenceTarget: z.number().int().positive().nullable(),
+		snoozeCountAt: z.number().int().nullable(),
+		firstReleaseVersion: z.string().nullable(),
 	})
 	.strict();
 

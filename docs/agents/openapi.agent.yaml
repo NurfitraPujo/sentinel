@@ -322,6 +322,24 @@ paths:
                       affectedTenantCount:
                         type: integer
                         minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
                     required:
                       - id
                       - projectId
@@ -348,6 +366,10 @@ paths:
                       - claimedAt
                       - affectedUserCount
                       - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
                     additionalProperties: false
                   report:
                     type:
@@ -694,6 +716,24 @@ paths:
                       affectedTenantCount:
                         type: integer
                         minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
                     required:
                       - id
                       - projectId
@@ -720,6 +760,10 @@ paths:
                       - claimedAt
                       - affectedUserCount
                       - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
                     additionalProperties: false
                   alreadyClaimed:
                     type: boolean
@@ -882,6 +926,24 @@ paths:
                       affectedTenantCount:
                         type: integer
                         minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
                     required:
                       - id
                       - projectId
@@ -908,6 +970,10 @@ paths:
                       - claimedAt
                       - affectedUserCount
                       - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
                     additionalProperties: false
                 required:
                   - success
