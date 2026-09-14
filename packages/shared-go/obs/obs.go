@@ -99,6 +99,20 @@ const (
 	// (§12): a producer sending `user_id: ""` shows up here as reason="empty", which is
 	// distinguishable from "no key at all", which increments nothing.
 	MetricAffectedRollupSkipped = "sentinel_affected_rollup_skipped_total"
+
+	// MetricReleaseNextRewriteFailures counts failures of sentinel-releases-snooze §4.3's post-commit
+	// `next` rewrite — the UPDATE that turns `resolved_in_version = 'next'` into the concrete version
+	// on every resolved issue of a project the first time that version is seen (decision 15). The
+	// rewrite is best-effort, outside the ingest transaction, so its failure is never returned: the
+	// event is stored and ACKed, the `next` issues keep reading `next`, and this counter is the only
+	// signal until the hourly catch-up in the dashboard's retention sweep rewrites them (§12). NO
+	// label — deliberately: the dashboard registers a counter of the SAME NAME in
+	// apps/dashboard-web/src/lib/server/metrics.ts for the catch-up's failures, and the two processes'
+	// series sum by name at the scrape (decision 30). The log line beside every increment names the
+	// SQLSTATE (pgconn.PgError.Code), so a `40P01` deadlock against batchUpdateIssues (decision 42) is
+	// distinguishable from any other failure without a label. No alert rule is owed: the catch-up makes
+	// a failure self-healing within the hour.
+	MetricReleaseNextRewriteFailures = "sentinel_release_next_rewrite_failures_total"
 )
 
 // Label keys. Kept few and low-cardinality on purpose: project_id is unbounded and would blow up the
