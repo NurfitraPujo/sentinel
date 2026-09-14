@@ -135,9 +135,61 @@ config:
     # per env to make them visible and tunable.
     claimStaleHours: "24"
     manualIssueRetentionDays: "365"
+    # sentinel-sourcemaps §4.1 / §12: the upload route's caps and the adapter's body limit.
+    # Every value here is a STRING in the syntax the reader of the variable expects -- the
+    # operator turning one reads nothing else.
+    #
+    # BODY_SIZE_LIMIT -- adapter-node's own syntax: an integer with an optional K/M/G suffix.
+    # Without it the adapter 413s every real map before the route runs (adapter-node defaults to
+    # 512KB); 110M covers two 50 MiB maps plus multipart overhead in one request.
+    # docker-compose.yml sets the same variable for the same reason.
+    bodySizeLimit: "110M"
+    # SOURCEMAP_MAX_BYTES -- plain integer bytes, per file part. 52428800 = 50 MiB (decision 10).
+    sourcemapMaxBytes: "52428800"
+    # SOURCEMAP_MAX_FILES_PER_REQUEST / SOURCEMAP_MAX_FILES_PER_RELEASE -- plain integers
+    # (decision 10). A request over the first is 400; a release that would exceed the second is
+    # 422 release_full with nothing written (§4.1).
+    sourcemapMaxFilesPerRequest: "50"
+    sourcemapMaxFilesPerRelease: "500"
   ingestor:
     # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
     ratelimitStrictMode: "true"
+  processor:
+    # sentinel-sourcemaps §12: the symbolication knobs (decisions 9, 11, 27, 37, 38). Rendered as
+    # plain env on the processor container (templates/processor.yaml), never in the ConfigMap the
+    # other two services also read. Every value is a STRING in the syntax stated beside it -- the
+    # operator turning one reads nothing else. S3_ENDPOINT/S3_BUCKET reach the processor via the
+    # ConfigMap already; S3_ACCESS_KEY/S3_SECRET_KEY come from the Secret (the same two keys the
+    # dashboard mounts). There is no chart switch for the startup check: a processor with a
+    # non-empty SYMBOLICATE_PLATFORMS and no S3 credentials log.Fatalf's before it subscribes
+    # (decision 32) -- see RUNBOOK.md §2's pre-deploy check.
+    #
+    # SYMBOLICATE_PLATFORMS -- comma-separated lowercase list of `platform` values the stage (and
+    # §4.4's frame normalisation) runs for. Unset = "javascript,browser"; set-and-EMPTY = off,
+    # which is the kill switch (decision 27) -- so this key must stay present and non-empty to
+    # keep symbolication on.
+    symbolicatePlatforms: "javascript,browser"
+    # SOURCEMAP_CACHE_BYTES -- plain integer bytes of RAW map size the in-process cache holds
+    # before evicting (decision 11). No Mi/M suffix. 134217728 = 128 MiB. The parsed maps the
+    # cache actually holds are a multiple of this; see gomemlimit under `processor:` below.
+    sourcemapCacheBytes: "134217728"
+    # SOURCEMAP_NEGATIVE_TTL -- Go duration string. How long a "no map for this frame" answer is
+    # remembered (decision 9); a map uploaded inside this window is not seen until it expires.
+    # docker-compose.yml sets 5s so the e2e case does not wait it out.
+    sourcemapNegativeTtl: "60s"
+    # SOURCEMAP_POSITIVE_TTL -- Go duration string. How long a parsed map is served before it is
+    # re-fetched; a replaced map propagates within this per pod (Known limit 3).
+    sourcemapPositiveTtl: "10m"
+    # SYMBOLICATE_DEADLINE -- Go duration string. Per-event wall-clock bound on cold fetch+parse
+    # (decision 37): past it the event's unresolved frames pass through `timeout` and the fill
+    # finishes in the background. Raising it means raising the NATS AckWait in
+    # apps/processor-go/main.go with it (>= BatchSize x this deadline) -- that follows in code,
+    # not here.
+    symbolicateDeadline: "5s"
+    # SOURCEMAP_MAX_PARSE_BYTES -- plain integer bytes. A `sourcemaps` row whose size_bytes is
+    # over this is never fetched (`oversize`, decision 38): the lever that keeps the biggest maps
+    # out of RSS. Default = the upload cap (SOURCEMAP_MAX_BYTES, 52428800).
+    sourcemapMaxParseBytes: "52428800"
 
 # -----------------------------------------------------------------------------
 # External managed endpoints (Huawei CCE only). Each entry renders a
@@ -208,6 +260,14 @@ processor:
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
+  # GOMEMLIMIT -- a Go memory-limit string (the runtime's own syntax: an integer with an optional
+  # B/KiB/MiB/GiB suffix, e.g. 400MiB), and it MUST stay below resources.limits.memory above so
+  # the runtime collects before the kernel OOM-kills (sentinel-sourcemaps decision 35). The
+  # symbolication cache accounts RAW map bytes (config.processor.sourcemapCacheBytes) and holds
+  # parsed maps that are a multiple of that, so the gauge under-reads real usage; this value is
+  # derived, not asserted: sourcemapCacheBytes x parsed:raw ratio + baseline < GOMEMLIMIT, with the
+  # ratio the §13 M2 measurement reports. Raise the memory limit and this together.
+  gomemlimit: "400MiB"
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -354,6 +414,12 @@ prometheusRule:
     exhausted: critical
     unresolved: warning
     stalled: warning
+    # The sentinel-sourcemaps group (DORMANT until a Prometheus consumes Sentinel's rules — see the
+    # group's header in templates/prometheusrule.yaml). All warning: every one degrades to
+    # pass-through and none stops ingest (contract §12, *Failure modes*).
+    sourcemapFetchErrors: warning
+    sourcemapCacheThrash: warning
+    sourcemapUploadStorageErrors: warning
 
 # -----------------------------------------------------------------------------
 # Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.

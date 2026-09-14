@@ -109,6 +109,12 @@ config:
     reportUploadBytesPerDay: "262144000"
     claimStaleHours: "24"
     manualIssueRetentionDays: "365"
+    # sentinel-sourcemaps §12 (value syntax beside each key in values.yaml). Same as the chart
+    # defaults; listed so this block stays the complete list of dashboard knobs for the env.
+    bodySizeLimit: "110M"
+    sourcemapMaxBytes: "52428800"
+    sourcemapMaxFilesPerRequest: "50"
+    sourcemapMaxFilesPerRelease: "500"
   ingestor:
     ratelimitStrictMode: "true"
 

@@ -228,6 +228,18 @@ services:
             # 'occurrence_burst' issue_activity discovery event — at most one per issue per this
             # many seconds. Default matches the code's own fallback; listed for discoverability.
             OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS: "3600"
+            # sentinel-sourcemaps §12: the processor reads maps from the same bucket the dashboard
+            # writes them to (§4.4), so it carries the same S3 env the `dashboard` and `minio-init`
+            # services already do — the in-cluster endpoint, never the host-mapped port. A processor
+            # with symbolication on and no S3_ACCESS_KEY/S3_SECRET_KEY refuses to start (decision 32).
+            S3_ENDPOINT: http://minio:9000
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
+            # Go duration string; the chart default is 60s (deploy/helm/sentinel/values.yaml,
+            # config.processor.sourcemapNegativeTtl). Low here so the e2e case that uploads a map
+            # AFTER an event referenced it does not wait out the negative cache (contract §11, §12).
+            SOURCEMAP_NEGATIVE_TTL: "${SOURCEMAP_NEGATIVE_TTL:-5s}"
 
     dlq-drainer:
         build:
@@ -290,10 +302,13 @@ services:
             REPORT_UPLOAD_RPM: "${REPORT_UPLOAD_RPM:-10}"
             REPORT_UPLOAD_BYTES_PER_DAY: "${REPORT_UPLOAD_BYTES_PER_DAY:-262144000}"
             # adapter-node caps a request body at 512 kB by default, which is below MAX_UPLOAD_BYTES
-            # and therefore below what every upload route in this app already advertises. Raised to
-            # the 25 MB cap plus multipart envelope headroom so the cap enforced by the application
-            # is the one the caller actually meets.
-            BODY_SIZE_LIMIT: "${BODY_SIZE_LIMIT:-27M}"
+            # and therefore below what every upload route in this app already advertises. Was the
+            # 25 MB attachment cap plus multipart envelope headroom (27M); sentinel-sourcemaps §12
+            # raises it to 110M so a POST /api/sourcemaps request carrying two maps at the 50 MiB
+            # SOURCEMAP_MAX_BYTES cap (§4.1) reaches the route instead of a 413 from the adapter
+            # — the cap enforced by the application is still the one the caller actually meets.
+            # Same value as the chart's config.dashboard.bodySizeLimit.
+            BODY_SIZE_LIMIT: "${BODY_SIZE_LIMIT:-110M}"
             S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
             S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
             POSTGRES_HOST: postgres
