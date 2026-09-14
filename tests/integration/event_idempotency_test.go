@@ -29,6 +29,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // This file is W3 of docs/plans/IDEMPOTENCY_PLAN.md (P9-3): the (a)-(g) proof suite for the
@@ -2465,4 +2466,379 @@ func TestStoreEvent_SnoozeOutcomes(t *testing.T) {
 
 	// Regressed, as today: a first sighting against an explicit version is newest (decision 14).
 	assert.Equal(t, store.IssueOutcomeRegressed, deliver(fpResolved, "v2.2.0"))
+}
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-releases-snooze §4.3 through ProcessorService — the outcome gate (6) and the post-commit
+// `next` rewrite (7); flows I11, I17, I18, I20
+// ---------------------------------------------------------------------------------------------------
+//
+// Contract §11, boundary 1's service-level half: the gate on dispatchAlert and the rewrite are
+// properties of processEventInternal, not of StoreEvent, so they are driven through
+// service.ProcessorService with a captured sender — the SetSender pattern of
+// TestEventIdempotency_DuplicateDoesNotFeedAlertsOrSearchIndex above, at frequency_threshold = 1 so
+// every dispatched occurrence is exactly one captured alert and a withheld one is exactly zero.
+
+// releaseProtoEvent is buildValidProtoEvent with the three fields these cases vary: the fingerprint
+// (the issue identity), the release and the event clock (the release's first_seen on a first sighting,
+// and the rewrite's `$3`). Environment stays buildValidProtoEvent's "test"; the metadata carries no
+// affected ids so the rollup writes nothing.
+func releaseProtoEvent(projectKey, fp, release string, at time.Time) *sentinelv1.ErrorEvent {
+	ev := buildValidProtoEvent(projectKey)
+	ev.Fingerprint = fp
+	ev.ReleaseVersion = release
+	ev.EventId = "evt-rel-svc-" + uuid.New().String()
+	ev.Timestamp = timestamppb.New(at)
+	ev.Metadata = nil
+	return ev
+}
+
+// newCapturingService builds a ProcessorService over pool with ONE enabled alert config for projectID
+// at frequency_threshold = 1 (inserted BEFORE construction — NewProcessorService loads configs
+// synchronously, VERIFIED_STATE.md S8 item 4) and a captured sender. The returned func reads how
+// many alerts have been sent so far.
+func newCapturingService(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string) (*service.ProcessorService, func() int) {
+	t.Helper()
+	var orgID string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT organization_id FROM projects WHERE id = $1`, projectID).Scan(&orgID))
+	_, err := pool.Exec(ctx,
+		`INSERT INTO alert_configs (project_id, organization_id, channel, channel_config, frequency_threshold, frequency_window_seconds, enabled)
+		 VALUES ($1, $2, 'email', '{"to": "oncall@example.com"}'::jsonb, 1, 60, true)`,
+		projectID, orgID)
+	require.NoError(t, err)
+
+	svc := service.NewProcessorService(pool)
+	var mu sync.Mutex
+	sent := 0
+	svc.Alerts().SetSender(func(_ context.Context, _ *alerts.AlertConfig, _ *alerts.Alert) {
+		mu.Lock()
+		defer mu.Unlock()
+		sent++
+	})
+	return svc, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return sent
+	}
+}
+
+// processOK marshals ev and drives it through svc.ProcessEvent, requiring an ACK (nil).
+func processOK(t *testing.T, ctx context.Context, svc *service.ProcessorService, ev *sentinelv1.ErrorEvent) {
+	t.Helper()
+	data, err := proto.Marshal(ev)
+	require.NoError(t, err)
+	require.NoError(t, svc.ProcessEvent(ctx, data))
+}
+
+// issueIDByFingerprint reads the id of the (project, "test", fp) issue the service wrote.
+func issueIDByFingerprint(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID, fp string) string {
+	t.Helper()
+	var id string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND environment = 'test' AND fingerprint = $2`,
+		projectID, fp).Scan(&id))
+	return id
+}
+
+// resolvedInVersionOf reads (status, resolved_in_version) — the two columns the rewrite reads and
+// the one it writes. resolved_in_version is returned as "" for NULL.
+func resolvedInVersionOf(t *testing.T, ctx context.Context, pool *pgxpool.Pool, issueID string) (status, resolvedIn string) {
+	t.Helper()
+	var riv *string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, resolved_in_version FROM issues WHERE id = $1`, issueID).Scan(&status, &riv))
+	if riv != nil {
+		resolvedIn = *riv
+	}
+	return status, resolvedIn
+}
+
+func activityRowCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, issueID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM issue_activity WHERE issue_id = $1`, issueID).Scan(&n))
+	return n
+}
+
+// TestProcessorService_AlertGateSkipsOnlyIgnoredOutcome is §11 (6)'s service-level case and decision
+// 16's execution proof: dispatchAlert is NOT called for an occurrence whose outcome is Ignored — a
+// running snooze and a plain indefinite ignore — and IS called for New, Existing, Regressed and
+// Unsnoozed. frequency_threshold = 1 makes "called" observable as exactly one captured alert per
+// dispatched occurrence. Remove the `if outcome != store.IssueOutcomeIgnored` gate in
+// processEventInternal and the two Ignored steps below go red (the count moves to 4 and 6).
+func TestProcessorService_AlertGateSkipsOnlyIgnoredOutcome(t *testing.T) {
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+	}
+	pool := newPostgresPool(t, cfg)
+	t.Cleanup(func() { pool.Close() })
+
+	projectName := uniqueProjectName("rel-gate")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("rel-gate"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	svc, sentCount := newCapturingService(t, ctx, pool, projectID)
+	fp := "fp-rel-gate-" + uuid.New().String()
+
+	// New → dispatched.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.0.0", time.Now().UTC()))
+	assert.Equal(t, 1, sentCount(), "New: dispatched (threshold 1 → one alert)")
+	issueID := issueIDByFingerprint(t, ctx, pool, projectID, fp)
+
+	// Existing (an unresolved recurrence) → dispatched.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.0.0", time.Now().UTC()))
+	assert.Equal(t, 2, sentCount(), "Existing: dispatched")
+
+	// Regressed: resolved in v1.0.0, then a first sighting of v1.1.0 is newest (decision 14) → dispatched.
+	_, err := pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_in_version = 'v1.0.0', resolved_at = now(),
+		        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`, issueID)
+	require.NoError(t, err)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.1.0", time.Now().UTC()))
+	status, _ := resolvedInVersionOf(t, ctx, pool, issueID)
+	require.Equal(t, "unresolved", status, "precondition: the regression arm ran")
+	assert.Equal(t, 3, sentCount(), "Regressed: dispatched")
+
+	// Ignored (a running snooze): target 2 set at the current count — the next occurrence leaves
+	// (count + 1) - count_at = 1 < 2, so the row stays ignored → NOT dispatched.
+	_, err = pool.Exec(ctx,
+		`UPDATE issues SET status = 'ignored', snooze_occurrence_target = 2, snooze_count_at = count WHERE id = $1`, issueID)
+	require.NoError(t, err)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.1.0", time.Now().UTC()))
+	status, _ = resolvedInVersionOf(t, ctx, pool, issueID)
+	require.Equal(t, "ignored", status, "precondition: the snooze is still running after this occurrence")
+	assert.Equal(t, 3, sentCount(), "Ignored (snooze running): NOT dispatched — decision 16")
+
+	// Unsnoozed: the 2nd post-snooze occurrence reaches the target; the row is unresolved → dispatched
+	// normally through the threshold (decision 17/29: neither bypassed nor withheld).
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.1.0", time.Now().UTC()))
+	status, _ = resolvedInVersionOf(t, ctx, pool, issueID)
+	require.Equal(t, "unresolved", status, "precondition: the snooze arm ended the snooze")
+	assert.Equal(t, 4, sentCount(), "Unsnoozed: dispatched")
+
+	// Ignored (a plain indefinite ignore) → NOT dispatched, on every occurrence (flow I15).
+	_, err = pool.Exec(ctx, `UPDATE issues SET status = 'ignored' WHERE id = $1`, issueID)
+	require.NoError(t, err)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.1.0", time.Now().UTC()))
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fp, "v1.1.0", time.Now().UTC()))
+	assert.Equal(t, 4, sentCount(), "Ignored (plain ignore): NOT dispatched, twice")
+
+	// The withheld occurrences were still stored, counted and bucketed (decision 16: muted, not dropped).
+	st := issueSnoozeStateOf(t, ctx, pool, issueID)
+	assert.Equal(t, "ignored", st.status)
+	assert.EqualValues(t, 7, st.count, "seven deliveries, seven counted — the gate withholds dispatch only")
+	var occ int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM error_occurrences WHERE issue_id = $1`, issueID).Scan(&occ))
+	assert.Equal(t, 7, occ)
+}
+
+// TestProcessorService_NextRewriteAfterFirstSighting is §11 (7): the post-commit `next` rewrite through
+// ProcessorService (flows I11, I18, I20; decisions 8, 15, 27, 41).
+//
+//   - a `next` issue reads the new version after an UNRELATED issue's first occurrence in it (I11), in
+//     every environment of the project (decision 41), and NOT in another project;
+//   - it is untouched by an occurrence in a release whose first_seen ≤ its resolved_at — a first
+//     sighting carrying a client clock BEFORE the resolution inserts the release with that first_seen,
+//     the rewrite runs, and `resolved_at < first_seen` matches nothing (the STRICT comparison);
+//   - a `next` with resolved_at IS NULL is untouched (I20, decision 27);
+//   - it is rewritten ONCE: a later first sighting leaves the concrete version alone, and a second
+//     occurrence in the same release (not inserted) runs no rewrite at all (I18);
+//   - no issue_activity row is written for the rewritten issue (decision 8).
+func TestProcessorService_NextRewriteAfterFirstSighting(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+
+	projectName := uniqueProjectName("rel-next")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("rel-next"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+	otherProjectName := uniqueProjectName("rel-next-other")
+	otherProjectID := createTestProject(t, pool, otherProjectName, uniqueAPIKey("rel-next-other"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, otherProjectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// X (environment "test") and X2 (environment "staging") are the project's `next` issues; Z is
+	// `next` with resolved_at IS NULL; O is another project's `next` issue. All created through the
+	// service so they are real rows, then resolved by SQL exactly as the dashboard's PATCH would.
+	t0 := time.Now().UTC().Add(-2 * time.Hour)
+	fpX, fpX2, fpZ, fpO := "fp-x-"+uuid.New().String(), "fp-x2-"+uuid.New().String(), "fp-z-"+uuid.New().String(), "fp-o-"+uuid.New().String()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpX, "v1.0.0", t0))
+	x2 := releaseProtoEvent(projectName, fpX2, "v1.0.0", t0)
+	x2.Environment = "staging"
+	processOK(t, ctx, svc, x2)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpZ, "v1.0.0", t0))
+	processOK(t, ctx, svc, releaseProtoEvent(otherProjectName, fpO, "v1.0.0", t0))
+
+	xID := issueIDByFingerprint(t, ctx, pool, projectID, fpX)
+	var x2ID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND environment = 'staging' AND fingerprint = $2`,
+		projectID, fpX2).Scan(&x2ID))
+	zID := issueIDByFingerprint(t, ctx, pool, projectID, fpZ)
+	oID := issueIDByFingerprint(t, ctx, pool, otherProjectID, fpO)
+
+	resolvedAt := time.Now().UTC().Add(-1 * time.Hour) // T
+	for _, id := range []string{xID, x2ID, oID} {
+		_, err := pool.Exec(ctx,
+			`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = $2,
+			        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`, id, resolvedAt)
+		require.NoError(t, err)
+	}
+	_, err := pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = NULL,
+		        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`, zID)
+	require.NoError(t, err)
+	xActivityBefore := activityRowCount(t, ctx, pool, xID)
+
+	// Y is the unrelated issue whose occurrences carry the releases.
+	fpY := "fp-y-" + uuid.New().String()
+
+	// (b) A first sighting of v0.9.0 with a client clock BEFORE T: the release row is inserted with
+	// first_seen = T - 30m ≤ resolved_at, the rewrite runs and matches nothing.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v0.9.0", resolvedAt.Add(-30*time.Minute)))
+	require.True(t, releaseRowOf(t, ctx, pool, projectID, "v0.9.0").found, "precondition: v0.9.0 was a first sighting")
+	_, riv := resolvedInVersionOf(t, ctx, pool, xID)
+	assert.Equal(t, "next", riv, "a release first seen at or before resolved_at must not rewrite `next` (strict >)")
+
+	// (a) A first sighting of v1.1.0 after T: X and X2 read it; Z (NULL resolved_at) and O (another
+	// project) do not.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.1.0", time.Now().UTC()))
+	status, riv := resolvedInVersionOf(t, ctx, pool, xID)
+	assert.Equal(t, "resolved", status, "the resolution did not change — only its version became known")
+	assert.Equal(t, "v1.1.0", riv, "I11: X reads the new release after an unrelated issue's first occurrence in it")
+	_, riv = resolvedInVersionOf(t, ctx, pool, x2ID)
+	assert.Equal(t, "v1.1.0", riv, "decision 41: the rewrite is project-wide across environments")
+	_, riv = resolvedInVersionOf(t, ctx, pool, zID)
+	assert.Equal(t, "next", riv, "I20 / decision 27: a `next` with resolved_at IS NULL is never rewritten")
+	_, riv = resolvedInVersionOf(t, ctx, pool, oID)
+	assert.Equal(t, "next", riv, "another project's `next` is not this project's release's to rewrite")
+	assert.Equal(t, xActivityBefore, activityRowCount(t, ctx, pool, xID), "decision 8: no activity row per rewritten issue")
+
+	// (c) Rewritten once: a later first sighting (v1.2.0) leaves the concrete version alone, and a
+	// second occurrence in v1.1.0 (the DO UPDATE arm, not inserted) changes nothing either.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.1.0", time.Now().UTC()))
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.2.0", time.Now().UTC()))
+	_, riv = resolvedInVersionOf(t, ctx, pool, xID)
+	assert.Equal(t, "v1.1.0", riv, "I18: the version is written once; later releases do not move it")
+	assert.EqualValues(t, 2, releaseRowOf(t, ctx, pool, projectID, "v1.1.0").occurrenceCount)
+	_, riv = resolvedInVersionOf(t, ctx, pool, zID)
+	assert.Equal(t, "next", riv)
+}
+
+// breakNextRewrite installs a BEFORE UPDATE trigger on issues that raises with SQLSTATE 40P01 for
+// exactly the write the post-commit rewrite performs on projectID's rows — resolved_in_version
+// leaving 'next' while the row stays resolved — so the fan-out's UPDATE, and only it, errors against
+// a REAL Postgres. The regression arm (status → unresolved) and every other writer are untouched.
+// 40P01 is decision 42's accepted deadlock, the one SQLSTATE the log line exists to make legible.
+//
+// Returned as a function so a test can drop it early and prove the failure was not sticky; t.Cleanup
+// drops it regardless.
+func breakNextRewrite(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string) (restore func()) {
+	t.Helper()
+	name := "eid_next_rewrite_boom_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	_, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $fn$
+		BEGIN
+			IF OLD.project_id::text = %s AND OLD.resolved_in_version = 'next'
+			   AND NEW.resolved_in_version IS DISTINCT FROM 'next' AND NEW.status = 'resolved' THEN
+				RAISE EXCEPTION 'simulated next rewrite deadlock (decision 42)' USING ERRCODE = '40P01';
+			END IF;
+			RETURN NEW;
+		END;
+		$fn$ LANGUAGE plpgsql;
+	`, name, quoteSQLLiteral(projectID)))
+	require.NoError(t, err, "creating the rewrite-failure trigger function")
+	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION %s()`, name, name))
+	require.NoError(t, err, "creating the rewrite-failure trigger")
+	dropped := false
+	drop := func() {
+		if dropped {
+			return
+		}
+		dropped = true
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON issues`, name))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, name))
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// TestProcessorService_NextRewriteFailureIsCountedAndNeverFailsTheEvent is flow I17 and the
+// registration proof for sentinel_release_next_rewrite_failures_total (§12): when the post-commit
+// rewrite's UPDATE fails, the event is STORED and ACKed, the release row exists, the `next` issue keeps
+// `next` (for the hourly catch-up), and the UNLABELLED counter moves by exactly one — read through the
+// same ManualReader the other §12 counters are, so it does not rely on obs.Bootstrap having run.
+// Remove procmetrics.RecordReleaseNextRewriteFailure from rewriteNextIssues and this goes red.
+func TestProcessorService_NextRewriteFailureIsCountedAndNeverFailsTheEvent(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+	reader := eidManualReader()
+
+	projectName := uniqueProjectName("rel-fail")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("rel-fail"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fpX, fpY := "fp-x-"+uuid.New().String(), "fp-y-"+uuid.New().String()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpX, "v1.0.0", time.Now().UTC().Add(-2*time.Hour)))
+	xID := issueIDByFingerprint(t, ctx, pool, projectID, fpX)
+	_, err := pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = $2,
+		        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`,
+		xID, time.Now().UTC().Add(-1*time.Hour))
+	require.NoError(t, err)
+
+	restore := breakNextRewrite(t, ctx, pool, projectID)
+	before := collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures)
+
+	ev := releaseProtoEvent(projectName, fpY, "v1.1.0", time.Now().UTC())
+	processOK(t, ctx, svc, ev) // nil: the event is ACKed regardless of the rewrite
+
+	// Stored: the occurrence and the release row are both there (the rewrite is outside the ingest tx).
+	var occ int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM error_occurrences WHERE event_id = $1`, ev.EventId).Scan(&occ))
+	assert.Equal(t, 1, occ, "I17: the event is stored even though the rewrite failed")
+	assert.True(t, releaseRowOf(t, ctx, pool, projectID, "v1.1.0").found, "the release row committed before the rewrite ran")
+
+	// Untouched: X keeps `next` for the hourly catch-up.
+	_, riv := resolvedInVersionOf(t, ctx, pool, xID)
+	assert.Equal(t, "next", riv, "a failed rewrite leaves `next` in place — the catch-up's input")
+
+	// Counted, once, under the contract's name, with no label.
+	assert.Equal(t, before+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures),
+		"%s must increment exactly once per failed rewrite", obs.MetricReleaseNextRewriteFailures)
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != obs.MetricReleaseNextRewriteFailures {
+				continue
+			}
+			found = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				assert.Equal(t, 0, dp.Attributes.Len(), "decision 30: no label — the dashboard's same-named counter sums with this one by name")
+			}
+		}
+	}
+	assert.True(t, found, "%s must be registered under exactly that name", obs.MetricReleaseNextRewriteFailures)
+	assert.Equal(t, "sentinel_release_next_rewrite_failures_total", obs.MetricReleaseNextRewriteFailures)
+
+	// A second first sighting after the trigger is gone rewrites normally — the failure was not sticky.
+	restore()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.2.0", time.Now().UTC()))
+	_, riv = resolvedInVersionOf(t, ctx, pool, xID)
+	assert.Equal(t, "v1.2.0", riv, "with the trigger gone the next first sighting rewrites X")
+	assert.Equal(t, before+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures),
+		"a successful rewrite must not move the failure counter")
 }

@@ -369,3 +369,14 @@ func TestObsEnvironmentMetricNames(t *testing.T) {
 	// alert configs right now, and it must be able to go down.
 	assert.Equal(t, "sentinel_alert_configs_environment_scoped", obs.MetricAlertConfigsEnvironmentScoped)
 }
+
+// TestObsReleaseNextRewriteMetricName pins the exact spelling of sentinel-releases-snooze §12's one
+// metric name, for the same reason TestObsEnvironmentMetricNames does — and with a sharper edge: the
+// dashboard registers a counter of the SAME NAME in apps/dashboard-web/src/lib/server/metrics.ts
+// (`sentinel_release_next_rewrite_failures_total`, no label) so the processor's fan-out failures and
+// the retention sweep's catch-up failures sum by name at the scrape (decision 30). Two registries in
+// two languages cannot share a constant; the literal here and the literal there must agree, and
+// renaming either side without the other silently splits one signal into two.
+func TestObsReleaseNextRewriteMetricName(t *testing.T) {
+	assert.Equal(t, "sentinel_release_next_rewrite_failures_total", obs.MetricReleaseNextRewriteFailures)
+}
