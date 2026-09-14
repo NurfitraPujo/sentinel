@@ -1,4 +1,4 @@
-module github.com/NurfitraPujo/sentinel/packages/sdk-go
+module github.com/tuju-ai/sentinel/packages/sdk-go
 
 go 1.21
 

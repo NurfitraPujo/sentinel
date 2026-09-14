@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
 	"github.com/rs/zerolog"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 func TestZerologHook(t *testing.T) {

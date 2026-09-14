@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
-	"github.com/NurfitraPujo/sentinel/packages/sdk-go/sentinelslog"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
+	"github.com/tuju-ai/sentinel/packages/sdk-go/sentinelslog"
 )
 
 func TestGoSDKEndToEndPipeline(t *testing.T) {

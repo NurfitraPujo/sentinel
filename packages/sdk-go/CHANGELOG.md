@@ -2,6 +2,27 @@
 
 All notable changes to `packages/sdk-go` are documented here.
 
+## v0.3.0 — Module path
+
+### Changed
+
+- **The module path is now `github.com/tuju-ai/sentinel/packages/sdk-go`** — the same
+  `sentinel/packages/sdk-go` path under the `tuju-ai` organisation instead of the `NurfitraPujo`
+  account every release up to `v0.2.2` was published from. The old path named a repository a
+  consumer's `GOPRIVATE=github.com/tuju-ai/*` credentials cannot reach, so no consumer outside this
+  repo could ever `go get` the SDK. Nothing but the path changes: the code delta since `v0.2.2` is
+  this entry, the `README.md` paths and a comment on `Event.Fingerprint` (already on `main` before
+  the rename); there is **no behaviour change**. Consumers upgrade by changing the import path and
+  pulling the new tag:
+
+  ```bash
+  go get github.com/tuju-ai/sentinel/packages/sdk-go@packages/sdk-go/v0.3.0
+  ```
+
+  The old path stops existing at `main`; tags `v0.1.0`…`v0.2.2` remain fetchable under it for
+  anyone who pinned them. The SDK is major-zero, so a path change on a minor bump follows the same
+  convention `v0.2.0` set for the wire-format change.
+
 ## v0.2.2 — Custom fingerprints
 
 ### Added

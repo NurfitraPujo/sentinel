@@ -6,7 +6,6 @@ require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1
 	buf.build/go/protovalidate v1.2.0
 	github.com/NurfitraPujo/sentinel/packages/db-migrations v0.0.0-20260723071735-63e4b00a5f52
-	github.com/NurfitraPujo/sentinel/packages/sdk-go v0.1.0
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/uuid v1.6.0

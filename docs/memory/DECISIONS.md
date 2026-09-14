@@ -675,6 +675,17 @@ it twice against a live server.
 **Gate**: U33 (`tests/e2e/dlq_test.go`) asserts both streams are bounded and that each discard policy
 matches its role.
 
+**Amendment 2026-09-14 (prd `core-sentinel-integration`, decision 24)**: `ERROR_EVENTS` is now **24h /
+10GiB**, still `DiscardNew`. The 72h / 4GiB numbers were derived from ~290-byte events; core's events carry
+request metadata and measure ~5 KiB (contract §4.7), and the stream lives on the shared-cluster JetStream
+file store (50Gi per server — infra `k8s/hcs/argocd/cluster/nats/helm-values.{staging,production}.yaml`).
+20 events/s (decision 24's per-process cap, held open for the whole window) × 5 KiB × 24h = 8.24 GiB ≤
+10GiB, ~22% of the store with the DLQ and control-plane streams counted; 72h at that rate would have been
+half of it. Both limits are now env-overridable (`ERROR_EVENTS_MAX_AGE` / `ERROR_EVENTS_MAX_BYTES`, set from
+the chart's `init.nats.errorEvents`) so a re-size is a values change, not an image rebuild. The full
+derivation is the comment block in `scripts/nats-init.sh`; U33 is unaffected because it asserts the
+property, not the tuning. Nothing else in this decision changes.
+
 ## D14 | Dead Letters Carry a Machine-Readable Class; Permanent Failures Are Never Auto-Replayed
 
 **Date**: 2026-07-30 · **Status**: active

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	sentinel "github.com/NurfitraPujo/sentinel/packages/sdk-go"
+	sentinel "github.com/tuju-ai/sentinel/packages/sdk-go"
 )
 
 func TestSlogHandler(t *testing.T) {
