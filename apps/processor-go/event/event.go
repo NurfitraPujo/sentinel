@@ -89,6 +89,12 @@ type StackFrame struct {
 	Line     int32  `json:"line"`
 	Function string `json:"function"`
 	InApp    bool   `json:"in_app"`
+	// sentinel-sourcemaps §4.3: copied from the proto's field 5, 1-based as browsers print it;
+	// 0 is "unknown" (every pre-feature message, every Go frame) and makes symbolication pass
+	// the frame through (`no_column`, §4.4 step 2). omitempty so that a pre-feature frame and a
+	// no-column frame serialise identically into error_occurrences.stacktrace -- the JSONB the
+	// dashboard reads carries "column" only when there is one.
+	Column int32 `json:"column,omitempty"`
 }
 
 func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker.Masker) {
@@ -235,6 +241,7 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 			Line:     frame.Line,
 			Function: frame.Function,
 			InApp:    frame.InApp,
+			Column:   frame.Column,
 		})
 	}
 

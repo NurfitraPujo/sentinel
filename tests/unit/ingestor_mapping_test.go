@@ -27,6 +27,8 @@ func fullPayload() *validation.ErrorPayload {
 		Stacktrace: []validation.StackFrame{
 			{File: "main.go", Line: 10, Function: "main", InApp: true},
 			{File: "utils.go", Line: 20, Function: "process", InApp: false},
+			// sentinel-sourcemaps §4.3: a browser frame with a 1-based column.
+			{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "onClick", InApp: true},
 		},
 		Metadata: map[string]interface{}{
 			"user_id": "u-42",
@@ -64,6 +66,7 @@ func TestMapPayloadToEvent_AllFieldsPopulated(t *testing.T) {
 		assert.Equal(t, payload.Stacktrace[i].Line, frame.Line)
 		assert.Equal(t, payload.Stacktrace[i].Function, frame.Function)
 		assert.Equal(t, payload.Stacktrace[i].InApp, frame.InApp)
+		assert.Equal(t, payload.Stacktrace[i].Column, frame.Column, "Column maps to Column (sentinel-sourcemaps §4.3 - the B5 seam)")
 	}
 
 	require.NotNil(t, got.Metadata)

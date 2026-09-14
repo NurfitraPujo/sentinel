@@ -30,7 +30,7 @@ Every Sentinel SDK MUST accept a configuration object or builder pattern with th
 | `project_key` | `string` | Conditional | — | Target project's **unique name** (`projects.name`) — an identifier, NOT a secret. Optional for a project-scoped key (the credential already fixes the project; a mismatch is rejected with 403). **Required** for an organization-wide key, unless supplied as the `X-Project-Key` header, which takes precedence. |
 | `endpoint` | `string` | **Yes** | — | Ingestor URL (e.g., `https://sentinel.internal/ingest`). |
 | `environment` | `string` | **Yes** | `"production"` | Lowercase alphanumeric environment tag (`production`, `staging`, `development`). |
-| `release_version` | `string` | No | `""` | Application version tag (`v1.2.0`) used for automated regression detection. |
+| `release_version` | `string` | No | `""` | Application version tag (`v1.2.0`) used for automated regression detection. Symbolication of browser stack traces requires it **and** `stacktrace[].column`: the processor looks a frame's source map up by the exact `release_version` the event carries (byte for byte the string CI uploaded the maps under — no trimming, no `v` stripping) and resolves it at `line:column`; an event without either is stored with its raw frames. |
 | `platform` | `string` | **Yes** | — | Lowercase platform identifier (`golang`, `javascript`, `python`, `rust`, `java`). |
 | `sample_rate` | `float` | No | `1.0` | Event sampling ratio (`0.0` to `1.0`). |
 | `max_buffer_size` | `int` | No | `100` | Maximum number of events buffered during network outages. |
@@ -60,6 +60,13 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
       "line": 42,
       "function": "GetUserProfile",
       "in_app": true
+    },
+    {
+      "file": "https://app.example.com/assets/index-3f2a1c.js",
+      "line": 1,
+      "column": 1234,
+      "function": "onClick",
+      "in_app": true
     }
   ],
   "metadata": {
@@ -77,6 +84,7 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
 - **`environment`**: Matches `^[a-z0-9]+$` (lowercase alphanumeric).
 - **`message`**: Truncated to maximum 10,000 characters.
 - **`stacktrace`**: Maximum 100 frames. File paths truncated to 512 characters.
+- **`stacktrace[].column`**: Optional integer, **1-based as browsers print it** (V8, SpiderMonkey and JavaScriptCore stack strings are `file:line:column`, 1-based — pass the number through unchanged). Omit it, or send `0`, when the platform has no column (Go, Python, Java frames); `0` means "unknown" and the frame is stored as-is. A negative value is rejected with `400` and `field: stacktrace[i].column`.
 - **`metadata`**: Maximum 64 KB total serialized size.
 
 ---

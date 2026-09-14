@@ -153,4 +153,13 @@ message StackFrame {
   int32 line = 2;
   string function = 3;
   bool in_app = 4;
+  // sentinel-sourcemaps §4.3: the column of the frame, 1-based as browsers print it (V8,
+  // SpiderMonkey and JavaScriptCore stack strings are `file:line:column`, 1-based; an SDK passes
+  // it through). 0 is "unknown" -- proto3's default, what every pre-feature producer sends and
+  // what a Go frame carries -- and a 0 makes the processor pass the frame through unsymbolicated
+  // (`no_column`, §4.4 step 2). Additive: no `required`, no CEL rule (the ingestor's
+  // ValidatePayload rejects a negative column with a 400 before the proto is built, so the
+  // descriptor never sees one); an old processor ignores field 5 and a new one reads 0 from an
+  // old message (§8).
+  int32 column = 5;
 }
