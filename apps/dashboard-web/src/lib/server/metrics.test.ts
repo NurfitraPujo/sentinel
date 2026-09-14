@@ -9,6 +9,7 @@ import {
 	recordEscalation,
 	recordEscalationExhausted,
 	recordOncallScheduleUnresolved,
+	recordReleaseNextRewriteFailure,
 } from './metrics';
 
 /**
@@ -187,5 +188,43 @@ describe('§12 escalation metrics', () => {
 		// by that is not tenant-identifying.
 		expect(body).not.toMatch(/sentinel_report_escalations_exhausted_total\{/);
 		expect(body).not.toMatch(/sentinel_oncall_schedule_unresolved_total\{/);
+	});
+});
+
+/**
+ * sentinel-releases-snooze §4.3 "Hourly" / §12 (decision 30): the dashboard's half of
+ * `sentinel_release_next_rewrite_failures_total`. Three properties, and the third is the one that
+ * matters: the NAME is the processor's (`obs.MetricReleaseNextRewriteFailures`, pinned by
+ * tests/unit's TestObsReleaseNextRewriteMetricName), the series exists at zero from process start
+ * so a `> 0` alert evaluates, and there is NO label -- the two processes' series are summed by name
+ * at the scrape, and a label on this side would make them two metrics.
+ */
+describe('§12 sentinel_release_next_rewrite_failures_total (sentinel-releases-snooze)', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('is registered under the processor\'s exact name and initialised to zero', async () => {
+		const { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_release_next_rewrite_failures_total counter');
+		expect(parse(body).get('sentinel_release_next_rewrite_failures_total')).toBe(0);
+	});
+
+	it('increments by one per recorded failure', async () => {
+		recordReleaseNextRewriteFailure();
+		recordReleaseNextRewriteFailure();
+		expect(parse((await renderMetrics()).body).get('sentinel_release_next_rewrite_failures_total')).toBe(2);
+	});
+
+	it('carries NO label, so it sums by name with the processor\'s counter at the scrape', async () => {
+		recordReleaseNextRewriteFailure();
+		const { body } = await renderMetrics();
+		const series = body.split('\n').filter((l) => l.startsWith('sentinel_release_next_rewrite_failures_total'));
+		expect(series).toHaveLength(1);
+		expect(series[0]).toMatch(/^sentinel_release_next_rewrite_failures_total 1$/);
+	});
+
+	it('never throws', () => {
+		expect(() => recordReleaseNextRewriteFailure()).not.toThrow();
 	});
 });
