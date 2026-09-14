@@ -575,6 +575,90 @@ describe('/issues/{id} the Ignore dialog (contract §4.1, flows D7–D9, decisio
 	});
 });
 
+// Same-route navigation: `IssueRelations` links to `/issues/{id}` and SvelteKit serves that by
+// reusing this component with new `data` — which `rerender` reproduces exactly (`$props()`
+// updated in place, no remount). A dialog and its draft belong to the issue they were opened on.
+describe('/issues/{id} a dialog open when data.issue.id changes (same-route navigation)', () => {
+	function otherIssue(): DetailPageData {
+		// B is in another project, whose picker never offered A's versions.
+		return pageData({
+			issue: issue({ id: 'issue-2', projectId: 'proj-2', message: 'other' }),
+			project: { id: 'proj-2', name: 'Billing' },
+			releases: [{ version: 'b9.9.9', firstSeen: new Date('2026-09-10T08:00:00Z') }],
+		});
+	}
+
+	it('closes the Resolve dialog, and the reopened one on B sends B\'s default — never A\'s picked version', async () => {
+		const fetchMock = stubFetch(async () => okResponse());
+		const { rerender } = render(DetailPage, { data: pageData() });
+		const dialog = await openResolveDialog();
+		await fireEvent.change(screen.getByLabelText('Release'), { target: { value: 'v1.2.4' } });
+		await fireEvent.click(dialog.querySelector('input[type="radio"][value="release"]') as HTMLInputElement);
+
+		await rerender({ data: otherIssue() });
+
+		expect(screen.queryByTestId('resolve-dialog')).toBeNull();
+		expect(fetchMock).not.toHaveBeenCalled();
+		// A fresh open on B: the default choice, B's own picker, nothing typed.
+		const reopened = await openResolveDialog();
+		expect((reopened.querySelector('input[type="radio"][value="next"]') as HTMLInputElement).checked).toBe(true);
+		expect((screen.getByLabelText('Release') as HTMLSelectElement).value).toBe('b9.9.9');
+		await fireEvent.click(submitButtonOf(reopened));
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('/api/issues/issue-2/status');
+		expect(JSON.parse(String(init.body))).toEqual({ status: 'resolved', resolvedInVersion: 'next' });
+	});
+
+	it('closes the Ignore dialog and discards its draft', async () => {
+		const fetchMock = stubFetch(async () => okResponse());
+		const { rerender } = render(DetailPage, { data: pageData() });
+		await openIgnoreDialog();
+		await fireEvent.input(screen.getByLabelText('Ignore until'), { target: { value: '2026-09-20T16:00' } });
+		await fireEvent.input(screen.getByLabelText('Ignore for N more occurrences'), { target: { value: '250' } });
+
+		await rerender({ data: otherIssue() });
+
+		expect(screen.queryByTestId('ignore-dialog')).toBeNull();
+		expect(fetchMock).not.toHaveBeenCalled();
+		const reopened = await openIgnoreDialog();
+		expect((screen.getByLabelText('Ignore until') as HTMLInputElement).value).toBe('');
+		expect((screen.getByLabelText('Ignore for N more occurrences') as HTMLInputElement).value).toBe('');
+		await fireEvent.click(submitButtonOf(reopened));
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('/api/issues/issue-2/status');
+		expect(JSON.parse(String(init.body))).toEqual({ status: 'ignored' });
+	});
+
+	it('discards a failure that lands after the navigation and does not reload B for A\'s 2xx', async () => {
+		let settle: (r: Response) => void = () => {};
+		const fetchMock = stubFetch(() => new Promise<Response>((resolve) => { settle = resolve; }));
+		const { rerender } = render(DetailPage, { data: pageData() });
+		const dialog = await openResolveDialog();
+		await fireEvent.click(submitButtonOf(dialog));
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		await rerender({ data: otherIssue() });
+		settle(okResponse());
+		await new Promise((r) => setTimeout(r, 0));
+
+		expect(reloadSpy).not.toHaveBeenCalled();
+		expect(screen.queryByTestId('dialog-error')).toBeNull();
+		expect(screen.queryByTestId('status-error')).toBeNull();
+		// And B's dialog is usable: the in-flight flag was released, its submit is not stuck disabled.
+		const reopened = await openResolveDialog();
+		expect(submitButtonOf(reopened).disabled).toBe(false);
+	});
+
+	it('keeps a dialog open across a data update that is the SAME issue (a refreshed row)', async () => {
+		const { rerender } = render(DetailPage, { data: pageData() });
+		await openResolveDialog();
+		await rerender({ data: pageData({ issue: issue({ count: 599 }) }) });
+		expect(screen.queryByTestId('resolve-dialog')).not.toBeNull();
+	});
+});
+
 describe('/issues/{id} Reopen (contract §4.1, flow D10)', () => {
 	it('sends { status: unresolved } and reloads on a 2xx', async () => {
 		const fetchMock = stubFetch(async () => okResponse());

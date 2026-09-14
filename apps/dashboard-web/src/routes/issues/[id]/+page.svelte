@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
+	import { untrack } from 'svelte';
 
 	let { data } = $props();
 
@@ -162,17 +163,25 @@
 	}
 
 	async function submitStatus(body: StatusBody): Promise<void> {
+		// Pinned at submit time: the issue this write is FOR. Same-route navigation reuses this
+		// component (see the reset effect below), so by the time the response lands `data.issue.id`
+		// may already be another issue's — its outcome is then not this page's to render or reload.
+		const issueId = data.issue.id;
 		submitting = true;
 		submitError = null;
 		let response: Response;
 		try {
-			response = await fetch(`/api/issues/${data.issue.id}/status`, {
+			response = await fetch(`/api/issues/${issueId}/status`, {
 				method: 'PATCH',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(body),
 			});
 		} catch {
-			submitError = 'Network error';
+			if (data.issue.id === issueId) submitError = 'Network error';
+			submitting = false;
+			return;
+		}
+		if (data.issue.id !== issueId) {
 			submitting = false;
 			return;
 		}
@@ -204,13 +213,17 @@
 	// `bind:value` on a `type="number"` input is a number, and `null` while the input is blank.
 	let ignoreOccurrences = $state<number | null>(null);
 
-	function showDialog(which: 'resolve' | 'ignore') {
+	function resetDrafts() {
 		submitError = null;
 		resolveChoice = 'next';
 		resolveRelease = pickerReleases[0]?.version ?? '';
 		resolveTyped = '';
 		ignoreUntil = '';
 		ignoreOccurrences = null;
+	}
+
+	function showDialog(which: 'resolve' | 'ignore') {
+		resetDrafts();
 		openDialog = which;
 	}
 
@@ -218,6 +231,28 @@
 		openDialog = null;
 		submitError = null;
 	}
+
+	// The dialogs are non-modal (`<dialog open>`, no `showModal()`), and `IssueRelations` renders
+	// same-route `<a href="/issues/{id}">` links that SvelteKit serves by REUSING this component
+	// with new `data` — so a draft opened on issue A would otherwise survive the click on a related
+	// issue behind it, sit open on B, and its confirm would PATCH B with A's picked version (B may
+	// be in another project, whose picker never offered it). Every dialog and draft belongs to ONE
+	// issue: when `data.issue.id` changes, close what is open and discard the draft. `data` is
+	// replaced wholesale on every navigation, including one that lands on the SAME issue with a
+	// refreshed row, so the id is compared against the one last shown, not merely tracked; the
+	// resets are untracked so this never re-runs on the state it writes. The initial capture is
+	// deliberately a snapshot (`untrack`), not a reactive reference: it is the "last shown" memo.
+	let shownIssueId = untrack(() => data.issue.id);
+	$effect(() => {
+		const issueId = data.issue.id;
+		if (issueId === shownIssueId) return;
+		shownIssueId = issueId;
+		untrack(() => {
+			openDialog = null;
+			submitting = false;
+			resetDrafts();
+		});
+	});
 
 	// §4.1's table, exactly: `next`, a picked version, a typed version — and an EMPTY typed value
 	// sends no `resolvedInVersion` at all (today's write; the dialog says it regresses on the next
