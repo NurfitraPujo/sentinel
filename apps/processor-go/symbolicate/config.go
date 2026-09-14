@@ -135,3 +135,68 @@ func parseDuration(lookup func(string) (string, bool), key string, def time.Dura
 	}
 	return d, nil
 }
+
+// The processor's object-storage variables (contract §12): the same four the dashboard's
+// storage.ts reads, reaching the processor through the chart's ConfigMap (`S3_ENDPOINT`,
+// `S3_BUCKET`) and the two `secretKeyRef`s templates/processor.yaml carries since TASK-01.
+const (
+	EnvS3Endpoint  = "S3_ENDPOINT"
+	EnvS3Bucket    = "S3_BUCKET"
+	EnvS3AccessKey = "S3_ACCESS_KEY"
+	EnvS3SecretKey = "S3_SECRET_KEY"
+)
+
+// S3ConfigFromEnv reads the four variables through lookup, whitespace-trimmed. An unset and a
+// set-but-empty variable are the same thing here: "absent", which is what StartupCheck judges.
+func S3ConfigFromEnv(lookup func(string) (string, bool)) S3Config {
+	get := func(key string) string {
+		v, _ := lookup(key)
+		return strings.TrimSpace(v)
+	}
+	return S3Config{
+		Endpoint:  get(EnvS3Endpoint),
+		Bucket:    get(EnvS3Bucket),
+		AccessKey: get(EnvS3AccessKey),
+		SecretKey: get(EnvS3SecretKey),
+	}
+}
+
+// StartupCheck is decision 32 (contract §8, §12, flow S8b): when the stage is on (cfg.Enabled(),
+// i.e. SYMBOLICATE_PLATFORMS non-empty -- unset counts, it is the default set) and S3_ACCESS_KEY
+// or S3_SECRET_KEY is absent, the processor must NOT start -- main.go log.Fatalf's the returned
+// error before Subscribe, exactly as the NATS-subscriber construction failure does, so the pod
+// CrashLoopBackOffs and never consumes an event instead of passing every frame through as
+// `fetch_error` on a rollout that forgot the secret refs. The message names both variables (the
+// last log line is what `kubectl logs` and the RUNBOOK read). A config check at startup, never a
+// per-event fatal: storage unreachable at runtime WITH credentials stays `fetch_error` (D7).
+//
+// With the stage off (SYMBOLICATE_PLATFORMS set and empty) nothing is required: the processor
+// starts without S3 and neither symbolicates nor normalises.
+func StartupCheck(cfg Config, s3 S3Config) error {
+	if !cfg.Enabled() {
+		return nil
+	}
+	if s3.AccessKey == "" || s3.SecretKey == "" {
+		return fmt.Errorf("symbolication is on (%s=%q) but %s and/or %s are absent: set both, or set %s to the empty string to turn the stage off (decision 32)",
+			EnvPlatforms, strings.Join(cfg.Platforms, ","), EnvS3AccessKey, EnvS3SecretKey, EnvPlatforms)
+	}
+	return nil
+}
+
+// AckWriteAllowance is the "plus the write time" term of contract §12's AckWait rule: the budget
+// for a whole batch's StoreEvent transactions and their post-commit work (audit rows, the `next`
+// rewrite, alert dispatch, indexing) after every event in it has spent its symbolication
+// deadline. Thirty seconds is the server's own default AckWait -- the budget one batch had for
+// EVERYTHING before this feature -- kept whole as the write term rather than shaved, so the new
+// value is never below what a batch used to be allowed.
+const AckWriteAllowance = 30 * time.Second
+
+// AckWait is §12's rule as arithmetic (decision 37): batchSize × deadline + AckWriteAllowance.
+// At the defaults (10 × 5s + 30s) that is 80s -- "at least BatchSize × SYMBOLICATE_DEADLINE plus
+// the write time -- more than 50s at the defaults". main.go sets nats.SubscriberConfig.AckWait
+// from it (zero there meant the server's 30s, under which a batch of ten cold maps would be
+// redelivered while still in flight -- Known limit 6's trigger), and because it follows the
+// deadline the operator set, raising SYMBOLICATE_DEADLINE never silently leaves AckWait behind.
+func AckWait(batchSize int, deadline time.Duration) time.Duration {
+	return time.Duration(batchSize)*deadline + AckWriteAllowance
+}
