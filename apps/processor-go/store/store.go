@@ -76,18 +76,30 @@ type CommandStore interface {
 	StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurrence, releaseVersion string) (outcome IssueOutcome, stored bool, err error)
 }
 
-// IssueOutcome reports what UpsertIssueWithOutcome actually did.
+// IssueOutcome is the class of the issue row's status AFTER the write (sentinel-releases-snooze
+// §4.3, decision 29). StoreEvent returns all five values; UpsertIssueWithOutcome (the pre-idempotency
+// path, no snooze arm) keeps its three-valued behaviour and never returns the two newest.
 type IssueOutcome int
 
 const (
-	// IssueOutcomeExisting means a non-resolved issue already existed for
-	// this fingerprint; this occurrence is just another duplicate.
+	// IssueOutcomeExisting means the DO UPDATE arm ran and the row's status after the write is
+	// 'unresolved' or 'resolved' — a non-regressing recurrence of an issue that already existed.
 	IssueOutcomeExisting IssueOutcome = iota
 	// IssueOutcomeNew means no issue existed for this fingerprint before
 	// this call.
 	IssueOutcomeNew
 	// IssueOutcomeRegressed means a previously resolved issue reappeared.
 	IssueOutcomeRegressed
+	// IssueOutcomeUnsnoozed means the snooze arm ran: the issue was 'ignored' with a condition
+	// (a date or an occurrence target) that this occurrence met, and the row is now 'unresolved'
+	// with the three snooze columns NULL (decision 17). The service dispatches it normally, through
+	// the threshold — neither bypassed nor withheld (decision 29).
+	IssueOutcomeUnsnoozed
+	// IssueOutcomeIgnored means the DO UPDATE arm ran and the row's status after the write is
+	// 'ignored' — a snooze still running, or a plain indefinite ignore. Read from RETURNING status on
+	// the upsert, never from the step-1 snapshot. It replaces IssueOutcomeExisting exactly for that
+	// case; the service skips dispatchAlert iff this value (decision 16).
+	IssueOutcomeIgnored
 )
 
 // issuesUpsertConflictPredicate scopes the issues ON CONFLICT (project_id, environment,
@@ -175,6 +187,16 @@ type ErrorOccurrence struct {
 	// back — a duplicate above all — never counts.
 	AffectedUserSkipReason   string
 	AffectedTenantSkipReason string
+	// ReleaseInserted is WRITTEN BACK by StoreEvent, never read by it — the same idiom as IssueID
+	// above. It is true exactly when this delivery committed and step 4c's `releases` upsert INSERTed
+	// the (project_id, ReleaseVersion) row (RETURNING xmax = 0): a first sighting of that version by
+	// the project, with first_seen = CreatedAt. It is the signal sentinel-releases-snooze §4.3's
+	// post-commit `next` rewrite runs on (decision 15) — surfaced here rather than as a fourth return
+	// value so the CommandStore signature and its ~40 call sites stay as they are. False on every
+	// other path: an empty ReleaseVersion, a duplicate (stored = false), an error, or the DO UPDATE
+	// arm (the version was seen before). Under concurrent first sightings ON CONFLICT arbitrates and
+	// exactly one delivery reads true (decision 4).
+	ReleaseInserted bool
 }
 
 // The §4.3 rollup statements, one pair per side table. RETURNING (xmax = 0) AS inserted is the same
@@ -217,6 +239,51 @@ const occurrenceBucketUpsertQuery = `
 		ON CONFLICT (issue_id, bucket_start) DO UPDATE
 		   SET count = issue_occurrence_buckets.count + 1
 	`
+
+// The sentinel-releases-snooze §4.3 statements. releaseFirstSeenQuery is step 0's read — a plain
+// SELECT, no FOR UPDATE / FOR SHARE: reading first_seen with a lock at the top of the transaction
+// would hold the project's hottest row for the whole transaction and invert the lock order every
+// other side-table write follows (decision 4). Two concurrent first sightings both reading "absent"
+// is harmless: the upsert's ON CONFLICT arbitrates and RETURNING inserted says who fans out.
+// releaseUpsertQuery is step 4c, verbatim: $3 = occ.CreatedAt (§3, decision 7 — the event's own
+// clock, exactly as issues.first_seen/last_seen are), so first_seen = last_seen on the INSERT arm;
+// GREATEST on last_seen mirrors issues.last_seen for out-of-order client timestamps.
+const (
+	releaseFirstSeenQuery = `SELECT first_seen FROM releases WHERE project_id = $1 AND version = $2`
+
+	releaseUpsertQuery = `
+		INSERT INTO releases (project_id, version, first_seen, last_seen, occurrence_count)
+		VALUES ($1, $2, $3, $3, 1)
+		ON CONFLICT (project_id, version) DO UPDATE SET
+		   last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen),
+		   occurrence_count = releases.occurrence_count + 1
+		RETURNING (xmax = 0) AS inserted
+	`
+)
+
+// releaseRow is one step-0 read of `releases`: the row's first_seen, or absent — no occurrence of
+// this project has carried the version before this transaction (a first sighting).
+type releaseRow struct {
+	present   bool
+	firstSeen time.Time
+}
+
+// readReleaseRow runs releaseFirstSeenQuery on tx and maps pgx.ErrNoRows to an absent row. Any
+// other error is the statement genuinely failing and is returned as such (the same 25P02 argument
+// UpsertIssueWithOutcome's SELECT makes: falling through would replace the real cause).
+func readReleaseRow(ctx context.Context, tx pgx.Tx, projectID, version string) (releaseRow, error) {
+	var row releaseRow
+	err := tx.QueryRow(ctx, releaseFirstSeenQuery, projectID, version).Scan(&row.firstSeen)
+	switch {
+	case err == nil:
+		row.present = true
+		return row, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return releaseRow{}, nil
+	default:
+		return releaseRow{}, fmt.Errorf("failed to read release project=%s version=%q: %w", projectID, version, err)
+	}
+}
 
 // rollupAffected runs one side table's pair of §4.3 statements inside tx: the upsert, then — only
 // when the upsert INSERTed — the count bump. Not savepointed (decision 8): unlike the registry touch,
@@ -274,6 +341,53 @@ func isRegressionVersion(releaseVersion, resolvedInVersion string) bool {
 	return true
 }
 
+// decideRegression is sentinel-releases-snooze §4.3's decision table, row for row, for an existing
+// issue whose status is 'resolved': does this occurrence — carrying releaseVersion (R) — regress an
+// issue resolved in resolvedInVersion (X)? It is pure: the two `releases` reads of step 0 are
+// passed in as rowR / rowX (absent = no occurrence of this project has carried that version before
+// this transaction), and resolvedAt is the row's resolved_at (nil = NULL). Releases are ordered by
+// when the project first saw them, never by parsing the version (decision 1); isRegressionVersion
+// survives only as the fallback for a version nobody ingested and for a first_seen tie (decision 3),
+// unchanged — equal → yes, empty → yes.
+//
+//	X            R / rows                              regression?
+//	'' / NULL    any                                   yes  (unchanged today)
+//	any          ''                                    yes  (unchanged today)
+//	next         resolved_at IS NULL                   yes  (decision 27: a pre-feature batch resolve has nothing to compare against)
+//	next         rowR absent                           yes  (decision 6: a release first seen now is newer than the resolution)
+//	next         rowR.first_seen > resolved_at         yes  (decision 6)
+//	next         rowR.first_seen <= resolved_at        no   (decisions 6, 32: R existed when the resolution was made, in whichever environment)
+//	a version    rowX absent                           isRegressionVersion(R, X)  (decision 3: typed, never ingested)
+//	a version    rowX present, rowR absent             yes  (decision 14: a first sighting is newest)
+//	a version    rowX present, R == X                  yes  (decision 13: the fix did not land)
+//	a version    rowR.first_seen > rowX.first_seen     yes  (decision 1)
+//	a version    rowR.first_seen < rowX.first_seen     no   (decision 1)
+//	a version    equal first_seen, R != X              isRegressionVersion(R, X)  (decision 3: the tie)
+func decideRegression(releaseVersion, resolvedInVersion string, resolvedAt *time.Time, rowR, rowX releaseRow) bool {
+	if resolvedInVersion == "" || releaseVersion == "" {
+		return true
+	}
+	if resolvedInVersion == "next" {
+		if resolvedAt == nil || !rowR.present {
+			return true
+		}
+		return rowR.firstSeen.After(*resolvedAt)
+	}
+	if !rowX.present {
+		return isRegressionVersion(releaseVersion, resolvedInVersion)
+	}
+	if !rowR.present || releaseVersion == resolvedInVersion {
+		return true
+	}
+	if rowR.firstSeen.After(rowX.firstSeen) {
+		return true
+	}
+	if rowR.firstSeen.Before(rowX.firstSeen) {
+		return false
+	}
+	return isRegressionVersion(releaseVersion, resolvedInVersion)
+}
+
 // UpsertIssue is a backward-compatible wrapper around UpsertIssueWithOutcome
 // that discards the outcome. Kept because tests/integration/processor_store_test.go
 // calls it directly with the single-error signature.
@@ -313,9 +427,14 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 	if err == nil {
 		issue.ID = existingID
 		if existingStatus == "resolved" {
-			if existingResolvedInVersion == "" || isRegressionVersion(releaseVersion, existingResolvedInVersion) {
-				isRegressed = true
-			}
+			// sentinel-releases-snooze §4.3: the same decision table StoreEvent uses, called with
+			// rowR and rowX both ABSENT and resolved_at NULL — this method performs none of step 0's
+			// reads on purpose. It is a test-only path (tests/integration/processor_store_test.go;
+			// the service package no longer calls it), so the shared function is still exercised
+			// without adding new SELECTs to a legacy path. Absent rows land an explicit version on
+			// the fallback row (isRegressionVersion, unchanged) and `next` on the first-sighting row
+			// (always a regression) — so this path can never return the two new outcomes.
+			isRegressed = decideRegression(releaseVersion, existingResolvedInVersion, nil, releaseRow{}, releaseRow{})
 		}
 	}
 
@@ -403,11 +522,27 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 // SERIALIZABLE, which classifyStoreError leaves retryable — a hot fingerprint would turn contention
 // into a NAK/retry storm. Never remove the explicit TxOptions on the theory that the default already
 // matches it):
-//  1. Read existing issue state; upsert/update exactly as UpsertIssueWithOutcome did, but with
-//     RETURNING id folded into BOTH arms so the separate GetIssueIDByFingerprint round trip disappears.
-//     BOTH arms check rows affected: a folded RETURNING id yielding pgx.ErrNoRows is a BUG (the
-//     DO UPDATE...WHERE predicate was narrowed, or the plain UPDATE hit a concurrently-deleted issue),
-//     never a duplicate signal — it is surfaced as an error, not stored=false.
+//  0. (sentinel-releases-snooze §4.3) Two plain reads of `releases` — no lock, no new lock order
+//     (decision 4): first_seen for the incoming version R (only when R <> ”), before step 1; and,
+//     only after step 1's SELECT finds status = 'resolved' with an explicit resolved-in version X
+//     (not ” and not 'next'), first_seen for X. Absent means a first sighting. Both are behind the
+//     compile-time constant writeRelease (decision 11, release_write.go / release_write_off.go);
+//     with it false decideRegression sees both absent and falls back to isRegressionVersion.
+//  1. Read existing issue state — the SELECT also returns resolved_at, the three snooze columns,
+//     count and the transaction's now(); then decide. A 'resolved' issue regresses per
+//     decideRegression's table (§4.3; decision 1: ordered by first_seen, never by parsing the
+//     version). An 'ignored' issue ENDS its snooze iff snoozed_until <= now() (the server's clock,
+//     §3, decision 7) or (count + 1) - snooze_count_at >= snooze_occurrence_target (this occurrence
+//     included) — the snooze arm: status → 'unresolved', the three columns NULL, count + 1, and one
+//     'status_changed' activity row by 'sentinel-snooze' whose new_value carries `reason`, the three
+//     PRE-null snooze values from the snapshot and the committed count from RETURNING (decisions 17,
+//     18, 40). Otherwise upsert/update exactly as UpsertIssueWithOutcome did, but with RETURNING id
+//     folded into ALL arms so the separate GetIssueIDByFingerprint round trip disappears; the
+//     fresh-insert arm stamps first_release_version = NULLIF(R, ”) and the DO UPDATE arm never
+//     touches it (the first release is the first release). ALL arms check rows affected: a folded
+//     RETURNING id yielding pgx.ErrNoRows is a BUG (the DO UPDATE...WHERE predicate was narrowed, or
+//     the plain UPDATE hit a concurrently-deleted issue), never a duplicate signal — it is surfaced
+//     as an error, not stored=false.
 //  2. Insert the occurrence with NULLIF($11,”) mapping ” (proto3's "absent", never a real key) to SQL
 //     NULL, and ON CONFLICT (issue_id, event_id) WHERE event_id IS NOT NULL DO NOTHING — the exact form
 //     that matches the D-b partial unique index. Dropping NULLIF silently destroys every pre-W0 event
@@ -432,13 +567,20 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     TimeZone). After step 4 and before the registry touch, so a deduplicated redelivery never
 //     reaches it; NOT savepointed (decision 1); behind the compile-time constant
 //     writeOccurrenceBucket (decision 20, bucket_write.go / bucket_write_off.go).
+//     4c. The release upsert (sentinel-releases-snooze §4.3): one QueryRow of INSERT INTO releases …
+//     ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(…), occurrence_count + 1
+//     RETURNING (xmax = 0) AS inserted, keyed on issue.ProjectID and R with occ.CreatedAt as the
+//     clock (§3, decision 7). Only when R <> ”. After step 4b and before the registry touch, so a
+//     deduplicated redelivery never reaches it (flow I10); NOT savepointed (decision 5); behind the
+//     compile-time constant writeRelease (decision 11). `inserted` is written back to
+//     occ.ReleaseInserted after commit — the post-commit `next` rewrite's signal (decision 15).
 //  5. The project_environments registry touch (sentinel-project-environments §4.8), savepointed.
 //     Then commit.
 //
 // Deadlock-freedom depends on this transaction acquiring its ONE contended lock (the issues row, via
 // ON CONFLICT DO UPDATE / the plain UPDATE) FIRST and holding it to commit — do not add audit
 // persistence, indexing, or any network I/O inside this transaction; move it after commit instead
-// (D-d). Three writes are the DELIBERATE exceptions to that sentence, and all three were added knowing it:
+// (D-d). Four writes are the DELIBERATE exceptions to that sentence, and all four were added knowing it:
 //
 //   - the registry touch of step 5 (sentinel-project-environments decision 9) — the first exception,
 //     best-effort behind a savepoint; see its own block comment below.
@@ -466,14 +608,28 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     issues in that step — so ingest (issues → bucket) versus sweep (bucket only) has no cycle.
 //     Cost, stated: every stored occurrence writes one more row version — its hour's bucket row —
 //     on top of the issues row version it already writes; sentinel-issue-trend §13 M2 reports it.
+//   - the release upsert of step 4c (sentinel-releases-snooze decision 5) — the FOURTH deliberate
+//     exception, a first-class fact like the second and third: a release count that can move
+//     without an occurrence behind it is the S18 defect again, on a new table. Written after
+//     commit, a NAK between the occurrence commit and the release write would either lose the count
+//     or, on retry, find the occurrence deduplicated and never count it. Inside, both land or
+//     neither does. The "one lock" property survives as it does for the others: the issues row lock
+//     is still taken FIRST (step 1) and held to commit; the releases row is taken AFTER every issues
+//     write and every side-table write of this transaction, like the project_environments row is,
+//     so ingest-vs-ingest has no cycle (X → (P,V) and Y → (P,V) serialise on (P,V) at the tail).
+//     Step 0's reads are plain SELECTs and take nothing (decision 4). Cost, stated: this is a HOT
+//     row — every occurrence of a project on its current release rewrites one releases row, the
+//     same cardinality as the project_environments row step 5 already rewrites; sentinel-releases-
+//     snooze §13 M1 reports it.
 //
-// The IssueOutcome return is BEST-EFFORT and currently consumed by nobody — every call site discards
-// it (verified at ship time). Its New/Existing distinction comes from a plain SELECT before the
-// upsert, so under a first-insert race two concurrent deliveries can both report IssueOutcomeNew;
-// the duplicate path always reports IssueOutcomeExisting regardless of what the original delivery
-// was. If you are about to build behavior on this value, either accept those semantics explicitly or
-// derive the distinction inside the upsert (e.g. xmax = 0 on the RETURNING row) first — do not assume
-// it is exact.
+// The IssueOutcome return is the class of the row's status AFTER the write (sentinel-releases-snooze
+// decision 29) and the service reads it: New from `inserted` (xmax = 0) on the upsert; Regressed
+// from the regression arm; Unsnoozed from the snooze arm; Ignored / Existing from RETURNING status
+// on the DO UPDATE arm — 'ignored' → Ignored (the service skips dispatchAlert, decision 16),
+// 'unresolved' or 'resolved' → Existing. NEVER from the step-1 snapshot, which is a plain SELECT
+// before the row lock and therefore best-effort: under a race it can be stale, while RETURNING
+// reads the row this transaction just wrote. The duplicate path (stored = false) always reports
+// IssueOutcomeExisting regardless of what the original delivery was.
 func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurrence, releaseVersion string) (IssueOutcome, bool, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -481,15 +637,46 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	}
 	defer tx.Rollback(ctx)
 
+	// R is the incoming release (sentinel-releases-snooze §4.3: `R = occ.ReleaseVersion`, which is
+	// the same wire value the service passes as releaseVersion — processor_service.go builds occ from
+	// evt.ReleaseVersion and passes evt.ReleaseVersion here). Compared byte-for-byte, never trimmed or
+	// normalised (§3). "" means no release: no step-0 read, NULL first_release_version, no step 4c.
+	R := releaseVersion
+
+	// --- 0. The release read for R (sentinel-releases-snooze §4.3, decisions 4 and 11) ---
+	//
+	// A plain SELECT before step 1 takes the issues row lock: no lock of its own, no new lock order.
+	// The second read (rowX) waits until step 1's SELECT says whether there is an explicit X to read.
+	var rowR, rowX releaseRow
+	if writeRelease && R != "" {
+		if rowR, err = readReleaseRow(ctx, tx, issue.ProjectID, R); err != nil {
+			return IssueOutcomeExisting, false, err
+		}
+	}
+
 	// --- 1. Issue upsert / regression bookkeeping (UpsertIssueWithOutcome's logic, folded) ---
+	//
+	// Widened (§4.3) to also return resolved_at (the `next` rows of decideRegression's table), the
+	// three snooze columns and count (the snooze arm's decision and its activity payload's PRE-null
+	// values), and now() — the transaction's server clock, so "snoozed_until <= now()" is judged on
+	// the clock §3 names (a skewed client must not end a snooze early; decision 7) without a second
+	// round trip. This SELECT takes no lock and is best-effort under a race — the outcome is never
+	// derived from it (decision 29); only the decision and the payload's snapshot values are.
 
 	var existingStatus, existingResolvedInVersion string
 	var existingID string
+	var existingResolvedAt, existingSnoozedUntil *time.Time
+	var existingSnoozeTarget, existingSnoozeCountAt *int64
+	var existingCount int64
+	var txNow time.Time
 
 	err = tx.QueryRow(ctx,
-		"SELECT id, status, COALESCE(resolved_in_version, '') FROM issues WHERE project_id = $1 AND environment = $2 AND fingerprint = $3",
+		`SELECT id, status, COALESCE(resolved_in_version, ''), resolved_at,
+		        snoozed_until, snooze_occurrence_target, snooze_count_at, count, now()
+		   FROM issues WHERE project_id = $1 AND environment = $2 AND fingerprint = $3`,
 		issue.ProjectID, issue.Environment, issue.Fingerprint,
-	).Scan(&existingID, &existingStatus, &existingResolvedInVersion)
+	).Scan(&existingID, &existingStatus, &existingResolvedInVersion, &existingResolvedAt,
+		&existingSnoozedUntil, &existingSnoozeTarget, &existingSnoozeCountAt, &existingCount, &txNow)
 
 	// Only "no such issue yet" is expected here; see UpsertIssueWithOutcome's identical comment for why
 	// falling through on any other error would replace the real cause with a generic 25P02 abort.
@@ -498,16 +685,44 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			issue.ProjectID, issue.Environment, issue.Fingerprint, err)
 	}
 
-	wasNewIssue := errors.Is(err, pgx.ErrNoRows)
+	// No wasNewIssue here any more: New is derived from the upsert's own RETURNING (xmax = 0) AS
+	// inserted, never from this pre-lock snapshot (decision 29; the doc comment's outcome rule).
 	isRegressed := false
+	// snoozeEnds / snoozeReason: the snooze arm's decision (§4.3, flows I8/I9/I14/I16). The date is
+	// checked first, so when both conditions hold on the same occurrence reason is
+	// 'snoozed_until_passed'. count + 1 is THIS occurrence included; snooze_count_at is non-NULL
+	// whenever the target is (check_snooze_pair), the nil check is belt and braces.
+	snoozeEnds := false
+	snoozeReason := ""
 	if err == nil {
 		issue.ID = existingID
-		if existingStatus == "resolved" {
-			if existingResolvedInVersion == "" || isRegressionVersion(releaseVersion, existingResolvedInVersion) {
-				isRegressed = true
+		switch existingStatus {
+		case "resolved":
+			// The second step-0 read: only for an explicit X that a `releases` row could exist for,
+			// and only when there is an R to compare it with (decideRegression answers "yes" for
+			// R == "" before it looks at either row, so the read would be wasted).
+			if writeRelease && R != "" && existingResolvedInVersion != "" && existingResolvedInVersion != "next" {
+				if rowX, err = readReleaseRow(ctx, tx, issue.ProjectID, existingResolvedInVersion); err != nil {
+					return IssueOutcomeExisting, false, err
+				}
+			}
+			// Beside UpsertIssueWithOutcome's call: the same pure table, this time fed step 0's rows.
+			isRegressed = decideRegression(R, existingResolvedInVersion, existingResolvedAt, rowR, rowX)
+		case "ignored":
+			switch {
+			case existingSnoozedUntil != nil && !existingSnoozedUntil.After(txNow):
+				snoozeEnds, snoozeReason = true, "snoozed_until_passed"
+			case existingSnoozeTarget != nil && existingSnoozeCountAt != nil &&
+				(existingCount+1)-*existingSnoozeCountAt >= *existingSnoozeTarget:
+				snoozeEnds, snoozeReason = true, "snooze_occurrences_reached"
 			}
 		}
 	}
+
+	// postWriteStatus is what the DO UPDATE arm's RETURNING status said — the outcome's source for
+	// Ignored vs Existing (decision 29). Empty on every other arm.
+	postWriteStatus := ""
+	wasFreshInsert := false
 
 	if isRegressed {
 		query := `
@@ -555,25 +770,95 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		if _, err := tx.Exec(ctx, activityQuery, issue.ID, activityMeta); err != nil {
 			return IssueOutcomeExisting, false, err
 		}
+	} else if snoozeEnds {
+		// The snooze arm (sentinel-releases-snooze §4.3, decisions 17, 18, 40): the condition a
+		// person parked this issue behind was met by this occurrence. status → 'unresolved', the
+		// three snooze columns NULL in the SAME statement (check_snooze_only_when_ignored would
+		// refuse anything else), count + 1, last_seen bumped — and NO regression column moves:
+		// nothing regressed, a person parked it (decision 17). RETURNING count is the committed
+		// value the activity row reports (600 in flow I9, not the snapshot's 599).
+		query := `
+			UPDATE issues SET
+				status = 'unresolved',
+				snoozed_until = NULL,
+				snooze_occurrence_target = NULL,
+				snooze_count_at = NULL,
+				last_seen = GREATEST(issues.last_seen, $1),
+				count = issues.count + 1
+			WHERE id = $2
+			RETURNING id, count
+		`
+		var updatedID string
+		var committedCount int64
+		if scanErr := tx.QueryRow(ctx, query, issue.LastSeen, issue.ID).Scan(&updatedID, &committedCount); scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				// F-TX-7, exactly as the regression arm handles it: the row this UPDATE targeted no
+				// longer exists (a concurrent retention DELETE won the race against the SELECT
+				// above). A bug condition, never a duplicate — surface it.
+				return IssueOutcomeExisting, false, fmt.Errorf(
+					"snooze-ending update matched no row for issue id=%s (concurrently deleted?): %w",
+					issue.ID, scanErr)
+			}
+			return IssueOutcomeExisting, false, scanErr
+		}
+		issue.ID = updatedID
+
+		// The payload's three snooze values are the ones the row held BEFORE this statement nulled
+		// them (the step-1 snapshot): null for the condition that was not set. snoozedUntil is
+		// UTC, `Z`, whole seconds (decision 40; §3 Timestamps) — never the offset form; readers
+		// parse it as an instant and never compare the strings.
+		var snoozedUntilJSON, snoozeTargetJSON, snoozeCountAtJSON interface{}
+		if existingSnoozedUntil != nil {
+			snoozedUntilJSON = existingSnoozedUntil.UTC().Format(time.RFC3339)
+		}
+		if existingSnoozeTarget != nil {
+			snoozeTargetJSON = *existingSnoozeTarget
+		}
+		if existingSnoozeCountAt != nil {
+			snoozeCountAtJSON = *existingSnoozeCountAt
+		}
+		newValue, _ := json.Marshal(map[string]interface{}{
+			"status":                 "unresolved",
+			"reason":                 snoozeReason,
+			"snoozedUntil":           snoozedUntilJSON,
+			"snoozeOccurrenceTarget": snoozeTargetJSON,
+			"snoozeCountAt":          snoozeCountAtJSON,
+			"count":                  committedCount,
+		})
+		oldValue, _ := json.Marshal(map[string]string{"status": "ignored"})
+
+		// 'status_changed', not a new event type (decision 18): the same row the dashboard writes
+		// when a person changes the status, with `reason` on the way out as it carries
+		// snoozedUntil / snoozeOccurrences on the way in. issue_activity's event_type CHECK is
+		// untouched by this feature's migration.
+		activityQuery := `
+			INSERT INTO issue_activity (id, issue_id, actor_type, actor_id, event_type, old_value, new_value, created_at)
+			VALUES (gen_random_uuid(), $1, 'system', 'sentinel-snooze', 'status_changed', $2, $3, NOW())
+		`
+		if _, err := tx.Exec(ctx, activityQuery, issue.ID, oldValue, newValue); err != nil {
+			return IssueOutcomeExisting, false, err
+		}
 	} else {
 		// N7a (A01/A06): RETURNING (xmax = 0) AS inserted gives an EXACT new-vs-existing signal
 		// from the upsert statement itself, unlike wasNewIssue above (a pre-upsert SELECT in the
-		// same tx — see the outcome-inexactness caveat in this method's doc comment, and
-		// store.go:309-315 for UpsertIssueWithOutcome's equivalent). xmax=0 means this row's
-		// current version was created by THIS command (a fresh INSERT), never by the DO UPDATE
-		// arm — so it cannot alias a concurrent-race duplicate the way wasNewIssue can.
+		// same tx — see the outcome caveat in this method's doc comment, and UpsertIssueWithOutcome's
+		// equivalent SELECT). xmax=0 means this row's current version was created by THIS command
+		// (a fresh INSERT), never by the DO UPDATE arm — so it cannot alias a concurrent-race
+		// duplicate the way wasNewIssue can. RETURNING status is the same idea for the two
+		// outcomes decision 29 adds: the status of the row THIS transaction just wrote, not the
+		// snapshot's. first_release_version = NULLIF($10, '') on the INSERT arm only — the DO UPDATE
+		// arm never touches it (sentinel-releases-snooze §4.3: the first release is the first release).
 		query := `
-			INSERT INTO issues (id, project_id, environment, fingerprint, message, error_class, status, first_seen, last_seen, count)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
+			INSERT INTO issues (id, project_id, environment, fingerprint, message, error_class, status, first_seen, last_seen, count, first_release_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, NULLIF($10, ''))
 			ON CONFLICT (project_id, environment, fingerprint)
 			DO UPDATE SET
 				last_seen = GREATEST(issues.last_seen, EXCLUDED.last_seen),
 				count = issues.count + 1
 			WHERE ` + issuesUpsertConflictPredicate + `
-			RETURNING id, (xmax = 0) AS inserted
+			RETURNING id, status, (xmax = 0) AS inserted
 		`
 		var returnedID string
-		var wasFreshInsert bool
 		if scanErr := tx.QueryRow(ctx, query,
 			issue.ID,
 			issue.ProjectID,
@@ -584,7 +869,8 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 			issue.Status,
 			issue.FirstSeen,
 			issue.LastSeen,
-		).Scan(&returnedID, &wasFreshInsert); scanErr != nil {
+			R,
+		).Scan(&returnedID, &postWriteStatus, &wasFreshInsert); scanErr != nil {
 			if errors.Is(scanErr, pgx.ErrNoRows) {
 				// F-TX-7: the folded RETURNING id yielded no row. The only way this happens is the
 				// DO UPDATE ... WHERE predicate being narrowed so it no longer matches — a bug in
@@ -711,6 +997,24 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		}
 	}
 
+	// --- 4c. Release upsert (sentinel-releases-snooze §4.3, decisions 4, 5, 7, 11) ---
+	//
+	// The fourth deliberate in-transaction exception named in this method's doc comment. Same
+	// position rules as 4 and 4b, for the same reasons: AFTER the duplicate rollback (flow I10 — a
+	// redelivered (issue_id, event_id) never bumps a release), BEFORE the registry touch, NOT
+	// savepointed (decision 5) — a genuine error here fails the event and NATS redelivers. Lock
+	// order: the releases row is taken after every issues write and every side-table write of this
+	// transaction, at the tail like the project_environments row, so ingest-vs-ingest serialises on
+	// (project, version) and has no cycle. Only when R <> '' (no phantom release named ""; the
+	// table's CHECK is the tripwire). Behind the compile-time constant so §13 M1's baseline build
+	// (-tags m1_norelease) is this exact path minus this statement and step 0 (decision 11).
+	releaseInserted := false
+	if writeRelease && R != "" {
+		if err := tx.QueryRow(ctx, releaseUpsertQuery, issue.ProjectID, R, occ.CreatedAt).Scan(&releaseInserted); err != nil {
+			return IssueOutcomeExisting, false, fmt.Errorf("release upsert failed for project=%s version=%q: %w", issue.ProjectID, R, err)
+		}
+	}
+
 	// --- 5. Registry touch (sentinel-project-environments §4.8, decisions 8 and 9) ---
 	//
 	// An UPDATE, never an INSERT. Under decision 8 a project_environments row exists because a
@@ -785,6 +1089,10 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		return IssueOutcomeExisting, false, err
 	}
 
+	// Written back only once the transaction is durable: a first sighting that did not commit is not
+	// a first sighting, and the post-commit rewrite must never run on one (decision 15).
+	occ.ReleaseInserted = releaseInserted
+
 	// Recorded after the commit: the metric counts occurrences that were STORED for an environment
 	// nobody declared, so an event that failed to commit must not appear on it.
 	if unregisteredEnvironment {
@@ -800,11 +1108,19 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		procmetrics.RecordAffectedRollupSkipped(ctx, obs.AffectedKindTenant, occ.AffectedTenantSkipReason)
 	}
 
+	// The outcome is the class of the post-write status (decision 29): each arm reports what it
+	// wrote; the DO UPDATE arm reports what RETURNING status said. The step-1 snapshot's "no row
+	// yet" is deliberately not consulted: under a first-insert race two deliveries can both read
+	// that, but only the one whose upsert INSERTed (xmax = 0) is New.
 	switch {
 	case isRegressed:
 		return IssueOutcomeRegressed, true, nil
-	case wasNewIssue:
+	case snoozeEnds:
+		return IssueOutcomeUnsnoozed, true, nil
+	case wasFreshInsert:
 		return IssueOutcomeNew, true, nil
+	case postWriteStatus == "ignored":
+		return IssueOutcomeIgnored, true, nil
 	default:
 		return IssueOutcomeExisting, true, nil
 	}
