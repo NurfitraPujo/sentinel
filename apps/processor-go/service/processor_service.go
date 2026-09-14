@@ -408,17 +408,33 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	return true, nil
 }
 
-// releaseNextRewriteQuery is sentinel-releases-snooze §4.3's "After commit" statement, verbatim:
-// $1 = project_id, $2 = the newly inserted release's version, $3 = its first_seen (occ.CreatedAt —
-// the value step 4c's INSERT arm wrote). The comparison is STRICT (`first_seen > resolved_at`), and a
-// row with resolved_at IS NULL never matches because `NULL < x` is not true — decision 27's rows are
-// left alone, exactly as the dashboard's hourly catch-up leaves them. Project-wide across
-// environments (decision 41). `idx_issues_project_resolved_next` (a partial index on project_id
-// WHERE resolved_in_version = 'next') makes this an index scan over exactly the waiting issues.
+// releaseNextRewriteQuery is sentinel-releases-snooze §4.3's "After commit" statement plus decision
+// 49's NOT EXISTS clause: $1 = project_id, $2 = the newly inserted release's version, $3 = its
+// first_seen (occ.CreatedAt — the value step 4c's INSERT arm wrote). The comparison is STRICT
+// (`first_seen > resolved_at`), and a row with resolved_at IS NULL never matches because `NULL < x` is
+// not true — decision 27's rows are left alone, exactly as the dashboard's hourly catch-up leaves
+// them. Project-wide across environments (decision 41). `idx_issues_project_resolved_next` (a
+// partial index on project_id WHERE resolved_in_version = 'next') makes this an index scan over
+// exactly the waiting issues.
+//
+// The NOT EXISTS (decision 49, `fanout-earliest-newer`) makes the fan-out write ONLY the earliest
+// release newer than the row's resolved_at: a `next` issue for which some OTHER release of the
+// project was already first seen strictly between its resolved_at and this release's first_seen is
+// skipped — that earlier release's own fan-out failed (the pod died, or decision 42's accepted 40P01)
+// and the row belongs to the hourly catch-up, which picks earliest-newer by construction. Without it
+// the following release would write a version LATER than the truth, and an occurrence of the issue
+// in the earlier release would then be judged rowR.first_seen < rowX.first_seen → not a regression
+// (decision 13) — the issue would stay resolved on a release that still throws it. §8's "the
+// following new release can never write a later version than the truth" is true only with this
+// clause. `r.first_seen < $3` is strict so the release being fanned out never excludes itself.
 const releaseNextRewriteQuery = `
 	UPDATE issues SET resolved_in_version = $2
 	WHERE project_id = $1 AND status = 'resolved' AND resolved_in_version = 'next'
 	  AND resolved_at < $3
+	  AND NOT EXISTS (
+	    SELECT 1 FROM releases r
+	    WHERE r.project_id = $1 AND r.first_seen > issues.resolved_at AND r.first_seen < $3
+	  )
 `
 
 // rewriteNextIssues runs the post-commit `next` rewrite for a release this delivery was the first to

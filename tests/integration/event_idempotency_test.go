@@ -2835,10 +2835,92 @@ func TestProcessorService_NextRewriteFailureIsCountedAndNeverFailsTheEvent(t *te
 	assert.Equal(t, "sentinel_release_next_rewrite_failures_total", obs.MetricReleaseNextRewriteFailures)
 
 	// A second first sighting after the trigger is gone rewrites normally — the failure was not sticky.
+	// It rewrites W, resolved `next` AFTER v1.1.0 was first seen; it does NOT rewrite X, because v1.1.0
+	// (first seen between X's resolved_at and v1.2.0's first_seen) is X's truth and the row belongs
+	// to the hourly catch-up (decision 49 — the earliest-newer rule the failed fan-out left behind).
 	restore()
-	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.2.0", time.Now().UTC()))
+	fpW := "fp-w-" + uuid.New().String()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpW, "v1.0.0", time.Now().UTC().Add(-2*time.Hour)))
+	wID := issueIDByFingerprint(t, ctx, pool, projectID, fpW)
+	_, err = pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = $2,
+		        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`,
+		wID, time.Now().UTC())
+	require.NoError(t, err)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "v1.2.0", time.Now().UTC().Add(time.Second)))
+	_, riv = resolvedInVersionOf(t, ctx, pool, wID)
+	assert.Equal(t, "v1.2.0", riv, "with the trigger gone the next first sighting rewrites W — the failure was not sticky")
 	_, riv = resolvedInVersionOf(t, ctx, pool, xID)
-	assert.Equal(t, "v1.2.0", riv, "with the trigger gone the next first sighting rewrites X")
+	assert.Equal(t, "next", riv, "decision 49: X's earliest newer release is v1.1.0, whose fan-out failed — v1.2.0 must not write a later version than the truth; the catch-up owns X")
 	assert.Equal(t, before+1, collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures),
 		"a successful rewrite must not move the failure counter")
+}
+
+// TestProcessorService_NextRewriteWritesOnlyTheEarliestNewerRelease is §11 (7)'s decision 49 case
+// (`fanout-earliest-newer`; §8's "the following new release can never write a later version than the
+// truth"): the post-commit rewrite writes only the EARLIEST release newer than a row's resolved_at.
+//
+// The failure it pins: I is resolved `next` at T; release A is first seen at T1 > T but its fan-out
+// fails (here: breakNextRewrite's 40P01, decision 42's accepted deadlock), so I still reads `next`;
+// before the hourly catch-up runs, release B is first seen at T2 > T1. B's fan-out must SKIP I —
+// the truth is A, and the catch-up (which picks earliest-newer) owns the row — while still
+// rewriting J, resolved `next` at T' with T1 < T' < T2, for which B IS the earliest newer release.
+// Skipping is not a failure: the failure counter does not move for B. Remove the NOT EXISTS clause
+// from releaseNextRewriteQuery and I reads 'B' here.
+func TestProcessorService_NextRewriteWritesOnlyTheEarliestNewerRelease(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+	reader := eidManualReader()
+
+	projectName := uniqueProjectName("rel-earliest")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("rel-earliest"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC()
+	tResolvedI := now.Add(-60 * time.Minute)  // T
+	tFirstSeenA := now.Add(-30 * time.Minute) // T1 > T
+	tResolvedJ := now.Add(-20 * time.Minute)  // T' with T1 < T' < T2
+	tFirstSeenB := now                        // T2 > T1
+
+	fpI, fpJ, fpY := "fp-i-"+uuid.New().String(), "fp-j-"+uuid.New().String(), "fp-y-"+uuid.New().String()
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpI, "v1.0.0", now.Add(-2*time.Hour)))
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpJ, "v1.0.0", now.Add(-2*time.Hour)))
+	iID := issueIDByFingerprint(t, ctx, pool, projectID, fpI)
+	jID := issueIDByFingerprint(t, ctx, pool, projectID, fpJ)
+
+	resolveNextAt := func(id string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx,
+			`UPDATE issues SET status = 'resolved', resolved_in_version = 'next', resolved_at = $2,
+			        resolved_by_type = 'user', resolved_by = 'integration-test' WHERE id = $1`, id, at)
+		require.NoError(t, err)
+	}
+	resolveNextAt(iID, tResolvedI)
+
+	// Release A's first sighting (an unrelated issue Y) with its fan-out broken: the release row is
+	// stored with first_seen = T1, I keeps `next`.
+	restore := breakNextRewrite(t, ctx, pool, projectID)
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "vA", tFirstSeenA))
+	restore()
+	require.True(t, releaseRowOf(t, ctx, pool, projectID, "vA").found, "precondition: A's release row committed")
+	_, riv := resolvedInVersionOf(t, ctx, pool, iID)
+	require.Equal(t, "next", riv, "precondition: A's fan-out failed and left I as `next`")
+
+	// J is resolved `next` after A was first seen, so for J the earliest newer release is B.
+	resolveNextAt(jID, tResolvedJ)
+	failuresBefore := collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures)
+
+	// Release B's first sighting: its fan-out rewrites J and skips I.
+	processOK(t, ctx, svc, releaseProtoEvent(projectName, fpY, "vB", tFirstSeenB))
+	require.True(t, releaseRowOf(t, ctx, pool, projectID, "vB").found, "precondition: B was a first sighting")
+
+	status, riv := resolvedInVersionOf(t, ctx, pool, iID)
+	assert.Equal(t, "resolved", status)
+	assert.Equal(t, "next", riv, "decision 49: A (first seen between I's resolved_at and B's first_seen) is the truth — B's fan-out must not write 'vB' onto I; the catch-up owns the row")
+	_, riv = resolvedInVersionOf(t, ctx, pool, jID)
+	assert.Equal(t, "vB", riv, "decision 49: B is the earliest release newer than J's resolved_at, so B's fan-out rewrites J")
+	assert.Equal(t, failuresBefore, collectUnlabelledCounter(t, ctx, reader, obs.MetricReleaseNextRewriteFailures),
+		"skipping I is not a failure — %s must not move", obs.MetricReleaseNextRewriteFailures)
 }
