@@ -88,18 +88,26 @@ describe('isForbiddenCrossSiteFormPost — what it must NOT reject', () => {
 	});
 });
 
-describe('isCsrfExemptPath — the §4.1/§4.5 intake endpoints, and nothing near them', () => {
-	it.each(['/api/report', '/api/report/attachments', '/api/report/', '/api/report/attachments/'])(
-		'exempts %s',
-		(path) => {
-			expect(isCsrfExemptPath(path)).toBe(true);
-		}
-	);
+describe('isCsrfExemptPath — the §4.1/§4.5 intake endpoints, the sourcemap upload, and nothing near them', () => {
+	it.each([
+		'/api/report',
+		'/api/report/attachments',
+		'/api/report/',
+		'/api/report/attachments/',
+		// sentinel-sourcemaps §2.1: the CI upload, same credential shape, same exemption.
+		'/api/sourcemaps',
+		'/api/sourcemaps/',
+	])('exempts %s', (path) => {
+		expect(isCsrfExemptPath(path)).toBe(true);
+	});
 
 	it.each([
 		'/api/reports',
 		'/api/report/attachments/abc',
 		'/api/reportx',
+		'/api/sourcemap',
+		'/api/sourcemaps/abc',
+		'/api/sourcemapsx',
 		'/api/uploads',
 		'/api/agent/uploads',
 		'/',
@@ -108,8 +116,10 @@ describe('isCsrfExemptPath — the §4.1/§4.5 intake endpoints, and nothing nea
 		expect(isCsrfExemptPath(path)).toBe(false);
 	});
 
-	it('exempts exactly the two intake paths and no others', () => {
-		expect([...CSRF_EXEMPT_PATHS].sort()).toEqual(['/api/report', '/api/report/attachments']);
+	// The exact-contents assertion (contract §11, "existing, moved"): adding a path is a deliberate
+	// edit HERE, never a side effect somewhere else.
+	it('exempts exactly the two intake paths and the sourcemap upload, and no others', () => {
+		expect([...CSRF_EXEMPT_PATHS].sort()).toEqual(['/api/report', '/api/report/attachments', '/api/sourcemaps']);
 	});
 });
 
@@ -117,6 +127,13 @@ describe('the service caller §4.5 exists for', () => {
 	it('is rejected by the predicate but exempted by path — which is the whole point', () => {
 		// A Go/Node service POSTing a screenshot: multipart, X-API-Key, no Origin, no cookie.
 		const upload = req({ url: `${ORIGIN}/api/report/attachments` });
+		expect(isForbiddenCrossSiteFormPost(upload, ORIGIN)).toBe(true);
+		expect(isCsrfExemptPath(new URL(upload.url).pathname)).toBe(true);
+	});
+
+	it('sentinel-sourcemaps §2.1: the CI curl is rejected by the predicate but exempted by path (U17)', () => {
+		// `curl -F … -H "X-API-Key: …"`: multipart, no Origin, no cookie.
+		const upload = req({ url: `${ORIGIN}/api/sourcemaps` });
 		expect(isForbiddenCrossSiteFormPost(upload, ORIGIN)).toBe(true);
 		expect(isCsrfExemptPath(new URL(upload.url).pathname)).toBe(true);
 	});

@@ -51,10 +51,13 @@ export const CSRF_TRUSTED_ORIGINS: readonly string[] = [];
 
 /**
  * The paths that do NOT get the origin check: sentinel-user-report-issue's two `X-API-Key` intake
- * endpoints (§4.1, §4.5). Exact paths, never a prefix — `/api/reports` and
- * `/api/report/anything-else` are not on this list and are protected exactly as before.
+ * endpoints (§4.1, §4.5), and sentinel-sourcemaps §2.1's `POST /api/sourcemaps` — the same shape
+ * of caller (a CI `curl` holding the project's ingest key sends no `Origin`) behind the same kind
+ * of credential: a header a cross-site form post cannot make a browser attach, no cookie, no
+ * session. Exact paths, never a prefix — `/api/reports`, `/api/report/anything-else` and
+ * `/api/sourcemaps/anything` are not on this list and are protected exactly as before.
  */
-export const CSRF_EXEMPT_PATHS: readonly string[] = ['/api/report', '/api/report/attachments'];
+export const CSRF_EXEMPT_PATHS: readonly string[] = ['/api/report', '/api/report/attachments', '/api/sourcemaps'];
 
 /** Strips one trailing slash so `/api/report/` matches `/api/report`. */
 function normalizePath(pathname: string): string {
