@@ -123,6 +123,44 @@ func TestIngest_ClientEventIDValidIsUsedVerbatim(t *testing.T) {
 	assert.Equal(t, clientID, payload.EventID)
 }
 
+// TestIngest_NegativeStackFrameColumnIsRejectedBeforePublish pins sentinel-sourcemaps §4.3 on the
+// LIVE ingest path: validation.ValidatePayload carries the same rule but no handler calls it
+// (docs/memory/BUGS.md B3), so the check that actually answers a request lives in Ingest. A frame
+// with column < 0 must be a "validation failed: stacktrace[i].column must be >= 0" error -- the
+// prefix handleIngest maps to 400 -- and nothing may be published; 0 (unknown) and a positive column
+// ride through to the proto's field 5 verbatim.
+func TestIngest_NegativeStackFrameColumnIsRejectedBeforePublish(t *testing.T) {
+	t.Run("column=-1 on the second frame is rejected with that frame's index and nothing is published", func(t *testing.T) {
+		svc, pub := newTestIngestService(t)
+		payload := validIngestPayload()
+		payload.Platform = "javascript"
+		payload.Stacktrace = []validation.StackFrame{
+			{File: "/assets/index-3f2a1c.js", Line: 1, Column: 5, Function: "f", InApp: true},
+			{File: "/assets/vendor-9a0d4e.js", Line: 3, Column: -1, Function: "g", InApp: true},
+		}
+
+		err := svc.Ingest(context.Background(), payload)
+		require.EqualError(t, err, "validation failed: stacktrace[1].column must be >= 0")
+		assert.Empty(t, pub.published, "a rejected event must never reach the publisher")
+	})
+
+	t.Run("column=1234 and an absent column both publish, carried verbatim on proto field 5", func(t *testing.T) {
+		svc, pub := newTestIngestService(t)
+		payload := validIngestPayload()
+		payload.Platform = "javascript"
+		payload.Stacktrace = []validation.StackFrame{
+			{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "f", InApp: true},
+			{File: "/assets/vendor-9a0d4e.js", Line: 3, Function: "g", InApp: false},
+		}
+
+		require.NoError(t, svc.Ingest(context.Background(), payload))
+		event := publishedEvent(t, pub)
+		require.Len(t, event.GetStacktrace(), 2)
+		assert.Equal(t, int32(1234), event.GetStacktrace()[0].GetColumn())
+		assert.Equal(t, int32(0), event.GetStacktrace()[1].GetColumn())
+	})
+}
+
 // TestIngest_TwoMintedEventIDsAreDistinct is a sanity check that resolveEventID's minting is not
 // accidentally deterministic (e.g. derived from a fixed input) - two separate empty-id requests must
 // not collide, or D-b's per-issue dedup would silently merge unrelated events.

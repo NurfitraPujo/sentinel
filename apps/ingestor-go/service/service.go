@@ -146,6 +146,18 @@ func (s *IngestService) Ingest(ctx context.Context, payload *validation.ErrorPay
 	}
 	payload.EventID = effectiveID
 
+	// sentinel-sourcemaps §4.3: a negative column is a producer bug, not an unknown (0 is the
+	// unknown value), and the proto deliberately carries no rule for it. Checked HERE, on the live
+	// path, because validation.ValidatePayload -- where the contract places the rule and where the
+	// same check also lives -- is not called by any handler (docs/memory/BUGS.md B3: superseded by
+	// protovalidate). The error text is the contract's, prefixed "validation failed" so
+	// handleIngest/handleBatchIngest map it to 400 exactly as a protovalidate failure.
+	for i, frame := range payload.Stacktrace {
+		if frame.Column < 0 {
+			return fmt.Errorf("validation failed: stacktrace[%d].column must be >= 0", i)
+		}
+	}
+
 	event := mapping.MapPayloadToEvent(payload)
 
 	if err := s.validator.Validate(event); err != nil {
