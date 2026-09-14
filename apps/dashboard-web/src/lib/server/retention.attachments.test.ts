@@ -79,7 +79,7 @@ function makeQueueableDb() {
 const { db: dbMock, resultQueue } = makeQueueableDb();
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
-const { cleanupRetainedData } = await import('./retention');
+const { cleanupRetainedData, bestEffortDeleteObjects } = await import('./retention');
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -124,5 +124,34 @@ describe('cleanupRetainedData attachment cleanup (R6)', () => {
 		await cleanupRetainedData(30);
 
 		expect(deleteObject).not.toHaveBeenCalled();
+	});
+});
+
+// sentinel-sourcemaps §4.1: the helper now REPORTS which deletes failed (still logged, still
+// swallowed) so the upload route can count each failed `replaced` cleanup as an orphan under
+// `uploads_total{outcome="storage_error"}`. Every earlier caller ignores the return value.
+describe('bestEffortDeleteObjects returns the keys whose delete failed', () => {
+	it('returns [] when every delete succeeds, and when storage is unconfigured', async () => {
+		deleteObject.mockResolvedValue(undefined);
+		await expect(bestEffortDeleteObjects(['k1', 'k2'], 'test')).resolves.toEqual([]);
+		expect(deleteObject).toHaveBeenCalledTimes(2);
+
+		isStorageConfigured.mockReturnValue(false);
+		await expect(bestEffortDeleteObjects(['k3'], 'test')).resolves.toEqual([]);
+		expect(deleteObject).toHaveBeenCalledTimes(2);
+	});
+
+	it('returns exactly the failed keys, keeps going past a failure, and logs each one', async () => {
+		deleteObject
+			.mockRejectedValueOnce(new Error('minio down'))
+			.mockResolvedValueOnce(undefined)
+			.mockRejectedValueOnce(new Error('minio down'));
+		await expect(bestEffortDeleteObjects(['k1', 'k2', 'k3'], 'sourcemaps.replaced')).resolves.toEqual(['k1', 'k3']);
+		expect(deleteObject).toHaveBeenCalledTimes(3);
+		expect(logError).toHaveBeenCalledTimes(2);
+		expect(logError).toHaveBeenCalledWith(
+			'retention.attachment_storage_delete_failed',
+			expect.objectContaining({ context: 'sourcemaps.replaced', key: 'k1' })
+		);
 	});
 });
