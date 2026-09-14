@@ -10,6 +10,8 @@ import {
 	recordEscalationExhausted,
 	recordOncallScheduleUnresolved,
 	recordReleaseNextRewriteFailure,
+	SOURCEMAP_UPLOAD_OUTCOME,
+	recordSourcemapUpload,
 } from './metrics';
 
 /**
@@ -226,5 +228,62 @@ describe('§12 sentinel_release_next_rewrite_failures_total (sentinel-releases-s
 
 	it('never throws', () => {
 		expect(() => recordReleaseNextRewriteFailure()).not.toThrow();
+	});
+});
+
+/**
+ * sentinel-sourcemaps §12: `sentinel_sourcemap_uploads_total{outcome}` in `REPORT_OUTCOME`'s
+ * shape. The five-value set is the contract's own (created · replaced · unchanged · rejected ·
+ * storage_error), and `storage_error` is the series `SentinelSourcemapUploadStorageErrors` reads,
+ * so it must exist at zero from the first scrape.
+ */
+describe('§12 sentinel_sourcemap_uploads_total (sentinel-sourcemaps)', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('carries exactly the contract\'s five outcomes', () => {
+		expect(Object.values(SOURCEMAP_UPLOAD_OUTCOME).sort()).toEqual(
+			['created', 'rejected', 'replaced', 'storage_error', 'unchanged'].sort()
+		);
+	});
+
+	it('exposes the metric under its §12 name with every outcome initialised to zero', async () => {
+		const { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_sourcemap_uploads_total counter');
+		const series = parse(body);
+		for (const outcome of Object.values(SOURCEMAP_UPLOAD_OUTCOME)) {
+			expect(series.get(`sentinel_sourcemap_uploads_total{outcome="${outcome}"}`)).toBe(0);
+		}
+	});
+
+	it('increments the named series and leaves the others alone', async () => {
+		recordSourcemapUpload('created');
+		recordSourcemapUpload('created');
+		recordSourcemapUpload('storage_error');
+		const series = parse((await renderMetrics()).body);
+		expect(series.get('sentinel_sourcemap_uploads_total{outcome="created"}')).toBe(2);
+		expect(series.get('sentinel_sourcemap_uploads_total{outcome="storage_error"}')).toBe(1);
+		expect(series.get('sentinel_sourcemap_uploads_total{outcome="unchanged"}')).toBe(0);
+		expect(series.get('sentinel_sourcemap_uploads_total{outcome="rejected"}')).toBe(0);
+		expect(series.get('sentinel_sourcemap_uploads_total{outcome="replaced"}')).toBe(0);
+	});
+
+	it('DROPS an outcome outside the closed set and never throws', async () => {
+		expect(() => recordSourcemapUpload('proj-1' as never)).not.toThrow();
+		const { body } = await renderMetrics();
+		expect(body).not.toContain('proj-1');
+		const series = [...parse(body).keys()].filter((k) => k.startsWith('sentinel_sourcemap_uploads_total'));
+		expect(series).toHaveLength(Object.values(SOURCEMAP_UPLOAD_OUTCOME).length);
+	});
+
+	it('carries `outcome` as its ONLY label', async () => {
+		recordSourcemapUpload('rejected');
+		const { body } = await renderMetrics();
+		for (const line of body.split('\n')) {
+			if (!line.startsWith('sentinel_sourcemap_uploads_total')) continue;
+			const labels = line.match(/\{([^}]*)\}/)?.[1] ?? '';
+			expect(labels).toMatch(/^outcome="[a-z_]+"$/);
+		}
 	});
 });

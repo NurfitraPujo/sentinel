@@ -88,6 +88,36 @@ export const ESCALATION_OUTCOME = {
 
 export type EscalationOutcome = (typeof ESCALATION_OUTCOME)[keyof typeof ESCALATION_OUTCOME];
 
+/**
+ * sentinel-sourcemaps §12: `sentinel_sourcemap_uploads_total{outcome}` -- `POST /api/sourcemaps`
+ * (§4.1), alerted on as `SentinelSourcemapUploadStorageErrors` ("`outcome="storage_error"` above
+ * zero over 15 min -- CI sees `503` and may not fail the deploy").
+ *
+ * Closed and fixed, exactly like `REPORT_OUTCOME`, and the contract's set is FIVE values: the
+ * three per-file results, one for every refusal, one for storage. Deliberately no `unauthorized`
+ * / `forbidden` / `ratelimited` split here -- §12 names five and a metric with more values than
+ * its contract is a metric whose alert nobody re-derived. `storage_error` is the orphan counter
+ * (§4.1, *Orphan objects*): every failure that leaves an object with no row -- a `putObject`
+ * that failed mid-request, a `replaced` delete that failed, a race lost at the per-release cap
+ * inside the transaction -- is counted under it, which is why it is incremented from more than
+ * one place in the route.
+ */
+export const SOURCEMAP_UPLOAD_OUTCOME = {
+	/** One `files[]` entry written for the first time (`201`). Per file, not per request. */
+	Created: 'created',
+	/** One `files[]` entry whose row and object were replaced (`201`). Per file. */
+	Replaced: 'replaced',
+	/** One `files[]` entry with the same bytes already stored -- nothing written. Per file. */
+	Unchanged: 'unchanged',
+	/** Every `4xx` -- the request was refused whole (all-or-nothing) and nothing was written. */
+	Rejected: 'rejected',
+	/** `503 storage_unavailable`, a failed `replaced` delete, or a lost race at the cap: one or more
+	 *  orphan objects, or storage refused. The only value §12's alert fires on. */
+	StorageError: 'storage_error',
+} as const;
+
+export type SourcemapUploadOutcome = (typeof SOURCEMAP_UPLOAD_OUTCOME)[keyof typeof SOURCEMAP_UPLOAD_OUTCOME];
+
 /** The one label this metric carries. Named once, so a typo cannot invent a second dimension. */
 const LABEL_OUTCOME = 'outcome';
 
@@ -106,6 +136,7 @@ interface MetricsState {
 	escalationsUnscoped: Counter<string> | null;
 	oncallUnresolved: Counter<string> | null;
 	releaseNextRewriteFailures: Counter<string> | null;
+	sourcemapUploads: Counter<typeof LABEL_OUTCOME> | null;
 }
 
 const GLOBAL_KEY = Symbol.for('sentinel.dashboard.metrics');
@@ -208,6 +239,25 @@ function createState(): MetricsState {
 		oncallUnresolved = null;
 	}
 
+	// sentinel-sourcemaps §12: the upload route's counter, in `sentinel_reports_received_total`'s
+	// shape (a closed `outcome` set, every series pre-initialised to zero so the `> 0` alert on
+	// `storage_error` evaluates from the first scrape rather than after the first failure).
+	// Registered in its own try so a failure here cannot take the intake counters down with it.
+	let sourcemapUploads: Counter<typeof LABEL_OUTCOME> | null = null;
+	try {
+		sourcemapUploads = new Counter({
+			name: 'sentinel_sourcemap_uploads_total',
+			help: 'Source maps received by POST /api/sourcemaps, by outcome (sentinel-sourcemaps §4.1/§12): created/replaced/unchanged per file, rejected per refused request, storage_error per orphaned object or storage failure.',
+			labelNames: [LABEL_OUTCOME],
+			registers: [registry],
+		});
+		for (const outcome of Object.values(SOURCEMAP_UPLOAD_OUTCOME)) {
+			sourcemapUploads.labels({ [LABEL_OUTCOME]: outcome }).inc(0);
+		}
+	} catch {
+		sourcemapUploads = null;
+	}
+
 	return {
 		registry,
 		reportsReceived,
@@ -216,6 +266,7 @@ function createState(): MetricsState {
 		escalationsUnscoped,
 		oncallUnresolved,
 		releaseNextRewriteFailures,
+		sourcemapUploads,
 	};
 }
 
@@ -296,6 +347,20 @@ export function recordOncallScheduleUnresolved(): void {
  */
 export function recordReleaseNextRewriteFailure(): void {
 	state().releaseNextRewriteFailures?.inc();
+}
+
+const KNOWN_SOURCEMAP_UPLOAD_OUTCOMES = new Set<string>(Object.values(SOURCEMAP_UPLOAD_OUTCOME));
+
+/**
+ * sentinel-sourcemaps §12: increments `sentinel_sourcemap_uploads_total{outcome}`. Same closed-set
+ * runtime guard and the same never-throw contract as `recordReportReceived`: the upload route
+ * calls this after it has decided its response, and a counter must never be the thing that
+ * turns a `201` into a `500`. Called once per `files[]` entry on success (each file's own
+ * outcome) and once per refusal or storage failure.
+ */
+export function recordSourcemapUpload(outcome: SourcemapUploadOutcome): void {
+	if (!KNOWN_SOURCEMAP_UPLOAD_OUTCOMES.has(outcome)) return;
+	state().sourcemapUploads?.labels({ [LABEL_OUTCOME]: outcome }).inc();
 }
 
 /** Renders the Prometheus text exposition format, with the content type a scraper expects. */
