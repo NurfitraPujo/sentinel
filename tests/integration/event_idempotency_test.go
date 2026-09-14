@@ -3053,3 +3053,128 @@ func TestProcessorService_NextRewriteUsesTheClampedFirstSeen(t *testing.T) {
 	_, riv = resolvedInVersionOf(t, ctx, pool, jID)
 	assert.Equal(t, future, riv, "J was resolved before the clamped first_seen, so the release is genuinely its next one")
 }
+
+// TestStoreEvent_RegressionArmSurvivesConcurrentIgnoreWithSnooze is BUG-05 (review finding R6 on
+// PR #25): the regression arm's UPDATE runs on a status the UNLOCKED step-1 SELECT read moments
+// earlier. A dashboard PATCH {status: 'ignored', snoozeOccurrences: N} that commits in that gap is
+// re-read by the UPDATE under READ COMMITTED — and before this fix the SET list nulled the four
+// resolve columns but not the three snooze ones, so the row went `unresolved` beside a live
+// snoozed_until / snooze_occurrence_target, check_snooze_only_when_ignored refused it (23514),
+// classifyStoreError made that Permanent, and the occurrence was dead-lettered and never replayed
+// (D14). Before this feature the same race silently overwrote the ignore; the fix keeps exactly that
+// outcome: the regression wins and the snooze goes with the status it belonged to.
+//
+// Staged the way TestEventIdempotency_RegressionRecordedExactlyOnceForADuplicateID stages its
+// interleaving: the "PATCH" is a transaction held open on the row lock BEFORE StoreEvent starts, so
+// StoreEvent's unlocked SELECT reads `resolved`, takes the regression branch, and its UPDATE blocks
+// on tx1 — proved by polling pg_locks, never assumed — and only then is tx1 committed. The UPDATE
+// then re-evaluates the now-ignored-with-snooze row. Without the three columns in the SET list this
+// test fails with `ERROR: new row for relation "issues" violates check constraint
+// "check_snooze_only_when_ignored" (SQLSTATE 23514)`.
+func TestStoreEvent_RegressionArmSurvivesConcurrentIgnoreWithSnooze(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "bug05")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fingerprint := eidFingerprint(t, "bug05")
+
+	// Seed at 1.0.0 and resolve it there, exactly as the exactly-once test does: a resolved row with
+	// an explicit resolved_in_version, so a 2.0.0 occurrence is a regression by decideRegression's
+	// table (releases 1.0.0 was first-seen by the seed; 2.0.0 has no row yet).
+	issue0 := eidIssue(projectID, fingerprint)
+	_, stored0, err := s.StoreEvent(ctx, issue0, eidOccurrence("evt-bug05-seed-"+uuid.New().String()), "1.0.0")
+	require.NoError(t, err)
+	require.True(t, stored0)
+
+	tag, err := pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_at = now(), resolved_in_version = '1.0.0',
+		        resolved_by_type = 'user', resolved_by = 'integration-test'
+		  WHERE id = $1`, issue0.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected())
+
+	// --- The dashboard's ignore-with-snooze, held open on the row lock (the §4.2 write's shape) ---
+	conn, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+
+	tx1, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	require.NoError(t, err)
+	committed1 := false
+	defer func() {
+		if !committed1 {
+			_ = tx1.Rollback(context.Background())
+		}
+	}()
+	_, err = tx1.Exec(ctx,
+		`UPDATE issues SET status = 'ignored', snoozed_until = now() + interval '1 day',
+		        snooze_occurrence_target = 100, snooze_count_at = count
+		  WHERE id = $1`, issue0.ID)
+	require.NoError(t, err, "the concurrent ignore-with-snooze UPDATE")
+
+	// --- The REAL regressing delivery, concurrent ---
+	type result struct {
+		outcome store.IssueOutcome
+		stored  bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		gctx, gcancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer gcancel()
+		outcome, stored, err := s.StoreEvent(gctx, eidIssue(projectID, fingerprint),
+			eidOccurrence("evt-bug05-regress-"+uuid.New().String()), "2.0.0")
+		done <- result{outcome, stored, err}
+	}()
+
+	// POSITIVE observation that StoreEvent has read `resolved`, taken the regression branch and is
+	// blocking on tx1's row lock. A fixed sleep would be a silent-green seed: if the unlocked SELECT
+	// landed after the commit it would read `ignored`, take the snooze arm (which already nulls the
+	// three columns) and every assertion below would pass regardless of the fix.
+	blockDeadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting))
+		if waiting >= 1 {
+			break
+		}
+		if time.Now().After(blockDeadline) {
+			t.Fatal("the concurrent StoreEvent never blocked on tx1's row lock — the interleaving this " +
+				"test exists to force did not occur, and its assertions would be vacuous")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	require.NoError(t, tx1.Commit(ctx))
+	committed1 = true
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(25 * time.Second):
+		t.Fatal("the concurrent StoreEvent call never returned after the blocking transaction committed")
+	}
+	require.NoError(t, got.err, "the regression arm must not trip check_snooze_only_when_ignored on a row "+
+		"a concurrent PATCH just ignored-with-snooze — a 23514 here is classified Permanent and dead-letters the event")
+	require.True(t, got.stored)
+	assert.Equal(t, store.IssueOutcomeRegressed, got.outcome, "the delivery that read `resolved` is a regression")
+
+	// The committed row: the regression won, and the snooze went with the status it belonged to.
+	st := issueSnoozeStateOf(t, ctx, pool, issue0.ID)
+	assert.Equal(t, "unresolved", st.status)
+	require.NotNil(t, st.regressionStatus)
+	assert.Equal(t, "regressed", *st.regressionStatus)
+	assert.EqualValues(t, 1, st.regressionCount)
+	assert.Nil(t, st.snoozedUntil, "snoozed_until must be nulled in the same statement as the status")
+	assert.Nil(t, st.snoozeTarget)
+	assert.Nil(t, st.snoozeCountAt)
+	_, riv := resolvedInVersionOf(t, ctx, pool, issue0.ID)
+	assert.Empty(t, riv)
+
+	var occCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM error_occurrences WHERE issue_id = $1`, issue0.ID).Scan(&occCount))
+	assert.Equal(t, 2, occCount, "the seed occurrence plus the stored regressing one — nothing was lost to the DLQ")
+}

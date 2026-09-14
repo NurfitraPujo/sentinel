@@ -754,6 +754,16 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	wasFreshInsert := false
 
 	if isRegressed {
+		// The three snooze columns are nulled here too, although the step-1 snapshot said
+		// `resolved` and a resolved row carries no snooze (§4.2). The snapshot is UNLOCKED: a
+		// dashboard PATCH {status: 'ignored', snoozeOccurrences: N} can commit between it and this
+		// UPDATE, which then re-evaluates the row under READ COMMITTED and, with the columns left
+		// alone, would set status = 'unresolved' beside a live snoozed_until — refused by
+		// check_snooze_only_when_ignored (23514), which classifyStoreError makes Permanent: the
+		// occurrence would be dead-lettered and never replayed (D14) for a race that, before this
+		// feature, merely overwrote the ignore. Nulling them costs nothing on a genuinely resolved
+		// row and keeps that pre-feature outcome: the regression wins, the snooze goes with the
+		// status it belonged to. Pinned by TestStoreEvent_RegressionArmSurvivesConcurrentIgnoreWithSnooze.
 		query := `
 			UPDATE issues SET
 				status = 'unresolved',
@@ -764,6 +774,9 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 				resolved_at = NULL,
 				resolved_by_type = NULL,
 				resolved_by = NULL,
+				snoozed_until = NULL,
+				snooze_occurrence_target = NULL,
+				snooze_count_at = NULL,
 				last_seen = GREATEST(issues.last_seen, $1),
 				count = issues.count + 1
 			WHERE id = $2
