@@ -16,7 +16,16 @@ const sendIssueNotificationEmails = vi.fn();
 vi.mock('$lib/server/notify', () => ({ sendIssueNotificationEmails }));
 
 const validateResolvedInVersion = vi.fn((v: unknown) => v ?? null);
-vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion }));
+// sentinel-releases-snooze §4.2: `issuesStatus` now also calls the two snooze validators. Stubbed
+// as "omitted" here; their behaviour is proved by `agent-api-spec/contract.test.ts` (real
+// validators, both routes) and `routes/api/issues/status.test.ts`.
+const validateSnoozedUntil = vi.fn(() => null);
+const validateSnoozeOccurrences = vi.fn(() => null);
+vi.mock('$lib/server/issue-access', () => ({
+	validateResolvedInVersion,
+	validateSnoozedUntil,
+	validateSnoozeOccurrences,
+}));
 
 vi.mock('$lib/db/queries/issues', () => ({
 	updateIssueStatus: vi.fn(),

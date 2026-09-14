@@ -76,6 +76,10 @@ const issueRow = {
 	organizationId: 'org-1',
 };
 
+// sentinel-releases-snooze §4.2: the route always forwards the two validated snooze conditions to
+// updateIssueStatus; a body without them (every pre-feature call) forwards both as null.
+const NO_SNOOZE = { snoozedUntil: null, snoozeOccurrences: null };
+
 describe('PATCH /api/issues/:id/status', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -155,7 +159,8 @@ describe('PATCH /api/issues/:id/status', () => {
 				'resolved',
 				undefined,
 				'user',
-				'user-1'
+				'user-1',
+				NO_SNOOZE
 			);
 		}
 	);
@@ -252,8 +257,150 @@ describe('PATCH /api/issues/:id/status', () => {
 			'resolved',
 			'v'.repeat(100),
 			'user',
-			'user-1'
+			'user-1',
+			NO_SNOOZE
 		);
+	});
+
+	// sentinel-releases-snooze §4.2 (decisions 33, 38, 40) -- flows A1-A5, A11. The validators are
+	// REAL here (issue-access is not mocked in this file): what these cases prove is the route's
+	// refusal strings, verbatim, and what reaches updateIssueStatus on the happy paths. The
+	// agent-route half of "one validator, both routes" is agent-api-spec/contract.test.ts.
+	describe('snoozedUntil / snoozeOccurrences (sentinel-releases-snooze §4.2)', () => {
+		const FUTURE_Z = '2099-09-20T09:00:00Z';
+		const FUTURE_OFFSET = '2099-09-20T16:00:00+07:00'; // the same instant as FUTURE_Z
+
+		/** An org admin on `issue-1` -- the shortest path through the access gate. */
+		function grantAdmin() {
+			dbMock.then
+				.mockImplementationOnce((resolve: any) => resolve([issueRow])) // issue+project lookup
+				.mockImplementationOnce((resolve: any) => resolve([{ role: 'admin' }])); // org role
+		}
+		function patch(body: unknown) {
+			return PATCH({
+				params: { issueId: 'issue-1' },
+				request: patchRequest(body),
+				locals: locals({ id: 'user-1' }),
+				url: new URL('http://x'),
+			} as any);
+		}
+		const lastSnooze = () => issueQueries.updateIssueStatus.mock.calls.at(-1)?.[5];
+
+		// A1: both conditions, parsed, reach updateIssueStatus.
+		it('A1: forwards both conditions to updateIssueStatus with the instant parsed', async () => {
+			grantAdmin();
+			const res = await patch({ status: 'ignored', snoozedUntil: FUTURE_Z, snoozeOccurrences: 100 });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ success: true, status: 'ignored', changed: true });
+			expect(issueQueries.updateIssueStatus).toHaveBeenCalledWith('issue-1', 'ignored', undefined, 'user', 'user-1', {
+				snoozedUntil: new Date(FUTURE_Z),
+				snoozeOccurrences: 100,
+			});
+		});
+
+		// A11: an offset is accepted on both routes and is the same instant as its Z form.
+		it('A11: a future +07:00 snoozedUntil is accepted and normalised to the instant', async () => {
+			grantAdmin();
+			const res = await patch({ status: 'ignored', snoozedUntil: FUTURE_OFFSET });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: new Date(FUTURE_Z), snoozeOccurrences: null });
+		});
+
+		// A11 / §3: both blanks are omitted -- the indefinite ignore, exactly today's write.
+		it("A11: '' on either key with status ignored is 200 and the indefinite ignore", async () => {
+			grantAdmin();
+			const res = await patch({ status: 'ignored', snoozedUntil: '', snoozeOccurrences: '' });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: null });
+		});
+
+		it("'' on either key with status resolved is omitted too -- not a 400", async () => {
+			grantAdmin();
+			const res = await patch({ status: 'resolved', snoozedUntil: '', snoozeOccurrences: '' });
+			expect(res.status).toBe(200);
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: null });
+		});
+
+		// A2 + A11: ONE string for a past, an unparseable and the two wrong-shaped values
+		// (decisions 33, 38 -- the last two would pass Date.parse alone).
+		it.each([
+			['A2: a past instant', '2020-01-01T00:00:00Z'],
+			["A11: an unparseable 'tomorrow'", 'tomorrow'],
+			['A11: a date-only 2099-09-20', '2099-09-20'],
+			['A11: a zone-less 2099-09-20T09:00', '2099-09-20T09:00'],
+			['a non-string', 12345],
+		])('400 `snoozedUntil must be a future timestamp`: %s', async (_label, snoozedUntil) => {
+			await expect(patch({ status: 'ignored', snoozedUntil })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozedUntil must be a future timestamp' },
+			});
+			expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		// A4: 0, over the cap, and a numeric STRING (only '' is omitted; '12' is refused).
+		it.each([0, 1000001, '12'])(
+			'A4: 400 `snoozeOccurrences must be an integer between 1 and 1000000`: %j',
+			async (snoozeOccurrences) => {
+				await expect(patch({ status: 'ignored', snoozeOccurrences })).rejects.toMatchObject({
+					status: 400,
+					body: { message: 'snoozeOccurrences must be an integer between 1 and 1000000' },
+				});
+				expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+			}
+		);
+
+		it('accepts the bounds: 1 and 1000000', async () => {
+			grantAdmin();
+			await patch({ status: 'ignored', snoozeOccurrences: 1 });
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: 1 });
+			grantAdmin();
+			await patch({ status: 'ignored', snoozeOccurrences: 1000000 });
+			expect(lastSnooze()).toEqual({ snoozedUntil: null, snoozeOccurrences: 1000000 });
+		});
+
+		// A3: a snooze key with any status but ignored -- each key has its own string.
+		it('A3: 400 `snoozeOccurrences is only valid with status ignored`', async () => {
+			await expect(patch({ status: 'resolved', snoozeOccurrences: 5 })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozeOccurrences is only valid with status ignored' },
+			});
+			expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		it('400 `snoozedUntil is only valid with status ignored`', async () => {
+			await expect(patch({ status: 'resolved', snoozedUntil: FUTURE_Z })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozedUntil is only valid with status ignored' },
+			});
+			await expect(patch({ status: 'unresolved', snoozedUntil: FUTURE_Z })).rejects.toMatchObject({
+				status: 400,
+				body: { message: 'snoozedUntil is only valid with status ignored' },
+			});
+			expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		// The refusal happens BEFORE the access gate, like resolvedInVersion's: no db query is made
+		// for an invalid body -- but a valid one still goes through it (the 401/403 matrix above is
+		// unchanged: a viewer with a valid snooze body is still 403).
+		it('403s an org viewer sending a valid snooze -- the access matrix is unchanged', async () => {
+			dbMock.then
+				.mockImplementationOnce((resolve: any) => resolve([issueRow]))
+				.mockImplementationOnce((resolve: any) => resolve([{ role: 'viewer' }]))
+				.mockImplementationOnce((resolve: any) => resolve([]));
+			await expect(patch({ status: 'ignored', snoozeOccurrences: 100 })).rejects.toMatchObject({ status: 403 });
+			expect(issueQueries.updateIssueStatus).not.toHaveBeenCalled();
+		});
+
+		it('401s with no session, whatever the snooze body', async () => {
+			await expect(
+				PATCH({
+					params: { issueId: 'issue-1' },
+					request: patchRequest({ status: 'ignored', snoozeOccurrences: 100 }),
+					locals: locals(null),
+					url: new URL('http://x'),
+				} as any)
+			).rejects.toMatchObject({ status: 401 });
+		});
 	});
 
 	describe('§4.4 implicit acknowledgement', () => {

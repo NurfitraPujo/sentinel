@@ -19,7 +19,12 @@ vi.mock('$lib/server/agent-audit', () => ({ writeAgentAuditLog }));
 const sendIssueNotificationEmails = vi.fn();
 vi.mock('$lib/server/notify', () => ({ sendIssueNotificationEmails }));
 
-vi.mock('$lib/server/issue-access', () => ({ validateResolvedInVersion: vi.fn((v: unknown) => v ?? null) }));
+vi.mock('$lib/server/issue-access', () => ({
+	validateResolvedInVersion: vi.fn((v: unknown) => v ?? null),
+	// sentinel-releases-snooze §4.2: stubbed as "omitted"; proved elsewhere (contract.test.ts).
+	validateSnoozedUntil: vi.fn(() => null),
+	validateSnoozeOccurrences: vi.fn(() => null),
+}));
 
 vi.mock('$lib/db/queries/issues', () => ({
 	updateIssueStatus: vi.fn(),
