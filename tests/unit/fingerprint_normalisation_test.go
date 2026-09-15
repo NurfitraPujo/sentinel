@@ -15,8 +15,8 @@ import (
 // hashNormalisationCases is sentinel-sourcemaps decision 6's deliverable, filed verbatim in prd
 // `sentinel-sourcemaps/status/be.md` for ratification: the ≥ 20-case fixture table for §4.4's
 // "Fingerprint input normalisation" — every negative §4.4 names, decision 29's three hard cases,
-// `1234-abcdef.js`, and the edges the rule's wording leaves to the implementer, stated as cases
-// so the ratification is on them. Each row is asserted TWICE below: on
+// `1234-abcdef.js`, decision 41's Rollup base64url names with their negatives, and the edges the
+// rule's wording leaves to the implementer, stated as cases so the ratification is on them. Each row is asserted TWICE below: on
 // fingerprint.NormalizeHashInput directly, and through fingerprint.Compute — where platform
 // `javascript` must hash the input as the expected output would, and platform `golang` must be
 // a byte-identical no-op on the same input (flows S5 / S6).
@@ -74,6 +74,26 @@ var hashNormalisationCases = []struct {
 	{"underscore is a token character", "x-a1_b2c3.js", "x-*.js", "token"},
 	{"a dash inside the candidate splits it: only the last piece is examined", "x-a1b2c3-d4e5f6.js", "x-a1b2c3-*.js", "token"},
 	{"consequence of the all-hex clause, stated: a 6-letter hex word strips", "decade.js", "*.js", "token"},
+	// --- decision 41: Rollup's default base64url hashes (digitless, non-hex, mixed-case) ---
+	{"vite default chunk: digitless mixed-case token", "analytics-CuqmStVf.js", "analytics-*.js", "token"},
+	{"vite default chunk: digitless mixed-case token, upper-case run", "cart-oQLsOyVD.js", "cart-*.js", "token"},
+	{"the committed vite fixture's own name: underscores and a trailing capital", "index-d_kdqh_W.js", "index-*.js", "token"},
+	{"TASK-07 finding 1's other two chunks", "money-Bcjv_cAO.js", "money-*.js", "token"},
+	{"TASK-07 finding 1's other two chunks (ii)", "search-BJccElTd.js", "search-*.js", "token"},
+	{"a `-` inside the base64url token is skipped: the last piece alone is too short", "cart-oQ-sOyVD.js", "cart-*.js", "token"},
+	{"a `-` inside the token when the last piece is a word-shaped fragment", "chunk-CuqmSt-Vfab.js", "chunk-*.js", "token"},
+	{"a `-` inside a digit-bearing base64url token", "http-Bx-3kQz9.js", "http-*.js", "token"},
+	{"the last piece wins when it is a token by itself: the neighbour is never joined", "vendor-react-a3f9b2.js", "vendor-react-*.js", "token"},
+	{"decision 41 negative: a kebab word pair does not strip", "polyfills-legacy.js", "polyfills-legacy.js", "none"},
+	{"decision 41 negative: a capitalised word is not a hash (.tsx is an extension)", "Header.tsx", "Header.tsx", "none"},
+	{"decision 41 negative: camelCase with a vowel run of 3 (eAu)", "useAuth.js", "useAuth.js", "none"},
+	{"decision 41 negative: camelCase whose pieces are syllables", "getUser.js", "getUser.js", "none"},
+	{"decision 41 negative: a camelCase acronym is single-letter pieces", "parseHTML.js", "parseHTML.js", "none"},
+	{"decision 41 negative: next.js's own manifest names", "/_next/static/AbC123xyz_-9pQrStUv/_ssgManifest.js", "/_next/static/*/_ssgManifest.js", "directory"},
+	{"decision 41 negative: a word before the `-` is never joined into a token", "my-cool-Component.js", "my-cool-Component.js", "none"},
+	{"decision 41 negative: a word before the `-` and a short digit piece", "main-a1b2c.js", "main-a1b2c.js", "none"},
+	{"decision 41 negative: all lower-case, no digit, not hex", "qmstvfxk.js", "qmstvfxk.js", "none"},
+	{"decision 41 negative: a 5-char mixed-case piece is below the minimum and `x` is no fragment", "x-CuqmS.js", "x-CuqmS.js", "none"},
 	{"function is never touched (asserted through Compute only; the path here is a control)", "/assets/x.js", "/assets/x.js", "none"},
 }
 

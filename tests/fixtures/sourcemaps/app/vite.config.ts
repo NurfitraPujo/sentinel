@@ -13,10 +13,12 @@
 // reduces both builds to `<name>-*.js` and the no-maps run (flow S5) can prove A ∪ B = A.
 //
 // hashCharacters is `hex` on purpose. Rollup's default is base64url, whose 8-char hashes contain
-// `-` about 12% of the time and contain NO digit about 26% of the time; either shape escapes the
-// contract's hash-token rule (`-` is not in [A-Za-z0-9_]; a digitless non-hex token is a word).
-// Hex hashes are always a token, which keeps the fixture about the rule as written; the finding
-// itself is reported in status/be.md, not silently absorbed here.
+// `-` about 12% of the time and contain NO digit about 26% of the time; either shape escaped the
+// contract's hash-token rule as first written (a digitless non-hex token was a word; a `-` split
+// at the wrong separator). Decision 41 (BUG-03) widened the rule to catch them, and the unit table
+// in tests/unit/fingerprint_normalisation_test.go pins the default names this app produces
+// (`analytics-CuqmStVf.js`, `cart-oQLsOyVD.js`, ...). Hex stays here so the committed maps and
+// every digest recorded in status/be.md remain byte-stable.
 import { defineConfig } from 'vite';
 
 const build = process.env.FIXTURE_BUILD === 'b' ? 'b' : 'a';
