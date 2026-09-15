@@ -10,6 +10,7 @@ import { isStorageConfigured, putObject } from '$lib/server/storage';
 import { bestEffortDeleteObjects } from '$lib/server/retention';
 import { normalizeMinifiedPath, sha256Hex, sourcemapStorageKey } from '$lib/server/sourcemap-path';
 import {
+	findReferencedStorageKeys,
 	readReleaseState,
 	upsertReleaseSourcemaps,
 	ReleaseFullError,
@@ -41,7 +42,11 @@ import { log } from '$lib/server/observability/log';
  *     already put stay as orphans -- permanent, counted, accepted (§4.1 *Orphan objects*);
  *  3. ONE short transaction for the upserts (`queries/sourcemaps.ts`), the per-release count
  *     re-read under a lock; object first, row second, so no row ever points at nothing. After
- *     commit, a `replaced` outcome deletes the previous object best-effort.
+ *     commit, a `replaced` outcome deletes the previous object best-effort -- but only the key
+ *     the transaction itself displaced (read under the lock, never phase 1's snapshot), never a
+ *     key this request put, and only if no `sourcemaps` row references it at that moment
+ *     (BUG-05: keys are content-addressed, so a concurrent re-upload of older bytes recreates a
+ *     key phase 1 saw, and deleting from the snapshot would leave that row pointing at nothing).
  *
  * The multipart pairing is POSITIONAL: the i-th `file` is the i-th `minified_path`
  * (`FormData.getAll` preserves part order). The route never guesses a path from the map's own
@@ -220,7 +225,6 @@ export const POST: RequestHandler = async ({ request }) => {
 	// ---- Phase 2: every object that is not `unchanged`, one after another, NO transaction open.
 	const outcomes: FileOutcome[] = new Array(parts.length);
 	const toUpsert: SourcemapUpsertInput[] = [];
-	const previousKeys: string[] = [];
 	let objectsPut = 0;
 	for (const part of parts) {
 		const existing = state.existing.get(part.minifiedPath);
@@ -244,7 +248,6 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 		objectsPut++;
 		outcomes[part.index] = existing ? 'replaced' : 'created';
-		if (existing) previousKeys.push(existing.storageKey);
 		toUpsert.push({
 			minifiedPath: part.minifiedPath,
 			storageKey,
@@ -255,9 +258,10 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	// ---- Phase 3: one short transaction. `unchanged` parts have nothing to write.
 	let releaseFileCount = state.current;
+	let displacedKeys: string[] = [];
 	if (toUpsert.length > 0) {
 		try {
-			({ releaseFileCount } = await upsertReleaseSourcemaps({
+			({ releaseFileCount, displacedKeys } = await upsertReleaseSourcemaps({
 				projectId: ctx.projectId,
 				releaseVersion,
 				files: toUpsert,
@@ -286,11 +290,32 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 	}
 
-	// After commit: a `replaced` outcome's previous object, best-effort (D3). A failed delete is
-	// one more permanent orphan, logged by the helper and counted here.
-	if (previousKeys.length > 0) {
-		const failed = await bestEffortDeleteObjects(previousKeys, 'sourcemaps.replaced');
-		for (let i = 0; i < failed.length; i++) recordSourcemapUpload('storage_error');
+	// After commit: the objects this transaction displaced, best-effort (D3), and only those no
+	// row references any more -- see the header. A key this request put is never a candidate
+	// (it cannot be, the key folds the path and sha in, but the rule is stated rather than
+	// relied on). A failed delete, or a reference check that could not be made, leaves the
+	// object as one more permanent orphan, logged and counted; an orphan is tolerated, a row
+	// pointing at nothing is not.
+	const putKeys = new Set(toUpsert.map((f) => f.storageKey));
+	const candidates = displacedKeys.filter((k) => !putKeys.has(k));
+	if (candidates.length > 0) {
+		let referenced: Set<string>;
+		try {
+			referenced = await findReferencedStorageKeys(candidates);
+		} catch (err) {
+			log.error('sourcemap_uploads.reference_check_failed', {
+				projectId: ctx.projectId,
+				orphanedObjects: candidates.length,
+				error: err,
+			});
+			referenced = new Set(candidates);
+			for (let i = 0; i < candidates.length; i++) recordSourcemapUpload('storage_error');
+		}
+		const doomed = candidates.filter((k) => !referenced.has(k));
+		if (doomed.length > 0) {
+			const failed = await bestEffortDeleteObjects(doomed, 'sourcemaps.replaced');
+			for (let i = 0; i < failed.length; i++) recordSourcemapUpload('storage_error');
+		}
 	}
 
 	for (const outcome of outcomes) recordSourcemapUpload(outcome);

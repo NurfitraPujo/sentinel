@@ -99,7 +99,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('a1')), sizeBytes: 10, sha256: sha('a1') }],
 				maxPerRelease: 500,
 			});
-			expect(out).toEqual({ releaseFileCount: 1 });
+			expect(out).toEqual({ releaseFileCount: 1, displacedKeys: [] });
 
 			const rows = await sql`
 				select id, storage_key, size_bytes, sha256, uploaded_at
@@ -126,8 +126,9 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('b2')), sizeBytes: 22, sha256: sha('b2') }],
 				maxPerRelease: 500,
 			});
-			// A replace is not an add: the count stays 1 (§4.1's release_file_count).
-			expect(out).toEqual({ releaseFileCount: 1 });
+			// A replace is not an add: the count stays 1 (§4.1's release_file_count); the key the
+			// row carried under the lock is the one displaced (BUG-05).
+			expect(out).toEqual({ releaseFileCount: 1, displacedKeys: [key(release, path, sha('a1'))] });
 
 			const rows = await sql`
 				select id, storage_key, size_bytes, sha256, uploaded_at
@@ -147,6 +148,47 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 			expect(state.current).toBe(1);
 			expect(state.existing.get(path)).toEqual({ sha256: sha('b2'), storageKey: key(release, path, sha('b2')) });
 			expect(state.existing.has('/assets/never-uploaded.js')).toBe(false);
+		});
+	});
+
+	describe('BUG-05: displaced keys come from the transaction, and a referenced key is never a delete candidate', () => {
+		// The review's scenario at the query layer: row {S0,K0}; A replaces it with K1; C (a CI retry
+		// of the older artifact) replaces it back with K0 -- content-addressed, so the SAME key.
+		// After C, K1 is unreferenced and K0 is referenced: A's cleanup, had it been deferred to
+		// this moment, must delete K1 and keep K0 whatever its phase-1 snapshot said.
+		const release = 'r-displace-' + suffix;
+		const path = '/assets/cart-oQLsOyVD.js';
+		const K0 = () => key(release, path, sha('s0'));
+		const K1 = () => key(release, path, sha('s1'));
+
+		it('each replace reports the key the row carried at commit time, not the first one ever written', async () => {
+			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
+			const file = (k: string, seed: string) => ({ minifiedPath: path, storageKey: k, sizeBytes: 1, sha256: sha(seed) });
+
+			const create = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500 });
+			expect(create.displacedKeys).toEqual([]);
+			const a = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 's1')], maxPerRelease: 500 });
+			expect(a.displacedKeys).toEqual([K0()]);
+			const c = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500 });
+			expect(c.displacedKeys).toEqual([K1()]);
+		});
+
+		it('findReferencedStorageKeys answers with the keys rows still point at, across the whole table', async () => {
+			const { findReferencedStorageKeys } = await import('./sourcemaps');
+			const referenced = await findReferencedStorageKeys([K0(), K1(), 'sourcemaps/nobody/has/this.map']);
+			expect(referenced).toEqual(new Set([K0()]));
+			expect(await findReferencedStorageKeys([])).toEqual(new Set());
+		});
+
+		it('an upsert that rewrites a row with the key it already has displaces nothing', async () => {
+			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
+			const again = await upsertReleaseSourcemaps({
+				projectId,
+				releaseVersion: release,
+				files: [{ minifiedPath: path, storageKey: K0(), sizeBytes: 1, sha256: sha('s0') }],
+				maxPerRelease: 500,
+			});
+			expect(again.displacedKeys).toEqual([]);
 		});
 	});
 
@@ -185,7 +227,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 			const rejected = results.filter((r) => r.status === 'rejected');
 			expect(fulfilled).toHaveLength(1);
 			expect(rejected).toHaveLength(1);
-			expect((fulfilled[0] as PromiseFulfilledResult<{ releaseFileCount: number }>).value).toEqual({ releaseFileCount: CAP });
+			expect((fulfilled[0] as PromiseFulfilledResult<{ releaseFileCount: number }>).value).toMatchObject({ releaseFileCount: CAP });
 			const err = (rejected[0] as PromiseRejectedResult).reason;
 			expect(err).toBeInstanceOf(ReleaseFullError);
 			expect(err).toMatchObject({ name: 'ReleaseFullError', max: CAP, current: CAP });
@@ -271,7 +313,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				files: [{ minifiedPath: '/last.js', storageKey: key(release, '/last.js', sha('l2')), sizeBytes: 2, sha256: sha('l2') }],
 				maxPerRelease: CAP,
 			});
-			expect(out).toEqual({ releaseFileCount: CAP });
+			expect(out).toEqual({ releaseFileCount: CAP, displacedKeys: [key(release, '/last.js', sha('l1'))] });
 			const [row] = await sql`
 				select storage_key from sourcemaps
 				where project_id = ${projectId} and release_version = ${release} and minified_path = ${'/last.js'}

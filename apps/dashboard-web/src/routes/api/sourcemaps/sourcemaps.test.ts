@@ -26,6 +26,7 @@ const putObject = vi.fn();
 const isStorageConfigured = vi.fn();
 const readReleaseState = vi.fn();
 const upsertReleaseSourcemaps = vi.fn();
+const findReferencedStorageKeys = vi.fn();
 const bestEffortDeleteObjects = vi.fn();
 const recordSourcemapUpload = vi.fn();
 
@@ -40,7 +41,7 @@ vi.mock('$lib/server/storage', () => ({ putObject, isStorageConfigured }));
 vi.mock('$lib/server/retention', () => ({ bestEffortDeleteObjects }));
 vi.mock('$lib/db/queries/sourcemaps', async () => {
 	const actual = await vi.importActual<typeof import('$lib/db/queries/sourcemaps')>('$lib/db/queries/sourcemaps');
-	return { ...actual, readReleaseState, upsertReleaseSourcemaps };
+	return { ...actual, readReleaseState, upsertReleaseSourcemaps, findReferencedStorageKeys };
 });
 vi.mock('$lib/server/metrics', () => ({ recordSourcemapUpload }));
 
@@ -129,7 +130,9 @@ beforeEach(() => {
 	readReleaseState.mockResolvedValue({ current: 0, existing: new Map() });
 	upsertReleaseSourcemaps.mockImplementation(async ({ files }: { files: unknown[] }) => ({
 		releaseFileCount: files.length,
+		displacedKeys: [],
 	}));
+	findReferencedStorageKeys.mockResolvedValue(new Set());
 	bestEffortDeleteObjects.mockResolvedValue([]);
 });
 
@@ -197,7 +200,7 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 			['/b.js', { sha256: sha256(mapBytes('b')), storageKey: 'old-key-b' }],
 		]);
 		readReleaseState.mockResolvedValue({ current: 2, existing });
-		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 2 });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 2, displacedKeys: ['old-key-a'] });
 		const { res, body } = await post(form([['/a.js', mapFile('a', { names: ['rebuilt'] })], ['/b.js', mapFile('b')]]));
 
 		expect(res.status).toBe(201);
@@ -207,9 +210,13 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
 			expect.objectContaining({ files: [expect.objectContaining({ minifiedPath: '/a.js' })] })
 		);
+		expect(findReferencedStorageKeys).toHaveBeenCalledWith(['old-key-a']);
 		expect(bestEffortDeleteObjects).toHaveBeenCalledWith(['old-key-a'], 'sourcemaps.replaced');
-		expect(bestEffortDeleteObjects.mock.invocationCallOrder[0]).toBeGreaterThan(
+		expect(findReferencedStorageKeys.mock.invocationCallOrder[0]).toBeGreaterThan(
 			upsertReleaseSourcemaps.mock.invocationCallOrder[0]
+		);
+		expect(bestEffortDeleteObjects.mock.invocationCallOrder[0]).toBeGreaterThan(
+			findReferencedStorageKeys.mock.invocationCallOrder[0]
 		);
 		expect(outcomesRecorded()).toEqual(['replaced', 'unchanged']);
 	});
@@ -219,7 +226,7 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 			current: 1,
 			existing: new Map([['/a.js', { sha256: 'stale', storageKey: 'old-key-a' }]]),
 		});
-		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1 });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: ['old-key-a'] });
 		bestEffortDeleteObjects.mockResolvedValue(['old-key-a']);
 		const { res } = await post(form([['/a.js', mapFile('a')]]));
 		expect(res.status).toBe(201);
@@ -260,6 +267,72 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 		const fd = form([['/a.js', mapFile('a')]]);
 		fd.append('dist_dir', 'dist');
 		expect((await post(fd)).res.status).toBe(201);
+	});
+});
+
+describe('POST /api/sourcemaps -- the replaced cleanup deletes what the transaction displaced, if nothing references it (BUG-05)', () => {
+	// The review's scenario: row {S0,K0}. Request A replaced it with K1 and deleted K0. Request C
+	// (a CI retry of the older artifact) then put K0 again and committed the row back to K0,
+	// displacing K1. THIS request B read phase 1 BEFORE A -- its snapshot says the previous key is
+	// K0 -- and is only now committing K1. What B displaced is K0 (again), what it must not touch
+	// is anything else; and if C's row still points at K0 when B looks, K0 stays.
+	const K0 = 'sourcemaps/p/r/a-000.map';
+	const K1 = 'sourcemaps/p/r/a-111.map';
+	const existingA = () => new Map([['/a.js', { sha256: 'stale-snapshot', storageKey: K0 }]]);
+
+	it('deletes the key the transaction displaced, not the key phase 1 snapshotted', async () => {
+		readReleaseState.mockResolvedValue({ current: 1, existing: existingA() });
+		// Between phase 1 and phase 3 another request moved the row to K1: that is the key B
+		// displaced, and the only one it may consider deleting.
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: [K1] });
+		const { res } = await post(form([['/a.js', mapFile('a')]]));
+		expect(res.status).toBe(201);
+		expect(findReferencedStorageKeys).toHaveBeenCalledWith([K1]);
+		expect(bestEffortDeleteObjects).toHaveBeenCalledWith([K1], 'sourcemaps.replaced');
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalledWith(expect.arrayContaining([K0]), expect.anything());
+	});
+
+	it('does not delete a displaced key that a sourcemaps row still references after commit', async () => {
+		readReleaseState.mockResolvedValue({ current: 1, existing: existingA() });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: [K0] });
+		// Request C re-committed a row to K0 between B's commit and B's reference check.
+		findReferencedStorageKeys.mockResolvedValue(new Set([K0]));
+		const { res } = await post(form([['/a.js', mapFile('a')]]));
+		expect(res.status).toBe(201);
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['replaced']);
+	});
+
+	it('never deletes a key this request itself just put, even if the transaction reports it displaced', async () => {
+		readReleaseState.mockResolvedValue({ current: 1, existing: existingA() });
+		const bytes = mapBytes('a');
+		const putKey = sourcemapStorageKey(CTX.projectId, RELEASE, '/a.js', sha256(bytes));
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: [putKey, K0] });
+		const { res } = await post(form([['/a.js', fileOf(bytes, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(201);
+		expect(putObject).toHaveBeenCalledWith(putKey, expect.anything(), 'application/json');
+		expect(findReferencedStorageKeys).toHaveBeenCalledWith([K0]);
+		expect(bestEffortDeleteObjects).toHaveBeenCalledWith([K0], 'sourcemaps.replaced');
+	});
+
+	it('when the transaction displaced nothing, neither the reference check nor a delete runs', async () => {
+		readReleaseState.mockResolvedValue({ current: 1, existing: existingA() });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: [] });
+		const { res, body } = await post(form([['/a.js', mapFile('a')]]));
+		expect(res.status).toBe(201);
+		expect(body.files[0].outcome).toBe('replaced');
+		expect(findReferencedStorageKeys).not.toHaveBeenCalled();
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+	});
+
+	it('a reference check that fails leaves the object in place (an orphan, counted), never a row pointing at nothing', async () => {
+		readReleaseState.mockResolvedValue({ current: 1, existing: existingA() });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 1, displacedKeys: [K0] });
+		findReferencedStorageKeys.mockRejectedValue(new Error('db down'));
+		const { res } = await post(form([['/a.js', mapFile('a')]]));
+		expect(res.status).toBe(201);
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['storage_error', 'replaced']);
 	});
 });
 
@@ -510,7 +583,7 @@ describe('POST /api/sourcemaps -- the three phases (U12, U18)', () => {
 			current: 499,
 			existing: new Map([['/a.js', { sha256: 'stale', storageKey: 'old' }]]),
 		});
-		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 500 });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 500, displacedKeys: [] });
 		const { res, body } = await post(form([['/a.js', mapFile('a')], ['/b.js', mapFile('b')]]));
 		expect(res.status).toBe(201);
 		expect(body.release_file_count).toBe(500);

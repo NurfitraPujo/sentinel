@@ -9,8 +9,10 @@ import { sql } from 'drizzle-orm';
  * What is load-bearing on the write path: the upsert conflicts on §4.5's unique key `(project_id,
  * release_version, minified_path)` and rewrites exactly the four replace columns; the per-release
  * count is re-read INSIDE the transaction under a per-release lock and a lost race is a thrown
- * `ReleaseFullError` (D18: thrown, never returned) with nothing inserted; and phase 1's read is
- * two plain selects with no transaction open.
+ * `ReleaseFullError` (D18: thrown, never returned) with nothing inserted; phase 1's read is
+ * two plain selects with no transaction open; and the keys reported as displaced are the ones
+ * the rows carried INSIDE the transaction, with `findReferencedStorageKeys` as the post-commit
+ * guard before any delete (BUG-05).
  *
  * On the reads: `listReleaseSourcemaps` selects §4.2's five columns and NEVER `storage_key`, and
  * orders `minified_path ASC`; `countSourcemapsByRelease` is ONE grouped statement for the page's
@@ -87,6 +89,7 @@ vi.mock('$lib/server/db', () => ({ db: dbMock }));
 const {
 	readReleaseState,
 	upsertReleaseSourcemaps,
+	findReferencedStorageKeys,
 	ReleaseFullError,
 	listReleaseSourcemaps,
 	countSourcemapsByRelease,
@@ -147,7 +150,7 @@ describe('readReleaseState (phase 1)', () => {
 
 describe('upsertReleaseSourcemaps (phase 3)', () => {
 	it('runs inside ONE transaction: lock, count, presence read, then the upserts', async () => {
-		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js' }]];
+		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: 'sourcemaps/p/r/a-0.map' }]];
 		const out = await upsertReleaseSourcemaps({
 			projectId: 'proj-1',
 			releaseVersion: 'v1',
@@ -158,9 +161,25 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 		expect(captured.executes).toHaveLength(1);
 		expect(render(captured.executes[0])).toContain('pg_advisory_xact_lock(hashtextextended(');
 		expect(render(captured.executes[0])).toContain('sourcemaps:proj-1:v1');
-		// /a.js already present (a replace), /b.js new: 1 + 1 = 2.
-		expect(out).toEqual({ releaseFileCount: 2 });
+		// /a.js already present (a replace), /b.js new: 1 + 1 = 2; the replace displaced /a.js's
+		// previous key, read under the lock.
+		expect(out).toEqual({ releaseFileCount: 2, displacedKeys: ['sourcemaps/p/r/a-0.map'] });
 		expect(captured.values).toHaveLength(2);
+	});
+
+	it('BUG-05: displacedKeys is what the row pointed at INSIDE the transaction -- the presence read selects storage_key', async () => {
+		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: 'moved-since-phase-1' }]];
+		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 });
+		expect(out.displacedKeys).toEqual(['moved-since-phase-1']);
+		// The presence read asks for both columns; a read that dropped storage_key would silently
+		// report nothing displaced.
+		expect(Object.keys(captured.selectFields[1] as object).sort()).toEqual(['minifiedPath', 'storageKey']);
+	});
+
+	it('BUG-05: a row rewritten with the key it already has displaces nothing', async () => {
+		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: FILE_A.storageKey }]];
+		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 });
+		expect(out.displacedKeys).toEqual([]);
 	});
 
 	it('conflicts on (project_id, release_version, minified_path) and rewrites exactly the four replace columns', async () => {
@@ -192,14 +211,14 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 	});
 
 	it('does not count a replace as an add: a full release still accepts a re-upload of its own paths', async () => {
-		selectResults = [[{ count: 500 }], [{ minifiedPath: '/a.js' }]];
+		selectResults = [[{ count: 500 }], [{ minifiedPath: '/a.js', storageKey: 'k-old' }]];
 		const out = await upsertReleaseSourcemaps({
 			projectId: 'proj-1',
 			releaseVersion: 'v1',
 			files: [FILE_A],
 			maxPerRelease: 500,
 		});
-		expect(out).toEqual({ releaseFileCount: 500 });
+		expect(out).toEqual({ releaseFileCount: 500, displacedKeys: ['k-old'] });
 		expect(captured.values).toHaveLength(1);
 	});
 
@@ -208,6 +227,26 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 		expect(err).toBeInstanceOf(Error);
 		expect(err.max).toBe(500);
 		expect(err.current).toBe(499);
+	});
+});
+
+describe('findReferencedStorageKeys (BUG-05)', () => {
+	it('is one select of storage_key WHERE storage_key IN (<keys>) across the whole table, answered as a Set', async () => {
+		selectResults = [[{ storageKey: 'k-1' }]];
+		const referenced = await findReferencedStorageKeys(['k-1', 'k-2']);
+		expect(referenced).toEqual(new Set(['k-1']));
+		expect(captured.selectWheres).toHaveLength(1);
+		const rendered = render(captured.selectWheres[0]);
+		expect(rendered).toContain('"storage_key" in ');
+		expect(rendered).toContain('k-1, k-2');
+		// No project or release clause: a key referenced by ANY row must survive.
+		expect(rendered).not.toContain('"project_id"');
+	});
+
+	it('builds no statement for an empty key list', async () => {
+		const referenced = await findReferencedStorageKeys([]);
+		expect(referenced).toEqual(new Set());
+		expect(dbMock.select).not.toHaveBeenCalled();
 	});
 });
 

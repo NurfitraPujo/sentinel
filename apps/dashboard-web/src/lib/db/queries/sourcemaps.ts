@@ -14,7 +14,10 @@ import { sourcemaps } from '$lib/db/schema';
  * every object with NO transaction open (phase 2), then calls `upsertReleaseSourcemaps` -- ONE
  * short transaction for the upserts, with the count re-read under a lock so a concurrent upload
  * that raced past the pre-check is refused here (phase 3). Object first, row second: no row ever
- * points at nothing, because a row that did would make §4.4 fetch and fail on every event.
+ * points at nothing, because a row that did would make §4.4 fetch and fail on every event. The
+ * same rule governs the cleanup after commit: a replaced object is deleted only when the
+ * transaction itself displaced its key AND no row references it any more
+ * (`findReferencedStorageKeys`, BUG-05).
  */
 
 /** What phase 1 reads for one request: the release's row count, and its rows for these paths. */
@@ -111,15 +114,21 @@ export async function readReleaseState(
  * release and nothing else; the `sourcemaps:` prefix keeps it out of the retention family's
  * `hashtext(...)` space.
  *
- * Returns the release's row count AFTER the upserts -- §4.1's `release_file_count`. Throws
- * `ReleaseFullError` (rolls back, nothing written) when the re-read count says otherwise.
+ * Returns the release's row count AFTER the upserts -- §4.1's `release_file_count` -- and
+ * `displacedKeys`: the `storage_key` each replaced row pointed at when THIS transaction rewrote
+ * it, read here under the lock and not from phase 1 (BUG-05). Keys are content-addressed
+ * (`sourcemapStorageKey` folds the sha256 in), so a key phase 1 saw may since have been displaced
+ * by another request, deleted, and put back by a third; the only key this request may delete is
+ * the one it displaced itself, and even that only if no row references it after commit
+ * (`findReferencedStorageKeys`). A row rewritten with the key it already had displaces nothing.
+ * Throws `ReleaseFullError` (rolls back, nothing written) when the re-read count says otherwise.
  */
 export async function upsertReleaseSourcemaps(input: {
 	projectId: string;
 	releaseVersion: string;
 	files: readonly SourcemapUpsertInput[];
 	maxPerRelease: number;
-}): Promise<{ releaseFileCount: number }> {
+}): Promise<{ releaseFileCount: number; displacedKeys: string[] }> {
 	const { projectId, releaseVersion, files, maxPerRelease } = input;
 
 	return await db.transaction(async (tx) => {
@@ -131,11 +140,12 @@ export async function upsertReleaseSourcemaps(input: {
 
 		// Which of this request's paths are new is decided here, not from the route's phase-1 read:
 		// a concurrent request may have created some of them since, and each of those is now a
-		// replace, not an add.
-		const alreadyPresent = new Set<string>();
+		// replace, not an add. The same read is where a replaced row's CURRENT storage_key comes
+		// from -- the key this transaction displaces, as opposed to the one phase 1 happened to see.
+		const alreadyPresent = new Map<string, string>();
 		if (files.length > 0) {
 			const rows = await tx
-				.select({ minifiedPath: sourcemaps.minifiedPath })
+				.select({ minifiedPath: sourcemaps.minifiedPath, storageKey: sourcemaps.storageKey })
 				.from(sourcemaps)
 				.where(
 					and(
@@ -147,11 +157,17 @@ export async function upsertReleaseSourcemaps(input: {
 						)
 					)
 				);
-			for (const row of rows) alreadyPresent.add(row.minifiedPath);
+			for (const row of rows) alreadyPresent.set(row.minifiedPath, row.storageKey);
 		}
 		const added = files.filter((f) => !alreadyPresent.has(f.minifiedPath)).length;
 		if (current + added > maxPerRelease) {
 			throw new ReleaseFullError(maxPerRelease, current);
+		}
+
+		const displacedKeys: string[] = [];
+		for (const file of files) {
+			const previousKey = alreadyPresent.get(file.minifiedPath);
+			if (previousKey !== undefined && previousKey !== file.storageKey) displacedKeys.push(previousKey);
 		}
 
 		for (const file of files) {
@@ -176,8 +192,30 @@ export async function upsertReleaseSourcemaps(input: {
 				});
 		}
 
-		return { releaseFileCount: current + added };
+		return { releaseFileCount: current + added, displacedKeys };
 	});
+}
+
+/**
+ * BUG-05's post-commit guard: of `keys`, the ones some `sourcemaps` row still points at -- for any
+ * project or release, because `storage_key` is unique across the table and a referenced object
+ * must never be deleted whoever references it. The route deletes a displaced key only when it is
+ * NOT in this set: a concurrent re-upload of the older bytes (a CI retry of the previous artifact)
+ * recreates the same content-addressed key and commits a row to it, and deleting it then would
+ * leave that row pointing at nothing -- `fetch_error` on every event, negatively cached, and not
+ * repairable by the identical upload because the sha matches (`unchanged`). Read AFTER the
+ * transaction committed, with no transaction of its own: what it answers is "as of now", which is
+ * as much as a delete outside the lock can ask. An empty list builds no statement.
+ */
+export async function findReferencedStorageKeys(keys: readonly string[]): Promise<Set<string>> {
+	const referenced = new Set<string>();
+	if (keys.length === 0) return referenced;
+	const rows = await db
+		.select({ storageKey: sourcemaps.storageKey })
+		.from(sourcemaps)
+		.where(inArray(sourcemaps.storageKey, [...keys]));
+	for (const row of rows) referenced.add(row.storageKey);
+	return referenced;
 }
 
 type Executor = Pick<typeof db, 'select'> | Pick<Tx, 'select'>;
