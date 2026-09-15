@@ -84,6 +84,11 @@ type StackFrame struct {
 	Line     int32  `json:"line"`
 	Function string `json:"function"`
 	InApp    bool   `json:"in_app"`
+	// sentinel-sourcemaps §4.3: optional, 1-based as browsers print it; 0 (absent) means
+	// "unknown" and the processor passes the frame through. Copied verbatim into the proto's
+	// field 5 by mapping.MapPayloadToEvent; a negative value is a 400 from ValidatePayload
+	// (`stacktrace[i].column must be >= 0`) -- the proto carries no CEL rule for it.
+	Column int32 `json:"column"`
 }
 
 const (
@@ -158,6 +163,12 @@ func ValidatePayload(payload *ErrorPayload) ValidationResult {
 		if frame.InApp && frame.File != "" && len(frame.File) > MaxFilePathLength {
 			result.Valid = false
 			result.Errors = append(result.Errors, ValidationError{Field: fmt.Sprintf("stacktrace[%d].file", i), Message: fmt.Sprintf("file path must not exceed %d characters", MaxFilePathLength)})
+		}
+		// A negative column is a producer bug, not an unknown: 0 is the "unknown" value
+		// (sentinel-sourcemaps §4.3), so nothing below zero has a meaning to store.
+		if frame.Column < 0 {
+			result.Valid = false
+			result.Errors = append(result.Errors, ValidationError{Field: fmt.Sprintf("stacktrace[%d].column", i), Message: fmt.Sprintf("stacktrace[%d].column must be >= 0", i)})
 		}
 	}
 

@@ -1,6 +1,7 @@
 package event
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/normalizer"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/golang/protobuf/proto"
@@ -29,8 +31,18 @@ const maxEventIDLength = 64
 const maxAffectedIDBytes = 255
 
 type ErrorEvent struct {
+	// Fingerprint is, after Deserialize, the CLIENT's value (proto field fingerprint, "" when none
+	// was sent) and, after ComputeFingerprint, issue identity: the client's value verbatim, or the
+	// server's hash. Nothing between the two reads it as identity — see ComputeFingerprint.
 	Fingerprint string `json:"fingerprint"`
-	ProjectKey  string `json:"project_key"`
+	// FingerprintOverride is the proto's fingerprint_override, carried here (sentinel-sourcemaps
+	// §4.4 / be.md task 4) because the fingerprint step no longer runs inside Deserialize: it
+	// runs in service.processEventInternal AFTER the project id is resolved and AFTER
+	// symbolication, and needs the flag there. The trap in the name is unchanged: true does NOT
+	// mean "my fingerprint wins" — it forces a server-side recompute and DISCARDS the value sent
+	// with it (event/fingerprint_semantics_test.go pins this).
+	FingerprintOverride bool   `json:"fingerprint_override,omitempty"`
+	ProjectKey          string `json:"project_key"`
 	// ProjectID is ErrorEvent.project_id (proto field 16, added alongside
 	// release_version in P2-1). When non-empty it is the authenticated
 	// project's UUID and must be preferred over any ProjectKey-based lookup
@@ -89,6 +101,20 @@ type StackFrame struct {
 	Line     int32  `json:"line"`
 	Function string `json:"function"`
 	InApp    bool   `json:"in_app"`
+	// sentinel-sourcemaps §4.3: copied from the proto's field 5, 1-based as browsers print it;
+	// 0 is "unknown" (every pre-feature message, every Go frame) and makes symbolication pass
+	// the frame through (`no_column`, §4.4 step 2). omitempty so that a pre-feature frame and a
+	// no-column frame serialise identically into error_occurrences.stacktrace -- the JSONB the
+	// dashboard reads carries "column" only when there is one.
+	Column int32 `json:"column,omitempty"`
+	// Symbolicated and Raw are sentinel-sourcemaps §4.4 step 6's record of a rewrite, written by
+	// service.processEventInternal from symbolicate.Frame after the stage ran, and step 7's
+	// absence otherwise: both omitempty, so a frame that passed through carries NEITHER key —
+	// absent, not false — and a pre-feature occurrence and an unsymbolicated one are
+	// byte-identical in error_occurrences.stacktrace. The dashboard reads
+	// `frame.symbolicated === true`; Raw holds the file/line/column/function the SDK sent.
+	Symbolicated bool                  `json:"symbolicated,omitempty"`
+	Raw          *symbolicate.RawFrame `json:"raw,omitempty"`
 }
 
 func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker.Masker) {
@@ -184,6 +210,8 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		SpanID:         protoEvent.SpanId,
 		TraceFlags:     protoEvent.TraceFlags,
 		Fingerprint:    protoEvent.Fingerprint,
+		// The override flag rides with the client's value to ComputeFingerprint (see the field).
+		FingerprintOverride: protoEvent.FingerprintOverride,
 		// See the EventID field comment on ErrorEvent: copied here, never normalized/masked (D-h).
 		EventID: protoEvent.EventId,
 	}
@@ -235,6 +263,7 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 			Line:     frame.Line,
 			Function: frame.Function,
 			InApp:    frame.InApp,
+			Column:   frame.Column,
 		})
 	}
 
@@ -242,26 +271,94 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 	mask := masker.NewMasker()
 	event.Normalize(norm, mask)
 
-	if event.Fingerprint == "" || protoEvent.FingerprintOverride {
-		frames := make([]fingerprint.StackFrame, len(event.Stacktrace))
-		for i, f := range event.Stacktrace {
-			frames[i] = fingerprint.StackFrame{
-				File:     f.File,
-				Line:     f.Line,
-				Function: f.Function,
-				InApp:    f.InApp,
-			}
-		}
-		event.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
-			// sentinel-project-environments §4.9: the environment is part of issue identity, so it is
-			// part of the hash input.
-			Environment: event.Environment,
-			ErrorClass:  event.ErrorClass,
-			Stacktrace:  frames,
-		})
-	}
-
+	// The fingerprint is NOT computed here any more (sentinel-sourcemaps §4.4, be.md task 4): it
+	// used to be the last thing Deserialize did, which made it impossible to symbolicate the
+	// frames first — symbolication needs the resolved project id and a database/storage read,
+	// and Deserialize is a pure function of the bytes. ComputeFingerprint below is the same block,
+	// called by service.processEventInternal after ResolveProjectID and after the symbolication
+	// stage; until then event.Fingerprint is the client's value (or "") and FingerprintOverride
+	// says what to do with it.
 	return event, nil
+}
+
+// ComputeFingerprint is the fingerprint step that Deserialize used to end with, split out so it
+// can run AFTER the project id is resolved and AFTER symbolication rewrote the frames
+// (sentinel-sourcemaps §4.4: "symbolicated after the project id is known and before
+// fingerprint.Compute is called"). It is the ONLY writer of issue identity on the event:
+//
+//   - Fingerprint == "" (the normal case) or FingerprintOverride: the server computes one over
+//     Environment, ErrorClass and the frames AS THEY ARE NOW — rewritten if the stage applied,
+//     as sent otherwise — with each frame's Symbolicated flag, so Compute strips build hashes
+//     from the frames that still carry a minified name and from no other (decision 44).
+//     FingerprintOverride true DISCARDS a client value sent with it.
+//   - otherwise the client's Fingerprint is stored verbatim, whether or not the frames were
+//     rewritten (flow S7; Compute's early return, untouched — the custom-fingerprint path is
+//     deliberately not environment-prefixed either, see fingerprint.Compute).
+//
+// normalisePlatforms is §4.4's gate set (symbolicate.Config.Platforms — SYMBOLICATE_PLATFORMS,
+// unset = {javascript, browser}, set and empty = off) handed to Compute as
+// FingerprintConfig.NormalisePlatforms, so the build-hash normalisation follows the same kill
+// switch as the stage. Idempotent on a second call only for the custom path; the computed path
+// is a pure function of the event's current fields, so calling it twice on unchanged fields
+// yields the same value.
+func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
+	if e.Fingerprint != "" && !e.FingerprintOverride {
+		return
+	}
+	frames := make([]fingerprint.StackFrame, len(e.Stacktrace))
+	for i, f := range e.Stacktrace {
+		frames[i] = fingerprint.StackFrame{
+			File:     f.File,
+			Line:     f.Line,
+			Function: f.Function,
+			InApp:    f.InApp,
+			// Decision 44: Compute strips build hashes only from a frame the stage did not
+			// rewrite; a rewritten File is a source path. Step 6's record is the signal.
+			Symbolicated: f.Symbolicated,
+		}
+	}
+	e.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
+		// sentinel-project-environments §4.9: the environment is part of issue identity, so it is
+		// part of the hash input.
+		Environment:        e.Environment,
+		ErrorClass:         e.ErrorClass,
+		Stacktrace:         frames,
+		Platform:           e.Platform,
+		NormalisePlatforms: normalisePlatforms,
+	})
+}
+
+// Symbolicate runs sentinel-sourcemaps §4.4's stage over this event's frames and writes the
+// rewrite back: for every frame the stage applied, File/Line/Column/Function become the original
+// position and Symbolicated/Raw carry step 6's record; a frame that passed through is left
+// exactly as it was — no key, not `symbolicated: false` (step 7). projectID MUST be the resolved
+// project (store.ResolveProjectID's return), never anything read from a frame; releaseVersion is
+// e.ReleaseVersion after Normalize's metadata fallback. The caller has already passed
+// symbolicate.Gate and counts the returned per-frame outcomes; this method never fails the
+// event (the stage returns a Result, not an error — D7).
+//
+// Here rather than in the service so the order the contract fixes — Deserialize, resolve,
+// Symbolicate, ComputeFingerprint — is exercisable end to end without a database
+// (tests/unit/processor_event_test.go drives it with a stubbed Store/Fetcher over the committed
+// fixture map); the service adds the gate, the span and the metrics around it.
+func (e *ErrorEvent) Symbolicate(ctx context.Context, stage *symbolicate.Service, projectID string) symbolicate.Result {
+	frames := make([]symbolicate.Frame, len(e.Stacktrace))
+	for i, f := range e.Stacktrace {
+		frames[i] = symbolicate.Frame{File: f.File, Line: f.Line, Column: f.Column, Function: f.Function, InApp: f.InApp}
+	}
+	res := stage.Symbolicate(ctx, projectID, e.ReleaseVersion, frames)
+	for i, f := range frames {
+		if !f.Symbolicated {
+			continue
+		}
+		e.Stacktrace[i].File = f.File
+		e.Stacktrace[i].Line = f.Line
+		e.Stacktrace[i].Column = f.Column
+		e.Stacktrace[i].Function = f.Function
+		e.Stacktrace[i].Symbolicated = true
+		e.Stacktrace[i].Raw = f.Raw
+	}
+	return res
 }
 
 func validateEvent(event *sentinelv1.ErrorEvent) error {

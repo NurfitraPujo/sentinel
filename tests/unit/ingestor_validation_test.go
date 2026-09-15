@@ -326,6 +326,78 @@ func TestValidatePayload_StackFrameFileLength(t *testing.T) {
 	})
 }
 
+// sentinel-sourcemaps §4.3: `column` on the wire frame is optional and 1-based; 0 is "unknown"
+// and anything below zero is a producer bug the ingestor refuses with the per-frame field name
+// the browser producer will need to locate it. Beside the MaxFilePathLength check because it is
+// the same per-frame loop.
+func TestValidatePayload_StackFrameColumn(t *testing.T) {
+	t.Run("a 1-based column is accepted", func(t *testing.T) {
+		p := validPayload()
+		p.Stacktrace = []validation.StackFrame{
+			{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "f", InApp: true},
+		}
+
+		result := validation.ValidatePayload(p)
+
+		require.True(t, result.Valid)
+		require.Empty(t, result.Errors)
+	})
+
+	t.Run("column absent (0) is accepted: 0 is the unknown value, never an error", func(t *testing.T) {
+		p := validPayload()
+		p.Stacktrace = []validation.StackFrame{
+			{File: "main.go", Line: 10, Function: "main", InApp: true},
+		}
+
+		result := validation.ValidatePayload(p)
+
+		require.True(t, result.Valid)
+		require.Empty(t, result.Errors)
+	})
+
+	t.Run("a negative column is rejected with field stacktrace[i].column", func(t *testing.T) {
+		p := validPayload()
+		p.Stacktrace = []validation.StackFrame{
+			{File: "/assets/index-3f2a1c.js", Line: 1, Column: 5, Function: "f", InApp: true},
+			{File: "/assets/vendor-9a0d4e.js", Line: 3, Column: -1, Function: "g", InApp: true},
+		}
+
+		result := validation.ValidatePayload(p)
+
+		require.False(t, result.Valid)
+		require.Len(t, result.Errors, 1)
+		assert.Equal(t, "stacktrace[1].column", result.Errors[0].Field)
+		assert.Equal(t, "stacktrace[1].column must be >= 0", result.Errors[0].Message)
+	})
+
+	t.Run("in_app=false does not bypass the column rule", func(t *testing.T) {
+		p := validPayload()
+		p.Stacktrace = []validation.StackFrame{
+			{File: "node_modules/x.js", Line: 1, Column: -7, Function: "f", InApp: false},
+		}
+
+		result := validation.ValidatePayload(p)
+
+		require.False(t, result.Valid)
+		require.Len(t, result.Errors, 1)
+		assert.Equal(t, "stacktrace[0].column", result.Errors[0].Field)
+	})
+
+	t.Run("the column error is reported beside the file-length error on the same frame", func(t *testing.T) {
+		p := validPayload()
+		p.Stacktrace = []validation.StackFrame{
+			{File: strings.Repeat("a", 513), Line: 1, Column: -1, Function: "f", InApp: true},
+		}
+
+		result := validation.ValidatePayload(p)
+
+		require.False(t, result.Valid)
+		require.Len(t, result.Errors, 2)
+		assert.Equal(t, "stacktrace[0].file", result.Errors[0].Field)
+		assert.Equal(t, "stacktrace[0].column", result.Errors[1].Field)
+	})
+}
+
 func TestIsValidAlphanumeric(t *testing.T) {
 	// isValidAlphanumeric is package-private; we exercise it via the public
 	// ValidatePayload path by observing platform/environment error messages.

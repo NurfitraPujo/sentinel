@@ -1,0 +1,2 @@
+function o(r){if(!Number.isFinite(r.amount))throw new RangeError(`formatMoney: amount is not finite (${r.amount})`);return`${r.currency} ${(r.amount/100).toFixed(2)}`}function u(r,n){if(r.currency!==n.currency)throw new TypeError(`addMoney: currency mismatch ${r.currency} vs ${n.currency}`);return{amount:r.amount+n.amount,currency:r.currency}}function e(r,n){if(n<0||n>100)throw new RangeError(`applyPercent: ${n} is outside 0..100`);return{amount:Math.round(r.amount*(100-n)/100),currency:r.currency}}export{e as a,u as b,o as f};
+//# sourceMappingURL=money-c4af03b2.js.map

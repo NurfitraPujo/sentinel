@@ -113,6 +113,42 @@ const (
 	// distinguishable from any other failure without a label. No alert rule is owed: the catch-up makes
 	// a failure self-healing within the hour.
 	MetricReleaseNextRewriteFailures = "sentinel_release_next_rewrite_failures_total"
+
+	// The six sentinel-sourcemaps §12 metrics. Five are the processor's symbolication stage
+	// (apps/processor-go/symbolicate, wired from service.processEventInternal and recorded through
+	// procmetrics); the sixth is the dashboard's upload route, declared here for the same reason
+	// MetricReleaseNextRewriteFailures records above — the two registries cannot share a constant,
+	// so exactly one Go spelling exists and tests/unit pins it against the TypeScript literal.
+	// No project_id label on any of them (OBSERVABILITY_PLAN.md §5); every label below is a
+	// CLOSED set declared in this file.
+
+	// MetricSymbolicationEvents counts events through §4.4's gate and stage, one per event:
+	// LabelOutcome ∈ SymbolicationEvent* (applied_all, applied_partial, none, skipped_platform,
+	// skipped_no_release, skipped_no_frames). `none` climbing while `sourcemaps` has rows for the
+	// release is the hand-read stand-in for the dormant alert group (§8, decision 32).
+	MetricSymbolicationEvents = "sentinel_symbolication_events_total"
+	// MetricSymbolicationFrames counts frames through the stage, one per frame: LabelOutcome ∈
+	// SymbolicationFrame* (applied and the seven pass-through reasons). A negative-cache hit
+	// re-emits the reason it was cached with, so this counter reflects ongoing breakage, not only
+	// its first sighting.
+	MetricSymbolicationFrames = "sentinel_symbolication_frames_total"
+	// MetricSourcemapFetchDuration is the cold path — one object GET plus one parse — in seconds.
+	// No label.
+	MetricSourcemapFetchDuration = "sentinel_sourcemap_fetch_duration_seconds"
+	// MetricSourcemapCacheBytes is a GAUGE (no _total): the positive cache's current cost in RAW
+	// bytes (the rows' size_bytes, decision 11), which under-reads the parsed maps' RSS — §12's
+	// OOM row and §13 M2 say the RSS is the number decision 11 is judged on, not this.
+	MetricSourcemapCacheBytes = "sentinel_sourcemap_cache_bytes"
+	// MetricSourcemapCacheEvents counts cache behaviour: LabelKind ∈ SourcemapCache* (hit, miss,
+	// negative_hit, evict, oversize). `oversize` HERE is a map larger than the cache bound —
+	// fetched, parsed, not retained; a row over the PARSE cap is never fetched and is
+	// MetricSymbolicationFrames{outcome="oversize"}, not this.
+	MetricSourcemapCacheEvents = "sentinel_sourcemap_cache_events_total"
+	// MetricSourcemapUploads is the DASHBOARD's counter (§4.1; apps/dashboard-web/src/lib/server/
+	// metrics.ts, process-local): LabelOutcome ∈ SourcemapUpload* (created, replaced, unchanged,
+	// rejected, storage_error). No Go process records it; the constant exists so the name is
+	// spelled once in Go and pinned against the TypeScript literal by tests/unit.
+	MetricSourcemapUploads = "sentinel_sourcemap_uploads_total"
 )
 
 // Label keys. Kept few and low-cardinality on purpose: project_id is unbounded and would blow up the
@@ -179,4 +215,53 @@ const (
 	AffectedRollupReasonEmpty       = "empty"        // the key was present and its value was ""
 	AffectedRollupReasonTooLong     = "too_long"     // the value exceeded 255 BYTES (VARCHAR(255) on both side tables)
 	AffectedRollupReasonControlChar = "control_char" // the value carried a rune < 0x20 or 0x7f (NUL cannot be stored in a varchar at all)
+)
+
+// Permitted values for LabelOutcome on MetricSymbolicationEvents (sentinel-sourcemaps §4.4 / §12):
+// the per-event derivation of the frames' outcomes, or the reason §4.4's three-part gate skipped
+// the stage. CLOSED — six values, the contract's table verbatim.
+const (
+	SymbolicationEventAppliedAll       = "applied_all"        // every frame rewritten
+	SymbolicationEventAppliedPartial   = "applied_partial"    // some frames rewritten, some passed through
+	SymbolicationEventNone             = "none"               // the stage ran and rewrote nothing
+	SymbolicationEventSkippedPlatform  = "skipped_platform"   // platform outside SYMBOLICATE_PLATFORMS (or the stage off)
+	SymbolicationEventSkippedNoRelease = "skipped_no_release" // release_version empty after Normalize's fallback
+	SymbolicationEventSkippedNoFrames  = "skipped_no_frames"  // no stack frame at all
+)
+
+// Permitted values for LabelOutcome on MetricSymbolicationFrames (sentinel-sourcemaps §4.4 steps
+// 2–7 / §12): `applied` and the seven pass-through reasons. CLOSED — eight values. The reasons are
+// also what a negative cache entry carries (no_map, fetch_error, map_error, oversize — never
+// timeout, decision 37; never no_mapping, the map is fine), and a hit re-emits its reason here.
+// apps/processor-go/symbolicate's Outcome constants are defined FROM these, never re-typed.
+const (
+	SymbolicationFrameApplied    = "applied"     // rewritten to the original position
+	SymbolicationFrameNoColumn   = "no_column"   // column == 0: a (file, line) lookup would be wrong, not absent
+	SymbolicationFrameNoMap      = "no_map"      // no `sourcemaps` row for (project, release, normalised path)
+	SymbolicationFrameNoMapping  = "no_mapping"  // no segment at or before the column on that line, or a source-less one
+	SymbolicationFrameMapError   = "map_error"   // parse failure, sha256 mismatch, or a recovered panic (decision 19)
+	SymbolicationFrameFetchError = "fetch_error" // the object GET (or the Store) failed
+	SymbolicationFrameTimeout    = "timeout"     // fetch + parse outlived SYMBOLICATE_DEADLINE; the fill continues
+	SymbolicationFrameOversize   = "oversize"    // the row's size_bytes exceeds SOURCEMAP_MAX_PARSE_BYTES; never fetched
+)
+
+// Permitted values for LabelKind on MetricSourcemapCacheEvents (sentinel-sourcemaps §4.4 cache
+// paragraph / §12). CLOSED — five values. apps/processor-go/symbolicate's CacheEventKind
+// constants are defined FROM these.
+const (
+	SourcemapCacheHit         = "hit"          // parsed map served from the positive cache
+	SourcemapCacheMiss        = "miss"         // no entry; the Store was queried
+	SourcemapCacheNegativeHit = "negative_hit" // a negative entry answered, re-emitting its reason
+	SourcemapCacheEvict       = "evict"        // an LRU eviction under SOURCEMAP_CACHE_BYTES
+	SourcemapCacheOversize    = "oversize"     // a map over the cache bound: fetched, parsed, not retained
+)
+
+// Permitted values for LabelOutcome on MetricSourcemapUploads (sentinel-sourcemaps §4.1 / §12) —
+// the dashboard's five, spelled here for the cross-language pin only. CLOSED.
+const (
+	SourcemapUploadCreated      = "created"
+	SourcemapUploadReplaced     = "replaced"
+	SourcemapUploadUnchanged    = "unchanged"
+	SourcemapUploadRejected     = "rejected"
+	SourcemapUploadStorageError = "storage_error"
 )

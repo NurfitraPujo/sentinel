@@ -1,0 +1,16 @@
+{
+  "name": "sentinel-sourcemaps-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The small Vite + TypeScript app behind tests/fixtures/sourcemaps (sentinel-sourcemaps contract §13, decision 39). Its two committed builds, dist-a and dist-b, are the fixture; this package exists only to rebuild them.",
+  "scripts": {
+    "build": "pnpm run build:a && pnpm run build:b",
+    "build:a": "FIXTURE_BUILD=a vite build",
+    "build:b": "FIXTURE_BUILD=b vite build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "5.4.21"
+  }
+}

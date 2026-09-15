@@ -1,10 +1,25 @@
 <script lang="ts">
 	import type { PageData } from './$types';
 	import { untrack } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 
 	let { data } = $props();
 
 	let expandedMetadata = $state(new Set<string>());
+
+	// sentinel-sourcemaps §4.7, flow `D4` — the occurrences currently showing their RAW frames. Per
+	// occurrence, never page-wide (fe.md decisions: two occurrences on one issue can differ in what
+	// was symbolicated). A `SvelteSet`, not `$state(new Set())`: `$state` proxies plain objects and
+	// arrays only, so `.add`/`.delete` on a raw `Set` re-renders nothing.
+	const rawFrames = new SvelteSet<string>();
+
+	function toggleRawFrames(id: string) {
+		if (rawFrames.has(id)) {
+			rawFrames.delete(id);
+		} else {
+			rawFrames.add(id);
+		}
+	}
 
 	function formatDate(date: string | Date | null): string {
 		if (!date) return 'Unknown';
@@ -26,14 +41,41 @@
 		}
 	}
 
-	function formatStackFrame(frame: { file: string; line: number; function: string }): string {
+	// sentinel-sourcemaps §4.7 / flow `D5`: `:column` is appended when present and > 0 — `0` is the
+	// wire's "unknown" (§4.3) and a pre-feature frame has no key at all, so both render exactly the
+	// pre-feature string. The 50-char truncation stays (decision 8: original paths are verbatim).
+	function formatStackFrame(frame: { file: string; line: number; column?: number; function: string }): string {
 		let file = frame.file;
 		if (file.length > 50) {
 			const start = file.slice(0, 20);
 			const end = file.slice(-25);
 			file = start + '...' + end;
 		}
-		return `at ${frame.function} (${file}:${frame.line})`;
+		const column = frame.column && frame.column > 0 ? `:${frame.column}` : '';
+		return `at ${frame.function} (${file}:${frame.line}${column})`;
+	}
+
+	// §4.7 — the per-occurrence symbolication state, derived client-side from the frames (contract
+	// D6: there is no occurrence-level field). `k` counts `symbolicated === true` exactly; a frame
+	// with the key false, or without it, is not symbolicated.
+	function countSymbolicated(frames: StackFrame[]): number {
+		return frames.filter((frame) => frame.symbolicated === true).length;
+	}
+
+	// The badge's text: *Symbolicated* when every frame is, *Partially symbolicated (k of n)* when
+	// some are, `null` — no badge — when none (flows `D1`–`D3`).
+	function symbolicationBadge(frames: StackFrame[]): string | null {
+		const n = frames.length;
+		const k = countSymbolicated(frames);
+		if (n === 0 || k === 0) return null;
+		if (k === n) return 'Symbolicated';
+		return `Partially symbolicated (${k} of ${n})`;
+	}
+
+	// `D4`: in raw mode a frame with `raw` renders `raw`'s values; a frame without `raw` renders as
+	// itself in both modes (it was never rewritten, so its raw form IS its form).
+	function displayedFrame(frame: StackFrame, raw: boolean): { file: string; line: number; column?: number; function: string } {
+		return raw && frame.raw ? frame.raw : frame;
 	}
 
 	function getDateGroup(dateStr: string | Date | null): string {
@@ -87,10 +129,15 @@
 		data.retentionDays < 30 ? ` (data kept for ${data.retentionDays} days)` : ''
 	);
 
+	// The frame as the JSONB stores it. `column`, `symbolicated` and `raw` are sentinel-sourcemaps
+	// §4.7's additions, all optional: a pre-feature occurrence carries none of them.
 	interface StackFrame {
 		file: string;
 		line: number;
 		function: string;
+		column?: number;
+		symbolicated?: boolean;
+		raw?: { file: string; line: number; column?: number; function: string };
 	}
 
 	interface Occurrence {
@@ -553,9 +600,30 @@
 						{/if}
 
 						{#if occurrence.stacktrace && occurrence.stacktrace.length > 0}
+							{@const badge = symbolicationBadge(occurrence.stacktrace)}
+							{@const showRaw = rawFrames.has(occurrence.id)}
+							<!--
+								sentinel-sourcemaps §4.7, flows `D1`–`D5`. The badge and the raw toggle sit on the
+								heading line and exist only when at least one frame is symbolicated — a pre-feature
+								occurrence renders this block exactly as before, heading and frames alike.
+							-->
 							<div class="stacktrace">
-								<h4>Stack Trace</h4>
-								<pre><code>{#each occurrence.stacktrace as frame}{formatStackFrame(frame)}
+								<div class="stacktrace-heading">
+									<h4>Stack Trace</h4>
+									{#if badge}
+										<span class="badge symbolication" data-testid="symbolication-badge">{badge}</span>
+										<button
+											type="button"
+											class="raw-frames-toggle"
+											data-testid="raw-frames-toggle"
+											aria-pressed={showRaw}
+											onclick={() => toggleRawFrames(occurrence.id)}
+										>
+											{showRaw ? 'Show symbolicated frames' : 'Show raw frames'}
+										</button>
+									{/if}
+								</div>
+								<pre><code>{#each occurrence.stacktrace as frame}{formatStackFrame(displayedFrame(frame, showRaw))}
 {/each}</code></pre>
 							</div>
 						{/if}
@@ -911,6 +979,43 @@
 		font-family: var(--font-mono);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+	}
+
+	/* sentinel-sourcemaps §4.7 — the heading line: the h4, then the badge, then the toggle. */
+	.stacktrace-heading {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+		margin-bottom: 0.5rem;
+	}
+
+	.stacktrace-heading h4 {
+		margin-bottom: 0;
+	}
+
+	.badge.symbolication {
+		background: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
+		border-color: transparent;
+	}
+
+	.raw-frames-toggle {
+		margin-left: auto;
+		padding: 0.125rem 0.5rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		font-size: 0.6875rem;
+		font-family: var(--font-mono);
+		cursor: pointer;
+		transition: background 0.15s ease, color 0.15s ease;
+	}
+
+	.raw-frames-toggle:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
 	}
 
 	.stacktrace pre {

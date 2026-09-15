@@ -1,0 +1,2 @@
+import{g as o,b as s}from"./http-609eceeb.js";function i(r){const e=r.toLowerCase().split(/\s+/).filter(t=>t.length>0);if(e.length===0)throw new RangeError("tokenize: the query is empty");return e}function a(r){return[...r].sort((e,t)=>t.score-e.score||e.sku.localeCompare(t.sku))}async function u(r,e=1){const t=i(r),n=await o(`/api/search${s({q:t.join(" "),page:e})}`);return a(n)}function l(r,e){let t=r;for(const n of e)t=t.replaceAll(n,`<mark>${n}</mark>`);return t}export{l as highlight,a as rankHits,u as runSearch,i as tokenize};
+//# sourceMappingURL=search-5b98ebd0.js.map

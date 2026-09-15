@@ -77,6 +77,61 @@ images (`:vX.Y.Z-staging`) → ArgoCD `app set --parameter *.image.tag` + sync.
 Production: tag `vX.Y.Z` (no `-staging` suffix) → same flow against
 `sentinel-production` after the manual environment gate.
 
+### Pre-deploy check before a processor tag (sentinel-sourcemaps)
+
+The processor reads source maps from object storage (contract §4.4) and, with
+`SYMBOLICATE_PLATFORMS` non-empty (the chart default), **refuses to start without
+`S3_ACCESS_KEY` / `S3_SECRET_KEY`** — `log.Fatalf` before it subscribes, so the
+pod CrashLoopBackOffs, never consumes an event, and the rollout stalls on the new
+ReplicaSet while the old pods keep processing (contract §8, decision 32). No
+Prometheus consumes Sentinel's rule group yet (decision 18), so **this render is
+the check** — run it against the env's values before the tag is cut and confirm
+BOTH `secretKeyRef`s are on the processor Deployment:
+
+```bash
+helm template sentinel deploy/helm/sentinel \
+  -f deploy/helm/sentinel/values-huawei-<env>.yml \
+  --show-only templates/processor.yaml \
+  | grep -E -A1 'name: (S3_ACCESS_KEY|S3_SECRET_KEY|GOMEMLIMIT|SYMBOLICATE_|SOURCEMAP_)'
+# Expected (the processor Deployment is the only Deployment in that template):
+#   - name: S3_ACCESS_KEY
+#     valueFrom: { secretKeyRef: { name: sentinel-sentinel-secrets, key: S3_ACCESS_KEY } }
+#   - name: S3_SECRET_KEY
+#     valueFrom: { secretKeyRef: { name: sentinel-sentinel-secrets, key: S3_SECRET_KEY } }
+#   the six knobs SYMBOLICATE_PLATFORMS, SOURCEMAP_CACHE_BYTES, SOURCEMAP_NEGATIVE_TTL,
+#   SOURCEMAP_POSITIVE_TTL, SYMBOLICATE_DEADLINE, SOURCEMAP_MAX_PARSE_BYTES (values.yaml,
+#   config.processor.*), and GOMEMLIMIT "800MiB" — below the 1Gi memory limit (decision 35;
+#   the three numbers are derived together, arithmetic beside processor.gomemlimit in values.yaml).
+# Both secret keys exist in every env's sealedData (they are the dashboard's too). A render
+# missing either secretKeyRef is a processor that will CrashLoopBackOff on this tag.
+```
+
+**Is symbolication working?** No alert says so (the `sentinel-sourcemaps` rule
+group in `templates/prometheusrule.yaml` is dormant until a Prometheus loads it).
+Read it by hand: on a processor pod's `/metrics`,
+`sentinel_symbolication_events_total{outcome="none"}` climbing **while
+`sourcemaps` has rows for that release** (`SELECT count(*) FROM sourcemaps WHERE
+release_version = '<version>'`) means events for a mapped release are not being
+symbolicated — check `sentinel_symbolication_frames_total` by `outcome`
+(`fetch_error` / `map_error` name the cause; `no_column` means the producer sends
+no column). `outcome="none"` with **no** rows is the expected state for a release
+whose maps were never uploaded.
+
+**`RESTARTS` climbing on a processor pod is now two signals, not one.** Read
+`lastState.terminated.reason` on the pod before assuming memory:
+
+- `Error`, last log line naming `S3_ACCESS_KEY` / `S3_SECRET_KEY` → the startup
+  fatal above: the chart release is missing the secret refs (or the Secret the
+  keys). Fix the chart/secret; nothing was consumed, nothing to replay.
+- `OOMKilled` → the parsed maps outgrew `1Gi`. `GOMEMLIMIT` (`800MiB`) makes the
+  runtime collect first, but the cache accounts **raw** bytes and holds parsed maps
+  that are ~7.7× raw (§13 M2), which is why `SOURCEMAP_CACHE_BYTES` is 64 MiB in the
+  chart, not the code's 128 MiB — the arithmetic is beside `processor.gomemlimit` in
+  values.yaml. Levers, in order: `SOURCEMAP_MAX_PARSE_BYTES` (keep the biggest
+  maps out of RSS), `SOURCEMAP_CACHE_BYTES` down, or the memory limit up with
+  `GOMEMLIMIT` following it (contract §12, decisions 11, 35, 38). In-flight events
+  are redelivered by NATS and a redelivery can land on a second issue (Known limit 6).
+
 ## 3. Rollback
 
 ```bash
@@ -221,3 +276,7 @@ running new-tag processor that is an ingest outage.
 | Large uploads fail, small work | `S3_PUBLIC_ENDPOINT` not browser-reachable | must resolve from end-user browsers (DEPLOYMENT.md §2) |
 | Dashboard 503 on repo credentials | `SENTINEL_ENCRYPTION_KEY` unset/invalid | must be base64 of exactly 32 bytes |
 | Cron 401s | `CRON_SECRET` mismatch | retention CronJob reads the same chart Secret |
+| Processor `CrashLoopBackOff`, `RESTARTS` climbing, `lastState.terminated.reason: Error` | processor rendered without `S3_ACCESS_KEY`/`S3_SECRET_KEY` while `SYMBOLICATE_PLATFORMS` is non-empty (startup fatal, contract decision 32) | last log line names the two variables; the §2 pre-deploy render above |
+| Processor `RESTARTS` climbing, `lastState.terminated.reason: OOMKilled` | parsed source maps exceed `1Gi` despite `GOMEMLIMIT` | §2's RESTARTS note: `SOURCEMAP_MAX_PARSE_BYTES`, `SOURCEMAP_CACHE_BYTES`, or the limit + `GOMEMLIMIT` |
+| Browser events for a mapped release stay unsymbolicated | maps uploaded after the events (Known limit 1), no `column` from the producer, or storage unreachable from the processor | `sentinel_symbolication_events_total{outcome="none"}` vs `sourcemaps` rows; `frames_total` by `outcome` |
+| `POST /api/sourcemaps` 413 before the route runs | `BODY_SIZE_LIMIT` on the dashboard below the request (chart default `110M`) | `config.dashboard.bodySizeLimit`; the route's own caps are `SOURCEMAP_MAX_*` |

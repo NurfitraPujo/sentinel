@@ -14,6 +14,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/google/uuid"
@@ -37,6 +38,15 @@ type ProcessorService struct {
 	indexer     *indexer.Indexer
 	degradation *degradation.GracefulDegradation
 	alerts      *alerts.Dispatcher
+
+	// symbolicator and symPlatforms are sentinel-sourcemaps §4.4's stage and its gate set, wired by
+	// EnableSymbolication from main.go before Subscribe. Both zero until then: the gate refuses
+	// every event as skipped_platform (counted), nothing is fetched, and fingerprint.Compute's
+	// build-hash normalisation — which follows the same set — is off. That is exactly the
+	// SYMBOLICATE_PLATFORMS="" kill switch (decision 27), and also what every integration test
+	// that constructs NewProcessorService(pool) without wiring the stage gets.
+	symbolicator *symbolicate.Service
+	symPlatforms []string
 }
 
 func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
@@ -72,6 +82,79 @@ func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
 // override that wiring.
 func (s *ProcessorService) Alerts() *alerts.Dispatcher {
 	return s.alerts
+}
+
+// EnableSymbolication wires sentinel-sourcemaps §4.4's stage into processEventInternal: cfg is
+// symbolicate.ParseConfig's result (the six knobs), fetcher the object-storage GET (an S3Fetcher
+// in main.go; a stub in tests). The stage's Store is this service's own store.LookupSourcemap, so
+// the lookup is always scoped by the project id ResolveProjectID returned — the tenancy rule of
+// §4.4 step 3 — and its Observer is the procmetrics adapter below. cfg.Platforms becomes both the
+// gate set and Compute's normalisation set.
+//
+// Called once, from main.go, AFTER decision 32's startup check passed and BEFORE Subscribe; with
+// cfg.Enabled() false (SYMBOLICATE_PLATFORMS set and empty) it wires nothing and returns nil, and
+// the service behaves as it does before the call. A second call replaces the stage; the previous
+// one's background fills are not waited for.
+func (s *ProcessorService) EnableSymbolication(cfg symbolicate.Config, fetcher symbolicate.Fetcher) error {
+	if !cfg.Enabled() {
+		s.symbolicator, s.symPlatforms = nil, nil
+		return nil
+	}
+	svc, err := symbolicate.New(cfg, symbolicate.StoreFunc(s.store.LookupSourcemap), fetcher,
+		symbolicate.WithObserver(symbolicationObserver{}))
+	if err != nil {
+		return fmt.Errorf("symbolication: %w", err)
+	}
+	s.symbolicator = svc
+	s.symPlatforms = cfg.Platforms
+	return nil
+}
+
+// CloseSymbolication waits for the stage's in-flight background fills (decision 37) so none
+// outlives the process's storage client; main.go defers it. A no-op when the stage is off.
+func (s *ProcessorService) CloseSymbolication() {
+	if s.symbolicator != nil {
+		s.symbolicator.Close()
+	}
+}
+
+// symbolicationObserver adapts symbolicate.Observer — the stage's seam for what only it can see
+// (cache events, the cache's byte total, the cold-path duration) — onto procmetrics' three
+// recorders. It lives here rather than in procmetrics because procmetrics is a leaf package with
+// no apps/processor-go-internal imports (its package doc says why), and the Observer's method
+// signatures name symbolicate's types.
+type symbolicationObserver struct{}
+
+func (symbolicationObserver) CacheEvent(kind symbolicate.CacheEventKind) {
+	procmetrics.RecordSourcemapCacheEvent(string(kind))
+}
+func (symbolicationObserver) CacheBytes(current int64) { procmetrics.SetSourcemapCacheBytes(current) }
+func (symbolicationObserver) FetchDuration(d time.Duration) {
+	procmetrics.RecordSourcemapFetchDuration(d)
+}
+
+// symbolicate is §4.4's stage as processEventInternal calls it: the three-part gate, then
+// event.Symbolicate (the rewrite onto evt.Stacktrace — Symbolicated and Raw for an applied
+// frame, NOTHING for one that passed through), then the metrics: one events_total per event
+// (the skipped_* reason, or the derivation of the frames' outcomes), one frames_total per frame
+// the gate admitted. projectID is ResolveProjectID's return, never anything from a frame. It
+// never fails the event (D7).
+func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEvent, projectID string) {
+	ok, skipped := symbolicate.Gate(s.symPlatforms, evt.Platform, evt.ReleaseVersion, len(evt.Stacktrace))
+	if !ok || s.symbolicator == nil {
+		if ok {
+			// Unreachable by construction (EnableSymbolication sets both or neither), kept so a
+			// future split of the two fields cannot turn into a nil dereference on the hot path.
+			skipped = symbolicate.EventSkippedPlatform
+		}
+		procmetrics.RecordSymbolicationEvent(ctx, string(skipped))
+		return
+	}
+	res := evt.Symbolicate(ctx, s.symbolicator, projectID)
+	for _, o := range res.Outcomes {
+		procmetrics.RecordSymbolicationFrame(ctx, string(o))
+	}
+	procmetrics.RecordSymbolicationEvent(ctx, string(res.EventOutcome()))
 }
 
 // ProcessEvent is the entry point the NATS subscriber calls per message. Its
@@ -196,9 +279,12 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		return false, nats.Permanent(err)
 	}
 
+	// No fingerprint on this line any more: at this point evt.Fingerprint is the client's value or
+	// "" — identity is computed below, after the project is resolved and the frames symbolicated
+	// (sentinel-sourcemaps §4.4), and logged there.
 	slog.InfoContext(ctx, "Processing event",
 		slog.String("project", evt.ProjectKey), slog.String("project_id", evt.ProjectID),
-		slog.String("error_class", evt.ErrorClass), slog.String("fingerprint", evt.Fingerprint),
+		slog.String("error_class", evt.ErrorClass),
 		slog.String("release_version", evt.ReleaseVersion))
 
 	var projectID string
@@ -207,27 +293,29 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// sentinel-project-environments §4.9: part of the issue's identity, not just the
 		// occurrence's. Taken from the event (§4.8) — the registry is never consulted here.
 		Environment: evt.Environment,
-		Fingerprint: evt.Fingerprint,
-		Message:     evt.Message,
-		ErrorClass:  evt.ErrorClass,
-		Status:      "unresolved",
-		FirstSeen:   evt.Timestamp,
-		LastSeen:    evt.Timestamp,
+		// Fingerprint is set below, once the frames are final (§4.4): it used to be copied here
+		// from Deserialize's computation, which ran before any project lookup could happen.
+		Message:    evt.Message,
+		ErrorClass: evt.ErrorClass,
+		Status:     "unresolved",
+		FirstSeen:  evt.Timestamp,
+		LastSeen:   evt.Timestamp,
 	}
 
-	stacktraceJSON, _ := json.Marshal(evt.Stacktrace)
 	metadataJSON, _ := json.Marshal(evt.Metadata)
 	occ := &store.ErrorOccurrence{
 		ID:             uuid.New().String(),
 		Environment:    evt.Environment,
 		Platform:       evt.Platform,
 		ReleaseVersion: evt.ReleaseVersion,
-		Stacktrace:     stacktraceJSON,
-		Metadata:       metadataJSON,
-		TraceID:        evt.TraceID,
-		SpanID:         evt.SpanID,
-		CreatedAt:      evt.Timestamp,
-		EventID:        evt.EventID,
+		// Stacktrace is marshalled below, AFTER symbolication — marshalling it here, as this code
+		// used to, would store the frames as sent and lose the rewrite (§4.4 step 6's
+		// `symbolicated`/`raw` record lives in this JSONB, decision D6).
+		Metadata:  metadataJSON,
+		TraceID:   evt.TraceID,
+		SpanID:    evt.SpanID,
+		CreatedAt: evt.Timestamp,
+		EventID:   evt.EventID,
 		// sentinel-affected-users §4.3: the pre-normalisation, decision-5-bounded identifiers and the
 		// reason each was dropped when it was — read by event.Normalize (decision 3), never from
 		// evt.Metadata, which by now holds "<UUID>" where a UUID was. StoreEvent writes the side
@@ -251,6 +339,21 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 			return classifyProjectLookupError(err)
 		}
 		issue.ProjectID = projectID
+
+		// sentinel-sourcemaps §4.4, the order the contract fixes: the project id is known (above),
+		// the frames are symbolicated (a child span — it can spend up to SYMBOLICATE_DEADLINE on a
+		// cold map), THEN the fingerprint is computed over the frames as they now are, and only
+		// then does the issue take its identity and the occurrence its JSONB. A client fingerprint
+		// without override survives verbatim through ComputeFingerprint's early return, frames
+		// rewritten or not (flow S7).
+		_ = withSpan(ctx, "processor.symbolicate", func(ctx context.Context) error {
+			s.symbolicate(ctx, evt, projectID)
+			return nil
+		})
+		evt.ComputeFingerprint(s.symPlatforms)
+		issue.Fingerprint = evt.Fingerprint
+		occ.Stacktrace, _ = json.Marshal(evt.Stacktrace)
+		slog.InfoContext(ctx, "Fingerprint computed", slog.String("fingerprint", evt.Fingerprint))
 
 		// StoreEvent (docs/plans/IDEMPOTENCY_PLAN.md D-c) folds the issue upsert/regression
 		// bookkeeping and the event_id-deduplicated occurrence insert into ONE transaction — this

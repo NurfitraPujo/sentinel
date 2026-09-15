@@ -15,6 +15,7 @@ func MapPayloadToEvent(payload *validation.ErrorPayload) *sentinelv1.ErrorEvent 
 			Line:     frame.Line,
 			Function: frame.Function,
 			InApp:    frame.InApp,
+			Column:   frame.Column,
 		})
 	}
 

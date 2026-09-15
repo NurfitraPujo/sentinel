@@ -56,6 +56,19 @@ var (
 	// dashboard's registry (metrics.ts), which is why a label would be wrong rather than merely
 	// unnecessary: the two series are meant to sum by name at the scrape (decision 30).
 	releaseNextRewriteFailed metric.Int64Counter
+
+	// sentinel-sourcemaps §12: the five processor instruments of the symbolication stage
+	// (apps/processor-go/symbolicate). The two _total counters carry ONE label each from the closed
+	// sets obs.go declares (SymbolicationEvent*, SymbolicationFrame*); the cache counter carries
+	// obs.LabelKind from obs.SourcemapCache*; the histogram and the gauge are unlabelled. Never a
+	// project_id, never a path. The gauge is a synchronous Int64Gauge because the stage reports the
+	// byte total on every change through its Observer seam; an observable one would need a second
+	// path into the cache.
+	symbolicationEvents    metric.Int64Counter
+	symbolicationFrames    metric.Int64Counter
+	sourcemapFetchDuration metric.Float64Histogram
+	sourcemapCacheBytes    metric.Int64Gauge
+	sourcemapCacheEvents   metric.Int64Counter
 )
 
 func init() {
@@ -146,6 +159,56 @@ func init() {
 	if err != nil {
 		slog.Error("procmetrics: failed to create release next rewrite failure counter", slog.String("error", err.Error()))
 		releaseNextRewriteFailed = nil
+	}
+
+	symbolicationEvents, err = meter.Int64Counter(
+		obs.MetricSymbolicationEvents,
+		metric.WithDescription("Count of events through the symbolication gate and stage by outcome (applied_all, applied_partial, none, skipped_platform, skipped_no_release, skipped_no_frames)"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create symbolication events counter", slog.String("error", err.Error()))
+		symbolicationEvents = nil
+	}
+
+	symbolicationFrames, err = meter.Int64Counter(
+		obs.MetricSymbolicationFrames,
+		metric.WithDescription("Count of stack frames through the symbolication stage by outcome (applied, no_column, no_map, no_mapping, map_error, fetch_error, timeout, oversize); a negative-cache hit re-emits its reason"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create symbolication frames counter", slog.String("error", err.Error()))
+		symbolicationFrames = nil
+	}
+
+	// Same buckets as processDuration: the cold path is one object GET plus one parse, and §13 M2
+	// reads its p95 against a 500 ms shape number on compose.
+	sourcemapFetchDuration, err = meter.Float64Histogram(
+		obs.MetricSourcemapFetchDuration,
+		metric.WithDescription("Time spent fetching and parsing one sourcemap on the cold path (object GET + parse)"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create sourcemap fetch duration histogram", slog.String("error", err.Error()))
+		sourcemapFetchDuration = nil
+	}
+
+	sourcemapCacheBytes, err = meter.Int64Gauge(
+		obs.MetricSourcemapCacheBytes,
+		metric.WithDescription("Current cost of the sourcemap positive cache in raw bytes (the rows' size_bytes, not the parsed size)"),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create sourcemap cache bytes gauge", slog.String("error", err.Error()))
+		sourcemapCacheBytes = nil
+	}
+
+	sourcemapCacheEvents, err = meter.Int64Counter(
+		obs.MetricSourcemapCacheEvents,
+		metric.WithDescription("Count of sourcemap cache events by kind (hit, miss, negative_hit, evict, oversize)"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create sourcemap cache events counter", slog.String("error", err.Error()))
+		sourcemapCacheEvents = nil
 	}
 }
 
@@ -256,5 +319,54 @@ func RecordAlertSuppressedByEnvironment(ctx context.Context) {
 func SetAlertConfigsEnvironmentScoped(ctx context.Context, n int) {
 	if alertConfigsEnvironmentScoped != nil {
 		alertConfigsEnvironmentScoped.Record(ctx, int64(n))
+	}
+}
+
+// RecordSymbolicationEvent records one event's pass through sentinel-sourcemaps §4.4's gate and
+// stage: outcome is one of obs.SymbolicationEvent* — the derivation of the frames' outcomes
+// (applied_all / applied_partial / none) when the stage ran, or the skipped_* reason when the gate
+// refused it. Exactly one per delivery that reached the stage, recorded by
+// service.(*ProcessorService).symbolicate before the fingerprint is computed; a delivery that
+// failed to resolve its project never gets here.
+func RecordSymbolicationEvent(ctx context.Context, outcome string) {
+	if symbolicationEvents != nil {
+		symbolicationEvents.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelOutcome, outcome)))
+	}
+}
+
+// RecordSymbolicationFrame records one frame's outcome through the stage: obs.SymbolicationFrame*
+// (`applied` or one of the seven pass-through reasons). One per frame of every event the gate
+// admitted; a negative-cache hit re-emits the reason the entry was cached with, which is what
+// makes ongoing breakage visible on this counter (§12).
+func RecordSymbolicationFrame(ctx context.Context, outcome string) {
+	if symbolicationFrames != nil {
+		symbolicationFrames.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelOutcome, outcome)))
+	}
+}
+
+// RecordSourcemapFetchDuration records one cold-path fetch + parse (§12's
+// sentinel_sourcemap_fetch_duration_seconds). Reached through symbolicate.Observer.FetchDuration,
+// which carries no context: the fill may be running in the background after the event that
+// started it was stored (decision 37), so there is no request context to attach.
+func RecordSourcemapFetchDuration(d time.Duration) {
+	if sourcemapFetchDuration != nil {
+		sourcemapFetchDuration.Record(context.Background(), d.Seconds())
+	}
+}
+
+// SetSourcemapCacheBytes publishes the positive cache's current raw-byte cost after a change. A
+// Set, not an Add: an eviction moves it DOWN, which is why §12 made it a gauge.
+func SetSourcemapCacheBytes(n int64) {
+	if sourcemapCacheBytes != nil {
+		sourcemapCacheBytes.Record(context.Background(), n)
+	}
+}
+
+// RecordSourcemapCacheEvent records one cache event: kind is one of obs.SourcemapCache* (hit,
+// miss, negative_hit, evict, oversize — the last being a map over the CACHE bound, fetched and not
+// retained; a row over the parse cap never reaches the cache and is a frame outcome instead).
+func RecordSourcemapCacheEvent(kind string) {
+	if sourcemapCacheEvents != nil {
+		sourcemapCacheEvents.Add(context.Background(), 1, metric.WithAttributes(attribute.String(obs.LabelKind, kind)))
 	}
 }

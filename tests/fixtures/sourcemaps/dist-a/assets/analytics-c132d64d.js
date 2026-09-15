@@ -1,0 +1,2 @@
+import{p as r}from"./http-609eceeb.js";const n=[];function i(t,e={}){if(t.length===0)throw new RangeError("track: the event name is empty");n.push({name:t,at:Date.now(),props:e})}function a(){return n.length}async function c(){if(n.length===0)return 0;const t=n.splice(0,n.length);return await r("/api/events",t),t.length}function p(t){i("page_view",{path:t})}export{c as flush,p as pageView,a as pending,i as track};
+//# sourceMappingURL=analytics-c132d64d.js.map

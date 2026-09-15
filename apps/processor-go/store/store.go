@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,6 +47,12 @@ type QueryStore interface {
 	// has its own inline SELECT — so changing only this function would leave the write path grouping
 	// across environments while every reader believed it did not.
 	GetIssueIDByFingerprint(ctx context.Context, projectID, environment, fingerprint string) (string, error)
+	// LookupSourcemap is sentinel-sourcemaps §4.4 step 3: the symbolication stage's read of
+	// `sourcemaps` on §4.5's UNIQUE (project_id, release_version, minified_path). It has
+	// symbolicate.Store's Lookup signature so the service wires it as
+	// symbolicate.StoreFunc(s.store.LookupSourcemap). (nil, nil) is "no row" -- the stage's
+	// `no_map`. See the method doc on pgStore.LookupSourcemap for the tenancy rule.
+	LookupSourcemap(ctx context.Context, projectID, releaseVersion, minifiedPath string) (*symbolicate.Sourcemap, error)
 }
 
 // CommandStore defines the "Write" side of the Issue store.
@@ -1228,6 +1235,33 @@ func (s *pgStore) ResolveProjectID(ctx context.Context, projectID, projectKey st
 		return "", fmt.Errorf("project not found: %s", projectID)
 	}
 	return id, err
+}
+
+// LookupSourcemap reads the one `sourcemaps` row for (projectID, releaseVersion, minifiedPath)
+// through the composite UNIQUE index (§4.5). projectID MUST be ResolveProjectID's return -- the
+// resolved tenant of the authenticated event, the value issue.ProjectID takes -- never anything
+// read from a frame: the row is scoped by it, so project A's map is unreachable from project B's
+// event whatever path B's frames name (contract risk surface `tenancy`; §11's tenancy case in
+// tests/integration proves it against a seeded database). minifiedPath is the frame's file
+// after symbolicate.NormalizePath, the same rule the upload route stored the row under.
+//
+// pgx.ErrNoRows is (nil, nil): a missing map is the stage's `no_map`, negatively cached, and not
+// an error. Any other error is returned as-is (the stage reads it as a transient `fetch_error`).
+func (s *pgStore) LookupSourcemap(ctx context.Context, projectID, releaseVersion, minifiedPath string) (*symbolicate.Sourcemap, error) {
+	var sm symbolicate.Sourcemap
+	err := s.db.QueryRow(ctx,
+		`SELECT id::text, project_id::text, release_version, minified_path, storage_key, size_bytes, sha256
+		   FROM sourcemaps
+		  WHERE project_id = $1 AND release_version = $2 AND minified_path = $3`,
+		projectID, releaseVersion, minifiedPath,
+	).Scan(&sm.ID, &sm.ProjectID, &sm.ReleaseVersion, &sm.MinifiedPath, &sm.StorageKey, &sm.SizeBytes, &sm.SHA256)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup sourcemap: %w", err)
+	}
+	return &sm, nil
 }
 
 func (s *pgStore) GetProjectByKey(ctx context.Context, projectKey string) (string, error) {

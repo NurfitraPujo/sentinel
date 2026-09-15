@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	_ "unsafe"
@@ -43,6 +44,21 @@ func marshalProtoEvent(t *testing.T, protoEvent *sentinelv1.ErrorEvent) []byte {
 	data, err := proto.Marshal(protoEvent)
 	require.NoError(t, err)
 	return data
+}
+
+// deserializeAndFingerprint is the processor's order since sentinel-sourcemaps §4.4 (be.md task
+// 4): event.Deserialize, then — after processEventInternal has resolved the project and run the
+// symbolication stage — ErrorEvent.ComputeFingerprint. The TestDeserialize_*Fingerprint* cases
+// below pinned "computed after Normalize, custom fingerprint verbatim, override discards" when
+// the computation was the last thing Deserialize did; they moved to this call with it, none
+// deleted (contract §11's "existing, moved" boundary). nil is the gate set with the stage off —
+// these events are platform `go`, outside it either way, so the hash input is ccc52aa's.
+func deserializeAndFingerprint(t *testing.T, protoEvent *sentinelv1.ErrorEvent) *event.ErrorEvent {
+	t.Helper()
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err)
+	got.ComputeFingerprint(nil)
+	return got
 }
 
 func TestValidateEvent(t *testing.T) {
@@ -107,6 +123,8 @@ func TestDeserialize_HappyPathMapsAllFields(t *testing.T) {
 	protoEvent.Stacktrace = []*sentinelv1.StackFrame{
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 		{File: "runtime.go", Line: 7, Function: "runtime.goexit", InApp: false},
+		// sentinel-sourcemaps §4.3: proto field 5, a browser frame's 1-based column.
+		{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "onClick", InApp: true},
 	}
 	// event_id (proto field 17, docs/plans/IDEMPOTENCY_PLAN.md W0/W2). This function has silently
 	// dropped a newly-added field TWICE before (S5, S6) — asserting it here is what would have caught
@@ -131,7 +149,43 @@ func TestDeserialize_HappyPathMapsAllFields(t *testing.T) {
 	assert.Equal(t, []event.StackFrame{
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 		{File: "runtime.go", Line: 7, Function: "runtime.goexit", InApp: false},
+		{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "onClick", InApp: true},
 	}, got.Stacktrace)
+}
+
+// TestDeserialize_StackFrameColumnRoundTripsAndIsOmittedWhenZero pins sentinel-sourcemaps §4.3's
+// processor half: proto field 5 is copied onto event.StackFrame.Column, and the JSON the occurrence
+// stores (processor_service.go marshals event.Stacktrace verbatim into error_occurrences.stacktrace)
+// carries "column" ONLY when there is one -- a pre-feature message (no field 5) and a no-column
+// frame serialise identically, so nothing downstream can tell the two apart or has to.
+func TestDeserialize_StackFrameColumnRoundTripsAndIsOmittedWhenZero(t *testing.T) {
+	protoEvent := validProtoEvent()
+	protoEvent.Platform = "javascript"
+	protoEvent.Stacktrace = []*sentinelv1.StackFrame{
+		{File: "/assets/index-3f2a1c.js", Line: 1, Column: 1234, Function: "onClick", InApp: true},
+		{File: "/assets/vendor-9a0d4e.js", Line: 12, Function: "dispatch", InApp: false},
+	}
+
+	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+	require.NoError(t, err)
+	require.Len(t, got.Stacktrace, 2)
+	assert.Equal(t, int32(1234), got.Stacktrace[0].Column)
+	assert.Equal(t, int32(0), got.Stacktrace[1].Column)
+
+	stored, err := json.Marshal(got.Stacktrace)
+	require.NoError(t, err)
+	var frames []map[string]any
+	require.NoError(t, json.Unmarshal(stored, &frames))
+	require.Len(t, frames, 2)
+	assert.Equal(t, float64(1234), frames[0]["column"], "the frame with a column stores it")
+	_, hasColumn := frames[1]["column"]
+	assert.False(t, hasColumn, "a zero column must not appear in the stored JSONB (omitempty): %s", stored)
+	// The other four keys are as before on both frames -- omitempty touches only column.
+	for _, frame := range frames {
+		for _, key := range []string{"file", "line", "function", "in_app"} {
+			assert.Contains(t, frame, key)
+		}
+	}
 }
 
 // TestDeserialize_EventIDSurvivesNormalizeByteIdentical pins D-h
@@ -242,12 +296,11 @@ func TestDeserialize_ComputesFingerprintWhenMissing(t *testing.T) {
 		{File: "main.go", Line: 42, Function: "main.process", InApp: true},
 	}
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 
-	// sentinel-project-environments §4.9: Deserialize passes event.Environment into the config, so
-	// the expectation carries it too. Without it this assertion would pass for a call site that
-	// silently dropped the environment out of the hash input.
+	// sentinel-project-environments §4.9: ComputeFingerprint passes event.Environment into the
+	// config, so the expectation carries it too. Without it this assertion would pass for a call
+	// site that silently dropped the environment out of the hash input.
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
@@ -262,8 +315,7 @@ func TestDeserialize_UsesProvidedFingerprintWithoutOverride(t *testing.T) {
 	protoEvent.Fingerprint = "provided-fingerprint"
 	protoEvent.FingerprintOverride = false
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, "provided-fingerprint", got.Fingerprint)
 }
 
@@ -297,10 +349,8 @@ func TestDeserialize_CustomFingerprintLeavesTheEnvironmentIntact(t *testing.T) {
 	stagEvent.Environment = "staging"
 	stagEvent.Fingerprint = shared
 
-	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
-	require.NoError(t, err)
-	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
-	require.NoError(t, err)
+	prod := deserializeAndFingerprint(t, prodEvent)
+	stag := deserializeAndFingerprint(t, stagEvent)
 
 	// The client's value survives in both — §4.9 left that early return alone, so the identical
 	// string does arrive from two environments.
@@ -316,8 +366,8 @@ func TestDeserialize_CustomFingerprintLeavesTheEnvironmentIntact(t *testing.T) {
 
 // The companion for the computed path, which decision 7 DOES reach: two events identical but for
 // their environment must not hash to the same fingerprint. Drop `Environment` from the
-// FingerprintConfig at event.go:190 and this fails, while every other fingerprint test here keeps
-// passing — they each assert one environment at a time.
+// FingerprintConfig in event.ComputeFingerprint and this fails, while every other fingerprint
+// test here keeps passing — they each assert one environment at a time.
 func TestDeserialize_ComputedFingerprintDiffersByEnvironment(t *testing.T) {
 	prodEvent := validProtoEvent()
 	prodEvent.Environment = "production"
@@ -327,10 +377,8 @@ func TestDeserialize_ComputedFingerprintDiffersByEnvironment(t *testing.T) {
 	stagEvent.Environment = "staging"
 	stagEvent.Fingerprint = ""
 
-	prod, err := event.Deserialize(marshalProtoEvent(t, prodEvent))
-	require.NoError(t, err)
-	stag, err := event.Deserialize(marshalProtoEvent(t, stagEvent))
-	require.NoError(t, err)
+	prod := deserializeAndFingerprint(t, prodEvent)
+	stag := deserializeAndFingerprint(t, stagEvent)
 
 	require.NotEmpty(t, prod.Fingerprint)
 	assert.NotEqual(t, prod.Fingerprint, stag.Fingerprint,
@@ -342,8 +390,7 @@ func TestDeserialize_ComputesFingerprintWhenOverrideIsTrue(t *testing.T) {
 	protoEvent.Fingerprint = ""
 	protoEvent.FingerprintOverride = true
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
@@ -355,8 +402,7 @@ func TestDeserialize_RecomputesProvidedFingerprintWhenOverrideIsTrue(t *testing.
 	protoEvent.Fingerprint = "provided-fingerprint"
 	protoEvent.FingerprintOverride = true
 
-	got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
-	require.NoError(t, err)
+	got := deserializeAndFingerprint(t, protoEvent)
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",

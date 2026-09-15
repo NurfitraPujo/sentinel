@@ -189,17 +189,24 @@ async function sweepAffectedSideTable(
 // R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): exported so the report delete route
 // (routes/api/organizations/[orgId]/reports/[issueId]/+server.ts) reuses this exact helper
 // instead of growing a second copy of the same best-effort-delete-and-log pattern.
-export async function bestEffortDeleteObjects(storageKeys: string[], context: string): Promise<void> {
+// sentinel-sourcemaps §4.1: returns the keys whose delete FAILED (still logged, still swallowed)
+// so the sourcemap upload route can count each one under `uploads_total{outcome="storage_error"}`
+// -- a failed `replaced` delete is one more permanent orphan, and §4.1 says every one is counted.
+// Every earlier caller ignores the return value, so this is additive.
+export async function bestEffortDeleteObjects(storageKeys: string[], context: string): Promise<string[]> {
 	if (storageKeys.length === 0 || !isStorageConfigured()) {
-		return;
+		return [];
 	}
+	const failed: string[] = [];
 	for (const key of storageKeys) {
 		try {
 			await deleteObject(key);
 		} catch (err) {
 			log.error('retention.attachment_storage_delete_failed', { context, key, error: err });
+			failed.push(key);
 		}
 	}
+	return failed;
 }
 
 export async function cleanupRetainedData(

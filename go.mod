@@ -11,6 +11,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lib/pq v1.12.3
+	github.com/minio/minio-go/v7 v7.1.0
 	github.com/nats-io/nats.go v1.52.0
 	github.com/nats-io/nkeys v0.4.15
 	github.com/redis/go-redis/v9 v9.19.0
@@ -20,6 +21,20 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/redis v0.42.0
 	google.golang.org/protobuf v1.36.11
+)
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/go-ini/ini v1.67.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
+	github.com/klauspost/crc32 v1.3.0 // indirect
+	github.com/minio/crc64nvme v1.1.1 // indirect
+	github.com/minio/md5-simd v1.1.2 // indirect
+	github.com/philhofer/fwd v1.2.0 // indirect
+	github.com/rs/xid v1.6.0 // indirect
+	github.com/tinylib/msgp v1.6.1 // indirect
+	github.com/zeebo/xxh3 v1.1.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
 )
 
 require (
@@ -110,5 +125,5 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260420184626-e10c466a9529 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	gopkg.in/yaml.v3 v3.0.1
 )

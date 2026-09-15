@@ -1,5 +1,6 @@
 {{- $img := .Values.images.processor -}}
 {{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $secret := include "sentinel.secretName" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -71,6 +72,36 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: processor-go
             {{- include "sentinel.otelEnv" . | nindent 12 }}
+            # sentinel-sourcemaps §12: the processor reads maps from the bucket the dashboard
+            # writes them to (§4.4). S3_ENDPOINT/S3_BUCKET already arrive via the ConfigMap's
+            # envFrom above; the two credentials are the same Secret keys dashboard.yaml mounts.
+            # With SYMBOLICATE_PLATFORMS non-empty and these two absent, the processor
+            # log.Fatalf's before it subscribes and CrashLoopBackOffs (decision 32) — the chart,
+            # not an alert, is what keeps them together. RUNBOOK.md §2 renders this Deployment
+            # and checks for both secretKeyRefs before a processor tag is cut.
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_SECRET_KEY } }
+            # The six symbolication knobs. Value syntax and meaning are documented beside each
+            # key in values.yaml (config.processor.*); every one is a string on the wire.
+            - name: SYMBOLICATE_PLATFORMS
+              value: {{ .Values.config.processor.symbolicatePlatforms | quote }}
+            - name: SOURCEMAP_CACHE_BYTES
+              value: {{ .Values.config.processor.sourcemapCacheBytes | quote }}
+            - name: SOURCEMAP_NEGATIVE_TTL
+              value: {{ .Values.config.processor.sourcemapNegativeTtl | quote }}
+            - name: SOURCEMAP_POSITIVE_TTL
+              value: {{ .Values.config.processor.sourcemapPositiveTtl | quote }}
+            - name: SYMBOLICATE_DEADLINE
+              value: {{ .Values.config.processor.symbolicateDeadline | quote }}
+            - name: SOURCEMAP_MAX_PARSE_BYTES
+              value: {{ .Values.config.processor.sourcemapMaxParseBytes | quote }}
+            # Go runtime soft memory limit, below resources.limits.memory (decision 35) so the
+            # collector runs before the kernel's OOM killer does; see processor.gomemlimit in
+            # values.yaml for the arithmetic that derives it.
+            - name: GOMEMLIMIT
+              value: {{ .Values.processor.gomemlimit | quote }}
           livenessProbe:
             httpGet: { path: {{ .Values.processor.livenessPath }}, port: health }
             initialDelaySeconds: 10

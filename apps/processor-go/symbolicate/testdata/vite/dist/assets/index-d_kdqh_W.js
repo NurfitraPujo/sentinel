@@ -1,0 +1,2 @@
+function r(n){let o=0;for(const t of n.items)o+=t;return o}function c(n,o){if(n.coupon===void 0)return o;if(n.coupon!=="SAVE10")throw new Error("unknown coupon "+n.coupon);return o*.9}class e{constructor(o){this.cart=o}pay(){const o=r(this.cart),t=c(this.cart,o);if(t<0)throw new RangeError("negative total");return t}}const u=new e({items:[10,20,30],coupon:"BOGUS"});console.log(u.pay());
+//# sourceMappingURL=index-d_kdqh_W.js.map

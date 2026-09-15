@@ -148,6 +148,31 @@ describe('csrfHandle (§4.5 -- the intake exemption, and only that)', () => {
 		expect(resolve).toHaveBeenCalledTimes(1);
 	});
 
+	// sentinel-sourcemaps §2.1, flow U17: outside `dev`, a CI curl's Origin-less multipart POST
+	// reaches the route (whatever the route then answers -- 401/201 -- is the route's), never
+	// csrfHandle's 403. Without `/api/sourcemaps` in CSRF_EXEMPT_PATHS the upload is unreachable by
+	// its only caller in every non-dev deployment.
+	it('lets an Origin-less multipart POST through to /api/sourcemaps outside dev (U17)', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('{"error":{"code":"unauthenticated"}}', { status: 401 }));
+		const request = multipartPost('/api/sourcemaps');
+
+		const response = await csrfHandle({ event: csrfEvent('/api/sourcemaps', request), resolve } as any);
+
+		expect(resolve).toHaveBeenCalledTimes(1);
+		expect(response.status).toBe(401);
+		expect(await response.text()).not.toBe('Cross-site POST form submissions are forbidden');
+	});
+
+	it('still 403s an Origin-less multipart POST to /api/sourcemaps/anything -- exact path, never a prefix', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const request = multipartPost('/api/sourcemaps/anything');
+
+		const response = await csrfHandle({ event: csrfEvent('/api/sourcemaps/anything', request), resolve } as any);
+
+		expect(response.status).toBe(403);
+		expect(resolve).not.toHaveBeenCalled();
+	});
+
 	it('still 403s an Origin-less multipart POST to /api/uploads, without calling the route', async () => {
 		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
 		const request = multipartPost('/api/uploads');

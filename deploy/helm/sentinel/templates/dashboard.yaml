@@ -115,6 +115,18 @@ spec:
             {{- end }}
             - name: EMAIL_SERVER
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: EMAIL_SERVER } }
+            # sentinel-sourcemaps §12: adapter-node's request-body cap and POST /api/sourcemaps's
+            # three caps (§4.1). Without BODY_SIZE_LIMIT the adapter 413s every real map before the
+            # route runs. Value syntax is documented beside each key in values.yaml
+            # (config.dashboard.*); docker-compose.yml carries the same BODY_SIZE_LIMIT.
+            - name: BODY_SIZE_LIMIT
+              value: {{ .Values.config.dashboard.bodySizeLimit | quote }}
+            - name: SOURCEMAP_MAX_BYTES
+              value: {{ .Values.config.dashboard.sourcemapMaxBytes | quote }}
+            - name: SOURCEMAP_MAX_FILES_PER_REQUEST
+              value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRequest | quote }}
+            - name: SOURCEMAP_MAX_FILES_PER_RELEASE
+              value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRelease | quote }}
           livenessProbe:
             httpGet: { path: {{ .Values.dashboard.livenessPath }}, port: http }
             initialDelaySeconds: 15

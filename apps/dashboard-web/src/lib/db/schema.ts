@@ -186,6 +186,41 @@ export const releases = pgTable('releases', {
 	byProjectFirstSeen: index('idx_releases_project_first_seen').on(table.projectId, table.firstSeen),
 }));
 
+// sentinel-sourcemaps §4.5 (1725100000_add_sourcemaps.sql): one row per (project, release,
+// minified path) map that POST /api/sourcemaps (§4.1) has stored. UNIQUE (projectId,
+// releaseVersion, minifiedPath) is that route's upsert target and the processor's symbolication
+// lookup (§4.4); idx_sourcemaps_project_release serves §4.2's list and §4.6's grouped count per
+// release. NO FK to `releases`: a map is uploaded BEFORE the first occurrence of its version exists
+// (CI uploads at build time; `releases` rows are created by StoreEvent), so the FK would refuse
+// the normal case. ON DELETE CASCADE from projects deletes rows; the objects stay (§4.1 *Orphan
+// objects*, decision 12's follow-on owns the bucket walk).
+//
+// `releaseVersion` is stored exactly as CI sent it (decision 25 -- no trim, no `v` stripping),
+// byte for byte the string the SDK sends on events, because it is the join key; VARCHAR(100) is
+// errorOccurrences.releaseVersion's bound. `minifiedPath` is the frame path AFTER §4.4's
+// normalisation (decision 22), VARCHAR(512) = the ingest path's MaxFilePathLength. `storageKey` is
+// UNIQUE (idx_sourcemaps_storage_key), like attachments.storageKey: each row owns exactly one
+// object, and the key folds the path in (decision 17) so two paths with identical bytes are two
+// objects. `sha256` is the hex digest of the raw bytes -- the migrated column is CHAR(64), declared
+// here with the same 64-character bound in the `string` family tests/schema-drift.test.ts compares
+// (`character` and `character varying` are one family there); a 64-hex digest never pads.
+// `sizeBytes` is the raw byte size (§4.4 accounts the cache on it; CHECK > 0 migrated). Written by
+// the upload route only; the processor reads it, and nothing in this file's callers deletes rows.
+export const sourcemaps = pgTable('sourcemaps', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+	releaseVersion: varchar('release_version', { length: 100 }).notNull(),
+	minifiedPath: varchar('minified_path', { length: 512 }).notNull(),
+	storageKey: varchar('storage_key', { length: 1024 }).notNull(),
+	sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+	sha256: varchar('sha256', { length: 64 }).notNull(),
+	uploadedAt: timestamp('uploaded_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+	projectReleasePath: uniqueIndex('sourcemaps_project_id_release_version_minified_path_key').on(table.projectId, table.releaseVersion, table.minifiedPath),
+	byStorageKey: uniqueIndex('idx_sourcemaps_storage_key').on(table.storageKey),
+	byProjectRelease: index('idx_sourcemaps_project_release').on(table.projectId, table.releaseVersion),
+}));
+
 // sentinel-affected-users §4.6: one row per DISTINCT (issue, user) pair seen within the retention
 // window. The composite primary key is what makes "distinct" a database fact and is the ON
 // CONFLICT target of the processor's upsert (§4.3); `issues.affectedUserCount` is its cardinality

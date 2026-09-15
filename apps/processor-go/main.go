@@ -18,6 +18,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/dlqmonitor"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/webhooks"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -89,6 +90,32 @@ func main() {
 		MaxConnIdleTime: 10 * time.Minute,
 	}
 
+	// sentinel-sourcemaps §4.4 / §12: the six symbolication knobs, each in the syntax the contract
+	// states beside its name (decision 27 — the operator turning one reads values.yaml and nothing
+	// else): SYMBOLICATE_PLATFORMS a comma-separated lowercase list (`javascript,browser`; unset =
+	// that default, set and EMPTY = the stage and Compute's normalisation off — the kill switch);
+	// SOURCEMAP_CACHE_BYTES and SOURCEMAP_MAX_PARSE_BYTES plain integer bytes (`134217728`,
+	// `52428800`; no Mi/M suffix); SOURCEMAP_NEGATIVE_TTL, SOURCEMAP_POSITIVE_TTL and
+	// SYMBOLICATE_DEADLINE Go duration strings (`60s`, `10m`, `5s`). A value set in the wrong syntax
+	// stops the process here rather than running with a default it did not ask for.
+	symCfg, err := symbolicate.ParseConfig(os.LookupEnv)
+	if err != nil {
+		log.Fatalf("Invalid symbolication configuration: %v", err)
+	}
+	// Decision 32 (contract §8, §12, flow S8b): the startup fatal that stands in for the dormant
+	// alert. With the stage on and S3_ACCESS_KEY / S3_SECRET_KEY absent this process must not
+	// start — log.Fatalf, exactly as the NATS-subscriber construction failure below does, so the
+	// pod CrashLoopBackOffs and never consumes an event, and a rollout that forgot the secret refs
+	// stalls on the new ReplicaSet instead of replacing pods that work. It runs BEFORE the
+	// database is dialled and BEFORE Subscribe: a config check at startup, never a per-event
+	// fatal (D7 — storage unreachable at runtime with credentials present is `fetch_error`). The
+	// last log line names both variables; that line and `kubectl rollout status` are the signal.
+	// No /health or readiness condition is added (§8).
+	s3Cfg := symbolicate.S3ConfigFromEnv(os.LookupEnv)
+	if err := symbolicate.StartupCheck(symCfg, s3Cfg); err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
+
 	db, err := database.NewConnection(ctx, dbCfg)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
@@ -100,8 +127,18 @@ func main() {
 		Stream:    "ERROR_EVENTS",
 		Subject:   "error_events",
 		Consumer:  "processor-consumer",
-		BatchSize: 10,
+		BatchSize: processorBatchSize,
 		BatchWait: 1 * time.Second,
+		// AckWait is set EXPLICITLY (sentinel-sourcemaps §4.4 / §12, decision 37): zero here meant
+		// the server's 30 s, and one batch of processorBatchSize events may now spend up to
+		// BatchSize × SYMBOLICATE_DEADLINE in the symbolication stage (each event's cold map is
+		// bounded by the deadline, and a batch is handled sequentially) plus the write time — 10 ×
+		// 5 s = 50 s at the defaults, already past the server default, so a batch still being
+		// processed would be redelivered under it (Known limit 6's trigger: the redelivery lands
+		// on a second issue). symbolicate.AckWait derives it from the deadline the operator
+		// actually set — raising SYMBOLICATE_DEADLINE in values.yaml moves this in code, not in
+		// the chart — and the arithmetic is recorded in prd status/be.md.
+		AckWait: symbolicate.AckWait(processorBatchSize, symCfg.Deadline),
 		// MaxDeliver caps redelivery attempts so a single
 		// permanently-unprocessable message cannot redeliver forever and
 		// starve every subsequent event (VERIFIED_STATE.md S13). Exhausted
@@ -150,6 +187,34 @@ func main() {
 
 	proc := service.NewProcessorService(db)
 	proc.Alerts().StartInvalidationSubscriber(alertConfigSub)
+
+	// sentinel-sourcemaps §4.4: the symbolication stage, wired before Subscribe so no event is
+	// consumed by a processor that would pass every frame through. The S3 client is built from
+	// S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY (§12 — the same four the dashboard
+	// reads; TASK-01's chart and compose changes deliver them to this container). Only the two
+	// credentials are decision 32's startup condition (checked above); an empty endpoint or
+	// bucket is a construction error and also fatal here — with the stage on, a processor that
+	// cannot address the bucket at all is the same rollout mistake. Storage that is addressable
+	// but UNREACHABLE stays a per-map `fetch_error` at runtime (D7): NewS3Fetcher never dials.
+	// With SYMBOLICATE_PLATFORMS set and empty none of this runs and no S3 variable is read.
+	if symCfg.Enabled() {
+		fetcher, err := symbolicate.NewS3Fetcher(s3Cfg, symCfg.MaxParseBytes)
+		if err != nil {
+			log.Fatalf("Failed to build the sourcemap storage client (%s/%s/%s/%s): %v",
+				symbolicate.EnvS3Endpoint, symbolicate.EnvS3Bucket, symbolicate.EnvS3AccessKey, symbolicate.EnvS3SecretKey, err)
+		}
+		if err := proc.EnableSymbolication(symCfg, fetcher); err != nil {
+			log.Fatalf("Failed to wire symbolication: %v", err)
+		}
+		defer proc.CloseSymbolication()
+		slog.InfoContext(ctx, "Symbolication enabled",
+			slog.Any("platforms", symCfg.Platforms), slog.Duration("deadline", symCfg.Deadline),
+			slog.Int64("cache_bytes", symCfg.CacheBytes), slog.Int64("max_parse_bytes", symCfg.MaxParseBytes),
+			slog.Duration("negative_ttl", symCfg.NegativeTTL), slog.Duration("positive_ttl", symCfg.PositiveTTL),
+			slog.Duration("ack_wait", natsCfg.AckWait))
+	} else {
+		slog.InfoContext(ctx, "Symbolication disabled: SYMBOLICATE_PLATFORMS is set and empty; frames are stored as sent and fingerprint input normalisation is off")
+	}
 
 	if err := proc.VerifyAuditLogTable(ctx); err != nil {
 		log.Fatalf("AUDIT_VERIFICATION_FAILED: audit_logs table is not writable: %v", err)
@@ -268,6 +333,11 @@ func main() {
 	slog.InfoContext(ctx, "Shutting down processor...")
 	cancel()
 }
+
+// processorBatchSize is the ERROR_EVENTS consumer's pull batch (nats.SubscriberConfig.BatchSize) —
+// a named constant because symbolicate.AckWait's arithmetic is in terms of it (§12: "BatchSize
+// is 10").
+const processorBatchSize = 10
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
