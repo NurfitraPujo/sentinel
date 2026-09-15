@@ -23,6 +23,7 @@ import crypto from 'node:crypto';
 
 const authenticateSourcemapRequest = vi.fn();
 const putObject = vi.fn();
+const headObject = vi.fn();
 const isStorageConfigured = vi.fn();
 const readReleaseState = vi.fn();
 const upsertReleaseSourcemaps = vi.fn();
@@ -37,7 +38,7 @@ vi.mock('$lib/server/report-auth', async () => {
 	const actual = await vi.importActual<typeof import('$lib/server/report-auth')>('$lib/server/report-auth');
 	return { ...actual, authenticateSourcemapRequest };
 });
-vi.mock('$lib/server/storage', () => ({ putObject, isStorageConfigured }));
+vi.mock('$lib/server/storage', () => ({ putObject, headObject, isStorageConfigured }));
 vi.mock('$lib/server/retention', () => ({ bestEffortDeleteObjects }));
 vi.mock('$lib/db/queries/sourcemaps', async () => {
 	const actual = await vi.importActual<typeof import('$lib/db/queries/sourcemaps')>('$lib/db/queries/sourcemaps');
@@ -127,11 +128,14 @@ beforeEach(() => {
 	authenticateSourcemapRequest.mockResolvedValue(CTX);
 	isStorageConfigured.mockReturnValue(true);
 	putObject.mockResolvedValue(undefined);
+	headObject.mockResolvedValue({ contentLength: 1 });
 	readReleaseState.mockResolvedValue({ current: 0, existing: new Map() });
-	upsertReleaseSourcemaps.mockImplementation(async ({ files }: { files: unknown[] }) => ({
-		releaseFileCount: files.length,
-		displacedKeys: [],
-	}));
+	// The default transaction mock behaves as the real one does on this point: it runs the
+	// route's `ensureObjectsPresent` for every key before answering (decision 43).
+	upsertReleaseSourcemaps.mockImplementation(async ({ files, ensureObjectsPresent }: any) => {
+		await ensureObjectsPresent(files.map((f: any) => f.storageKey));
+		return { releaseFileCount: files.length, displacedKeys: [] };
+	});
 	findReferencedStorageKeys.mockResolvedValue(new Set());
 	bestEffortDeleteObjects.mockResolvedValue([]);
 });
@@ -173,6 +177,7 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 				expect.objectContaining({ minifiedPath: '/assets/vendor-9a0d4e.js' }),
 			],
 			maxPerRelease: 500,
+			ensureObjectsPresent: expect.any(Function),
 		});
 		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
 		expect(outcomesRecorded()).toEqual(['created', 'created']);
@@ -333,6 +338,89 @@ describe('POST /api/sourcemaps -- the replaced cleanup deletes what the transact
 		expect(res.status).toBe(201);
 		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
 		expect(outcomesRecorded()).toEqual(['storage_error', 'replaced']);
+	});
+});
+
+describe('POST /api/sourcemaps -- every key a row is committed to is confirmed under the lock, and re-put if gone (decision 43, BUG-07)', () => {
+	// The review's interleaving, one level up from BUG-05: THIS request B put K1 in phase 2. Before
+	// B's transaction took the lock, C (a CI retry of the older artifact) committed its row back
+	// to K0, found no row on K1 -- B has not committed -- and deleted K1. B's `ensureObjectsPresent`
+	// is what the transaction runs under the lock before it writes B's row: HEAD K1, and put it
+	// again from the bytes B still holds when the bucket says it is gone.
+	const notFound = () => Object.assign(new Error('NotFound'), { name: 'NotFound', $metadata: { httpStatusCode: 404 } });
+	const bytesA = mapBytes('a');
+	const keyA = () => sourcemapStorageKey(CTX.projectId, RELEASE, '/a.js', sha256(bytesA));
+
+	it('hands the transaction an ensureObjectsPresent that HEADs each key and puts nothing when the object is there', async () => {
+		const { res } = await post(form([['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(201);
+		expect(headObject).toHaveBeenCalledTimes(1);
+		expect(headObject).toHaveBeenCalledWith(keyA());
+		// One put in phase 2, none from the check.
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expect(outcomesRecorded()).toEqual(['created']);
+	});
+
+	it('re-puts the part\'s own bytes under the key when HEAD says the object is gone, then the row is written and the request is 201', async () => {
+		headObject.mockRejectedValueOnce(notFound());
+		const { res, body } = await post(form([['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(201);
+		expect(body.files[0].outcome).toBe('created');
+		expect(putObject).toHaveBeenCalledTimes(2);
+		expect(putObject).toHaveBeenNthCalledWith(2, keyA(), expect.any(Uint8Array), 'application/json');
+		expect(Buffer.from(putObject.mock.calls[1][1])).toEqual(Buffer.from(bytesA));
+		// The repair happened INSIDE the transaction call, not after it.
+		expect(putObject.mock.invocationCallOrder[1]).toBeGreaterThan(upsertReleaseSourcemaps.mock.invocationCallOrder[0]);
+		expect(outcomesRecorded()).toEqual(['created']);
+	});
+
+	it('checks every key the transaction names, in order, and repairs only the missing ones', async () => {
+		const bytesB = mapBytes('b');
+		const keyB = sourcemapStorageKey(CTX.projectId, RELEASE, '/b.js', sha256(bytesB));
+		headObject.mockImplementation(async (key: string) => {
+			if (key === keyB) throw notFound();
+			return { contentLength: 1 };
+		});
+		const { res } = await post(
+			form([
+				['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')],
+				['/b.js', fileOf(bytesB, 'b.js.map', 'application/json')],
+			])
+		);
+		expect(res.status).toBe(201);
+		expect(headObject.mock.calls.map((c) => c[0])).toEqual([keyA(), keyB]);
+		expect(putObject).toHaveBeenCalledTimes(3);
+		expect(putObject).toHaveBeenNthCalledWith(3, keyB, expect.any(Uint8Array), 'application/json');
+		expect(Buffer.from(putObject.mock.calls[2][1])).toEqual(Buffer.from(bytesB));
+	});
+
+	it('a HEAD that fails for any reason but "not found" aborts the transaction: 503 storage_unavailable, nothing put again, counted as storage_error', async () => {
+		headObject.mockRejectedValueOnce(Object.assign(new Error('AccessDenied'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } }));
+		const { res, body } = await post(form([['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(503);
+		expect(body.error).toEqual({ code: 'storage_unavailable', message: expect.any(String), details: {} });
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['storage_error']);
+	});
+
+	it('a re-put that fails aborts the transaction the same way: 503, no row, counted', async () => {
+		headObject.mockRejectedValueOnce(notFound());
+		putObject.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('bucket gone'));
+		const { res, body } = await post(form([['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(503);
+		expect(body.error.code).toBe('storage_unavailable');
+		expect(outcomesRecorded()).toEqual(['storage_error']);
+	});
+
+	it('the transaction\'s own failure after the check is still 500 internal -- the repair error is the only storage answer mapped to 503', async () => {
+		upsertReleaseSourcemaps.mockImplementation(async ({ files, ensureObjectsPresent }: any) => {
+			await ensureObjectsPresent(files.map((f: any) => f.storageKey));
+			throw new Error('connection reset');
+		});
+		const { res, body } = await post(form([['/a.js', fileOf(bytesA, 'a.js.map', 'application/json')]]));
+		expect(res.status).toBe(500);
+		expect(body.error.code).toBe('internal');
 	});
 });
 

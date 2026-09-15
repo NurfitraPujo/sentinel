@@ -14,7 +14,10 @@ import { randomUUID } from 'node:crypto';
 //      contract's sentence true -- "a concurrent upload that races past the pre-check is refused
 //      there": two transactions that both saw cap−1 cannot both insert;
 //   3. `ReleaseFullError` is THROWN inside the callback (D18), so the losing transaction rolls
-//      back and leaves no row.
+//      back and leaves no row;
+//   4. (BUG-07, decision 43) `ensureObjectsPresent` runs under that same lock and before the
+//      row is written, so an object a concurrent cleanup deleted between this request's put and
+//      its commit is put back before any row references it.
 //
 // The disposable-DB contract is the same as every other `*.integration.test.ts` beside this file:
 // it seeds its own organization and project and deletes them again (the FK cascades the
@@ -59,6 +62,8 @@ function key(release: string, path: string, sha: string): string {
 function sha(seed: string): string {
 	return seed.padEnd(64, '0').slice(0, 64);
 }
+/** Decision 43's check, for the cases that are not about it: every object is where it should be. */
+const present = async () => {};
 
 describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres)', () => {
 	let sql: ReturnType<typeof postgres>;
@@ -98,6 +103,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('a1')), sizeBytes: 10, sha256: sha('a1') }],
 				maxPerRelease: 500,
+				ensureObjectsPresent: present,
 			});
 			expect(out).toEqual({ releaseFileCount: 1, displacedKeys: [] });
 
@@ -125,6 +131,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('b2')), sizeBytes: 22, sha256: sha('b2') }],
 				maxPerRelease: 500,
+				ensureObjectsPresent: present,
 			});
 			// A replace is not an add: the count stays 1 (§4.1's release_file_count); the key the
 			// row carried under the lock is the one displaced (BUG-05).
@@ -165,11 +172,11 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
 			const file = (k: string, seed: string) => ({ minifiedPath: path, storageKey: k, sizeBytes: 1, sha256: sha(seed) });
 
-			const create = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500 });
+			const create = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(create.displacedKeys).toEqual([]);
-			const a = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 's1')], maxPerRelease: 500 });
+			const a = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 's1')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(a.displacedKeys).toEqual([K0()]);
-			const c = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500 });
+			const c = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(c.displacedKeys).toEqual([K1()]);
 		});
 
@@ -187,8 +194,165 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: path, storageKey: K0(), sizeBytes: 1, sha256: sha('s0') }],
 				maxPerRelease: 500,
+				ensureObjectsPresent: present,
 			});
 			expect(again.displacedKeys).toEqual([]);
+		});
+	});
+
+	describe('BUG-07 (decision 43): every key a row is committed to is confirmed under the lock, before the row is written', () => {
+		// The review's interleaving, driven by hand against a simulated bucket (a Set of keys; the
+		// route's real `ensureObjectsPresent` HEADs and re-puts against S3, and the route test pins
+		// that -- what a mock cannot show is WHEN the transaction runs it, which is this file's job).
+		//
+		//   row {S0,K0}.
+		//   A commits row→K1 and deletes K0 (unreferenced -- correct).
+		//   B read phase 1 before A and is mid-phase-2: it puts K1 (same bytes, same key as A's).
+		//   C (a CI retry of the older artifact) puts K0, commits row→K0 (displaced = [K1]); its
+		//     reference check finds no row on K1 -- B has not committed -- so C deletes K1.
+		//   B commits row→K1.
+		//
+		// Before this fix B's row pointed at an object C had removed. With it, B's transaction
+		// asks the bucket for K1 under the lock, finds it gone, puts it back, and only then writes
+		// the row: at commit the row's key exists.
+		const release = 'r-bug07-' + suffix;
+		const path = '/assets/checkout-CT5Yxj3h.js';
+		const K0 = () => key(release, path, sha('b7-s0'));
+		const K1 = () => key(release, path, sha('b7-s1'));
+		const file = (k: string, seed: string) => ({ minifiedPath: path, storageKey: k, sizeBytes: 1, sha256: sha(seed) });
+		const lockId = `sourcemaps:${projectId}:${release}`;
+
+		it('the A/B/C interleaving: B re-puts K1 inside its transaction and its committed row points at an object that exists', async () => {
+			const { upsertReleaseSourcemaps, findReferencedStorageKeys } = await import('./sourcemaps');
+			const bucket = new Set<string>();
+			const repairs: string[] = [];
+			/** The route's `ensureObjectsPresent`, over the simulated bucket: HEAD, and re-put when gone. */
+			const ensure = async (keys: readonly string[]) => {
+				for (const k of keys) {
+					if (bucket.has(k)) continue;
+					bucket.add(k);
+					repairs.push(k);
+				}
+			};
+
+			// row {S0,K0}
+			bucket.add(K0());
+			await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 'b7-s0')], maxPerRelease: 500, ensureObjectsPresent: ensure });
+			// A: put K1, commit row→K1, delete K0 (no row references it).
+			bucket.add(K1());
+			const a = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 'b7-s1')], maxPerRelease: 500, ensureObjectsPresent: ensure });
+			expect(a.displacedKeys).toEqual([K0()]);
+			expect(await findReferencedStorageKeys(a.displacedKeys)).toEqual(new Set());
+			bucket.delete(K0());
+			// B, mid-phase-2: puts K1 (content-addressed: A's key).
+			bucket.add(K1());
+			// C: puts K0, commits row→K0, and its post-commit check finds no row on K1 -- B has not
+			// committed -- so C deletes K1.
+			bucket.add(K0());
+			const c = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 'b7-s0')], maxPerRelease: 500, ensureObjectsPresent: ensure });
+			expect(c.displacedKeys).toEqual([K1()]);
+			expect(await findReferencedStorageKeys(c.displacedKeys)).toEqual(new Set());
+			bucket.delete(K1());
+			expect(bucket.has(K1())).toBe(false);
+			expect(repairs).toEqual([]);
+
+			// B commits row→K1.
+			const b = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 'b7-s1')], maxPerRelease: 500, ensureObjectsPresent: ensure });
+			expect(b.displacedKeys).toEqual([K0()]);
+
+			// The row's key exists: B's transaction put K1 back before it wrote the row.
+			const [row] = await sql`
+				select storage_key from sourcemaps
+				where project_id = ${projectId} and release_version = ${release} and minified_path = ${path}
+			`;
+			expect(row.storage_key).toBe(K1());
+			expect(bucket.has(K1())).toBe(true);
+			expect(repairs).toEqual([K1()]);
+			// And B's own cleanup, run through the same guard, keeps K0 only if a row references it
+			// -- none does now -- so it goes; no row points at nothing either way.
+			expect(await findReferencedStorageKeys(b.displacedKeys)).toEqual(new Set());
+		});
+
+		it('the check runs UNDER the release lock and BEFORE the row is written: it waits for a hand-held lock, and at check time another connection still sees the old key', async () => {
+			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
+			// Its own row, on its own path: this case does not depend on the one above having run.
+			const path = '/assets/lock-b7.js';
+			const K1 = key(release, path, sha('b7-lock-1'));
+			const K2 = key(release, path, sha('b7-lock-2'));
+			await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [{ minifiedPath: path, storageKey: K1, sizeBytes: 1, sha256: sha('b7-lock-1') }], maxPerRelease: 500, ensureObjectsPresent: present });
+
+			// T1 holds the release lock (the same id the function computes) and does not commit.
+			let releaseT1!: () => void;
+			const holdT1 = new Promise<void>((r) => (releaseT1 = r));
+			let t1Reached = false;
+			const t1 = sql.begin(async (tx) => {
+				await tx`select pg_advisory_xact_lock(hashtextextended(${lockId}, 0))`;
+				t1Reached = true;
+				await holdT1;
+			});
+			while (!t1Reached) await new Promise((r) => setTimeout(r, 5));
+
+			const seenAtCheck: { lockFree: boolean | null; keyAtCheck: string | null } = { lockFree: null, keyAtCheck: null };
+			const ensure = async (keys: readonly string[]) => {
+				expect(keys).toEqual([K2]);
+				// Another connection cannot take the lock now: this transaction holds it.
+				const [{ free }] = await sql`select pg_try_advisory_lock(hashtextextended(${lockId}, 0)) as free`;
+				if (free) await sql`select pg_advisory_unlock(hashtextextended(${lockId}, 0))`;
+				seenAtCheck.lockFree = Boolean(free);
+				// And nothing has been written yet: outside the transaction the row still carries K1.
+				const [row] = await sql`
+					select storage_key from sourcemaps
+					where project_id = ${projectId} and release_version = ${release} and minified_path = ${path}
+				`;
+				seenAtCheck.keyAtCheck = row.storage_key;
+			};
+
+			let settled = false;
+			const t2 = upsertReleaseSourcemaps({
+				projectId,
+				releaseVersion: release,
+				files: [{ minifiedPath: path, storageKey: K2, sizeBytes: 1, sha256: sha('b7-lock-2') }],
+				maxPerRelease: 500,
+				ensureObjectsPresent: ensure,
+			}).finally(() => (settled = true));
+			await new Promise((r) => setTimeout(r, 250));
+			// Blocked on the lock, so the check has not run either.
+			expect(settled).toBe(false);
+			expect(seenAtCheck.lockFree).toBeNull();
+
+			releaseT1();
+			await t1;
+			await expect(t2).resolves.toMatchObject({ displacedKeys: [K1] });
+			expect(seenAtCheck).toEqual({ lockFree: false, keyAtCheck: K1 });
+			const [row] = await sql`
+				select storage_key from sourcemaps
+				where project_id = ${projectId} and release_version = ${release} and minified_path = ${path}
+			`;
+			expect(row.storage_key).toBe(K2);
+		});
+
+		it('a check that throws rolls the transaction back: the row keeps its previous key (D18)', async () => {
+			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
+			const path = '/assets/throw-b7.js';
+			const K1 = key(release, path, sha('b7-throw-1'));
+			await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [{ minifiedPath: path, storageKey: K1, sizeBytes: 1, sha256: sha('b7-throw-1') }], maxPerRelease: 500, ensureObjectsPresent: present });
+			const K3 = key(release, path, sha('b7-throw-3'));
+			await expect(
+				upsertReleaseSourcemaps({
+					projectId,
+					releaseVersion: release,
+					files: [{ minifiedPath: path, storageKey: K3, sizeBytes: 1, sha256: sha('b7-throw-3') }],
+					maxPerRelease: 500,
+					ensureObjectsPresent: async () => {
+						throw new Error('object gone and the re-put failed');
+					},
+				})
+			).rejects.toThrow('object gone and the re-put failed');
+			const [row] = await sql`
+				select storage_key from sourcemaps
+				where project_id = ${projectId} and release_version = ${release} and minified_path = ${path}
+			`;
+			expect(row.storage_key).toBe(K1);
 		});
 	});
 
@@ -203,7 +367,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				sizeBytes: 1,
 				sha256: sha(`s${i}`),
 			}));
-			await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files, maxPerRelease: CAP });
+			await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files, maxPerRelease: CAP, ensureObjectsPresent: present });
 		}
 
 		it('two concurrent transactions at cap−1, each adding one path: exactly one succeeds, the other rejects with ReleaseFullError and leaves no row', async () => {
@@ -220,6 +384,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 					releaseVersion: release,
 					files: [{ minifiedPath: `/${name}.js`, storageKey: key(release, `/${name}.js`, sha(name)), sizeBytes: 1, sha256: sha(name) }],
 					maxPerRelease: CAP,
+					ensureObjectsPresent: present,
 				});
 			const results = await Promise.allSettled([attempt('racer-a'), attempt('racer-b')]);
 
@@ -280,6 +445,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: '/t2.js', storageKey: key(release, '/t2.js', sha('t2')), sizeBytes: 1, sha256: sha('t2') }],
 				maxPerRelease: CAP,
+				ensureObjectsPresent: present,
 			}).finally(() => (settled = true));
 			await new Promise((r) => setTimeout(r, 250));
 			expect(settled).toBe(false);
@@ -305,6 +471,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: '/last.js', storageKey: key(release, '/last.js', sha('l1')), sizeBytes: 1, sha256: sha('l1') }],
 				maxPerRelease: CAP,
+				ensureObjectsPresent: present,
 			});
 
 			const out = await upsertReleaseSourcemaps({
@@ -312,6 +479,7 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 				releaseVersion: release,
 				files: [{ minifiedPath: '/last.js', storageKey: key(release, '/last.js', sha('l2')), sizeBytes: 2, sha256: sha('l2') }],
 				maxPerRelease: CAP,
+				ensureObjectsPresent: present,
 			});
 			expect(out).toEqual({ releaseFileCount: CAP, displacedKeys: [key(release, '/last.js', sha('l1'))] });
 			const [row] = await sql`

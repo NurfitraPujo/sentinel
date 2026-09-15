@@ -116,6 +116,8 @@ beforeEach(() => {
 
 const FILE_A = { minifiedPath: '/a.js', storageKey: 'sourcemaps/p/r/a-1.map', sizeBytes: 10, sha256: '1'.repeat(64) };
 const FILE_B = { minifiedPath: '/b.js', storageKey: 'sourcemaps/p/r/b-2.map', sizeBytes: 20, sha256: '2'.repeat(64) };
+/** The cases that are not about decision 43 hand the transaction a check that always passes. */
+const present = async () => {};
 
 describe('readReleaseState (phase 1)', () => {
 	it('returns the release count and the existing rows keyed by normalised path, with no transaction', async () => {
@@ -156,6 +158,7 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 			releaseVersion: 'v1',
 			files: [FILE_A, FILE_B],
 			maxPerRelease: 500,
+			ensureObjectsPresent: present,
 		});
 		expect(dbMock.transaction).toHaveBeenCalledTimes(1);
 		expect(captured.executes).toHaveLength(1);
@@ -169,7 +172,7 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 
 	it('BUG-05: displacedKeys is what the row pointed at INSIDE the transaction -- the presence read selects storage_key', async () => {
 		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: 'moved-since-phase-1' }]];
-		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 });
+		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent: present });
 		expect(out.displacedKeys).toEqual(['moved-since-phase-1']);
 		// The presence read asks for both columns; a read that dropped storage_key would silently
 		// report nothing displaced.
@@ -178,13 +181,13 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 
 	it('BUG-05: a row rewritten with the key it already has displaces nothing', async () => {
 		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: FILE_A.storageKey }]];
-		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 });
+		const out = await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent: present });
 		expect(out.displacedKeys).toEqual([]);
 	});
 
 	it('conflicts on (project_id, release_version, minified_path) and rewrites exactly the four replace columns', async () => {
 		selectResults = [[{ count: 0 }], []];
-		await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 });
+		await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent: present });
 		expect(captured.values[0]).toEqual({
 			projectId: 'proj-1',
 			releaseVersion: 'v1',
@@ -204,7 +207,7 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 		// The route's pre-check saw 498; a concurrent upload landed two rows since.
 		selectResults = [[{ count: 500 }], []];
 		await expect(
-			upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500 })
+			upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent: present })
 		).rejects.toMatchObject({ name: 'ReleaseFullError', max: 500, current: 500 });
 		expect(captured.values).toHaveLength(0);
 		expect(dbMock.insert).not.toHaveBeenCalled();
@@ -217,9 +220,41 @@ describe('upsertReleaseSourcemaps (phase 3)', () => {
 			releaseVersion: 'v1',
 			files: [FILE_A],
 			maxPerRelease: 500,
+			ensureObjectsPresent: present,
 		});
 		expect(out).toEqual({ releaseFileCount: 500, displacedKeys: ['k-old'] });
 		expect(captured.values).toHaveLength(1);
+	});
+
+	it('decision 43 (BUG-07): ensureObjectsPresent is called once with every storageKey, after the lock and the cap check and before the first insert', async () => {
+		selectResults = [[{ count: 1 }], [{ minifiedPath: '/a.js', storageKey: 'sourcemaps/p/r/a-0.map' }]];
+		const ensureObjectsPresent = vi.fn(async () => {
+			// At the moment of the check the lock statement has run and nothing has been inserted.
+			expect(captured.executes).toHaveLength(1);
+			expect(captured.values).toHaveLength(0);
+		});
+		await upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A, FILE_B], maxPerRelease: 500, ensureObjectsPresent });
+		expect(ensureObjectsPresent).toHaveBeenCalledTimes(1);
+		expect(ensureObjectsPresent).toHaveBeenCalledWith([FILE_A.storageKey, FILE_B.storageKey]);
+		expect(captured.values).toHaveLength(2);
+	});
+
+	it('decision 43 (BUG-07): a check that throws propagates out of the transaction with nothing inserted (D18: thrown, rolled back)', async () => {
+		selectResults = [[{ count: 0 }], []];
+		const boom = new Error('object gone and the re-put failed');
+		await expect(
+			upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent: async () => { throw boom; } })
+		).rejects.toBe(boom);
+		expect(dbMock.insert).not.toHaveBeenCalled();
+	});
+
+	it('decision 43 (BUG-07): the check is not made when the cap refuses -- nothing will be committed to those keys', async () => {
+		selectResults = [[{ count: 500 }], []];
+		const ensureObjectsPresent = vi.fn(async () => {});
+		await expect(
+			upsertReleaseSourcemaps({ projectId: 'proj-1', releaseVersion: 'v1', files: [FILE_A], maxPerRelease: 500, ensureObjectsPresent })
+		).rejects.toBeInstanceOf(ReleaseFullError);
+		expect(ensureObjectsPresent).not.toHaveBeenCalled();
 	});
 
 	it('exports ReleaseFullError as a thrown Error carrying max and current (D18)', () => {

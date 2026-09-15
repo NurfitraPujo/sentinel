@@ -17,7 +17,9 @@ import { sourcemaps } from '$lib/db/schema';
  * points at nothing, because a row that did would make §4.4 fetch and fail on every event. The
  * same rule governs the cleanup after commit: a replaced object is deleted only when the
  * transaction itself displaced its key AND no row references it any more
- * (`findReferencedStorageKeys`, BUG-05).
+ * (`findReferencedStorageKeys`, BUG-05) -- and because that check runs outside the lock, the
+ * transaction itself re-checks, under the lock and before it commits a row, that every object
+ * it is about to reference still exists (`ensureObjectsPresent`, decision 43 / BUG-07).
  */
 
 /** What phase 1 reads for one request: the release's row count, and its rows for these paths. */
@@ -122,14 +124,31 @@ export async function readReleaseState(
  * the one it displaced itself, and even that only if no row references it after commit
  * (`findReferencedStorageKeys`). A row rewritten with the key it already had displaces nothing.
  * Throws `ReleaseFullError` (rolls back, nothing written) when the re-read count says otherwise.
+ *
+ * `ensureObjectsPresent` (decision 43, BUG-07) is called ONCE, under the lock, after the cap
+ * check and before the first upsert, with every `storageKey` this transaction is about to commit
+ * a row to. The route's implementation `headObject`s each key and re-puts the part's bytes when
+ * the object is gone. Why here: keys are content-addressed, so a concurrent request can put the
+ * SAME key this request put (a CI retry re-uploading the same artifact), and a third request's
+ * post-commit cleanup -- which answers "is any row referencing this key" outside any lock --
+ * can find no row yet and delete it while this request is still between its `putObject` and its
+ * commit. That window was the length of phase 2 -- put-to-commit, seconds for a 50-part
+ * request. Checking here shrinks it to this call's own head-to-commit (milliseconds, no bytes
+ * moving): a delete that landed before the check is repaired before any row references the
+ * key, and one that lands after this commit sees the row in its reference check and keeps the
+ * object. What remains is a cleanup whose reference check ran before this commit and whose
+ * delete lands after this check -- the residual `status/be.md` states. An `ensureObjectsPresent`
+ * that throws rolls the transaction back (D18): no row is written to a key that could not be
+ * proven to exist.
  */
 export async function upsertReleaseSourcemaps(input: {
 	projectId: string;
 	releaseVersion: string;
 	files: readonly SourcemapUpsertInput[];
 	maxPerRelease: number;
+	ensureObjectsPresent: (storageKeys: readonly string[]) => Promise<void>;
 }): Promise<{ releaseFileCount: number; displacedKeys: string[] }> {
-	const { projectId, releaseVersion, files, maxPerRelease } = input;
+	const { projectId, releaseVersion, files, maxPerRelease, ensureObjectsPresent } = input;
 
 	return await db.transaction(async (tx) => {
 		await tx.execute(
@@ -170,6 +189,13 @@ export async function upsertReleaseSourcemaps(input: {
 			if (previousKey !== undefined && previousKey !== file.storageKey) displacedKeys.push(previousKey);
 		}
 
+		// Decision 43: every object a row below will point at must exist NOW, under the lock --
+		// see the doc comment. Before the first insert so a throw leaves nothing to roll back but
+		// the reads.
+		if (files.length > 0) {
+			await ensureObjectsPresent(files.map((f) => f.storageKey));
+		}
+
 		for (const file of files) {
 			await tx
 				.insert(sourcemaps)
@@ -205,7 +231,9 @@ export async function upsertReleaseSourcemaps(input: {
  * leave that row pointing at nothing -- `fetch_error` on every event, negatively cached, and not
  * repairable by the identical upload because the sha matches (`unchanged`). Read AFTER the
  * transaction committed, with no transaction of its own: what it answers is "as of now", which is
- * as much as a delete outside the lock can ask. An empty list builds no statement.
+ * as much as a delete outside the lock can ask -- the request whose put this check cannot see
+ * is the one `ensureObjectsPresent` protects, from inside its own transaction (decision 43). An
+ * empty list builds no statement.
  */
 export async function findReferencedStorageKeys(keys: readonly string[]): Promise<Set<string>> {
 	const referenced = new Set<string>();

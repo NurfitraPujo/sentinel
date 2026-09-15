@@ -6,7 +6,7 @@ import {
 	toReportError,
 	type ReportAuthContext,
 } from '$lib/server/report-auth';
-import { isStorageConfigured, putObject } from '$lib/server/storage';
+import { headObject, isStorageConfigured, putObject } from '$lib/server/storage';
 import { bestEffortDeleteObjects } from '$lib/server/retention';
 import { normalizeMinifiedPath, sha256Hex, sourcemapStorageKey } from '$lib/server/sourcemap-path';
 import {
@@ -41,12 +41,18 @@ import { log } from '$lib/server/observability/log';
  *     decision 17). A failure here is `503 storage_unavailable` with NO row written; the objects
  *     already put stay as orphans -- permanent, counted, accepted (§4.1 *Orphan objects*);
  *  3. ONE short transaction for the upserts (`queries/sourcemaps.ts`), the per-release count
- *     re-read under a lock; object first, row second, so no row ever points at nothing. After
- *     commit, a `replaced` outcome deletes the previous object best-effort -- but only the key
- *     the transaction itself displaced (read under the lock, never phase 1's snapshot), never a
- *     key this request put, and only if no `sourcemaps` row references it at that moment
- *     (BUG-05: keys are content-addressed, so a concurrent re-upload of older bytes recreates a
- *     key phase 1 saw, and deleting from the snapshot would leave that row pointing at nothing).
+ *     re-read under a lock; object first, row second, so no row ever points at nothing. Under
+ *     that lock and before the rows are written, every key this request is about to reference is
+ *     `headObject`ed and re-put from the part's bytes if it is gone (decision 43, BUG-07): a
+ *     concurrent request can put the SAME content-addressed key and a third one's cleanup can
+ *     delete it in the seconds between this request's put and its commit; the check is the one
+ *     serialised point at which "the object exists" and "the row references it" can be made true
+ *     together. After commit, a `replaced` outcome deletes the previous object best-effort --
+ *     but only the key the transaction itself displaced (read under the lock, never phase 1's
+ *     snapshot), never a key this request put, and only if no `sourcemaps` row references it at
+ *     that moment (BUG-05: keys are content-addressed, so a concurrent re-upload of older bytes
+ *     recreates a key phase 1 saw, and deleting from the snapshot would leave that row pointing
+ *     at nothing).
  *
  * The multipart pairing is POSITIONAL: the i-th `file` is the i-th `minified_path`
  * (`FormData.getAll` preserves part order). The route never guesses a path from the map's own
@@ -70,6 +76,28 @@ interface ValidatedPart {
 	minifiedPath: string;
 	bytes: Uint8Array;
 	sha256: string;
+}
+
+/**
+ * Thrown from inside the transaction by `ensureObjectsPresent` when a key this request is about
+ * to commit a row to could neither be confirmed nor re-put: the transaction rolls back (D18) and
+ * the route answers `503 storage_unavailable`, the same as a phase-2 put failure -- nothing is
+ * written, the objects already put stay as counted orphans.
+ */
+class ObjectRepairError extends Error {
+	constructor(
+		public readonly storageKey: string,
+		public readonly cause: unknown
+	) {
+		super(`Could not confirm object ${storageKey} before committing its row`);
+		this.name = 'ObjectRepairError';
+	}
+}
+
+/** The S3 SDK's "no such object" for HeadObject: `NotFound` (v3), `NoSuchKey`, or a bare 404. */
+function isObjectMissing(err: unknown): boolean {
+	const e = err as { name?: unknown; $metadata?: { httpStatusCode?: unknown } } | null;
+	return e?.name === 'NotFound' || e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404;
 }
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -225,6 +253,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	// ---- Phase 2: every object that is not `unchanged`, one after another, NO transaction open.
 	const outcomes: FileOutcome[] = new Array(parts.length);
 	const toUpsert: SourcemapUpsertInput[] = [];
+	const bytesByKey = new Map<string, Uint8Array>();
 	let objectsPut = 0;
 	for (const part of parts) {
 		const existing = state.existing.get(part.minifiedPath);
@@ -247,6 +276,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			return reportErrorResponse(503, 'storage_unavailable', 'Object storage is unavailable; retry later.');
 		}
 		objectsPut++;
+		bytesByKey.set(storageKey, part.bytes);
 		outcomes[part.index] = existing ? 'replaced' : 'created';
 		toUpsert.push({
 			minifiedPath: part.minifiedPath,
@@ -257,6 +287,33 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	// ---- Phase 3: one short transaction. `unchanged` parts have nothing to write.
+	//
+	// `ensureObjectsPresent` runs INSIDE it, under the release lock, before the rows are written
+	// (decision 43): each key is HEADed and, only if the object is gone, put again from the bytes
+	// this request already holds -- the one case in which bytes move with a transaction open,
+	// bounded to the rare repair and sanctioned by the decision. Any other storage answer aborts
+	// the transaction: a row must never be committed to a key that could not be proven to exist.
+	let objectsRepaired = 0;
+	const ensureObjectsPresent = async (storageKeys: readonly string[]): Promise<void> => {
+		for (const storageKey of storageKeys) {
+			try {
+				await headObject(storageKey);
+				continue;
+			} catch (err) {
+				if (!isObjectMissing(err)) throw new ObjectRepairError(storageKey, err);
+			}
+			const bytes = bytesByKey.get(storageKey);
+			if (bytes === undefined) throw new ObjectRepairError(storageKey, new Error('no bytes held for this key'));
+			try {
+				await putObject(storageKey, bytes, 'application/json');
+			} catch (err) {
+				throw new ObjectRepairError(storageKey, err);
+			}
+			objectsRepaired++;
+			log.warn('sourcemap_uploads.object_repaired', { projectId: ctx.projectId, releaseVersion, storageKey });
+		}
+	};
+
 	let releaseFileCount = state.current;
 	let displacedKeys: string[] = [];
 	if (toUpsert.length > 0) {
@@ -266,8 +323,19 @@ export const POST: RequestHandler = async ({ request }) => {
 				releaseVersion,
 				files: toUpsert,
 				maxPerRelease: maxFilesPerRelease,
+				ensureObjectsPresent,
 			}));
 		} catch (err) {
+			if (err instanceof ObjectRepairError) {
+				log.error('sourcemap_uploads.repair_failed', {
+					projectId: ctx.projectId,
+					storageKey: err.storageKey,
+					orphanedObjects: objectsPut,
+					error: err.cause,
+				});
+				recordSourcemapUpload('storage_error');
+				return reportErrorResponse(503, 'storage_unavailable', 'Object storage is unavailable; retry later.');
+			}
 			if (err instanceof ReleaseFullError) {
 				// A concurrent upload raced past the pre-check; refused inside the transaction after
 				// this request's objects were put -- tolerated exactly as a putObject failure is,
@@ -327,6 +395,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		created: outcomes.filter((o) => o === 'created').length,
 		replaced: outcomes.filter((o) => o === 'replaced').length,
 		unchanged: outcomes.filter((o) => o === 'unchanged').length,
+		objectsRepaired,
 		releaseFileCount,
 	});
 
