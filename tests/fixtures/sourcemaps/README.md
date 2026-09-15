@@ -84,7 +84,8 @@ after build A's events the project has 60 issues; after build B's, still 60.
   the wrong separator. Decision 41 (BUG-03) widened the rule and decision 42 (BUG-06) fixed its
   measured reading (≥ 2 upper-case letters after position 0, no vowel run over 2, the `-` inside
   a token skipped unconditionally — `TestNormalizeHashInput_Base64urlMissRate` re-measures the
-  residual on 200,000 random names every run); those four names and the `-` cases are rows in
+  residual, **3.72 %** as decision 44 records it, on 200,000 random names every run); those four
+  names and the `-` cases are rows in
   `tests/unit/fingerprint_normalisation_test.go`. Hex stays here so the committed
   maps, their digests and the M1–M3 numbers in `status/be.md` remain byte-stable.
 - **The build id sits inside the token.** `[name]-[hash]_b2.js` normalises to `<name>-*.js` because
