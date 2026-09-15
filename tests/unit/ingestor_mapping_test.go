@@ -218,3 +218,25 @@ func TestMapPayloadToEvent_MetadataPreservesValues(t *testing.T) {
 	assert.Equal(t, true, got.Metadata.Fields["is_admin"].GetBoolValue())
 	assert.InDelta(t, 3.14, got.Metadata.Fields["score"].GetNumberValue(), 1e-9)
 }
+
+// TestMapPayloadToEvent_TimestampRoundTripsUnchanged pins sentinel-ingest-timestamp-clamp decision 2:
+// the mapper is a verbatim copy and the timestamp RULE lives in service.IngestService, not here. A
+// non-zero payload timestamp — deliberately one a year ahead, i.e. one the service would replace under
+// R2, and carrying a non-UTC offset — must reach proto field 10 as exactly the same instant, with
+// nanoseconds intact. If this ever fails, someone has moved the clamp into the mapper, where it would
+// run against no receipt time at all and break the "resolve, stamp back, echo" contract the handlers
+// rely on.
+func TestMapPayloadToEvent_TimestampRoundTripsUnchanged(t *testing.T) {
+	farFuture := time.Date(2027, 9, 16, 17, 0, 0, 123456789, time.FixedZone("+07:00", 7*3600))
+	payload := fullPayload()
+	payload.Timestamp = farFuture
+
+	got := mapping.MapPayloadToEvent(payload)
+
+	require.NotNil(t, got.Timestamp, "a non-zero timestamp must be mapped, never dropped")
+	assert.True(t, farFuture.Equal(got.Timestamp.AsTime()),
+		"the mapper must copy the timestamp verbatim (same instant), got %v want %v", got.Timestamp.AsTime(), farFuture)
+	assert.Equal(t, farFuture.UnixNano(), got.Timestamp.AsTime().UnixNano(), "nanosecond precision must survive the copy")
+	assert.Equal(t, int64(farFuture.Unix()), got.Timestamp.GetSeconds())
+	assert.Equal(t, int32(123456789), got.Timestamp.GetNanos())
+}

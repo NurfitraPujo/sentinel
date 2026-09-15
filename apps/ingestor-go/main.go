@@ -376,9 +376,14 @@ type batchItemError struct {
 // batchItemEventID names a single successfully-ingested batch item's EFFECTIVE event_id by its index
 // in the request payload (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f) — mirrors batchItemError's
 // index-keyed shape so a client can diff what it sent against what was used, per item.
+//
+// Timestamp is the EFFECTIVE timestamp for the same item (sentinel-ingest-timestamp-clamp decision 12):
+// the client's own value when it was inside the window, or the request's receipt time when it was
+// absent or replaced — time.RFC3339Nano, UTC "Z". Additive; index/event_id are unchanged.
 type batchItemEventID struct {
-	Index   int    `json:"index"`
-	EventID string `json:"event_id"`
+	Index     int    `json:"index"`
+	EventID   string `json:"event_id"`
+	Timestamp string `json:"timestamp"`
 }
 
 // batchResult is the /ingest/batch response body. The single-event /ingest
@@ -419,7 +424,13 @@ func handleIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Log
 			return
 		}
 
-		if err := svc.Ingest(r.Context(), &payload); err != nil {
+		// T_recv (sentinel-ingest-timestamp-clamp §3, decision 3): the ingestor's one UTC wall-clock
+		// reading for this request, taken only once the body decoded and auth/scope passed, so a
+		// refused request never reads the clock. svc.IngestAt resolves the event's effective
+		// timestamp against it (§4.1 R1-R4).
+		receivedAt := time.Now().UTC()
+
+		if err := svc.IngestAt(r.Context(), &payload, receivedAt); err != nil {
 			// Logged with the request's context so the handler wrapping in obs.Handler injects
 			// trace_id/span_id automatically (docs/plans/OBSERVABILITY_PLAN.md D-a) — never threaded by
 			// hand. Message text kept unchanged; the error is also attached structurally.
@@ -439,7 +450,16 @@ func handleIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slog.Log
 		// payload.EventID in place to whatever was actually published - the client's own value when
 		// usable, or a freshly minted UUIDv4 when it was absent/oversized - so a client can diff what it
 		// sent against what was used. Additive key; "status" is unchanged.
-		json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "event_id": payload.EventID})
+		//
+		// timestamp is the EFFECTIVE timestamp, by the same idiom (sentinel-ingest-timestamp-clamp
+		// decision 12): svc.IngestAt stamps payload.Timestamp with the value it published — the
+		// client's own when inside the window, receivedAt when absent or replaced — already in UTC, so
+		// RFC3339Nano renders it with a "Z" suffix (decision 15). Additive key.
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "accepted",
+			"event_id":  payload.EventID,
+			"timestamp": payload.Timestamp.UTC().Format(time.RFC3339Nano),
+		})
 	}
 }
 
@@ -472,6 +492,12 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 			return
 		}
 
+		// T_recv (sentinel-ingest-timestamp-clamp §4.2, decision 3): ONE UTC wall-clock reading for the
+		// whole request, taken after the body decoded and before the first item, and shared by every
+		// item — a batch is one receipt, and per-item clocks would encode processing order as event
+		// order. An item refused by scope below never reaches the rule (flows W8).
+		receivedAt := time.Now().UTC()
+
 		result := batchResult{}
 		for i := range payloads {
 			if err := applyAuthenticatedScope(r.Context(), db, &payloads[i]); err != nil {
@@ -479,7 +505,7 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 				result.Errors = append(result.Errors, batchItemError{Index: i, Message: err.Error()})
 				continue
 			}
-			if err := svc.Ingest(r.Context(), &payloads[i]); err != nil {
+			if err := svc.IngestAt(r.Context(), &payloads[i], receivedAt); err != nil {
 				logger.ErrorContext(r.Context(), fmt.Sprintf("Failed to ingest batch item %d: %v", i, err),
 					slog.Int("batch_index", i), slog.Any("error", err))
 				result.Failed++
@@ -487,9 +513,14 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 				continue
 			}
 			result.Ingested++
-			// payloads[i].EventID is the EFFECTIVE id: svc.Ingest mutated it in place before publish
-			// (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f).
-			result.EventIDs = append(result.EventIDs, batchItemEventID{Index: i, EventID: payloads[i].EventID})
+			// payloads[i].EventID is the EFFECTIVE id: svc.IngestAt mutated it in place before publish
+			// (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-f). payloads[i].Timestamp is the EFFECTIVE timestamp
+			// by the same mechanism (sentinel-ingest-timestamp-clamp decision 12), already UTC.
+			result.EventIDs = append(result.EventIDs, batchItemEventID{
+				Index:     i,
+				EventID:   payloads[i].EventID,
+				Timestamp: payloads[i].Timestamp.UTC().Format(time.RFC3339Nano),
+			})
 		}
 
 		// A batch response is only 2xx if at least one item made it through;
