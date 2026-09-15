@@ -170,9 +170,13 @@ config:
     # keep symbolication on.
     symbolicatePlatforms: "javascript,browser"
     # SOURCEMAP_CACHE_BYTES -- plain integer bytes of RAW map size the in-process cache holds
-    # before evicting (decision 11). No Mi/M suffix. 134217728 = 128 MiB. The parsed maps the
-    # cache actually holds are a multiple of this; see gomemlimit under `processor:` below.
-    sourcemapCacheBytes: "134217728"
+    # before evicting (decision 11). No Mi/M suffix. 67108864 = 64 MiB. The parsed maps the
+    # cache actually holds are a multiple of this, so this number is DERIVED from the memory
+    # limit, not asserted (contract §12): the arithmetic is beside `processor.gomemlimit` below,
+    # and tests/unit/helm_processor_memory_test.go re-checks it. The code's own default is still
+    # 128 MiB (decision 11's number); it is the chart that carries the derived value, because
+    # the chart is where the limit it is derived from lives.
+    sourcemapCacheBytes: "67108864"
     # SOURCEMAP_NEGATIVE_TTL -- Go duration string. How long a "no map for this frame" answer is
     # remembered (decision 9); a map uploaded inside this window is not seen until it expires.
     # docker-compose.yml sets 5s so the e2e case does not wait it out.
@@ -188,7 +192,11 @@ config:
     symbolicateDeadline: "5s"
     # SOURCEMAP_MAX_PARSE_BYTES -- plain integer bytes. A `sourcemaps` row whose size_bytes is
     # over this is never fetched (`oversize`, decision 38): the lever that keeps the biggest maps
-    # out of RSS. Default = the upload cap (SOURCEMAP_MAX_BYTES, 52428800).
+    # out of RSS. Default = the upload cap (SOURCEMAP_MAX_BYTES, 52428800), kept: decision 35
+    # keeps the 50 MiB upload cap so that a cap-size map IS symbolicated, and the memory for it
+    # is carried by the limit / gomemlimit / cache triple below. It MUST stay <= sourcemapCacheBytes
+    # so a map the processor is allowed to parse is never too large for the cache (a map over the
+    # CACHE bound is fetched and parsed per event, never retained -- the thrash row of §12).
     sourcemapMaxParseBytes: "52428800"
 
 # -----------------------------------------------------------------------------
@@ -259,15 +267,33 @@ processor:
     port: 8081
   resources:
     requests: { cpu: 100m, memory: 128Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    # 1Gi, not 512Mi: the raise decision 11 reserved for review, taken on §13 M2's number (below).
+    # values-huawei-{staging,production}.yml override this block and carry the same 1Gi -- an
+    # overlay that lowers it without lowering gomemlimit puts the soft limit ABOVE the kernel's.
+    limits: { cpu: "1", memory: 1Gi }
   # GOMEMLIMIT -- a Go memory-limit string (the runtime's own syntax: an integer with an optional
-  # B/KiB/MiB/GiB suffix, e.g. 400MiB), and it MUST stay below resources.limits.memory above so
+  # B/KiB/MiB/GiB suffix, e.g. 800MiB), and it MUST stay below resources.limits.memory above so
   # the runtime collects before the kernel OOM-kills (sentinel-sourcemaps decision 35). The
   # symbolication cache accounts RAW map bytes (config.processor.sourcemapCacheBytes) and holds
   # parsed maps that are a multiple of that, so the gauge under-reads real usage; this value is
   # derived, not asserted: sourcemapCacheBytes x parsed:raw ratio + baseline < GOMEMLIMIT, with the
   # ratio the §13 M2 measurement reports. Raise the memory limit and this together.
-  gomemlimit: "400MiB"
+  #
+  # The arithmetic, from M2 as taken on 2026-09-15 (prd sentinel-sourcemaps/status/be.md, M2):
+  # one 50 MiB cap-size map parsed and held = 387 MiB of RSS, parsed:raw ratio 7.65 (7.69 for the
+  # whole bundle; 7.7 used below), baseline RSS 28.3 MiB with the cache empty (29 used below).
+  #   steady state (the contract's formula):  64 MiB x 7.7 + 29 MiB = 522 MiB < 800 MiB GOMEMLIMIT
+  #   peak, the moment before eviction:  (64 + 50) MiB x 7.7 + 29 MiB = 907 MiB < 1024 MiB limit
+  # The second line exists because the cache admits a map AFTER parsing it and only then evicts
+  # (apps/processor-go/symbolicate/cache.go, put): with the cache full, a cold cap-size map
+  # (sourcemapMaxParseBytes, 50 MiB) is held in RSS alongside everything already cached until it
+  # is inserted. That peak may cross GOMEMLIMIT (a soft limit: the runtime collects harder, the
+  # process lives) but must not cross the kernel limit. The shipped 128 MiB / 400MiB / 512Mi
+  # failed the first line alone (128 x 7.7 + 29 = 1015 MiB): two cap-size maps referenced by
+  # events fit that raw bound, RSS would reach ~800 MiB, and the pod would be OOM-killed into a
+  # crash loop with a cold cache. tests/unit/helm_processor_memory_test.go asserts both lines against this file
+  # and the Huawei overlays; re-derive all three numbers when M2 is re-taken (§13's held task).
+  gomemlimit: "800MiB"
   autoscaling:
     enabled: true
     minReplicas: 2

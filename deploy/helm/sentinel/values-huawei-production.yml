@@ -165,7 +165,10 @@ processor:
     minAvailable: 1
   resources:
     requests: { cpu: 100m, memory: 128Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    # 1Gi with values.yaml's processor.gomemlimit (800MiB, NOT overridden here): the two are
+    # derived together from §13 M2's parsed:raw ratio -- the arithmetic is in values.yaml beside
+    # gomemlimit. Lowering this alone puts the Go soft limit above the kernel's.
+    limits: { cpu: "1", memory: 1Gi }
 
 dashboard:
   replicaCount: 2
