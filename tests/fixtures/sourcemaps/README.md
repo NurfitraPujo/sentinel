@@ -81,8 +81,11 @@ after build A's events the project has 60 issues; after build B's, still 60.
   hash-token rule as first written whenever they carried no digit and were not all-hex — on this
   app, a default build names `analytics-CuqmStVf.js`, `cart-oQLsOyVD.js`, `money-Bcjv_cAO.js` and
   `search-BJccElTd.js` (4 of 8 chunks) — and a hash containing `-` (`index-Ab-3xyz.js`) split at
-  the wrong separator. Decision 41 (BUG-03) widened the rule; those four names and the `-` case
-  are rows in `tests/unit/fingerprint_normalisation_test.go`. Hex stays here so the committed
+  the wrong separator. Decision 41 (BUG-03) widened the rule and decision 42 (BUG-06) fixed its
+  measured reading (≥ 2 upper-case letters after position 0, no vowel run over 2, the `-` inside
+  a token skipped unconditionally — `TestNormalizeHashInput_Base64urlMissRate` re-measures the
+  residual on 200,000 random names every run); those four names and the `-` cases are rows in
+  `tests/unit/fingerprint_normalisation_test.go`. Hex stays here so the committed
   maps, their digests and the M1–M3 numbers in `status/be.md` remain byte-stable.
 - **The build id sits inside the token.** `[name]-[hash]_b2.js` normalises to `<name>-*.js` because
   `<hash>_b2` is 6–64 chars of `[A-Za-z0-9_]` with a digit. `[name]-[hash]-b2.js` or

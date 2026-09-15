@@ -126,12 +126,15 @@ func (cfg FingerprintConfig) normalises() bool {
 //     separator has its whole stem as the token (`8f7a6b5c3d2e1f0a.js` → `*.js`). Only the ONE
 //     token immediately before the extension run is examined (`vendor-react-a3f9b2.js` →
 //     `vendor-react-*.js`; `react` is never looked at).
-//   - Hash token (decision 41): 6–64 chars of [A-Za-z0-9_-] that is not a word — it contains at
-//     least one digit, OR it is entirely [0-9a-f], OR it is mixed-case with no vowel run longer
-//     than 2 (Rollup's default base64url hashes: `CuqmStVf`, `oQLsOyVD`, `d_kdqh_W`). The
-//     separator search skips a `-` that sits INSIDE such a token (`cart-oQ-sOyVD.js` →
-//     `cart-*.js`): the piece after the last separator is examined first, and only when it is not
-//     a token by itself is the previous `-` treated as part of the token.
+//   - Hash token (decisions 41 and 42): 6–64 chars of [A-Za-z0-9_-] that is not a word — it
+//     contains at least one digit, OR it is entirely [0-9a-f], OR it is digitless with ≥ 2
+//     upper-case letters after position 0 and no vowel run longer than 2 (Rollup's default
+//     base64url hashes: `CuqmStVf`, `oQLsOyVD`; `d_kdqh_W` by its inner `_`). The separator
+//     search skips a `-` that sits INSIDE such a token unconditionally (`cart-oQ-sOyVD.js` →
+//     `cart-*.js`, `chunk-Ab-xyz9Qw.js` → `chunk-*.js`, `chunk--rv42314.js` → `chunk-*.js`):
+//     the candidate widens back across every `-` whose preceding piece is hash-shaped and the
+//     widest candidate that is a token wins, so a word (`react`, `main`) or a numeric chunk id
+//     (`1234`) is never absorbed.
 //   - Extension run: the trailing sequence of `.<ext>` segments where each ext is 1–8 chars of
 //     [a-z] with no digit (`.js`, `.chunk.js`, `.min.js`, `.js.map`); `main.a1b2c3d4.chunk.js` →
 //     `main.*.chunk.js`.
@@ -157,49 +160,56 @@ func normalizeBasename(base string) string {
 	if stem == "" {
 		return base
 	}
-	// The piece after the LAST separator is examined first: `vendor-react-a3f9b2.js` strips to
-	// `vendor-react-*.js` because `a3f9b2` is a token on its own, and `react` is never looked at.
+	// The candidate starts as the piece after the LAST separator, then widens back across `-`
+	// separators only (a `.` is never inside a token) for as long as the piece being crossed is
+	// hash-shaped; the widest candidate that is a token wins (decision 42: the `-` inside a
+	// base64url token is skipped unconditionally -- whether or not the last piece happens to be a
+	// token on its own, so `chunk-Ab-xyz9Qw.js` and `cart-oQ-sOyVD.js` both strip to
+	// `chunk-*.js` / `cart-*.js`, and `chunk-EF--2AAw.js` crosses an intermediate candidate that
+	// is not one). A lower-case word (`react`, `main`, `http`) or a numeric chunk id (`1234`) is
+	// never hash-shaped, so `vendor-react-a3f9b2.js` → `vendor-react-*.js`, `1234-abcdef.js` →
+	// `1234-*.js` and `main-a1b2c.js` stay as §4.4 states.
 	sep := strings.LastIndexAny(stem, "-.")
-	if isHashToken(stem[sep+1:]) {
-		return stem[:sep+1] + "*" + ext
-	}
-	// Decision 41: a `-` can sit INSIDE a base64url token (`oQ-sOyVD`), in which case the last
-	// piece is a fragment and the wrong separator was found. Walk back over `-` separators only (a
-	// `.` is never inside a token), widening the candidate one piece at a time while the piece
-	// being crossed is itself hash-shaped -- a lower-case word (`main`, `cool`, `chunk`) is never
-	// part of a token, so `main-a1b2c.js` and `my-cool-Component.js` stay as they are -- and take
-	// the first candidate that is a token.
+	tokenSep, found := sep, isHashToken(stem[sep+1:])
 	for sep >= 0 && stem[sep] == '-' {
 		prev := strings.LastIndexAny(stem[:sep], "-.")
 		if !isHashFragment(stem[prev+1 : sep]) {
 			break
 		}
-		if isHashToken(stem[prev+1:]) {
-			return stem[:prev+1] + "*" + ext
-		}
 		sep = prev
+		if isHashToken(stem[sep+1:]) {
+			tokenSep, found = sep, true
+		}
 	}
-	return base
+	if !found {
+		return base
+	}
+	return stem[:tokenSep+1] + "*" + ext
 }
 
-// isHashFragment says whether a `-`-separated piece may be the front part of one base64url token
-// (decision 41): at least 2 chars, and not a lower-case word -- it carries a digit, an upper-case
-// letter, or no vowel at all.
+// isHashFragment says whether a `-`-separated piece may be the front part of one hash token whose
+// `-` the separator search must skip (decision 42): empty (a leading `-`, `chunk--rv42314.js`),
+// or carrying an upper-case letter (`A`, `Ab`, `oQ`, `CuqmSt`), or carrying a digit without being
+// all digits (`a1b2c3`, `rv42`). A word is never a fragment, and neither is a vowel-less one
+// (`http`, `css`, `x`) nor a numeric chunk id (`1234`): `http-Bx-3kQz9.js` → `http-*.js`,
+// `1234-abcdef.js` → `1234-*.js`, `vendor-react-a3f9b2.js` → `vendor-react-*.js`.
 func isHashFragment(s string) bool {
-	if len(s) < 2 {
-		return false
-	}
-	hasVowel := false
+	hasDigit, allDigits := false, true
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c >= '0' && c <= '9', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+			hasDigit = true
+			continue
+		case c >= 'A' && c <= 'Z':
 			return true
-		case isVowel(c):
-			hasVowel = true
 		}
+		allDigits = false
 	}
-	return !hasVowel
+	if allDigits {
+		return len(s) == 0
+	}
+	return hasDigit
 }
 
 func isVowel(c byte) bool {
@@ -241,24 +251,25 @@ func isExtension(s string) bool {
 	return true
 }
 
-// isHashToken is the contract's hash-token definition (§4.4, decision 41): 6–64 chars of
-// [A-Za-z0-9_-], and not a word — at least one digit, OR entirely [0-9a-f], OR mixed-case with no
-// vowel run longer than 2 (Rollup's default `hashCharacters: 'base64'` names: `CuqmStVf`,
-// `oQLsOyVD`, `d_kdqh_W`).
+// isHashToken is the contract's hash-token definition (§4.4, decisions 41 and 42): 6–64 chars of
+// [A-Za-z0-9_-], and not a word — at least one digit, OR entirely [0-9a-f], OR digitless with
+// ≥ 2 upper-case letters after position 0 AND no vowel run longer than 2 (decision 42's measured
+// reading of decision 41's "mixed-case": Rollup's default `hashCharacters: 'base64'` names
+// `CuqmStVf`, `oQLsOyVD`, `FksjBCVK`, `LVliPaoS`). The contract's own negatives are what fix the
+// reading: `Header` has no upper-case letter after position 0, `getUser` and `_buildManifest`
+// (the directory rule's example) have one, `useAuth` has one and the run `eAu`. `parseHTML`
+// strips -- an accepted false positive of the same class as `decade.js` under the all-hex clause.
 //
-// "Mixed-case" has to mean more than "has both cases", because the contract's own rows say so:
-// `Header`, `useAuth` and `_buildManifest` (the directory rule's example) must not strip, and each
-// has both cases and no vowel run over 2 except `useAuth` (`eAu`). What separates a base64url hash
-// from a camelCase word is that its case-pieces are not syllables: split the token at every
-// upper-case letter, and a hash has a piece after the first that is ≥ 2 chars with no vowel
-// (`Cuqm|St|Vf`, `o|Q|Ls|Oy|V|D`), or an `_` inside it (`d_kdqh_W` -- snake and camel do not mix
-// in a word). `_build|Manifest`, `Header`, `get|User` and `parse|H|T|M|L` have neither.
+// One digitless shape the case count refuses is kept from decision 41 because §4.4 names it as a
+// hash: an inner `_` in a mixed-case token (`d_kdqh_W` -- a single upper-case letter after
+// position 0, but snake and camel do not mix in a word). Both clauses still require no vowel run
+// over 2.
 func isHashToken(s string) bool {
 	if len(s) < 6 || len(s) > 64 {
 		return false
 	}
-	hasDigit, allHex, hasLower, hasUpper, innerUnderscore, longVowelRun := false, true, false, false, false, false
-	vowelRun := 0
+	hasDigit, allHex, hasLower, innerUnderscore, longVowelRun := false, true, false, false, false
+	uppersAfterFirst, vowelRun := 0, 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
@@ -271,7 +282,9 @@ func isHashToken(s string) bool {
 			hasLower = true
 		case c >= 'A' && c <= 'Z':
 			allHex = false
-			hasUpper = true
+			if i > 0 {
+				uppersAfterFirst++
+			}
 		case c == '_':
 			allHex = false
 			innerUnderscore = innerUnderscore || i > 0
@@ -292,32 +305,10 @@ func isHashToken(s string) bool {
 	if hasDigit || allHex {
 		return true
 	}
-	if !hasLower || !hasUpper || longVowelRun {
+	if longVowelRun {
 		return false
 	}
-	return innerUnderscore || hasVowellessCasePiece(s)
-}
-
-// hasVowellessCasePiece: after splitting s at every upper-case letter (each starts a piece), is
-// there a piece other than the first of ≥ 2 chars with no vowel? See isHashToken.
-func hasVowellessCasePiece(s string) bool {
-	pieceStart, pieceHasVowel := -1, false
-	check := func(end int) bool {
-		return pieceStart > 0 && end-pieceStart >= 2 && !pieceHasVowel
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			if check(i) {
-				return true
-			}
-			pieceStart, pieceHasVowel = i, false
-		}
-		if isVowel(c) {
-			pieceHasVowel = true
-		}
-	}
-	return check(len(s))
+	return uppersAfterFirst >= 2 || (innerUnderscore && hasLower && uppersAfterFirst >= 1)
 }
 
 // isBuildIDSegment is the directory rule's predicate: ≥ 16 chars of [A-Za-z0-9_-] with a digit.

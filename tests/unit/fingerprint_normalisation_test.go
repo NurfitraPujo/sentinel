@@ -3,6 +3,7 @@ package unit
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -54,7 +55,7 @@ var hashNormalisationCases = []struct {
 	{"a 16-char segment without a digit is not a build id", "/static/abcdefghijklmnop/x.js", "/static/abcdefghijklmnop/x.js", "none"},
 	{"a 15-char segment with digits is below the bound", "/static/abcdefghij12345/x.js", "/static/abcdefghij12345/x.js", "none"},
 	{"a segment with a dot is not a build id", "/static/abc.def123456789012/x.js", "/static/abc.def123456789012/x.js", "none"},
-	{"the basename is the basename rule's alone (a bare 20-char id with no extension)", "/static/AbC123xyz_-9pQrStUvW", "/static/AbC123xyz_-*", "basename"},
+	{"the basename is the basename rule's alone (a bare 20-char id with no extension; decision 42 joins its inner `-`)", "/static/AbC123xyz_-9pQrStUvW", "/static/*", "basename"},
 	// --- step 1 (path normalisation) composes with the rules ---
 	{"scheme and host dropped, then the basename rule", "https://app.example.com/assets/index-3f2a1c.js", "/assets/index-*.js", "path+basename"},
 	{"cache-buster query dropped, then the basename rule", "/assets/index-3f2a1c.js?v=1725100000", "/assets/index-*.js", "path+basename"},
@@ -72,7 +73,7 @@ var hashNormalisationCases = []struct {
 	{"a 64-char token is the maximum", "x-" + strings.Repeat("a1b2c3d4", 8) + ".js", "x-*.js", "token"},
 	{"a 65-char token is over the maximum", "x-" + strings.Repeat("a1b2c3d4", 8) + "e.js", "x-" + strings.Repeat("a1b2c3d4", 8) + "e.js", "token"},
 	{"underscore is a token character", "x-a1_b2c3.js", "x-*.js", "token"},
-	{"a dash inside the candidate splits it: only the last piece is examined", "x-a1b2c3-d4e5f6.js", "x-a1b2c3-*.js", "token"},
+	{"a dash inside a digit-bearing candidate is skipped too (decision 42); `x` is a word, never joined", "x-a1b2c3-d4e5f6.js", "x-*.js", "token"},
 	{"consequence of the all-hex clause, stated: a 6-letter hex word strips", "decade.js", "*.js", "token"},
 	// --- decision 41: Rollup's default base64url hashes (digitless, non-hex, mixed-case) ---
 	{"vite default chunk: digitless mixed-case token", "analytics-CuqmStVf.js", "analytics-*.js", "token"},
@@ -88,12 +89,26 @@ var hashNormalisationCases = []struct {
 	{"decision 41 negative: a capitalised word is not a hash (.tsx is an extension)", "Header.tsx", "Header.tsx", "none"},
 	{"decision 41 negative: camelCase with a vowel run of 3 (eAu)", "useAuth.js", "useAuth.js", "none"},
 	{"decision 41 negative: camelCase whose pieces are syllables", "getUser.js", "getUser.js", "none"},
-	{"decision 41 negative: a camelCase acronym is single-letter pieces", "parseHTML.js", "parseHTML.js", "none"},
+	{"decision 42 accepted false positive, stated: an acronym tail is ≥ 2 upper-case letters after position 0", "parseHTML.js", "*.js", "token"},
 	{"decision 41 negative: next.js's own manifest names", "/_next/static/AbC123xyz_-9pQrStUv/_ssgManifest.js", "/_next/static/*/_ssgManifest.js", "directory"},
 	{"decision 41 negative: a word before the `-` is never joined into a token", "my-cool-Component.js", "my-cool-Component.js", "none"},
 	{"decision 41 negative: a word before the `-` and a short digit piece", "main-a1b2c.js", "main-a1b2c.js", "none"},
 	{"decision 41 negative: all lower-case, no digit, not hex", "qmstvfxk.js", "qmstvfxk.js", "none"},
 	{"decision 41 negative: a 5-char mixed-case piece is below the minimum and `x` is no fragment", "x-CuqmS.js", "x-CuqmS.js", "none"},
+	// --- decision 42: the measured reading -- ≥ 2 upper-case letters after position 0 and no vowel run over 2; the `-` inside a token is skipped unconditionally ---
+	{"decision 42: letter-only base64url hash (the review's FksjBCVK)", "chunk-FksjBCVK.js", "chunk-*.js", "token"},
+	{"decision 42: letter-only base64url hash (the review's LVliPaoS)", "chunk-LVliPaoS.js", "chunk-*.js", "token"},
+	{"decision 42: letter-only base64url hash (the review's IkGvixYa)", "chunk-IkGvixYa.js", "chunk-*.js", "token"},
+	{"decision 42: letter-only base64url hash (the review's qkpCfiLo)", "chunk-qkpCfiLo.js", "chunk-*.js", "token"},
+	{"decision 42: letter-only base64url hash (the review's TMVamrKO)", "chunk-TMVamrKO.js", "chunk-*.js", "token"},
+	{"decision 42: a leading `-` in the hash is an empty fragment, not a second separator", "chunk--rv42314.js", "chunk-*.js", "token"},
+	{"decision 42: a `-` at index 1 of the hash is skipped although the tail is a token by itself", "chunk-A-xyz9Qw.js", "chunk-*.js", "token"},
+	{"decision 42: a `-` at index 2 of the hash is skipped although the tail is a token by itself", "chunk-Ab-xyz9Qw.js", "chunk-*.js", "token"},
+	{"decision 42 negative: one upper-case letter after position 0 is a capitalised word", "chunk-Abcdefgh.js", "chunk-Abcdefgh.js", "none"},
+	{"decision 42 negative: a vowel run of 3 (eau) refuses a token with two upper-case letters", "chunk-BeauTyQx.js", "chunk-BeauTyQx.js", "none"},
+	{"decision 42 negative: the directory rule's own basename has one upper-case letter after position 0", "_buildManifest.js", "_buildManifest.js", "none"},
+	{"decision 42 negative: a vowel-less word before the `-` is not a fragment", "http-Bx-3kQz9.js", "http-*.js", "token"},
+	{"decision 42 negative: a numeric chunk id before the `-` is not a fragment", "1234-Ab-CdEfGh.js", "1234-*.js", "token"},
 	{"function is never touched (asserted through Compute only; the path here is a control)", "/assets/x.js", "/assets/x.js", "none"},
 }
 
@@ -233,4 +248,63 @@ func TestCompute_NormalisationNeverTouchesFunction(t *testing.T) {
 	assert.Equal(t,
 		ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: "/assets/index-*.js", Function: "a1b2c3", InApp: true}}),
 		compute("a1b2c3"))
+}
+
+// TestNormalizeHashInput_Base64urlMissRate is decision 42's measurement, re-run on every test run:
+// 200,000 seeded random 8-char base64url names (Rollup's default `hashCharacters: 'base64'`
+// alphabet, `[A-Za-z0-9_-]`), each as `chunk-<name>.js` through NormalizeHashInput, and the share
+// that does NOT come out as `chunk-*.js` is the residual -- a chunk whose identity would still
+// split per build. The rate is logged (status/be.md quotes it) and bounded; the bound is a
+// regression guard for the rule, not the decision's target, and the breakdown says which clause
+// of the rule each miss failed on so a change to the bound is a deliberate one.
+func TestNormalizeHashInput_Base64urlMissRate(t *testing.T) {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	const n = 200_000
+	r := rand.New(rand.NewSource(20260915))
+	miss, fewUppers, vowelRun, dash, other := 0, 0, 0, 0, 0
+	var samples []string
+	for i := 0; i < n; i++ {
+		b := make([]byte, 8)
+		for j := range b {
+			b[j] = alphabet[r.Intn(len(alphabet))]
+		}
+		name := string(b)
+		if fingerprint.NormalizeHashInput("chunk-"+name+".js") == "chunk-*.js" {
+			continue
+		}
+		miss++
+		switch {
+		case !strings.ContainsAny(name, "0123456789") && hasVowelRunOver2(name):
+			vowelRun++
+		case !strings.ContainsAny(name, "0123456789"):
+			fewUppers++
+		case strings.Contains(name, "-"):
+			dash++
+		default:
+			other++
+		}
+		if len(samples) < 12 {
+			samples = append(samples, name)
+		}
+	}
+	rate := 100 * float64(miss) / n
+	t.Logf("decision 42 miss rate: %d / %d = %.2f%% -- digitless with a vowel run over 2: %d (%.2f%%); digitless with fewer than 2 upper-case letters after position 0: %d (%.2f%%); digit-bearing with a `-` after a piece that is not hash-shaped (a lower-case letter or word): %d (%.2f%%); other: %d; e.g. %s",
+		miss, n, rate, vowelRun, 100*float64(vowelRun)/n, fewUppers, 100*float64(fewUppers)/n, dash, 100*float64(dash)/n, other, strings.Join(samples, " "))
+	assert.Equal(t, 0, other, "every miss must be explained by one of the rule's named clauses")
+	assert.LessOrEqual(t, rate, 4.0, "decision 42: the residual on Rollup's default names")
+}
+
+func hasVowelRunOver2(s string) bool {
+	run := 0
+	for i := 0; i < len(s); i++ {
+		if strings.IndexByte("aeiouAEIOU", s[i]) >= 0 {
+			run++
+			if run > 2 {
+				return true
+			}
+		} else {
+			run = 0
+		}
+	}
+	return false
 }

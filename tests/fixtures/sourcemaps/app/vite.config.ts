@@ -15,7 +15,8 @@
 // hashCharacters is `hex` on purpose. Rollup's default is base64url, whose 8-char hashes contain
 // `-` about 12% of the time and contain NO digit about 26% of the time; either shape escaped the
 // contract's hash-token rule as first written (a digitless non-hex token was a word; a `-` split
-// at the wrong separator). Decision 41 (BUG-03) widened the rule to catch them, and the unit table
+// at the wrong separator). Decision 41 (BUG-03) widened the rule to catch them, decision 42 (BUG-06)
+// fixed its measured reading (~3.7% of random default names still escape it), and the unit table
 // in tests/unit/fingerprint_normalisation_test.go pins the default names this app produces
 // (`analytics-CuqmStVf.js`, `cart-oQLsOyVD.js`, ...). Hex stays here so the committed maps and
 // every digest recorded in status/be.md remain byte-stable.
