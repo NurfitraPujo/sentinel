@@ -19,6 +19,11 @@ import { randomUUID } from 'node:crypto';
 //      row is written, so an object a concurrent cleanup deleted between this request's put and
 //      its commit is put back before any row references it.
 //
+// Every `it` here is order-independent (review minor 2 on sentinel#27): a `describe` owns its
+// release, an `it` owns its path or seeds the row it asserts on, and a sequence whose later
+// steps need the earlier ones is one `it`. `pnpm vitest run --sequence.shuffle` with any seed is
+// the check.
+//
 // The disposable-DB contract is the same as every other `*.integration.test.ts` beside this file:
 // it seeds its own organization and project and deletes them again (the FK cascades the
 // `sourcemaps` rows), with a per-run suffix so two concurrent runs cannot collide. The probe
@@ -92,41 +97,40 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 		}
 	});
 
+	// Order-independent by construction (review minor 2): the three phases below share one row
+	// on purpose -- replace needs a row to replace and "unchanged" needs the replaced row -- so
+	// they are ONE case, not three `it`s that only pass in file order. Every `describe` in this
+	// file owns its release; every `it` owns its path, or seeds what it asserts on.
 	describe('create → replace → unchanged on one (project, release, path)', () => {
 		const release = 'r-crud-' + suffix;
 		const path = '/assets/index-3f2a1c.js';
 
-		it('create: the first upsert inserts one row with the given columns and counts it', async () => {
-			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
-			const out = await upsertReleaseSourcemaps({
+		it('create inserts one row with the given columns; replace rewrites the SAME row (new storage_key / sha256 / size_bytes, uploaded_at moved, id kept, still one row); unchanged is reported by phase 1 so the route never calls phase 3 for it', async () => {
+			const { upsertReleaseSourcemaps, readReleaseState } = await import('./sourcemaps');
+
+			// create
+			const created = await upsertReleaseSourcemaps({
 				projectId,
 				releaseVersion: release,
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('a1')), sizeBytes: 10, sha256: sha('a1') }],
 				maxPerRelease: 500,
 				ensureObjectsPresent: present,
 			});
-			expect(out).toEqual({ releaseFileCount: 1, displacedKeys: [] });
+			expect(created).toEqual({ releaseFileCount: 1, displacedKeys: [] });
 
-			const rows = await sql`
+			const afterCreate = await sql`
 				select id, storage_key, size_bytes, sha256, uploaded_at
 				from sourcemaps where project_id = ${projectId} and release_version = ${release}
 			`;
-			expect(rows).toHaveLength(1);
-			expect(rows[0].storage_key).toBe(key(release, path, sha('a1')));
-			expect(Number(rows[0].size_bytes)).toBe(10);
-			expect(rows[0].sha256).toBe(sha('a1'));
-		});
+			expect(afterCreate).toHaveLength(1);
+			expect(afterCreate[0].storage_key).toBe(key(release, path, sha('a1')));
+			expect(Number(afterCreate[0].size_bytes)).toBe(10);
+			expect(afterCreate[0].sha256).toBe(sha('a1'));
+			const before = afterCreate[0];
 
-		it('replace: the same path with new bytes rewrites the SAME row -- new storage_key / sha256 / size_bytes, uploaded_at moved, id kept, still one row', async () => {
-			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
-			const [before] = await sql`
-				select id, uploaded_at from sourcemaps
-				where project_id = ${projectId} and release_version = ${release} and minified_path = ${path}
-			`;
-			// `now()` is transaction time at microsecond resolution; make sure the clock has moved.
+			// replace: `now()` is transaction time at microsecond resolution; make sure the clock has moved.
 			await new Promise((r) => setTimeout(r, 5));
-
-			const out = await upsertReleaseSourcemaps({
+			const replaced = await upsertReleaseSourcemaps({
 				projectId,
 				releaseVersion: release,
 				files: [{ minifiedPath: path, storageKey: key(release, path, sha('b2')), sizeBytes: 22, sha256: sha('b2') }],
@@ -135,22 +139,20 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 			});
 			// A replace is not an add: the count stays 1 (§4.1's release_file_count); the key the
 			// row carried under the lock is the one displaced (BUG-05).
-			expect(out).toEqual({ releaseFileCount: 1, displacedKeys: [key(release, path, sha('a1'))] });
+			expect(replaced).toEqual({ releaseFileCount: 1, displacedKeys: [key(release, path, sha('a1'))] });
 
-			const rows = await sql`
+			const afterReplace = await sql`
 				select id, storage_key, size_bytes, sha256, uploaded_at
 				from sourcemaps where project_id = ${projectId} and release_version = ${release}
 			`;
-			expect(rows).toHaveLength(1);
-			expect(rows[0].id).toBe(before.id);
-			expect(rows[0].storage_key).toBe(key(release, path, sha('b2')));
-			expect(Number(rows[0].size_bytes)).toBe(22);
-			expect(rows[0].sha256).toBe(sha('b2'));
-			expect(new Date(rows[0].uploaded_at).getTime()).toBeGreaterThan(new Date(before.uploaded_at).getTime());
-		});
+			expect(afterReplace).toHaveLength(1);
+			expect(afterReplace[0].id).toBe(before.id);
+			expect(afterReplace[0].storage_key).toBe(key(release, path, sha('b2')));
+			expect(Number(afterReplace[0].size_bytes)).toBe(22);
+			expect(afterReplace[0].sha256).toBe(sha('b2'));
+			expect(new Date(afterReplace[0].uploaded_at).getTime()).toBeGreaterThan(new Date(before.uploaded_at).getTime());
 
-		it('unchanged: phase 1 reports the row with its sha256 and storageKey, so the route never calls phase 3 for it', async () => {
-			const { readReleaseState } = await import('./sourcemaps');
+			// unchanged
 			const state = await readReleaseState(projectId, release, [path, '/assets/never-uploaded.js']);
 			expect(state.current).toBe(1);
 			expect(state.existing.get(path)).toEqual({ sha256: sha('b2'), storageKey: key(release, path, sha('b2')) });
@@ -162,40 +164,33 @@ describe.skipIf(!dbReachable)('sourcemaps write path (integration, real Postgres
 		// The review's scenario at the query layer: row {S0,K0}; A replaces it with K1; C (a CI retry
 		// of the older artifact) replaces it back with K0 -- content-addressed, so the SAME key.
 		// After C, K1 is unreferenced and K0 is referenced: A's cleanup, had it been deferred to
-		// this moment, must delete K1 and keep K0 whatever its phase-1 snapshot said.
+		// this moment, must delete K1 and keep K0 whatever its phase-1 snapshot said. The three
+		// assertions read the state the sequence leaves, so they are one case.
 		const release = 'r-displace-' + suffix;
 		const path = '/assets/cart-oQLsOyVD.js';
 		const K0 = () => key(release, path, sha('s0'));
 		const K1 = () => key(release, path, sha('s1'));
 
-		it('each replace reports the key the row carried at commit time, not the first one ever written', async () => {
-			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
+		it('each replace reports the key the row carried at commit time; findReferencedStorageKeys answers with the keys rows still point at; a rewrite with the key the row already has displaces nothing', async () => {
+			const { upsertReleaseSourcemaps, findReferencedStorageKeys } = await import('./sourcemaps');
 			const file = (k: string, seed: string) => ({ minifiedPath: path, storageKey: k, sizeBytes: 1, sha256: sha(seed) });
 
+			// create → A → C: each replace reports the key the row carried at commit time, not the
+			// first one ever written.
 			const create = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(create.displacedKeys).toEqual([]);
 			const a = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K1(), 's1')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(a.displacedKeys).toEqual([K0()]);
 			const c = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(c.displacedKeys).toEqual([K1()]);
-		});
 
-		it('findReferencedStorageKeys answers with the keys rows still point at, across the whole table', async () => {
-			const { findReferencedStorageKeys } = await import('./sourcemaps');
+			// The reference check reads the whole table: K0 is referenced, K1 no longer is.
 			const referenced = await findReferencedStorageKeys([K0(), K1(), 'sourcemaps/nobody/has/this.map']);
 			expect(referenced).toEqual(new Set([K0()]));
 			expect(await findReferencedStorageKeys([])).toEqual(new Set());
-		});
 
-		it('an upsert that rewrites a row with the key it already has displaces nothing', async () => {
-			const { upsertReleaseSourcemaps } = await import('./sourcemaps');
-			const again = await upsertReleaseSourcemaps({
-				projectId,
-				releaseVersion: release,
-				files: [{ minifiedPath: path, storageKey: K0(), sizeBytes: 1, sha256: sha('s0') }],
-				maxPerRelease: 500,
-				ensureObjectsPresent: present,
-			});
+			// An upsert that rewrites the row with the key it already has displaces nothing.
+			const again = await upsertReleaseSourcemaps({ projectId, releaseVersion: release, files: [file(K0(), 's0')], maxPerRelease: 500, ensureObjectsPresent: present });
 			expect(again.displacedKeys).toEqual([]);
 		});
 	});
