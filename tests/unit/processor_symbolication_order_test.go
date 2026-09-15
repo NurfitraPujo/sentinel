@@ -132,12 +132,48 @@ func TestSymbolicate_FingerprintIsComputedOnTheRewrittenFrames(t *testing.T) {
 	rewritten := fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production", ErrorClass: "TypeError", Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
 		Stacktrace: []fingerprint.StackFrame{
-			{File: orderSource, Line: 6, Function: "subtotal", InApp: true},
+			{File: orderSource, Line: 6, Function: "subtotal", InApp: true, Symbolicated: true},
 			{File: "/assets/vendor-3f2a1c.js", Line: 1, Function: "n", InApp: true},
 		},
 	})
 	assert.Equal(t, rewritten, evt.Fingerprint, "identity is computed over the symbolicated frames")
 	assert.NotEqual(t, asSent, evt.Fingerprint, "and it differs from the raw-frame identity, so the order is observable")
+}
+
+// TestSymbolicate_ComputeFingerprintCarriesTheSymbolicatedFlag is decision 44 on the call path
+// (B3): ComputeFingerprint must hand each frame's step-6 record to fingerprint.Compute, or the
+// gate in Compute is unreachable and a symbolicated `UserProfileCard.tsx` is hash-stripped
+// anyway. The committed fixture map's one source is `main.ts`, which no clause strips, so the
+// rewrite is applied by hand here exactly as the stage writes it (File replaced, Raw kept,
+// Symbolicated set): the fingerprint must be the hash over that source path verbatim next to the
+// un-rewritten vendor frame stripped as before. Drop `Symbolicated: f.Symbolicated` from
+// ComputeFingerprint and this goes red.
+func TestSymbolicate_ComputeFingerprintCarriesTheSymbolicatedFlag(t *testing.T) {
+	evt, err := event.Deserialize(marshalProtoEvent(t, javascriptProtoEvent()))
+	require.NoError(t, err)
+	f := &evt.Stacktrace[0]
+	f.Raw = &symbolicate.RawFrame{File: f.File, Line: f.Line, Column: f.Column, Function: f.Function}
+	f.File, f.Line, f.Column, f.Function, f.Symbolicated = "src/components/UserProfileCard.tsx", 42, 7, "onClick", true
+
+	evt.ComputeFingerprint(symbolicate.DefaultPlatforms)
+
+	want := fingerprint.Compute(fingerprint.FingerprintConfig{
+		Environment: "production", ErrorClass: "TypeError", Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
+		Stacktrace: []fingerprint.StackFrame{
+			{File: "src/components/UserProfileCard.tsx", Line: 42, Function: "onClick", InApp: true, Symbolicated: true},
+			{File: "/assets/vendor-3f2a1c.js", Line: 1, Function: "n", InApp: true},
+		},
+	})
+	assert.Equal(t, want, evt.Fingerprint)
+	stripped := fingerprint.Compute(fingerprint.FingerprintConfig{
+		Environment: "production", ErrorClass: "TypeError", Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
+		Stacktrace: []fingerprint.StackFrame{
+			{File: "src/components/UserProfileCard.tsx", Line: 42, Function: "onClick", InApp: true},
+			{File: "/assets/vendor-3f2a1c.js", Line: 1, Function: "n", InApp: true},
+		},
+	})
+	assert.NotEqual(t, stripped, evt.Fingerprint, "the flag reached Compute: the source path was not read as `src/components/*.tsx`")
+	assert.Equal(t, "src/components/UserProfileCard.tsx", evt.Stacktrace[0].File, "the stored frame is untouched")
 }
 
 // TestSymbolicate_StoredFrameShape pins §4.4 steps 6 and 7 on the JSON processEventInternal

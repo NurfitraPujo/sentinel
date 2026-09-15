@@ -25,9 +25,10 @@ type FingerprintConfig struct {
 	Stacktrace  []StackFrame
 	// Platform is the event's platform (sentinel-sourcemaps §4.4, "Fingerprint input
 	// normalisation"): when it is in NormalisePlatforms, every frame's File is passed through
-	// NormalizeHashInput — symbolicate.NormalizePath, then the basename and directory rules —
-	// INSIDE Compute only, so a build-hash-renamed chunk hashes to the same identity across
-	// builds. The stored frame is untouched. Outside the set (Go, Python, an empty Platform) the
+	// symbolicate.NormalizePath and — for a frame symbolication did not rewrite (decision 44) —
+	// the basename and directory rules of NormalizeHashInput, INSIDE Compute only, so a
+	// build-hash-renamed chunk hashes to the same identity across builds. The stored frame is
+	// untouched. Outside the set (Go, Python, an empty Platform) the
 	// hash input is byte-identical to what it was before the field existed, which is why every
 	// pre-feature issue of those platforms keeps its fingerprint (decision 7 of
 	// sentinel-project-environments had to guard a migration against exactly that kind of split).
@@ -44,6 +45,15 @@ type StackFrame struct {
 	Line     int32
 	Function string
 	InApp    bool
+	// Symbolicated is §4.4 step 6's record on the event frame (event.StackFrame.Symbolicated),
+	// carried here for decision 44: File is then the map's ORIGINAL source path
+	// (`src/components/UserProfileCard.tsx`), which has no build hash to strip, so the basename
+	// and directory rules must not run on it — decision 42's digitless clause reads a three-word
+	// camelCase identifier as a hash token and would collapse every such file in a directory into
+	// one identity. Only a frame the stage did not rewrite (outcome no_map, map_error,
+	// no_mapping, timeout, oversize, or an event the stage never saw) still carries a minified
+	// name, and only that frame gets the rules. False for every pre-feature caller.
+	Symbolicated bool
 }
 
 func Compute(cfg FingerprintConfig) string {
@@ -57,13 +67,19 @@ func Compute(cfg FingerprintConfig) string {
 	}
 
 	// §4.4: the normalisation applies to the hash input of every frame Compute reads — in_app or
-	// fallback, symbolicated or not — and to nothing else: never Function, never the stored frame.
+	// fallback — and to nothing else: never Function, never the stored frame. Step 1's path rule
+	// runs on every frame in the gate set; the hash-strip rules run ONLY on a frame symbolication
+	// did not rewrite (decision 44) — a symbolicated File is a source-level path, and a source
+	// path has no build hash. Decision 42's reading of a minified name is unchanged.
 	normalise := cfg.normalises()
 	hashFile := func(frame StackFrame) string {
-		if normalise {
-			return NormalizeHashInput(frame.File)
+		switch {
+		case !normalise:
+			return frame.File
+		case frame.Symbolicated:
+			return symbolicate.NormalizePath(frame.File)
 		}
-		return frame.File
+		return NormalizeHashInput(frame.File)
 	}
 
 	var appFrames []string
@@ -112,7 +128,8 @@ func (cfg FingerprintConfig) normalises() bool {
 }
 
 // NormalizeHashInput is sentinel-sourcemaps §4.4's "Fingerprint input normalisation", applied to a
-// frame's File inside Compute for the platforms in the gate set: symbolicate.NormalizePath first
+// frame's File inside Compute for the platforms in the gate set when symbolication did not rewrite
+// the frame (decision 44; a symbolicated frame gets step 1 alone): symbolicate.NormalizePath first
 // (step 1's scheme+host / query / fragment rule, so `https://app.example.com/assets/x.js` and
 // `/assets/x.js` hash alike), then the directory rule on every directory segment and the basename
 // rule on the last one. Everything the rules do not name is byte-identical. Exported so the

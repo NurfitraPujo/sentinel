@@ -112,6 +112,92 @@ var hashNormalisationCases = []struct {
 	{"function is never touched (asserted through Compute only; the path here is a control)", "/assets/x.js", "/assets/x.js", "none"},
 }
 
+// symbolicatedFrameCases is the fixture table's decision 44 block (review R8 / BUG-08): the
+// symbolicated-frame NEGATIVES. Decision 42's digitless clause reads a three-word camelCase or
+// PascalCase identifier as a hash token, which is right for a minified name and wrong for a
+// source path — and a symbolicated frame's File IS a source path (the map's `sources` entry),
+// with no build hash to strip. So §4.4 now runs the basename and directory rules only on a frame
+// symbolication did not rewrite; a symbolicated one gets step 1 alone. Each row states BOTH
+// readings so the fix is pinned where decision 44 put it — in Compute's gate, not in the token
+// rule: `minified` is what NormalizeHashInput still does to the bare name (decision 42 stands,
+// BUG-06 is not undone), and through Compute the same File with Symbolicated set hashes
+// byte-identical. The three names are the ones the decision lists; `src/app/page.tsx` is §4.4's
+// own sentence.
+var symbolicatedFrameCases = []struct {
+	name, file, minified string
+}{
+	{"decision 44 negative: a three-word PascalCase component (U, P, C after position 0; no vowel run over 2)", "src/components/UserProfileCard.tsx", "src/components/*.tsx"},
+	{"decision 44 negative: a three-word camelCase hook", "src/hooks/useLocalStorage.ts", "src/hooks/*.ts"},
+	{"decision 44 negative: a three-word camelCase function module", "src/api/fetchUserData.ts", "src/api/*.ts"},
+	{"decision 44 negative: §4.4's own example, which no clause strips either way", "src/app/page.tsx", "src/app/page.tsx"},
+	{"decision 44 negative: a webpack source URL with a directory-rule-shaped segment", "webpack:///./src/features/Ab12Cd34Ef56Gh78/OrderSummaryPanel.tsx", "webpack:///./src/features/*/*.tsx"},
+}
+
+// TestCompute_SymbolicatedFrameIsNeverHashStripped is decision 44 through Compute, the layer the
+// decision names: for platform `javascript`, a frame carrying Symbolicated hashes over its File
+// verbatim (step 1's path rule aside), while the SAME File on a frame the stage did not rewrite
+// still gets decision 42's reading. Two component files in one directory stay two identities.
+// Delete the Symbolicated arm of Compute's hashFile and every row here goes red on the first
+// assertion; narrow isHashToken instead and the `minified` assertion goes red.
+func TestCompute_SymbolicatedFrameIsNeverHashStripped(t *testing.T) {
+	compute := func(file string, symbolicated bool) string {
+		return fingerprint.Compute(fingerprint.FingerprintConfig{
+			Environment: "production", ErrorClass: "TypeError",
+			Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
+			Stacktrace: []fingerprint.StackFrame{{File: file, Line: 12, Function: "onClick", InApp: true, Symbolicated: symbolicated}},
+		})
+	}
+	for _, c := range symbolicatedFrameCases {
+		t.Run(c.name, func(t *testing.T) {
+			verbatim := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.file, Function: "onClick", InApp: true}})
+			stripped := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.minified, Function: "onClick", InApp: true}})
+
+			assert.Equal(t, verbatim, compute(c.file, true), "symbolicated: the source path is the hash input, untouched")
+			assert.Equal(t, c.minified, fingerprint.NormalizeHashInput(c.file), "decision 42's reading of the same name as a minified one stands")
+			assert.Equal(t, stripped, compute(c.file, false), "not rewritten: the rules still run")
+		})
+	}
+
+	// The review's failure scenario, as a value: two defects in two components of one directory.
+	assert.NotEqual(t,
+		compute("src/components/UserProfileCard.tsx", true),
+		compute("src/components/OrderSummaryPanel.tsx", true),
+		"two symbolicated components in one directory are two identities")
+	assert.Equal(t,
+		compute("src/components/UserProfileCard.tsx", false),
+		compute("src/components/OrderSummaryPanel.tsx", false),
+		"control: the same two names as minified frames DO collapse — the fix is the gate, not the rule")
+}
+
+// TestCompute_SymbolicatedFrameStillGetsStepOne: decision 44 gates the basename and directory
+// rules, not step 1 — a symbolicated File that is an http(s) URL still loses scheme, host, query
+// and fragment, so the flag never widens identity beyond what the path rule already joined.
+func TestCompute_SymbolicatedFrameStillGetsStepOne(t *testing.T) {
+	compute := func(file string) string {
+		return fingerprint.Compute(fingerprint.FingerprintConfig{
+			Environment: "production", ErrorClass: "TypeError",
+			Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
+			Stacktrace: []fingerprint.StackFrame{{File: file, Line: 1, Function: "t", InApp: true, Symbolicated: true}},
+		})
+	}
+	want := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: "/src/components/UserProfileCard.tsx", Function: "t", InApp: true}})
+	assert.Equal(t, want, compute("https://app.example.com/src/components/UserProfileCard.tsx?v=2"))
+	assert.Equal(t, want, compute("/src/components/UserProfileCard.tsx"))
+}
+
+// TestCompute_SymbolicatedFlagIsInertOutsideTheGateSet: for `golang` the flag changes nothing —
+// the hash input is ccc52aa's either way, so no pre-feature identity moves.
+func TestCompute_SymbolicatedFlagIsInertOutsideTheGateSet(t *testing.T) {
+	for _, c := range symbolicatedFrameCases {
+		frames := []fingerprint.StackFrame{{File: c.file, Line: 1, Function: "t", InApp: true, Symbolicated: true}}
+		got := fingerprint.Compute(fingerprint.FingerprintConfig{
+			Environment: "production", ErrorClass: "TypeError",
+			Platform: "golang", NormalisePlatforms: symbolicate.DefaultPlatforms, Stacktrace: frames,
+		})
+		assert.Equal(t, ccc52aaHash("production", "TypeError", frames), got, c.name)
+	}
+}
+
 // ccc52aaHash is fingerprint.Compute's formula at the branch point, re-implemented here so the
 // "byte-identical no-op for golang" claim is measured against what the hash input WAS, not against
 // another call into the same function: environment, error class, then `file:function` for the

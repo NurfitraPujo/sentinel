@@ -288,7 +288,9 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 //
 //   - Fingerprint == "" (the normal case) or FingerprintOverride: the server computes one over
 //     Environment, ErrorClass and the frames AS THEY ARE NOW — rewritten if the stage applied,
-//     as sent otherwise. FingerprintOverride true DISCARDS a client value sent with it.
+//     as sent otherwise — with each frame's Symbolicated flag, so Compute strips build hashes
+//     from the frames that still carry a minified name and from no other (decision 44).
+//     FingerprintOverride true DISCARDS a client value sent with it.
 //   - otherwise the client's Fingerprint is stored verbatim, whether or not the frames were
 //     rewritten (flow S7; Compute's early return, untouched — the custom-fingerprint path is
 //     deliberately not environment-prefixed either, see fingerprint.Compute).
@@ -310,6 +312,9 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 			Line:     f.Line,
 			Function: f.Function,
 			InApp:    f.InApp,
+			// Decision 44: Compute strips build hashes only from a frame the stage did not
+			// rewrite; a rewritten File is a source path. Step 6's record is the signal.
+			Symbolicated: f.Symbolicated,
 		}
 	}
 	e.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
