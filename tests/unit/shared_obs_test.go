@@ -370,6 +370,19 @@ func TestObsEnvironmentMetricNames(t *testing.T) {
 	assert.Equal(t, "sentinel_alert_configs_environment_scoped", obs.MetricAlertConfigsEnvironmentScoped)
 }
 
+// TestObsIngestTimestampReplacedMetricName pins the exact spelling of sentinel-ingest-timestamp-clamp
+// §4.3's one metric name and its CLOSED reason set, for the reason TestObsEnvironmentMetricNames
+// gives: the readers that matter are outside this module (a Prometheus scrape, a future infra rule,
+// the contract itself, which names the three reasons in those words), and a drifted name or a fourth
+// reason would match nothing silently. Asserted as literals on purpose. The order is the contract's
+// R1/R2/R3 order.
+func TestObsIngestTimestampReplacedMetricName(t *testing.T) {
+	assert.Equal(t, "sentinel_ingest_timestamp_replaced_total", obs.MetricIngestTimestampReplaced)
+	assert.Equal(t, []string{"empty", "future", "ancient"},
+		[]string{obs.TimestampReasonEmpty, obs.TimestampReasonFuture, obs.TimestampReasonAncient},
+		"the closed reason set of §4.3, in R1/R2/R3 order")
+}
+
 // TestObsReleaseNextRewriteMetricName pins the exact spelling of sentinel-releases-snooze §12's one
 // metric name, for the same reason TestObsEnvironmentMetricNames does — and with a sharper edge: the
 // dashboard registers a counter of the SAME NAME in apps/dashboard-web/src/lib/server/metrics.ts

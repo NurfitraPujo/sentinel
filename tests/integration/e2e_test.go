@@ -442,3 +442,101 @@ func TestFingerprinting(t *testing.T) {
 
 	assert.NotEqual(t, fp1, fp3, "Different fingerprints expected when first 3 in_app frames differ")
 }
+
+// TestIngestAndProcess_NoTimestampIsStoredAtReceipt is the end-to-end proof of
+// sentinel-ingest-timestamp-clamp (contract §11 row 5, flows W1 → D1–D3 / R1): a client that omits
+// `timestamp` — every non-Go client following docs/sdk-specification.md §3 — used to get an
+// occurrence stored at year 1 and swept within the hour. After the rule, the ingestor's receipt time
+// is what reaches error_occurrences.created_at, and the 202 body echoes exactly that value
+// (decision 12), so the row is read back BY the echoed event_id and compared at microsecond
+// precision — TIMESTAMP WITH TIME ZONE keeps microseconds, the wire keeps nanoseconds (decision 15).
+func TestIngestAndProcess_NoTimestampIsStoredAtReceipt(t *testing.T) {
+	cfg := TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+		NATSURL:          os.Getenv("NATS_URL"),
+		IngesterURL:      os.Getenv("INGESTOR_URL"),
+	}
+	pool := newPostgresPool(t, cfg)
+	defer pool.Close()
+
+	projectName := "test-project-ingest-nots"
+	apiKey := "test-api-key-ingest-nots-789"
+
+	projectID := createTestProject(t, pool, projectName, apiKey)
+	defer cleanupProject(t, pool, projectID)
+
+	// No "timestamp" key at all — the R1 shape a curl client produces.
+	payload := map[string]interface{}{
+		"project_key": projectName,
+		"platform":    "python",
+		"environment": "test",
+		"message":     "posted without a timestamp",
+		"error_class": "NoTimestampError",
+		"stacktrace": []map[string]interface{}{
+			{"file": "app.py", "line": 7, "function": "handler", "in_app": true},
+		},
+	}
+
+	before := time.Now().UTC()
+	resp := sendErrorEvent(t, cfg.IngesterURL, apiKey, payload)
+	if resp == nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Expected status 202, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Status    string `json:"status"`
+		EventID   string `json:"event_id"`
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("Failed to decode 202 body: %v", err)
+	}
+	if body.EventID == "" {
+		t.Fatalf("202 body carries no event_id: %+v", body)
+	}
+	echoed, err := time.Parse(time.RFC3339Nano, body.Timestamp)
+	if err != nil {
+		t.Fatalf("202 body timestamp %q is not RFC3339Nano: %v", body.Timestamp, err)
+	}
+	t.Logf("202 body: status=%s event_id=%s timestamp=%s", body.Status, body.EventID, body.Timestamp)
+
+	// The processor consumes asynchronously; poll for the row by the echoed event_id rather than
+	// sleeping a fixed interval.
+	var createdAt time.Time
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := pool.QueryRow(context.Background(),
+			`SELECT o.created_at FROM error_occurrences o
+			   JOIN issues i ON i.id = o.issue_id
+			  WHERE i.project_id = $1 AND o.event_id = $2`,
+			projectID, body.EventID,
+		).Scan(&createdAt)
+		if err == nil {
+			break
+		}
+		if err != pgx.ErrNoRows {
+			t.Fatalf("Failed to query occurrence by event_id: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("occurrence with event_id %s never appeared in error_occurrences", body.EventID)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Logf("error_occurrences.created_at=%s for event_id=%s", createdAt.UTC().Format(time.RFC3339Nano), body.EventID)
+
+	// Not year 1 (the pre-feature behaviour), within 10 s of the test's own clock, and equal to the
+	// echoed value once both are truncated to the microsecond (decision 15).
+	assert.NotEqual(t, 1, createdAt.Year(), "created_at must not be the zero time's year 1")
+	assert.False(t, createdAt.Before(before.Add(-10*time.Second)) || createdAt.After(before.Add(10*time.Second)),
+		"created_at %v is not within 10 s of the request time %v", createdAt, before)
+	assert.True(t, echoed.Truncate(time.Microsecond).Equal(createdAt.Truncate(time.Microsecond)),
+		"the 202 body's timestamp (%s) must equal the stored created_at (%s) at microsecond precision",
+		echoed.Format(time.RFC3339Nano), createdAt.UTC().Format(time.RFC3339Nano))
+}

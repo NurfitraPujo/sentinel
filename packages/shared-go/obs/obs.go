@@ -54,6 +54,11 @@ const (
 	// UUIDv4 instead of using the client's value verbatim (docs/plans/IDEMPOTENCY_PLAN.md D-a). Never
 	// records the id itself as a label (D15 cardinality rule) - only the fixed EventIDReason* below.
 	MetricIngestEventIDReplaced = "sentinel_ingest_event_id_replaced_total"
+	// MetricIngestTimestampReplaced counts events whose client-supplied timestamp the ingestor
+	// replaced with its own receipt time (sentinel-ingest-timestamp-clamp §4.3): absent/zero, more
+	// than service.MaxFutureSkew ahead, or more than service.MaxEventAge behind. Never records the
+	// value, the delta or the project as a label - only the fixed TimestampReason* below.
+	MetricIngestTimestampReplaced = "sentinel_ingest_timestamp_replaced_total"
 
 	// The four sentinel-project-environments §12 instruments. They are declared here, beside the
 	// eight above, for the same B5 reason: infra's Prometheus rules (a THIRD repo — see decision 17)
@@ -199,6 +204,16 @@ const (
 	// particular cannot be stored in a Postgres varchar at all, so passing it through would let a
 	// client dead-letter its own events once the processor writes the column (F-VW0-2).
 	EventIDReasonInvalidChars = "invalid_chars"
+)
+
+// Permitted values for LabelReason on MetricIngestTimestampReplaced (sentinel-ingest-timestamp-clamp
+// §4.3). A CLOSED set of exactly these three, fixed here for the same reason as EventIDReason* above:
+// a typo'd literal at a call site must not be able to invent a new time series. `empty` is deliberately
+// its own constant rather than EventIDReasonEmpty - the two metrics are different contracts.
+const (
+	TimestampReasonEmpty   = "empty"   // absent, null or the explicit zero string (decision 1) -> T_recv
+	TimestampReasonFuture  = "future"  // more than service.MaxFutureSkew ahead of T_recv -> T_recv
+	TimestampReasonAncient = "ancient" // more than service.MaxEventAge behind T_recv -> T_recv (decision 10)
 )
 
 // Permitted values for LabelKind and LabelReason on MetricAffectedRollupSkipped

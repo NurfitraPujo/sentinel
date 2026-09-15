@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"buf.build/go/protovalidate"
@@ -26,6 +27,21 @@ import (
 // maxEventIDLength matches error_occurrences.event_id VARCHAR(64) / the proto's "error_event.event_id"
 // CEL rule (packages/proto/sentinel/v1/error_event.proto) - see docs/plans/IDEMPOTENCY_PLAN.md D-a/D-b.
 const maxEventIDLength = 64
+
+// MaxFutureSkew and MaxEventAge bound the window around receipt time (T_recv) inside which a
+// client-supplied timestamp is believed (sentinel-ingest-timestamp-clamp contract §4.1, decisions 4,
+// 8, 9). They are compile-time constants, not configuration, for the same reason maxEventIDLength is:
+// a bound that varies per deployment is not stated anywhere a client can read.
+//
+//   - A value more than MaxFutureSkew AHEAD of T_recv is disbelieved (R2, reason "future"). A clock a
+//     minute fast is stored as sent; anything further is stored at T_recv.
+//   - A value more than MaxEventAge BEHIND T_recv is disbelieved (R3, reason "ancient"). Equal to the
+//     dashboard's default DATA_RETENTION_DAYS (retention-window.ts): an occurrence older than this is
+//     deleted by the next sweep whatever the ingestor does. The coupling is stated, not enforced.
+const (
+	MaxFutureSkew = 60 * time.Second
+	MaxEventAge   = 30 * 24 * time.Hour
+)
 
 // tracerName is the OTel instrumentation scope name for spans and instruments this package creates. It
 // matches the ingestor's obs.Setup/obs.Bootstrap ServiceName ("ingestor-go") so a trace's spans and the
@@ -59,6 +75,10 @@ type IngestService struct {
 	// IDEMPOTENCY_PLAN.md D-a). Same degradation posture as publishFailureCounter above: nil-safe, Add
 	// guarded, never fatal to construction.
 	eventIDReplacedCounter metric.Int64Counter
+
+	// timestampReplacedCounter records obs.MetricIngestTimestampReplaced{reason}
+	// (sentinel-ingest-timestamp-clamp §4.3). Same degradation posture as the two above.
+	timestampReplacedCounter metric.Int64Counter
 }
 
 func NewIngestService(publisher eventPublisher) (*IngestService, error) {
@@ -95,11 +115,24 @@ func NewIngestService(publisher eventPublisher) (*IngestService, error) {
 			slog.String("error", err.Error()))
 	}
 
+	timestampReplacedCounter, err := otel.Meter(tracerName).Int64Counter(
+		obs.MetricIngestTimestampReplaced,
+		metric.WithDescription("Ingest events whose client-supplied timestamp was replaced with the ingestor's receipt time"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		// Same degradation posture as the two counters above (OBSERVABILITY_PLAN.md D-b; contract
+		// §12): "not recorded as a metric", never a refused ingest or a failed construction.
+		slog.Default().Error("obs: failed to create ingest timestamp-replaced counter; timestamp replacements will not be recorded as a metric",
+			slog.String("error", err.Error()))
+	}
+
 	return &IngestService{
-		publisher:              publisher,
-		validator:              v,
-		publishFailureCounter:  failureCounter,
-		eventIDReplacedCounter: eventIDReplacedCounter,
+		publisher:                publisher,
+		validator:                v,
+		publishFailureCounter:    failureCounter,
+		eventIDReplacedCounter:   eventIDReplacedCounter,
+		timestampReplacedCounter: timestampReplacedCounter,
 	}, nil
 }
 
@@ -135,7 +168,53 @@ func resolveEventID(clientEventID string) (effectiveID string, reason string, of
 	}
 }
 
+// resolveTimestamp applies sentinel-ingest-timestamp-clamp §4.1's rule, the timestamp sibling of
+// resolveEventID: given the decoded client value ts and the request's receipt time receivedAt
+// (T_recv), it returns the EFFECTIVE timestamp - the only one anything downstream ever sees - and the
+// reason it was replaced, or "" when the client's value was used as-is. First match wins:
+//
+//	R1  ts.IsZero()                    -> receivedAt, obs.TimestampReasonEmpty
+//	R2  ts > receivedAt + MaxFutureSkew -> receivedAt, obs.TimestampReasonFuture
+//	R3  ts < receivedAt - MaxEventAge   -> receivedAt, obs.TimestampReasonAncient   (decision 10)
+//	R4  otherwise                       -> ts, verbatim as the same instant in UTC
+//
+// R1 covers an absent key, an explicit null and the literal "0001-01-01T00:00:00Z" alike: encoding/json
+// leaves time.Time at its zero value for all three (decision 1). Pure - it never reads the clock
+// itself; the caller reads it ONCE per HTTP request (decision 3) so every item of a batch compares
+// against, and under R1-R3 receives, the same instant. Replacing with T_recv rather than clamping to
+// the window's edge is deliberate: it is what the processor already writes for releases (LEAST($3,
+// now()), decision 50 of sentinel-releases-snooze), and two different future clocks on one row would
+// be a third thing to explain. Never a rejection (decision 5): the SDK contract says never retry a
+// 4xx, so a 400 here would drop the event this rule exists to keep.
+func resolveTimestamp(ts time.Time, receivedAt time.Time) (effective time.Time, reason string) {
+	// Every branch returns UTC: the effective value is stamped back onto the payload and echoed with
+	// a "Z" suffix (decision 12), whatever location the caller's clock or the client's offset carried.
+	receivedAt = receivedAt.UTC()
+	switch {
+	case ts.IsZero():
+		return receivedAt, obs.TimestampReasonEmpty
+	case ts.After(receivedAt.Add(MaxFutureSkew)):
+		return receivedAt, obs.TimestampReasonFuture
+	case ts.Before(receivedAt.Add(-MaxEventAge)):
+		return receivedAt, obs.TimestampReasonAncient
+	default:
+		return ts.UTC(), ""
+	}
+}
+
+// Ingest resolves, validates and publishes one event using the current wall clock as its receipt
+// time. It is IngestAt with receivedAt = time.Now().UTC(); the HTTP handlers call IngestAt directly so
+// one clock reading is shared by every item of a batch (decision 3), and this wrapper exists for the
+// callers that have no request to share it across.
 func (s *IngestService) Ingest(ctx context.Context, payload *validation.ErrorPayload) error {
+	return s.IngestAt(ctx, payload, time.Now().UTC())
+}
+
+// IngestAt is Ingest with an explicit receipt time (T_recv, sentinel-ingest-timestamp-clamp §3):
+// the ingestor's ONE UTC wall-clock reading for the HTTP request this payload arrived in, taken after
+// the body was decoded and auth/scope passed, and shared by every item of a batch. The handlers read
+// it once and pass it here; tests pass a fixed instant so R1-R4 are deterministic.
+func (s *IngestService) IngestAt(ctx context.Context, payload *validation.ErrorPayload, receivedAt time.Time) error {
 	// D-a: resolve the effective event_id BEFORE mapping/validate/publish, and stamp it back onto the
 	// payload so callers (handleIngest/handleBatchIngest) can echo the effective id in the HTTP
 	// response without this method's signature changing - main.go reads payload.EventID after this
@@ -145,6 +224,16 @@ func (s *IngestService) Ingest(ctx context.Context, payload *validation.ErrorPay
 		s.recordEventIDReplaced(ctx, reason, offendingLength, payload.ProjectKey)
 	}
 	payload.EventID = effectiveID
+
+	// sentinel-ingest-timestamp-clamp §4.1 (decision 2): resolve the effective timestamp HERE - after
+	// resolveEventID, before MapPayloadToEvent - and stamp it back onto the payload in UTC, exactly as
+	// the event_id above, so the mapper stays a verbatim copy and the handlers can echo the effective
+	// value (decision 12) by reading payload.Timestamp after this call returns.
+	effectiveTS, tsReason := resolveTimestamp(payload.Timestamp, receivedAt)
+	if tsReason != "" {
+		s.recordTimestampReplaced(ctx, tsReason, payload.Timestamp, receivedAt, payload.ProjectKey)
+	}
+	payload.Timestamp = effectiveTS
 
 	// sentinel-sourcemaps §4.3: a negative column is a producer bug, not an unknown (0 is the
 	// unknown value), and the proto deliberately carries no rule for it. Checked HERE, on the live
@@ -196,6 +285,40 @@ func (s *IngestService) recordEventIDReplaced(ctx context.Context, reason string
 	)
 	if s.eventIDReplacedCounter != nil {
 		s.eventIDReplacedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelReason, reason)))
+	}
+}
+
+// recordTimestampReplaced is the loud half of §4.1's rule (decision 11): a replaced timestamp is never
+// silent. "empty" is the DESIGNED-FOR case - every non-Go client that simply omits the field - so it
+// logs at Debug, exactly as recordEventIDReplaced treats an absent event_id; "future" and "ancient"
+// mean a client whose clock is wrong and somebody should go and fix it, so they log at Warn. The
+// original value is kept NOWHERE but this line (decision 11: not in metadata, not in a column), as an
+// RFC 3339 string with the signed delta in whole seconds and the project_key - never the event_id.
+// The D15 rule on client input in log fields is about labels and cardinality; a timestamp is neither
+// PII nor high-cardinality as a log field, and it is the one thing an engineer asking "what did my
+// client actually send" needs. For "empty" there is no original worth printing, so the two fields
+// are omitted.
+//
+// Like its sibling, the counter counts REPLACEMENTS AT RESOLVE TIME (contract §4.3): an item that
+// later fails protovalidate or the publish has already been counted, and the series is not expected
+// to reconcile with sentinel_ingest_requests_total{outcome="accepted"}.
+func (s *IngestService) recordTimestampReplaced(ctx context.Context, reason string, original time.Time, receivedAt time.Time, projectKey string) {
+	attrs := []any{
+		slog.String("reason", reason),
+		slog.String("project_key", projectKey),
+	}
+	logFn := slog.Default().WarnContext
+	if reason == obs.TimestampReasonEmpty {
+		logFn = slog.Default().DebugContext
+	} else {
+		attrs = append(attrs,
+			slog.String("original", original.UTC().Format(time.RFC3339)),
+			slog.Int64("delta_seconds", int64(original.Sub(receivedAt)/time.Second)),
+		)
+	}
+	logFn(ctx, "ingest: client timestamp replaced with receipt time", attrs...)
+	if s.timestampReplacedCounter != nil {
+		s.timestampReplacedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelReason, reason)))
 	}
 }
 
