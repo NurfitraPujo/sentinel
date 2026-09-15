@@ -10,6 +10,11 @@ import Page from './+page.svelte';
 //
 // Page data is a LITERAL typed by hand from contract §4.4 (never `$types`). No DB, no loader.
 // Layout — the heading, the back link, spacing — is guidance and is NOT asserted.
+//
+// sentinel-sourcemaps §4.6 added a sixth column, Maps (`sourcemapCount`, `0` never absent), and a
+// control in its cell — so the header list is six and every row carries a sixth cell here. The
+// column's own behaviour (the count, the expand control, §4.2) is `page.sourcemaps.test.ts` beside
+// this file; this file only keeps the five original columns pinned.
 
 interface ReleaseRow {
 	version: string;
@@ -17,10 +22,11 @@ interface ReleaseRow {
 	lastSeen: Date;
 	occurrenceCount: number;
 	issuesIntroduced: number;
+	sourcemapCount: number;
 }
 
 interface ReleasesPageData {
-	org: { slug: string; name: string };
+	org: { id: string; slug: string; name: string };
 	project: { id: string; name: string };
 	releases: ReleaseRow[];
 	truncated: boolean;
@@ -36,6 +42,7 @@ const RELEASES: ReleaseRow[] = [
 		lastSeen: new Date('2026-09-13T08:40:00Z'),
 		occurrenceCount: 1204,
 		issuesIntroduced: 3,
+		sourcemapCount: 2,
 	},
 	{
 		version: '9f8e7d6',
@@ -43,12 +50,13 @@ const RELEASES: ReleaseRow[] = [
 		lastSeen: new Date('2026-09-12T14:01:59Z'),
 		occurrenceCount: 88,
 		issuesIntroduced: 0,
+		sourcemapCount: 0,
 	},
 ];
 
 function pageData(overrides: Partial<ReleasesPageData> = {}): ReleasesPageData {
 	return {
-		org: { slug: 'acme', name: 'Acme' },
+		org: { id: '0a9e0000-0000-4000-8000-00000000000a', slug: 'acme', name: 'Acme' },
 		project: { id: '0b1f0000-0000-4000-8000-000000000001', name: 'checkout' },
 		releases: RELEASES,
 		truncated: false,
@@ -80,10 +88,10 @@ function rows(): string[][] {
 }
 
 describe('/{orgSlug}/projects/{projectId}/releases the table (contract §4.4, flows R2, R6)', () => {
-	it('renders the five columns in order: Version · First seen · Last seen · Occurrences · Issues introduced', () => {
+	it('renders the five columns in order: Version · First seen · Last seen · Occurrences · Issues introduced (then sourcemaps\' Maps)', () => {
 		render(ReleasesPage, { data: pageData() });
 		const headers = Array.from(screen.getByTestId('releases-table').querySelectorAll('thead th')).map(text);
-		expect(headers).toEqual(['Version', 'First seen', 'Last seen', 'Occurrences', 'Issues introduced']);
+		expect(headers).toEqual(['Version', 'First seen', 'Last seen', 'Occurrences', 'Issues introduced', 'Maps']);
 	});
 
 	it('renders one row per release in the order the loader sent them — newest first, never re-sorted', () => {
@@ -95,6 +103,7 @@ describe('/{orgSlug}/projects/{projectId}/releases the table (contract §4.4, fl
 				formatDateLikeTheDetailPage(RELEASES[0].lastSeen),
 				'1,204',
 				'3',
+				'2 Show',
 			],
 			[
 				'9f8e7d6',
@@ -102,6 +111,7 @@ describe('/{orgSlug}/projects/{projectId}/releases the table (contract §4.4, fl
 				formatDateLikeTheDetailPage(RELEASES[1].lastSeen),
 				'88',
 				'0',
+				'0 Show',
 			],
 		]);
 	});
@@ -154,6 +164,7 @@ describe('/{orgSlug}/projects/{projectId}/releases the truncation note (contract
 			lastSeen: new Date(Date.UTC(2026, 8, 13, 0, 0, 0) - i * 60_000),
 			occurrenceCount: 1,
 			issuesIntroduced: 0,
+			sourcemapCount: 0,
 		}));
 		render(ReleasesPage, { data: pageData({ releases, truncated: true }) });
 		const note = screen.getByTestId('releases-truncated');
