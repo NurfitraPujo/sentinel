@@ -86,6 +86,7 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
 - **`stacktrace`**: Maximum 100 frames. File paths truncated to 512 characters.
 - **`stacktrace[].column`**: Optional integer, **1-based as browsers print it** (V8, SpiderMonkey and JavaScriptCore stack strings are `file:line:column`, 1-based — pass the number through unchanged). Omit it, or send `0`, when the platform has no column (Go, Python, Java frames); `0` means "unknown" and the frame is stored as-is. A negative value is rejected with `400` and `field: stacktrace[i].column`.
 - **`metadata`**: Maximum 64 KB total serialized size.
+- **`timestamp`**: Optional, RFC 3339 (fractional seconds and any offset accepted; stored as the same instant in UTC). When absent, `null`, or the zero `0001-01-01T00:00:00Z`, the server **defaults it to its own receipt time** (`reason="empty"`). A value more than **60 s ahead** of receipt time (`MaxFutureSkew`, `reason="future"`) or more than **30 days behind** it (`MaxEventAge`, `reason="ancient"`) is **replaced with the receipt time** — never rejected. Every replacement is counted in `sentinel_ingest_timestamp_replaced_total{reason}`; the value the client sent is **not stored** anywhere — it survives only in the ingestor's log line. The effective value is echoed back as `timestamp` in the `202` body (and per `event_ids[]` item on `/ingest/batch`), so a client can diff what it sent against what was used. A `timestamp` that does not parse as RFC 3339 is still `400 Invalid JSON payload`.
 
 ---
 
@@ -97,7 +98,7 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
   - `Content-Type: application/json`
   - `X-API-Key: <api_key>` — the SECRET (`sent_live_...` project-scoped, or `sent_org_...` organization-wide). Never place it in the body.
   - `X-Project-Key: <project_name>` — optional; for organization-wide keys, selects the target project. **Takes precedence over the body's `project_key`**, so the server resolves tenancy without reading the body.
-- **Expected Status**: `HTTP 202 Accepted` (`{"status": "accepted"}`)
+- **Expected Status**: `HTTP 202 Accepted` (`{"status": "accepted", "event_id": "<effective event id>", "timestamp": "<effective timestamp, RFC 3339 with nanoseconds, UTC>"}`) — both keys are the values the server **used**, which differ from what was sent when the server generated the `event_id` or replaced the `timestamp` (§3).
 
 ---
 

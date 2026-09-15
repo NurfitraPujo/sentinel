@@ -55,9 +55,10 @@ type ErrorEvent struct {
 	TraceId string `protobuf:"bytes,6,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`
 	// Upper bound (64 chars) is enforced by the "error_event.span_id" CEL rule
 	// above, matching error_occurrences.span_id VARCHAR(64).
-	SpanId     string                 `protobuf:"bytes,7,opt,name=span_id,json=spanId,proto3" json:"span_id,omitempty"`
-	Stacktrace []*StackFrame          `protobuf:"bytes,8,rep,name=stacktrace,proto3" json:"stacktrace,omitempty"`
-	Metadata   *structpb.Struct       `protobuf:"bytes,9,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	SpanId     string           `protobuf:"bytes,7,opt,name=span_id,json=spanId,proto3" json:"span_id,omitempty"`
+	Stacktrace []*StackFrame    `protobuf:"bytes,8,rep,name=stacktrace,proto3" json:"stacktrace,omitempty"`
+	Metadata   *structpb.Struct `protobuf:"bytes,9,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	// Defaulted and clamped by the ingestor around its receipt time - see apps/ingestor-go/service/service.go resolveTimestamp and docs/sdk-specification.md §3.
 	Timestamp  *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	TraceFlags uint32                 `protobuf:"varint,11,opt,name=trace_flags,json=traceFlags,proto3" json:"trace_flags,omitempty"`
 	// Client-supplied custom fingerprint. When set (with fingerprint_override,
