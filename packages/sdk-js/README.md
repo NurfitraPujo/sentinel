@@ -345,19 +345,20 @@ processor matches it byte for byte: **`serverRoot` must equal the container's ru
 `/app/…` or `/pages/…` is the `serverRoot`. A wrong `serverRoot` costs unsymbolicated server
 frames, never a failed build.
 
-Server maps count against **`SOURCEMAP_MAX_FILES_PER_RELEASE`** — 500 at `c5082e3`, ≥ 2 000 once
-`sentinel-sourcemaps-release-cap` is deployed where you upload — and `web`'s Turbopack build holds
-≈ 794 server + 447 client ≈ 1 240 maps per release, over the cap even browser-only; the
-`SOURCEMAP_MAX_FILES_PER_RELEASE + 1`th file is `422 release_full`, which fails the build. They also
+Server maps count against **`SOURCEMAP_MAX_FILES_PER_RELEASE`** — **2 000 by default since
+`sentinel-sourcemaps-turbopack-grouping`** — and `web`'s Turbopack build holds ≈ 794 server + 447
+client ≈ 1 240 maps per release, so a `web` release fits with room; the
+`SOURCEMAP_MAX_FILES_PER_RELEASE + 1`th file is still `422 release_full`, which fails the build. They also
 cost ≈ +90 MB of object store per `web` release (server maps carry full `sourcesContent` of server
 code — private source at rest in the bucket) and run 1–7 MB each against the processor's 64 MiB
 positive cache, so cache-miss and `SYMBOLICATE_DEADLINE` timeouts on server frames are expected
-until that cache is re-sized. Turbopack's server chunk names (`_052cc036._.js`,
-`node_modules__pnpm_52f51f25._.js`) do not normalise in the processor, so a server frame that
-symbolication does **not** rewrite is a new issue per build until the processor card lands.
-Turbopack also emits **index maps** (`sections`, no `mappings`) for its server entry stubs and its
-own runtime; the walk leaves those out with one `warn` each, because the route stores flat maps
-only — nothing that could symbolicate is lost.
+until that cache is re-sized. The processor strips Turbopack's `_<8-hex>` suffix from an
+unsymbolicated server chunk name (`_052cc036._.js` → `_*._.js`, `node_modules__pnpm_52f51f25._.js`
+→ `node_modules__pnpm_*._.js`), so a server frame that symbolication does **not** rewrite groups
+across builds (since `sentinel-sourcemaps-turbopack-grouping`). Turbopack also emits **index
+maps** (`sections`, no `mappings`) for its server entry stubs and its own runtime; the walk leaves
+those out with one `warn` each, because the route stores flat maps only — nothing that could
+symbolicate is lost.
 
 Under webpack with `output: 'standalone'`, Next's per-page build traces list the server maps; the
 wrapper rewrites those `.nft.json` files after deleting the maps (one `Sentinel: build trace …
@@ -409,9 +410,11 @@ A frame is `in_app: false` when its `file` is empty, contains `/node_modules/`, 
 `webpack-internal:///(…)/./node_modules/`); **`true` otherwise**. That resolves a dev build, a
 plain-node stack and a webpack production build. **On a Turbopack production build every bundle
 frame is `in_app: true`**: every client chunk is a content-hashed `<16-hex>.js` (409 of 409 in
-`web`'s build), and the rule cannot see through the name. That stays so until the processor
-re-derives `in_app` from the symbolicated original path; **`init({ inApp })` is the escape** — a
-per-frame refinement called with the default already set, `frame => frame.in_app &&
+`web`'s build), and the rule cannot see through the name. **`init({ inApp })` governs the frames
+the processor did not symbolicate.** A symbolicated frame's `in_app` is the processor's — set from
+the original path (`/node_modules/` and a non-`[project]` Turbopack namespace root are not in-app;
+everything under `[project]` is) — and the value the SDK sent is kept beside it under `raw.in_app`.
+`inApp` is a per-frame refinement called with the default already set, `frame => frame.in_app &&
 !frame.file.includes('/vendor/')`, `undefined` to keep the default; a throwing `inApp` keeps the
 default and never loses an event.
 
