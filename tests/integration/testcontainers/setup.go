@@ -322,8 +322,12 @@ func runInitSQLMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 	// `relation "organizations" does not exist` or an unexplained 401, and the S12 constraint fix
 	// was invisible to them. See ARCHITECTURE.md A1's 2026-07-29 note, which recommends exactly this.
 	//
-	// goose directives are stripped rather than interpreted: this is a one-shot bootstrap of a
-	// disposable container, so only the Up sections are needed and no version ledger is required.
+	// Only the Up sections are applied and no version ledger is kept: this is a one-shot bootstrap of
+	// a disposable container. The one goose directive that IS interpreted is `-- +goose NO
+	// TRANSACTION` on line 1 — see ApplyGooseUp (goose.go): such a file is split on its
+	// StatementBegin/StatementEnd markers and run block by block on one acquired connection, because
+	// its whole Up section in one Exec would be an implicit transaction block and
+	// 1725200000_add_error_occurrences_project_id_dedup.sql's CREATE INDEX CONCURRENTLY fails there.
 	migDir := projectRoot + "/packages/db-migrations/migrations"
 	entries, err := os.ReadDir(migDir)
 	if err != nil {
@@ -343,12 +347,8 @@ func runInitSQLMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to read migration %s: %w", name, err)
 		}
-		up := extractGooseUp(string(raw))
-		if strings.TrimSpace(up) == "" {
-			continue
-		}
-		if _, err := pool.Exec(ctx, up); err != nil {
-			return fmt.Errorf("failed to apply migration %s: %w", name, err)
+		if err := ApplyGooseUp(ctx, pool, name, string(raw)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -356,7 +356,8 @@ func runInitSQLMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 
 // extractGooseUp returns only the `-- +goose Up` portion of a goose migration, stopping at
 // `-- +goose Down`, and drops the StatementBegin/StatementEnd markers (which are goose parser
-// directives, not SQL).
+// directives, not SQL). This is the single-block shape for a file WITHOUT the no-transaction
+// directive; SplitGooseUp (goose.go) is the entrypoint and handles the directive case.
 func extractGooseUp(content string) string {
 	var out []string
 	inUp := false

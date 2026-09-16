@@ -285,8 +285,12 @@ func runMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 	// Apply the REAL migrations, not scripts/db/init.sql. init.sql is a third hand-maintained schema
 	// frozen at the 1716508800 baseline — no organizations, no project_api_keys, and the pre-S12
 	// status CHECK — so bootstrapping from it silently gave every test a schema that predates
-	// features 005 and 008. This mirrors testcontainers/setup.go's runPostgresMigrations; both had
-	// to change, which is itself the argument for there being one migration entrypoint.
+	// features 005 and 008. This mirrors testcontainers/setup.go's runInitSQLMigrations; both had
+	// to change, which is itself the argument for there being one migration entrypoint — so the
+	// per-file step is now shared: tc.ApplyGooseUp honours `-- +goose NO TRANSACTION` on line 1 by
+	// running the file block by block on one acquired connection (CREATE INDEX CONCURRENTLY cannot
+	// run inside the implicit transaction block a whole-Up Exec is), and leaves every other file as
+	// the single Exec it always was.
 	projectRoot := findProjectRoot()
 	migDir := projectRoot + "/packages/db-migrations/migrations"
 
@@ -308,41 +312,12 @@ func runMigrations(ctx context.Context, cfg PostgreSQLConfig) error {
 		if rErr != nil {
 			return fmt.Errorf("failed to read migration %s: %w", name, rErr)
 		}
-		up := extractGooseUpSection(string(raw))
-		if strings.TrimSpace(up) == "" {
-			continue
-		}
-		if _, eErr := pool.Exec(ctx, up); eErr != nil {
-			return fmt.Errorf("failed to apply migration %s: %w", name, eErr)
+		if aErr := tc.ApplyGooseUp(ctx, pool, name, string(raw)); aErr != nil {
+			return aErr
 		}
 	}
 
 	return nil
-}
-
-// extractGooseUpSection returns only the `-- +goose Up` portion of a migration file, dropping the
-// Down section and goose's StatementBegin/StatementEnd parser directives.
-func extractGooseUpSection(content string) string {
-	var out []string
-	inUp := false
-	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "-- +goose Up"):
-			inUp = true
-			continue
-		case strings.HasPrefix(trimmed, "-- +goose Down"):
-			inUp = false
-			continue
-		case strings.HasPrefix(trimmed, "-- +goose StatementBegin"),
-			strings.HasPrefix(trimmed, "-- +goose StatementEnd"):
-			continue
-		}
-		if inUp {
-			out = append(out, line)
-		}
-	}
-	return strings.Join(out, "\n")
 }
 
 func findProjectRoot() string {

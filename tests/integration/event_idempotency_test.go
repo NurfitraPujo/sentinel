@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -3177,4 +3178,425 @@ func TestStoreEvent_RegressionArmSurvivesConcurrentIgnoreWithSnooze(t *testing.T
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM error_occurrences WHERE issue_id = $1`, issue0.ID).Scan(&occCount))
 	assert.Equal(t, 2, occCount, "the seed occurrence plus the stored regressing one — nothing was lost to the DLQ")
+}
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-occurrence-dedup-project §4.1 R1–R5 / §11 row 1 — the dedup key widened from
+// (issue_id, event_id) to (project_id, event_id)
+// ---------------------------------------------------------------------------------------------------
+//
+// The cases the contract names, in the order the item file lists them:
+//   P3 — the cross-issue redelivery: same event_id, same project and environment, two different
+//        fingerprints → one occurrence row, the second issue never created, every counter of the
+//        first issue where the first delivery put it, (IssueOutcomeExisting, stored=false, nil).
+//   P4 — the tenancy pin (R4): the same event_id under two projects stores twice.
+//   P7 — the pre-release row (decision 12 / OQ-3 (a)): a stored row whose project_id is NULL is
+//        outside the arbiter; a same-issue redelivery trips the old (issue_id, event_id) index and
+//        StoreEvent tolerates that 23505 BY NAME as a clean duplicate, never an error.
+//   P6 — N goroutines racing one event_id across two fingerprints: exactly one stores, zero
+//        errors, one row, no issue for the losing fingerprint. Two fingerprints share NO issues-row
+//        lock, so unlike (b) above this proves the unique index's speculative-insert wait, not the
+//        F-TX-2 row-lock argument.
+// and the key-aware duplicate log line (§4.3, decision 19) through ProcessEvent, since the line
+// is the service's: matched_key="project" for the arbiter, "issue" only on P7's tolerance path.
+
+// dedupOccurrenceRows counts error_occurrences rows for (projectID, eventID) by the new column —
+// the key the feature dedups on — and returns the issue_id of the one row when there is exactly one.
+func dedupOccurrenceRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID, eventID string) (rows int, issueID string) {
+	t.Helper()
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*), COALESCE(min(issue_id::text), '') FROM error_occurrences
+		  WHERE project_id = $1 AND event_id = $2`, projectID, eventID).Scan(&rows, &issueID))
+	return rows, issueID
+}
+
+// dedupIssuesWithFingerprint counts issues rows for (projectID, fp) across every environment — "the
+// second issue is never created" is `0` here (R2).
+func dedupIssuesWithFingerprint(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID, fp string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM issues WHERE project_id = $1 AND fingerprint = $2`, projectID, fp).Scan(&n))
+	return n
+}
+
+// dedupIssueCount reads issues.count for one issue row.
+func dedupIssueCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, issueID string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count FROM issues WHERE id = $1`, issueID).Scan(&n))
+	return n
+}
+
+// eidLogCapture is a slog.Handler that records every record it is handed, with its attributes
+// flattened to a map, so a test can assert the exact fields of the service's duplicate log line.
+// Installed as the process default for the duration of one test (this package never calls
+// t.Parallel, so the swap cannot leak into another test) and restored by t.Cleanup.
+type eidLogCapture struct {
+	mu      sync.Mutex
+	attrs   []slog.Attr // attrs bound by WithAttrs on this handler
+	records *[]eidLogRecord
+}
+
+type eidLogRecord struct {
+	Message string
+	Fields  map[string]string
+}
+
+func (h *eidLogCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *eidLogCapture) Handle(_ context.Context, r slog.Record) error {
+	rec := eidLogRecord{Message: r.Message, Fields: map[string]string{}}
+	for _, a := range h.attrs {
+		rec.Fields[a.Key] = a.Value.String()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.Fields[a.Key] = a.Value.String()
+		return true
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.records = append(*h.records, rec)
+	return nil
+}
+
+func (h *eidLogCapture) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &eidLogCapture{attrs: append(append([]slog.Attr{}, h.attrs...), attrs...), records: h.records}
+}
+
+func (h *eidLogCapture) WithGroup(string) slog.Handler { return h }
+
+// captureSlog swaps the default slog logger for a recording one until the test ends and returns
+// a func that reads the records captured so far whose message equals msg.
+func captureSlog(t *testing.T) func(msg string) []eidLogRecord {
+	t.Helper()
+	records := &[]eidLogRecord{}
+	h := &eidLogCapture{records: records}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func(msg string) []eidLogRecord {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		var out []eidLogRecord
+		for _, r := range *records {
+			if r.Message == msg {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+}
+
+// duplicateLogMessage is the service's duplicate log line as processor_service.go emits it.
+const duplicateLogMessage = "Duplicate event skipped: (project_id, event_id) already stored"
+
+// TestStoreEvent_DedupProject_CrossIssueRedeliveryStoresNothing is P3 — the case the feature
+// exists for (contract §1: a redelivery whose frames symbolicated differently hashes to a second
+// fingerprint). The first delivery stores with a release, an affected user and tenant, so every
+// counter step 4/4b/4c writes has a value to hold; the second delivery carries the SAME event_id
+// under a DIFFERENT fingerprint and must be rolled back at step 3 — one row, the second issue
+// never created (R2), the first issue's count, buckets, affected rollup and the release's
+// occurrence_count untouched, and (IssueOutcomeExisting, false, nil) with matched_key "project".
+//
+// Red-proof: revert the arbiter to (issue_id, event_id) and this goes red — the second insert's
+// pair (issue₂, event_id) is new under that key, so it stores, and the second issue exists.
+func TestStoreEvent_DedupProject_CrossIssueRedeliveryStoresNothing(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "p3")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp1 := eidFingerprint(t, "p3-raw")
+	fp2 := eidFingerprint(t, "p3-symbolicated")
+	eventID := "evt-eid-p3-" + uuid.New().String()
+	at := time.Date(2026, 9, 16, 9, 10, 0, 0, time.UTC)
+	const release = "1.0.0-p3"
+
+	issue1 := eidIssue(projectID, fp1)
+	first := eidOccurrenceAffected("test", eventID, "user-p3", "tenant-p3", at)
+	first.ReleaseVersion = release
+	outcome1, stored1, err := s.StoreEvent(ctx, issue1, first, release)
+	require.NoError(t, err)
+	require.True(t, stored1, "the first delivery stores")
+	require.Equal(t, store.IssueOutcomeNew, outcome1)
+	assert.Equal(t, projectID, first.ProjectID, "StoreEvent stamps the resolved project back on occ")
+	assert.Empty(t, first.DuplicateMatchedKey, "no matched key on the stored path")
+
+	// Snapshot every counter the first delivery moved.
+	countBefore := dedupIssueCount(t, ctx, pool, issue1.ID)
+	bucketsBefore := trendBuckets(t, ctx, pool, issue1.ID)
+	usersBefore, tenantsBefore := affectedCounts(t, ctx, pool, issue1.ID)
+	releaseBefore := releaseRowOf(t, ctx, pool, projectID, release)
+	require.Equal(t, int64(1), countBefore)
+	require.Len(t, bucketsBefore, 1)
+	require.Equal(t, 1, usersBefore)
+	require.Equal(t, 1, tenantsBefore)
+	require.True(t, releaseBefore.found)
+	require.EqualValues(t, 1, releaseBefore.occurrenceCount)
+
+	// The redelivery: same bytes, frames resolved differently → fp2, same event_id, a LATER hour
+	// and a NEW affected user so a leaked step 4/4b would be visible.
+	issue2 := eidIssue(projectID, fp2)
+	second := eidOccurrenceAffected("test", eventID, "user-p3-other", "tenant-p3-other", at.Add(2*time.Hour))
+	second.ReleaseVersion = release
+	outcome2, stored2, err := s.StoreEvent(ctx, issue2, second, release)
+	require.NoError(t, err, "R1: a cross-issue duplicate is a clean no-op, never an error")
+	assert.False(t, stored2, "R1: stored=false on the cross-issue redelivery")
+	assert.Equal(t, store.IssueOutcomeExisting, outcome2, "the duplicate path always reports IssueOutcomeExisting")
+	assert.Equal(t, store.DuplicateKeyProject, second.DuplicateMatchedKey, "the arbiter refused the row (decision 19)")
+	assert.Equal(t, projectID, second.ProjectID)
+
+	rows, rowIssueID := dedupOccurrenceRows(t, ctx, pool, projectID, eventID)
+	assert.Equal(t, 1, rows, "one error_occurrences row for (project_id, event_id)")
+	assert.Equal(t, issue1.ID, rowIssueID, "the row is the first delivery's, on the first issue")
+	assert.Equal(t, 0, dedupIssuesWithFingerprint(t, ctx, pool, projectID, fp2),
+		"R2: the issue the redelivery resolved to is never created — step 1's fresh insert was rolled back")
+	assert.Equal(t, 1, dedupIssuesWithFingerprint(t, ctx, pool, projectID, fp1))
+
+	assert.Equal(t, countBefore, dedupIssueCount(t, ctx, pool, issue1.ID), "issues.count unchanged")
+	assert.Equal(t, bucketsBefore, trendBuckets(t, ctx, pool, issue1.ID), "issue_occurrence_buckets unchanged")
+	usersAfter, tenantsAfter := affectedCounts(t, ctx, pool, issue1.ID)
+	assert.Equal(t, usersBefore, usersAfter, "affected_user_count unchanged")
+	assert.Equal(t, tenantsBefore, tenantsAfter, "affected_tenant_count unchanged")
+	assert.Equal(t, releaseBefore, releaseRowOf(t, ctx, pool, projectID, release), "releases row unchanged")
+	var activityRows int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM issue_activity WHERE issue_id = $1`, issue2.ID).Scan(&activityRows))
+	assert.Equal(t, 0, activityRows, "no 'created' activity row for the never-created issue")
+}
+
+// TestStoreEvent_DedupProject_SameEventIDTwoProjectsBothStore is P4, the tenancy pin (R4, decision
+// 2): the key is (project_id, event_id), never event_id alone — the same event_id under two
+// projects is two events and stores twice, each row carrying its own project_id. A global key
+// would let project A's client suppress project B's events.
+func TestStoreEvent_DedupProject_SameEventIDTwoProjectsBothStore(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectA := eidSeedProject(t, pool, "p4a")
+	projectB := eidSeedProject(t, pool, "p4b")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "p4")
+	eventID := "evt-eid-p4-" + uuid.New().String()
+
+	issueA := eidIssue(projectA, fp)
+	occA := eidOccurrence(eventID)
+	_, storedA, err := s.StoreEvent(ctx, issueA, occA, "")
+	require.NoError(t, err)
+	require.True(t, storedA)
+
+	issueB := eidIssue(projectB, fp)
+	occB := eidOccurrence(eventID)
+	_, storedB, err := s.StoreEvent(ctx, issueB, occB, "")
+	require.NoError(t, err, "R4: the same event_id in another project is not a duplicate")
+	assert.True(t, storedB, "R4: the same event_id under a second project stores")
+	assert.Empty(t, occB.DuplicateMatchedKey)
+
+	rowsA, issueOfA := dedupOccurrenceRows(t, ctx, pool, projectA, eventID)
+	rowsB, issueOfB := dedupOccurrenceRows(t, ctx, pool, projectB, eventID)
+	assert.Equal(t, 1, rowsA)
+	assert.Equal(t, 1, rowsB)
+	assert.Equal(t, issueA.ID, issueOfA)
+	assert.Equal(t, issueB.ID, issueOfB)
+	assert.Equal(t, projectA, occA.ProjectID)
+	assert.Equal(t, projectB, occB.ProjectID)
+}
+
+// TestStoreEvent_DedupProject_PreReleaseNullRowToleratedByName is P7 — decision 12's OQ-3 (a)
+// guarantee for the rollout window and any row the post-roll sweep has not reached. The stored
+// row is put back to project_id = NULL by hand (what an old-tag pod writes), so it is outside
+// the (project_id, event_id) arbiter; the same-issue redelivery then passes the arbiter and
+// trips uq_error_occurrences_issue_event with 23505 — class 23, which classifyStoreError would
+// dead-letter — and StoreEvent must tolerate exactly that constraint, by name, as a clean
+// duplicate: stored=false, err=nil, matched_key "issue", nothing written, the NULL row untouched.
+//
+// Red-proof: remove the ConstraintName branch and this fails with the 23505 surfaced.
+func TestStoreEvent_DedupProject_PreReleaseNullRowToleratedByName(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "p7")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := eidFingerprint(t, "p7")
+	eventID := "evt-eid-p7-" + uuid.New().String()
+
+	issue1 := eidIssue(projectID, fp)
+	first := eidOccurrence(eventID)
+	_, stored1, err := s.StoreEvent(ctx, issue1, first, "")
+	require.NoError(t, err)
+	require.True(t, stored1)
+
+	// The pre-release shape: written before the column existed / by an old-tag pod during the roll.
+	tag, err := pool.Exec(ctx, `UPDATE error_occurrences SET project_id = NULL WHERE id = $1`, first.ID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected())
+	countBefore := dedupIssueCount(t, ctx, pool, issue1.ID)
+
+	second := eidOccurrence(eventID)
+	outcome2, stored2, err := s.StoreEvent(ctx, eidIssue(projectID, fp), second, "")
+	require.NoError(t, err, "decision 12: a 23505 named uq_error_occurrences_issue_event is the duplicate path, never surfaced")
+	assert.False(t, stored2)
+	assert.Equal(t, store.IssueOutcomeExisting, outcome2)
+	assert.Equal(t, store.DuplicateKeyIssue, second.DuplicateMatchedKey, "the OLD index refused the row (decision 19)")
+
+	var rows int
+	var projectOfRow *string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*), min(project_id::text) FROM error_occurrences WHERE issue_id = $1 AND event_id = $2`,
+		issue1.ID, eventID).Scan(&rows, &projectOfRow))
+	assert.Equal(t, 1, rows, "still one row for the event")
+	assert.Nil(t, projectOfRow, "the pre-release row is left as it was — the sweep, not StoreEvent, sets project_id")
+	assert.Equal(t, countBefore, dedupIssueCount(t, ctx, pool, issue1.ID), "issues.count unchanged by the tolerated duplicate")
+}
+
+// TestStoreEvent_DedupProject_ConcurrentTwoFingerprintsOnlyOneStores is P6: 8 deliveries of ONE
+// event_id race across TWO fingerprints. Different fingerprints resolve to different issues rows,
+// so — unlike TestEventIdempotency_ConcurrentSameEventOnlyOneStores — the racers on opposite
+// fingerprints hold no lock in common before the occurrence insert; what serialises them is the
+// unique index itself: the second speculative insert on (project_id, event_id) waits for the
+// first's transaction to end and then, if it committed, resolves ON CONFLICT DO NOTHING to
+// RowsAffected() == 0. Exactly one stores, nobody errors, one row, one issue — the winner's — and
+// no issue for the losing fingerprint (every racer that resolved to it rolled its fresh insert back).
+//
+// Red-proof: revert the arbiter to (issue_id, event_id) and this goes red — one racer per
+// fingerprint stores and both issues exist.
+func TestStoreEvent_DedupProject_ConcurrentTwoFingerprintsOnlyOneStores(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "p6")
+
+	fps := []string{eidFingerprint(t, "p6-raw"), eidFingerprint(t, "p6-symbolicated")}
+	eventID := "evt-eid-p6-" + uuid.New().String()
+
+	const n = 8
+	var wg sync.WaitGroup
+	var storedCount, errCount int64
+	var storedFP atomic.Value
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(fp string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			_, stored, err := s.StoreEvent(ctx, eidIssue(projectID, fp), eidOccurrence(eventID), "")
+			if err != nil {
+				atomic.AddInt64(&errCount, 1)
+				t.Errorf("concurrent StoreEvent returned an unexpected error: %v", err)
+				return
+			}
+			if stored {
+				atomic.AddInt64(&storedCount, 1)
+				storedFP.Store(fp)
+			}
+		}(fps[i%2])
+	}
+	wg.Wait()
+
+	assert.Equal(t, int64(0), atomic.LoadInt64(&errCount), "no goroutine should ever see an error")
+	require.Equal(t, int64(1), atomic.LoadInt64(&storedCount), "exactly one of the 8 racers must store")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	winner := storedFP.Load().(string)
+	loser := fps[0]
+	if winner == fps[0] {
+		loser = fps[1]
+	}
+
+	rows, rowIssueID := dedupOccurrenceRows(t, ctx, pool, projectID, eventID)
+	assert.Equal(t, 1, rows, "one occurrence row after 8 racing deliveries across two fingerprints")
+	assert.Equal(t, 1, dedupIssuesWithFingerprint(t, ctx, pool, projectID, winner), "the winner's issue exists")
+	assert.Equal(t, 0, dedupIssuesWithFingerprint(t, ctx, pool, projectID, loser),
+		"no issue for the losing fingerprint — every racer that resolved to it rolled back (R2)")
+	var winnerIssueID string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id::text FROM issues WHERE project_id = $1 AND fingerprint = $2`, projectID, winner).Scan(&winnerIssueID))
+	assert.Equal(t, winnerIssueID, rowIssueID, "the row belongs to the winner's issue")
+	assert.Equal(t, int64(1), dedupIssueCount(t, ctx, pool, winnerIssueID), "issues.count stays 1")
+}
+
+// TestEventIdempotency_DedupProject_DuplicateLogLineIsKeyAware is §4.3's log line, through
+// ProcessEvent — the service is what emits it. Two deliveries: the P3 shape (same event_id, a
+// second client fingerprint → a second issue the redelivery resolves to) logs matched_key
+// "project" with the issue_id THIS delivery resolved to; the P7 shape (the row put back to
+// project_id = NULL, same fingerprint) logs matched_key "issue". Both carry event_id and
+// project_id. Neither delivery stores or errors, and the process counter sees two duplicates
+// (decision 8: the outcome label does not change).
+func TestEventIdempotency_DedupProject_DuplicateLogLineIsKeyAware(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+
+	projectName := uniqueProjectName("eid-dedup-log")
+	apiKey := uniqueAPIKey("eid-dedup-log")
+	projectID := createTestProject(t, pool, projectName, apiKey)
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	logsFor := captureSlog(t)
+	reader := eidManualReader()
+	before := collectProcessOutcomes(t, ctx, reader)
+
+	eventID := "evt-eid-dedup-log-" + uuid.New().String()
+	fpRaw := "fp-dedup-log-raw"
+	fpSym := "fp-dedup-log-sym"
+
+	first := buildValidProtoEvent(projectName)
+	first.EventId = eventID
+	first.Fingerprint = fpRaw
+	processOK(t, ctx, svc, first)
+	issueRaw := issueIDByFingerprint(t, ctx, pool, projectID, fpRaw)
+	require.Empty(t, logsFor(duplicateLogMessage), "the first delivery is not a duplicate")
+
+	// P3 through the service: the same event_id resolving to a second fingerprint.
+	cross := buildValidProtoEvent(projectName)
+	cross.EventId = eventID
+	cross.Fingerprint = fpSym
+	processOK(t, ctx, svc, cross)
+
+	lines := logsFor(duplicateLogMessage)
+	require.Len(t, lines, 1, "one duplicate log line for the cross-issue redelivery")
+	assert.Equal(t, eventID, lines[0].Fields["event_id"])
+	assert.Equal(t, projectID, lines[0].Fields["project_id"])
+	assert.Equal(t, store.DuplicateKeyProject, lines[0].Fields["matched_key"], "the arbiter refused the row")
+	assert.NotEmpty(t, lines[0].Fields["issue_id"], "the issue_id this delivery resolved to")
+	assert.NotEqual(t, issueRaw, lines[0].Fields["issue_id"],
+		"the logged issue_id is the one THIS delivery resolved to (the never-created second issue), not the stored row's")
+	assert.Equal(t, 0, dedupIssuesWithFingerprint(t, ctx, pool, projectID, fpSym), "R2 through the service: the second issue is never created")
+	t.Logf("P3 duplicate log line: msg=%q %v", lines[0].Message, lines[0].Fields)
+
+	// P7 through the service: the stored row put back to the pre-release shape, same fingerprint.
+	tag, err := pool.Exec(ctx,
+		`UPDATE error_occurrences SET project_id = NULL WHERE project_id = $1 AND event_id = $2`, projectID, eventID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected())
+
+	same := buildValidProtoEvent(projectName)
+	same.EventId = eventID
+	same.Fingerprint = fpRaw
+	processOK(t, ctx, svc, same)
+
+	lines = logsFor(duplicateLogMessage)
+	require.Len(t, lines, 2, "a second duplicate log line for the tolerated same-issue redelivery")
+	assert.Equal(t, eventID, lines[1].Fields["event_id"])
+	assert.Equal(t, projectID, lines[1].Fields["project_id"])
+	assert.Equal(t, issueRaw, lines[1].Fields["issue_id"])
+	assert.Equal(t, store.DuplicateKeyIssue, lines[1].Fields["matched_key"], "the old index refused the row (decision 12, 19)")
+	t.Logf("P7 duplicate log line: msg=%q %v", lines[1].Message, lines[1].Fields)
+
+	var rows int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM error_occurrences WHERE issue_id = $1 AND event_id = $2`, issueRaw, eventID).Scan(&rows))
+	assert.Equal(t, 1, rows, "still exactly one row for the event")
+
+	after := collectProcessOutcomes(t, ctx, reader)
+	assert.Equal(t, int64(1), after[obs.OutcomeStored]-before[obs.OutcomeStored])
+	assert.Equal(t, int64(2), after[obs.OutcomeDuplicate]-before[obs.OutcomeDuplicate],
+		"both redeliveries are outcome=duplicate — the label is unchanged, its meaning is 'already stored' (decision 8)")
 }

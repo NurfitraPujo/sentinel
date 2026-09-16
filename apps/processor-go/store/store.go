@@ -15,6 +15,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -159,8 +160,15 @@ type Issue struct {
 }
 
 type ErrorOccurrence struct {
-	ID             string
-	IssueID        string
+	ID      string
+	IssueID string
+	// ProjectID is the project the event was ingested under — ResolveProjectID's value, the same one
+	// the service puts on Issue.ProjectID (sentinel-occurrence-dedup-project §4.3, decision 27) — and
+	// the first half of the occurrence dedup key (project_id, event_id). StoreEvent writes
+	// issue.ProjectID to the row REGARDLESS of what is here and stamps it back, the IssueID idiom,
+	// so the two can never disagree; the field exists so the value is on the struct a test asserts.
+	// Never a value read from the payload (proto field 16's rule).
+	ProjectID      string
 	Environment    string
 	Platform       string
 	ReleaseVersion string
@@ -212,7 +220,38 @@ type ErrorOccurrence struct {
 	// otherwise fan a version out to every waiting `next` issue of the project on the strength of a
 	// first_seen the row does not hold. Zero on every path where ReleaseInserted is false.
 	ReleaseFirstSeen time.Time
+	// DuplicateMatchedKey is WRITTEN BACK by StoreEvent on the duplicate path only (stored = false,
+	// nil): the constraint that refused this delivery's row, DuplicateKeyProject when the
+	// (project_id, event_id) arbiter reported RowsAffected() == 0 and DuplicateKeyIssue when the
+	// pre-release index uq_error_occurrences_issue_event raised 23505 on a row whose project_id is
+	// still NULL (sentinel-occurrence-dedup-project decisions 12, 19). It is the `matched_key` field
+	// of the service's duplicate log line, carried here rather than as a fourth return value so the
+	// CommandStore signature and its call sites stay as they are. "" on every other path. It says
+	// which index matched, NOT whether the redelivery resolved to the same issue or a different one —
+	// that is not distinguishable under this feature (decision 19).
+	DuplicateMatchedKey string
 }
+
+// The two values DuplicateMatchedKey can take (sentinel-occurrence-dedup-project decision 19):
+// "the constraint that refused the row". A fixed set so the log field cannot grow a third spelling.
+const (
+	// DuplicateKeyProject — the (project_id, event_id) arbiter, uq_error_occurrences_project_event:
+	// the row was already stored under this project, on this issue or any other.
+	DuplicateKeyProject = "project"
+	// DuplicateKeyIssue — the pre-release (issue_id, event_id) index, uq_error_occurrences_issue_event,
+	// tolerated by name: the stored row predates the column (project_id IS NULL, outside the arbiter)
+	// and this delivery resolved to the same issue. Decision 12's rollout-window guarantee.
+	DuplicateKeyIssue = "issue"
+)
+
+// legacyOccurrenceDedupConstraint is the pre-release partial unique index on (issue_id, event_id),
+// kept this release for the old-tag processor that still names it as its arbiter (decision 5) and
+// tolerated by StoreEvent by exactly this name (decision 12). Dropping the index in a later release
+// makes the tolerance branch dead, never wrong.
+const legacyOccurrenceDedupConstraint = "uq_error_occurrences_issue_event"
+
+// pgUniqueViolation is SQLSTATE 23505.
+const pgUniqueViolation = "23505"
 
 // The §4.3 rollup statements, one pair per side table. RETURNING (xmax = 0) AS inserted is the same
 // exact new-vs-existing signal the 'created' activity row above already relies on: xmax = 0 means
@@ -576,18 +615,30 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     RETURNING id yielding pgx.ErrNoRows is a BUG (the DO UPDATE...WHERE predicate was narrowed, or
 //     the plain UPDATE hit a concurrently-deleted issue), never a duplicate signal — it is surfaced
 //     as an error, not stored=false.
-//  2. Insert the occurrence with NULLIF($11,”) mapping ” (proto3's "absent", never a real key) to SQL
-//     NULL, and ON CONFLICT (issue_id, event_id) WHERE event_id IS NOT NULL DO NOTHING — the exact form
-//     that matches the D-b partial unique index. Dropping NULLIF silently destroys every pre-W0 event
-//     after the first per issue (F-TX-1); dropping the WHERE clause, or using a bare
-//     ON CONFLICT DO NOTHING, either fails to match the index or swallows an
-//     error_occurrences_pkey collision as a false "duplicate" (F-TX-5) — both are forbidden here.
-//     Executed via tx.Exec, never QueryRow+RETURNING: pgx.ErrNoRows is not a *pgconn.PgError, so
-//     classifyStoreError would leave a genuine duplicate retryable and eventually dead-letter an
-//     already-stored message (F-TX-8).
-//  3. RowsAffected()==0 on the occurrence insert means this exact (issue_id, event_id) pair already
-//     exists: roll back (undoing this delivery's count/regression writes) and report stored=false with
-//     a nil error — the caller ACKs this as a successful no-op. Otherwise continue.
+//  2. Insert the occurrence with project_id = issue.ProjectID (the resolved project, never the
+//     payload's — sentinel-occurrence-dedup-project decision 27) and NULLIF($11,”) mapping ”
+//     (proto3's "absent", never a real key) to SQL NULL, and ON CONFLICT (project_id, event_id)
+//     WHERE project_id IS NOT NULL AND event_id IS NOT NULL DO NOTHING — the exact form that
+//     matches the uq_error_occurrences_project_event partial unique index (decision 11; it used to
+//     be D-b's (issue_id, event_id), which stopped being the right key once symbolication made the
+//     same bytes hash differently between deliveries — sentinel-sourcemaps Known limit 6). Dropping
+//     NULLIF silently destroys every pre-W0 event after the first per project (F-TX-1); dropping
+//     the WHERE clause, or using a bare ON CONFLICT DO NOTHING, either fails to match the index or
+//     swallows an error_occurrences_pkey collision as a false "duplicate" (F-TX-5) — both are
+//     forbidden here. Executed via tx.Exec, never QueryRow+RETURNING: pgx.ErrNoRows is not a
+//     *pgconn.PgError, so classifyStoreError would leave a genuine duplicate retryable and
+//     eventually dead-letter an already-stored message (F-TX-8). ONE error is a duplicate too: a
+//     23505 whose ConstraintName is uq_error_occurrences_issue_event — the pre-release index, kept
+//     this release (decision 5) — means the stored row has project_id IS NULL (written by an old-tag
+//     pod during the roll, or a row the post-roll sweep has not reached), so it is outside the
+//     arbiter and this same-issue redelivery would otherwise dead-letter (decision 12, OQ-3 (a)).
+//     Matched by name, never by code alone; treated exactly as step 3.
+//  3. RowsAffected()==0 on the occurrence insert means this (project_id, event_id) pair already
+//     exists — on this issue or on ANY other issue of the project (R1): roll back (undoing this
+//     delivery's count/regression writes, and the issue row itself when this delivery would have
+//     created it — R2) and report stored=false with a nil error — the caller ACKs this as a
+//     successful no-op. occ.DuplicateMatchedKey says which index refused the row (DuplicateKeyProject
+//     here, DuplicateKeyIssue on the by-name branch of step 2; decision 19). Otherwise continue.
 //  4. The affected users/tenants rollup (sentinel-affected-users §4.3): per present identifier, an
 //     upsert into issue_affected_users / issue_affected_tenants keyed (issue_id, id) and — only when
 //     that upsert INSERTed (RETURNING xmax = 0) — a +1 on issues.affected_user_count /
@@ -973,14 +1024,22 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		}
 	}
 
-	// --- 2. Occurrence insert, deduplicated on (issue_id, event_id) ---
+	// --- 2. Occurrence insert, deduplicated on (project_id, event_id) ---
+	//
+	// project_id is issue.ProjectID — ResolveProjectID's value, the same one step 1's upsert keyed
+	// on — never a value read from the payload (sentinel-occurrence-dedup-project §4.1, decision
+	// 27); stamped back on occ beside IssueID so the struct a caller holds says what the row says.
+	// The arbiter is the (project_id, event_id) partial unique index uq_error_occurrences_project_event
+	// (decision 11), written with the index's own predicate; the pre-release (issue_id, event_id)
+	// index still exists this release (decision 5) and is handled by name below, never as an arbiter.
 
 	occ.IssueID = issue.ID
+	occ.ProjectID = issue.ProjectID
 	occQuery := `
 		INSERT INTO error_occurrences (id, issue_id, environment, platform, release_version,
-			stacktrace, metadata, trace_id, span_id, created_at, event_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''))
-		ON CONFLICT (issue_id, event_id) WHERE event_id IS NOT NULL DO NOTHING
+			stacktrace, metadata, trace_id, span_id, created_at, event_id, project_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''), $12)
+		ON CONFLICT (project_id, event_id) WHERE project_id IS NOT NULL AND event_id IS NOT NULL DO NOTHING
 	`
 	tag, err := tx.Exec(ctx, occQuery,
 		occ.ID,
@@ -994,27 +1053,48 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		occ.SpanID,
 		occ.CreatedAt,
 		occ.EventID,
+		issue.ProjectID,
 	)
 	if err != nil {
+		// The rollout-window tolerance (sentinel-occurrence-dedup-project decision 12, OQ-3 (a)):
+		// a row written by an old-tag processor carries project_id = NULL and is outside the
+		// arbiter, so a redelivery of it that resolved to the SAME issue passes the arbiter and
+		// trips the pre-release (issue_id, event_id) index instead — 23505, class 23, which
+		// classifyStoreError would dead-letter where the old arbiter made it a clean no-op. Matched
+		// by constraint NAME (the errors.As pattern of service/errors.go), never by code alone: a
+		// 23505 on error_occurrences_pkey or on any other index is still a genuine error (F-TX-5).
+		// Permanent, so it also covers any future NULL-project_id row; dead once the index is
+		// dropped in a later release.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == legacyOccurrenceDedupConstraint {
+			if rbErr := tx.Rollback(ctx); rbErr != nil {
+				return IssueOutcomeExisting, false, fmt.Errorf("failed to roll back duplicate occurrence insert (%s): %w", legacyOccurrenceDedupConstraint, rbErr)
+			}
+			occ.DuplicateMatchedKey = DuplicateKeyIssue
+			return IssueOutcomeExisting, false, nil
+		}
 		return IssueOutcomeExisting, false, err
 	}
 
-	// --- 3. Duplicate detection strictly from RowsAffected (F-TX-8) ---
+	// --- 3. Duplicate detection from RowsAffected (F-TX-8), plus the by-name branch above ---
 
 	if tag.RowsAffected() == 0 {
-		// This exact (issue_id, event_id) pair is already stored. Roll back everything this
-		// delivery would otherwise have written — the issue's count/regression bookkeeping above
-		// included — so a redelivered duplicate leaves every counter untouched (D-c property 3).
+		// This (project_id, event_id) pair is already stored — on this issue or on any other issue
+		// of the project (R1). Roll back everything this delivery would otherwise have written —
+		// the issue's count/regression bookkeeping above included, and a fresh issue row this
+		// delivery resolved to (R2: it is never created) — so a redelivered duplicate leaves every
+		// counter untouched (D-c property 3).
 		if rbErr := tx.Rollback(ctx); rbErr != nil {
 			return IssueOutcomeExisting, false, fmt.Errorf("failed to roll back duplicate occurrence insert: %w", rbErr)
 		}
+		occ.DuplicateMatchedKey = DuplicateKeyProject
 		return IssueOutcomeExisting, false, nil
 	}
 
 	// --- 4. Affected users / tenants rollup (sentinel-affected-users §4.3, decisions 2, 8, 9) ---
 	//
 	// The second deliberate in-transaction exception named in this method's doc comment. Position is
-	// load-bearing: AFTER the duplicate rollback above so a redelivered (issue_id, event_id) never
+	// load-bearing: AFTER the duplicate rollback above so a redelivered (project_id, event_id) never
 	// writes a side row or bumps a count (flow I5), BEFORE the registry touch, and NOT inside a
 	// savepoint — a failure here is a failure to store the event, returned so NATS retries (decision
 	// 8). An event with neither identifier runs no statement at all; an identifier decision 5 dropped
@@ -1050,7 +1130,7 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	//
 	// The fourth deliberate in-transaction exception named in this method's doc comment. Same
 	// position rules as 4 and 4b, for the same reasons: AFTER the duplicate rollback (flow I10 — a
-	// redelivered (issue_id, event_id) never bumps a release), BEFORE the registry touch, NOT
+	// redelivered (project_id, event_id) never bumps a release), BEFORE the registry touch, NOT
 	// savepointed (decision 5) — a genuine error here fails the event and NATS redelivers. Lock
 	// order: the releases row is taken after every issues write and every side-table write of this
 	// transaction, at the tail like the project_environments row, so ingest-vs-ingest serialises on
