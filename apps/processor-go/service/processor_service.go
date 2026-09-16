@@ -173,11 +173,12 @@ func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEven
 // processEventInternal reports (docs/plans/IDEMPOTENCY_PLAN.md D-e): err != nil and nats.IsPermanent ->
 // OutcomeDeadLettered (dead-lettered on THIS delivery, unconditionally, by the subscriber regardless of
 // delivery count); err != nil otherwise -> OutcomeRetried; err == nil && !stored -> obs.OutcomeDuplicate
-// (store.StoreEvent found the (issue_id, event_id) pair already stored and rolled back — a healthy
-// no-op ACK, not a failure); err == nil && stored -> OutcomeStored. This classifier is the ONLY place
-// that records a process outcome for a message — processEventInternal itself must never also record
-// OutcomeDuplicate, or one message would mint two time series and the
-// stored+duplicate+retried+deadlettered == deliveries invariant (W3) would stop holding.
+// (store.StoreEvent found the (project_id, event_id) pair already stored — on any issue of the
+// project — and rolled back — a healthy no-op ACK, not a failure); err == nil && stored ->
+// OutcomeStored. This classifier is the ONLY place that records a process outcome for a message —
+// processEventInternal itself must never also record OutcomeDuplicate, or one message would mint
+// two time series and the stored+duplicate+retried+deadlettered == deliveries invariant (W3) would
+// stop holding.
 //
 // The retried-vs-deadlettered split is an approximation, not a certainty: whether NATS retries or
 // actually dead-letters a non-permanent error depends on the message's delivery count, which lives
@@ -259,11 +260,11 @@ func withSpan(ctx context.Context, name string, fn func(ctx context.Context) err
 }
 
 // processEventInternal deserializes and stores one event, returning (stored, err) instead of a bare
-// error (docs/plans/IDEMPOTENCY_PLAN.md D-e): stored distinguishes "persisted" from "this exact
-// (issue_id, event_id) pair was already stored — store.StoreEvent rolled back and this is a healthy
-// no-op ACK", which ProcessEvent's deferred classifier is the ONLY place allowed to turn into
-// obs.OutcomeDuplicate (see that function's doc comment for why recording it here too would
-// double-count).
+// error (docs/plans/IDEMPOTENCY_PLAN.md D-e): stored distinguishes "persisted" from "this
+// (project_id, event_id) pair was already stored, on whichever issue — store.StoreEvent rolled back
+// and this is a healthy no-op ACK", which ProcessEvent's deferred classifier is the ONLY place
+// allowed to turn into obs.OutcomeDuplicate (see that function's doc comment for why recording it
+// here too would double-count).
 func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) (bool, error) {
 	var evt *event.ErrorEvent
 	if err := withSpan(ctx, "processor.deserialize", func(ctx context.Context) error {
@@ -339,6 +340,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 			return classifyProjectLookupError(err)
 		}
 		issue.ProjectID = projectID
+		// sentinel-occurrence-dedup-project §4.3: the same resolved value on the occurrence, for the
+		// (project_id, event_id) dedup key. StoreEvent writes issue.ProjectID to the row regardless
+		// and stamps it back here, so the two cannot disagree; never a value read from the payload.
+		occ.ProjectID = projectID
 
 		// sentinel-sourcemaps §4.4, the order the contract fixes: the project id is known (above),
 		// the frames are symbolicated (a child span — it can spend up to SYMBOLICATE_DEADLINE on a
@@ -376,11 +381,17 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	}
 
 	if !stored {
-		// Duplicate: store.StoreEvent found (issue_id, event_id) already stored and rolled back
-		// this delivery's issue/occurrence writes. This is a successful no-op — audit, alert
-		// dispatch, and indexing must NOT run for it (D-d: they are gated on stored==true, because
-		// each one reads state this delivery did not actually write). One structured log line is
-		// D-e's whole visibility contract for this branch.
+		// Duplicate: store.StoreEvent found (project_id, event_id) already stored — on the issue
+		// this delivery resolved to or on any other issue of the project (sentinel-occurrence-
+		// dedup-project R1) — and rolled back this delivery's issue/occurrence writes, a fresh issue
+		// row included (R2). This is a successful no-op — audit, alert dispatch, and indexing must
+		// NOT run for it (D-d: they are gated on stored==true, because each one reads state this
+		// delivery did not actually write). One structured log line is D-e's whole visibility
+		// contract for this branch, key-aware since sentinel-occurrence-dedup-project (§4.3, OQ-5
+		// (a)): event_id, project_id, the issue_id THIS delivery resolved to (not necessarily the
+		// stored row's), and matched_key — the constraint that refused the row, "project" for the
+		// arbiter and "issue" only on the decision-12 tolerance path (a pre-release row with
+		// project_id IS NULL). Same-issue vs cross-issue is NOT what matched_key says (decision 19).
 		//
 		// The NATS delivery count is deliberately omitted here — a RECORDED DEVIATION from
 		// IDEMPOTENCY_PLAN.md D-e, which asks for it (the plan's E2E_RECOVERY_PLAN.md P9-3 entry
@@ -391,8 +402,11 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// issue_id alone are already enough to find the exact duplicate in error_occurrences,
 		// and "redelivery vs client re-send" is distinguishable by whether the ingest-side POST
 		// count moved.
-		slog.InfoContext(ctx, "Duplicate event skipped: (issue_id, event_id) already stored",
-			slog.String("event_id", occ.EventID), slog.String("issue_id", issue.ID))
+		slog.InfoContext(ctx, "Duplicate event skipped: (project_id, event_id) already stored",
+			slog.String("event_id", occ.EventID),
+			slog.String("project_id", occ.ProjectID),
+			slog.String("issue_id", issue.ID),
+			slog.String("matched_key", occ.DuplicateMatchedKey))
 		return false, nil
 	}
 

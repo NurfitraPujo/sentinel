@@ -135,9 +135,11 @@ func main() {
 		// bounded by the deadline, and a batch is handled sequentially) plus the write time — 10 ×
 		// 5 s = 50 s at the defaults, already past the server default, so a batch still being
 		// processed would be redelivered under it (Known limit 6's trigger: the redelivery lands
-		// on a second issue). symbolicate.AckWait derives it from the deadline the operator
-		// actually set — raising SYMBOLICATE_DEADLINE in values.yaml moves this in code, not in
-		// the chart — and the arithmetic is recorded in prd status/be.md.
+		// on a second issue — closed by sentinel-occurrence-dedup-project, which dedups the
+		// occurrence on (project_id, event_id) so the second issue is never created).
+		// symbolicate.AckWait derives it from the deadline the operator actually set — raising
+		// SYMBOLICATE_DEADLINE in values.yaml moves this in code, not in the chart — and the
+		// arithmetic is recorded in prd status/be.md.
 		AckWait: symbolicate.AckWait(processorBatchSize, symCfg.Deadline),
 		// MaxDeliver caps redelivery attempts so a single
 		// permanently-unprocessable message cannot redeliver forever and

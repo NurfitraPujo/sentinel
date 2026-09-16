@@ -177,13 +177,16 @@ const (
 	OutcomeStored       = "stored"       // process: persisted
 	OutcomeRetried      = "retried"      // process: returned to NATS for redelivery
 	OutcomeDeadLettered = "deadlettered" // process: parked in the DLQ
-	// OutcomeDuplicate marks a message whose (issue_id, event_id) pair was already stored
-	// (docs/plans/IDEMPOTENCY_PLAN.md D-e): store.StoreEvent returned stored=false, nil — a healthy
-	// no-op ACK, not a failure. Recorded EXACTLY ONCE per message, by ProcessEvent's deferred
-	// classifier alone (never inside processEventInternal too — recording it in both places would
-	// double-count one message across two outcome labels, breaking the
-	// stored+duplicate+retried+deadlettered == deliveries invariant W3 asserts).
-	OutcomeDuplicate       = "duplicate" // process: (issue_id, event_id) already stored; no-op ACK
+	// OutcomeDuplicate marks a message that was already stored — "already stored" under whichever
+	// key store.StoreEvent dedups on, (project_id, event_id) since sentinel-occurrence-dedup-project
+	// (it was (issue_id, event_id) under docs/plans/IDEMPOTENCY_PLAN.md D-e): StoreEvent returned
+	// stored=false, nil — a healthy no-op ACK, not a failure. The value is unchanged; the meaning
+	// widened from "same-issue redelivery" to "already stored" (contract §6, decision 8). Recorded
+	// EXACTLY ONCE per message, by ProcessEvent's deferred classifier alone (never inside
+	// processEventInternal too — recording it in both places would double-count one message across
+	// two outcome labels, breaking the stored+duplicate+retried+deadlettered == deliveries
+	// invariant W3 asserts).
+	OutcomeDuplicate       = "duplicate" // process: already stored (project_id, event_id); no-op ACK
 	OutcomeDispatchSent    = "sent"      // alert: notifier accepted it
 	OutcomeDispatchError   = "error"     // alert: notifier failed
 	OutcomeDispatchDropped = "dropped"   // alert: never reached a notifier worker (missing/unroutable
