@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -142,6 +144,13 @@ const (
 	releaseR    = "1.2.3"
 	fixturePath = "/assets/index-d_kdqh_W.js"
 	fixtureKey  = "sourcemaps/p/r/fixture.map"
+
+	// The committed Turbopack-shaped map (testdata/turbopack/README.md): twenty sources, one
+	// resolvable segment each at wire (n, 1) → sources[n-1] 1:1, seeded under a browser chunk
+	// path of Turbopack's `<16-hex>.js` shape.
+	turbopackMapPath = "testdata/turbopack/ac0ebedaba77188c.js.map"
+	turbopackPath    = "/_next/static/chunks/ac0ebedaba77188c.js"
+	turbopackKey     = "sourcemaps/p/r/turbopack.map"
 )
 
 func sha256Hex(b []byte) string {
@@ -186,6 +195,20 @@ func (h *harness) seedFixture(t *testing.T) *Sourcemap {
 	raw := readFixtureMap(t)
 	h.fetcher.objects[fixtureKey] = raw
 	row := rowFor("map-fixture", projectA, releaseR, fixturePath, fixtureKey, raw)
+	h.store.add(row)
+	return row
+}
+
+// seedTurbopack adds the committed Turbopack-shaped map under (projectA, releaseR, path).
+func (h *harness) seedTurbopack(t *testing.T, id, path string) *Sourcemap {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.FromSlash(turbopackMapPath))
+	if err != nil {
+		t.Fatalf("read turbopack fixture map: %v", err)
+	}
+	key := turbopackKey + "/" + id
+	h.fetcher.objects[key] = raw
+	row := rowFor(id, projectA, releaseR, path, key, raw)
 	h.store.add(row)
 	return row
 }
@@ -269,8 +292,11 @@ func TestSymbolicate_FixtureTable(t *testing.T) {
 			if f.Raw.File != fixturePath || f.Raw.Line != 1 || f.Raw.Column != c.column || f.Raw.Function != "minified" {
 				t.Fatalf("raw = %+v; want the values the SDK sent", *f.Raw)
 			}
-			if !f.InApp {
-				t.Fatal("in_app is untouched")
+			// turbopack-grouping §4.2: the rule re-derives in_app from the resolved source; the
+			// Vite fixture's `../../src/main.ts` is A13 → true, the same value the SDK sent, and
+			// that value is recorded under raw.
+			if !f.InApp || !f.Raw.InApp {
+				t.Fatalf("in_app = %v, raw.in_app = %v; want true (A13) over the SDK's true", f.InApp, f.Raw.InApp)
 			}
 		})
 	}
@@ -368,6 +394,153 @@ func TestSymbolicate_SourceRootJoinedAsStrings(t *testing.T) {
 		res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
 		if res.Outcomes[0] != OutcomeApplied || frames[0].File != c.wantFile || frames[0].Function != c.wantFn {
 			t.Fatalf("%s: %s file=%q fn=%q; want applied %q %q", c.path, res.Outcomes[0], frames[0].File, frames[0].Function, c.wantFile, c.wantFn)
+		}
+	}
+}
+
+// ---- in_app re-derived from the resolved source (turbopack-grouping contract §4.2) --------------
+
+// inAppCases are contract §4.2's fixture table A1–A22 -- the rows ARE the spec. A rewritten row
+// resolves through the committed Turbopack-shaped map at wire (line, 1) to `file` (the map's
+// sources[line-1], verbatim; README.md derives the mappings by hand), and the stage must store
+// `want` under in_app and the SDK's `sent` under raw.in_app. A18 and A19 are frames the stage does
+// NOT rewrite (`no_map`: a minified path the stub Store has no row for; `no_column`): the SDK's
+// value is kept byte-identical and there is no raw (flow P7). The rule column is contract §4.2's:
+// 1 = `/node_modules/` anywhere or a leading `node_modules/`; 2 = a non-`[project]` namespace
+// ROOT (decision 18); 3 = everything else is the app's.
+var inAppCases = []struct {
+	row     string
+	line    int32 // wire line on the Turbopack chunk; 0 = not rewritten
+	file    string
+	sent    bool
+	want    bool
+	outcome Outcome
+}{
+	{"A1", 1, "turbopack:///[project]/node_modules/.pnpm/react-dom@19.2.4_react@19.2.4/node_modules/react-dom/cjs/react-dom-client.production.js", true, false, OutcomeApplied}, // rule 1
+	{"A2", 2, "turbopack:///[project]/node_modules/.pnpm/next@15.5.21_…/node_modules/next/dist/client/components/app-router.js", true, false, OutcomeApplied},                   // rule 1
+	{"A3", 3, "turbopack:///[project]/src/app/(dashboard)/chats/page.tsx", true, true, OutcomeApplied},                                                                          // rule 3
+	{"A4", 4, "turbopack:///[project]/src/features/chats/components/ChatList.tsx", false, true, OutcomeApplied},                                                                 // rule 3: the map outranks an init.inApp false (flow P3)
+	{"A5", 5, "turbopack:///[project]/instrumentation.ts", true, true, OutcomeApplied},                                                                                          // rule 3: a [project] file outside src/ (D6)
+	{"A6", 6, "turbopack:///[project]/app/boundary/thrower.tsx", true, true, OutcomeApplied},                                                                                    // rule 3: the scratch app, no src/
+	{"A7", 7, "turbopack:///[turbopack]/shared/runtime-utils.ts", true, false, OutcomeApplied},                                                                                  // rule 2
+	{"A8", 8, "turbopack:///[next]/internal/font/google/roboto_5a85fab1.module.css", true, false, OutcomeApplied},                                                               // rule 2
+	{"A9", 9, "turbopack:///[externals]/node:inspector", true, false, OutcomeApplied},                                                                                           // rule 2
+	{"A10", 10, "webpack:///./node_modules/react-dom/cjs/react-dom.production.js", true, false, OutcomeApplied},                                                                 // rule 1
+	{"A11", 11, "webpack://_N_E/./app/boundary/thrower.tsx", true, true, OutcomeApplied},                                                                                        // rule 3
+	{"A12", 12, "webpack:///./src/app/page.tsx", true, true, OutcomeApplied},                                                                                                    // rule 3
+	{"A13", 13, "../../src/main.ts", true, true, OutcomeApplied},                                                                                                                // rule 3: the Vite fixture's shape
+	{"A14", 14, "../node_modules/.vite/deps/chunk-ABCDEF12.js", true, false, OutcomeApplied},                                                                                    // rule 1
+	{"A15", 15, "src/lib/server.ts", true, true, OutcomeApplied},                                                                                                                // rule 3: bare relative, sourceRoot empty
+	{"A16", 16, "webpack:///./src/vendor/[next]-like-name.ts", true, true, OutcomeApplied},                                                                                      // rule 3: the root is `.`, the bracket is later (decision 18)
+	{"A17", 17, "turbopack:///[project]/src/node_modules_shim/x.ts", true, true, OutcomeApplied},                                                                                // rule 3: `node_modules_shim` is not the segment `node_modules`
+	{"A18", 0, "/app/.next/server/chunks/_052cc036._.js", true, true, OutcomeNoMap},                                                                                             // not rewritten: kept
+	{"A19", 0, "https://app.example.com/_next/static/chunks/5f982f94079ecf41.js", false, false, OutcomeNoColumn},                                                                // not rewritten: kept
+	{"A20", 18, "turbopack:///[project]/src/app/(dashboard)/agents/[id]/page.tsx", true, true, OutcomeApplied},                                                                  // rule 3: `[id]` is a later segment (decision 18)
+	{"A21", 19, "turbopack:///[project]/src/app/(dashboard)/agents/[...unmatched]/page.tsx", true, true, OutcomeApplied},                                                        // rule 3: `[...unmatched]` is a later segment (decision 18)
+	{"A22", 20, "node_modules/react-dom/cjs/react-dom.production.js", true, false, OutcomeApplied},                                                                              // rule 1: the leading-segment clause
+}
+
+// TestSymbolicate_InAppTable drives A1–A22 through Symbolicate over the committed Turbopack map:
+// the returned Frame.InApp is the table's stored column and, on a rewritten row, Frame.Raw.InApp
+// is what the SDK sent -- recorded whether true or false (D4). The minified name the frame came
+// in with and its function are never read by the rule (rule 3 rows resolve from a chunk name that
+// says nothing about the app); TestSymbolicate_InAppReadsOnlyTheResolvedFile pins that.
+func TestSymbolicate_InAppTable(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seedTurbopack(t, "map-turbopack", turbopackPath)
+	for _, c := range inAppCases {
+		t.Run(c.row, func(t *testing.T) {
+			var fr Frame
+			switch c.outcome {
+			case OutcomeApplied:
+				fr = frame(turbopackPath, c.line, 1)
+			case OutcomeNoMap:
+				fr = frame(c.file, 1, 314) // a column, but no `sourcemaps` row for this path
+			case OutcomeNoColumn:
+				fr = frame(c.file, 1, 0)
+			default:
+				t.Fatalf("table row %s names an outcome the test cannot drive: %s", c.row, c.outcome)
+			}
+			fr.InApp = c.sent
+			frames := []Frame{fr}
+			res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+			f := frames[0]
+			if res.Outcomes[0] != c.outcome {
+				t.Fatalf("outcome %s, want %s", res.Outcomes[0], c.outcome)
+			}
+			if f.File != c.file {
+				t.Fatalf("file = %q, want %q", f.File, c.file)
+			}
+			if f.InApp != c.want {
+				t.Fatalf("in_app = %v, want %v (SDK sent %v)", f.InApp, c.want, c.sent)
+			}
+			if c.outcome != OutcomeApplied {
+				if f.Symbolicated || f.Raw != nil {
+					t.Fatalf("a frame the stage did not rewrite carries no raw and no symbolicated: %+v", f)
+				}
+				return
+			}
+			if !f.Symbolicated || f.Raw == nil {
+				t.Fatal("applied frame must carry symbolicated=true and raw")
+			}
+			if f.Raw.InApp != c.sent {
+				t.Fatalf("raw.in_app = %v, want the SDK's %v", f.Raw.InApp, c.sent)
+			}
+			if f.Raw.File != turbopackPath || f.Raw.Line != c.line || f.Raw.Column != 1 || f.Raw.Function != "minified" {
+				t.Fatalf("raw = %+v; want the values the SDK sent", *f.Raw)
+			}
+			if f.Line != 1 || f.Column != 1 {
+				t.Fatalf("resolved to %d:%d, want 1:1 (README.md's mappings)", f.Line, f.Column)
+			}
+		})
+	}
+	if n := h.fetcher.calls.Load(); n != 1 {
+		t.Fatalf("fetcher called %d times across the table; the map is fetched once and cached", n)
+	}
+}
+
+// TestSymbolicate_InAppReadsOnlyTheResolvedFile: contract §4.2 -- "the rule never reads the
+// minified name and never reads function". The same map is seeded under a minified path rule 1
+// would reject and the frame's function is a string rule 2 would reject; an app row (A3) is still
+// true and a vendor row (A1) still false, and the function reaches the stored frame untouched
+// where the segment carries no name.
+func TestSymbolicate_InAppReadsOnlyTheResolvedFile(t *testing.T) {
+	h := newHarness(t, nil)
+	const vendorLookingChunk = "/node_modules/.pnpm/next@15.5.21/dist/chunks/ac0ebedaba77188c.js"
+	h.seedTurbopack(t, "map-vendor-named", vendorLookingChunk)
+	frames := []Frame{
+		{File: vendorLookingChunk, Line: 3, Column: 1, Function: "[next]/node_modules/x", InApp: false},
+		{File: vendorLookingChunk, Line: 1, Column: 1, Function: "[project]/src/App", InApp: true},
+	}
+	res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+	if res.Outcomes[0] != OutcomeApplied || res.Outcomes[1] != OutcomeApplied {
+		t.Fatalf("%v, want [applied applied]", res.Outcomes)
+	}
+	if !frames[0].InApp || frames[0].Function != "[next]/node_modules/x" {
+		t.Fatalf("A3 under a vendor-looking chunk name: in_app=%v fn=%q; want true, function untouched", frames[0].InApp, frames[0].Function)
+	}
+	if frames[1].InApp || frames[1].Function != "renderWithHooks" {
+		t.Fatalf("A1 with an app-looking function: in_app=%v fn=%q; want false, the map's name", frames[1].InApp, frames[1].Function)
+	}
+}
+
+// TestInApp pins the pure rule on the strings contract §4.2's prose names beside the A-rows, so a
+// regression in the regex is reported by the string, not by a table row's position.
+func TestInApp(t *testing.T) {
+	cases := map[string]bool{
+		"webpack-internal:///(app-pages-browser)/./node_modules/next/dist/client/x.js": false, // rule 1
+		"file:///home/ci/web/node_modules/react/index.js":                              false, // rule 1
+		"node_modules/react/index.js":                                                  false, // rule 1, leading segment
+		"turbopack:///[project]/x/node_modules_shim/y.ts":                              true,  // not the segment
+		"[next]/dist/x.js":                      false, // rule 2, bare path root
+		"[project]/src/x.ts":                    true,  // rule 2 admits [project]
+		"turbopack:///[project]/[id]/page.tsx":  true,  // decision 18: only the root
+		"https://cdn.example.com/[vendor]/x.js": true,  // `://` is not `:///`: no namespace root
+		"":                                      true,  // rule 3 is the default
+	}
+	for p, want := range cases {
+		if got := inApp(p); got != want {
+			t.Errorf("inApp(%q) = %v, want %v", p, got, want)
 		}
 	}
 }

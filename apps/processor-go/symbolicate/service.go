@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -69,8 +70,8 @@ func (o Outcome) negativelyCacheable() bool {
 }
 
 // Frame is the stage's own view of a stack frame. The caller copies event.StackFrame in, calls
-// Symbolicate, and copies out File/Line/Column/Function plus -- only when Symbolicated -- the
-// `symbolicated: true` and `raw` keys of §4.4 step 6. A frame that passed through has
+// Symbolicate, and copies out File/Line/Column/Function plus -- only when Symbolicated -- InApp
+// and the `symbolicated: true` and `raw` keys of §4.4 step 6. A frame that passed through has
 // Symbolicated false and Raw nil, and the caller writes NO key for it (§4.4 step 7: absent, not
 // false, so a pre-feature occurrence and an unsymbolicated one are byte-identical).
 type Frame struct {
@@ -78,7 +79,9 @@ type Frame struct {
 	Line     int32
 	Column   int32
 	Function string
-	// InApp is carried so a caller can round-trip the frame; the stage never reads or writes it.
+	// InApp is the SDK's value on the way in. On a frame the stage rewrote it becomes the value
+	// inApp derives from the resolved File (sentinel-sourcemaps-turbopack-grouping §4.2; the
+	// SDK's value moves to Raw.InApp); on any other frame the stage leaves it exactly as sent.
 	InApp bool
 
 	Symbolicated bool
@@ -86,11 +89,41 @@ type Frame struct {
 }
 
 // RawFrame is §4.4 step 6's `raw` record: the values the SDK sent, kept beside the rewrite.
+// InApp has no omitempty on purpose (turbopack-grouping D4): a `false` the SDK sent over a
+// `false` the rule derived is a fact worth one byte, and omitempty on a bool would erase it.
 type RawFrame struct {
 	File     string `json:"file"`
 	Line     int32  `json:"line"`
 	Column   int32  `json:"column,omitempty"`
 	Function string `json:"function"`
+	InApp    bool   `json:"in_app"`
+}
+
+// namespaceRoot is turbopack-grouping §4.2 rule 2's root segment: the first segment after a
+// `<scheme>:///` prefix, or the leading segment of a bare path, when it is a bracketed name
+// (`[project]`, `[turbopack]`, `[next]`, `[externals]`). Decision 18: only the ROOT is tested --
+// a `[id]` or `[...unmatched]` later in the path is an ordinary directory.
+var namespaceRoot = regexp.MustCompile(`^(?:[a-z][a-z0-9+.-]*:///)?\[([a-z][a-z0-9-]*)\]/`)
+
+// inApp is turbopack-grouping §4.2's rule over a frame's POST-rewrite file string -- the map's
+// `sources` entry joined to `sourceRoot`, never the minified name and never the function. It
+// reads, in order:
+//  1. false when p contains `/node_modules/` anywhere or starts with `node_modules/` (a bare
+//     relative source under an empty sourceRoot -- A22);
+//  2. else false when the namespace root is a bracketed name other than `[project]` (A7-A9);
+//  3. else true -- `[project]`-rooted whatever directory follows (D6), `webpack:///./src/…`, a
+//     bare `src/lib/x.ts`, the Vite fixture's `../../src/main.ts`.
+//
+// The fixture table A1-A22 (contract §4.2) is the spec; TestSymbolicate_InAppTable drives it
+// through Symbolicate.
+func inApp(p string) bool {
+	if strings.Contains(p, "/node_modules/") || strings.HasPrefix(p, "node_modules/") {
+		return false
+	}
+	if m := namespaceRoot.FindStringSubmatch(p); m != nil && m[1] != "project" {
+		return false
+	}
+	return true
 }
 
 // EventOutcome is the per-event derivation of §4.4 -- the `outcome` label of
@@ -312,13 +345,16 @@ func (s *Service) resolveGroup(row *Sourcemap, pm *parsedMap, frames []Frame, in
 			continue
 		}
 		f := &frames[i]
-		f.Raw = &RawFrame{File: f.File, Line: f.Line, Column: f.Column, Function: f.Function}
+		f.Raw = &RawFrame{File: f.File, Line: f.Line, Column: f.Column, Function: f.Function, InApp: f.InApp}
 		f.File = rs[k].file
 		f.Line = rs[k].line
 		f.Column = rs[k].column
 		if rs[k].name != "" {
 			f.Function = rs[k].name
 		}
+		// turbopack-grouping §4.2: the map outranks the SDK on a rewritten frame (A4, flow P3);
+		// the SDK's value is already under Raw.InApp. Read AFTER f.File took the resolved source.
+		f.InApp = inApp(f.File)
 		f.Symbolicated = true
 		outcomes[i] = OutcomeApplied
 	}

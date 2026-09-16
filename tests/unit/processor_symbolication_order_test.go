@@ -178,9 +178,12 @@ func TestSymbolicate_ComputeFingerprintCarriesTheSymbolicatedFlag(t *testing.T) 
 
 // TestSymbolicate_StoredFrameShape pins §4.4 steps 6 and 7 on the JSON processEventInternal
 // marshals into error_occurrences.stacktrace: an applied frame carries `symbolicated: true` and
-// `raw` with the values the SDK sent (file, line, column, function), a passed-through frame carries
+// `raw` with the values the SDK sent (file, line, column, function and — since
+// sentinel-sourcemaps-turbopack-grouping §4.2, D4 — in_app), a passed-through frame carries
 // NEITHER key — absent, not false — so a pre-feature occurrence and an unsymbolicated one are
-// byte-identical. `in_app` is untouched on both.
+// byte-identical. `in_app` on the applied frame is the re-derived value: the fixture's
+// `../../src/main.ts` is A13 → true, the same value the SDK sent here; the pass-through frame's
+// is the SDK's, untouched.
 func TestSymbolicate_StoredFrameShape(t *testing.T) {
 	stage := newFixtureStage(t)
 	evt, err := event.Deserialize(marshalProtoEvent(t, javascriptProtoEvent()))
@@ -201,7 +204,7 @@ func TestSymbolicate_StoredFrameShape(t *testing.T) {
 	assert.Equal(t, "subtotal", applied["function"])
 	assert.Equal(t, true, applied["in_app"])
 	assert.Equal(t, map[string]any{
-		"file": "https://app.example.com" + orderMinified + "?v=1", "line": float64(1), "column": float64(10), "function": "t",
+		"file": "https://app.example.com" + orderMinified + "?v=1", "line": float64(1), "column": float64(10), "function": "t", "in_app": true,
 	}, applied["raw"], "raw is the SDK's values, before the rewrite")
 
 	passed := frames[1]
@@ -211,6 +214,42 @@ func TestSymbolicate_StoredFrameShape(t *testing.T) {
 	assert.False(t, hasRaw, "a passed-through frame has no `raw` key")
 	assert.Equal(t, map[string]any{"file": "/assets/vendor-3f2a1c.js", "line": float64(1), "function": "n", "in_app": true}, passed,
 		"byte-identical to a pre-feature frame: file, line, function, in_app and nothing else")
+}
+
+// TestSymbolicate_InAppCopiedBackForRewrittenFramesOnly is sentinel-sourcemaps-turbopack-grouping
+// §4.2 on the call path (flows P3, P7): ErrorEvent.Symbolicate copies the stage's re-derived InApp
+// back for a rewritten frame and ONLY for one. The SDK sends `false` on both frames (an
+// init({ inApp }) refinement, A4's shape): the rewritten frame's `in_app` becomes the rule's
+// `true` (`../../src/main.ts` is A13) with the SDK's `false` recorded under `raw.in_app` — no
+// omitempty, so a false is a false (D4) — and the pass-through frame's JSON is byte-identical to
+// what the SDK sent. Drop `e.Stacktrace[i].InApp = f.InApp` from Symbolicate and this goes red.
+func TestSymbolicate_InAppCopiedBackForRewrittenFramesOnly(t *testing.T) {
+	stage := newFixtureStage(t)
+	proto := javascriptProtoEvent()
+	proto.Stacktrace[0].InApp = false
+	proto.Stacktrace[1].InApp = false
+	evt, err := event.Deserialize(marshalProtoEvent(t, proto))
+	require.NoError(t, err)
+	before, err := json.Marshal(evt.Stacktrace[1])
+	require.NoError(t, err)
+
+	res := evt.Symbolicate(context.Background(), stage, orderProjectID)
+	require.Equal(t, []symbolicate.Outcome{symbolicate.OutcomeApplied, symbolicate.OutcomeNoColumn}, res.Outcomes)
+
+	assert.True(t, evt.Stacktrace[0].InApp, "the rewritten frame carries the rule's value, not the SDK's false")
+	require.NotNil(t, evt.Stacktrace[0].Raw)
+	assert.False(t, evt.Stacktrace[0].Raw.InApp, "the SDK's false is kept under raw")
+	stored, err := json.Marshal(evt.Stacktrace[0])
+	require.NoError(t, err)
+	var applied map[string]any
+	require.NoError(t, json.Unmarshal(stored, &applied))
+	assert.Equal(t, true, applied["in_app"])
+	assert.Equal(t, false, applied["raw"].(map[string]any)["in_app"], "raw.in_app is present when false: no omitempty")
+
+	after, err := json.Marshal(evt.Stacktrace[1])
+	require.NoError(t, err)
+	assert.False(t, evt.Stacktrace[1].InApp)
+	assert.Equal(t, string(before), string(after), "a pass-through frame is byte-identical to what the SDK sent, in_app included")
 }
 
 // TestSymbolicate_TenancyAtTheStage: the lookup is keyed by the RESOLVED project id the caller
