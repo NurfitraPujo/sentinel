@@ -34,10 +34,14 @@
 --     path is an ordinary directory). Mirrored from symbolicate.inApp. Such a frame's `in_app`
 --     becomes the processor's on the next occurrence instead of the SDK's, which changes WHICH
 --     frames Compute selects — so this predicate is judged over EVERY frame of the occurrence, not
---     only the three currently selected. `by_symbolicated_vendor` is the predicate as §4.4 states
---     it; `by_in_app_rederived_changed` narrows it to the frames whose stored `in_app` differs from
---     the value the rule derives (a vendor frame the SDK already sent as `false` does not move).
---     The wider one is what the totals fold in — the count is conservative by construction.
+--     only the three currently selected. `by_symbolicated_vendor` is the predicate exactly as
+--     §4.4 (a) states it; `by_in_app_rederived_changed` is the EXACT set of occurrences with a
+--     symbolicated frame whose stored `in_app` differs from the value the rule derives. Neither
+--     contains the other: a vendor frame the SDK already sent as `false` is in the first and not
+--     the second (nothing moves), while a NON-vendor symbolicated frame the SDK sent as `false`
+--     (§4.2 A4 — an `init({ inApp })` refinement) is in the second and not the first, yet it flips
+--     to `true`, changes Compute's selection and splits. The totals fold in their UNION (decision
+--     20, review R2 / BUG-02); §4.4 (a)'s wording is narrower than §4.2's own A4 row.
 --   * the UNSYMBOLICATED-frame predicate (§4.3) — a selected frame the stage did not rewrite
 --     (no `symbolicated: true`) whose basename matches `_[0-9a-f]{8}(\._)?\.[a-z]+$`:
 --     Turbopack's `_<8-hex>` server-chunk suffix, with or without the `._` merged-chunk marker,
@@ -154,10 +158,10 @@ per_occurrence AS (
 SELECT
   (SELECT count(*) FROM js)                                                        AS javascript_occurrences,
   count(*) FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory
-                      OR symbolicated_vendor OR turbopack_suffix)                   AS occurrences_that_would_split,
+                      OR symbolicated_vendor OR in_app_changed OR turbopack_suffix) AS occurrences_that_would_split,
   count(DISTINCT issue_id)
       FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory
-                 OR symbolicated_vendor OR turbopack_suffix)                        AS issues_that_would_split,
+                 OR symbolicated_vendor OR in_app_changed OR turbopack_suffix)      AS issues_that_would_split,
   count(*) FILTER (WHERE scheme_host)                                               AS by_scheme_host,
   count(*) FILTER (WHERE query_or_fragment)                                         AS by_query_or_fragment,
   count(*) FILTER (WHERE basename)                                                  AS by_basename_rule,
