@@ -8,7 +8,7 @@ import { debug, reportError } from './report.js';
 import type { InitPlan } from './options.js';
 import { type QueuedEvent, queuedEvent } from './queue.js';
 import { getSlot, type InternalClient } from './state.js';
-import { Transport } from './transport/transport.js';
+import { REQUEST_TIMEOUT_MS, Transport } from './transport/transport.js';
 import type { InitOptions, ResolvedOptions, Runtime, SentinelEvent } from './types.js';
 
 export const DEFAULT_MAX_BUFFER_SIZE = 100;
@@ -257,4 +257,35 @@ export async function close(timeoutMs?: number): Promise<boolean> {
   if (slot.client === client) delete slot.client;
   debug(client, `close: ${count} event(s) dropped (queued, in flight, sleeping or held by a pending beforeSend); flush resolved ${flushed}`);
   return flushed;
+}
+
+/**
+ * The send's promise (contract §4.4 *Edge*, §4.7): resolves once the first attempt of the POST carrying `eventId`
+ * has been acted on, so an edge isolate that awaits it stays alive for that one POST — and no longer than the
+ * per-attempt timeout plus a pending async `beforeSend`, which is waited for up to that same timeout (a hook that
+ * never settles must not hold a middleware response open forever). Resolves at once when nothing was enqueued
+ * (no client, the no-op client, a dropped event). Never rejects.
+ */
+export async function sendPromise(eventId: string): Promise<void> {
+  try {
+    const slot = getSlot();
+    if (slot.pending.size > 0) {
+      const expired = deferred<void>();
+      const timer = setTimeout(() => expired.resolve(), REQUEST_TIMEOUT_MS);
+      unref(timer);
+      try {
+        while (slot.pending.size > 0) {
+          const settled = await Promise.race([Promise.all([...slot.pending]).then(() => true as const), expired.promise.then(() => false as const)]);
+          if (!settled) return;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const transport = slot.client?.transport;
+    if (transport === undefined) return;
+    await transport.sent(eventId);
+  } catch {
+    // Never rejects: Next awaits this before it writes the error response (contract §4.7).
+  }
 }

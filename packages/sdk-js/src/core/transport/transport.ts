@@ -185,6 +185,8 @@ export class Transport {
   private flushGen = 0;
   private hiding = false;
   private idleWaiters: Array<() => void> = [];
+  /** `sent` callers keyed by the event id they wait on (the edge build's `captureRequestError`, contract §4.7). */
+  private sentWaiters = new Map<string, Array<() => void>>();
 
   constructor(private readonly cfg: TransportConfig) {
     this.queue = new RingBuffer(cfg.maxBufferSize);
@@ -207,6 +209,37 @@ export class Transport {
     };
     if (b?.sleep !== undefined) stats.sleepReason = b.sleep.reason;
     return stats;
+  }
+
+  /**
+   * The send's promise of contract §4.4 *Edge* / §4.7: resolves once the FIRST attempt of the batch carrying event
+   * `id` has been acted on — the batch is done, or its retry sleep is set up (retries run on timers after this
+   * resolves) — so an edge isolate awaiting it stays alive for one POST and at most the per-attempt timeout.
+   * Resolves at once when the event is not here (already sent, dropped, or never enqueued), and when the transport
+   * is closed or detached. Never rejects.
+   */
+  sent(id: string): Promise<void> {
+    if (this.closed || this.detached) return Promise.resolve();
+    const b = this.current;
+    if (b !== undefined && b.events.some((e) => e.id === id)) return b.decided.promise;
+    if (!this.queue.snapshot().some((e) => e.id === id)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const list = this.sentWaiters.get(id);
+      if (list === undefined) this.sentWaiters.set(id, [resolve]);
+      else list.push(resolve);
+    });
+  }
+
+  /** Wake the `sent` callers of `ids` (or of every id when `ids` is omitted — `close` / `detach`). */
+  private settleSent(ids?: Iterable<string>): void {
+    if (this.sentWaiters.size === 0) return;
+    const keys = ids === undefined ? [...this.sentWaiters.keys()] : [...ids];
+    for (const id of keys) {
+      const list = this.sentWaiters.get(id);
+      if (list === undefined) continue;
+      this.sentWaiters.delete(id);
+      for (const resolve of list) resolve();
+    }
   }
 
   /**
@@ -287,6 +320,7 @@ export class Transport {
       b.sleep?.wake('closed');
     }
     this.settleIdle(true);
+    this.settleSent();
     return count;
   }
 
@@ -299,6 +333,7 @@ export class Transport {
     this.clearWaitTimer();
     const events = this.queue.drain();
     this.settleIdle(true);
+    this.settleSent();
     return events;
   }
 
@@ -372,6 +407,18 @@ export class Transport {
     };
     if (batch.oversize) this.cfg.debug(`event ${events[0]?.id} is ${batch.body.length} bytes serialised, over the 60 KiB keepalive cap: sent alone, without keepalive`);
     this.current = batch;
+    if (this.sentWaiters.size > 0) {
+      // The batch's first `decided` is the first attempt's outcome (contract §4.7: one POST, never the retries).
+      const packed = new Set(events.map((e) => e.id));
+      const waiting = [...this.sentWaiters.keys()];
+      const inBatch = waiting.filter((id) => packed.has(id));
+      const first = batch.decided.promise;
+      if (inBatch.length > 0) void first.then(() => this.settleSent(inBatch));
+      // An id no longer queued was overflow-dropped (contract §4.4 *Queue*): nothing will ever send it.
+      const remaining = this.queue.snapshot();
+      const gone = waiting.filter((id) => !packed.has(id) && !remaining.some((e) => e.id === id));
+      if (gone.length > 0) this.settleSent(gone);
+    }
     return batch;
   }
 

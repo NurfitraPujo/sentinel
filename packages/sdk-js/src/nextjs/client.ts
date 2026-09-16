@@ -1,7 +1,21 @@
-// `@sentinel/sdk-js/nextjs/client` (contract §4.1, decision 31): a fixed typed entry with its own `.d.ts` and no
-// export conditions — the `client` init file imports this string, never the conditional `./nextjs`.
+// `@sentinel/sdk-js/nextjs/client` (contract §4.1, §4.7; decision 31): the client build — a fixed typed entry
+// with its own `.d.ts` and no export conditions, imported by `instrumentation-client.ts` and nothing else. Its
+// `init` is the browser's (`tunnel`, `flushOnHide`, `installGlobalHandlers`; NO `apiKey` / `endpoint` — B18),
+// plus §4.3's API, the router no-op under both names (B20) and `captureRequestError` as a no-op so
+// `instrumentation.ts` type-checks in every bundle.
 //
-// Scaffold (sentinel-sdk-js/TASK-01): the Next.js adapter lands in task 6 (contract §4.7).
-// Import-time inertness (contract §11): the module body registers nothing until `init`.
+// Import-time inertness (contract §4.7, §11; D7): `instrumentation-client.ts` runs before hydration on every
+// page and Next evaluates this graph wherever it bundles it — nothing here touches `window`, `process`, timers
+// or `fetch` until `init`.
 
-export { SDK_NAME } from '../core/index.js';
+import type { InstrumentationOnRequestError } from './request-error.js';
+
+export * from '../browser.js';
+export { captureRouterTransitionStart, onRouterTransitionStart } from './router.js';
+export type { NavigationType } from './router.js';
+export type { InstrumentationOnRequestError, RequestErrorContext, RequestErrorRequest } from './request-error.js';
+
+/** The client build's `captureRequestError`: a no-op with Next's signature (contract §4.7). Never throws. */
+export const captureRequestError: InstrumentationOnRequestError = function captureRequestError(): void {
+  // `onRequestError` is a server-side hook; on the client bundle it exists only so the import resolves.
+};
