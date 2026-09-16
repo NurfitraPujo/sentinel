@@ -173,6 +173,61 @@ func newEventID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// ClassifiedError wraps an underlying error with an explicit error class.
+type ClassifiedError struct {
+	Class   string
+	Message string
+	Cause   error
+}
+
+func (e *ClassifiedError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Cause != nil {
+		return e.Cause.Error()
+	}
+	return e.Class
+}
+
+func (e *ClassifiedError) Unwrap() error {
+	return e.Cause
+}
+
+func (e *ClassifiedError) ErrorClass() string {
+	return e.Class
+}
+
+// Classify wraps err with an explicit error class for Sentinel.
+func Classify(err error, class string) error {
+	if err == nil {
+		return nil
+	}
+	return &ClassifiedError{
+		Class: class,
+		Cause: err,
+	}
+}
+
+func classifyRootError(root error) string {
+	if root == nil {
+		return "Error"
+	}
+	if cp, ok := root.(interface{ ErrorClass() string }); ok {
+		if c := cp.ErrorClass(); c != "" {
+			return c
+		}
+	}
+	t := fmt.Sprintf("%T", root)
+	if t == "*errors.errorString" {
+		msg := root.Error()
+		if strings.HasPrefix(msg, "handler not found for task") {
+			return "TaskHandlerNotFoundError"
+		}
+	}
+	return t
+}
+
 // extractErrorClass resolves the error class from err by unwrapping the error
 // chain down to the root/innermost cause so that wrapper types such as
 // *fmt.wrapError (from fmt.Errorf("%w", err)) or join errors resolve to the
@@ -181,13 +236,23 @@ func extractErrorClass(err error) string {
 	if err == nil {
 		return "Error"
 	}
+	if cp, ok := err.(interface{ ErrorClass() string }); ok {
+		if c := cp.ErrorClass(); c != "" {
+			return c
+		}
+	}
 	curr := err
 	for {
+		if cp, ok := curr.(interface{ ErrorClass() string }); ok {
+			if c := cp.ErrorClass(); c != "" {
+				return c
+			}
+		}
 		switch u := curr.(type) {
 		case interface{ Unwrap() error }:
 			unwrapped := u.Unwrap()
 			if unwrapped == nil {
-				return fmt.Sprintf("%T", curr)
+				return classifyRootError(curr)
 			}
 			curr = unwrapped
 		case interface{ Unwrap() []error }:
@@ -200,13 +265,13 @@ func extractErrorClass(err error) string {
 				}
 			}
 			if found == nil {
-				return fmt.Sprintf("%T", curr)
+				return classifyRootError(curr)
 			}
 			curr = found
 		default:
 			unwrapped := errors.Unwrap(curr)
 			if unwrapped == nil {
-				return fmt.Sprintf("%T", curr)
+				return classifyRootError(curr)
 			}
 			curr = unwrapped
 		}
