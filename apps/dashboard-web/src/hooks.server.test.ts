@@ -104,6 +104,16 @@ describe('orgHandle reservedRoutes (D01)', () => {
 
 		expect(resolve).toHaveBeenCalledWith(event);
 	});
+
+	it('reaches resolve() (not a 403) for static file requests like /favicon.png even when authenticated', async () => {
+		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+		const event = makeEvent('/favicon.png', true);
+
+		const response = await orgHandle({ event, resolve });
+
+		expect(resolve).toHaveBeenCalledWith(event);
+		expect(response).toBeInstanceOf(Response);
+	});
 });
 
 /**

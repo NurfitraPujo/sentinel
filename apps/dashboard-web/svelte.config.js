@@ -20,6 +20,10 @@ const config = {
 		// favour of `csrf.trustedOrigins`, which does not help here — an ABSENT origin is rejected
 		// before any trusted list is consulted.
 		csrf: { checkOrigin: false },
+		version: {
+			// Poll every 60s for new deployment versions so clients detect build updates
+			pollInterval: 60000
+		},
 		alias: {
 			'$lib': './src/lib',
 			'$lib/*': './src/lib/*'

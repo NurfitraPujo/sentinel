@@ -134,7 +134,14 @@ export const orgHandle = async ({ event, resolve }: any) => {
 	];
 	let orgSlugFromUrl = null;
 
-	if (pathParts.length > 0 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {
+	// If the path looks like a static asset file (e.g. /favicon.png, /robots.txt),
+	// do NOT treat it as an organization slug. Treating missing or requested static
+	// files as org slugs causes orgHandle to throw a 403 instead of letting SvelteKit
+	// or the static file server handle it (returning 404 cleanly).
+	const firstSegment = pathParts.length > 0 ? pathParts[0].toLowerCase() : '';
+	const isStaticFile = firstSegment.includes('.');
+
+	if (pathParts.length > 0 && !isStaticFile && !reservedRoutes.includes(firstSegment)) {
 		orgSlugFromUrl = pathParts[0];
 	}
 

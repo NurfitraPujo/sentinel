@@ -2,8 +2,23 @@
 	import '../app.css';
 	import type { LayoutData } from './$types';
 	import NotificationBell from '$lib/components/notifications/NotificationBell.svelte';
+	import { onNavigate } from '$app/navigation';
+	import { updated } from '$app/state';
 
 	let { data, children } = $props();
+
+	onNavigate(async (navigation) => {
+		if (!navigation.to) return;
+		try {
+			if (await updated.check()) {
+				// New app version detected on navigation: force a full reload so the client
+				// loads the newly deployed assets and chunk hashes cleanly.
+				location.href = navigation.to.url.href;
+			}
+		} catch {
+			// updated.check() can fail if offline or network glitch; let normal navigation proceed
+		}
+	});
 </script>
 
 <div class="app">
