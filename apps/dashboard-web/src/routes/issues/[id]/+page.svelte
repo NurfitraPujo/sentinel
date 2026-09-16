@@ -5,7 +5,8 @@
 
 	let { data } = $props();
 
-	let expandedMetadata = $state(new Set<string>());
+	// SvelteSet ensures .add() and .delete() trigger Svelte 5 fine-grained reactivity.
+	const expandedMetadata = new SvelteSet<string>();
 
 	// sentinel-sourcemaps §4.7, flow `D4` — the occurrences currently showing their RAW frames. Per
 	// occurrence, never page-wide (fe.md decisions: two occurrences on one issue can differ in what
@@ -628,14 +629,24 @@
 							</div>
 						{/if}
 
-						<button class="metadata-toggle" onclick={() => toggleMetadata(occurrence.id)}>
+						<button
+							type="button"
+							class="metadata-toggle"
+							data-testid="metadata-toggle"
+							aria-pressed={expandedMetadata.has(occurrence.id)}
+							onclick={() => toggleMetadata(occurrence.id)}
+						>
 							{expandedMetadata.has(occurrence.id) ? 'Hide' : 'Show'} Metadata
 						</button>
 
-						{#if expandedMetadata.has(occurrence.id) && occurrence.metadata}
-							<div class="metadata">
+						{#if expandedMetadata.has(occurrence.id)}
+							<div class="metadata" data-testid="occurrence-metadata">
 								<h4>Metadata</h4>
-								<pre><code>{JSON.stringify(occurrence.metadata, null, 2)}</code></pre>
+								{#if occurrence.metadata && Object.keys(occurrence.metadata).length > 0}
+									<pre><code>{JSON.stringify(occurrence.metadata, null, 2)}</code></pre>
+								{:else}
+									<p class="metadata-empty">No metadata recorded.</p>
+								{/if}
 							</div>
 						{/if}
 					</div>
@@ -1064,5 +1075,12 @@
 		font-size: 0.75rem;
 		color: var(--text-muted);
 		overflow-x: auto;
+	}
+
+	.metadata-empty {
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		color: var(--text-subtle);
+		margin: 0;
 	}
 </style>
