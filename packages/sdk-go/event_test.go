@@ -92,6 +92,9 @@ func TestExtractErrorClassUnwrapsChains(t *testing.T) {
 		{"single wrap", fmt.Errorf("wrap: %w", base), "*sentinel.customSDKError"},
 		{"double wrap", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", base)), "*sentinel.customSDKError"},
 		{"join wrap", errors.Join(fmt.Errorf("wrap: %w", base), errors.New("other")), "*sentinel.customSDKError"},
+		{"handler not found task error", errors.New(`handler not found for task "custom_object:foo"`), "TaskHandlerNotFoundError"},
+		{"explicit Classify", Classify(errors.New("plain"), "ExplicitClass"), "ExplicitClass"},
+		{"wrapped Classify", fmt.Errorf("wrap: %w", Classify(errors.New("inner"), "WrappedClass")), "WrappedClass"},
 	}
 
 	for _, tc := range cases {
