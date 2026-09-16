@@ -132,11 +132,13 @@ describe('W1 (BUG-01, Turbopack shape): every stored browser path is a chunk the
       expect.stringMatching(/^Sentinel: browser sourcemaps: .*60394cfab7bcbc98\.js: its sourceMappingURL names 4c218c652b8c48af\.js\.map, which does not exist/),
       expect.stringMatching(/^Sentinel: browser sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*3f9721961e8f2ba6\.js/),
       expect.stringMatching(/^Sentinel: server sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*page_client-reference-manifest\.js/),
-      // BUG-02 (decision 44): the entry stub's empty index map is skipped, never posted, and the sweep below still deletes it.
+      // BUG-02 (decision 44): the entry stub's empty index map and the runtime's sections map are skipped, never posted, and the sweep below still deletes them.
       expect.stringMatching(/^Sentinel: server sourcemaps: .*server\/app\/page\.js\.map: empty index map \(no mappings, no sections\) — nothing to symbolicate; skipping it$/),
+      expect.stringMatching(/^Sentinel: server sourcemaps: .*server\/chunks\/\[turbopack\]_runtime\.js\.map: index map \(sections, no mappings\) — the route stores flat maps only; skipping it$/),
     ]);
     expect(server).not.toContain(`${DEFAULT_SERVER_ROOT}/app/page.js`);
-    for (const rel of ['static/chunks/8f15d5d03090a0be.js.map', 'static/chunks/e96569a392fa278c.js.map', 'static/chunks/9a8b7c6d5e4f3a2b.js.map', 'static/chunks/20c20fcd5d02c4c2.css.map', 'server/edge/chunks/edge-wrapper_56e5ba59.js.map', 'server/chunks/[root-of-the-server]__a6734ae3._.js.map', 'server/app/page.js.map']) {
+    expect(server).not.toContain(`${DEFAULT_SERVER_ROOT}/chunks/[turbopack]_runtime.js`);
+    for (const rel of ['static/chunks/8f15d5d03090a0be.js.map', 'static/chunks/e96569a392fa278c.js.map', 'static/chunks/9a8b7c6d5e4f3a2b.js.map', 'static/chunks/20c20fcd5d02c4c2.css.map', 'server/edge/chunks/edge-wrapper_56e5ba59.js.map', 'server/chunks/[root-of-the-server]__a6734ae3._.js.map', 'server/app/page.js.map', 'server/chunks/[turbopack]_runtime.js.map']) {
       expect(existsSync(join(dir, rel)), rel).toBe(false);
     }
     expect(existsSync(join(dir, 'static/chunks/d69eb7d85499027c.js'))).toBe(true);

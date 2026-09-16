@@ -26,8 +26,8 @@ export { DEFAULT_TIMEOUT_MS, sendWithNodeHttp } from './http.js';
 export type { SendFn, UploadRequest, UploadResponse } from './http.js';
 export { MAX_FILES_PER_REQUEST, MAX_REQUEST_BYTES, newBoundary, packBatches } from './multipart.js';
 export type { PackedBatch, PackOptions } from './multipart.js';
-export { EMPTY_INDEX_MAP_MAX_BYTES, isEmptyIndexMap, isScript, isSourcemapOfScript, listMaps, pairMinifiedPath, parseSourceMappingUrl, SOURCEMAPPING_URL_TAIL_BYTES, walkSourcemaps } from './walk.js';
-export type { MapPair, WalkOptions } from './walk.js';
+export { INDEX_MAP_CHECK_MAX_BYTES, indexMapKind, isScript, isSourcemapOfScript, listMaps, pairMinifiedPath, parseSourceMappingUrl, SOURCEMAPPING_URL_TAIL_BYTES, walkSourcemaps } from './walk.js';
+export type { IndexMapKind, MapPair, WalkOptions } from './walk.js';
 
 /** Total sends per batch — the first plus at most three retries (contract §4.8 step 5). */
 export const MAX_ATTEMPTS = 4;

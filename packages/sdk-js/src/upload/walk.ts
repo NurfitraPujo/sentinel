@@ -19,13 +19,16 @@
 //     never a skip (the original step 1);
 //   - a map two chunks reference is one pair per chunk (the route is keyed by `minified_path`); the uploader
 //     unlinks it once, after the last batch that carried it;
-//   - an EMPTY INDEX MAP — no string `mappings` and a `sections` that is absent or `[]` — is left out with one
-//     warn per file (BUG-02, the seat's decision 44). Turbopack 15.5.21 writes `{"version":3,"sources":[],
-//     "sections":[]}` for every one-line server entry stub (`app/*/page.js`, `pages/_app.js`, `instrumentation.js`,
-//     `app/api/*/route.js` — 10 of the scratch app's 62 server maps), the route answers `422 invalid_sourcemap
-//     no_mappings` for the whole batch, and decision 29 turns that into a red build with nothing to show for it:
-//     there is nothing in such a map to symbolicate. A NON-empty `sections` map is still uploaded — the route's
-//     422 is then the loud signal that index-map support is missing on the sentinel side, not something to hide.
+//   - an INDEX MAP — no string `mappings`, whatever `sections` holds — is left out with one warn per file (BUG-02,
+//     the seat's decision 44). Turbopack 15.5.21 writes `{"version":3,"sources":[],"sections":[]}` for every
+//     one-line server entry stub (`app/*/page.js`, `pages/_app.js`, `instrumentation.js`, `app/api/*/route.js` —
+//     11 of the scratch app's 62 server maps) and a five-section index map of its OWN runtime
+//     (`chunks/[turbopack]_runtime.js.map`, `chunks/ssr/[turbopack]_runtime.js.map` — `turbopack:///[turbopack]/…`
+//     sources, no app code); the route answers `422 invalid_sourcemap no_mappings` for the whole batch, decision 29
+//     turns that into a red build, and the processor counts a `sections` map `map_error` anyway, so nothing that
+//     could symbolicate is lost by leaving them out. The warn line is the signal that index-map support is
+//     missing on the sentinel side until a card gives the route and processor `sections`; a map that is not JSON,
+//     not an object, or larger than `INDEX_MAP_CHECK_MAX_BYTES` is uploaded as written for the route to judge.
 // The prefix need not be a URL path: §4.9's server walk passes `serverRoot` (`/app/.next/server`, decision 18)
 // and gets the absolute filesystem path the node runtime prints. Only regular files are walked (`find -type
 // f`); a `.css.map` is ignored here — sweeping every `*.map` out of a Next output is the wrapper's job (§4.9
@@ -148,30 +151,33 @@ async function assertDirectory(dir: string): Promise<void> {
 const NAMED_SKIPS = 10;
 
 /**
- * The largest map the empty-index-map check reads and parses. Turbopack's stubs are ≈ 40 bytes; a real server map
- * runs 1–7 MB and parsing every one of `web`'s ≈ 800 in the build hook would cost more than the upload. A map over
- * this size is uploaded unread and the route judges it.
+ * The largest map the index-map check reads and parses. Turbopack's entry stubs are ≈ 50 bytes and its runtime
+ * index map ≈ 48 KiB; a real server map runs 1–7 MB, and parsing every one of `web`'s ≈ 800 in the build hook
+ * (a sourcesContent-heavy map is several times its raw size once parsed) would cost more than the upload. A map
+ * over this size is uploaded unread and the route judges it — an index map that large is the route's loud 422.
  */
-export const EMPTY_INDEX_MAP_MAX_BYTES = 64 * 1024;
+export const INDEX_MAP_CHECK_MAX_BYTES = 1024 * 1024;
+
+export type IndexMapKind = 'empty' | 'sections';
 
 /**
- * `true` for a version-3 index map with nothing to symbolicate: no string `mappings` and a `sections` that is
- * absent or an empty array (`{"version":3,"sources":[],"sections":[]}`). A map that is not JSON, not an object,
- * larger than `EMPTY_INDEX_MAP_MAX_BYTES`, has a `mappings` string (even `""`, which the route accepts) or a
- * non-empty `sections` is `false` — it is uploaded as written and the route's structural check judges it.
+ * `'empty'` for an index map with nothing in it (`sections` absent or `[]`), `'sections'` for one with sections,
+ * both meaning a JSON object with no string `mappings` — `{"version":3,"sources":[],"sections":[]}` and Turbopack's
+ * runtime map. `undefined` for a flat map (a `mappings` string, even `""`, which the route accepts) and for what
+ * this check does not judge: not JSON, not an object, or over `INDEX_MAP_CHECK_MAX_BYTES` — uploaded as written.
  */
-export async function isEmptyIndexMap(path: string, sizeBytes: number): Promise<boolean> {
-  if (sizeBytes > EMPTY_INDEX_MAP_MAX_BYTES) return false;
+export async function indexMapKind(path: string, sizeBytes: number): Promise<IndexMapKind | undefined> {
+  if (sizeBytes > INDEX_MAP_CHECK_MAX_BYTES) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(path, 'utf8'));
   } catch {
-    return false;
+    return undefined;
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
   const map = parsed as Record<string, unknown>;
-  if (typeof map.mappings === 'string') return false;
-  return map.sections === undefined || (Array.isArray(map.sections) && map.sections.length === 0);
+  if (typeof map.mappings === 'string') return undefined;
+  return Array.isArray(map.sections) && map.sections.length > 0 ? 'sections' : 'empty';
 }
 
 /** The pairs of contract §4.8 step 1 (as amended by BUG-01), in walk order. `usage` when the directory cannot be read; `[]` when it holds no map. */
@@ -210,17 +216,19 @@ export async function walkSourcemaps(buildDir: string, publicPrefix: string, opt
     warn(`${withoutComment.length} script(s) under ${buildDir} carry no sourceMappingURL comment and have no map to upload: ${named}${more}`);
   }
 
-  // Pass 2: the pairs, in walk order of the file that produced each. An empty index map is checked once per file
-  // (a map two chunks reference is one read) and left out with one warn naming it.
-  const emptyChecked = new Map<string, boolean>();
-  const skipIfEmpty = async (key: string, mapPath: string, sizeBytes: number): Promise<boolean> => {
-    let empty = emptyChecked.get(key);
-    if (empty === undefined) {
-      empty = await isEmptyIndexMap(mapPath, sizeBytes);
-      emptyChecked.set(key, empty);
-      if (empty) warn(`${mapPath}: empty index map (no mappings, no sections) — nothing to symbolicate; skipping it`);
+  // Pass 2: the pairs, in walk order of the file that produced each. An index map is checked once per file (a map
+  // two chunks reference is one read) and left out with one warn naming it.
+  const indexChecked = new Map<string, boolean>();
+  const skipIfIndexMap = async (key: string, mapPath: string, sizeBytes: number): Promise<boolean> => {
+    let skip = indexChecked.get(key);
+    if (skip === undefined) {
+      const kind = await indexMapKind(mapPath, sizeBytes);
+      skip = kind !== undefined;
+      indexChecked.set(key, skip);
+      if (kind === 'empty') warn(`${mapPath}: empty index map (no mappings, no sections) — nothing to symbolicate; skipping it`);
+      else if (kind === 'sections') warn(`${mapPath}: index map (sections, no mappings) — the route stores flat maps only; skipping it`);
     }
-    return empty;
+    return skip;
   };
   const pairs: MapPair[] = [];
   for (const [path, rel] of files) {
@@ -228,11 +236,11 @@ export async function walkSourcemaps(buildDir: string, publicPrefix: string, opt
     const mapPath = chunkMap.get(abs);
     if (mapPath !== undefined) {
       const sizeBytes = sizes.get(mapPath) ?? (await stat(mapPath)).size;
-      if (await skipIfEmpty(mapPath, mapPath, sizeBytes)) continue;
+      if (await skipIfIndexMap(mapPath, mapPath, sizeBytes)) continue;
       pairs.push({ path: mapPath, minifiedPath: pairMinifiedPath(publicPrefix, rel), sizeBytes, pairedBy: 'comment', chunkPath: path, siblingExists: true });
     } else if (isSourcemapOfScript(rel) && !referenced.has(abs)) {
       const sizeBytes = sizes.get(abs) ?? 0;
-      if (await skipIfEmpty(abs, path, sizeBytes)) continue;
+      if (await skipIfIndexMap(abs, path, sizeBytes)) continue;
       const chunkPath = path.slice(0, -'.map'.length);
       pairs.push({
         path,
