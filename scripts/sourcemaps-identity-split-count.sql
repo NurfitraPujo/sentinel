@@ -23,6 +23,27 @@
 -- verbatim, so a frame carrying `?v=1` or `#L1` changes its hash input even when no rule matches.
 -- It is counted under `by_query_or_fragment` and folded into the totals.
 --
+-- sentinel-sourcemaps-turbopack-grouping §4.4 (decision 18, be.md task 9) EXTENDS the count with
+-- two more predicates, folded into the same totals:
+--
+--   * the SYMBOLICATED-frame predicate (§4.2) — a frame the stage rewrote (`symbolicated: true`)
+--     whose resolved `file` contains `/node_modules/` (or starts with `node_modules/`, a bare
+--     relative source under an empty sourceRoot) or whose namespace ROOT — the first segment after
+--     an optional `<scheme>:///`, or the leading segment of a bare path — is a bracketed name other
+--     than `[project]` (`[turbopack]`, `[next]`, `[externals]`; a `[id]` or `[...slug]` later in the
+--     path is an ordinary directory). Mirrored from symbolicate.inApp. Such a frame's `in_app`
+--     becomes the processor's on the next occurrence instead of the SDK's, which changes WHICH
+--     frames Compute selects — so this predicate is judged over EVERY frame of the occurrence, not
+--     only the three currently selected. `by_symbolicated_vendor` is the predicate as §4.4 states
+--     it; `by_in_app_rederived_changed` narrows it to the frames whose stored `in_app` differs from
+--     the value the rule derives (a vendor frame the SDK already sent as `false` does not move).
+--     The wider one is what the totals fold in — the count is conservative by construction.
+--   * the UNSYMBOLICATED-frame predicate (§4.3) — a selected frame the stage did not rewrite
+--     (no `symbolicated: true`) whose basename matches `_[0-9a-f]{8}(\._)?\.[a-z]+$`:
+--     Turbopack's `_<8-hex>` server-chunk suffix, with or without the `._` merged-chunk marker,
+--     which the normaliser now strips (`_052cc036._.js` → `_*._.js`). Judged, like the two rules
+--     above, on the frames Compute hashes.
+--
 -- What it does NOT do. It cannot tell a pre-feature row from one the new processor already
 -- stored — on a database the feature has run against, every symbolicated row's `file` is a source
 -- path (`../../src/x.ts`) that matches nothing, and every raw row matches exactly as it did before,
@@ -46,13 +67,14 @@ WITH js AS (
 frames AS (
   SELECT js.id AS occurrence_id, js.issue_id, f.ord,
          COALESCE(f.frame->>'file', '') AS file,
-         COALESCE((f.frame->>'in_app')::boolean, false) AS in_app
+         COALESCE((f.frame->>'in_app')::boolean, false) AS in_app,
+         COALESCE((f.frame->>'symbolicated')::boolean, false) AS symbolicated
     FROM js
     CROSS JOIN LATERAL jsonb_array_elements(js.stacktrace) WITH ORDINALITY AS f(frame, ord)
 ),
 -- Compute's selection: the first three in_app frames, else (P4-3) the first three frames.
 selected AS (
-  SELECT occurrence_id, issue_id, ord, file
+  SELECT occurrence_id, issue_id, ord, file, symbolicated
     FROM (
       SELECT fr.*,
              bool_or(in_app) OVER (PARTITION BY occurrence_id) AS any_in_app,
@@ -68,6 +90,8 @@ judged AS (
          s.file ~* '^https?://[^/?#]'                                  AS has_scheme_host,
          s.file ~ '[?#]'                                               AS has_query_or_fragment,
          p.path,
+         -- turbopack-grouping §4.3: an unrewritten frame whose basename ends in _<8-hex>[._].<ext>
+         (NOT s.symbolicated AND bb.base ~ '_[0-9a-f]{8}(\._)?\.[a-z]+$') AS turbopack_suffix_rule,
          -- basename rule: token after the last [-.] of the stem (or the whole stem), before the ext run
          (b.token ~ '^[A-Za-z0-9_]{6,64}$'
             AND (b.token ~ '[0-9]' OR b.token ~ '^[0-9a-f]+$')
@@ -97,22 +121,48 @@ judged AS (
       SELECT st.stem, regexp_replace(st.stem, '^.*[-.]', '') AS token
     ) b
 ),
+-- turbopack-grouping §4.2 on EVERY symbolicated frame of the occurrence (it moves the selection,
+-- so the currently selected three are not the population): mirrored from symbolicate.inApp.
+rederived AS (
+  SELECT fr.occurrence_id, fr.issue_id,
+         bool_or(v.vendor)                    AS symbolicated_vendor,
+         bool_or(v.vendor = fr.in_app)        AS in_app_changed   -- derived (NOT vendor) <> stored
+    FROM frames fr
+    CROSS JOIN LATERAL (
+      SELECT fr.file LIKE '%/node_modules/%'
+          OR fr.file LIKE 'node\_modules/%'
+          OR COALESCE(
+               substring(fr.file FROM '^(?:[a-z][a-z0-9+.-]*:///)?\[([a-z][a-z0-9-]*)\]/') <> 'project',
+               false) AS vendor
+    ) v
+   WHERE fr.symbolicated
+   GROUP BY fr.occurrence_id, fr.issue_id
+),
 per_occurrence AS (
-  SELECT occurrence_id, issue_id,
-         bool_or(has_scheme_host)       AS scheme_host,
-         bool_or(has_query_or_fragment) AS query_or_fragment,
-         bool_or(basename_rule)         AS basename,
-         bool_or(directory_rule)        AS directory
-    FROM judged
-   GROUP BY occurrence_id, issue_id
+  SELECT j.occurrence_id, j.issue_id,
+         bool_or(j.has_scheme_host)       AS scheme_host,
+         bool_or(j.has_query_or_fragment) AS query_or_fragment,
+         bool_or(j.basename_rule)         AS basename,
+         bool_or(j.directory_rule)        AS directory,
+         bool_or(j.turbopack_suffix_rule) AS turbopack_suffix,
+         COALESCE(bool_or(r.symbolicated_vendor), false) AS symbolicated_vendor,
+         COALESCE(bool_or(r.in_app_changed), false)      AS in_app_changed
+    FROM judged j
+    LEFT JOIN rederived r ON r.occurrence_id = j.occurrence_id
+   GROUP BY j.occurrence_id, j.issue_id
 )
 SELECT
   (SELECT count(*) FROM js)                                                        AS javascript_occurrences,
-  count(*) FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory) AS occurrences_that_would_split,
+  count(*) FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory
+                      OR symbolicated_vendor OR turbopack_suffix)                   AS occurrences_that_would_split,
   count(DISTINCT issue_id)
-      FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory)      AS issues_that_would_split,
+      FILTER (WHERE scheme_host OR query_or_fragment OR basename OR directory
+                 OR symbolicated_vendor OR turbopack_suffix)                        AS issues_that_would_split,
   count(*) FILTER (WHERE scheme_host)                                               AS by_scheme_host,
   count(*) FILTER (WHERE query_or_fragment)                                         AS by_query_or_fragment,
   count(*) FILTER (WHERE basename)                                                  AS by_basename_rule,
-  count(*) FILTER (WHERE directory)                                                 AS by_directory_rule
+  count(*) FILTER (WHERE directory)                                                 AS by_directory_rule,
+  count(*) FILTER (WHERE symbolicated_vendor)                                       AS by_symbolicated_vendor,
+  count(*) FILTER (WHERE in_app_changed)                                            AS by_in_app_rederived_changed,
+  count(*) FILTER (WHERE turbopack_suffix)                                          AS by_turbopack_suffix_rule
   FROM per_occurrence;
