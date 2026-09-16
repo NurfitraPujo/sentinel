@@ -12,7 +12,10 @@
 //      (`distDir/server` under `serverRoot`, default `/app/.next/server`, decision 18) — each map stored under
 //      the path of the CHUNK whose `//# sourceMappingURL=` names it (BUG-01: Turbopack's map names are not its
 //      chunk names; walk.ts) — then, when `deleteAfterUpload`, every `*.map` under both (the `.css.map` files
-//      the walks never upload included).
+//      the walks never upload included) — and, because the hook runs BEFORE `output: 'standalone'`'s trace copy,
+//      every `*.nft.json` under `distDir/server` is rewritten without the entries that named a deleted map
+//      (BUG-03, the seat's decision 45: the sweep repairs the traces it invalidates, so a webpack standalone build
+//      stays green and map-free; `pruneTraces` below).
 //
 // Failure policy (decisions 28, 29, 32, 34), all of it in the hook and nothing at import (D7):
 //   - `upload` is tri-state: `false` never uploads; `undefined` uploads when `dashboardUrl` + `apiKey` resolve
@@ -30,9 +33,9 @@
 // at 15.5.21) rather than imported, so the package builds with no `next` types (the same rule as
 // request-error.ts); `withSentinelConfig` is generic over the shape it is given and returns that shape.
 
-import { rm } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { isSourcemapUploadError, listMaps, type UploadEvent, type UploadReport, uploadSourcemaps } from '../upload/index.js';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative, resolve } from 'node:path';
+import { isSourcemapUploadError, listMaps, listTraces, type UploadEvent, type UploadReport, uploadSourcemaps } from '../upload/index.js';
 
 export { SDK_NAME } from '../core/index.js';
 export type { BatchResult, StoredFile, UploadEvent, UploadReport, UploadSourcemapsOptions } from '../upload/index.js';
@@ -122,6 +125,73 @@ async function deleteEveryMap(dirs: readonly string[]): Promise<string[]> {
   return deleted;
 }
 
+/** The shape of a `*.nft.json` (`@vercel/nft` version 1): entries relative to the trace file's own directory. */
+interface TraceFile {
+  version?: unknown;
+  files?: unknown;
+}
+
+/** One rewritten trace: the file and the entries dropped from it. */
+export interface PrunedTrace {
+  readonly path: string;
+  readonly removed: readonly string[];
+}
+
+/**
+ * BUG-03 (the seat's decision 45): under webpack, `next-trace-entrypoints-plugin` wrote every server entry's
+ * `<entry>.js.nft.json` at compile time, and with `experimental.serverSourceMaps` each one lists the `.js.map`
+ * beside every chunk the entry needs (`instrumentation.js.nft.json` →
+ * `["../package.json","chunks/260.js","chunks/260.js.map",…]`). `next build`'s *Collecting build traces* and the
+ * `output: 'standalone'` copy (`copyTracedFiles`) run AFTER this hook and copy every listed file — one that the
+ * sweep deleted is `⚠ Failed to copy traced files` per page and a hard ENOENT on `instrumentation.js.map`, exit 1,
+ * no `.next/standalone/server.js`. So the sweep repairs what it invalidated: every `*.nft.json` under
+ * `distDir/server` is rewritten without the entries that resolve to a path THIS run deleted — never a generic
+ * `*.map` filter — and nothing else in the file changes: key order, the remaining entries' order and the file's
+ * indentation are kept; a file that is not JSON, not an object or has no `files` array is left alone (the copy then
+ * reports it itself). Turbopack's traces never list a map, so there the rewrite is a no-op. Next's own
+ * `next-server.js.nft.json` (written later, under `distDir`) ignores `**\/*.map` on its own.
+ */
+export async function pruneTraces(serverDir: string, deleted: ReadonlySet<string>): Promise<PrunedTrace[]> {
+  const pruned: PrunedTrace[] = [];
+  if (deleted.size === 0) return pruned;
+  for (const path of await listTraces(serverDir)) {
+    let text: string;
+    let trace: TraceFile;
+    try {
+      text = await readFile(path, 'utf8');
+      trace = JSON.parse(text) as TraceFile;
+    } catch {
+      continue;
+    }
+    if (trace === null || typeof trace !== 'object' || !Array.isArray(trace.files)) continue;
+    const dir = dirname(path);
+    const removed: string[] = [];
+    const kept = trace.files.filter((entry) => {
+      if (typeof entry !== 'string' || !deleted.has(resolve(dir, entry))) return true;
+      removed.push(entry);
+      return false;
+    });
+    if (removed.length === 0) continue;
+    await writeFile(path, JSON.stringify({ ...trace, files: kept }, null, detectIndent(text)) + (text.endsWith('\n') ? '\n' : ''));
+    pruned.push({ path, removed });
+  }
+  return pruned;
+}
+
+/** The indentation a JSON text was written with (Next writes its traces compact), so the rewrite keeps it. */
+function detectIndent(text: string): string {
+  return /^\s*\{\r?\n([ \t]+)"/.exec(text)?.[1] ?? '';
+}
+
+/** Step 4 in full: the sweep over both series' directories, then the trace repair it makes necessary, one line per rewritten trace. */
+async function sweep(distDir: string, silent: boolean): Promise<void> {
+  const serverDir = join(distDir, 'server');
+  const deleted = await deleteEveryMap([join(distDir, 'static'), serverDir]);
+  for (const { path, removed } of await pruneTraces(serverDir, new Set(deleted))) {
+    if (!silent) console.log(`Sentinel: build trace ${relative(distDir, path)} — ${removed.length} deleted map entr${removed.length === 1 ? 'y' : 'ies'} removed`);
+  }
+}
+
 interface SeriesPlan {
   readonly series: Series;
   readonly buildDir: string;
@@ -166,7 +236,7 @@ async function runSentinelHook(config: NextConfigLike, options: WithSentinelConf
   if (!uploads) {
     if (deleteAfterUpload) {
       warn(`sourcemaps not uploaded (${quietReason}); deleting them anyway`);
-      await deleteEveryMap([staticDir, serverDir]);
+      await sweep(distDir, silent);
     } else {
       warn(`sourcemaps not uploaded (${quietReason}); \`deleteAfterUpload\` is false, so the maps stay in place`);
     }
@@ -193,7 +263,7 @@ async function runSentinelHook(config: NextConfigLike, options: WithSentinelConf
     await runSeries(plan, { release, dashboardUrl: dashboardUrl as string, apiKey: apiKey as string, projectKey, silent, deleteAfterUpload });
   }
 
-  if (deleteAfterUpload) await deleteEveryMap([staticDir, serverDir]);
+  if (deleteAfterUpload) await sweep(distDir, silent);
 }
 
 interface SeriesContext {

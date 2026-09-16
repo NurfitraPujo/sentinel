@@ -6,7 +6,7 @@
 // their named tokens (release, the walk's directory, the series name, the status or code), never by sentence
 // (contract §11's guidance rule). Shuffle-safe: every test builds its own tree, script and env.
 
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -52,7 +52,7 @@ vi.mock('../../src/upload/index.js', async (importOriginal) => {
 });
 
 // Imported after the mock is registered (vitest hoists `vi.mock`, but the import must be in this module).
-const { DEFAULT_SERVER_ROOT, defaultPublicPrefix, withSentinelConfig } = await import('../../src/nextjs/config.js');
+const { DEFAULT_SERVER_ROOT, defaultPublicPrefix, pruneTraces, withSentinelConfig } = await import('../../src/nextjs/config.js');
 type NextConfigLike = import('../../src/nextjs/config.js').NextConfigLike;
 type Hook = NonNullable<NonNullable<NextConfigLike['compiler']>['runAfterProductionCompile']>;
 
@@ -537,5 +537,159 @@ describe('W15: deleteAfterUpload: false governs every path', () => {
     expect(allMaps(dir).static).toHaveLength(3);
     expect(allMaps(dir).server).toHaveLength(2);
     expect(allMaps(dir).css).toHaveLength(1);
+  });
+});
+
+// BUG-03 (the seat's decision 45): webpack's trace plugin writes `<entry>.js.nft.json` beside every server entry at
+// compile time listing the `.js.map` beside every chunk it needs, and `output: 'standalone'`'s copy reads them AFTER
+// the hook — so the sweep must rewrite the traces it invalidates or the copy ENOENTs (W2). The tree here carries
+// webpack's shape: `server/app/route-000.js.nft.json` and `server/instrumentation.js.nft.json` as Next 15.5.21 writes
+// them (compact, `{"version":1,"files":[…]}`, entries relative to the trace's own directory, `../` for the chunks).
+describe('W2 (BUG-03, webpack + standalone): the sweep rewrites the *.nft.json traces under distDir/server without the entries it deleted', () => {
+  /** A webpack-shaped tree: `tree()` plus `server/chunks/260.js` (+ map) and two traces listing the maps beside what they need. */
+  function webpackTree(): { dir: string; routeTrace: string; instrumentationTrace: string; nodeModulesMap: string } {
+    const dir = tree();
+    mkdirSync(join(dir, 'server/chunks'), { recursive: true });
+    writeFileSync(join(dir, 'server/chunks/260.js'), 'module.exports={};\n//# sourceMappingURL=260.js.map\n');
+    writeFileSync(join(dir, 'server/chunks/260.js.map'), '{"version":3,"file":"260.js","sources":["src/260.ts"],"names":[],"mappings":"AAAA"}\n');
+    // A map OUTSIDE the sweep (under distDir, beside static/ and server/) that a trace lists — the rule is "what this
+    // run deleted", never `*.map` (constraint 1).
+    mkdirSync(join(dir, 'node_modules/dep/dist'), { recursive: true });
+    const nodeModulesMap = join(dir, 'node_modules/dep/dist/index.js.map');
+    writeFileSync(nodeModulesMap, '{"version":3,"sources":[],"names":[],"mappings":""}\n');
+    const routeTrace = join(dir, 'server/app/route-000.js.nft.json');
+    writeFileSync(
+      routeTrace,
+      JSON.stringify({ version: 1, files: ['../../../package.json', '../chunks/260.js', '../chunks/260.js.map', 'route-000.js.map', '../../node_modules/dep/dist/index.js', '../../node_modules/dep/dist/index.js.map', 'route-001.js', 'route-001.js.map'] }),
+    );
+    const instrumentationTrace = join(dir, 'server/instrumentation.js.nft.json');
+    writeFileSync(instrumentationTrace, JSON.stringify({ version: 1, files: ['../package.json', 'chunks/260.js', 'chunks/260.js.map', 'instrumentation.js.map', 'webpack-runtime.js', 'webpack-runtime.js.map'] }));
+    return { dir, routeTrace, instrumentationTrace, nodeModulesMap };
+  }
+
+  function files(trace: string): unknown {
+    return JSON.parse(readFileSync(trace, 'utf8'));
+  }
+
+  it('W2: after the success path every map is gone and each trace lists only what still exists — compact, `version` before `files`, the remaining entries in their original order; one log line per rewritten trace with the count', async () => {
+    const { dir, routeTrace, instrumentationTrace, nodeModulesMap } = webpackTree();
+    const out = withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS });
+    await runHook(out, dir);
+    expect(allMaps(dir)).toEqual({ static: [], server: [], css: [] });
+    expect(existsSync(join(dir, 'server/chunks/260.js.map'))).toBe(false);
+    expect(readFileSync(routeTrace, 'utf8')).toBe(
+      '{"version":1,"files":["../../../package.json","../chunks/260.js","../../node_modules/dep/dist/index.js","../../node_modules/dep/dist/index.js.map","route-001.js"]}',
+    );
+    expect(existsSync(nodeModulesMap)).toBe(true);
+    // `instrumentation.js.map` and `webpack-runtime.js.map` never existed in this tree: not this run's to remove (constraint 1).
+    expect(files(instrumentationTrace)).toEqual({ version: 1, files: ['../package.json', 'chunks/260.js', 'instrumentation.js.map', 'webpack-runtime.js', 'webpack-runtime.js.map'] });
+    const lines = logs.filter((l) => l.startsWith('Sentinel: build trace '));
+    expect(lines).toHaveLength(2);
+    expect(lines.find((l) => l.includes('server/app/route-000.js.nft.json'))).toMatch(/ 3 deleted map entries removed$/);
+    expect(lines.find((l) => l.includes('server/instrumentation.js.nft.json'))).toMatch(/ 1 deleted map entry removed$/);
+    expect(warns).toEqual([]);
+  });
+
+  it('W2 / W3: the upload-off and not-configured paths sweep the same way, so a webpack standalone build without credentials is green too', async () => {
+    for (const sourcemaps of [{ upload: false as const, ...CREDS }, {}]) {
+      const { dir, routeTrace } = webpackTree();
+      const out = withSentinelConfig({}, { release: RELEASE, sourcemaps });
+      await runHook(out, dir);
+      expect(allMaps(dir)).toEqual({ static: [], server: [], css: [] });
+      expect((files(routeTrace) as { files: string[] }).files).not.toContain('../chunks/260.js.map');
+      expect((files(routeTrace) as { files: string[] }).files).toContain('../chunks/260.js');
+      expect(logs.filter((l) => l.startsWith('Sentinel: build trace '))).toHaveLength(2);
+      logs.length = 0;
+    }
+  });
+
+  it('W2 / W14: the exhausted-5xx path deletes anyway and repairs the traces anyway', async () => {
+    const { dir, routeTrace } = webpackTree();
+    script = { browser: 'ok', server: { unavailable: { status: 503, code: 'storage_unavailable' } } };
+    const out = withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS });
+    await runHook(out, dir);
+    expect(allMaps(dir).server).toEqual([]);
+    expect((files(routeTrace) as { files: string[] }).files).not.toContain('route-000.js.map');
+  });
+
+  it('W2 / W15: `deleteAfterUpload: false` leaves every trace byte-identical — nothing was deleted, nothing is rewritten', async () => {
+    const { dir, routeTrace, instrumentationTrace } = webpackTree();
+    const before = [readFileSync(routeTrace, 'utf8'), readFileSync(instrumentationTrace, 'utf8')];
+    const out = withSentinelConfig({}, { release: RELEASE, sourcemaps: { ...CREDS, deleteAfterUpload: false } });
+    await runHook(out, dir);
+    expect([readFileSync(routeTrace, 'utf8'), readFileSync(instrumentationTrace, 'utf8')]).toEqual(before);
+    expect(logs.filter((l) => l.startsWith('Sentinel: build trace '))).toEqual([]);
+  });
+
+  it('W2 / W4: a 4xx deletes nothing, so no trace is touched', async () => {
+    const { dir, routeTrace } = webpackTree();
+    const before = readFileSync(routeTrace, 'utf8');
+    script = { browser: { rejected: { status: 401, code: 'unauthorized' } }, server: 'ok' };
+    await expect(runHook(withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS }), dir)).rejects.toThrow(/401/);
+    expect(readFileSync(routeTrace, 'utf8')).toBe(before);
+  });
+
+  it('W2: `silent: true` hides the per-trace line (it is part of the report, not a warn)', async () => {
+    const { dir, routeTrace } = webpackTree();
+    await runHook(withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS, silent: true }), dir);
+    expect(logs).toEqual([]);
+    expect((files(routeTrace) as { files: string[] }).files).not.toContain('route-000.js.map');
+  });
+
+  it('W2 (Turbopack shape): traces that list no map — Turbopack’s — are left byte-identical and print nothing', async () => {
+    const dir = copyTree(TURBOPACK);
+    const trace = join(dir, 'server/app/page.js.nft.json');
+    mkdirSync(dirname(trace), { recursive: true });
+    const text = JSON.stringify({ version: 1, files: ['../../../package.json', '../../chunks/ssr/[turbopack]_runtime.js', 'page.js'] });
+    writeFileSync(trace, text);
+    await runHook(withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS }), dir);
+    expect(readFileSync(trace, 'utf8')).toBe(text);
+    expect(logs.filter((l) => l.startsWith('Sentinel: build trace '))).toEqual([]);
+  });
+
+  describe('pruneTraces — the rewrite keeps everything but the deleted entries', () => {
+    it('keeps key order, unknown keys, a pretty-printed file’s indentation and its trailing newline (constraint 2)', async () => {
+      const dir = makeTree({ server: 1 });
+      const trace = join(dir, 'server/app/route-000.js.nft.json');
+      writeFileSync(trace, `{\n  "version": 1,\n  "files": [\n    "route-000.js.map",\n    "route-000.js"\n  ],\n  "reasons": {"route-000.js": "entry"}\n}\n`);
+      const deleted = new Set([join(dir, 'server/app/route-000.js.map')]);
+      const pruned = await pruneTraces(join(dir, 'server'), deleted);
+      expect(pruned).toEqual([{ path: trace, removed: ['route-000.js.map'] }]);
+      expect(readFileSync(trace, 'utf8')).toBe(`{\n  "version": 1,\n  "files": [\n    "route-000.js"\n  ],\n  "reasons": {\n    "route-000.js": "entry"\n  }\n}\n`);
+    });
+
+    it('matches by the resolved path — the same map named two ways from two directories is removed from both, a different `.map` is not', async () => {
+      const dir = makeTree({ server: 1 });
+      const a = join(dir, 'server/app/route-000.js.nft.json');
+      const b = join(dir, 'server/instrumentation.js.nft.json');
+      writeFileSync(a, JSON.stringify({ version: 1, files: ['route-000.js.map', './route-000.js.map', 'other.js.map'] }));
+      writeFileSync(b, JSON.stringify({ version: 1, files: ['app/route-000.js.map', 'app/../app/route-000.js.map', 'app/other.js.map'] }));
+      const pruned = await pruneTraces(join(dir, 'server'), new Set([join(dir, 'server/app/route-000.js.map')]));
+      expect(pruned.map((p) => p.removed)).toEqual([
+        ['route-000.js.map', './route-000.js.map'],
+        ['app/route-000.js.map', 'app/../app/route-000.js.map'],
+      ]);
+      expect(JSON.parse(readFileSync(a, 'utf8'))).toEqual({ version: 1, files: ['other.js.map'] });
+      expect(JSON.parse(readFileSync(b, 'utf8'))).toEqual({ version: 1, files: ['app/other.js.map'] });
+    });
+
+    it('leaves a non-JSON, non-object or files-less trace byte-identical, and reports nothing for a trace with nothing to remove or an empty deleted set', async () => {
+      const dir = makeTree({ server: 1 });
+      const texts: Record<string, string> = {
+        'server/app/broken.js.nft.json': '{"version":1,"files":[',
+        'server/app/array.js.nft.json': '["route-000.js.map"]',
+        'server/app/nofiles.js.nft.json': '{"version":1}',
+        'server/app/strings.js.nft.json': '{"version":1,"files":"route-000.js.map"}',
+        'server/app/clean.js.nft.json': '{"version":1,"files":["route-000.js"]}',
+      };
+      for (const [rel, text] of Object.entries(texts)) writeFileSync(join(dir, rel), text);
+      const deleted = new Set([join(dir, 'server/app/route-000.js.map')]);
+      expect(await pruneTraces(join(dir, 'server'), deleted)).toEqual([]);
+      for (const [rel, text] of Object.entries(texts)) expect(readFileSync(join(dir, rel), 'utf8')).toBe(text);
+      writeFileSync(join(dir, 'server/app/route-000.js.nft.json'), '{"version":1,"files":["route-000.js.map"]}');
+      expect(await pruneTraces(join(dir, 'server'), new Set())).toEqual([]);
+      expect(readFileSync(join(dir, 'server/app/route-000.js.nft.json'), 'utf8')).toBe('{"version":1,"files":["route-000.js.map"]}');
+      expect(await pruneTraces(join(dir, 'does-not-exist'), deleted)).toEqual([]);
+    });
   });
 });

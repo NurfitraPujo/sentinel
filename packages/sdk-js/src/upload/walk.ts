@@ -255,9 +255,23 @@ export async function walkSourcemaps(buildDir: string, publicPrefix: string, opt
   return pairs;
 }
 
-/** Every `*.map` of any kind under `dir` — the wrapper's sweep (contract §4.9 step 4). A missing directory is empty. */
-export async function listMaps(dir: string): Promise<string[]> {
+/** Every regular file under `dir` whose name ends in `suffix` (walk order). A missing directory is empty. */
+async function listEndingWith(dir: string, suffix: string): Promise<string[]> {
   if (!existsSync(dir)) return [];
   const files = await walkFiles(dir);
-  return files.filter(([, rel]) => rel.endsWith('.map')).map(([path]) => path);
+  return files.filter(([, rel]) => rel.endsWith(suffix)).map(([path]) => path);
+}
+
+/** Every `*.map` of any kind under `dir` — the wrapper's sweep (contract §4.9 step 4). A missing directory is empty. */
+export function listMaps(dir: string): Promise<string[]> {
+  return listEndingWith(dir, '.map');
+}
+
+/**
+ * Every `*.nft.json` under `dir` — the per-entry file traces webpack's `next-trace-entrypoints-plugin` writes beside
+ * each server entry (`.next/server/app/page.js.nft.json`, `instrumentation.js.nft.json`, …), which `output:
+ * 'standalone'`'s copy reads after the wrapper's hook (BUG-03; config.ts `pruneTraces`). A missing directory is empty.
+ */
+export function listTraces(dir: string): Promise<string[]> {
+  return listEndingWith(dir, '.nft.json');
 }
