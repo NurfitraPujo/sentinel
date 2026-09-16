@@ -1,6 +1,6 @@
 {
   "name": "@sentinel/sdk-js",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Sentinel error-tracking SDK for JavaScript/TypeScript: browser, node and edge entries, a Next.js adapter, a tunnel route handler, the sentinel-sourcemaps CLI and the withSentinelConfig build wrapper",
   "license": "GPL-3.0-only",
   "repository": {
