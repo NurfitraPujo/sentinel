@@ -561,14 +561,15 @@ shown them before the tag.
   check (contract §12).
 - **A cancelled deploy job is checked with `argocd app get`, never re-synced.**
   The release workflow's deploy job can be cancelled or time out (its own 30-minute
-  cap; the reusable workflow's `wait_timeout: 600` on `argocd app wait`) while
-  the sync it started is still running wave 1 in ArgoCD — the migrate Job does
-  not stop because the GitHub job did. Read the operation with
+  cap; the `wait_timeout: 600` it hands the reusable deploy workflow) while the
+  sync it started is still running wave 1 in ArgoCD — the migrate Job does not
+  stop because the GitHub job did. Read the operation with
   `argocd app get sentinel-<env>` (operation state, the `sentinel-sentinel-migrate`
   hook's status, then `kubectl -n sentinel-<env> get job sentinel-sentinel-migrate`)
   and let it finish; a second `argocd app sync` on top of a running one is at
-  best refused and at worst starts a second migrate Job against the same table.
-  Re-sync only once the operation has ended in failure.
+  best refused and at worst — the hook's `BeforeHookCreation` delete policy —
+  kills the running migrate Job mid-backfill and starts a fresh one (resumable,
+  but the batches restart). Re-sync only once the operation has ended in failure.
 - **The `RollingUpdate` minutes — processor.** The processor Deployment has no
   `strategy:` and rolls over `replicaCount: 2`; for the minutes the old-tag pod is
   still draining it writes rows with `project_id = NULL`, outside the new key.
