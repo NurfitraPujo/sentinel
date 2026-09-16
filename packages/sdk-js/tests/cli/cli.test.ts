@@ -7,15 +7,17 @@
 // a byte of body. Shuffle-safe: every test builds its own tree and stub.
 
 import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { REACHABILITY_LINE, USAGE } from '../../src/cli/main.js';
-import { MAX_REQUEST_BYTES, uploadSourcemaps, walkSourcemaps } from '../../src/upload/index.js';
+import { MAX_REQUEST_BYTES, parseSourceMappingUrl, uploadSourcemaps, walkSourcemaps } from '../../src/upload/index.js';
 import {
   API_KEY,
   cleanupTrees,
+  copyTree,
   envelope,
   makeTree,
   recordingSend,
@@ -32,6 +34,7 @@ import {
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const FIXTURE_STATIC = join(root, 'tests/fixtures-build/.next/static');
+const TURBOPACK = join(root, 'tests/fixtures-build/turbopack/.next');
 const stubs: SourcemapStub[] = [];
 /** Every run's output in this file, for C11's grep (the C11 test also drives its own rows, so shuffle cannot empty it). */
 const outputs: RunResult[] = [];
@@ -79,7 +82,8 @@ describe('the walker and the pairing (contract §4.8 step 1 — docs/sdk-specifi
       '/_next/static/chunks/webpack-9c0d.js',
     ]);
     expect(pairs.find((p) => p.minifiedPath.endsWith('webpack-9c0d.js'))?.siblingExists).toBe(false);
-    expect(pairs.filter((p) => !p.minifiedPath.endsWith('webpack-9c0d.js')).every((p) => p.siblingExists)).toBe(true);
+    expect(pairs.find((p) => p.minifiedPath.endsWith('webpack-9c0d.js'))?.pairedBy).toBe('name');
+    expect(pairs.filter((p) => !p.minifiedPath.endsWith('webpack-9c0d.js')).every((p) => p.siblingExists && p.pairedBy === 'comment')).toBe(true);
     for (const p of pairs) expect(p.sizeBytes).toBe(readFileSync(p.path).byteLength);
   });
 
@@ -116,6 +120,130 @@ describe('the walker and the pairing (contract §4.8 step 1 — docs/sdk-specifi
     expect(r.stderr).toMatch(/7 file\(s\) stored in 1 request\(s\)/);
     // Nothing was deleted without --delete.
     expect(mapsUnder(FIXTURE_STATIC)).toHaveLength(8);
+  });
+});
+
+describe('BUG-01: the pairing follows the chunk’s `//# sourceMappingURL=` comment (contract §4.8 step 1 as amended — decision 43)', () => {
+  const TP_STATIC = join(TURBOPACK, 'static');
+  const TP_SERVER = join(TURBOPACK, 'server');
+
+  it('C1 (Turbopack): `d69eb7d85499027c.js` → its map `8f15d5d03090a0be.js.map` is stored under the CHUNK’s path; a chunk with no map and one whose comment names a missing file are skipped with a warn each; an unreferenced map keeps the name pairing', async () => {
+    const warns: string[] = [];
+    const pairs = await walkSourcemaps(TP_STATIC, '/_next/static', { onWarn: (line) => warns.push(line) });
+    expect(pairs.map((p) => [p.minifiedPath, p.path.split('/').pop(), p.pairedBy, p.siblingExists])).toEqual([
+      ['/_next/static/chunks/9a8b7c6d5e4f3a2b.js', '9a8b7c6d5e4f3a2b.js.map', 'name', false],
+      ['/_next/static/chunks/d69eb7d85499027c.js', '8f15d5d03090a0be.js.map', 'comment', true],
+      ['/_next/static/chunks/turbopack-4364a8ae2a6af640.js', 'e96569a392fa278c.js.map', 'comment', true],
+    ]);
+    // Never the map's own name — that is the path no browser frame carries (TASK-07 F3).
+    expect(pairs.map((p) => p.minifiedPath)).not.toContain('/_next/static/chunks/8f15d5d03090a0be.js');
+    expect(pairs.map((p) => p.minifiedPath)).not.toContain('/_next/static/chunks/e96569a392fa278c.js');
+    expect(pairs[1]!.chunkPath).toBe(join(TP_STATIC, 'chunks/d69eb7d85499027c.js'));
+    expect(pairs[1]!.sizeBytes).toBe(readFileSync(join(TP_STATIC, 'chunks/8f15d5d03090a0be.js.map')).byteLength);
+    expect(warns).toHaveLength(2);
+    expect(warns.find((w) => w.includes('60394cfab7bcbc98.js'))).toMatch(/names 4c218c652b8c48af\.js\.map, which does not exist; skipping/);
+    expect(warns.find((w) => w.includes('3f9721961e8f2ba6.js'))).toMatch(/^1 script\(s\) under .* carry no sourceMappingURL comment/);
+    expect(warns.join('\n')).not.toMatch(/css/);
+  });
+
+  it('C1 (Turbopack, server walk): the percent-encoded comments (`%5B`, `%40`) find the file beside the chunk, the edge-wrapper pair is stored under `turbopack-edge-wrapper_<h>.js`, and Next’s manifest .js is the one “no comment” line', async () => {
+    const warns: string[] = [];
+    const pairs = await walkSourcemaps(TP_SERVER, '/app/.next/server', { onWarn: (line) => warns.push(line) });
+    expect(pairs.map((p) => [p.minifiedPath, p.path.split('/').pop(), p.pairedBy])).toEqual([
+      ['/app/.next/server/chunks/[root-of-the-server]__a6734ae3._.js', '[root-of-the-server]__a6734ae3._.js.map', 'comment'],
+      ['/app/.next/server/chunks/_0fe1378c._.js', '_0fe1378c._.js.map', 'comment'],
+      ['/app/.next/server/chunks/f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js', 'f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js.map', 'comment'],
+      ['/app/.next/server/edge/chunks/edge-wrapper_8937e6f3.js', 'edge-wrapper_8937e6f3.js.map', 'comment'],
+      ['/app/.next/server/edge/chunks/turbopack-edge-wrapper_56e5ba59.js', 'edge-wrapper_56e5ba59.js.map', 'comment'],
+    ]);
+    expect(warns).toEqual([expect.stringMatching(/^1 script\(s\) under .* carry no sourceMappingURL comment .*: app\/page_client-reference-manifest\.js$/)]);
+  });
+
+  it('C1 (Turbopack): the CLI posts the three pairs as the chunks’ paths with the differently-named map bytes, prints the stored chunk paths, and the two skip lines plus the orphan’s “beside it” on stderr; exit 0', async () => {
+    const s = await stub();
+    const r = await cli(['upload', TP_STATIC, '/_next/static', '--release', RELEASE, '--dashboard-url', s.url, '--api-key', API_KEY]);
+    expect(r.code).toBe(0);
+    expect(s.requests).toHaveLength(1);
+    const req = s.requests[0]!;
+    expect(req.paths).toEqual(['/_next/static/chunks/9a8b7c6d5e4f3a2b.js', '/_next/static/chunks/d69eb7d85499027c.js', '/_next/static/chunks/turbopack-4364a8ae2a6af640.js']);
+    expect(req.files.map((f) => f.name)).toEqual(['9a8b7c6d5e4f3a2b.js.map', '8f15d5d03090a0be.js.map', 'e96569a392fa278c.js.map']);
+    expect(JSON.parse(req.files[1]!.text)).toMatchObject({ version: 3, sources: ['turbopack:///[project]/app/boundary/thrower.tsx'] });
+    expect(JSON.parse(req.files[1]!.text)).not.toHaveProperty('file');
+    const lines = r.stdout.trim().split('\n');
+    expect(lines).toEqual([
+      expect.stringMatching(/^created  \/_next\/static\/chunks\/9a8b7c6d5e4f3a2b\.js  /),
+      expect.stringMatching(/^created  \/_next\/static\/chunks\/d69eb7d85499027c\.js  /),
+      expect.stringMatching(/^created  \/_next\/static\/chunks\/turbopack-4364a8ae2a6af640\.js  /),
+    ]);
+    expect(r.stdout).not.toContain('8f15d5d03090a0be.js ');
+    expect(r.stderr).toMatch(/warning: .*60394cfab7bcbc98\.js: its sourceMappingURL names 4c218c652b8c48af\.js\.map, which does not exist; skipping the chunk/);
+    expect(r.stderr).toMatch(/warning: 1 script\(s\) under .* carry no sourceMappingURL comment .*: chunks\/3f9721961e8f2ba6\.js/);
+    expect(r.stderr).toMatch(/warning: .*9a8b7c6d5e4f3a2b\.js\.map: no .*9a8b7c6d5e4f3a2b\.js beside it; uploading the map anyway/);
+    expect(r.stderr).toMatch(/3 file\(s\) stored in 1 request\(s\)/);
+    expect(mapsUnder(TP_STATIC)).toHaveLength(4);
+  });
+
+  it('C4 (Turbopack): --delete unlinks the map under its own name after the batch; the chunk, the orphan-less chunks and the .css.map stay', async () => {
+    const dir = copyTree(TURBOPACK);
+    const s = await stub();
+    const r = await cli(uploadArgs(dir, s.url, '--delete'));
+    expect(r.code).toBe(0);
+    expect(mapsUnder(join(dir, 'static'))).toEqual([join(dir, 'static/chunks/20c20fcd5d02c4c2.css.map')]);
+    expect(existsSync(join(dir, 'static/chunks/d69eb7d85499027c.js'))).toBe(true);
+    expect(existsSync(join(dir, 'static/chunks/3f9721961e8f2ba6.js'))).toBe(true);
+    expect(r.stderr).toMatch(/3 map\(s\) deleted/);
+  });
+
+  it('a map two chunks reference is posted once per chunk path and unlinked once, after the LAST batch that carried it (--batch-size 1 puts them in two requests)', async () => {
+    const dir = makeTree({ extra: ['static/chunks/a-1111.js'] });
+    writeFileSync(join(dir, 'static/chunks/b-2222.js'), 'export const y=2;\n//# sourceMappingURL=a-1111.js.map\n');
+    const shared = join(dir, 'static/chunks/a-1111.js.map');
+    const thereAtAnswer: boolean[] = [];
+    const s = await stub((req) => {
+      thereAtAnswer.push(existsSync(shared));
+      return stored(req);
+    });
+    const r = await cli(uploadArgs(dir, s.url, '--delete', '--batch-size', '1'));
+    expect(r.code).toBe(0);
+    expect(s.requests.map((q) => q.paths)).toEqual([['/_next/static/chunks/a-1111.js'], ['/_next/static/chunks/b-2222.js']]);
+    expect(s.requests.map((q) => q.files[0]!.name)).toEqual(['a-1111.js.map', 'a-1111.js.map']);
+    expect(s.requests[1]!.files[0]!.text).toBe(sourcemapJson('a-1111.js'));
+    // Still on disk when batch 1 was answered (batch 2 has yet to stream it); gone after batch 2.
+    expect(thereAtAnswer).toEqual([true, true]);
+    expect(existsSync(shared)).toBe(false);
+    expect(r.stderr).toMatch(/batch 1: 201, 1 file\(s\)\n/);
+    expect(r.stderr).toMatch(/batch 2: 201, 1 file\(s\), 1 map\(s\) deleted\n/);
+    expect(r.stderr).not.toMatch(/ENOENT/);
+  });
+
+  it('a relative <build dir> pairs the same as an absolute one (the comment’s target is resolved against the chunk’s directory)', async () => {
+    const dir = copyTree(TURBOPACK);
+    const cwd = process.cwd();
+    try {
+      process.chdir(tmpdir());
+      const rel = join(dir.slice(tmpdir().length + 1), 'static');
+      expect(rel.startsWith('/')).toBe(false);
+      const pairs = await walkSourcemaps(rel, '/_next/static');
+      expect(pairs.map((p) => p.minifiedPath)).toEqual(['/_next/static/chunks/9a8b7c6d5e4f3a2b.js', '/_next/static/chunks/d69eb7d85499027c.js', '/_next/static/chunks/turbopack-4364a8ae2a6af640.js']);
+      expect(pairs.map((p) => p.path)).toEqual([join(rel, 'chunks/9a8b7c6d5e4f3a2b.js.map'), join(dir, 'static/chunks/8f15d5d03090a0be.js.map'), join(dir, 'static/chunks/e96569a392fa278c.js.map')]);
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  it('parseSourceMappingUrl: the last comment wins, `/*# … */` counts, a query is dropped, `%40` / `%5B` decode, a bad escape is kept, and data: / http(s): / a missing comment are undefined', () => {
+    expect(parseSourceMappingUrl('x\n//# sourceMappingURL=a.js.map\n')).toBe('a.js.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=old.map\nmore\n//@ sourceMappingURL=new.map')).toBe('new.map');
+    expect(parseSourceMappingUrl('body{}\n/*# sourceMappingURL=styles.css.map */\n')).toBe('styles.css.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=a.js.map?v=1#x')).toBe('a.js.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=f9941_%40sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js.map')).toBe('f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=%5Broot-of-the-server%5D__a6734ae3._.js.map')).toBe('[root-of-the-server]__a6734ae3._.js.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=bad%E0.map')).toBe('bad%E0.map');
+    expect(parseSourceMappingUrl('//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==')).toBeUndefined();
+    expect(parseSourceMappingUrl('//# sourceMappingURL=https://cdn.example/a.js.map')).toBeUndefined();
+    expect(parseSourceMappingUrl('//# sourceMappingURL=')).toBeUndefined();
+    expect(parseSourceMappingUrl('export const x=1;\n')).toBeUndefined();
+    expect(parseSourceMappingUrl('')).toBeUndefined();
   });
 });
 
@@ -498,6 +626,18 @@ describe('the bin (contract §4.1, §4.8) — node dist/cli/index.js', () => {
     expect(lines[2]).toMatch(/^\/_next\/static\/chunks\/app\/page-9b0d\.js  /);
     expect(lines[7]).toBe(`1 request(s) would be sent for 7 map(s), release ${RELEASE}`);
     expect(r.stdout + r.stderr).not.toContain(API_KEY);
+  });
+
+  it(`upload --dry-run on the Turbopack tree prints the three chunk paths, exits 0 (${process.version})`, () => {
+    const r = spawnSync(process.execPath, [bin, 'upload', join(TURBOPACK, 'static'), '/_next/static', '--dry-run', '--release', RELEASE, '--dashboard-url', 'http://localhost:5173', '--api-key', API_KEY], {
+      encoding: 'utf8',
+    });
+    expect(r.status).toBe(0);
+    const lines = r.stdout.trim().split('\n');
+    expect(lines).toHaveLength(4);
+    expect(lines[1]).toMatch(/^\/_next\/static\/chunks\/d69eb7d85499027c\.js  .*8f15d5d03090a0be\.js\.map  /);
+    expect(lines[3]).toBe(`1 request(s) would be sent for 3 map(s), release ${RELEASE}`);
+    expect(r.stderr).toMatch(/warning: /);
   });
 
   it('with no arguments exits 2 and points at --help', () => {

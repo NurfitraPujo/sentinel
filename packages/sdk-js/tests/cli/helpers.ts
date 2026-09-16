@@ -5,7 +5,7 @@
 // no-op `sleep`, recording the delays the ladder asked for so they can be asserted ≤ 60 s.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -54,6 +54,14 @@ export function makeTree(spec: TreeSpec = {}): string {
     writeFileSync(join(dir, 'static/css/styles.css'), 'body{margin:0}\n');
     writeFileSync(join(dir, 'static/css/styles.css.map'), `${JSON.stringify({ version: 3, file: 'styles.css', sources: ['src/globals.css'], mappings: 'AAAA' })}\n`);
   }
+  return dir;
+}
+
+/** A fresh temp copy of a committed fixture tree (`tests/fixtures-build/<name>/.next`), for the rows that delete; removed by `cleanupTrees`. */
+export function copyTree(fixtureDistDir: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'sdk-js-fixture-'));
+  scratchDirs.push(dir);
+  cpSync(fixtureDistDir, dir, { recursive: true });
   return dir;
 }
 

@@ -9,8 +9,10 @@
 //      `withSentryConfig(withSentinelConfig(…))` Sentry's proxy chains THIS hook first, decision 32);
 //   3. the hook: two walks as two independent batch series through `uploadSourcemaps` (§4.8) — browser
 //      (`distDir/static` under `(assetPrefix ?? '') + (basePath ?? '') + '/_next/static'`), then server
-//      (`distDir/server` under `serverRoot`, default `/app/.next/server`, decision 18) — then, when
-//      `deleteAfterUpload`, every `*.map` under both (the `.css.map` files the walks never upload included).
+//      (`distDir/server` under `serverRoot`, default `/app/.next/server`, decision 18) — each map stored under
+//      the path of the CHUNK whose `//# sourceMappingURL=` names it (BUG-01: Turbopack's map names are not its
+//      chunk names; walk.ts) — then, when `deleteAfterUpload`, every `*.map` under both (the `.css.map` files
+//      the walks never upload included).
 //
 // Failure policy (decisions 28, 29, 32, 34), all of it in the hook and nothing at import (D7):
 //   - `upload` is tri-state: `false` never uploads; `undefined` uploads when `dashboardUrl` + `apiKey` resolve

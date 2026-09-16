@@ -21,8 +21,10 @@ export const USAGE = `sentinel-sourcemaps upload <build dir> <public prefix> [op
   --json                    one JSON object per file on stdout
   --help                    this text
 
-Pairs every *.js.map / *.mjs.map under <build dir> to <public prefix>/<relative path without .map> and posts
-them to <dashboard url>/api/sourcemaps in batches of ≤ 50 files and ≤ 100 MiB. Exit 0 when every batch was
+Pairs every *.js / *.mjs under <build dir> to the map its trailing //# sourceMappingURL= comment names, under
+<public prefix>/<relative path of the chunk> (Turbopack names a map by a different hash than its chunk); a map no
+chunk references is paired by its own name, <public prefix>/<relative path without .map>. Posts them to
+<dashboard url>/api/sourcemaps in batches of ≤ 50 files and ≤ 100 MiB. Exit 0 when every batch was
 stored; 1 on any 4xx (the envelope is printed) or a 5xx / network failure after ${MAX_ATTEMPTS} attempts; 2 for a
 usage error, an unreadable dir or zero maps.
 `;

@@ -10,8 +10,9 @@
 // guidance, each ≤ 60 s) and then thrown as `unavailable`. The envelope `code` is printed, never branched on.
 //
 // `deleteAfterUpload` here is the CLI's `--delete` (step 6): a batch's own `.js.map` / `.mjs.map` files are
-// unlinked only after THAT batch's 2xx and nothing else is touched; the wrapper's every-`*.map` sweep is its own
-// (§4.9 step 4, `listMaps`). The key is never part of any message or event.
+// unlinked only after THAT batch's 2xx and nothing else is touched — a map two chunks reference (walk.ts) is
+// unlinked once, after the last batch that carried it, so the later batch can still stream it; the wrapper's
+// every-`*.map` sweep is its own (§4.9 step 4, `listMaps`). The key is never part of any message or event.
 
 import { unlink } from 'node:fs/promises';
 import { describeResponse, SourcemapUploadError } from './errors.js';
@@ -25,8 +26,8 @@ export { DEFAULT_TIMEOUT_MS, sendWithNodeHttp } from './http.js';
 export type { SendFn, UploadRequest, UploadResponse } from './http.js';
 export { MAX_FILES_PER_REQUEST, MAX_REQUEST_BYTES, newBoundary, packBatches } from './multipart.js';
 export type { PackedBatch, PackOptions } from './multipart.js';
-export { isSourcemapOfScript, listMaps, pairMinifiedPath, walkSourcemaps } from './walk.js';
-export type { MapPair } from './walk.js';
+export { isScript, isSourcemapOfScript, listMaps, pairMinifiedPath, parseSourceMappingUrl, SOURCEMAPPING_URL_TAIL_BYTES, walkSourcemaps } from './walk.js';
+export type { MapPair, WalkOptions } from './walk.js';
 
 /** Total sends per batch — the first plus at most three retries (contract §4.8 step 5). */
 export const MAX_ATTEMPTS = 4;
@@ -228,10 +229,10 @@ export async function uploadSourcemaps(opts: UploadSourcemapsOptions): Promise<U
   if (typeof opts.apiKey !== 'string' || opts.apiKey.length === 0) throw new SourcemapUploadError('usage', 'api key is missing');
   const batchSize = resolveBatchSize(opts.batchSize, warn);
 
-  const pairs = await walkSourcemaps(opts.buildDir, opts.publicPrefix);
+  const pairs = await walkSourcemaps(opts.buildDir, opts.publicPrefix, { onWarn: warn });
   if (pairs.length === 0) throw new SourcemapUploadError('no_maps', `no *.js.map under ${opts.buildDir}`);
   for (const pair of pairs) {
-    if (!pair.siblingExists) warn(`${pair.path}: no ${pair.path.slice(0, -'.map'.length)} beside it; uploading the map anyway`);
+    if (!pair.siblingExists) warn(`${pair.path}: no ${pair.chunkPath} beside it; uploading the map anyway`);
   }
 
   const boundary = newBoundary();
@@ -244,11 +245,12 @@ export async function uploadSourcemaps(opts: UploadSourcemapsOptions): Promise<U
   const sleep = opts.sleep ?? defaultSleep;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  const lastBatchOf = lastBatchByPath(batches);
   const results: BatchResult[] = [];
   for (const [index, batch] of batches.entries()) {
     const request: UploadRequest = { url, headers, contentLength: batch.contentLength, body: () => batchBody(batch, { boundary, release }) };
     const { response, attempts } = await sendWithRetry(request, timeoutMs, send, sleep, onEvent);
-    const deleted = opts.deleteAfterUpload ? await unlinkBatch(batch) : [];
+    const deleted = opts.deleteAfterUpload ? await unlinkBatch(batch, (path) => lastBatchOf.get(path) === index) : [];
     const result: BatchResult = { index, status: response.status, attempts, contentLength: batch.contentLength, sent: batch.pairs, files: readStoredFiles(response.body), deleted };
     results.push(result);
     onEvent({ type: 'batch', batch: result });
@@ -264,10 +266,20 @@ export async function uploadSourcemaps(opts: UploadSourcemapsOptions): Promise<U
   };
 }
 
-/** Step 6: only this batch's maps, only after its 2xx. */
-async function unlinkBatch(batch: PackedBatch): Promise<string[]> {
+/** The index of the last batch carrying each map file — a map two chunks reference may sit in two batches. */
+function lastBatchByPath(batches: readonly PackedBatch[]): Map<string, number> {
+  const last = new Map<string, number>();
+  batches.forEach((batch, index) => {
+    for (const pair of batch.pairs) last.set(pair.path, index);
+  });
+  return last;
+}
+
+/** Step 6: only this batch's maps, only after its 2xx, each file once and only when no later batch still needs it. */
+async function unlinkBatch(batch: PackedBatch, isLastUse: (path: string) => boolean): Promise<string[]> {
   const deleted: string[] = [];
   for (const pair of batch.pairs) {
+    if (deleted.includes(pair.path) || !isLastUse(pair.path)) continue;
     await unlink(pair.path);
     deleted.push(pair.path);
   }

@@ -7,10 +7,11 @@
 // (contract §11's guidance rule). Shuffle-safe: every test builds its own tree, script and env.
 
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UploadEvent, UploadReport, UploadSourcemapsOptions } from '../../src/upload/index.js';
-import { cleanupTrees, makeTree } from '../cli/helpers.js';
+import { cleanupTrees, copyTree, makeTree } from '../cli/helpers.js';
 
 type Answer = 'ok' | { rejected: { status: number; code: string } } | { unavailable: { status?: number; code?: string; text?: string; network?: string } };
 interface Script {
@@ -28,7 +29,7 @@ vi.mock('../../src/upload/index.js', async (importOriginal) => {
   const uploadSourcemaps = async (opts: UploadSourcemapsOptions): Promise<UploadReport> => {
     calls.push(opts);
     actual.validateRelease(opts.release);
-    const pairs = await actual.walkSourcemaps(opts.buildDir, opts.publicPrefix);
+    const pairs = await actual.walkSourcemaps(opts.buildDir, opts.publicPrefix, { onWarn: (line) => opts.onEvent?.({ type: 'warn', line }) });
     walked.push(pairs.length);
     if (pairs.length === 0) throw new actual.SourcemapUploadError('no_maps', `no *.js.map under ${opts.buildDir}`);
     const answer = opts.buildDir.endsWith('server') ? script.server : script.browser;
@@ -54,6 +55,8 @@ vi.mock('../../src/upload/index.js', async (importOriginal) => {
 const { DEFAULT_SERVER_ROOT, defaultPublicPrefix, withSentinelConfig } = await import('../../src/nextjs/config.js');
 type NextConfigLike = import('../../src/nextjs/config.js').NextConfigLike;
 type Hook = NonNullable<NonNullable<NextConfigLike['compiler']>['runAfterProductionCompile']>;
+
+const TURBOPACK = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures-build/turbopack/.next');
 
 const ENV_KEYS = ['NEXT_PUBLIC_APP_VERSION', 'SENTINEL_DASHBOARD_URL', 'SENTINEL_API_KEY', 'SENTINEL_PROJECT_KEY', 'SENTINEL_UPLOAD_SOURCEMAPS'] as const;
 const savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
@@ -107,6 +110,35 @@ function hookOf(config: NextConfigLike): Hook {
 async function runHook(config: NextConfigLike, distDir: string): Promise<void> {
   await hookOf(config)({ projectDir: join(distDir, '..'), distDir });
 }
+
+describe('W1 (BUG-01, Turbopack shape): every stored browser path is a chunk the browser loads, never the map’s own differently-hashed name', () => {
+  it('W1: the browser series reports `/_next/static/chunks/d69eb7d85499027c.js` for the map named `8f15d5d03090a0be.js.map`; the edge-wrapper and percent-encoded server pairs land under serverRoot; the skips are warns naming the series; every *.map is then deleted', async () => {
+    const dir = copyTree(TURBOPACK);
+    const out = withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS });
+    await runHook(out, dir);
+    const browser = logs.filter((l) => l.startsWith('Sentinel: browser  created  ')).map((l) => l.split(/\s{2,}/)[2]);
+    expect(browser).toEqual(['/_next/static/chunks/9a8b7c6d5e4f3a2b.js', '/_next/static/chunks/d69eb7d85499027c.js', '/_next/static/chunks/turbopack-4364a8ae2a6af640.js']);
+    expect(logs.join('\n')).not.toMatch(/\/_next\/static\/chunks\/(8f15d5d03090a0be|e96569a392fa278c)\.js/);
+    const server = logs.filter((l) => l.startsWith('Sentinel: server  created  ')).map((l) => l.split(/\s{2,}/)[2]);
+    expect(server).toEqual([
+      `${DEFAULT_SERVER_ROOT}/chunks/[root-of-the-server]__a6734ae3._.js`,
+      `${DEFAULT_SERVER_ROOT}/chunks/_0fe1378c._.js`,
+      `${DEFAULT_SERVER_ROOT}/chunks/f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js`,
+      `${DEFAULT_SERVER_ROOT}/edge/chunks/edge-wrapper_8937e6f3.js`,
+      `${DEFAULT_SERVER_ROOT}/edge/chunks/turbopack-edge-wrapper_56e5ba59.js`,
+    ]);
+    // The walker's skip lines, through the hook's warn with the series named (the orphan's "beside it" line is the real uploader's, tested in tests/cli).
+    expect(warns).toEqual([
+      expect.stringMatching(/^Sentinel: browser sourcemaps: .*60394cfab7bcbc98\.js: its sourceMappingURL names 4c218c652b8c48af\.js\.map, which does not exist/),
+      expect.stringMatching(/^Sentinel: browser sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*3f9721961e8f2ba6\.js/),
+      expect.stringMatching(/^Sentinel: server sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*page_client-reference-manifest\.js/),
+    ]);
+    for (const rel of ['static/chunks/8f15d5d03090a0be.js.map', 'static/chunks/e96569a392fa278c.js.map', 'static/chunks/9a8b7c6d5e4f3a2b.js.map', 'static/chunks/20c20fcd5d02c4c2.css.map', 'server/edge/chunks/edge-wrapper_56e5ba59.js.map', 'server/chunks/[root-of-the-server]__a6734ae3._.js.map']) {
+      expect(existsSync(join(dir, rel)), rel).toBe(false);
+    }
+    expect(existsSync(join(dir, 'static/chunks/d69eb7d85499027c.js'))).toBe(true);
+  });
+});
 
 describe('W7: the three input shapes yield one resolved config and return their own shape', () => {
   const input: NextConfigLike & { reactStrictMode: boolean; experimental: { ppr: boolean; serverSourceMaps?: boolean } } = {
