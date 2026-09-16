@@ -359,6 +359,11 @@ Turbopack also emits **index maps** (`sections`, no `mappings`) for its server e
 own runtime; the walk leaves those out with one `warn` each, because the route stores flat maps
 only — nothing that could symbolicate is lost.
 
+Under webpack with `output: 'standalone'`, Next's per-page build traces list the server maps; the
+wrapper rewrites those `.nft.json` files after deleting the maps (one `Sentinel: build trace …
+removed` line each), so the standalone copy never looks for a deleted map and the image ships
+none. Turbopack's traces list no maps, so nothing is rewritten there.
+
 ## When the upload fails
 
 - **Any 4xx fails the build** — `401` / `403` (the key, its scope, its expiry), `400`, `413`,
