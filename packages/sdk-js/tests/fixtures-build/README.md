@@ -37,6 +37,10 @@ shape it has to handle; the webpack tree above is unchanged, because webpack's c
 - `server/edge/chunks/turbopack-edge-wrapper_56e5ba59.js` → `edge-wrapper_56e5ba59.js.map` — the edge series'
   differently-named pair, stored under `<serverRoot>/edge/chunks/turbopack-edge-wrapper_56e5ba59.js`;
   `edge-wrapper_8937e6f3.js` ↔ its own map.
+- `server/app/page.js` ↔ `page.js.map` = `{"version":3,"sources":[],"sections":[]}` — Turbopack's one-line entry
+  stub and its **empty index map** (BUG-02; 10 of the scratch app's 62 server maps: `app/*/page.js`, `pages/_app.js`,
+  `instrumentation.js`, `app/api/*/route.js`). The route refuses it `422 no_mappings` and decision 29 would fail the
+  build, so the walker skips it with one warn naming the file (decision 44); the wrapper's sweep still deletes it.
 
 `sentinel-sourcemaps upload tests/fixtures-build/turbopack/.next/static /_next/static --dry-run …` prints three
-pairs (the two comment pairs and the orphan) and two warnings; the server walk prints five pairs and one.
+pairs (the two comment pairs and the orphan) and two warnings; the server walk prints five pairs and two.

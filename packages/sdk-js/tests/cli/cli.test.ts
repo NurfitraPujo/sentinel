@@ -13,7 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { REACHABILITY_LINE, USAGE } from '../../src/cli/main.js';
-import { MAX_REQUEST_BYTES, parseSourceMappingUrl, uploadSourcemaps, walkSourcemaps } from '../../src/upload/index.js';
+import { EMPTY_INDEX_MAP_MAX_BYTES, isEmptyIndexMap, MAX_REQUEST_BYTES, parseSourceMappingUrl, uploadSourcemaps, walkSourcemaps } from '../../src/upload/index.js';
 import {
   API_KEY,
   cleanupTrees,
@@ -156,7 +156,12 @@ describe('BUG-01: the pairing follows the chunk’s `//# sourceMappingURL=` comm
       ['/app/.next/server/edge/chunks/edge-wrapper_8937e6f3.js', 'edge-wrapper_8937e6f3.js.map', 'comment'],
       ['/app/.next/server/edge/chunks/turbopack-edge-wrapper_56e5ba59.js', 'edge-wrapper_56e5ba59.js.map', 'comment'],
     ]);
-    expect(warns).toEqual([expect.stringMatching(/^1 script\(s\) under .* carry no sourceMappingURL comment .*: app\/page_client-reference-manifest\.js$/)]);
+    expect(warns).toEqual([
+      expect.stringMatching(/^1 script\(s\) under .* carry no sourceMappingURL comment .*: app\/page_client-reference-manifest\.js$/),
+      expect.stringMatching(/app\/page\.js\.map: empty index map \(no mappings, no sections\) — nothing to symbolicate; skipping it$/),
+    ]);
+    // The entry stub's own path is never stored (BUG-02): nothing in `{"version":3,"sources":[],"sections":[]}` symbolicates.
+    expect(pairs.map((p) => p.minifiedPath)).not.toContain('/app/.next/server/app/page.js');
   });
 
   it('C1 (Turbopack): the CLI posts the three pairs as the chunks’ paths with the differently-named map bytes, prints the stored chunk paths, and the two skip lines plus the orphan’s “beside it” on stderr; exit 0', async () => {
@@ -244,6 +249,84 @@ describe('BUG-01: the pairing follows the chunk’s `//# sourceMappingURL=` comm
     expect(parseSourceMappingUrl('//# sourceMappingURL=')).toBeUndefined();
     expect(parseSourceMappingUrl('export const x=1;\n')).toBeUndefined();
     expect(parseSourceMappingUrl('')).toBeUndefined();
+  });
+});
+
+describe('BUG-02: an empty index map is skipped with one warn, never posted (contract §4.8 step 1 as amended — decision 44)', () => {
+  const EMPTY_INDEX = '{"version":3,"sources":[],"sections":[]}';
+
+  it('C1 (Turbopack, server walk): the entry stub’s `{"version":3,"sources":[],"sections":[]}` beside a real chunk map is skipped with a warn naming the file; the real map is posted and printed; exit 0', async () => {
+    const dir = makeTree({ server: 1 });
+    // Turbopack 15.5.21's one-line entry stub and its index map — the shape of 10 of the scratch app's 62 server maps.
+    mkdirSync(join(dir, 'server/app/route'), { recursive: true });
+    writeFileSync(join(dir, 'server/app/route/route.js'), 'module.exports = runtime.getOrInstantiateRuntimeModule("[project]/app/route/route.ts").exports;\n//# sourceMappingURL=route.js.map\n');
+    writeFileSync(join(dir, 'server/app/route/route.js.map'), EMPTY_INDEX);
+    const s = await stub();
+    const r = await cli(['upload', join(dir, 'server'), '/app/.next/server', '--release', RELEASE, '--dashboard-url', s.url, '--api-key', API_KEY]);
+    expect(r.code).toBe(0);
+    expect(s.requests).toHaveLength(1);
+    expect(s.requests[0]!.paths).toEqual(['/app/.next/server/app/route-000.js']);
+    expect(s.requests[0]!.files.map((f) => f.name)).toEqual(['route-000.js.map']);
+    expect(r.stdout.trim().split('\n')).toEqual([expect.stringMatching(/^created  \/app\/.next\/server\/app\/route-000\.js  /)]);
+    expect(r.stderr).toMatch(/warning: .*server\/app\/route\/route\.js\.map: empty index map \(no mappings, no sections\) — nothing to symbolicate; skipping it/);
+    expect(r.stderr.match(/empty index map/g)).toHaveLength(1);
+    expect(r.stderr).toMatch(/1 file\(s\) stored in 1 request\(s\)/);
+    // Not uploaded, so not the CLI's to delete (step 6); the wrapper's every-*.map sweep removes it (§4.9 step 4).
+    expect(existsSync(join(dir, 'server/app/route/route.js.map'))).toBe(true);
+  });
+
+  it('C4: --delete leaves the skipped index map in place and unlinks only the map it uploaded', async () => {
+    const dir = makeTree({ server: 1 });
+    writeFileSync(join(dir, 'server/app/page.js'), 'module.exports = 1;\n//# sourceMappingURL=page.js.map\n');
+    writeFileSync(join(dir, 'server/app/page.js.map'), EMPTY_INDEX);
+    const s = await stub();
+    const r = await cli(['upload', join(dir, 'server'), '/app/.next/server', '--release', RELEASE, '--dashboard-url', s.url, '--api-key', API_KEY, '--delete']);
+    expect(r.code).toBe(0);
+    expect(mapsUnder(join(dir, 'server'))).toEqual([join(dir, 'server/app/page.js.map')]);
+  });
+
+  it('a name-paired empty index map (no chunk references it) is skipped the same way, and a tree of only index maps is `no *.js.map` (exit 2)', async () => {
+    const dir = makeTree({ server: 1 });
+    writeFileSync(join(dir, 'server/app/orphan.js.map'), EMPTY_INDEX);
+    const warns: string[] = [];
+    const pairs = await walkSourcemaps(join(dir, 'server'), '/app/.next/server', { onWarn: (line) => warns.push(line) });
+    expect(pairs.map((p) => p.minifiedPath)).toEqual(['/app/.next/server/app/route-000.js']);
+    expect(warns).toEqual([expect.stringMatching(/orphan\.js\.map: empty index map .*; skipping it$/)]);
+
+    const only = makeTree();
+    mkdirSync(join(only, 'server/app'), { recursive: true });
+    writeFileSync(join(only, 'server/app/page.js'), 'module.exports = 1;\n//# sourceMappingURL=page.js.map\n');
+    writeFileSync(join(only, 'server/app/page.js.map'), EMPTY_INDEX);
+    const s = await stub();
+    const r = await cli(['upload', join(only, 'server'), '/app/.next/server', '--release', RELEASE, '--dashboard-url', s.url, '--api-key', API_KEY]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/no \*\.js\.map under /);
+    expect(s.requests).toHaveLength(0);
+  });
+
+  it('only the EMPTY index map is skipped: a non-empty `sections` map, `mappings: ""`, a non-JSON map and one over EMPTY_INDEX_MAP_MAX_BYTES are all uploaded as written for the route to judge', async () => {
+    const dir = makeTree();
+    mkdirSync(join(dir, 'server/app'), { recursive: true });
+    const write = (name: string, body: string): void => {
+      writeFileSync(join(dir, `server/app/${name}`), `module.exports = 1;\n//# sourceMappingURL=${name}.map\n`);
+      writeFileSync(join(dir, `server/app/${name}.map`), body);
+    };
+    write('sections.js', JSON.stringify({ version: 3, sources: [], sections: [{ offset: { line: 0, column: 0 }, map: { version: 3, sources: ['a.ts'], names: [], mappings: 'AAAA' } }] }));
+    write('blank.js', JSON.stringify({ version: 3, sources: [], names: [], mappings: '' }));
+    write('broken.js', '{"version":3,"sources":[],"sections":[');
+    write('big.js', `{"version":3,"sources":[],"sections":[],"x":"${'a'.repeat(EMPTY_INDEX_MAP_MAX_BYTES)}"}`);
+    write('empty.js', EMPTY_INDEX);
+    const warns: string[] = [];
+    const pairs = await walkSourcemaps(join(dir, 'server'), '/app/.next/server', { onWarn: (line) => warns.push(line) });
+    expect(pairs.map((p) => p.minifiedPath)).toEqual(['/app/.next/server/app/big.js', '/app/.next/server/app/blank.js', '/app/.next/server/app/broken.js', '/app/.next/server/app/sections.js']);
+    expect(warns).toEqual([expect.stringMatching(/empty\.js\.map: empty index map .*; skipping it$/)]);
+    await expect(isEmptyIndexMap(join(dir, 'server/app/empty.js.map'), EMPTY_INDEX.length)).resolves.toBe(true);
+    await expect(isEmptyIndexMap(join(dir, 'server/app/big.js.map'), EMPTY_INDEX_MAP_MAX_BYTES + 1)).resolves.toBe(false);
+    // A `sections` key absent altogether, with no `mappings`, is the same empty class; an array or a non-object is not.
+    writeFileSync(join(dir, 'server/app/nosections.js.map'), '{"version":3,"sources":[]}');
+    writeFileSync(join(dir, 'server/app/array.js.map'), '[]');
+    await expect(isEmptyIndexMap(join(dir, 'server/app/nosections.js.map'), 26)).resolves.toBe(true);
+    await expect(isEmptyIndexMap(join(dir, 'server/app/array.js.map'), 2)).resolves.toBe(false);
   });
 });
 
