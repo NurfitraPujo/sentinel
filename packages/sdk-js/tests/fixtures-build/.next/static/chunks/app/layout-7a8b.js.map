@@ -1,0 +1,1 @@
+{"version":3,"file":"layout-7a8b.js","sources":["src/app/layout.tsx"],"sourcesContent":["// src/app/layout.tsx\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}
