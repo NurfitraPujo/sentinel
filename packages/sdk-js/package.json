@@ -25,10 +25,10 @@
     "./nextjs/edge": "./dist/nextjs/edge.js",
     "./nextjs": {
       "types": "./dist/nextjs/index.d.ts",
-      "browser": "./dist/nextjs/client.js",
       "edge-light": "./dist/nextjs/edge.js",
       "worker": "./dist/nextjs/edge.js",
       "workerd": "./dist/nextjs/edge.js",
+      "browser": "./dist/nextjs/client.js",
       "node": "./dist/nextjs/server.js",
       "default": "./dist/nextjs/server.js"
     },

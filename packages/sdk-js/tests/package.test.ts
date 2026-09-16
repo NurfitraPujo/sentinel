@@ -34,15 +34,29 @@ const SUBPATHS = [
   './package.json',
 ];
 
+/**
+ * In THIS order. Resolvers take the first key in object order that is in their condition set, and Next's edge
+ * compiler (webpack's `edgeConditionNames`, Turbopack's edge environment) enables `browser` AS WELL AS
+ * `edge-light` — so with `browser` listed first the middleware bundle resolved `./nextjs` to the client build,
+ * whose `captureRequestError` is a no-op, and no middleware error ever reached Sentinel (N2 on the compose
+ * walk of TASK-07). The edge conditions come before `browser`, exactly as @sentry/nextjs 10.69.0's own map
+ * (`edge`, `edge-light`, `worker`, `workerd`, then `browser`) — the shape contract §4.1 transcribes.
+ */
 const NEXTJS_CONDITIONS: Record<string, string> = {
   types: './dist/nextjs/index.d.ts',
-  browser: './dist/nextjs/client.js',
   'edge-light': './dist/nextjs/edge.js',
   worker: './dist/nextjs/edge.js',
   workerd: './dist/nextjs/edge.js',
+  browser: './dist/nextjs/client.js',
   node: './dist/nextjs/server.js',
   default: './dist/nextjs/server.js',
 };
+
+/** The exports-map rule every resolver follows: the first key, in object order, that the condition set contains. */
+function resolveConditions(map: Record<string, string>, conditions: ReadonlySet<string>): string | undefined {
+  for (const [condition, target] of Object.entries(map)) if (conditions.has(condition)) return target;
+  return undefined;
+}
 
 /** Every `.js` target the exports table can resolve to — the runtime entries (not the bin). */
 function runtimeEntryFiles(): string[] {
@@ -75,6 +89,20 @@ describe('package.json (contract §4.1, flows D1)', () => {
     expect(pkg.exports['./nextjs']).toEqual(NEXTJS_CONDITIONS);
     // `types` must come first: resolvers take the first matching condition in object order.
     expect(Object.keys(pkg.exports['./nextjs'] as Record<string, string>)[0]).toBe('types');
+  });
+
+  it('resolves ./nextjs per bundle target — the edge conditions are listed BEFORE browser (N2)', () => {
+    const map = pkg.exports['./nextjs'] as Record<string, string>;
+    const keys = Object.keys(map);
+    for (const edge of ['edge-light', 'worker', 'workerd']) expect(keys.indexOf(edge)).toBeLessThan(keys.indexOf('browser'));
+    // Next's edge compiler enables browser AND edge-light (webpack: `['edge-light', '...']` on a web target;
+    // Turbopack: the edge environment's `browser` + `edge-light`): the middleware bundle must get edge.js.
+    expect(resolveConditions(map, new Set(['edge-light', 'worker', 'browser', 'import', 'module', 'default']))).toBe('./dist/nextjs/edge.js');
+    // The client compiler: browser without any edge condition → client.js.
+    expect(resolveConditions(map, new Set(['browser', 'import', 'module', 'default']))).toBe('./dist/nextjs/client.js');
+    // The node server compiler: node → server.js; a bare resolver with no conditions → default → server.js.
+    expect(resolveConditions(map, new Set(['node', 'import', 'module', 'default']))).toBe('./dist/nextjs/server.js');
+    expect(resolveConditions(map, new Set(['default']))).toBe('./dist/nextjs/server.js');
   });
 
   it('exports the remaining fixed subpaths and ./package.json', () => {
