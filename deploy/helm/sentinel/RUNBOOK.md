@@ -495,10 +495,17 @@ shown them before the tag.
 - **What the migrate log shows.** `>> migrating target=processor`, then goose's
   one line for the file — `OK   1725200000_add_error_occurrences_project_id_dedup.sql (<duration>)`
   — then `>> migrating target=ingestor` and `>> migrating target=dashboard`, each
-  replaying the same file as a no-op in seconds (the column exists, the backfill
-  finds no NULL row, the gate finds no group, the index is valid and
-  `IF NOT EXISTS` skips the build). Goose prints per file, not per block; the
-  blocks are visible by name only when one **fails**. In order, they are:
+  replaying the same file in seconds and changing nothing (the column exists,
+  the backfill block exits by name because the index exists, the gate finds no
+  group on the column, the index is valid and `IF NOT EXISTS` skips the build).
+  It is **not** true that the backfill "finds no NULL row" on those replays:
+  old-tag pods insert rows with `project_id = NULL` for the whole of wave 1
+  (§13 M2 counted 4,124 of them below ledger 1's cursor at 1,010,000 rows), and
+  the second and third ledgers meet them minutes after the first ledger built
+  the index. Those rows are the rollout window's and O3's (contract decisions
+  12, 15); the backfill deliberately does not touch them (block 3 below).
+  Goose prints per file, not per block; the blocks are visible by name only
+  when one **fails**. In order, they are:
   1. the session guards — `SET statement_timeout = '15min'`, `SET lock_timeout = '5s'`
      (decision 16: the SETs are session-scoped under `NO TRANSACTION`);
   2. **(a)** `ALTER TABLE error_occurrences ADD COLUMN IF NOT EXISTS project_id UUID` —
@@ -506,9 +513,21 @@ shown them before the tag.
      table makes it fail with `canceling statement due to lock timeout` — re-sync;
   3. **(b)** the backfill `DO` block — `project_id := issues.project_id` via
      `issue_id`, `WHERE project_id IS NULL`, 10,000 rows per batch by `id` range,
-     one `COMMIT` per batch (decision 20). A failure here is
-     `canceling statement due to statement timeout` naming the `DO $$` — every
-     committed batch stays and the re-run continues from the remaining NULLs;
+     one `COMMIT` per batch (decision 20). **It runs only while no index of the
+     key exists** (`to_regclass` on `uq_error_occurrences_project_event` and on
+     block (d)'s `…_invalid` name both NULL) and otherwise exits before its first
+     batch with the notice `1725200000 backfill (b): uq_error_occurrences_project_event
+     exists -- the backfill is skipped …` — the second and third ledgers, and any
+     re-run of the first after its build. Its purpose is the pre-release rows
+     before the build; a row still NULL once the index exists was inserted by an
+     old-tag pod during the window, and the unguarded `UPDATE` over such a row
+     is decision 15's hazard (a cross-issue redelivery of that event already
+     stored under the key → `23505` on `uq_error_occurrences_project_event` from
+     inside the `DO` block, on every retry, no pod rolled). O3's two-step sweep
+     is the guarded form and owns those rows. A failure here on the first ledger
+     is `canceling statement due to statement timeout` naming the `DO $$` —
+     every committed batch stays and the re-run continues from the remaining
+     NULLs;
   4. **(c)** the duplicate gate `DO` block — fails as
      `1725200000 gate (c): N (project_id, event_id) group(s) in error_occurrences have more than one row …`
      (run O2, re-sync), or as
@@ -699,4 +718,5 @@ running new-tag processor that is an ingest outage.
 | `POST /api/sourcemaps` 413 before the route runs | `BODY_SIZE_LIMIT` on the dashboard below the request (chart default `110M`) | `config.dashboard.bodySizeLimit`; the route's own caps are `SOURCEMAP_MAX_*` |
 | Migrate Job fails, log names `1725200000 gate (c): N (project_id, event_id) group(s)` | duplicate groups on the table — O1 was skipped or is stale (the count decays within the hour) | §2's pre-deploy check: O1, O2 until zero, re-sync; no index was touched |
 | Migrate Job fails, log names `1725200000 check (e): … indisvalid = false` | the concurrent build found a violation the gate could not see, or was killed mid-scan | O1 (a group formed between the gate and the scan → O2), then re-sync: block (d) drops the invalid index and rebuilds |
+| Migrate Job fails, log shows `duplicate key value violates unique constraint "uq_error_occurrences_project_event" (SQLSTATE 23505)` under the backfill `DO $$` (block (b): `SET project_id = i.project_id … AND o.project_id IS NULL`), same failure on every retry, under the `ingestor` or `dashboard` target | block (b)'s sweep ran with the index already present — a rollout-window row (`project_id IS NULL`, an old-tag pod's insert) whose event is already stored under the key on another issue (contract decision 15's hazard). The block's `to_regclass` guard exits before the first batch when the index exists; seeing this means the migrate image predates that guard — check the tag | §2's **O3 step 1**: the `COALESCE(o.project_id, i.project_id)` group query, then O2 on every group it returns; re-sync, and run O3 in full once the roll completes |
 | Processor dead-letters every event with `42703` on `project_id` after a rollback | `migrate down` ran while new-tag processor pods were attached | §3's rollback entry: processor tag `v0.2.18` FIRST; `Down` is not part of a rollback |
