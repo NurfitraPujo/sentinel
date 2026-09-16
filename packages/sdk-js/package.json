@@ -48,6 +48,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "size": "node scripts/size.mjs",
+    "bench": "vitest bench --run --config bench/vitest.config.ts",
     "check:no-dependencies": "node scripts/assert-no-dependencies.mjs"
   },
   "peerDependencies": {
