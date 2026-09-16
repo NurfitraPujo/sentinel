@@ -266,10 +266,17 @@ export default withSentinelConfig(nextConfig, {
   with `dashboardUrl` / `apiKey` unresolved, an empty or whitespace-padded `release` with uploads
   on, and a walk that finds zero `*.js.map` all fail the build before anything is uploaded.
 - **Caps.** ≤ 50 files and ≤ 100 MiB serialised per request, ≤ 50 MiB per map
-  (`SOURCEMAP_MAX_BYTES`), and **`SOURCEMAP_MAX_FILES_PER_RELEASE`** maps per release — 500 at
-  `c5082e3`, ≥ 2 000 once `sentinel-sourcemaps-release-cap` is deployed; a Next app's server maps
-  count against it (a Turbopack build of `web` holds ≈ 1 240 maps per release), and the
-  `SOURCEMAP_MAX_FILES_PER_RELEASE + 1`th file is `422 release_full`, a red build.
+  (`SOURCEMAP_MAX_BYTES`), and **`SOURCEMAP_MAX_FILES_PER_RELEASE`** maps per release — 2 000 by
+  default since `sentinel-sourcemaps-turbopack-grouping`; a Next app's server maps count against it
+  (a Turbopack build of `web` holds ≈ 1 240 maps per release, so a `web` release fits with room),
+  and the `SOURCEMAP_MAX_FILES_PER_RELEASE + 1`th file is `422 release_full`, a red build.
+- **What the processor does with a server frame.** A symbolicated frame's `in_app` is set by the
+  processor from the original path — `/node_modules/` and Turbopack's `[turbopack]` / `[next]` /
+  `[externals]` namespaces are not in-app, everything under `[project]` is — and the value the SDK
+  sent is kept beside it under `raw.in_app`. An unsymbolicated Turbopack server chunk
+  (`_052cc036._.js`, `node_modules__pnpm_52f51f25._.js`) groups by its `_<8-hex>`-stripped name
+  (`_*._.js`, `node_modules__pnpm_*._.js`), so such a frame is one issue across builds rather than
+  a new one per build (since `sentinel-sourcemaps-turbopack-grouping`).
 - **With `@sentry/nextjs`** and its `deleteSourcemapsAfterUpload` on, the only valid order is
   `withSentryConfig(withSentinelConfig(nextConfig, …), sentryOptions)` — the inner hook runs
   first, so Sentinel uploads and deletes before Sentry's step looks.
@@ -302,7 +309,7 @@ bundle under the same version **replaces** the previous map (`201`, `replaced`).
 and do not retry, `503 storage_unavailable` means retry later, `413 payload_too_large` means split
 the request (a file is over `SOURCEMAP_MAX_BYTES`, 50 MiB, or the whole body is over the host's
 `BODY_SIZE_LIMIT`). Caps: 50 files per request, `SOURCEMAP_MAX_FILES_PER_RELEASE` per release
-(500 at `c5082e3`, ≥ 2 000 after `sentinel-sourcemaps-release-cap`).
+(2 000 by default since `sentinel-sourcemaps-turbopack-grouping`).
 
 ### A loop over a build directory
 

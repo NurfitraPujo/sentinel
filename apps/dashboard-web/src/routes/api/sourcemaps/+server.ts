@@ -59,10 +59,14 @@ import { log } from '$lib/server/observability/log';
  * `file` key -- that key is a basename and collides across directories (D4).
  */
 
-/** Decision 10's defaults; the chart and compose set the same three names (§12). */
+/**
+ * Decision 10's defaults; the chart and compose set the same three names (§12). The per-release
+ * default is 2000, not decision 10's 500: one Next.js (Turbopack) release emits ~794 server maps
+ * plus ~447 client chunk maps, ~1240 in all (sentinel-sdk-js decision 26, 2026-09-16).
+ */
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_FILES_PER_REQUEST = 50;
-const DEFAULT_MAX_FILES_PER_RELEASE = 500;
+const DEFAULT_MAX_FILES_PER_RELEASE = 2000;
 
 /** `error_occurrences.release_version VARCHAR(100)` and the proto's CEL bound -- bytes, not chars. */
 const MAX_RELEASE_VERSION_BYTES = 100;

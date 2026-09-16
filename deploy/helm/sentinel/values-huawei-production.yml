@@ -114,7 +114,7 @@ config:
     bodySizeLimit: "110M"
     sourcemapMaxBytes: "52428800"
     sourcemapMaxFilesPerRequest: "50"
-    sourcemapMaxFilesPerRelease: "500"
+    sourcemapMaxFilesPerRelease: "2000"
   ingestor:
     ratelimitStrictMode: "true"
 
