@@ -31,27 +31,25 @@ interface Walk {
 }
 
 function walk(value: unknown, path: (string | number)[], w: Walk, skipToJSON: boolean): JsonValue | undefined {
-  switch (typeof value) {
-    case 'string':
-      return value;
-    case 'number':
-      return Number.isFinite(value) ? value : null;
-    case 'boolean':
-      return value;
-    case 'bigint':
-      w.substituted.push(pathOf(path));
-      return value.toString();
-    case 'symbol':
-      w.substituted.push(pathOf(path));
-      return UNSERIALIZABLE;
-    case 'undefined':
-    case 'function':
-      return undefined;
-    case 'object':
-      break;
-    default:
-      return undefined;
+  // The type dispatch is an if-chain ON PURPOSE. It was a `switch (typeof value)` whose `case 'object': break;`
+  // fell through to the object handling below, and SWC's minifier (Next 15.5.21's bundled one and @swc/core
+  // 1.13.5 alike) merges that `break` case with the `default: return undefined` arm and then drops everything
+  // after the switch as unreachable — so in every Next production bundle (Turbopack and webpack, browser, node
+  // and edge) `sanitize(event)` returned `undefined`, every event serialised to `null` and the tunnel / ingestor
+  // rejected each batch as `[null]`. tests/minified/swc.test.ts minifies the built entries with @swc/core and
+  // sends through them; keep this shape (and any new dispatch) free of a `break`-then-fall-out `switch`.
+  const kind = typeof value;
+  if (kind === 'string' || kind === 'boolean') return value as string | boolean;
+  if (kind === 'number') return Number.isFinite(value as number) ? (value as number) : null;
+  if (kind === 'bigint') {
+    w.substituted.push(pathOf(path));
+    return (value as bigint).toString();
   }
+  if (kind === 'symbol') {
+    w.substituted.push(pathOf(path));
+    return UNSERIALIZABLE;
+  }
+  if (kind !== 'object') return undefined; // undefined, function
   if (value === null) return null;
   const obj = value as object;
   if (w.ancestors.has(obj)) {
