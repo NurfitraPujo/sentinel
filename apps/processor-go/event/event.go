@@ -330,8 +330,10 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 
 // Symbolicate runs sentinel-sourcemaps §4.4's stage over this event's frames and writes the
 // rewrite back: for every frame the stage applied, File/Line/Column/Function become the original
-// position and Symbolicated/Raw carry step 6's record; a frame that passed through is left
-// exactly as it was — no key, not `symbolicated: false` (step 7). projectID MUST be the resolved
+// position, InApp becomes the value the stage re-derived from that position
+// (sentinel-sourcemaps-turbopack-grouping §4.2; the SDK's value is under Raw.InApp) and
+// Symbolicated/Raw carry step 6's record; a frame that passed through is left exactly as it was
+// — InApp included, no key, not `symbolicated: false` (step 7). projectID MUST be the resolved
 // project (store.ResolveProjectID's return), never anything read from a frame; releaseVersion is
 // e.ReleaseVersion after Normalize's metadata fallback. The caller has already passed
 // symbolicate.Gate and counts the returned per-frame outcomes; this method never fails the
@@ -355,6 +357,7 @@ func (e *ErrorEvent) Symbolicate(ctx context.Context, stage *symbolicate.Service
 		e.Stacktrace[i].Line = f.Line
 		e.Stacktrace[i].Column = f.Column
 		e.Stacktrace[i].Function = f.Function
+		e.Stacktrace[i].InApp = f.InApp
 		e.Stacktrace[i].Symbolicated = true
 		e.Stacktrace[i].Raw = f.Raw
 	}

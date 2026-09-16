@@ -148,9 +148,10 @@ config:
     sourcemapMaxBytes: "52428800"
     # SOURCEMAP_MAX_FILES_PER_REQUEST / SOURCEMAP_MAX_FILES_PER_RELEASE -- plain integers
     # (decision 10). A request over the first is 400; a release that would exceed the second is
-    # 422 release_full with nothing written (§4.1).
+    # 422 release_full with nothing written (§4.1). The per-release value is 2000, not decision
+    # 10's 500: one Next.js (Turbopack) release is ~1240 maps (sentinel-sdk-js decision 26).
     sourcemapMaxFilesPerRequest: "50"
-    sourcemapMaxFilesPerRelease: "500"
+    sourcemapMaxFilesPerRelease: "2000"
   ingestor:
     # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
     ratelimitStrictMode: "true"

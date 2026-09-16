@@ -137,6 +137,15 @@ const (
 	// re-emits the reason it was cached with, so this counter reflects ongoing breakage, not only
 	// its first sighting.
 	MetricSymbolicationFrames = "sentinel_symbolication_frames_total"
+	// MetricSymbolicationInAppRederived counts the stage's in_app re-derivation
+	// (sentinel-sourcemaps-turbopack-grouping §4.2, decisions 11 and 16), one per frame — the SAME
+	// population as MetricSymbolicationFrames, incremented in the same loop, so the sum over every
+	// series equals frames_total by construction (flow P9). Two labels: LabelTo ∈
+	// SymbolicationInAppTo* (true, false, kept) and LabelChanged ∈ SymbolicationInAppChanged*
+	// (true, false). `kept` is a frame the stage did not rewrite, whose SDK value stands, so
+	// {to="kept", changed="true"} is never incremented: a closed set of six, five live.
+	// changed="true" is the "SDK's rule was wrong N times/min" signal.
+	MetricSymbolicationInAppRederived = "sentinel_symbolication_in_app_rederived_total"
 	// MetricSourcemapFetchDuration is the cold path — one object GET plus one parse — in seconds.
 	// No label.
 	MetricSourcemapFetchDuration = "sentinel_sourcemap_fetch_duration_seconds"
@@ -165,6 +174,11 @@ const (
 	// LabelKind names WHICH identifier MetricAffectedRollupSkipped skipped: AffectedKindUser or
 	// AffectedKindTenant. Nothing else records it.
 	LabelKind = "kind"
+	// LabelTo and LabelChanged are MetricSymbolicationInAppRederived's two labels and nothing
+	// else's: the re-derived in_app a rewritten frame was set TO (or `kept`), and whether that
+	// differs from the value the SDK sent (raw.in_app).
+	LabelTo      = "to"
+	LabelChanged = "changed"
 )
 
 // Permitted values for LabelOutcome. Fixed sets, so a typo at one call site cannot invent an eighth
@@ -261,6 +275,24 @@ const (
 	SymbolicationFrameFetchError = "fetch_error" // the object GET (or the Store) failed
 	SymbolicationFrameTimeout    = "timeout"     // fetch + parse outlived SYMBOLICATE_DEADLINE; the fill continues
 	SymbolicationFrameOversize   = "oversize"    // the row's size_bytes exceeds SOURCEMAP_MAX_PARSE_BYTES; never fetched
+)
+
+// Permitted values for LabelTo and LabelChanged on MetricSymbolicationInAppRederived
+// (sentinel-sourcemaps-turbopack-grouping §4.2 Metric). CLOSED — three `to` values, two `changed`
+// values. `true`/`false` on `to` are the re-derived in_app of a frame the stage rewrote
+// (outcome applied), spelled as strconv.FormatBool spells a bool; `kept` is every other outcome,
+// where the SDK's value stands and `changed` is `false` by definition. The recorder is
+// apps/processor-go/procmetrics.RecordInAppRederived, called from
+// service.(*ProcessorService).symbolicate's outcomes loop — never from inside the stage.
+const (
+	SymbolicationInAppToTrue  = "true"  // rewritten; the rule said in_app
+	SymbolicationInAppToFalse = "false" // rewritten; the rule said vendor
+	SymbolicationInAppToKept  = "kept"  // not rewritten; the SDK's in_app stands
+)
+
+const (
+	SymbolicationInAppChangedTrue  = "true"  // the re-derived value differs from raw.in_app (the SDK's rule was wrong)
+	SymbolicationInAppChangedFalse = "false" // equal to the SDK's value, or `kept`
 )
 
 // Permitted values for LabelKind on MetricSourcemapCacheEvents (sentinel-sourcemaps §4.4 cache

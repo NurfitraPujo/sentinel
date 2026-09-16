@@ -176,7 +176,7 @@ describe('POST /api/sourcemaps -- the happy paths (U1, U2, U3, U11, U13)', () =>
 				{ minifiedPath: '/assets/index-3f2a1c.js', storageKey: expectedKeyA, sizeBytes: mapBytes('a').byteLength, sha256: sha256(mapBytes('a')) },
 				expect.objectContaining({ minifiedPath: '/assets/vendor-9a0d4e.js' }),
 			],
-			maxPerRelease: 500,
+			maxPerRelease: 2000,
 			ensureObjectsPresent: expect.any(Function),
 		});
 		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
@@ -652,29 +652,29 @@ describe('POST /api/sourcemaps -- per-file validation, in order, all-or-nothing 
 });
 
 describe('POST /api/sourcemaps -- the three phases (U12, U18)', () => {
-	it('U18: 422 release_full { max: 500, current: 499 } from the pre-check -- before the first putObject', async () => {
-		readReleaseState.mockResolvedValue({ current: 499, existing: new Map() });
+	it('U18: 422 release_full { max: 2000, current: 1999 } from the pre-check -- before the first putObject', async () => {
+		readReleaseState.mockResolvedValue({ current: 1999, existing: new Map() });
 		const { res, body } = await post(form([['/a.js', mapFile('a')], ['/b.js', mapFile('b')]]));
 		expect(res.status).toBe(422);
 		expect(body.error).toEqual({
 			code: 'release_full',
 			message: expect.any(String),
-			details: { max: 500, current: 499 },
+			details: { max: 2000, current: 1999 },
 		});
 		expect(putObject).not.toHaveBeenCalled();
 		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
 		expect(outcomesRecorded()).toEqual(['rejected']);
 	});
 
-	it('the pre-check counts only paths with no row yet: 499 rows + 1 replace + 1 new = 500 is accepted', async () => {
+	it('the pre-check counts only paths with no row yet: 1999 rows + 1 replace + 1 new = 2000 is accepted', async () => {
 		readReleaseState.mockResolvedValue({
-			current: 499,
+			current: 1999,
 			existing: new Map([['/a.js', { sha256: 'stale', storageKey: 'old' }]]),
 		});
-		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 500, displacedKeys: [] });
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 2000, displacedKeys: [] });
 		const { res, body } = await post(form([['/a.js', mapFile('a')], ['/b.js', mapFile('b')]]));
 		expect(res.status).toBe(201);
-		expect(body.release_file_count).toBe(500);
+		expect(body.release_file_count).toBe(2000);
 	});
 
 	it('reads SOURCEMAP_MAX_FILES_PER_RELEASE from the env and hands it to the transaction', async () => {
@@ -719,10 +719,10 @@ describe('POST /api/sourcemaps -- the three phases (U12, U18)', () => {
 	});
 
 	it('a lost race at the cap inside the transaction is 422 release_full with the re-read count, counted as storage_error', async () => {
-		upsertReleaseSourcemaps.mockRejectedValue(new ReleaseFullError(500, 500));
+		upsertReleaseSourcemaps.mockRejectedValue(new ReleaseFullError(2000, 2000));
 		const { res, body } = await post(form([['/a.js', mapFile('a')]]));
 		expect(res.status).toBe(422);
-		expect(body.error).toMatchObject({ code: 'release_full', details: { max: 500, current: 500 } });
+		expect(body.error).toMatchObject({ code: 'release_full', details: { max: 2000, current: 2000 } });
 		expect(putObject).toHaveBeenCalledTimes(1);
 		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
 		expect(outcomesRecorded()).toEqual(['storage_error']);

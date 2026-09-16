@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -424,4 +425,32 @@ func TestObsSourcemapMetricNames(t *testing.T) {
 		[]string{obs.SourcemapCacheHit, obs.SourcemapCacheMiss, obs.SourcemapCacheNegativeHit, obs.SourcemapCacheEvict, obs.SourcemapCacheOversize})
 	assert.Equal(t, []string{"created", "replaced", "unchanged", "rejected", "storage_error"},
 		[]string{obs.SourcemapUploadCreated, obs.SourcemapUploadReplaced, obs.SourcemapUploadUnchanged, obs.SourcemapUploadRejected, obs.SourcemapUploadStorageError})
+}
+
+// TestSharedObs_SymbolicationInAppRederivedMetric pins sentinel-sourcemaps-turbopack-grouping §4.2's one
+// metric name and its two CLOSED label sets (decisions 11, 16), for the reasons
+// TestObsSourcemapMetricNames gives: the RUNBOOK's hand-read check greps `sentinel_symbolication`,
+// and flow P9's sum-over-all-series check against `sentinel_symbolication_frames_total` is only
+// meaningful if the series are exactly {true,false,kept} × {true,false}. The `to` values `true`
+// and `false` are spelled as strconv.FormatBool spells a bool, because that is how
+// service.(*ProcessorService).symbolicate derives them from the post-copy frame; `kept` is the
+// third and stands for every outcome other than `applied`. The label KEYS are constants too,
+// because a typo at the one call site would otherwise invent a series the alert never reads.
+func TestSharedObs_SymbolicationInAppRederivedMetric(t *testing.T) {
+	assert.Equal(t, "sentinel_symbolication_in_app_rederived_total", obs.MetricSymbolicationInAppRederived)
+	assert.Equal(t, "to", obs.LabelTo)
+	assert.Equal(t, "changed", obs.LabelChanged)
+
+	assert.Equal(t, []string{"true", "false", "kept"},
+		[]string{obs.SymbolicationInAppToTrue, obs.SymbolicationInAppToFalse, obs.SymbolicationInAppToKept},
+		"the closed `to` set of §4.2's Metric table: the two bools and `kept`")
+	assert.Equal(t, []string{"true", "false"},
+		[]string{obs.SymbolicationInAppChangedTrue, obs.SymbolicationInAppChangedFalse},
+		"the closed `changed` set of §4.2's Metric table")
+	// The loop spells a bool with strconv.FormatBool; the constants must be that spelling or the
+	// `applied` series and the closed set drift apart silently.
+	assert.Equal(t, strconv.FormatBool(true), obs.SymbolicationInAppToTrue)
+	assert.Equal(t, strconv.FormatBool(false), obs.SymbolicationInAppToFalse)
+	assert.Equal(t, strconv.FormatBool(true), obs.SymbolicationInAppChangedTrue)
+	assert.Equal(t, strconv.FormatBool(false), obs.SymbolicationInAppChangedFalse)
 }

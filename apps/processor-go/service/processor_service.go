@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
@@ -151,8 +152,19 @@ func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEven
 		return
 	}
 	res := evt.Symbolicate(ctx, s.symbolicator, projectID)
-	for _, o := range res.Outcomes {
+	for i, o := range res.Outcomes {
 		procmetrics.RecordSymbolicationFrame(ctx, string(o))
+		// turbopack-grouping §4.2's counter, one per frame in THIS loop so it sums to
+		// frames_total by construction (P9). Read off the post-copy frame: an applied frame
+		// carries the re-derived InApp and the SDK's under Raw (set together by the stage);
+		// any other outcome kept the SDK's value, so `changed` is false by definition.
+		to, changed := obs.SymbolicationInAppToKept, obs.SymbolicationInAppChangedFalse
+		if o == symbolicate.OutcomeApplied {
+			f := evt.Stacktrace[i]
+			to = strconv.FormatBool(f.InApp)
+			changed = strconv.FormatBool(f.InApp != f.Raw.InApp)
+		}
+		procmetrics.RecordInAppRederived(ctx, to, changed)
 	}
 	procmetrics.RecordSymbolicationEvent(ctx, string(res.EventOutcome()))
 }

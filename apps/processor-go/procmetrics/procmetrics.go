@@ -58,17 +58,22 @@ var (
 	releaseNextRewriteFailed metric.Int64Counter
 
 	// sentinel-sourcemaps §12: the five processor instruments of the symbolication stage
-	// (apps/processor-go/symbolicate). The two _total counters carry ONE label each from the closed
-	// sets obs.go declares (SymbolicationEvent*, SymbolicationFrame*); the cache counter carries
-	// obs.LabelKind from obs.SourcemapCache*; the histogram and the gauge are unlabelled. Never a
-	// project_id, never a path. The gauge is a synchronous Int64Gauge because the stage reports the
+	// (apps/processor-go/symbolicate), plus turbopack-grouping §4.2's sixth below. The two
+	// _total counters carry ONE label each from the closed sets obs.go declares
+	// (SymbolicationEvent*, SymbolicationFrame*); the cache counter carries obs.LabelKind from
+	// obs.SourcemapCache*; the histogram and the gauge are unlabelled. Never a project_id, never
+	// a path. The gauge is a synchronous Int64Gauge because the stage reports the
 	// byte total on every change through its Observer seam; an observable one would need a second
 	// path into the cache.
-	symbolicationEvents    metric.Int64Counter
-	symbolicationFrames    metric.Int64Counter
-	sourcemapFetchDuration metric.Float64Histogram
-	sourcemapCacheBytes    metric.Int64Gauge
-	sourcemapCacheEvents   metric.Int64Counter
+	symbolicationEvents metric.Int64Counter
+	symbolicationFrames metric.Int64Counter
+	// sentinel-sourcemaps-turbopack-grouping §4.2: the in_app re-derivation counter, TWO labels
+	// (obs.LabelTo ∈ obs.SymbolicationInAppTo*, obs.LabelChanged ∈ obs.SymbolicationInAppChanged*),
+	// incremented once per frame beside symbolicationFrames so the two sum by construction (P9).
+	symbolicationInAppRederived metric.Int64Counter
+	sourcemapFetchDuration      metric.Float64Histogram
+	sourcemapCacheBytes         metric.Int64Gauge
+	sourcemapCacheEvents        metric.Int64Counter
 )
 
 func init() {
@@ -177,6 +182,15 @@ func init() {
 	if err != nil {
 		slog.Error("procmetrics: failed to create symbolication frames counter", slog.String("error", err.Error()))
 		symbolicationFrames = nil
+	}
+
+	symbolicationInAppRederived, err = meter.Int64Counter(
+		obs.MetricSymbolicationInAppRederived,
+		metric.WithDescription("Count of stack frames through the symbolication stage by the in_app value the stage re-derived (to: true, false, or kept when the frame was not rewritten) and whether it differs from the value the SDK sent (changed)"),
+	)
+	if err != nil {
+		slog.Error("procmetrics: failed to create symbolication in_app rederived counter", slog.String("error", err.Error()))
+		symbolicationInAppRederived = nil
 	}
 
 	// Same buckets as processDuration: the cold path is one object GET plus one parse, and §13 M2
@@ -341,6 +355,23 @@ func RecordSymbolicationEvent(ctx context.Context, outcome string) {
 func RecordSymbolicationFrame(ctx context.Context, outcome string) {
 	if symbolicationFrames != nil {
 		symbolicationFrames.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelOutcome, outcome)))
+	}
+}
+
+// RecordInAppRederived records one frame's in_app re-derivation
+// (sentinel-sourcemaps-turbopack-grouping §4.2 Metric): to is one of obs.SymbolicationInAppTo*
+// (`true`/`false` for a frame the stage rewrote — the value it now carries — or `kept` for any
+// other outcome), changed is one of obs.SymbolicationInAppChanged* (`true` when the re-derived
+// value differs from raw.in_app; always `false` with `kept`). Exactly one per frame, recorded by
+// service.(*ProcessorService).symbolicate in the SAME loop as RecordSymbolicationFrame, so the
+// sum over every to×changed series equals frames_total (flow P9). Never called from the stage:
+// the stage has overwritten the SDK's value by the time it could report it.
+func RecordInAppRederived(ctx context.Context, to, changed string) {
+	if symbolicationInAppRederived != nil {
+		symbolicationInAppRederived.Add(ctx, 1, metric.WithAttributes(
+			attribute.String(obs.LabelTo, to),
+			attribute.String(obs.LabelChanged, changed),
+		))
 	}
 }
 

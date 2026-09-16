@@ -158,6 +158,20 @@ func (cfg FingerprintConfig) normalises() bool {
 //   - Directory rule: a whole DIRECTORY segment (every segment but the last — the basename is the
 //     basename rule's alone) of ≥ 16 chars of [A-Za-z0-9_-] containing a digit is replaced by `*`
 //     (`/_next/static/AbC123xyz_-9pQrStUv/_buildManifest.js` → `/_next/static/*/_buildManifest.js`).
+//   - Turbopack suffix rule (sentinel-sourcemaps-turbopack-grouping §4.3, D5, decisions 9 and
+//     10): a PREFIX step inside the basename rule, after the extension run is split and BEFORE
+//     the separator search. (1) Admit one `._` into the extension run: if the stem ends with
+//     `._`, move it — stem `_052cc036._` / ext `.js` → stem `_052cc036` / ext `._.js`. Only one,
+//     only innermost, only immediately before a non-empty run. (2) If the stem is ≥ 9 chars and
+//     ends with `_` followed by exactly 8 lower-case hex chars (`[0-9a-f]{8}`) — the `_` may be
+//     the stem's first byte — replace those 8 chars with `*` and return: `_052cc036._.js` →
+//     `_*._.js`, `node_modules__pnpm_52f51f25._.js` → `node_modules__pnpm_*._.js`,
+//     `…_app-route_f5a91902.js` → `…_app-route_*.js`. The separator search and the hash token
+//     do NOT run on such a stem, so the whole-stem collapse to `*.js` no longer happens for
+//     these names. (3) Otherwise the existing rule, unchanged, on the stem as step (1) left it
+//     (`main.a1b2c3d4._.js` → `main.*._.js`). The `<5-hex>_` directory-hash prefix (`0264e_`)
+//     is kept (decision 10); `user_12345678.js` → `user_*.js` and `chunk-Ab_deadbeef.js` →
+//     `chunk-Ab_*.js` are the stated false positives (T28, T29).
 func NormalizeHashInput(file string) string {
 	file = symbolicate.NormalizePath(file)
 	segments := strings.Split(file, "/")
@@ -176,6 +190,31 @@ func normalizeBasename(base string) string {
 	stem, ext := splitExtensionRun(base)
 	if stem == "" {
 		return base
+	}
+	// Turbopack's server chunk names (sentinel-sourcemaps-turbopack-grouping §4.3, D5) end in
+	// `_<8-hex>` with an optional `._` before the run, and neither `._` (not an extension) nor
+	// `_` (not a separator) is anything the rule below reads -- so `_052cc036._.js` came out
+	// unchanged and `…_app-route_f5a91902.js` collapsed to `*.js`. Two prefix steps, before the
+	// separator search: one `._` immediately before a non-empty run is moved into the run; then
+	// a stem of ≥ 9 bytes ending in `_` + exactly 8 lower-case hex has those 8 replaced and
+	// returns without the separator search (`_*._.js`, `node_modules__pnpm_*._.js`). A stem the
+	// suffix test refuses falls through to the existing rule as step one left it
+	// (`main.a1b2c3d4._.js` → `main.*._.js`, T30).
+	if ext != "" && strings.HasSuffix(stem, "._") {
+		stem, ext = stem[:len(stem)-2], "._"+ext
+	}
+	if n := len(stem); n >= 9 && stem[n-9] == '_' {
+		suffixHex := true
+		for i := n - 8; i < n; i++ {
+			c := stem[i]
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				suffixHex = false
+				break
+			}
+		}
+		if suffixHex {
+			return stem[:n-8] + "*" + ext
+		}
 	}
 	// The candidate starts as the piece after the LAST separator, then widens back across `-`
 	// separators only (a `.` is never inside a token) for as long as the piece being crossed is
