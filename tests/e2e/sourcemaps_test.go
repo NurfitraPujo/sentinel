@@ -79,6 +79,7 @@ type storedFrame struct {
 		Line     int32  `json:"line"`
 		Column   int32  `json:"column"`
 		Function string `json:"function"`
+		InApp    bool   `json:"in_app"`
 	} `json:"raw"`
 }
 
@@ -95,6 +96,11 @@ type sourcemapUploadResponse struct {
 	} `json:"files"`
 }
 
+// seedInApp is the in_app value the seed sends for frame i: the three anchors true, the rest false.
+// Shared by sourcemapEvent and assertSymbolicatedFrames so the seed and the raw.in_app expectation
+// cannot drift apart.
+func seedInApp(i int) bool { return i < 3 }
+
 // sourcemapEvent builds the javascript event for one build: the three anchors in_app, the fourth
 // not, every frame with a column, and an explicit event_id so "the same event with a fresh
 // event_id" is literal (the ingestor dedups on it).
@@ -106,7 +112,7 @@ func (f *fixture) sourcemapEvent(build byte, errorClass string) event {
 			file, column = a.fileB, a.columnB
 		}
 		frames = append(frames, map[string]any{
-			"file": file, "line": 1, "column": column, "function": a.minName, "in_app": i < 3,
+			"file": file, "line": 1, "column": column, "function": a.minName, "in_app": seedInApp(i),
 		})
 	}
 	return f.newEvent().with(event{
@@ -205,7 +211,13 @@ func assertRawFrames(t *testing.T, frames []storedFrame) {
 
 // assertSymbolicatedFrames asserts §4.4 step 6 on every frame: file ← the map's source verbatim,
 // function ← the map's name, line/column ← the original 1-based position, `symbolicated: true`,
-// and `raw` holding exactly what the SDK sent for the given build.
+// and `raw` holding exactly what the SDK sent for the given build — including `raw.in_app`.
+//
+// in_app itself is turbopack-grouping §4.2 (decision 19): a rewritten frame's in_app is
+// RE-DERIVED from the resolved source, and every source of the Vite fixture
+// (`../../app/src/<x>.ts` — bare relative, no node_modules, no bracketed root) is `true` by rule 3,
+// whatever the seed sent. So a symbolicated frame asserts `in_app == true` and `raw.in_app` equal
+// to the seed's value; only an UNREWRITTEN frame would keep the seed's value as its own in_app.
 func assertSymbolicatedFrames(t *testing.T, frames []storedFrame, build byte) {
 	t.Helper()
 	if len(frames) != len(sourcemapAnchors) {
@@ -227,8 +239,11 @@ func assertSymbolicatedFrames(t *testing.T, frames []storedFrame, build byte) {
 		if fr.Raw.File != rawFile || fr.Raw.Column != rawColumn || fr.Raw.Line != 1 || fr.Raw.Function != a.minName {
 			t.Fatalf("frame %d raw = %+v, want %s:1:%d %s", i, *fr.Raw, rawFile, rawColumn, a.minName)
 		}
-		if fr.InApp != (i < 3) {
-			t.Fatalf("frame %d in_app = %v changed by symbolication", i, fr.InApp)
+		if !fr.InApp {
+			t.Fatalf("frame %d in_app = false, want true: symbolicated source %s is in_app by §4.2 rule 3", i, fr.File)
+		}
+		if fr.Raw.InApp != seedInApp(i) {
+			t.Fatalf("frame %d raw.in_app = %v, want the seed's %v", i, fr.Raw.InApp, seedInApp(i))
 		}
 	}
 }
