@@ -27,6 +27,11 @@ export interface CaptureInput {
   ctx: CaptureContext | undefined;
   /** Set only by a global handler (§4.6, decision 37); never by the two public capture calls. */
   source?: CaptureSource;
+  /**
+   * Decision 22: the two node global-handler captures call `beforeSend` synchronously and ignore a promise-returning
+   * hook's result — the event is sent as built, with one `debug` line. Never set by the public calls.
+   */
+  syncHookOnly?: boolean;
 }
 
 function newEventId(): string {
@@ -140,7 +145,7 @@ function isThenable(v: unknown): v is PromiseLike<unknown> {
 }
 
 /** The pipeline after the event is built and sampled: scrub, hook, re-stamp, re-apply, enqueue. */
-function send(client: InternalClient, event: SentinelEvent, originalException: unknown): void {
+function send(client: InternalClient, event: SentinelEvent, originalException: unknown, syncHookOnly: boolean): void {
   scrubPII(event.metadata as Metadata);
   const hook = client.options.beforeSend;
   if (typeof hook !== 'function') {
@@ -166,6 +171,14 @@ function send(client: InternalClient, event: SentinelEvent, originalException: u
     return;
   }
   if (isThenable(result)) {
+    if (syncHookOnly) {
+      // Decision 22: on the node crash path there is no async window — the promise's result is ignored and the
+      // event goes as built (the pre-hook copy), with one `debug` line (contract §4.6).
+      debug(client, `beforeSend returned a promise on a node global-handler capture: its result is ignored and event ${stamp.event_id} is sent as built (decision 22)`);
+      Promise.resolve(result).then(undefined, () => undefined);
+      enqueue(pre);
+      return;
+    }
     // A pending hook holds its event out of the queue until it settles, then enqueues into the client current
     // at that moment (contract §4.2); a rejection ≡ a throw. Tracked on the slot so `flush` can wait for it (B9).
     const pending = getSlot().pending;
@@ -188,6 +201,12 @@ export function capture(input: CaptureInput): string {
   if (client === undefined) {
     // Before the first `init` or after `close` (contract §4.2): a fresh id, the event dropped, nothing marked.
     return newEventId();
+  }
+  if (client.noop) {
+    // The no-op client (contract §4.2 — `not_configured`, or a refused `endpoint` / `tunnel`): accepted and dropped.
+    const id = newEventId();
+    debug(client, `no-op client: ${input.kind} ${id} accepted and dropped`);
+    return id;
   }
   const isObject = input.kind === 'exception' && (typeof input.value === 'object' || typeof input.value === 'function') && input.value !== null;
   if (isObject) {
@@ -264,7 +283,7 @@ function build(client: InternalClient, input: CaptureInput, eventId: string): vo
     return;
   }
 
-  send(client, event, originalException);
+  send(client, event, originalException, input.syncHookOnly === true);
 }
 
 export function captureException(error: unknown, ctx?: CaptureContext): string {

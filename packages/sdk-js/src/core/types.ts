@@ -152,7 +152,13 @@ export interface TransportOptions {
   flushOnHide?: boolean;
 }
 
-export type InitOptions = CoreOptions & TransportOptions;
+/** The global handlers' switch (contract §4.6): browser and node only; the edge has nothing to install. */
+export interface HandlerOptions {
+  /** Default `true`. */
+  installGlobalHandlers?: boolean;
+}
+
+export type InitOptions = CoreOptions & TransportOptions & HandlerOptions;
 
 /** The transport options as `init` resolved them — the `apiKey` is not here (redacted, decision 36). */
 export interface ResolvedTransportOptions {
@@ -165,7 +171,25 @@ export interface ResolvedTransportOptions {
   tunnel?: string;
 }
 
-export type ResolvedOptions = ResolvedCoreOptions & ResolvedTransportOptions;
+export interface ResolvedHandlerOptions {
+  installGlobalHandlers: boolean;
+}
+
+export type ResolvedOptions = ResolvedCoreOptions & ResolvedTransportOptions & ResolvedHandlerOptions;
+
+/**
+ * The per-entry option types of decision 31 (contract §4.1, §4.2's *Runtimes* column): `./browser` and
+ * `./nextjs/client` have `tunnel` and `flushOnHide` and NO `apiKey` / `endpoint` — `init({ apiKey })` in a
+ * client file is a compile error, not a bundled key (B18); `./node` and `./edge` have `endpoint` / `apiKey` /
+ * `projectKey`; only the browser and node entries have `installGlobalHandlers`.
+ */
+export type BrowserInitOptions = CoreOptions &
+  Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'tunnel' | 'flushOnHide'> &
+  HandlerOptions;
+export type NodeInitOptions = CoreOptions &
+  Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'> &
+  HandlerOptions;
+export type EdgeInitOptions = CoreOptions & Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'>;
 
 /** The opaque client of decision 36: nothing callable. */
 export interface SentinelClient {

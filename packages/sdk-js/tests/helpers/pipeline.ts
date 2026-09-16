@@ -9,10 +9,28 @@ import type { CoreOptions, Runtime, SentinelEvent, SentinelSdkError } from '../.
 
 export const SLOT = Symbol.for('@sentinel/sdk-js');
 
-/** Back to "before the first `init`": the slot deleted, every spy restored. */
+/**
+ * Back to "before the first `init`" (contract §4.1's guidance): any installed handlers uninstalled — the current
+ * client's teardown hooks run, so no `window` / `process` listener from a previous test survives — the slot
+ * deleted, every spy restored.
+ */
 export function resetPipeline(): void {
+  uninstallHandlers();
   clearSlot();
   vi.restoreAllMocks();
+}
+
+/** Run the current client's teardown hooks (its global handlers and hide listeners go); swallow a throwing one. */
+export function uninstallHandlers(): void {
+  const client = getInternalClient();
+  if (client === undefined) return;
+  for (const hook of client.teardown.splice(0)) {
+    try {
+      hook();
+    } catch {
+      // A teardown that throws must not stop the reset.
+    }
+  }
 }
 
 export interface Pipeline {

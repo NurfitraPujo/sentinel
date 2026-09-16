@@ -19,6 +19,11 @@ export const SLOT_KEY: unique symbol = Symbol.for(SDK_NAME);
 export interface InternalClient {
   readonly options: ResolvedOptions;
   readonly runtime: Runtime;
+  /**
+   * The no-op client of contract §4.2 (`not_configured`, or an unusable `endpoint` / `tunnel`): every capture is
+   * accepted and dropped, nothing is ever posted, no handler is installed.
+   */
+  readonly noop: boolean;
   readonly transport: Transport | undefined;
   /** The not-yet-sent serialised events in enqueue order — the string is what the transport sends (contract §4.3). */
   readonly queue: readonly string[];
@@ -27,9 +32,9 @@ export interface InternalClient {
   /** An already-serialised event — the second-`init` drain (contract §4.2). */
   push(event: QueuedEvent): void;
   /**
-   * Run by `close` (contract §4.3) and when a second `init` replaces the client: the hide listeners' removal
-   * here, the global handlers' uninstall (§4.6, task 5) once they exist. Each is called once and may not throw
-   * outward.
+   * Run by `close` (contract §4.3) and when a second `init` replaces the client — before the new client's
+   * handlers are installed: the hide listeners' removal (client.ts) and the global handlers' uninstall
+   * (handlers/browser.ts, handlers/node.ts). Each is called once and may not throw outward.
    */
   readonly teardown: Array<() => void>;
 }

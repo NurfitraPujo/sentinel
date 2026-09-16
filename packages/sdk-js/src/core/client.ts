@@ -1,13 +1,14 @@
 // The client the transport hangs off (contract §4.2, §4.4): the transport options resolved with their
-// degradations, the send target derived from the runtime (`{endpoint}/batch` with `X-API-Key` on node and edge;
-// the tunnel URL on the browser), the browser's hide listeners, and `flush` / `close` (contract §4.4, §4.3). The
-// runtime entries' `init` — env defaults, the tunnel's same-origin rule, the `not_configured` no-op client, the
-// global handlers — is task 5's; this file is the plumbing that drives the transport.
+// degradations, the send target the entry planned (options.ts — `{endpoint}/batch` with `X-API-Key` on node and
+// edge; the same-origin tunnel URL on the browser), the no-op client that accepts and drops every capture, the
+// browser's hide listeners, and `flush` / `close` (contract §4.4, §4.3). The global handlers are handlers/ and
+// hang off the same `teardown` list, so `close` and a second `init` uninstall them here.
 
 import { debug, reportError } from './report.js';
+import type { InitPlan } from './options.js';
 import { type QueuedEvent, queuedEvent } from './queue.js';
 import { getSlot, type InternalClient } from './state.js';
-import { Transport, type TransportTarget } from './transport/transport.js';
+import { Transport } from './transport/transport.js';
 import type { InitOptions, ResolvedOptions, Runtime, SentinelEvent } from './types.js';
 
 export const DEFAULT_MAX_BUFFER_SIZE = 100;
@@ -64,49 +65,10 @@ function resolveTransportOptions(client: InternalClient, given: InitOptions): vo
   }
 
   opts.flushOnHide = given.flushOnHide !== false;
+  opts.installGlobalHandlers = given.installGlobalHandlers !== false;
   if (typeof given.endpoint === 'string') opts.endpoint = given.endpoint;
   if (typeof given.projectKey === 'string' && given.projectKey !== '') opts.projectKey = given.projectKey;
   if (typeof given.tunnel === 'string') opts.tunnel = given.tunnel;
-}
-
-/** `new URL(value)` succeeding with an `http:` / `https:` protocol (contract §4.2's `endpoint` row). */
-function absoluteHttpUrl(value: string, base?: string): URL | undefined {
-  try {
-    const url = base === undefined ? new URL(value) : new URL(value, base);
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The send target (contract §4.4 *Batching*): `{endpoint}/batch` on node and edge with the key headers; the
- * resolved tunnel URL on the browser (the same-origin rule that refuses it is task 5's, B19). `undefined` when
- * nothing usable was given — the client then keeps a plain queue and sends nothing.
- */
-function resolveTarget(client: InternalClient, given: InitOptions): TransportTarget | undefined {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (client.runtime === 'browser') {
-    const tunnel = client.options.tunnel;
-    if (tunnel === undefined) return undefined;
-    const origin = (globalThis as { location?: { origin?: string } }).location?.origin;
-    const url = absoluteHttpUrl(tunnel, typeof origin === 'string' ? origin : undefined);
-    if (url === undefined) {
-      debug(client, `tunnel ${JSON.stringify(tunnel)} does not resolve to an http(s) URL; nothing will be sent`);
-      return undefined;
-    }
-    return { url: url.href, headers };
-  }
-  const endpoint = client.options.endpoint;
-  if (endpoint === undefined) return undefined;
-  const url = absoluteHttpUrl(endpoint);
-  if (url === undefined) {
-    debug(client, `endpoint ${JSON.stringify(endpoint)} is not an absolute http(s) URL; nothing will be sent`);
-    return undefined;
-  }
-  if (typeof given.apiKey === 'string' && given.apiKey !== '') headers['X-API-Key'] = given.apiKey;
-  if (client.options.projectKey !== undefined) headers['X-Project-Key'] = client.options.projectKey;
-  return { url: `${endpoint.replace(/\/$/, '')}/batch`, headers };
 }
 
 /**
@@ -137,15 +99,18 @@ function installHideListeners(client: InternalClient, transport: Transport): voi
 }
 
 /**
- * Build the client for `runtime`: `core` is the runtime-agnostic half init.ts resolved; the transport options and
- * the target are resolved here and the transport attached when the target exists.
+ * Build the client for `runtime`: `core` is the runtime-agnostic half init.ts resolved; the transport options are
+ * resolved here and the transport attached when the plan carries a target. A no-op plan (contract §4.2) gives a
+ * client with no transport and no queue: `push` drops with a `debug` line, and the plan's reports fire once
+ * through the new client's `onError`.
  */
-export function createClient(core: ResolvedOptions, runtime: Runtime, given: InitOptions): InternalClient {
+export function createClient(core: ResolvedOptions, runtime: Runtime, given: InitOptions, plan: InitPlan): InternalClient {
   const plain: string[] = [];
   let transport: Transport | undefined;
   const client: InternalClient = {
     options: core,
     runtime,
+    noop: plan.noop,
     get transport() {
       return transport;
     },
@@ -156,18 +121,19 @@ export function createClient(core: ResolvedOptions, runtime: Runtime, given: Ini
       client.push(queuedEvent(event.event_id, json));
     },
     push(event: QueuedEvent) {
-      if (transport === undefined) plain.push(event.json);
+      if (plan.noop) debug(client, `no-op client: event ${event.id} dropped`);
+      else if (transport === undefined) plain.push(event.json);
       else transport.enqueue(event);
     },
     teardown: [],
   };
   try {
     resolveTransportOptions(client, given);
-    const target = resolveTarget(client, given);
-    if (target !== undefined) {
+    for (const r of plan.reports) reportError(client, r.code, r.message, r.option === undefined ? {} : { option: r.option });
+    if (!plan.noop && plan.target !== undefined) {
       transport = new Transport({
         runtime,
-        target,
+        target: plan.target,
         maxBufferSize: core.maxBufferSize,
         batchSize: core.batchSize,
         batchWaitMs: core.batchWaitMs,
@@ -202,9 +168,9 @@ function unsent(previous: InternalClient): QueuedEvent[] {
 /**
  * A second `init`'s drain (contract §4.2): the previous client's not-yet-sent queue moves into `next` — the same
  * `event_id`s, the same bytes (an already-built event is immutable, B22) — while a batch in flight or backing
- * off finishes under the previous transport. The previous client's teardown hooks run: its hide listeners go,
- * and the global handlers with them once task 5 registers theirs (they are uninstalled before the new ones are
- * installed, which is why this runs before `next` is installed).
+ * off finishes under the previous transport. The previous client's teardown hooks run: its hide listeners and
+ * its global handlers go — uninstalled BEFORE the entry installs the new ones (contract §4.2), which is why this
+ * runs before `next` is installed and the entry installs handlers only after `initCore` returns.
  */
 export function replaceClient(previous: InternalClient, next: InternalClient): void {
   const events = unsent(previous);

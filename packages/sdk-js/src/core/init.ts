@@ -1,12 +1,15 @@
 // The runtime-agnostic half of `init` (contract §4.2): the options the event pipeline reads, resolved with the
 // degradations their rows pin — `release` over 100 bytes omitted with `release_too_long` (N10), `environment`
 // normalised with `invalid_option` (N11), `sampleRate` defaulted / clamped with `invalid_option` — and the client
-// installed on the `globalThis` slot, with the transport of §4.4 attached by client.ts when the runtime's target
-// resolves. The runtime entries (`./browser`, `./node`, `./edge`) wrap this with their own options, env defaults
-// and the global handlers (task 5).
+// installed on the `globalThis` slot, with the transport of §4.4 attached by client.ts when the entry's plan
+// (options.ts) carries a target. The runtime entries (`./browser`, `./node`, `./edge`) wrap this with their own
+// option types, the env defaults, the plan and the global handlers (handlers/); `initCore` is synchronous,
+// idempotent and never throws — a second call drains the previous client and runs its teardown (the old global
+// handlers go) before the new client is installed.
 
 import { cutUtf8, utf8Bytes } from './bytes.js';
 import { createClient, replaceClient } from './client.js';
+import { type InitPlan, planPermissive } from './options.js';
 import { debug, reportError } from './report.js';
 import { getSlot, type InternalClient } from './state.js';
 import type { InitOptions, ResolvedOptions, Runtime, SentinelClient } from './types.js';
@@ -63,8 +66,12 @@ function resolve(client: InternalClient, given: InitOptions): void {
   if (given.tracesSampleRate !== undefined) debug(client, 'tracesSampleRate is accepted and ignored');
 }
 
-/** Install the client for `runtime` with `options` resolved. Synchronous, idempotent, never throws. */
-export function initCore(options: InitOptions | undefined, runtime: Runtime): InternalClient {
+/**
+ * Install the client for `runtime` with `options` resolved and `plan` deciding the target (the entry's verdict:
+ * options.ts's `planServer` / `planBrowser`; the permissive plan when a test calls this directly). Synchronous,
+ * idempotent, never throws.
+ */
+export function initCore(options: InitOptions | undefined, runtime: Runtime, plan?: InitPlan): InternalClient {
   const given: InitOptions = options !== null && typeof options === 'object' ? options : {};
   const resolved: ResolvedOptions = {
     release: '',
@@ -75,11 +82,18 @@ export function initCore(options: InitOptions | undefined, runtime: Runtime): In
     batchSize: 10,
     batchWaitMs: 1000,
     flushOnHide: true,
+    installGlobalHandlers: true,
   };
   if (typeof given.beforeSend === 'function') resolved.beforeSend = given.beforeSend;
   if (typeof given.onError === 'function') resolved.onError = given.onError;
   if (typeof given.inApp === 'function') resolved.inApp = given.inApp;
-  const client = createClient(resolved, runtime, given);
+  let planned: InitPlan;
+  try {
+    planned = plan ?? planPermissive(given, runtime);
+  } catch {
+    planned = { noop: false, reports: [] };
+  }
+  const client = createClient(resolved, runtime, given, planned);
   try {
     resolve(client, given);
   } catch (cause) {
