@@ -465,9 +465,24 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	// keep it named after the migration that is the actual source of truth. No dashboard code reads this
 	// yet; that is expected at this stage of the plan.
 	eventId: varchar('event_id', { length: 64 }),
+	// sentinel-occurrence-dedup-project §4.2 (1725200000_add_error_occurrences_project_id_dedup.sql):
+	// nullable, no default, no FK — rows written before that release carry NULL until its batched
+	// backfill (issues.project_id via issue_id) reaches them, and the processor is the only writer.
+	// Widens the occurrence dedup key from (issue_id, event_id) to (project_id, event_id); the partial
+	// unique index is declared below. Same hand-maintained-mirror caveat as eventId: the migration is
+	// the source of truth, not this file. No dashboard code reads this yet.
+	projectId: uuid('project_id'),
 	createdAt: timestamp('created_at').defaultNow(),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),
+	// 1725200000: partial unique index on (project_id, event_id), built CONCURRENTLY by the migration.
+	// The .where(...) predicate is load-bearing — without it this would claim a plain UNIQUE over every
+	// pre-release NULL row and every NULL event_id, which is not what the database enforces. The older
+	// uq_error_occurrences_issue_event (1722200000) still exists in the database and is deliberately
+	// not mirrored here, as before.
+	uqOccurrencesProjectEvent: uniqueIndex('uq_error_occurrences_project_event')
+		.on(table.projectId, table.eventId)
+		.where(sql`project_id IS NOT NULL AND event_id IS NOT NULL`),
 	// sentinel-user-report-issue §4.3/§4.6 (1724100000_add_user_report_intake_and_oncall.sql): the triage
 	// matcher scans a candidate issue's recent occurrences newest-first inside
 	// REPORT_MATCH_WINDOW_MINUTES of the report. The release-keyed index above cannot serve that scan.
