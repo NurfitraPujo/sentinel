@@ -100,6 +100,13 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 			wantPath:   "/api/agent/issues/iss-1/claim",
 		},
 		{
+			name:       "claim-next with filters",
+			args:       []string{"claim-next", "--type", "system_error", "--project", "p1", "--environment", "staging", "--source", "api", "--sort", "firstSeen"},
+			wantMethod: "POST",
+			wantPath:   "/api/agent/issues/claim-next",
+			wantBody:   map[string]interface{}{"type": "system_error", "project": "p1", "environment": "staging", "source": "api", "sort": "firstSeen"},
+		},
+		{
 			name:       "release",
 			args:       []string{"release", "iss-1"},
 			wantMethod: "DELETE",
@@ -222,6 +229,56 @@ func parseQuery(t *testing.T, raw string) url.Values {
 		t.Fatalf("parsing query %q: %v", raw, err)
 	}
 	return vals
+}
+
+// claim-next: no flags sends an EMPTY JSON object (the server treats absent filters as "any"), a
+// positional argument is a usage error (there is no issueId -- the server picks it), and the
+// server's 404 for an empty queue maps to ExitNotFound so a shell loop can stop on it.
+func TestClaimNext_EmptyBodyUsageAndEmptyQueue(t *testing.T) {
+	t.Run("no flags sends an empty JSON body", func(t *testing.T) {
+		srv, rec := newRecordingServer(t, 200, `{"issue":{"id":"iss-1"},"report":null,"latestOccurrence":null,"relations":[]}`)
+		e, out, errBuf := newTestEnv(srv, "sk_test_key")
+		if code := commands["claim-next"](context.Background(), e, nil); code != ExitOK {
+			t.Fatalf("exit = %d, want 0; stderr=%s", code, errBuf.String())
+		}
+		if rec.Method != "POST" || rec.Path != "/api/agent/issues/claim-next" {
+			t.Errorf("request = %s %s, want POST /api/agent/issues/claim-next", rec.Method, rec.Path)
+		}
+		if len(rec.Body) != 0 {
+			t.Errorf("body = %v, want empty object", rec.Body)
+		}
+		if !strings.Contains(out.String(), `"iss-1"`) {
+			t.Errorf("stdout should carry the detail response, got %q", out.String())
+		}
+	})
+
+	t.Run("positional argument is a usage error and makes no request", func(t *testing.T) {
+		srv, rec := newRecordingServer(t, 200, `{}`)
+		e, _, errBuf := newTestEnv(srv, "sk_test_key")
+		if code := commands["claim-next"](context.Background(), e, []string{"iss-1"}); code != ExitUsage {
+			t.Fatalf("exit = %d, want %d", code, ExitUsage)
+		}
+		if rec.Method != "" {
+			t.Errorf("a request was made (%s %s); want none", rec.Method, rec.Path)
+		}
+		if !strings.Contains(errBuf.String(), "usage: sentinel claim-next") {
+			t.Errorf("stderr = %q, want usage line", errBuf.String())
+		}
+	})
+
+	t.Run("empty queue (404) exits ExitNotFound with the server message on stderr", func(t *testing.T) {
+		srv, _ := newRecordingServer(t, 404, `{"message":"No unclaimed issue matches"}`)
+		e, out, errBuf := newTestEnv(srv, "sk_test_key")
+		if code := commands["claim-next"](context.Background(), e, nil); code != ExitNotFound {
+			t.Fatalf("exit = %d, want %d", code, ExitNotFound)
+		}
+		if out.Len() != 0 {
+			t.Errorf("stdout should be empty on 404, got %q", out.String())
+		}
+		if !strings.Contains(errBuf.String(), "No unclaimed issue matches") {
+			t.Errorf("stderr = %q, want the server message", errBuf.String())
+		}
+	})
 }
 
 func TestExitCodeMapping(t *testing.T) {

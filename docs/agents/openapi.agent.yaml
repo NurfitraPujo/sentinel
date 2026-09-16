@@ -500,6 +500,324 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+  /api/agent/issues/claim-next:
+    post:
+      operationId: claimNextIssue
+      summary: Atomically select, claim and return full detail for the next unclaimed unresolved issue (one round trip; concurrent callers never receive the same issue). 404 when no eligible issue exists
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type:
+                  type: string
+                  enum:
+                    - any
+                    - user_report
+                    - system_error
+                project:
+                  type: string
+                environment:
+                  type: string
+                source:
+                  type: string
+                  enum:
+                    - ingestion_sdk
+                    - manual_support
+                    - api
+                    - user_report_api
+                sort:
+                  type: string
+                  enum:
+                    - firstSeen
+                    - lastSeen
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issue:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      projectId:
+                        type: string
+                      environment:
+                        type: string
+                      fingerprint:
+                        type: string
+                      message:
+                        type: string
+                      errorClass:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - unresolved
+                          - resolved
+                          - ignored
+                      regressionStatus:
+                        type: string
+                      issueType:
+                        type: string
+                      sourceChannel:
+                        type: string
+                      assigneeType:
+                        type:
+                          - string
+                          - "null"
+                      assignedTo:
+                        type:
+                          - string
+                          - "null"
+                      resolvedInVersion:
+                        type:
+                          - string
+                          - "null"
+                      resolvedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      resolvedByType:
+                        type:
+                          - string
+                          - "null"
+                      resolvedBy:
+                        type:
+                          - string
+                          - "null"
+                      regressionCount:
+                        type: number
+                      lastRegressedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      firstSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      lastSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      count:
+                        type: number
+                      waitingOn:
+                        type:
+                          - string
+                          - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - projectId
+                      - environment
+                      - fingerprint
+                      - message
+                      - errorClass
+                      - status
+                      - regressionStatus
+                      - issueType
+                      - sourceChannel
+                      - assigneeType
+                      - assignedTo
+                      - resolvedInVersion
+                      - resolvedAt
+                      - resolvedByType
+                      - resolvedBy
+                      - regressionCount
+                      - lastRegressedAt
+                      - firstSeen
+                      - lastSeen
+                      - count
+                      - waitingOn
+                      - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
+                    additionalProperties: false
+                  report:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      bodyMd:
+                        type: string
+                      severity:
+                        type: string
+                      reporterId:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - bodyMd
+                      - severity
+                      - reporterId
+                    additionalProperties: false
+                  latestOccurrence:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      id:
+                        type: string
+                      environment:
+                        type: string
+                      platform:
+                        type: string
+                      releaseVersion:
+                        type:
+                          - string
+                          - "null"
+                      stacktrace: {}
+                      metadata: {}
+                      traceId:
+                        type:
+                          - string
+                          - "null"
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                    required:
+                      - id
+                      - environment
+                      - platform
+                      - releaseVersion
+                      - stacktrace
+                      - metadata
+                      - traceId
+                      - createdAt
+                    additionalProperties: false
+                  relations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        sourceIssueId:
+                          type: string
+                        targetIssueId:
+                          type: string
+                        relationType:
+                          type: string
+                          enum:
+                            - linked_to
+                            - caused_by
+                            - duplicate_of
+                        createdByType:
+                          type: string
+                        createdBy:
+                          type: string
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        direction:
+                          type: string
+                          enum:
+                            - outgoing
+                            - incoming
+                        relatedIssue:
+                          type: object
+                          additionalProperties: true
+                      required:
+                        - id
+                        - sourceIssueId
+                        - targetIssueId
+                        - relationType
+                        - createdByType
+                        - createdBy
+                        - createdAt
+                        - direction
+                        - relatedIssue
+                      additionalProperties: true
+                required:
+                  - issue
+                  - report
+                  - latestOccurrence
+                  - relations
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/issues/{issueId}/occurrences:
     get:
       operationId: listIssueOccurrences

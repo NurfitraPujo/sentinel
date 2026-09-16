@@ -285,6 +285,18 @@ A minimal, working loop:
    last is how you re-enumerate your own in-flight work after a restart. `&waiting=true` narrows
    to issues currently blocked on a question (see §6).
 2. **Claim** — `POST /api/agent/issues/:id/claim`. Stop here (409) if someone beat you to it.
+
+   **Or do steps 1–3 in one call** — `POST /api/agent/issues/claim-next` selects the next
+   unclaimed, **unresolved** issue in your org, claims it for you, and returns the SAME body as
+   step 3's `GET /api/agent/issues/:id` (with `issue.assignedTo` already set to you). The select
+   and the claim are one statement (`FOR UPDATE SKIP LOCKED`), so N agents calling it at once get
+   N different issues — there is no 409 to handle. "Next" is the first row
+   `GET /api/agent/issues?claimed=false` would show (`lastSeen` descending, `id` tiebreak); the
+   optional JSON body takes the list route's own filters — `type`, `project`, `environment`,
+   `source` — plus `sort` (`firstSeen` | `lastSeen`). An empty or absent body means "any". A
+   **404** (`{"message": "No unclaimed issue matches"}`) means the queue is empty for those
+   filters, not that the route is missing — loop until you see it. Resolved and ignored issues
+   are never handed out, and the single-issue claim/release routes are unchanged.
 3. **Get full detail** — `GET /api/agent/issues/:id` returns:
    ```json
    {
@@ -619,6 +631,7 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` (409 on conflict) |
+| `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen\|lastSeen]` | `POST /api/agent/issues/claim-next` — pick + claim + full detail in one call; exit 4 when the queue is empty |
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` (own claim only) |
 | `sentinel status <issueId> <unresolved\|resolved\|ignored> [--resolved-in VERSION]` | `PATCH /api/agent/issues/:id/status` |
 | `sentinel comment <issueId> --body <md> [--attachment <id> ...]` | `POST /api/agent/issues/:id/comments` |
@@ -758,6 +771,10 @@ curl -s "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/occurrences?limit=20" -H "$AUT
 curl -s -X POST "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/claim" -H "$AUTH"
 curl -s -X DELETE "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/claim" -H "$AUTH"
 
+# Claim the next unclaimed unresolved issue and get its detail in one call (404 = queue empty)
+curl -s -X POST "$SENTINEL_URL/api/agent/issues/claim-next" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"type":"system_error"}'
+
 # Status
 curl -s -X PATCH "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/status" -H "$AUTH" \
   -H 'Content-Type: application/json' -d '{"status":"resolved","resolved_in_version":"v1.2.3"}'
@@ -811,6 +828,15 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### `POST /api/agent/issues/claim-next` (sentinel-agent-claim-next-issue)
+
+- **New route.** Atomically selects the next unclaimed, unresolved issue in the calling key's org,
+  claims it for the calling agent, and returns the `GET /api/agent/issues/{issueId}` body in one
+  round trip (§5 step 2). Optional JSON body: `type`, `project`, `environment`, `source`, `sort`.
+  `404` when nothing matches. Concurrent callers never receive the same issue. Records the same
+  `claimed` activity row, claimant subscription, notification and `agent.issue.claimed` audit
+  entry a single-issue claim does. Additive — nothing existing changed. CLI: `sentinel claim-next`.
 
 ### Releases, snooze and `resolved_in_version: "next"` (sentinel-releases-snooze)
 

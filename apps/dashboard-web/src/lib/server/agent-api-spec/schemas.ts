@@ -211,6 +211,28 @@ export const IssueDetailResponseSchema = z
 	.strict();
 
 // ---------------------------------------------------------------------------
+// POST /api/agent/issues/claim-next -- agent-work.ts's `claimNextAgentIssue`
+// ---------------------------------------------------------------------------
+
+/**
+ * sentinel-agent-claim-next-issue: the list route's own filter vocabulary, as a JSON body. Every
+ * key is optional; an empty (or absent) body claims the next unresolved, unclaimed issue in the
+ * org by `lastSeen` descending -- the first row `GET /api/agent/issues?claimed=false` would show.
+ * The 200 body is `IssueDetailResponseSchema` with `issue` already carrying the claim.
+ */
+export const ClaimNextBodySchema = z
+	.object({
+		type: z.enum(['any', 'user_report', 'system_error']).optional(),
+		project: z.string().optional(),
+		/** Exact, case-sensitive match on issues.environment, as on the list route. */
+		environment: z.string().optional(),
+		source: z.enum(['ingestion_sdk', 'manual_support', 'api', 'user_report_api']).optional(),
+		/** Which end of the queue is "next": descending on this column, default 'lastSeen'. */
+		sort: z.enum(['firstSeen', 'lastSeen']).optional(),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
 // GET /api/agent/issues/{issueId}/occurrences
 // ---------------------------------------------------------------------------
 

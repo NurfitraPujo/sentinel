@@ -45,6 +45,7 @@ if it finds the file group- or world-readable.
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` | full detail: issue, report, latest occurrence, relations |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` | newest-first page |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` | 409 on conflict |
+| `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen\|lastSeen]` | `POST /api/agent/issues/claim-next` | atomically picks + claims the next unclaimed unresolved issue and prints its full detail (same shape as `issues get`); exit 4 when the queue is empty, never 409 |
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` | releases only YOUR OWN claim |
 | `sentinel status <issueId> <unresolved\|resolved\|ignored> [--resolved-in VERSION]` | `PATCH /api/agent/issues/:id/status` | |
 | `sentinel comment <issueId> --body <md> [--parent <id>] [--attachment <id> ...]` | `POST /api/agent/issues/:id/comments` | see mismatch note below re. `--parent` |
@@ -132,6 +133,17 @@ sentinel events --follow --type issue.created | while read -r line; do
   else
     echo "could not claim $issue_id (already claimed?)"
   fi
+done
+```
+
+Or drain the current backlog without listing it first — `claim-next` folds the
+"list → claim → get" head of that loop into one request and cannot lose a race to another agent
+(the server hands each caller a different issue); it exits `4` once nothing is left:
+
+```bash
+while next=$(sentinel claim-next --type system_error); do
+  issue_id=$(echo "$next" | jq -r '.issue.id')
+  sentinel progress "$issue_id" --body "Investigating — picked up by triage-bot."
 done
 ```
 

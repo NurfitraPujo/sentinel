@@ -27,23 +27,24 @@ type cmdFunc func(ctx context.Context, e *env, args []string) int
 
 // commands is the dispatch table used by both main() and tests.
 var commands = map[string]cmdFunc{
-	"issues":   cmdIssues,
-	"claim":    cmdClaim,
-	"release":  cmdRelease,
-	"status":   cmdStatus,
-	"comment":  cmdComment,
-	"comments": cmdComments,
-	"question": cmdQuestion,
-	"progress": cmdProgress,
-	"severity": cmdSeverity,
-	"link":     cmdLink,
-	"unlink":   cmdUnlink,
-	"projects": cmdProjects,
-	"whoami":   cmdWhoami,
-	"events":   cmdEvents,
-	"batch":    cmdBatch,
-	"upload":   cmdUpload,
-	"key":      cmdKey,
+	"issues":     cmdIssues,
+	"claim":      cmdClaim,
+	"claim-next": cmdClaimNext,
+	"release":    cmdRelease,
+	"status":     cmdStatus,
+	"comment":    cmdComment,
+	"comments":   cmdComments,
+	"question":   cmdQuestion,
+	"progress":   cmdProgress,
+	"severity":   cmdSeverity,
+	"link":       cmdLink,
+	"unlink":     cmdUnlink,
+	"projects":   cmdProjects,
+	"whoami":     cmdWhoami,
+	"events":     cmdEvents,
+	"batch":      cmdBatch,
+	"upload":     cmdUpload,
+	"key":        cmdKey,
 }
 
 // reorderArgs moves every "-flag value" (or "-flag=value", or a bare boolean "-flag") pair to the
@@ -217,6 +218,51 @@ func cmdClaim(ctx context.Context, e *env, args []string) int {
 		return usageErr(e, "usage: sentinel claim <issueId>")
 	}
 	res, err := e.client.Do(ctx, "POST", "/api/agent/issues/"+url.PathEscape(args[0])+"/claim", nil, map[string]interface{}{})
+	if err != nil {
+		return e.networkErr(err)
+	}
+	return e.respond(res, "")
+}
+
+// cmdClaimNext is `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S]
+// [--sort firstSeen|lastSeen]`: one round trip that atomically selects, claims and returns the
+// full detail (same shape as `issues get`) of the next unclaimed, unresolved issue. The filters
+// are the `issues list` ones, sent as a JSON body (the endpoint is a POST). An empty queue is a
+// 404 from the server, so this exits ExitNotFound (4) -- `while sentinel claim-next; do ...; done`
+// stops on its own. Never a 409: the server picks a row nobody else holds.
+func cmdClaimNext(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("claim-next", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	typ := fs.String("type", "", `filter: "user_report" or "system_error" (omit for any)`)
+	project := fs.String("project", "", "filter: project id")
+	environment := fs.String("environment", "", "filter: environment name (exact match)")
+	source := fs.String("source", "", `filter: "ingestion_sdk", "manual_support", "api" or "user_report_api"`)
+	sort := fs.String("sort", "", `queue order: "firstSeen" or "lastSeen" (default lastSeen, newest first)`)
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if len(fs.Args()) != 0 {
+		return usageErr(e, "usage: sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen|lastSeen]")
+	}
+
+	body := map[string]interface{}{}
+	if *typ != "" {
+		body["type"] = *typ
+	}
+	if *project != "" {
+		body["project"] = *project
+	}
+	if *environment != "" {
+		body["environment"] = *environment
+	}
+	if *source != "" {
+		body["source"] = *source
+	}
+	if *sort != "" {
+		body["sort"] = *sort
+	}
+
+	res, err := e.client.Do(ctx, "POST", "/api/agent/issues/claim-next", nil, body)
 	if err != nil {
 		return e.networkErr(err)
 	}

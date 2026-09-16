@@ -9,6 +9,7 @@ import {
 } from '$lib/db/schema';
 import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { recordClaim } from '$lib/db/queries/reports';
 import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
 import {
 	findIdempotencyKey,
@@ -296,6 +297,95 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	}
 
 	return { issues: mapped, nextCursor };
+}
+
+export interface ClaimNextAgentIssueOptions {
+	organizationId: string;
+	/** B7: the claimant, resolved from the credential -- never a request param. */
+	agentId: string;
+	type?: 'user_report' | 'system_error';
+	projectId?: string;
+	environment?: string;
+	source?: AgentIssueSource;
+	/** Same vocabulary and direction as `listAgentIssues`: descending on this column, default
+	 *  `lastSeen`, `id` as the tiebreaker. */
+	sort?: AgentIssuesSort;
+}
+
+/**
+ * sentinel-agent-claim-next-issue: `POST /api/agent/issues/claim-next` -- select the next
+ * unclaimed issue and claim it for `agentId` in ONE statement, so two agents polling the same
+ * queue can never both be handed the same row.
+ *
+ * "Next" is defined by the same ordering `GET /api/agent/issues?claimed=false` uses (descending
+ * on `sort`, default `lastSeen`, `id` tiebreak), narrowed to `status = 'unresolved'`: a resolved
+ * or ignored issue is not work, and handing one to a worker loop would only make it release and
+ * ask again. The optional filters are the list route's own (`type`, `project`, `environment`,
+ * `source`), so an agent's discovery query and its claim query cannot disagree about what is
+ * eligible.
+ *
+ * Atomicity: the candidate is picked by a `SELECT ... FOR UPDATE OF issues SKIP LOCKED` subquery
+ * inside the UPDATE, and the UPDATE re-asserts `assigned_to IS NULL`. Under READ COMMITTED that
+ * closes both races: a concurrent claim-next skips the row this one has locked and takes the next
+ * eligible one, and a concurrent single-issue `claimIssue` that committed first makes the outer
+ * predicate fail so the statement updates nothing and this call reports "queue empty" for that
+ * row rather than double-claiming it (the caller then simply asks again). Returns `null` when no
+ * eligible issue exists -- deliberately not an error at this layer.
+ *
+ * The claim it records is byte-for-byte a `claimIssue` claim: same `claimed` activity row, same
+ * claimant auto-subscription, same notification fan-out, via reports.ts's `recordClaim`, all in
+ * this transaction (D18).
+ */
+export async function claimNextAgentIssue(
+	options: ClaimNextAgentIssueOptions
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] } | null> {
+	const sort: AgentIssuesSort = options.sort ?? 'lastSeen';
+	const sortColumn = sort === 'firstSeen' ? issues.firstSeen : issues.lastSeen;
+
+	const conditions = [
+		eq(projects.organizationId, options.organizationId),
+		isNull(issues.assignedTo),
+		eq(issues.status, 'unresolved'),
+	];
+	if (options.type) {
+		conditions.push(eq(issues.issueType, options.type));
+	}
+	if (options.projectId) {
+		conditions.push(eq(issues.projectId, options.projectId));
+	}
+	if (options.environment) {
+		conditions.push(eq(issues.environment, options.environment));
+	}
+	if (options.source) {
+		conditions.push(eq(issues.sourceChannel, options.source));
+	}
+
+	return await db.transaction(async (tx) => {
+		// `FOR UPDATE OF issues` (not the joined projects row) + SKIP LOCKED: concurrent callers
+		// each lock a different candidate instead of queueing on the same one and then losing on
+		// the `assigned_to IS NULL` re-check.
+		const candidate = tx
+			.select({ id: issues.id })
+			.from(issues)
+			.innerJoin(projects, eq(projects.id, issues.projectId))
+			.where(and(...conditions))
+			.orderBy(desc(sortColumn), desc(issues.id))
+			.limit(1)
+			.for('update', { of: issues, skipLocked: true });
+
+		const updated = await tx
+			.update(issues)
+			.set({ assigneeType: 'agent', assignedTo: options.agentId, claimedAt: new Date() })
+			.where(and(sql`${issues.id} = (${candidate})`, isNull(issues.assignedTo)))
+			.returning();
+
+		if (updated.length === 0) {
+			return null;
+		}
+
+		const notified = await recordClaim(tx, updated[0].id, 'agent', options.agentId);
+		return { issue: updated[0], notified };
+	});
 }
 
 /**

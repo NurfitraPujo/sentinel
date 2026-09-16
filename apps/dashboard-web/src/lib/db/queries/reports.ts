@@ -1036,32 +1036,49 @@ export async function claimIssue(
 			throw new ClaimConflictError();
 		}
 
-		await tx.insert(issueActivity).values({
-			issueId,
-			eventType: 'claimed',
-			actorType,
-			actorId,
-			newValue: { assigneeType: actorType, assignedTo: actorId },
-		});
-
-		// §7/§8/M5: the claimant is auto-subscribed (reason 'claimant'), for BOTH actor types as of
-		// M5. M4 only subscribed user claimants (a correct simplification while nothing ever claimed
-		// as an agent); M5's work-loop makes agent claims real, and design §7 step 2 explicitly
-		// requires the subscription ROW to exist ("claimant auto-subscribed") even though
-		// `notifyIssueEvent` (design §8) still skips agent subscribers when building `notifications`
-		// rows -- agents poll comments/activity rather than receive notification rows, so this row's
-		// only consumer today is the subscription-list UI/toggle, not the email/notification fan-out.
-		await subscribe({ issueId, subscriberType: actorType, subscriberId: actorId, reason: 'claimant' }, tx);
-
-		const notified = await notifyIssueEvent(tx, {
-			issueId,
-			kind: 'claimed',
-			actorType,
-			actorId,
-			payload: { assigneeType: actorType, assignedTo: actorId },
-		});
+		const notified = await recordClaim(tx, issueId, actorType, actorId);
 
 		return { issue: updated[0], notified };
+	});
+}
+
+/**
+ * The three writes that accompany a successful claim UPDATE, in the claim's own transaction:
+ * the `claimed` activity row, the claimant auto-subscription, and the notification fan-out.
+ * Extracted from `claimIssue` (unchanged behaviour) so `claimNextAgentIssue` (agent-work.ts) --
+ * which wins its row with a different UPDATE (queue-select + SKIP LOCKED) -- records a claim
+ * indistinguishable from a single-issue one instead of drifting its own copy of these rows.
+ * The caller has ALREADY won the row; this never checks.
+ */
+export async function recordClaim(
+	tx: Tx,
+	issueId: string,
+	actorType: 'user' | 'agent',
+	actorId: string
+): Promise<NotifiedUser[]> {
+	await tx.insert(issueActivity).values({
+		issueId,
+		eventType: 'claimed',
+		actorType,
+		actorId,
+		newValue: { assigneeType: actorType, assignedTo: actorId },
+	});
+
+	// §7/§8/M5: the claimant is auto-subscribed (reason 'claimant'), for BOTH actor types as of
+	// M5. M4 only subscribed user claimants (a correct simplification while nothing ever claimed
+	// as an agent); M5's work-loop makes agent claims real, and design §7 step 2 explicitly
+	// requires the subscription ROW to exist ("claimant auto-subscribed") even though
+	// `notifyIssueEvent` (design §8) still skips agent subscribers when building `notifications`
+	// rows -- agents poll comments/activity rather than receive notification rows, so this row's
+	// only consumer today is the subscription-list UI/toggle, not the email/notification fan-out.
+	await subscribe({ issueId, subscriberType: actorType, subscriberId: actorId, reason: 'claimant' }, tx);
+
+	return await notifyIssueEvent(tx, {
+		issueId,
+		kind: 'claimed',
+		actorType,
+		actorId,
+		payload: { assigneeType: actorType, assignedTo: actorId },
 	});
 }
 

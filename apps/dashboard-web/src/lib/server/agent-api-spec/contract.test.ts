@@ -145,7 +145,13 @@ vi.mock('$lib/db/queries/issues', () => ({
 
 const recordAgentProgress = vi.fn();
 const listAgentIssues = vi.fn();
-vi.mock('$lib/db/queries/agent-work', () => ({ recordAgentProgress, listAgentIssues }));
+const claimNextAgentIssue = vi.fn();
+vi.mock('$lib/db/queries/agent-work', () => ({
+	recordAgentProgress,
+	listAgentIssues,
+	claimNextAgentIssue,
+	AGENT_ISSUE_SOURCES: ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'],
+}));
 
 const getAgentIssueDetail = vi.fn();
 const getAgentReportDetail = vi.fn();
@@ -175,6 +181,7 @@ const issuesListRoute = await import('../../../routes/api/agent/issues/+server')
 const issueDetailRoute = await import('../../../routes/api/agent/issues/[issueId]/+server');
 const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId]/occurrences/+server');
 const claimRoute = await import('../../../routes/api/agent/issues/[issueId]/claim/+server');
+const claimNextRoute = await import('../../../routes/api/agent/issues/claim-next/+server');
 const statusRoute = await import('../../../routes/api/agent/issues/[issueId]/status/+server');
 const commentsRoute = await import('../../../routes/api/agent/issues/[issueId]/comments/+server');
 const questionsRoute = await import('../../../routes/api/agent/issues/[issueId]/questions/+server');
@@ -331,6 +338,40 @@ describe('POST/DELETE /api/agent/issues/{issueId}/claim', () => {
 		);
 		expect(res.status).toBe(200);
 		expect(S.ReleaseResponseSchema.parse(await res.json())).toBeTruthy();
+	});
+});
+
+describe('POST /api/agent/issues/claim-next', () => {
+	it('200: matches IssueDetailResponseSchema with the claim on the issue row', async () => {
+		claimNextAgentIssue.mockResolvedValue({
+			issue: { ...ISSUE_ROW, assigneeType: 'agent', assignedTo: 'agent-1', claimedAt: new Date().toISOString() },
+			notified: [],
+		});
+		getAgentReportDetail.mockResolvedValue(null);
+		getLatestAgentOccurrence.mockResolvedValue(null);
+		getIssueRelations.mockResolvedValue([]);
+		const res = await claimNextRoute.POST(
+			makeEvent('http://localhost/api/agent/issues/claim-next', { method: 'POST', body: { type: 'system_error' } })
+		);
+		expect(res.status).toBe(200);
+		const body = S.IssueDetailResponseSchema.parse(await res.json());
+		expect(body.issue.assignedTo).toBe('agent-1');
+	});
+
+	it('404: empty queue maps to 404 with MessageErrorSchema', async () => {
+		claimNextAgentIssue.mockResolvedValue(null);
+		await expect(
+			claimNextRoute.POST(makeEvent('http://localhost/api/agent/issues/claim-next', { method: 'POST', body: {} }))
+		).rejects.toMatchObject({ status: 404, body: { message: expect.any(String) } });
+	});
+
+	it('400: invalid sort', async () => {
+		await expect(
+			claimNextRoute.POST(
+				makeEvent('http://localhost/api/agent/issues/claim-next', { method: 'POST', body: { sort: 'bogus' } })
+			)
+		).rejects.toMatchObject({ status: 400 });
+		expect(claimNextAgentIssue).not.toHaveBeenCalled();
 	});
 });
 

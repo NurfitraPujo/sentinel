@@ -52,6 +52,21 @@ export const agentApiRegistry: RegistryEntry[] = [
 		},
 	},
 	{
+		path: '/api/agent/issues/claim-next',
+		method: 'post',
+		routeFile: 'src/routes/api/agent/issues/claim-next/+server.ts',
+		operationId: 'claimNextIssue',
+		summary:
+			'Atomically select, claim and return full detail for the next unclaimed unresolved issue (one round trip; concurrent callers never receive the same issue). 404 when no eligible issue exists',
+		request: { bodySchema: S.ClaimNextBodySchema },
+		responses: {
+			'200': S.IssueDetailResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
 		path: '/api/agent/issues/{issueId}/occurrences',
 		method: 'get',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/occurrences/+server.ts',

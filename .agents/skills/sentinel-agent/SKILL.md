@@ -44,6 +44,7 @@ Prefer the `sentinel` CLI (`tools/sentinel-cli`) over raw curl when scripting:
 sentinel issues list [--type T] [--claimed true|false] [--project ID] [--waiting true]
 sentinel issues get <issueId>
 sentinel claim <issueId>            # 409 = owned by someone else, back off
+sentinel claim-next [--type T] [--project ID] [--environment E] [--source S]   # pick+claim+get in one call; exit 4 = queue empty
 sentinel release <issueId>          # releases only your own claim
 sentinel comment <issueId> --body <md>
 sentinel comment edit <issueId> <commentId> --body <md>      # own comment only, 403 otherwise
@@ -66,6 +67,9 @@ table and config resolution order: guide §11.
 2. **Claim** — `sentinel claim <id>`; on conflict (exit 5), skip and move on.
 3. **Read** — `sentinel issues get <id>`: `system_error` → `latestOccurrence.stacktrace`;
    `user_report` → `report.bodyMd` / `report.severity`.
+   Steps 1–3 collapse into `sentinel claim-next [filters]` when you just want the next unclaimed
+   unresolved issue: it is atomic across agents (no 409 to handle), prints the same detail shape
+   as `issues get`, and exits 4 when nothing is left.
 4. **Act** — post a triage `comment`; if blocked, `question` (sets `waiting_on`, forces an email;
    ANY user reply clears it — poll `comments` or `events --type question_answered` to notice) and
    `release`; otherwise `status resolved` (or `ignored`) then `release`.
