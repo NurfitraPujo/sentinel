@@ -30,6 +30,10 @@ package dbmigrations
 //     RUNBOOK recipe (O2) run by the test, not the migration (decision 4), and the re-run passes;
 //   - the gate's session check (decision 16): the same block RAISEs by name when
 //     current_setting('statement_timeout') is not '15min';
+//   - the replay over rollout-window rows (BUG-01): once the index exists, block (b) leaves rows
+//     with project_id NULL alone -- a cross-issue redelivery of a stored event, two NULL rows of
+//     one event, a plain window row -- and the second and third ledgers SUCCEED; the rows are
+//     O3's (decisions 12, 15), run by the test as the operator would, and clear them;
 //   - drop-if-invalid (M5): a failed CONCURRENTLY build left in the database -- an index of the
 //     name that EXISTS with indisvalid = false, produced the real way, by building over a
 //     violating pair -- is dropped and rebuilt valid on replay (a new OID), and a VALID index is
@@ -211,20 +215,117 @@ func TestOccurrenceDedupProjectReplay(t *testing.T) {
 	assertIndexExists(t, db, occurrenceDedupInvalidIndex, false)
 	assertRowCount(t, db, "error_occurrences", 6)
 
-	// The second and third ledgers replay the file on a database that already has every object
-	// it creates: the column is found, the backfill has nothing to do, the gate counts zero, the
-	// VALID index is left alone (same OID -- (d) must never drop a valid index), the build is
-	// skipped by IF NOT EXISTS, (e) passes, and the rows survive.
+	// The rollout window (§8), as the second and third ledgers meet it: the migrate Job replays
+	// the file under the ingestor and dashboard ledgers minutes after the processor ledger built
+	// the index, and old-tag pods have been inserting rows with project_id NULL the whole time
+	// (§13 M2 counted 4,124 of them below ledger 1's cursor). Three shapes, all of which the
+	// backfill's plain `SET project_id = i.project_id ... WHERE project_id IS NULL` would rewrite:
+	//   - a cross-issue redelivery of a STORED event: (I2, e1, NULL) beside the stored (I1, e1, P)
+	//     -- Known limit 6's mechanism, live on the old tag for the whole window. Setting its
+	//     project_id is a 23505 on uq_error_occurrences_project_event from inside the DO block;
+	//   - an old pod's own cross-issue redelivery, BOTH rows NULL: (I1, w2, NULL), (I2, w2, NULL)
+	//     -- they collide with each other inside one batch;
+	//   - a plain window row with no collision at all: (I2, w3, NULL).
+	// Block (b) must not touch any of them once the index exists: they are O3's rows (decisions
+	// 12 and 15 -- the RUNBOOK's two-step sweep is the guarded form), and the backfill's purpose is
+	// the pre-release rows before the build. The replay must SUCCEED, leave the valid index alone
+	// (same OID -- (d) must never drop a valid index; the build is skipped by IF NOT EXISTS), leave
+	// every window row NULL, and keep every pre-release row's backfilled value.
+	windowCross := seedKeyedOccurrenceWithProject(t, db, issueI2, "e1", "")
+	windowNullA := seedKeyedOccurrenceWithProject(t, db, issueI1, "w2", "")
+	windowNullB := seedKeyedOccurrenceWithProject(t, db, issueI2, "w2", "")
+	windowPlain := seedKeyedOccurrenceWithProject(t, db, issueI2, "w3", "")
+	windowRows := []string{windowCross, windowNullA, windowNullB, windowPlain}
+	// Ordered after every pre-release row, so O2's keep-min(created_at) is deterministic below.
+	for i, id := range windowRows {
+		if _, err := db.Exec(`UPDATE error_occurrences SET created_at = $1 WHERE id = $2`, base.Add(time.Duration(10+i)*time.Minute), id); err != nil {
+			t.Fatalf("date window row %s: %v", id, err)
+		}
+	}
+	assertRowCount(t, db, "error_occurrences", 10)
+
 	for _, ledger := range []string{"dashboard_migrations", "processor_migrations"} {
 		replayUnderLedger(t, db, ledger, occurrenceDedupVersion)
 		assertLedgerHas(t, db, ledger, occurrenceDedupVersion, true)
 		assertOccurrenceDedupShape(t, db, true)
-		assertOccurrenceDedupBackfilled(t, db)
 		if got := readIndexOID(t, db, occurrenceDedupIndex); got != rebuiltOID {
 			t.Errorf("replay under %s rebuilt %s (OID %d -> %d); a valid index must be left alone", ledger, occurrenceDedupIndex, rebuiltOID, got)
 		}
-		assertRowCount(t, db, "error_occurrences", 6)
+		assertOccurrenceDedupBackfilledExcept(t, db, windowRows)
+		for _, id := range windowRows {
+			if got := readOccurrenceProjectID(t, db, id); got.Valid {
+				t.Errorf("replay under %s set project_id = %s on window row %s; once the index exists block (b) must leave window rows to O3 (decisions 12, 15)", ledger, got.String, id)
+			}
+		}
+		assertRowCount(t, db, "error_occurrences", 10)
 	}
+
+	// O3, run by the test as the operator would (never by the migration -- decision 4): step 1's
+	// COALESCE group query + O2 delete the later row of each group -- the cross-issue redelivery
+	// of e1 and the later of the two w2 rows -- and step 2's guarded sweep joins the rest to the
+	// key. After it, no row is NULL and every row matches its issue: the migration's own
+	// backfill assertion holds again, which is the end state the troubleshooting row routes to.
+	runOccurrenceDedupO3(t, db)
+	assertOccurrenceDedupBackfilled(t, db)
+	assertRowCount(t, db, "error_occurrences", 8)
+	for _, id := range []string{windowCross, windowNullB} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM error_occurrences WHERE id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("count row %s: %v", id, err)
+		}
+		if n != 0 {
+			t.Errorf("O3 step 1 left the later row %s of its group in place", id)
+		}
+	}
+	for _, id := range []string{windowNullA, windowPlain} {
+		if got := readOccurrenceProjectID(t, db, id); got.String != projectP {
+			t.Errorf("O3 step 2 left window row %s at project_id %q, want %s", id, got.String, projectP)
+		}
+	}
+}
+
+// runOccurrenceDedupO3 is RUNBOOK O3 verbatim -- step 1 (the COALESCE-partitioned O2 delete) then
+// step 2 (the NOT EXISTS-guarded sweep), then the skipped count, which must be zero.
+func runOccurrenceDedupO3(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	mustExec(t, db, `WITH ranked AS (
+	  SELECT o.id,
+	         row_number() OVER (PARTITION BY COALESCE(o.project_id, i.project_id), o.event_id
+	                            ORDER BY o.created_at, o.id) AS rn
+	    FROM error_occurrences o JOIN issues i ON i.id = o.issue_id
+	   WHERE o.event_id IS NOT NULL
+	)
+	DELETE FROM error_occurrences WHERE id IN (SELECT id FROM ranked WHERE rn > 1)`)
+	mustExec(t, db, `UPDATE error_occurrences o
+	   SET project_id = i.project_id
+	  FROM issues i
+	 WHERE i.id = o.issue_id
+	   AND o.project_id IS NULL
+	   AND NOT EXISTS (SELECT 1 FROM error_occurrences x
+	                    WHERE x.project_id = i.project_id AND x.event_id = o.event_id)`)
+	var skipped int
+	if err := db.QueryRow(`SELECT count(*)
+	  FROM error_occurrences o JOIN issues i ON i.id = o.issue_id
+	 WHERE o.project_id IS NULL AND o.event_id IS NOT NULL
+	   AND EXISTS (SELECT 1 FROM error_occurrences x
+	                WHERE x.project_id = i.project_id AND x.event_id = o.event_id)`).Scan(&skipped); err != nil {
+		t.Fatalf("O3 skipped count: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("O3 step 2 skipped %d row(s) after step 1; want 0", skipped)
+	}
+}
+
+// readOccurrenceProjectID returns the row's project_id, Valid = false when it is NULL.
+func readOccurrenceProjectID(t *testing.T, db *sql.DB, id string) sql.NullString {
+	t.Helper()
+
+	var got sql.NullString
+	if err := db.QueryRow(`SELECT project_id::text FROM error_occurrences WHERE id = $1`, id).Scan(&got); err != nil {
+		t.Fatalf("read project_id of %s: %v", id, err)
+	}
+	return got
 }
 
 // TestOccurrenceDedupProjectGateChecksSession runs gate block (c) on its own, out of the file's
@@ -417,7 +518,11 @@ func TestOccurrenceDedupProjectFileIsShapedAsDecided(t *testing.T) {
 	// The backfill: batched by id range with a COMMIT per batch, the batch size 10,000 in the
 	// block and stated in the header (decision 20).
 	backfill := joined(gooseBlockContaining(t, occurrenceDedupFile, "SET project_id = i.project_id"))
-	for _, want := range []string{"batch_size CONSTANT integer := 10000;", "AND project_id IS NULL ORDER BY id LIMIT batch_size", "COMMIT;", "AND o.project_id IS NULL;", "FROM issues i WHERE i.id = o.issue_id"} {
+	// BUG-01: the sweep is not safe once the index exists (decision 15's hazard, the migration's
+	// own statement), so the block exits by name before its first batch when either name of the
+	// index -- valid, invalid, or the renamed leftover -- is in the catalog.
+	for _, want := range []string{"batch_size CONSTANT integer := 10000;", "AND project_id IS NULL ORDER BY id LIMIT batch_size", "COMMIT;", "AND o.project_id IS NULL;", "FROM issues i WHERE i.id = o.issue_id",
+		"to_regclass('" + occurrenceDedupIndex + "') IS NOT NULL", "to_regclass('" + occurrenceDedupInvalidIndex + "') IS NOT NULL"} {
 		if !strings.Contains(backfill, want) {
 			t.Errorf("%s: backfill block lacks %q (decision 20 / §4.2 (b)): %q", occurrenceDedupFile, want, backfill)
 		}
@@ -518,12 +623,20 @@ func assertOccurrenceDedupShape(t *testing.T, db *sql.DB, want bool) {
 // project_id and every row's project_id equals its issue's.
 func assertOccurrenceDedupBackfilled(t *testing.T, db *sql.DB) {
 	t.Helper()
+	assertOccurrenceDedupBackfilledExcept(t, db, nil)
+}
+
+// assertOccurrenceDedupBackfilledExcept is assertOccurrenceDedupBackfilled over every row but the
+// given ids -- the rollout-window rows a replay after the build must leave to O3.
+func assertOccurrenceDedupBackfilledExcept(t *testing.T, db *sql.DB, except []string) {
+	t.Helper()
 
 	var nulls, mismatched int
 	if err := db.QueryRow(
 		`SELECT count(*) FILTER (WHERE o.project_id IS NULL),
 		        count(*) FILTER (WHERE o.project_id IS DISTINCT FROM i.project_id)
-		   FROM error_occurrences o JOIN issues i ON i.id = o.issue_id`,
+		   FROM error_occurrences o JOIN issues i ON i.id = o.issue_id
+		  WHERE NOT (o.id::text = ANY ($1::text[]))`, append([]string{}, except...),
 	).Scan(&nulls, &mismatched); err != nil {
 		t.Fatalf("read the backfill's result: %v", err)
 	}

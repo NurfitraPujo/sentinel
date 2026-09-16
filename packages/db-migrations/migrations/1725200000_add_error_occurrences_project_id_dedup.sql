@@ -26,10 +26,23 @@
 --       with project_id IS NULL ordered by id`, one UPDATE over that id range, one COMMIT. Only
 --       row locks on the rows rewritten; a concurrent StoreEvent inserts new rows, so ingest is
 --       not stalled. Idempotent and resumable: a statement_timeout mid-loop keeps every
---       committed batch and the re-run continues from the remaining NULLs; the second and third
---       ledgers find no NULL row and exit after one index scan. statement_timeout = '15min'
---       bounds the whole DO block; the per-batch duration at >= 1,000,000 rows is §13 M2's
---       measurement and is recorded in the feature's status/be.md, not here.
+--       committed batch and the re-run continues from the remaining NULLs. statement_timeout =
+--       '15min' bounds the whole DO block; the per-batch duration at >= 1,000,000 rows is §13
+--       M2's measurement and is recorded in the feature's status/be.md, not here.
+--       The block runs ONLY while no index of the key exists (to_regclass on both names, the
+--       valid/invalid one and (d)'s renamed leftover, is NULL) and exits by name otherwise. Its
+--       purpose is the pre-release rows before the build; once an index exists -- even an
+--       invalid one, which writes still maintain -- every remaining NULL row was inserted
+--       after the backfill ran, i.e. by an old-tag pod in the rollout window (§8; M2 counted
+--       4,124 of them below ledger 1's cursor), and those rows are O3's (decisions 12, 15): a
+--       window row (I1, k, NULL) whose event was redelivered cross-issue and stored as
+--       (I2, k, P), or two NULL rows of one event, makes this plain UPDATE raise 23505 on
+--       uq_error_occurrences_project_event from inside the DO block -- the second and third
+--       ledgers replay the file minutes after the first built the index, and a 23505 there
+--       fails the migrate Job on every retry with no pod rolled. The RUNBOOK's O3 is the
+--       guarded form of the same sweep (step 1's COALESCE group query + O2, then step 2's NOT
+--       EXISTS), run by an operator; the guard is not applied here because unindexed, on the
+--       first ledger, it is a per-row seq scan over 769,590 rows.
 --   (c) the duplicate gate -- RAISE EXCEPTION naming the number of (project_id, event_id) groups
 --       with more than one row, on the index's own predicate and grouped on the COLUMN, not via
 --       the issues join (decision 21). A unique CONCURRENTLY build over a violated key fails
@@ -56,8 +69,9 @@
 --
 -- Re-runnable at every block: a failure leaves everything before it applied and the ledger
 -- unadvanced, and the next sync re-runs the file top to bottom. Three ledgers replay it (hazard
--- sentinel_goose_target): the second and third find the column, a backfill with nothing left to
--- do, zero groups, a valid index (untouched), IF NOT EXISTS skips the build, (e) passes.
+-- sentinel_goose_target): the second and third find the column, a backfill that exits because
+-- the index exists (leaving any rollout-window row NULL for O3), zero groups on the column, a
+-- valid index (untouched), IF NOT EXISTS skips the build, (e) passes.
 --
 -- Deploy order (§8): this file before any processor build that writes project_id, which the
 -- migrate Job (ArgoCD wave 1) and compose's `depends_on: migrate` already enforce. Down is paired
@@ -81,6 +95,15 @@ DECLARE
     last_id uuid := NULL;
     hi uuid;
 BEGIN
+    -- Block (b) is for the rows that predate the index. Once any index of the key exists --
+    -- valid, invalid (writes maintain it all the same), or the leftover (d) renames -- a row
+    -- still NULL is a rollout-window row and belongs to the RUNBOOK's guarded sweep (O3): the
+    -- plain UPDATE below would raise 23505 on it (see the header).
+    IF to_regclass('uq_error_occurrences_project_event') IS NOT NULL
+       OR to_regclass('uq_error_occurrences_project_event_invalid') IS NOT NULL THEN
+        RAISE NOTICE '1725200000 backfill (b): uq_error_occurrences_project_event exists -- the backfill is skipped; rows with project_id IS NULL are rollout-window rows for the RUNBOOK sweep (O3)';
+        RETURN;
+    END IF;
     LOOP
         -- The next batch: the first batch_size rows still NULL past the previous batch's upper
         -- bound, by id (the primary key, so this is one index range scan); hi is its upper
