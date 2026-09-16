@@ -1,0 +1,1 @@
+{"version":3,"file":"framework-3c4d.js","sources":["node_modules/react/index.js"],"sourcesContent":["// node_modules/react/index.js\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

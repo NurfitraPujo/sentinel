@@ -1,0 +1,23 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "platform": "javascript",
+  "environment": "production",
+  "error_class": "Error",
+  "message": "traced",
+  "stacktrace": [
+    {
+      "file": "https://app/_next/static/chunks/app/page-9b0d4e.js",
+      "line": 3,
+      "column": 3,
+      "function": "fetchOrders",
+      "in_app": true
+    }
+  ],
+  "metadata": {
+    "runtime": "browser"
+  },
+  "timestamp": "2026-09-16T12:00:00.000Z",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "trace_flags": 1
+}

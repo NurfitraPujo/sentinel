@@ -1,0 +1,1 @@
+{"version":3,"sources":["turbopack:///[project]/instrumentation.ts"],"sourcesContent":["// turbopack:///[project]/instrumentation.ts\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

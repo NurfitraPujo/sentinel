@@ -1,0 +1,1 @@
+{"version":3,"sources":["turbopack:///[turbopack]/browser/runtime/base/runtime-base.ts"],"sourcesContent":["// turbopack:///[turbopack]/browser/runtime/base/runtime-base.ts\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

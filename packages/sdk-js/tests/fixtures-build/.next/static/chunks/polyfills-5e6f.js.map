@@ -1,0 +1,1 @@
+{"version":3,"file":"polyfills-5e6f.js","sources":["node_modules/polyfills.js"],"sourcesContent":["// node_modules/polyfills.js\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

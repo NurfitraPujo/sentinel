@@ -1,0 +1,20 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "platform": "javascript",
+  "environment": "production",
+  "error_class": "Error",
+  "message": "module scope",
+  "stacktrace": [
+    {
+      "file": "/app/.next/server/app/page.js",
+      "line": 9,
+      "column": 10,
+      "function": "Object.<anonymous>",
+      "in_app": true
+    }
+  ],
+  "metadata": {
+    "runtime": "browser"
+  },
+  "timestamp": "2026-09-16T12:00:00.000Z"
+}

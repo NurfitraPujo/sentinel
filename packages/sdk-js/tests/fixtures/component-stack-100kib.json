@@ -1,0 +1,24 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "platform": "javascript",
+  "environment": "production",
+  "error_class": "Error",
+  "message": "boundary",
+  "stacktrace": [
+    {
+      "file": "https://app/_next/static/chunks/app/page-9b0d4e.js",
+      "line": 2,
+      "column": 2,
+      "function": "Page",
+      "in_app": true
+    }
+  ],
+  "metadata": {
+    "runtime": "browser",
+    "react_component_stack": "\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-pages-browser)/./src/app/page.tsx:12:5)\n    at Page (webpack-internal:///(app-p",
+    "truncated": [
+      "react_component_stack"
+    ]
+  },
+  "timestamp": "2026-09-16T12:00:00.000Z"
+}
