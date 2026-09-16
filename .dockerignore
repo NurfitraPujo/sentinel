@@ -6,3 +6,7 @@
 # read it run on the host, never inside an image. Excluding it keeps the bundle out of every
 # build context (decision 39).
 tests/fixtures
+# packages/sdk-js's `pnpm install` and `prepare` leave node_modules/ and dist/ that no Dockerfile COPYs
+# (the SDK is a git dependency of its consumers, built on their side — sentinel-sdk-js contract §4.1 / D1).
+packages/sdk-js/node_modules
+packages/sdk-js/dist

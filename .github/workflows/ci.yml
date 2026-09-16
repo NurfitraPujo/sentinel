@@ -331,6 +331,103 @@ jobs:
         run: pnpm test
 
   # ---------------------------------------------------------------------------------------------------------
+  # sdk-js-node: packages/sdk-js (the JavaScript/TypeScript SDK, sentinel-sdk-js contract §4.10, decisions 30
+  # and 35). A node 20 + node 22 matrix: `web`'s pods run node:20-alpine, so the runtime entries must load and
+  # pass on 20, and 22 is the runner `web` builds on. Every leg installs with --frozen-lockfile (pnpm-lock.yaml
+  # governs CI only — a consumer never reads it), typechecks, builds and asserts `dependencies` is absent from
+  # package.json (contract §11). The node-20 leg additionally runs the CONSUMER PATH: `npm install && npm run
+  # prepare` in a clean copy of packages/sdk-js without node_modules — pnpm hands a git dependency's lifecycle
+  # scripts to npm, so a `prepare` that shells to `pnpm` or a `^`-floated devDependency is red here, on every
+  # event, rather than in a consumer's Dockerfile.
+  # `pnpm test` and `pnpm size` carry the same `if: github.event_name != 'pull_request'` guard as go-root's
+  # `go test ./tests/unit/...` (PR scope, 2026-09-06: two full suites per change on a shared pool) — a PR run
+  # proves typecheck and build only (decision 30). `pnpm size` is report-only in v0.1 (decision 40): it prints
+  # the default-level gzip byte count of the raw dist/nextjs/client.js and exits 0, and prints a note and exits
+  # 0 when that file does not exist yet.
+  # ---------------------------------------------------------------------------------------------------------
+  sdk-js-node:
+    name: sdk-js-node (${{ matrix.node }})
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
+    defaults:
+      run:
+        working-directory: packages/sdk-js
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: packages/sdk-js/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm typecheck
+        run: pnpm typecheck
+
+      - name: pnpm build
+        run: pnpm build
+
+      # Contract §11: package.json has no `dependencies` key — absent, not empty. Hard-gate on both legs.
+      - name: no runtime dependencies
+        run: pnpm check:no-dependencies
+
+      # The consumer path (contract §4.1 rule 4): what `pnpm add git+https://…#<ref>&path:packages/sdk-js`
+      # actually runs inside the clone — npm, not pnpm, with devDependencies resolved fresh from package.json.
+      # `git archive` gives exactly the committed files: no node_modules, no dist, no lockfile but pnpm's.
+      # (Run from the repo root: `git archive HEAD:<path>` resolves <path> under the current directory prefix,
+      # so from packages/sdk-js the same spelling archives nothing.)
+      - name: consumer path — npm install && npm run prepare in a clean copy (node 20)
+        if: matrix.node == 20
+        run: |
+          clean="$(mktemp -d)"
+          git -C "$GITHUB_WORKSPACE" archive HEAD:packages/sdk-js | tar -x -C "$clean"
+          cd "$clean"
+          npm install
+          npm run prepare
+          test -f dist/core/index.js && test -f dist/core/index.d.ts
+
+      - name: pnpm test
+        if: github.event_name != 'pull_request'
+        run: pnpm test
+
+      # Report-only (decision 40): prints sdk_js_client_entry_gzip_bytes, exits 0 whatever the number.
+      - name: pnpm size
+        if: github.event_name != 'pull_request' && matrix.node == 20
+        run: pnpm size
+
+  # ---------------------------------------------------------------------------------------------------------
+  # sdk-js: the aggregate gate for sdk-js-node (decision 35). A matrix job's check runs are named
+  # `sdk-js-node (20)` / `sdk-js-node (22)` — the shape the plane's registry refuses as a gate ref (see go-sdk),
+  # and this repo has no branch protection to fall back on — so this non-matrix job is the check named exactly
+  # `sdk-js` that the feature's PR is read on (the seat registers `github-check:sdk-js`). `if: always()` so it
+  # reports when a leg fails or is cancelled; it fails unless every leg succeeded and otherwise passes in
+  # seconds.
+  # ---------------------------------------------------------------------------------------------------------
+  sdk-js:
+    name: sdk-js
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
+    needs: [sdk-js-node]
+    if: always()
+    steps:
+      - name: every sdk-js-node leg succeeded
+        run: |
+          if [ "${{ needs.sdk-js-node.result }}" != "success" ]; then
+            echo "sdk-js-node result: ${{ needs.sdk-js-node.result }}"
+            exit 1
+          fi
+          echo "sdk-js-node (20) and (22) succeeded"
+
+  # ---------------------------------------------------------------------------------------------------------
   # integration: boots the real compose stack and runs the integration suite with SENTINEL_E2E=1, which is
   # P0-4's mechanism for turning "infra unreachable" from a silent skip into a hard failure (C5) — this is the
   # direct reason S3 (100% of /ingest rejected) survived to main undetected. Written against the POST-fix
