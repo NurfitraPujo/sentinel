@@ -433,8 +433,11 @@ O3's sweep joins them to it on the next roll-forward.
 
 **Step 1 — the processor image roll-back, to `v0.2.18`** (the previous tag,
 contract decision 26). The ingestor did not change on this tag; the dashboard's
-only change is the Drizzle mirror's declaration of the column, and a dashboard
-on either tag is correct against either schema — neither needs a roll-back:
+only change is the Drizzle mirror's declaration of the column. **In this step —
+an image roll-back with the migrated schema left in place — neither the ingestor
+nor the dashboard needs a roll-back**: a dashboard on either tag is correct
+against the *migrated* schema (the old tag never names the column, the new tag
+reads a column that exists):
 
 ```bash
 argocd app set sentinel-<env> --parameter images.processor.tag=v0.2.18
@@ -444,18 +447,37 @@ kubectl --context hwc-daya-cce-production -n sentinel-<env> rollout status deplo
 
 That is the whole rollback. Stop here.
 
-**Step 2 — `Down`, only if the column itself must go, and never before step 1
-has completed.** `Down` drops `uq_error_occurrences_project_event` (concurrently)
-and then `error_occurrences.project_id`. A processor on this feature's tag
-against a database that ran `Down` gets **`42703` (undefined column
-`project_id`) on every `INSERT`** — class 42, which `classifyStoreError` leaves
-*retryable*, so every event burns `MaxDeliver` (7) and is dead-lettered until the
-tag is rolled: an ingest outage, not a broken chart (contract §7, §8). That is why
-`Down` is not part of a rollback and why, if it is ever run, the running pods
-must already be on `v0.2.18`:
+**Step 2 — `Down`, only if the column itself must go, and never before BOTH
+`images.processor.tag=v0.2.18` AND `images.dashboard.tag=v0.2.18` have rolled
+out.** `Down` drops `uq_error_occurrences_project_event` (concurrently) and then
+`error_occurrences.project_id`, and *both* new-tag services read that column:
+
+- A processor on this feature's tag against a database that ran `Down` gets
+  **`42703` (undefined column `project_id`) on every `INSERT`** — class 42, which
+  `classifyStoreError` leaves *retryable*, so every event burns `MaxDeliver` (7)
+  and is dead-lettered until the tag is rolled: an ingest outage, not a broken
+  chart (contract §7, §8).
+- A dashboard on this feature's tag is **not** correct against the Down'd schema,
+  because step 1's "either tag" only held while the column existed.
+  `getOccurrencesByIssueId` (`apps/dashboard-web/src/lib/server/queries/issue-queries.ts:200`)
+  is a bare `db.select().from(errorOccurrences)`, which Drizzle expands to every
+  column the mirror declares — including `project_id` — so after `Down` every
+  `/issues/[id]` page load (`routes/issues/[id]/+page.server.ts:86`) fails with
+  **`42703` `column "project_id" does not exist`** until the dashboard image is
+  rolled back or the file is re-applied.
+
+That is why `Down` is not part of a rollback and why, if it is ever run, the
+running pods of BOTH Deployments must already be on `v0.2.18` — the general rule
+at the top of §3 (`down` is never run with new-tag pods attached) applies to the
+dashboard exactly as it does to the processor:
 
 ```bash
-# Only after step 1's rollout status reports the roll complete, from the migrate image's shell:
+# Precondition: BOTH rollouts complete on v0.2.18 — step 1's processor roll, plus the dashboard:
+argocd app set sentinel-<env> --parameter images.dashboard.tag=v0.2.18
+argocd app sync sentinel-<env>
+kubectl --context hwc-daya-cce-production -n sentinel-<env> rollout status deploy/sentinel-sentinel-processor
+kubectl --context hwc-daya-cce-production -n sentinel-<env> rollout status deploy/sentinel-sentinel-dashboard
+# Only after BOTH rollout status commands report the roll complete, from the migrate image's shell:
 migrate status -target=processor     # `down` rolls the ledger's LATEST version back: confirm it is 1725200000
 migrate down -target=processor
 # then the same for the other two ledgers, which replayed the file (hazard sentinel_goose_target):
@@ -720,3 +742,4 @@ running new-tag processor that is an ingest outage.
 | Migrate Job fails, log names `1725200000 check (e): … indisvalid = false` | the concurrent build found a violation the gate could not see, or was killed mid-scan | O1 (a group formed between the gate and the scan → O2), then re-sync: block (d) drops the invalid index and rebuilds |
 | Migrate Job fails, log shows `duplicate key value violates unique constraint "uq_error_occurrences_project_event" (SQLSTATE 23505)` under the backfill `DO $$` (block (b): `SET project_id = i.project_id … AND o.project_id IS NULL`), same failure on every retry, under the `ingestor` or `dashboard` target | block (b)'s sweep ran with the index already present — a rollout-window row (`project_id IS NULL`, an old-tag pod's insert) whose event is already stored under the key on another issue (contract decision 15's hazard). The block's `to_regclass` guard exits before the first batch when the index exists; seeing this means the migrate image predates that guard — check the tag | §2's **O3 step 1**: the `COALESCE(o.project_id, i.project_id)` group query, then O2 on every group it returns; re-sync, and run O3 in full once the roll completes |
 | Processor dead-letters every event with `42703` on `project_id` after a rollback | `migrate down` ran while new-tag processor pods were attached | §3's rollback entry: processor tag `v0.2.18` FIRST; `Down` is not part of a rollback |
+| Dashboard `/issues/[id]` returns 500 on every load after a rollback; dashboard log shows `42703` `column "project_id" does not exist` | `migrate down` ran while new-tag dashboard pods were attached — `getOccurrencesByIssueId` (`issue-queries.ts:200`) is a bare `select()` that names every mirror column, `project_id` included | §3's rollback entry, step 2's precondition: roll the dashboard tag back to `v0.2.18` FIRST (`images.dashboard.tag=v0.2.18`, `rollout status deploy/sentinel-sentinel-dashboard`); re-applying the file also clears it |
