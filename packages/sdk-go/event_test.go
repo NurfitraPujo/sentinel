@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -68,5 +69,70 @@ func TestNewEventFieldsMatchWireContract(t *testing.T) {
 	}
 	if ev.Metadata["user_id"] != "u1" {
 		t.Errorf("expected Metadata[user_id]=u1, got %v", ev.Metadata["user_id"])
+	}
+}
+
+type customSDKError struct {
+	msg string
+}
+
+func (e *customSDKError) Error() string { return e.msg }
+
+func TestExtractErrorClassUnwrapsChains(t *testing.T) {
+	cfg := Config{ProjectKey: "pk_test"}
+	base := &customSDKError{msg: "inner"}
+
+	cases := []struct {
+		name      string
+		err       error
+		wantClass string
+	}{
+		{"nil error", nil, "Error"},
+		{"errors.New", errors.New("plain"), "*errors.errorString"},
+		{"single wrap", fmt.Errorf("wrap: %w", base), "*sentinel.customSDKError"},
+		{"double wrap", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", base)), "*sentinel.customSDKError"},
+		{"join wrap", errors.Join(fmt.Errorf("wrap: %w", base), errors.New("other")), "*sentinel.customSDKError"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := NewEvent(cfg, tc.err, nil)
+			if ev.ErrorClass != tc.wantClass {
+				t.Errorf("expected ErrorClass=%q, got %q", tc.wantClass, ev.ErrorClass)
+			}
+			if tc.err != nil && ev.ErrorClass == "*fmt.wrapError" {
+				t.Errorf("error class must never be *fmt.wrapError")
+			}
+		})
+	}
+}
+
+func TestNewEventOptionsAndOverrides(t *testing.T) {
+	cfg := Config{ProjectKey: "pk_test"}
+	err := fmt.Errorf("wrap: %w", &customSDKError{msg: "foo"})
+
+	// Context tags override
+	tags := map[string]interface{}{
+		"fingerprint": "custom-tag-fp",
+		"error_class": "ExplicitTagClass",
+	}
+	evTags := NewEvent(cfg, err, tags)
+	if evTags.Fingerprint != "custom-tag-fp" {
+		t.Errorf("expected Fingerprint=custom-tag-fp, got %q", evTags.Fingerprint)
+	}
+	if evTags.ErrorClass != "ExplicitTagClass" {
+		t.Errorf("expected ErrorClass=ExplicitTagClass, got %q", evTags.ErrorClass)
+	}
+
+	// Functional options override
+	evOpts := NewEvent(cfg, err, tags,
+		WithEventFingerprint("fp-from-opt"),
+		WithEventErrorClass("ClassFromOpt"),
+	)
+	if evOpts.Fingerprint != "fp-from-opt" {
+		t.Errorf("expected Fingerprint=fp-from-opt, got %q", evOpts.Fingerprint)
+	}
+	if evOpts.ErrorClass != "ClassFromOpt" {
+		t.Errorf("expected ErrorClass=ClassFromOpt, got %q", evOpts.ErrorClass)
 	}
 }

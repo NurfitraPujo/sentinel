@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -172,24 +173,100 @@ func newEventID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func NewEvent(cfg Config, err error, ctxTags map[string]interface{}) *Event {
+// extractErrorClass resolves the error class from err by unwrapping the error
+// chain down to the root/innermost cause so that wrapper types such as
+// *fmt.wrapError (from fmt.Errorf("%w", err)) or join errors resolve to the
+// underlying concrete error type.
+func extractErrorClass(err error) string {
+	if err == nil {
+		return "Error"
+	}
+	curr := err
+	for {
+		switch u := curr.(type) {
+		case interface{ Unwrap() error }:
+			unwrapped := u.Unwrap()
+			if unwrapped == nil {
+				return fmt.Sprintf("%T", curr)
+			}
+			curr = unwrapped
+		case interface{ Unwrap() []error }:
+			unwrappedList := u.Unwrap()
+			var found error
+			for _, item := range unwrappedList {
+				if item != nil {
+					found = item
+					break
+				}
+			}
+			if found == nil {
+				return fmt.Sprintf("%T", curr)
+			}
+			curr = found
+		default:
+			unwrapped := errors.Unwrap(curr)
+			if unwrapped == nil {
+				return fmt.Sprintf("%T", curr)
+			}
+			curr = unwrapped
+		}
+	}
+}
+
+// EventOption configures an Event during NewEvent construction.
+type EventOption func(*Event)
+
+// WithEventFingerprint sets a custom fingerprint on the Event.
+func WithEventFingerprint(fingerprint string) EventOption {
+	return func(e *Event) {
+		e.Fingerprint = fingerprint
+	}
+}
+
+// WithEventErrorClass sets a custom error class on the Event.
+func WithEventErrorClass(errorClass string) EventOption {
+	return func(e *Event) {
+		e.ErrorClass = errorClass
+	}
+}
+
+func NewEvent(cfg Config, err error, ctxTags map[string]interface{}, opts ...EventOption) *Event {
 	errMsg := ""
 	errClass := "Error"
 	if err != nil {
 		errMsg = err.Error()
-		errClass = fmt.Sprintf("%T", err)
+		errClass = extractErrorClass(err)
 	}
 
-	return &Event{
+	var fp string
+	if ctxTags != nil {
+		if ec, ok := ctxTags["error_class"].(string); ok && ec != "" {
+			errClass = ec
+		}
+		if f, ok := ctxTags["fingerprint"].(string); ok && f != "" {
+			fp = f
+		}
+	}
+
+	ev := &Event{
 		EventID:        newEventID(),
 		ProjectKey:     cfg.ProjectKey,
 		Platform:       "go",
 		ErrorClass:     errClass,
 		Message:        errMsg,
+		Fingerprint:    fp,
 		Stacktrace:     ExtractStacktrace(3),
 		Timestamp:      time.Now().UTC(),
 		Environment:    cfg.Environment,
 		ReleaseVersion: cfg.ReleaseVersion,
 		Metadata:       ScrubPII(ctxTags),
 	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(ev)
+		}
+	}
+
+	return ev
 }

@@ -75,6 +75,13 @@ func (c *Client) CaptureErrorContext(ctx context.Context, err error, additionalC
 	event.SpanID = spanID
 	event.TraceFlags = traceFlags
 
+	if fp := ExtractFingerprint(ctx); fp != "" {
+		event.Fingerprint = fp
+	}
+	if ec := ExtractErrorClass(ctx); ec != "" {
+		event.ErrorClass = ec
+	}
+
 	c.transport.Push(event)
 }
 

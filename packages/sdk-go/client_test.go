@@ -1,7 +1,10 @@
 package sentinel
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -30,5 +33,41 @@ func TestClientLatencyAndAutoInit(t *testing.T) {
 	ok := Flush(2 * time.Second)
 	if !ok {
 		t.Errorf("expected flush to succeed")
+	}
+}
+
+func TestCaptureErrorContextCarriesFingerprintAndErrorClass(t *testing.T) {
+	var received Event
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("failed to decode received event: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+
+	client := Init(Config{
+		ProjectKey: "pk_test",
+		Endpoint:   ts.URL,
+		BatchSize:  1,
+	})
+
+	ctx := context.Background()
+	ctx = WithFingerprint(ctx, "custom-fingerprint-123")
+	ctx = WithErrorClass(ctx, "ExplicitErrorClass")
+
+	wrapped := fmt.Errorf("outer: %w", errors.New("inner"))
+	client.CaptureErrorContext(ctx, wrapped)
+
+	ok := Flush(2 * time.Second)
+	if !ok {
+		t.Fatalf("expected flush to succeed")
+	}
+
+	if received.Fingerprint != "custom-fingerprint-123" {
+		t.Errorf("expected Fingerprint=custom-fingerprint-123, got %q", received.Fingerprint)
+	}
+	if received.ErrorClass != "ExplicitErrorClass" {
+		t.Errorf("expected ErrorClass=ExplicitErrorClass, got %q", received.ErrorClass)
 	}
 }

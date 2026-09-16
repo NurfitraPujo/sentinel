@@ -25,6 +25,32 @@ func TestContextHelpers(t *testing.T) {
 	}
 }
 
+func TestFingerprintAndErrorClassContext(t *testing.T) {
+	ctx := context.Background()
+	if got := ExtractFingerprint(ctx); got != "" {
+		t.Fatalf("expected empty fingerprint, got %q", got)
+	}
+	if got := ExtractErrorClass(ctx); got != "" {
+		t.Fatalf("expected empty error class, got %q", got)
+	}
+	if got := ExtractFingerprint(nil); got != "" {
+		t.Fatalf("expected empty fingerprint for nil ctx, got %q", got)
+	}
+	if got := ExtractErrorClass(nil); got != "" {
+		t.Fatalf("expected empty error class for nil ctx, got %q", got)
+	}
+
+	ctx = WithFingerprint(ctx, "custom-fingerprint")
+	ctx = WithErrorClass(ctx, "CustomErrorClass")
+
+	if got := ExtractFingerprint(ctx); got != "custom-fingerprint" {
+		t.Errorf("expected custom-fingerprint, got %q", got)
+	}
+	if got := ExtractErrorClass(ctx); got != "CustomErrorClass" {
+		t.Errorf("expected CustomErrorClass, got %q", got)
+	}
+}
+
 // The server accepts, maps and stores trace_flags end to end
 // (ingestor validation -> mapping -> processor), but ExtractTraceIDs read only the
 // ids off the SpanContext and dropped the flags that sit on the same object — so
