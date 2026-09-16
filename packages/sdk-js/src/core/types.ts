@@ -128,6 +128,45 @@ export interface ResolvedCoreOptions {
   inApp?: (frame: StackFrame) => boolean | undefined;
 }
 
+/**
+ * The transport's options (contract §4.2's table, §4.4) — every runtime's, as one shape: the runtime entries
+ * (task 5) narrow it per entry (`apiKey` does not exist on the browser type, decision 31). The defaults and
+ * degradations are applied in client.ts.
+ */
+export interface TransportOptions {
+  /** The ring buffer (§4.4); default 100. */
+  maxBufferSize?: number;
+  /** Default 10, clamped to `[1, 50]`. */
+  batchSize?: number;
+  /** Default 1 000; forced to `0` — "drain on the next microtask" — on the edge build. */
+  batchWaitMs?: number;
+  /** node, edge: the `/ingest` URL; the batch URL is `endpoint.replace(/\/$/, '') + '/batch'`. */
+  endpoint?: string;
+  /** node, edge: sent as `X-API-Key`; never in the body, never on `getClient().options`. */
+  apiKey?: string;
+  /** node, edge: sent as `X-Project-Key` when set. */
+  projectKey?: string;
+  /** browser: the same-origin URL the browser posts to. */
+  tunnel?: string;
+  /** browser: the page-hide send (§4.4); default `true`. */
+  flushOnHide?: boolean;
+}
+
+export type InitOptions = CoreOptions & TransportOptions;
+
+/** The transport options as `init` resolved them — the `apiKey` is not here (redacted, decision 36). */
+export interface ResolvedTransportOptions {
+  maxBufferSize: number;
+  batchSize: number;
+  batchWaitMs: number;
+  flushOnHide: boolean;
+  endpoint?: string;
+  projectKey?: string;
+  tunnel?: string;
+}
+
+export type ResolvedOptions = ResolvedCoreOptions & ResolvedTransportOptions;
+
 /** The opaque client of decision 36: nothing callable. */
 export interface SentinelClient {
   readonly options: Readonly<ResolvedCoreOptions & Record<string, unknown>>;

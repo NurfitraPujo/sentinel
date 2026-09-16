@@ -167,8 +167,15 @@ function send(client: InternalClient, event: SentinelEvent, originalException: u
   }
   if (isThenable(result)) {
     // A pending hook holds its event out of the queue until it settles, then enqueues into the client current
-    // at that moment (contract §4.2); a rejection ≡ a throw.
-    void Promise.resolve(result).then(settle, threw);
+    // at that moment (contract §4.2); a rejection ≡ a throw. Tracked on the slot so `flush` can wait for it (B9).
+    const pending = getSlot().pending;
+    const tracked: Promise<void> = Promise.resolve(result)
+      .then(settle, threw)
+      .catch(() => undefined)
+      .then(() => {
+        pending.delete(tracked);
+      });
+    pending.add(tracked);
     return;
   }
   settle(result);

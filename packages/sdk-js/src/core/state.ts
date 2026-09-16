@@ -3,22 +3,35 @@
 // because `.` and `./browser` bundled separately are two module instances that must see one SDK. The slot is
 // created lazily on first access — reading it touches nothing but `globalThis` (import-time inertness, §11).
 
-import type { ResolvedCoreOptions, Runtime, SentinelEvent } from './types.js';
+import type { QueuedEvent } from './queue.js';
+import type { Transport } from './transport/transport.js';
+import type { ResolvedOptions, Runtime, SentinelEvent } from './types.js';
 
 export const SDK_NAME = '@sentinel/sdk-js';
 
 export const SLOT_KEY: unique symbol = Symbol.for(SDK_NAME);
 
 /**
- * The client as the pipeline sees it. The transport (contract §4.4) replaces `enqueue` with the ring buffer and
- * the batch worker; until then a queue of the serialised strings is what `enqueue` fills, and what a test reads.
+ * The client as the pipeline sees it: the resolved options, the transport of contract §4.4 when the runtime's
+ * target (`endpoint` / `tunnel`) resolved — a client without one keeps the serialised events in a plain queue —
+ * and the teardown hooks `close` runs.
  */
 export interface InternalClient {
-  readonly options: ResolvedCoreOptions;
+  readonly options: ResolvedOptions;
   readonly runtime: Runtime;
-  /** The serialised events in enqueue order — the string is what the transport sends (contract §4.3). */
-  readonly queue: string[];
+  readonly transport: Transport | undefined;
+  /** The not-yet-sent serialised events in enqueue order — the string is what the transport sends (contract §4.3). */
+  readonly queue: readonly string[];
+  /** Serialise-once enqueue from the pipeline (contract §4.3): the string beside the event's `event_id`. */
   enqueue(json: string, event: SentinelEvent): void;
+  /** An already-serialised event — the second-`init` drain (contract §4.2). */
+  push(event: QueuedEvent): void;
+  /**
+   * Run by `close` (contract §4.3) and when a second `init` replaces the client: the hide listeners' removal
+   * here, the global handlers' uninstall (§4.6, task 5) once they exist. Each is called once and may not throw
+   * outward.
+   */
+  readonly teardown: Array<() => void>;
 }
 
 export interface Scope {
@@ -32,6 +45,12 @@ export interface Slot {
   client?: InternalClient;
   readonly scope: Scope;
   /**
+   * The async `beforeSend` hooks still pending (contract §4.2): each enqueues into the client current when it
+   * settles, and `flush` waits for them up to its timeout (B9). Module-level, like the scope — a second `init`
+   * in between does not lose them.
+   */
+  readonly pending: Set<Promise<void>>;
+  /**
    * Decision 39's dedup mark — contract §4.3 calls it a `WeakSet`; a `WeakMap` is the same mark with the first
    * capture's `event_id` attached, which is what the second caller must be handed back.
    */
@@ -44,7 +63,7 @@ export function getSlot(): Slot {
   const host = globalThis as SlotHost;
   let slot = host[SLOT_KEY];
   if (slot === undefined) {
-    slot = { scope: { tags: new Map() }, seen: new WeakMap() };
+    slot = { scope: { tags: new Map() }, seen: new WeakMap(), pending: new Set() };
     host[SLOT_KEY] = slot;
   }
   return slot;

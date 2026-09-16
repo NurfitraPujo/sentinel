@@ -1,13 +1,15 @@
 // The runtime-agnostic half of `init` (contract §4.2): the options the event pipeline reads, resolved with the
 // degradations their rows pin — `release` over 100 bytes omitted with `release_too_long` (N10), `environment`
 // normalised with `invalid_option` (N11), `sampleRate` defaulted / clamped with `invalid_option` — and the client
-// installed on the `globalThis` slot. The runtime entries (`./browser`, `./node`, `./edge`) wrap this with their
-// own options, the transport and the global handlers; the client here queues the serialised events it is handed.
+// installed on the `globalThis` slot, with the transport of §4.4 attached by client.ts when the runtime's target
+// resolves. The runtime entries (`./browser`, `./node`, `./edge`) wrap this with their own options, env defaults
+// and the global handlers (task 5).
 
 import { cutUtf8, utf8Bytes } from './bytes.js';
+import { createClient, replaceClient } from './client.js';
 import { debug, reportError } from './report.js';
 import { getSlot, type InternalClient } from './state.js';
-import type { CoreOptions, ResolvedCoreOptions, Runtime, SentinelClient, SentinelEvent } from './types.js';
+import type { InitOptions, ResolvedOptions, Runtime, SentinelClient } from './types.js';
 
 export const MAX_RELEASE_BYTES = 100;
 export const DEFAULT_ENVIRONMENT = 'production';
@@ -27,8 +29,8 @@ export function normaliseEnvironment(given: unknown): { value: string; changed: 
   return { value: out, changed: out !== input };
 }
 
-function resolve(client: InternalClient, given: CoreOptions): void {
-  const opts = client.options as ResolvedCoreOptions;
+function resolve(client: InternalClient, given: InitOptions): void {
+  const opts = client.options;
 
   const release = typeof given.release === 'string' ? given.release : '';
   if (utf8Bytes(release) > MAX_RELEASE_BYTES) {
@@ -62,26 +64,22 @@ function resolve(client: InternalClient, given: CoreOptions): void {
 }
 
 /** Install the client for `runtime` with `options` resolved. Synchronous, idempotent, never throws. */
-export function initCore(options: CoreOptions | undefined, runtime: Runtime): InternalClient {
-  const given: CoreOptions = options !== null && typeof options === 'object' ? options : {};
-  const queue: string[] = [];
-  const resolved: ResolvedCoreOptions = {
+export function initCore(options: InitOptions | undefined, runtime: Runtime): InternalClient {
+  const given: InitOptions = options !== null && typeof options === 'object' ? options : {};
+  const resolved: ResolvedOptions = {
     release: '',
     environment: DEFAULT_ENVIRONMENT,
     sampleRate: 1,
     debug: given.debug === true,
+    maxBufferSize: 100,
+    batchSize: 10,
+    batchWaitMs: 1000,
+    flushOnHide: true,
   };
   if (typeof given.beforeSend === 'function') resolved.beforeSend = given.beforeSend;
   if (typeof given.onError === 'function') resolved.onError = given.onError;
   if (typeof given.inApp === 'function') resolved.inApp = given.inApp;
-  const client: InternalClient = {
-    options: resolved,
-    runtime,
-    queue,
-    enqueue(json: string, _event: SentinelEvent) {
-      queue.push(json);
-    },
-  };
+  const client = createClient(resolved, runtime, given);
   try {
     resolve(client, given);
   } catch (cause) {
@@ -90,9 +88,13 @@ export function initCore(options: CoreOptions | undefined, runtime: Runtime): In
   const slot = getSlot();
   const previous = slot.client;
   if (previous !== undefined) {
-    // A second `init` drains the old client's not-yet-sent queue into the new one (contract §4.2).
-    queue.push(...previous.queue);
-    previous.queue.length = 0;
+    // A second `init` drains the old client's not-yet-sent queue into the new one; a batch in flight or backing
+    // off finishes under the old transport (contract §4.2).
+    try {
+      replaceClient(previous, client);
+    } catch (cause) {
+      debug(client, `init: draining the previous client failed inside the SDK: ${String(cause)}`);
+    }
   }
   slot.client = client;
   return client;
