@@ -14,7 +14,7 @@ pasted here (the *Bundle size* and *Local bench* numbers were measured the same 
 ### 1. Install
 
 ```sh
-pnpm add 'git+https://github.com/tuju-ai/sentinel.git#packages/sdk-js/v0.1.0&path:packages/sdk-js'
+pnpm add 'git+https://github.com/tuju-ai/sentinel.git#packages/sdk-js/v0.1.1&path:packages/sdk-js'
 ```
 
 The package is a **git dependency** of the `sentinel` repo, pinned to a tag, with `path:` pointing
@@ -189,6 +189,15 @@ export const { POST } = createSentinelRouteHandler({
 });
 ```
 
+**Passing `apiKey` turns the `SENTINEL_API_KEY` default off, even when its value is unset.** The
+factory looks at whether the property is *present*, not at its value: with `SENTINEL_TUNNEL_API_KEY`
+unset, the mount above hands the route `apiKey: undefined`, and the route answers every request
+`503 sentinel_not_configured` (one `console.warn` per process: *the route apiKey option is unset;
+not falling back to SENTINEL_API_KEY*) rather than quietly picking up the server/edge key and letting
+the browser spend that key's rate-limit budget (*Environment variables*, below). Only a mount that
+omits the option entirely — the one-line mount — reads `SENTINEL_API_KEY`. So a missing tunnel key
+is a loud `503` in the browser SDK's `onError` and in the server log, not a silent budget merge.
+
 `isCrossSite` replaces the built-in origin check (which is `web`'s `isCrossSiteRequest` transcribed
 minus its `NEXT_PUBLIC_FRONTEND_URL` lookup — pass the real one to get byte-identical behaviour);
 `clientKey` replaces the rate-limit key (*The tunnel's rate limit*). A callback that throws fails
@@ -249,11 +258,11 @@ covers the tunnel).
 | Variable | Read by | Meaning |
 | --- | --- | --- |
 | `SENTINEL_ENDPOINT` | the server and edge `init`, the route | the ingest URL, e.g. `https://api-sentinel.daya.ai/ingest`; batches go to `{endpoint}/batch` |
-| `SENTINEL_API_KEY` | the server and edge `init`, the route (default), the CLI, the wrapper | a project-scoped `ingest` key — **the runtime key** in the pods, **the build key** in CI |
+| `SENTINEL_API_KEY` | the server and edge `init`, the route (default — only when no `apiKey` option is passed), the CLI, the wrapper | a project-scoped `ingest` key — **the runtime key** in the pods, **the build key** in CI |
 | `SENTINEL_PROJECT_KEY` | the same | the project **name**, sent as `X-Project-Key`; only for an organization-wide (`sent_org_…`) key |
 | `SENTINEL_DASHBOARD_URL` | the CLI, the wrapper | the dashboard host the maps are uploaded to, e.g. `https://sentinel.daya.ai` |
 | `SENTINEL_UPLOAD_SOURCEMAPS` | your `next.config.mjs` (above) | `false` turns the upload off; the maps are still deleted |
-| `SENTINEL_TUNNEL_API_KEY` | your `route.ts` (above) — an app-side name | the tunnel's own ingest key (below) |
+| `SENTINEL_TUNNEL_API_KEY` | your `route.ts` (above) — an app-side name | the tunnel's own ingest key (below); unset with the option passed → `503`, never `SENTINEL_API_KEY` |
 | `NEXT_PUBLIC_SENTINEL_TUNNEL` | your `instrumentation-client.ts`, if you want one | an app-side convention: `init({ tunnel: process.env.NEXT_PUBLIC_SENTINEL_TUNNEL ?? '/api/sentinel' })`. The library reads no `NEXT_PUBLIC_*` itself |
 
 The browser build reads **no** environment; the server-side code reads its variables once, at

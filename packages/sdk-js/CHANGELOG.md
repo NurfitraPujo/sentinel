@@ -4,6 +4,24 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+## v0.1.1 — The tunnel route never falls back from an explicit `apiKey` option
+
+```sh
+pnpm add 'git+https://github.com/tuju-ai/sentinel.git#packages/sdk-js/v0.1.1&path:packages/sdk-js'
+```
+
+### Fixed
+
+- **`createSentinelRouteHandler({ apiKey })` with the option present but unset** (`undefined` or
+  `''` — `apiKey: process.env.SENTINEL_TUNNEL_API_KEY` with the variable unset) no longer falls back
+  to `SENTINEL_API_KEY`. The route answers `503 sentinel_not_configured` (the same envelope as
+  before) and warns once per process — *the route apiKey option is unset; not falling back to
+  SENTINEL_API_KEY* — without reading `SENTINEL_API_KEY` at all. Before, the browser silently spent
+  the server/edge key's 5 000 rpm budget against the shared `ERROR_EVENTS` stream, which is exactly
+  what a separate tunnel key (README §4, §6) exists to prevent; `web` had to carry its own guard.
+  Presence is the test: only a mount that omits `apiKey` entirely — the one-line mount — reads
+  `SENTINEL_API_KEY`, as documented. No wire-vocabulary change.
+
 ## v0.1.0 — First release
 
 Installed as a git dependency of the `sentinel` repo, built on install by `prepare`:
