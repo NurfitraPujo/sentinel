@@ -139,11 +139,16 @@ func parseDuration(lookup func(string) (string, bool), key string, def time.Dura
 // The processor's object-storage variables (contract §12): the same four the dashboard's
 // storage.ts reads, reaching the processor through the chart's ConfigMap (`S3_ENDPOINT`,
 // `S3_BUCKET`) and the two `secretKeyRef`s templates/processor.yaml carries since TASK-01.
+//
+// EnvS3ForcePathStyle is the optional fifth: an explicit addressing-style override for
+// UsePathStyle (fetcher.go). Unset = decide from the endpoint host; nothing in a deployment needs
+// to set it. The dashboard's storage.ts reads the same variable with the same meaning.
 const (
-	EnvS3Endpoint  = "S3_ENDPOINT"
-	EnvS3Bucket    = "S3_BUCKET"
-	EnvS3AccessKey = "S3_ACCESS_KEY"
-	EnvS3SecretKey = "S3_SECRET_KEY"
+	EnvS3Endpoint       = "S3_ENDPOINT"
+	EnvS3Bucket         = "S3_BUCKET"
+	EnvS3AccessKey      = "S3_ACCESS_KEY"
+	EnvS3SecretKey      = "S3_SECRET_KEY"
+	EnvS3ForcePathStyle = "S3_FORCE_PATH_STYLE"
 )
 
 // S3ConfigFromEnv reads the four variables through lookup, whitespace-trimmed. An unset and a
@@ -154,10 +159,11 @@ func S3ConfigFromEnv(lookup func(string) (string, bool)) S3Config {
 		return strings.TrimSpace(v)
 	}
 	return S3Config{
-		Endpoint:  get(EnvS3Endpoint),
-		Bucket:    get(EnvS3Bucket),
-		AccessKey: get(EnvS3AccessKey),
-		SecretKey: get(EnvS3SecretKey),
+		Endpoint:       get(EnvS3Endpoint),
+		Bucket:         get(EnvS3Bucket),
+		AccessKey:      get(EnvS3AccessKey),
+		SecretKey:      get(EnvS3SecretKey),
+		ForcePathStyle: get(EnvS3ForcePathStyle),
 	}
 }
 

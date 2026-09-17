@@ -257,6 +257,10 @@ services:
       # public HTTPS URL of your object store — the browser cannot resolve the in-cluster `minio`
       # host. A wrong value here makes large uploads fail from the browser while server-side works.
       S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT to a browser-reachable S3 URL}
+      # The bundled minio has no MINIO_DOMAIN, so it cannot serve `https://<bucket>.<domain>/…`: the
+      # dotted S3_PUBLIC_ENDPOINT would otherwise presign virtual-hosted. Drop this if S3_ENDPOINT
+      # points at hosted OBS/S3/R2 instead of the minio service.
+      S3_FORCE_PATH_STYLE: "true"
       S3_BUCKET: ${S3_BUCKET:-sentinel-attachments}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
       S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}

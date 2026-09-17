@@ -96,6 +96,22 @@ reach — never the in-cluster endpoint the server uses.
 If `S3_PUBLIC_ENDPOINT` points at an in-cluster host, small uploads (proxied) keep working while
 large uploads silently fail from the browser — a failure mode a localhost test cannot catch.
 
+**Addressing style** (path-style `http://host/bucket/key` vs virtual-hosted `https://bucket.host/key`)
+is derived from each endpoint's host by both clients (dashboard `storage.ts`, processor
+`symbolicate/fetcher.go`): a bare hostname, `localhost` or an IP literal (MinIO in compose/dev) is
+path-style; a dotted hostname (Huawei OBS, AWS S3, R2) is virtual-hosted — OBS rejects path-style
+with `VirtualHostDomainRequired`. `S3_FORCE_PATH_STYLE=true|false` overrides the rule, read by both
+services from the same environment as `S3_ENDPOINT`. Who needs it:
+
+- **Hosted OBS / S3 / R2**: nothing. Both endpoints are dotted hostnames and the rule picks
+  virtual-hosted, which is what those stores want.
+- **Self-hosted MinIO behind a domain** (the `docker-compose.prod.yml` topology: `S3_ENDPOINT`
+  is the in-cluster `http://minio:9000`, `S3_PUBLIC_ENDPOINT` is a dotted public domain): set
+  `S3_FORCE_PATH_STYLE=true` on the dashboard, as the compose file does. Otherwise presigned PUT
+  URLs come out as `https://<bucket>.<domain>/…`, which MinIO without `MINIO_DOMAIN` cannot serve.
+  The Helm chart's bundled-minio default topology (`deploy/helm`, empty `s3.endpoint`) needs the
+  same key on the dashboard — for the chart owner; not set by this change.
+
 ---
 
 ## 3. Database migrations

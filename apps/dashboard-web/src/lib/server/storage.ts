@@ -11,18 +11,21 @@ import { env } from '$env/dynamic/private';
 
 /**
  * Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4): a thin S3-compatible client wrapper
- * around MinIO (dev/prod-compose) or real S3/R2 in a hosted deployment -- `forcePathStyle` is
- * required for MinIO's virtual-host-style addressing not being set up, and is harmless against
- * real S3. Config comes entirely from env, mirroring email.ts's EMAIL_SERVER pattern:
+ * around MinIO (dev/prod-compose) or real S3/R2/OBS in a hosted deployment. Addressing style is
+ * decided per endpoint by `usePathStyle` (see it for the rule and the `S3_FORCE_PATH_STYLE`
+ * override): MinIO has no virtual-host DNS and needs path-style, while Huawei OBS REJECTS
+ * path-style ("VirtualHostDomainRequired") -- it was hard-coded to path-style until the first
+ * production sourcemap upload failed 4/4 on exactly that. Config comes entirely from env,
+ * mirroring email.ts's EMAIL_SERVER pattern:
  * `isStorageConfigured()` is the same "feature present or not" guard as email.ts's
  * `if (!emailServer)` check, just promoted to a named export since two call sites (uploads,
  * attachments) both need to ask the question.
  */
 
 let cachedClient: S3Client | null = null;
-let cachedEndpoint: string | null = null;
+let cachedEndpoint: string | null = null; // a clientCacheKey, not a bare endpoint
 let cachedPresignClient: S3Client | null = null;
-let cachedPresignEndpoint: string | null = null;
+let cachedPresignEndpoint: string | null = null; // likewise
 
 export interface StorageConfig {
 	/** Server-side endpoint: where THIS process reaches the bucket (e.g. `http://minio:9000`). */
@@ -39,6 +42,49 @@ export interface StorageConfig {
 	bucket: string;
 	accessKeyId: string;
 	secretAccessKey: string;
+	/**
+	 * Raw `S3_FORCE_PATH_STYLE` value, if set: an explicit addressing-style override that wins over
+	 * the host-shape rule of `usePathStyle`. Kept raw (not parsed) so `isStorageConfigured()` never
+	 * throws on a typo; the client builder parses it and names the variable when it cannot.
+	 */
+	forcePathStyle?: string;
+}
+
+/**
+ * Whether an endpoint should be addressed path-style (`http://host/bucket/key`) or virtual-hosted
+ * (`https://bucket.host/key`). The rule is by host shape, so nothing in a deployment has to say
+ * which flavour of store it is:
+ *
+ * - a bare hostname with no dots (`minio`, `localhost`), or an IP literal (`127.0.0.1`, `[::1]`)
+ *   -> path-style. That is MinIO in compose/dev/tests, where `bucket.minio` resolves nowhere.
+ * - anything with a dot (`obs.ap-southeast-3.myhuaweicloud.com`, `s3.us-east-1.amazonaws.com`)
+ *   -> virtual-hosted, which every hosted S3-compatible store supports and Huawei OBS requires.
+ *
+ * `override` is `S3_FORCE_PATH_STYLE` and wins when set: `true`/`1` forces path-style,
+ * `false`/`0` forces virtual-hosted. Any other non-empty value is an error naming the variable
+ * rather than a silent fallback. Exported for its unit test; apps/processor-go/symbolicate's
+ * `UsePathStyle` is the same rule for the read side and the two must not drift (the processor
+ * reads what this module wrote, through the same endpoint).
+ */
+export function usePathStyle(endpoint: string, override?: string): boolean {
+	const raw = override?.trim().toLowerCase();
+	if (raw) {
+		if (raw === 'true' || raw === '1') return true;
+		if (raw === 'false' || raw === '0') return false;
+		throw new Error(`S3_FORCE_PATH_STYLE must be true or false, got ${JSON.stringify(override)}`);
+	}
+	let hostname = '';
+	try {
+		hostname = new URL(endpoint).hostname; // `minio:9000` parses as scheme `minio:` with NO host
+	} catch {
+		// fall through to the empty-hostname error below
+	}
+	if (!hostname) {
+		throw new Error(`S3_ENDPOINT must be a URL with a scheme and host, got ${JSON.stringify(endpoint)}`);
+	}
+	// URL.hostname keeps IPv6 brackets (`[::1]`), and IPv4 is "dotted" but not a DNS name.
+	if (hostname.startsWith('[') || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return true;
+	return !hostname.includes('.');
 }
 
 function readConfig(): StorageConfig | null {
@@ -52,8 +98,9 @@ function readConfig(): StorageConfig | null {
 	}
 
 	const publicEndpoint = env.S3_PUBLIC_ENDPOINT || endpoint;
+	const forcePathStyle = env.S3_FORCE_PATH_STYLE;
 
-	return { endpoint, publicEndpoint, bucket, accessKeyId, secretAccessKey };
+	return { endpoint, publicEndpoint, bucket, accessKeyId, secretAccessKey, forcePathStyle };
 }
 
 /** Whether object storage is configured at all -- mirrors email.ts's isSmtpConfigured shape. */
@@ -61,11 +108,22 @@ export function isStorageConfigured(): boolean {
 	return readConfig() !== null;
 }
 
+/**
+ * Identity of a built client for the two caches below: the endpoint AND the addressing style it
+ * was built with, so a changed `S3_FORCE_PATH_STYLE` (tests vary it per case; a process reads it
+ * once) can never keep serving a client built for the other style.
+ */
+function clientCacheKey(config: StorageConfig, endpoint: string): string {
+	return `${endpoint}|${usePathStyle(endpoint, config.forcePathStyle) ? 'path' : 'virtual-hosted'}`;
+}
+
 function buildClient(config: StorageConfig, endpoint: string): S3Client {
 	return new S3Client({
 		endpoint,
 		region: 'us-east-1', // MinIO ignores this; required by the SDK's client shape regardless.
-		forcePathStyle: true,
+		// Decided per endpoint, so the presign client (public endpoint) and the server-side client
+		// (internal endpoint) can each land on the style THEIR host needs.
+		forcePathStyle: usePathStyle(endpoint, config.forcePathStyle),
 		// AWS SDK v3 (>= ~3.729) injects a default integrity checksum
 		// (`x-amz-sdk-checksum-algorithm` + `x-amz-checksum-crc32`) into write requests. On a
 		// presigned PUT those become signed expectations that MinIO rejects as "headers present
@@ -83,9 +141,10 @@ function buildClient(config: StorageConfig, endpoint: string): S3Client {
 
 /** Server-side client (internal `endpoint`), for puts/gets/heads/deletes this process makes. */
 function getClient(config: StorageConfig): S3Client {
-	if (!cachedClient || cachedEndpoint !== config.endpoint) {
+	const key = clientCacheKey(config, config.endpoint);
+	if (!cachedClient || cachedEndpoint !== key) {
 		cachedClient = buildClient(config, config.endpoint);
-		cachedEndpoint = config.endpoint;
+		cachedEndpoint = key;
 	}
 	return cachedClient;
 }
@@ -97,9 +156,10 @@ function getClient(config: StorageConfig): S3Client {
  * with identical config.
  */
 function getPresignClient(config: StorageConfig): S3Client {
-	if (!cachedPresignClient || cachedPresignEndpoint !== config.publicEndpoint) {
+	const key = clientCacheKey(config, config.publicEndpoint);
+	if (!cachedPresignClient || cachedPresignEndpoint !== key) {
 		cachedPresignClient = buildClient(config, config.publicEndpoint);
-		cachedPresignEndpoint = config.publicEndpoint;
+		cachedPresignEndpoint = key;
 	}
 	return cachedPresignClient;
 }
