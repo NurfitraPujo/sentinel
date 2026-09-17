@@ -96,6 +96,13 @@ reach — never the in-cluster endpoint the server uses.
 If `S3_PUBLIC_ENDPOINT` points at an in-cluster host, small uploads (proxied) keep working while
 large uploads silently fail from the browser — a failure mode a localhost test cannot catch.
 
+**Addressing style** (path-style `http://host/bucket/key` vs virtual-hosted `https://bucket.host/key`)
+is derived from each endpoint's host by both clients (dashboard `storage.ts`, processor
+`symbolicate/fetcher.go`): a bare hostname, `localhost` or an IP literal (MinIO in compose/dev) is
+path-style; a dotted hostname (Huawei OBS, AWS S3, R2) is virtual-hosted — OBS rejects path-style
+with `VirtualHostDomainRequired`. Nothing needs setting; `S3_FORCE_PATH_STYLE=true|false` is an
+optional override, read by both services from the same environment as `S3_ENDPOINT`.
+
 ---
 
 ## 3. Database migrations
