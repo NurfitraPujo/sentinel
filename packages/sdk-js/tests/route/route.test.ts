@@ -1,4 +1,4 @@
-// `createSentinelRouteHandler` as a function (contract §4.5, §7; flows T1–T17, `code` halves): `Request` →
+// `createSentinelRouteHandler` as a function (contract §4.5, §7; flows T1–T17, `code` halves; T18 the no-fallback apiKey rule): `Request` →
 // `Response` with `globalThis.fetch` stubbed as the ingestor. The factory returns `{ POST }` only; the nine steps
 // run in the contract's order — the rate limit at step 4, before the body is read; the origin rule is `web`'s
 // transcribed (port included, whole-string host compare); the body taxonomy is complete; one forward attempt;
@@ -356,6 +356,79 @@ describe('T11: SENTINEL_API_KEY unset (step 7)', () => {
     expect(text).toContain('sentinel_not_configured');
     expect(text).not.toContain(KEY);
     expect(upstream.calls).toHaveLength(0);
+  });
+});
+
+describe('T18: the apiKey option present but unset never falls back to SENTINEL_API_KEY (step 7; sdk-js decision 41)', () => {
+  /** Record every `process.env` property read for the call's duration — the route reads env per request, inside the handler. */
+  async function envReadsDuring(run: () => Promise<void>): Promise<string[]> {
+    const reads: string[] = [];
+    const real = process.env;
+    process.env = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string') reads.push(prop);
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    try {
+      await run();
+    } finally {
+      process.env = real;
+    }
+    return reads;
+  }
+
+  it('(a) { apiKey: undefined } with SENTINEL_API_KEY set → 503 sentinel_not_configured, one warn per process naming the option and the variable, SENTINEL_API_KEY never read, nothing forwarded', async () => {
+    const route = await freshRoute();
+    const warned = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Exactly web's mount with the tunnel variable unset: an own property whose value is `undefined`.
+    const { POST } = route.createSentinelRouteHandler({ apiKey: process.env.SENTINEL_TUNNEL_API_KEY });
+    let first: Response | undefined;
+    let second: Response | undefined;
+    const reads = await envReadsDuring(async () => {
+      first = await POST(request());
+      second = await POST(request());
+    });
+    const third = await route.createSentinelRouteHandler({ apiKey: undefined }).POST(request());
+    for (const res of [first!, second!, third]) {
+      expect(res.status).toBe(503);
+      expect(res.headers.get('content-type')).toBe('application/json');
+      expect((await envelope(res)).error.code).toBe('sentinel_not_configured');
+    }
+    expect(reads).not.toContain('SENTINEL_API_KEY');
+    expect(upstream.calls).toHaveLength(0);
+    expect(warned).toHaveBeenCalledTimes(1);
+    const line = warned.mock.calls[0]?.join(' ') ?? '';
+    expect(line).toContain('apiKey option is unset');
+    expect(line).toContain('not falling back to SENTINEL_API_KEY');
+    expect(line).not.toContain(KEY);
+  });
+
+  it("(a') { apiKey: '' } is the same: present and unset → 503, no fallback, nothing forwarded", async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { POST } = createSentinelRouteHandler({ apiKey: '' });
+    const res = await POST(request());
+    expect(res.status).toBe(503);
+    expect((await envelope(res)).error.code).toBe('sentinel_not_configured');
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it('(b) the option absent → SENTINEL_API_KEY is the documented default and the batch is forwarded with it', async () => {
+    const { POST } = createSentinelRouteHandler({});
+    const res = await POST(request());
+    expect(res.status).toBe(202);
+    expect(upstream.calls).toHaveLength(1);
+    expect(upstream.calls[0]?.headers['x-api-key']).toBe(KEY);
+  });
+
+  it('(c) the option set → it is used, and SENTINEL_API_KEY (set to a different value) is not', async () => {
+    const tunnelKey = 'sk_live_tunnel_0123456789abcdef';
+    const { POST } = createSentinelRouteHandler({ apiKey: tunnelKey });
+    const res = await POST(request());
+    expect(res.status).toBe(202);
+    expect(upstream.calls).toHaveLength(1);
+    expect(upstream.calls[0]?.headers['x-api-key']).toBe(tunnelKey);
+    expect(upstream.calls[0]?.headers['x-api-key']).not.toBe(KEY);
   });
 });
 

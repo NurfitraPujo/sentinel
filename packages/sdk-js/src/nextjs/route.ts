@@ -23,8 +23,14 @@ import { SHARED_KEY, storeOf, TokenBucketStore, type BucketKey } from './rate-li
 export interface RouteHandlerOptions {
   /** The `/ingest` URL; default `process.env.SENTINEL_ENDPOINT`. */
   endpoint?: string;
-  /** Default `process.env.SENTINEL_API_KEY`. */
-  apiKey?: string;
+  /**
+   * The ingest key. Default `process.env.SENTINEL_API_KEY` — **only when the property is absent**. When the
+   * property is present (own property, `undefined` or `''` included — `apiKey: process.env.SENTINEL_TUNNEL_API_KEY`
+   * with that variable unset), the route answers `503 sentinel_not_configured` and never falls back to
+   * `SENTINEL_API_KEY`: the server/edge key's rate-limit budget must not be spent by the browser (decision 41).
+   * `| undefined` is deliberate: under `exactOptionalPropertyTypes` it is what lets a mount pass an env read.
+   */
+  apiKey?: string | undefined;
   /** Default `process.env.SENTINEL_PROJECT_KEY`. */
   projectKey?: string;
   /** Default 262144 (256 KiB); non-finite or ≤ 0 → default, one `warn`. */
@@ -83,9 +89,10 @@ export type RouteErrorCode =
   | 'upstream_unavailable';
 
 const PREFIX = '[@sentinel/sdk-js]';
-/** Once per process (contract §4.5): the numeric-option warns, by option name, and the not-configured warn. */
+/** Once per process (contract §4.5): the numeric-option warns, by option name, the not-configured warn, and the unset-`apiKey`-option warn. */
 const warnedOptions = new Set<string>();
 let warnedNotConfigured = false;
+let warnedApiKeyOptionUnset = false;
 
 function warn(line: string): void {
   try {
@@ -301,6 +308,9 @@ export function createSentinelRouteHandler(options: RouteHandlerOptions = {}): {
   const forwardTimeoutMs = positive('forwardTimeoutMs', given.forwardTimeoutMs, DEFAULT_FORWARD_TIMEOUT_MS);
   const isCrossSite = typeof given.isCrossSite === 'function' ? given.isCrossSite : undefined;
   const clientKey = typeof given.clientKey === 'function' ? given.clientKey : undefined;
+  // Presence, not value: `{ apiKey: process.env.SENTINEL_TUNNEL_API_KEY }` with the variable unset is an own
+  // property holding `undefined`, and it means "the tunnel's own key" — never `SENTINEL_API_KEY`.
+  const apiKeyGiven = Object.prototype.hasOwnProperty.call(given, 'apiKey');
 
   // Decision 19: on by default at 60/min; `false` off; a non-finite or ≤ 0 `perMinute` ≡ `false`.
   let store: TokenBucketStore | undefined;
@@ -390,8 +400,22 @@ export function createSentinelRouteHandler(options: RouteHandlerOptions = {}): {
 
     // 7. Configuration — resolved per request (never at import), never echoed.
     const endpoint = typeof given.endpoint === 'string' && given.endpoint !== '' ? given.endpoint : readEnv('SENTINEL_ENDPOINT');
-    const apiKey = typeof given.apiKey === 'string' && given.apiKey !== '' ? given.apiKey : readEnv('SENTINEL_API_KEY');
     const projectKey = typeof given.projectKey === 'string' && given.projectKey !== '' ? given.projectKey : readEnv('SENTINEL_PROJECT_KEY');
+    let apiKey: string | undefined;
+    if (apiKeyGiven) {
+      // The option is present: its value is the key, and an unset value is a configuration error, not a
+      // request to read the environment — the browser must never spend the server/edge key's budget.
+      apiKey = typeof given.apiKey === 'string' && given.apiKey !== '' ? given.apiKey : undefined;
+      if (apiKey === undefined) {
+        if (!warnedApiKeyOptionUnset) {
+          warnedApiKeyOptionUnset = true;
+          warn('createSentinelRouteHandler: the route apiKey option is unset; not falling back to SENTINEL_API_KEY (set the tunnel’s own key, e.g. SENTINEL_TUNNEL_API_KEY); answering 503 sentinel_not_configured');
+        }
+        return errorResponse(503, 'sentinel_not_configured', 'The Sentinel tunnel is not configured.');
+      }
+    } else {
+      apiKey = readEnv('SENTINEL_API_KEY');
+    }
     if (endpoint === undefined || apiKey === undefined) {
       if (!warnedNotConfigured) {
         warnedNotConfigured = true;
