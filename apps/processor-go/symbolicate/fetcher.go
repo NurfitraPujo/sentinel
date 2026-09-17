@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -28,6 +29,10 @@ type S3Config struct {
 	// override that wins over UsePathStyle's host rule. Parsed in NewS3Fetcher, so a typo is a
 	// startup error naming the variable, never a silent default.
 	ForcePathStyle string
+
+	// transport, when set, replaces the minio client's HTTP transport. Test-only (same-package):
+	// fetcher_test pins the addressing style by watching the GET the client actually sends.
+	transport http.RoundTripper
 }
 
 // UsePathStyle decides whether endpointHost (a `host` or `host:port`, as url.URL.Host gives it)
@@ -76,12 +81,7 @@ type S3Fetcher struct {
 	client    *minio.Client
 	bucket    string
 	readLimit int64
-	pathStyle bool
 }
-
-// PathStyle reports the addressing style the client was built with (true = path-style). The
-// minio client does not expose its BucketLookup, so this is what the unit test reads.
-func (f *S3Fetcher) PathStyle() bool { return f.pathStyle }
 
 // NewS3Fetcher builds the client. maxParseBytes is Config.MaxParseBytes (decision 38): the
 // service never asks for a row over it, so the body read is bounded at one byte past it (see
@@ -112,11 +112,12 @@ func NewS3Fetcher(cfg S3Config, maxParseBytes int64) (*S3Fetcher, error) {
 		Secure:       strings.EqualFold(u.Scheme, "https"),
 		Region:       "us-east-1",
 		BucketLookup: lookup,
+		Transport:    cfg.transport,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("symbolicate: s3 client: %w", err)
 	}
-	return &S3Fetcher{client: client, bucket: cfg.Bucket, readLimit: maxParseBytes + 1, pathStyle: pathStyle}, nil
+	return &S3Fetcher{client: client, bucket: cfg.Bucket, readLimit: maxParseBytes + 1}, nil
 }
 
 // Fetch GETs the whole object. The service has already refused rows over MaxParseBytes (decision

@@ -1,8 +1,14 @@
 package symbolicate
 
 import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Addressing-style guard for the read side. Both clients hard-coded path-style until the first
@@ -60,38 +66,78 @@ func TestUsePathStyle_OverrideWins(t *testing.T) {
 	}
 }
 
-// TestNewS3Fetcher_AddressingStyle pins the decision THROUGH the constructor, on the fields
-// S3ConfigFromEnv fills: the pure rule being right is worthless if NewS3Fetcher still passes
-// BucketLookupPath.
+// TestNewS3Fetcher_AddressingStyle pins the decision THROUGH the request the client sends: the
+// pure rule being right is worthless if NewS3Fetcher still passes BucketLookupPath, and a mirror
+// field on the fetcher would stay green in exactly that case. An httptest.Server stands in for
+// the store; a dialer routes every host (including `bucket.obs.example.test`) to it, so the
+// dotted virtual-hosted case resolves without DNS. Virtual-hosted shows up as Host
+// `<bucket>.<endpoint host>`; path-style as a request path under `/<bucket>/`.
 func TestNewS3Fetcher_AddressingStyle(t *testing.T) {
-	base := S3Config{Bucket: "sentinel-attachments", AccessKey: "k", SecretKey: "s"}
+	const bucket = "sentinel-attachments"
+	var mu sync.Mutex
+	var gotHost, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotHost, gotPath = r.Host, r.URL.Path
+		mu.Unlock()
+		// The minimum the minio client parses out of a GET response.
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.Header().Set("ETag", `"0"`)
+		w.Header().Set("Content-Length", "2")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer srv.Close()
+	srvAddr := srv.Listener.Addr().String()
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+		},
+	}
+
 	cases := []struct {
 		name     string
-		endpoint string
+		host     string // endpoint host as the deployment would set it
 		override string
-		path     bool
+		wantHost string // "" = path-style: Host is the endpoint, path starts with /<bucket>/
 	}{
-		{"minio is path-style", "http://minio:9000", "", true},
-		{"obs is virtual-hosted", "https://obs.ap-southeast-3.myhuaweicloud.com", "", false},
-		{"override forces path-style on obs", "https://obs.ap-southeast-3.myhuaweicloud.com", "true", true},
-		{"override forces virtual-hosted on minio", "http://minio:9000", "false", false},
+		{"minio is path-style", srvAddr, "", ""},
+		{"obs is virtual-hosted", "obs.example.test", "", bucket + ".obs.example.test"},
+		{"override forces path-style on obs", "obs.example.test", "true", ""},
+		{"override forces virtual-hosted on minio", srvAddr, "false", bucket + "." + srvAddr},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg := base
-			cfg.Endpoint, cfg.ForcePathStyle = c.endpoint, c.override
+			cfg := S3Config{Endpoint: "http://" + c.host, Bucket: bucket, AccessKey: "k", SecretKey: "s",
+				ForcePathStyle: c.override, transport: transport}
 			f, err := NewS3Fetcher(cfg, DefaultMaxParseBytes)
 			if err != nil {
 				t.Fatalf("NewS3Fetcher: %v", err)
 			}
-			if f.PathStyle() != c.path {
-				t.Errorf("PathStyle() = %v, want %v", f.PathStyle(), c.path)
+			if _, err := f.Fetch(context.Background(), "maps/a.map"); err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			mu.Lock()
+			host, path := gotHost, gotPath
+			mu.Unlock()
+			if c.wantHost != "" {
+				if host != c.wantHost {
+					t.Errorf("virtual-hosted: Host = %q, want %q (path %q)", host, c.wantHost, path)
+				}
+				if strings.HasPrefix(path, "/"+bucket+"/") {
+					t.Errorf("virtual-hosted: path %q must not carry the bucket", path)
+				}
+			} else {
+				if host != c.host {
+					t.Errorf("path-style: Host = %q, want the bare endpoint %q", host, c.host)
+				}
+				if !strings.HasPrefix(path, "/"+bucket+"/") {
+					t.Errorf("path-style: path = %q, want a /%s/ prefix", path, bucket)
+				}
 			}
 		})
 	}
 
-	cfg := base
-	cfg.Endpoint, cfg.ForcePathStyle = "http://minio:9000", "maybe"
+	cfg := S3Config{Endpoint: "http://minio:9000", Bucket: bucket, AccessKey: "k", SecretKey: "s", ForcePathStyle: "maybe"}
 	if _, err := NewS3Fetcher(cfg, DefaultMaxParseBytes); err == nil || !strings.Contains(err.Error(), EnvS3ForcePathStyle) {
 		t.Fatalf("a bad override must be a constructor (startup) error naming the variable, got %v", err)
 	}
