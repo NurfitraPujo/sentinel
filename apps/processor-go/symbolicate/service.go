@@ -8,7 +8,7 @@
 // in this direction would cycle. It exposes its own Frame; the service copies the event's frames
 // in and out.
 //
-// Everything a frame can become is one of the eight Outcomes, and nothing here ever fails an
+// Everything a frame can become is one of the nine Outcomes, and nothing here ever fails an
 // event (D7): every failure is a pass-through with a reason, a panic in parse or resolve is
 // recovered per map (decision 19), and the per-event Deadline (decision 37) bounds the wall clock
 // while the fetch + parse that outlived it continues in the background and fills the cache.
@@ -56,6 +56,10 @@ const (
 	// OutcomeOversize: the row's size_bytes exceeds MaxParseBytes; never fetched. Negatively
 	// cached (decision 38).
 	OutcomeOversize Outcome = Outcome(obs.SymbolicationFrameOversize)
+	// OutcomeNoSection: the map is an index map and the frame's generated position precedes its
+	// first section (or the map has no sections) -- sentinel-sourcemaps-index-maps §4.4, D14. Not
+	// cached, like no_mapping: the map is fine and the next frame may resolve.
+	OutcomeNoSection Outcome = Outcome(obs.SymbolicationFrameNoSection)
 )
 
 // negativelyCacheable is the set §4.4 allows a negative entry to carry: the four step-3/4
@@ -335,12 +339,17 @@ func (s *Service) resolveGroup(row *Sourcemap, pm *parsedMap, frames []Frame, in
 	// Resolve every frame BEFORE writing any, so a panic on the third frame does not leave the
 	// first two rewritten while the map is being reported broken.
 	rs := make([]resolved, len(indexes))
-	found := make([]bool, len(indexes))
+	status := make([]resolveStatus, len(indexes))
 	for k, i := range indexes {
-		rs[k], found[k] = pm.resolve(frames[i].Line, frames[i].Column)
+		rs[k], status[k] = pm.resolveFrame(frames[i].Line, frames[i].Column)
 	}
 	for k, i := range indexes {
-		if !found[k] {
+		switch status[k] {
+		case resolveNoSection:
+			// index-maps §4.4: no section reaches the position; the row and the map are fine.
+			outcomes[i] = OutcomeNoSection
+			continue
+		case resolveNoMapping:
 			outcomes[i] = OutcomeNoMapping
 			continue
 		}

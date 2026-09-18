@@ -365,9 +365,11 @@ until that cache is re-sized. The processor strips Turbopack's `_<8-hex>` suffix
 unsymbolicated server chunk name (`_052cc036._.js` → `_*._.js`, `node_modules__pnpm_52f51f25._.js`
 → `node_modules__pnpm_*._.js`), so a server frame that symbolication does **not** rewrite groups
 across builds (since `sentinel-sourcemaps-turbopack-grouping`). Turbopack also emits **index
-maps** (`sections`, no `mappings`) for its server entry stubs and its own runtime; the walk leaves
-those out with one `warn` each, because the route stores flat maps only — nothing that could
-symbolicate is lost.
+maps** (`sections`, no `mappings`) for its server entry stubs and its own runtime; since `0.1.2`
+the walk uploads them (the route accepts them since `sentinel-sourcemaps-index-maps`), so the
+runtime's frames symbolicate to `turbopack:///[turbopack]/…`; an empty stub is acknowledged by
+the route (`skipped_empty`) and not stored, and the upload's summary line counts how many. A map
+with a `url` section is the one index map still skipped, with one `warn`.
 
 Under webpack with `output: 'standalone'`, Next's per-page build traces list the server maps; the
 wrapper rewrites those `.nft.json` files after deleting the maps (one `Sentinel: build trace …
@@ -502,7 +504,7 @@ global handlers exist to install on the edge; `captureRequestError` is the path.
   calls `setUser`).
 - `withSentinelErrorBoundary` — Next's `error.tsx` / `global-error.tsx` call the boundary helper
   above.
-- Index-map (`sections`) uploads — skipped with a `warn` until the route and processor accept them.
+- Index maps with `url` sections — skipped with a `warn`; the route rejects them.
 
 ## Bundle size
 

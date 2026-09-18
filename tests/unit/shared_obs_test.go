@@ -402,9 +402,10 @@ func TestObsReleaseNextRewriteMetricName(t *testing.T) {
 // and matches nothing silently if a name drifts; the RUNBOOK's hand-read check greps
 // `sentinel_symbolication`; and the sixth name is registered by the dashboard in TypeScript
 // (`sentinel_sourcemap_uploads_total`, lib/server/metrics.ts), where no constant can be shared.
-// The frames counter's eight outcome values are asserted in full — they are what
+// The frames counter's nine outcome values are asserted in full — they are what
 // apps/processor-go/symbolicate's Outcome constants are defined FROM, and the acceptance bar is
-// that the obs constant block carries all eight.
+// that the obs constant block carries all nine (the ninth, `no_section`, is
+// sentinel-sourcemaps-index-maps §4.4's).
 func TestObsSourcemapMetricNames(t *testing.T) {
 	assert.Equal(t, "sentinel_symbolication_events_total", obs.MetricSymbolicationEvents)
 	assert.Equal(t, "sentinel_symbolication_frames_total", obs.MetricSymbolicationFrames)
@@ -417,10 +418,11 @@ func TestObsSourcemapMetricNames(t *testing.T) {
 	assert.Equal(t, []string{"applied_all", "applied_partial", "none", "skipped_platform", "skipped_no_release", "skipped_no_frames"},
 		[]string{obs.SymbolicationEventAppliedAll, obs.SymbolicationEventAppliedPartial, obs.SymbolicationEventNone,
 			obs.SymbolicationEventSkippedPlatform, obs.SymbolicationEventSkippedNoRelease, obs.SymbolicationEventSkippedNoFrames})
-	assert.Equal(t, []string{"applied", "no_column", "no_map", "no_mapping", "map_error", "fetch_error", "timeout", "oversize"},
+	assert.Equal(t, []string{"applied", "no_column", "no_map", "no_mapping", "map_error", "fetch_error", "timeout", "oversize", "no_section"},
 		[]string{obs.SymbolicationFrameApplied, obs.SymbolicationFrameNoColumn, obs.SymbolicationFrameNoMap, obs.SymbolicationFrameNoMapping,
-			obs.SymbolicationFrameMapError, obs.SymbolicationFrameFetchError, obs.SymbolicationFrameTimeout, obs.SymbolicationFrameOversize},
-		"the eight per-frame outcomes of §4.4, in the contract's order")
+			obs.SymbolicationFrameMapError, obs.SymbolicationFrameFetchError, obs.SymbolicationFrameTimeout, obs.SymbolicationFrameOversize,
+			obs.SymbolicationFrameNoSection},
+		"the nine per-frame outcomes of §4.4, in the contract's order — index-maps §4.4's no_section ninth")
 	assert.Equal(t, []string{"hit", "miss", "negative_hit", "evict", "oversize"},
 		[]string{obs.SourcemapCacheHit, obs.SourcemapCacheMiss, obs.SourcemapCacheNegativeHit, obs.SourcemapCacheEvict, obs.SourcemapCacheOversize})
 	assert.Equal(t, []string{"created", "replaced", "unchanged", "rejected", "storage_error"},

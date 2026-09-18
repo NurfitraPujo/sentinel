@@ -133,7 +133,7 @@ const (
 	// release is the hand-read stand-in for the dormant alert group (§8, decision 32).
 	MetricSymbolicationEvents = "sentinel_symbolication_events_total"
 	// MetricSymbolicationFrames counts frames through the stage, one per frame: LabelOutcome ∈
-	// SymbolicationFrame* (applied and the seven pass-through reasons). A negative-cache hit
+	// SymbolicationFrame* (applied and the eight pass-through reasons). A negative-cache hit
 	// re-emits the reason it was cached with, so this counter reflects ongoing breakage, not only
 	// its first sighting.
 	MetricSymbolicationFrames = "sentinel_symbolication_frames_total"
@@ -262,9 +262,10 @@ const (
 )
 
 // Permitted values for LabelOutcome on MetricSymbolicationFrames (sentinel-sourcemaps §4.4 steps
-// 2–7 / §12): `applied` and the seven pass-through reasons. CLOSED — eight values. The reasons are
-// also what a negative cache entry carries (no_map, fetch_error, map_error, oversize — never
-// timeout, decision 37; never no_mapping, the map is fine), and a hit re-emits its reason here.
+// 2–7 / §12, plus sentinel-sourcemaps-index-maps §4.4's ninth): `applied` and the eight
+// pass-through reasons. CLOSED — nine values. The reasons are also what a negative cache entry
+// carries (no_map, fetch_error, map_error, oversize — never timeout, decision 37; never
+// no_mapping or no_section, the map is fine), and a hit re-emits its reason here.
 // apps/processor-go/symbolicate's Outcome constants are defined FROM these, never re-typed.
 const (
 	SymbolicationFrameApplied    = "applied"     // rewritten to the original position
@@ -275,6 +276,10 @@ const (
 	SymbolicationFrameFetchError = "fetch_error" // the object GET (or the Store) failed
 	SymbolicationFrameTimeout    = "timeout"     // fetch + parse outlived SYMBOLICATE_DEADLINE; the fill continues
 	SymbolicationFrameOversize   = "oversize"    // the row's size_bytes exceeds SOURCEMAP_MAX_PARSE_BYTES; never fetched
+	// SymbolicationFrameNoSection: the frame's generated position precedes the index map's first
+	// section (or the map has no sections). sentinel-sourcemaps-index-maps §4.4, D14 — per frame,
+	// never negatively cached.
+	SymbolicationFrameNoSection = "no_section"
 )
 
 // Permitted values for LabelTo and LabelChanged on MetricSymbolicationInAppRederived

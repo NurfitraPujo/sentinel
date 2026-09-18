@@ -36,10 +36,11 @@ import { log } from '$lib/server/observability/log';
  *  1. validate EVERYTHING (all-or-nothing: a CI run never lands half a release), read the
  *     release's existing rows for the request's paths, and answer the per-release pre-check
  *     (`422 release_full`, nothing written) from that read;
- *  2. `putObject` every part that is not `unchanged`, one after another, under a key derived
- *     from hashes and never from user strings (`sourcemap-path.ts: sourcemapStorageKey`, D5,
- *     decision 17). A failure here is `503 storage_unavailable` with NO row written; the objects
- *     already put stay as orphans -- permanent, counted, accepted (§4.1 *Orphan objects*);
+ *  2. `putObject` every part that is not `unchanged` or `skipped_empty`, one after another,
+ *     under a key derived from hashes and never from user strings (`sourcemap-path.ts:
+ *     sourcemapStorageKey`, D5, decision 17). A failure here is `503 storage_unavailable` with
+ *     NO row written; the objects already put stay as orphans -- permanent, counted, accepted
+ *     (§4.1 *Orphan objects*);
  *  3. ONE short transaction for the upserts (`queries/sourcemaps.ts`), the per-release count
  *     re-read under a lock; object first, row second, so no row ever points at nothing. Under
  *     that lock and before the rows are written, every key this request is about to reference is
@@ -53,6 +54,17 @@ import { log } from '$lib/server/observability/log';
  *     that moment (BUG-05: keys are content-addressed, so a concurrent re-upload of older bytes
  *     recreates a key phase 1 saw, and deleting from the snapshot would leave that row pointing
  *     at nothing).
+ *
+ * A zero-section index map (sentinel-sourcemaps-index-maps §4.1, D12 -- Turbopack's
+ * `{"version":3,"sources":[],"sections":[]}` route-entry stub) takes a short path through those
+ * phases: it passes phase 1b's validation and keeps its `index`, is excluded from phase 1c's
+ * `newPathCount` (it never adds a row, so it never contributes to `release_full` -- R25), is
+ * answered `skipped_empty` in phase 2 with NO `putObject` and nothing added to the upsert (a row
+ * the release already holds under that path is left exactly as it is -- R24), has nothing to
+ * write in phase 3, and is NOT recorded on `sentinel_sourcemap_uploads_total` after commit --
+ * only the `sourcemap_uploads.accepted` log line counts it. The status is `201` iff at least
+ * one part was `created` or `replaced`; a request of nothing but `unchanged` and
+ * `skipped_empty` parts wrote nothing and says so with `200` (R22, R23).
  *
  * The multipart pairing is POSITIONAL: the i-th `file` is the i-th `minified_path`
  * (`FormData.getAll` preserves part order). The route never guesses a path from the map's own
@@ -73,13 +85,22 @@ const MAX_RELEASE_VERSION_BYTES = 100;
 /** `validation.MaxFilePathLength`, the ingestor's own bound on a frame's `file`; `VARCHAR(512)`. */
 const MAX_MINIFIED_PATH_CHARS = 512;
 
-type FileOutcome = 'created' | 'replaced' | 'unchanged';
+/**
+ * `files[].outcome` in §4.1's success body. `created` / `replaced` / `unchanged` are per-file
+ * results of a write (or a write not needed); `skipped_empty` is the one outcome that writes
+ * nothing while the request succeeds -- a zero-section index map, acknowledged and discarded
+ * (sentinel-sourcemaps-index-maps §3, D12, D19). Only the first three reach
+ * `sentinel_sourcemap_uploads_total`.
+ */
+type FileOutcome = 'created' | 'replaced' | 'unchanged' | 'skipped_empty';
 
 interface ValidatedPart {
 	index: number;
 	minifiedPath: string;
 	bytes: Uint8Array;
 	sha256: string;
+	/** The part is a zero-section index map: acknowledged `skipped_empty`, never stored (D12). */
+	skipEmpty: boolean;
 }
 
 /**
@@ -216,14 +237,22 @@ export const POST: RequestHandler = async ({ request }) => {
 			});
 		}
 		const bytes = new Uint8Array(await file.arrayBuffer());
-		const reason = sourcemapV3Rejection(bytes);
-		if (reason) {
-			return rejected(422, 'invalid_sourcemap', `Part ${i} is not a version-3 sourcemap (${reason}).`, {
+		const verdict = sourcemapV3Rejection(bytes);
+		if (verdict.form === null) {
+			const { form: _form, ...details } = verdict;
+			return rejected(422, 'invalid_sourcemap', `Part ${i} is not a version-3 sourcemap (${verdict.reason}).`, {
 				index: i,
-				reason,
+				...details,
 			});
 		}
-		parts.push({ index: i, minifiedPath: normalisedPaths[i], bytes, sha256: sha256Hex(bytes) });
+		// The form travels no further than this flag (D12): nothing is stored, echoed or passed on.
+		parts.push({
+			index: i,
+			minifiedPath: normalisedPaths[i],
+			bytes,
+			sha256: sha256Hex(bytes),
+			skipEmpty: verdict.form === 'index-empty',
+		});
 	}
 
 	// Storage must exist before anything is read for a write that could not happen anyway. After
@@ -236,7 +265,8 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	// ---- Phase 1c: the release's existing rows for these paths, and the pre-check (decision 26):
 	// `would_be` = rows before the request + the request's paths with no row yet; a replace does
-	// not add. Answered BEFORE the first putObject, having written nothing.
+	// not add, and neither does a `skipEmpty` part (it never becomes a row -- R25). Answered
+	// BEFORE the first putObject, having written nothing.
 	let state;
 	try {
 		state = await readReleaseState(ctx.projectId, releaseVersion, normalisedPaths);
@@ -246,7 +276,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		log.error('sourcemap_uploads.read_failed', { projectId: ctx.projectId, error: err });
 		return reportErrorResponse(500, 'internal', 'Failed to read the release.');
 	}
-	const newPathCount = parts.filter((p) => !state.existing.has(p.minifiedPath)).length;
+	const newPathCount = parts.filter((p) => !p.skipEmpty && !state.existing.has(p.minifiedPath)).length;
 	if (state.current + newPathCount > maxFilesPerRelease) {
 		return rejected(422, 'release_full', `Release already holds ${state.current} of at most ${maxFilesPerRelease} source maps.`, {
 			max: maxFilesPerRelease,
@@ -254,12 +284,19 @@ export const POST: RequestHandler = async ({ request }) => {
 		});
 	}
 
-	// ---- Phase 2: every object that is not `unchanged`, one after another, NO transaction open.
+	// ---- Phase 2: every object that is not `unchanged` or `skipped_empty`, one after another, NO
+	// transaction open.
 	const outcomes: FileOutcome[] = new Array(parts.length);
 	const toUpsert: SourcemapUpsertInput[] = [];
 	const bytesByKey = new Map<string, Uint8Array>();
 	let objectsPut = 0;
 	for (const part of parts) {
+		if (part.skipEmpty) {
+			// Acknowledged, not stored (D12): no object, no row, and whatever row the release
+			// already holds under this path stays exactly as it is (R24).
+			outcomes[part.index] = 'skipped_empty';
+			continue;
+		}
 		const existing = state.existing.get(part.minifiedPath);
 		if (existing && existing.sha256 === part.sha256) {
 			outcomes[part.index] = 'unchanged';
@@ -290,7 +327,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		});
 	}
 
-	// ---- Phase 3: one short transaction. `unchanged` parts have nothing to write.
+	// ---- Phase 3: one short transaction. `unchanged` and `skipped_empty` parts have nothing to write.
 	//
 	// `ensureObjectsPresent` runs INSIDE it, under the release lock, before the rows are written
 	// (decision 43): each key is HEADed and, only if the object is gone, put again from the bytes
@@ -390,7 +427,12 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 	}
 
-	for (const outcome of outcomes) recordSourcemapUpload(outcome);
+	// A `skipped_empty` part is neither a write nor a refusal nor an orphan: the metric keeps its
+	// closed five-value set (`metrics.ts: SOURCEMAP_UPLOAD_OUTCOME`) and the log line below is
+	// where an operator counts stubs.
+	for (const outcome of outcomes) {
+		if (outcome !== 'skipped_empty') recordSourcemapUpload(outcome);
+	}
 
 	log.info('sourcemap_uploads.accepted', {
 		projectId: ctx.projectId,
@@ -399,13 +441,15 @@ export const POST: RequestHandler = async ({ request }) => {
 		created: outcomes.filter((o) => o === 'created').length,
 		replaced: outcomes.filter((o) => o === 'replaced').length,
 		unchanged: outcomes.filter((o) => o === 'unchanged').length,
+		skipped_empty: outcomes.filter((o) => o === 'skipped_empty').length,
 		objectsRepaired,
 		releaseFileCount,
 	});
 
-	// §4.1's success body, snake_case per §3; `files[]` in request order. 200 when every file is
-	// `unchanged` (the CI retry case), 201 otherwise.
-	const allUnchanged = outcomes.every((o) => o === 'unchanged');
+	// §4.1's success body, snake_case per §3; `files[]` in request order. 201 iff at least one
+	// part was written (`created` or `replaced`); 200 when every part is `unchanged` (the CI
+	// retry case) or `skipped_empty` -- the request wrote nothing and says so.
+	const wroteSomething = outcomes.some((o) => o === 'created' || o === 'replaced');
 	return new Response(
 		JSON.stringify({
 			project_id: ctx.projectId,
@@ -418,28 +462,105 @@ export const POST: RequestHandler = async ({ request }) => {
 			})),
 			release_file_count: releaseFileCount,
 		}),
-		{ status: allUnchanged ? 200 : 201, headers: { 'Content-Type': 'application/json' } }
+		{ status: wroteSomething ? 201 : 200, headers: { 'Content-Type': 'application/json' } }
 	);
 };
 
+/** The flat-map reasons of sentinel-sourcemaps §4.1, reused per section as `inner` (§7). */
+type FlatReason = 'not_v3' | 'no_mappings' | 'no_sources';
+
 /**
- * §4.1's structural sourcemap-v3 check, in the contract's order: the bytes parse as JSON, the
- * object has `"version": 3`, a string `"mappings"` and an array `"sources"`. Returns the §7
- * `reason` or null when the part passes. Deliberately not a decode (decision 19).
+ * What `sourcemapV3Rejection` answers: the form it validated, or `form: null` with the §7
+ * `reason` and, for the five `section_*` reasons, the 0-based `section` (+ `inner` for
+ * `section_map`). The form is read by exactly one line of the route (`skipEmpty`) and goes
+ * nowhere else (D12).
  */
-function sourcemapV3Rejection(bytes: Uint8Array): 'not_json' | 'not_v3' | 'no_mappings' | 'no_sources' | null {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8'));
-	} catch {
-		return 'not_json';
-	}
-	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return 'not_v3';
-	const map = parsed as Record<string, unknown>;
+type SourcemapVerdict =
+	| { form: 'flat' | 'index' | 'index-empty' }
+	| { form: null; reason: 'not_json' | FlatReason | 'both_mappings_and_sections' }
+	| { form: null; reason: 'section_url' | 'section_shape' | 'section_order'; section: number }
+	| { form: null; reason: 'section_map'; section: number; inner: FlatReason | 'nested' };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The flat rules, in sentinel-sourcemaps §4.1's order: `"version": 3`, a string `"mappings"`, an
+ * array `"sources"`. Applied to a top-level map and, unchanged, to every section's `map`.
+ */
+function flatRejection(map: Record<string, unknown>): FlatReason | null {
 	if (map.version !== 3) return 'not_v3';
 	if (typeof map.mappings !== 'string') return 'no_mappings';
 	if (!Array.isArray(map.sources)) return 'no_sources';
 	return null;
+}
+
+/**
+ * The structural sourcemap-v3 check, in the contract's order (sentinel-sourcemaps §4.1, widened
+ * by sentinel-sourcemaps-index-maps §4.1): the bytes parse as JSON and the object has
+ * `"version": 3`; then
+ *
+ *  1. a string `mappings` is the FLAT form -- the flat rules, and `both_mappings_and_sections`
+ *     when a `sections` array rides beside it (R14, D5);
+ *  2. else a `sections` array is the INDEX form -- each entry, in order, stopping at the first
+ *     failure with `section` naming it: an object (`section_shape`), no `url` key
+ *     (`section_url`, checked before anything else so a `url` section is named as such whatever
+ *     else it lacks), an `offset` whose `line` and `column` are integers >= 0 (`section_shape`),
+ *     a `map` that is an object (`section_shape`) passing the flat rules and not itself carrying
+ *     a `sections` array (`section_map` + `inner`); then, across the array, offsets strictly
+ *     increasing in `(line, column)` order (`section_order`). Zero sections is valid and is the
+ *     `index-empty` form. Top-level `sources` is not read (Turbopack writes `[]`, a Sentry-wrapped
+ *     build writes `null`);
+ *  3. else `no_mappings`, exactly as before.
+ *
+ * Deliberately not a decode (decision 19): three keys per map, a handful per section, never a VLQ.
+ */
+function sourcemapV3Rejection(bytes: Uint8Array): SourcemapVerdict {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8'));
+	} catch {
+		return { form: null, reason: 'not_json' };
+	}
+	if (!isPlainObject(parsed)) return { form: null, reason: 'not_v3' };
+	const map = parsed;
+	if (map.version !== 3) return { form: null, reason: 'not_v3' };
+
+	if (typeof map.mappings === 'string') {
+		const reason = flatRejection(map);
+		if (reason) return { form: null, reason };
+		if (Array.isArray(map.sections)) return { form: null, reason: 'both_mappings_and_sections' };
+		return { form: 'flat' };
+	}
+
+	if (!Array.isArray(map.sections)) return { form: null, reason: 'no_mappings' };
+	const sections = map.sections as unknown[];
+	const offsets: Array<[number, number]> = [];
+	for (let section = 0; section < sections.length; section++) {
+		const entry = sections[section];
+		if (!isPlainObject(entry)) return { form: null, reason: 'section_shape', section };
+		if ('url' in entry) return { form: null, reason: 'section_url', section };
+		const offset = entry.offset;
+		if (!isPlainObject(offset)) return { form: null, reason: 'section_shape', section };
+		const { line, column } = offset;
+		if (!Number.isInteger(line) || (line as number) < 0 || !Number.isInteger(column) || (column as number) < 0) {
+			return { form: null, reason: 'section_shape', section };
+		}
+		if (!isPlainObject(entry.map)) return { form: null, reason: 'section_shape', section };
+		const inner = flatRejection(entry.map);
+		if (inner) return { form: null, reason: 'section_map', section, inner };
+		if (Array.isArray(entry.map.sections)) return { form: null, reason: 'section_map', section, inner: 'nested' };
+		offsets.push([line as number, column as number]);
+	}
+	for (let section = 1; section < offsets.length; section++) {
+		const [prevLine, prevColumn] = offsets[section - 1];
+		const [line, column] = offsets[section];
+		if (line < prevLine || (line === prevLine && column <= prevColumn)) {
+			return { form: null, reason: 'section_order', section };
+		}
+	}
+	return { form: sections.length === 0 ? 'index-empty' : 'index' };
 }
 
 /**

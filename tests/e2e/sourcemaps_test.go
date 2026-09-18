@@ -125,6 +125,12 @@ func (f *fixture) sourcemapEvent(build byte, errorClass string) event {
 	})
 }
 
+// sourcemapPart is one (minified_path, file) pair of a multipart POST /api/sourcemaps body.
+type sourcemapPart struct {
+	minifiedPath string
+	fixturePath  string
+}
+
 // uploadFixtureBuild POSTs every map under tests/fixtures/sourcemaps/dist-<build>/assets to
 // §4.1's route with the fixture's project-scoped ingest key, paired by position, and returns the
 // decoded body. The minified_path is `/assets/<chunk>.js`, exactly what the browser reports and
@@ -136,24 +142,35 @@ func (f *fixture) uploadFixtureBuild(build byte) (int, sourcemapUploadResponse, 
 	if err != nil || len(maps) == 0 {
 		f.t.Fatalf("no fixture maps under %s (err=%v) — run from tests/e2e, the fixture is committed", dir, err)
 	}
+	parts := make([]sourcemapPart, 0, len(maps))
+	for _, m := range maps {
+		chunk := strings.TrimSuffix(filepath.Base(m), ".map")
+		parts = append(parts, sourcemapPart{minifiedPath: "/assets/" + chunk, fixturePath: m})
+	}
+	return f.postSourcemaps(parts)
+}
 
+// postSourcemaps POSTs the given parts, in order, as ONE multipart request to §4.1's route under
+// sourcemapsRelease with the fixture's project-scoped ingest key, and returns the status, the
+// decoded body and the raw body.
+func (f *fixture) postSourcemaps(parts []sourcemapPart) (int, sourcemapUploadResponse, string) {
+	f.t.Helper()
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 	if err := w.WriteField("release_version", sourcemapsRelease); err != nil {
 		f.t.Fatal(err)
 	}
-	for _, m := range maps {
-		chunk := strings.TrimSuffix(filepath.Base(m), ".map")
-		if err := w.WriteField("minified_path", "/assets/"+chunk); err != nil {
+	for _, p := range parts {
+		if err := w.WriteField("minified_path", p.minifiedPath); err != nil {
 			f.t.Fatal(err)
 		}
-		part, err := w.CreateFormFile("file", filepath.Base(m))
+		part, err := w.CreateFormFile("file", filepath.Base(p.fixturePath))
 		if err != nil {
 			f.t.Fatal(err)
 		}
-		raw, err := os.ReadFile(m)
+		raw, err := os.ReadFile(p.fixturePath)
 		if err != nil {
-			f.t.Fatal(err)
+			f.t.Fatalf("reading fixture %s: %v — run from tests/e2e, the fixture is committed", p.fixturePath, err)
 		}
 		if _, err := part.Write(raw); err != nil {
 			f.t.Fatal(err)
@@ -262,7 +279,13 @@ func assertSymbolicatedFrames(t *testing.T, frames []storedFrame, build byte) {
 //     chunk names differ — and build B's event (new chunk hash and generated column, the same
 //     source position, fresh event_id) lands on issue 2: the fingerprint saw the symbolicated
 //     frames, never the chunk hash. That is the feature's hypothesis (§1) in one assertion;
-//  4. the issue-detail loader serves the symbolicated frame, and /metrics carries the counters.
+//  4. the issue-detail loader serves the symbolicated frame, and /metrics carries the counters;
+//  5. (sentinel-sourcemaps-index-maps §4.6, D8, D12, D15) the real Turbopack index map and the
+//     empty stub go up under R1 in ONE two-part request — `created` + `skipped_empty`, and
+//     `release_file_count` 17 because the stub is not a row — and an event with a frame inside
+//     the map's fifth section, a frame before its first section and a frame on the stub lands
+//     with exactly the first one rewritten through the section (`applied_partial`), the second
+//     `no_section` and the third `no_map`.
 func TestS1S2_SymbolicateBeforeFingerprint(t *testing.T) {
 	f := newFixture(t)
 
@@ -384,6 +407,173 @@ func TestS1S2_SymbolicateBeforeFingerprint(t *testing.T) {
 		}
 	}
 	t.Logf("processor /metrics after the run:\n%s", metrics)
+
+	// --- 5. the Turbopack index map and the empty stub, through the sections -------------------
+	// No SOURCEMAP_NEGATIVE_TTL sleep is owed here: the negative cache is keyed by (project, R1,
+	// normalised path), and neither `/app/.next/server/chunks/[turbopack]_runtime.js` nor
+	// `/app/.next/server/app/page.js` was looked up in steps 1–4 (every event so far carried only
+	// the `/assets/…` anchors), so there is no `no_map` entry to wait out.
+	before := metrics
+	status, up, raw = f.postSourcemaps([]sourcemapPart{
+		{minifiedPath: indexMapRuntimePath, fixturePath: filepath.Join(sourcemapsFixtureDir, "turbopack", "chunks", "[turbopack]_runtime.js.map")},
+		{minifiedPath: indexMapStubPath, fixturePath: filepath.Join(sourcemapsFixtureDir, "turbopack", "app", "page.js.map")},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /api/sourcemaps (index map + stub): got %d, want 201\n  body: %s", status, raw)
+	}
+	if len(up.Files) != 2 || up.Files[0].Outcome != "created" || up.Files[1].Outcome != "skipped_empty" || up.ReleaseFileCount != 17 {
+		t.Fatalf("index map + stub upload: want files[0] created, files[1] skipped_empty, release_file_count 17 (8 + 8 + 1: the stub is not a row, D12)\n  body: %s", raw)
+	}
+	if up.Files[0].MinifiedPath != indexMapRuntimePath || up.Files[1].MinifiedPath != indexMapStubPath {
+		t.Fatalf("index map + stub upload: files[] out of order\n  body: %s", raw)
+	}
+	t.Logf("step 5 upload response body: %s", raw)
+
+	// M2, through the test's pool. Scoped to the fixture's project: R1 is the release name every
+	// run of this case uses, and the `sourcemaps` rows of a previous run's project are only gone
+	// once that project's cleanup cascaded.
+	var releaseRows, stubRows int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM sourcemaps WHERE project_id = $1 AND release_version = $2`,
+		f.ProjectID, sourcemapsRelease).Scan(&releaseRows); err != nil {
+		t.Fatalf("counting sourcemaps rows of R1: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM sourcemaps WHERE project_id = $1 AND release_version = $2 AND minified_path = $3`,
+		f.ProjectID, sourcemapsRelease, indexMapStubPath).Scan(&stubRows); err != nil {
+		t.Fatalf("counting sourcemaps rows of the stub: %v", err)
+	}
+	t.Logf("SELECT count(*) FROM sourcemaps WHERE project_id = '%s' AND release_version = 'R1' → %d", f.ProjectID, releaseRows)
+	t.Logf("SELECT count(*) FROM sourcemaps WHERE project_id = '%s' AND release_version = 'R1' AND minified_path = '%s' → %d", f.ProjectID, indexMapStubPath, stubRows)
+	if releaseRows != 17 {
+		t.Fatalf("sourcemaps rows for R1 = %d, want 17 (build A 8 + build B 8 + the runtime index map)", releaseRows)
+	}
+	if stubRows != 0 {
+		t.Fatalf("sourcemaps rows for the stub %s = %d, want 0: a zero-section index map is never stored (D12)", indexMapStubPath, stubRows)
+	}
+
+	fifth := f.indexMapEvent("ReferenceError")
+	if res := f.ingest(fifth); res.Status != http.StatusAccepted {
+		t.Fatalf("POST /ingest (index map event): got %d, want 202\n  body: %s", res.Status, res.Body)
+	}
+	f.waitForOccurrences(4)
+	occ = f.occurrences()
+	frames := storedFrames(t, occ[3])
+	if len(frames) != 3+len(sourcemapAnchors) {
+		t.Fatalf("stored %d frames, want %d", len(frames), 3+len(sourcemapAnchors))
+	}
+	// Logged as the JSONB bytes themselves, so "no `symbolicated`/`raw` key" is visible verbatim.
+	var rawFrames []json.RawMessage
+	if err := json.Unmarshal(occ[3].Stacktrace, &rawFrames); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		t.Logf("step 5 stored frame (%s): %s", []string{"i", "ii", "iii"}[i], rawFrames[i])
+	}
+	// (i) inside section 4 (offset line 553): wire 600:12 → nodejs/runtime.ts:77:7. in_app is
+	// RE-DERIVED from the resolved source (turbopack-grouping §4.2): a `turbopack:///[turbopack]/…`
+	// root is false, whatever the SDK sent; `raw.in_app` keeps the SDK's true.
+	fr := frames[0]
+	if fr.Symbolicated == nil || !*fr.Symbolicated || fr.Raw == nil {
+		t.Fatalf("frame (i) was not symbolicated through the section: %+v", fr)
+	}
+	if fr.File != indexMapResolvedSource || fr.Line != 77 || fr.Column != 7 || fr.Function != indexMapFunction {
+		t.Fatalf("frame (i) resolved to %s:%s:%d:%d, want %s:%s:77:7", fr.File, fr.Function, fr.Line, fr.Column, indexMapResolvedSource, indexMapFunction)
+	}
+	if fr.InApp {
+		t.Fatalf("frame (i) in_app = true, want false: %s is a bracketed-root source", fr.File)
+	}
+	if fr.Raw.File != indexMapRuntimePath || fr.Raw.Line != 600 || fr.Raw.Column != 12 || fr.Raw.Function != indexMapFunction || !fr.Raw.InApp {
+		t.Fatalf("frame (i) raw = %+v, want %s:600:12 %s in_app=true", *fr.Raw, indexMapRuntimePath, indexMapFunction)
+	}
+	// (ii) before the first section (I1) and (iii) on the stub, for which nothing is stored (I14):
+	// byte-identical pass-throughs, no `symbolicated`, no `raw`.
+	for i, want := range []struct {
+		file         string
+		line, column int32
+	}{{indexMapRuntimePath, 1, 1}, {indexMapStubPath, 1, 5}} {
+		fr := frames[1+i]
+		if fr.Symbolicated != nil || fr.Raw != nil {
+			t.Fatalf("frame %d was rewritten, want a pass-through: %+v", 1+i, fr)
+		}
+		if fr.File != want.file || fr.Line != want.line || fr.Column != want.column || fr.Function != indexMapFunction || !fr.InApp {
+			t.Fatalf("frame %d stored as %+v, want %s:%d:%d %s in_app=true unrewritten", 1+i, fr, want.file, want.line, want.column, indexMapFunction)
+		}
+	}
+	assertSymbolicatedFrames(t, frames[3:], 'a')
+
+	after := readProcessorMetrics(t)
+	noSection := metricValue(t, after, `sentinel_symbolication_frames_total`, "no_section")
+	noMapDelta := metricValue(t, after, `sentinel_symbolication_frames_total`, "no_map") - metricValue(t, before, `sentinel_symbolication_frames_total`, "no_map")
+	partialDelta := metricValue(t, after, `sentinel_symbolication_events_total`, "applied_partial") - metricValue(t, before, `sentinel_symbolication_events_total`, "applied_partial")
+	for _, l := range strings.Split(after, "\n") {
+		if strings.Contains(l, `outcome="no_section"`) || strings.Contains(l, `outcome="no_map"`) || strings.Contains(l, `outcome="applied_partial"`) {
+			t.Logf("step 5 /metrics: %s", l)
+		}
+	}
+	if noSection < 1 {
+		t.Fatalf("frames_total{outcome=\"no_section\"} = %v, want >= 1 (frame ii)", noSection)
+	}
+	if noMapDelta < 1 {
+		t.Fatalf("frames_total{outcome=\"no_map\"} grew by %v over step 5, want >= 1 (frame iii)", noMapDelta)
+	}
+	if partialDelta != 1 {
+		t.Fatalf("events_total{outcome=\"applied_partial\"} grew by %v over step 5, want exactly 1", partialDelta)
+	}
+}
+
+// The Turbopack index-map fixture (tests/fixtures/sourcemaps/README.md, `turbopack/`): the two
+// minified paths under the sdk-js wrapper's `serverRoot` shape (contract D18), the source the
+// map's fifth section resolves wire 600:12 to, and the `function` every step-5 frame carries —
+// the map's `names` are all empty, so it must come back verbatim (I8).
+const (
+	indexMapRuntimePath    = "/app/.next/server/chunks/[turbopack]_runtime.js"
+	indexMapStubPath       = "/app/.next/server/app/page.js"
+	indexMapResolvedSource = "turbopack:///[turbopack]/nodejs/runtime.ts"
+	indexMapFunction       = "loadChunk"
+)
+
+// indexMapEvent builds step 5's javascript event: (i) inside the map's last section, (ii) before
+// its first section, (iii) on the stub — all in_app as a Node server frame would be — followed by
+// build A's four anchors, so the anchors' assertions still hold on the same occurrence.
+func (f *fixture) indexMapEvent(errorClass string) event {
+	frames := []map[string]any{
+		{"file": indexMapRuntimePath, "line": 600, "column": 12, "function": indexMapFunction, "in_app": true},
+		{"file": indexMapRuntimePath, "line": 1, "column": 1, "function": indexMapFunction, "in_app": true},
+		{"file": indexMapStubPath, "line": 1, "column": 5, "function": indexMapFunction, "in_app": true},
+	}
+	for i, a := range sourcemapAnchors {
+		frames = append(frames, map[string]any{
+			"file": a.fileA, "line": 1, "column": a.columnA, "function": a.minName, "in_app": seedInApp(i),
+		})
+	}
+	return f.newEvent().with(event{
+		"platform":        "javascript",
+		"release_version": sourcemapsRelease,
+		"error_class":     errorClass,
+		"message":         "sourcemaps e2e (index map): " + errorClass,
+		"event_id":        uuid.NewString(),
+		"stacktrace":      frames,
+	})
+}
+
+// metricValue returns the sample of `<name>{…outcome="<outcome>"…}` in a readProcessorMetrics
+// dump, or 0 when the series has not been emitted yet (a counter that was never incremented is
+// absent from the exposition, not 0).
+func metricValue(t *testing.T, metrics, name, outcome string) float64 {
+	t.Helper()
+	for _, l := range strings.Split(metrics, "\n") {
+		if !strings.HasPrefix(l, name+"{") || !strings.Contains(l, `outcome="`+outcome+`"`) {
+			continue
+		}
+		fields := strings.Fields(l)
+		var v float64
+		if _, err := fmt.Sscanf(fields[len(fields)-1], "%g", &v); err != nil {
+			t.Fatalf("parsing %q: %v", l, err)
+		}
+		return v
+	}
+	return 0
 }
 
 // readProcessorMetrics returns the sentinel_symbolication_* and sentinel_sourcemap_* lines of the

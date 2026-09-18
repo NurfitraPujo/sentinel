@@ -4,6 +4,36 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+## v0.1.2 — Index maps upload
+
+```sh
+pnpm add 'git+https://github.com/tuju-ai/sentinel.git#packages/sdk-js/v0.1.2&path:packages/sdk-js'
+```
+
+### Changed
+
+- **The sourcemap walker uploads index maps** (`sections`, no string `mappings`) — the shape
+  Turbopack writes for every server entry stub and for its own runtime — instead of leaving them
+  out with a `warn` each (`sentinel-sourcemaps-index-maps`; the route and processor accept
+  `sections` since the same feature). The runtime's frames now symbolicate to
+  `turbopack:///[turbopack]/…`. An empty stub (`{"version":3,"sources":[],"sections":[]}`) is
+  acknowledged by the route as `skipped_empty` and not stored. **The one exception**: an index map
+  any of whose sections carries a `url` key is still skipped, with one `warn` naming the file —
+  the route rejects `url` sections for the whole batch, and a shape the route does not serve must
+  not fail a build. Every other rejection an index map can draw is a malformed map, which fails
+  the build exactly as a malformed flat map does.
+- **The summary line counts the acknowledged stubs.** The CLI's *"`<n>` file(s) stored in `<r>`
+  request(s), release `<v>`"* and `withSentinelConfig`'s *"Sentinel: `<series>` sourcemaps —
+  `<n>` file(s) stored in `<r>` request(s) under release `<v>`"* now count as stored only the
+  entries whose `outcome` is not `skipped_empty`, and gain the clause *"`<k>` empty index map(s)
+  acknowledged and not stored"* when `<k>` > 0 — read from the route's `files[].outcome`, never
+  re-derived from the walk. With `<k>` = 0 both lines read as before. `--dry-run` is unchanged: it
+  lists every pair, stubs included, because the walker does not know which the route will skip.
+  `--json` is unchanged in shape — the per-file `outcome` is where a JSON consumer counts.
+- The internal `IndexMapKind` type (`src/upload/index.ts`) gains `'url'`; no public API, option or
+  export changes. **No wire-vocabulary change**: the ingest JSON is untouched, and `files[].outcome`
+  on the upload route is the dashboard's surface, not the SDK's `metadata`.
+
 ## v0.1.1 — The tunnel route never falls back from an explicit `apiKey` option
 
 ```sh

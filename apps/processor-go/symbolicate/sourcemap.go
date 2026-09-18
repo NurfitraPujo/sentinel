@@ -31,11 +31,22 @@ import (
 //     19) and the panicking input is the case §11 feeds it; checking here as well would leave the
 //     recover untested by any input the decoder can produce.
 //
-// Index maps (a top-level `sections` array) are not v3 flat maps and are a parse error.
+// Index maps (a top-level `sections` array, sentinel-sourcemaps-index-maps §4.3) are the v3
+// spec's second form and are decoded here too: each section's `map` is a flat map decoded by the
+// SAME decodeMappings with its OWN `sources` / `sourceRoot` / `names`, and a frame resolves
+// through the section whose `offset` is the greatest at-or-before its generated position (the
+// column offset applies only to the section's first line -- ECMA-426 §5). The form is decided
+// from the BYTES at parse time (the row says nothing -- D12) and cached with the map. What is
+// still a parse error: a `url` section (D1 -- nothing fetches it), a nested index map (D6), an
+// offset that is negative or not strictly after the previous section's (D5), a section without a
+// v3 flat `map`, and a map carrying both `mappings` and `sections` (D5). Zero sections is a
+// valid parse that resolves nothing (every frame `no_section`, flow P9). `sourcesContent` and
+// `ignoreList` are dropped per section exactly as for a flat map.
 
 // parsedMap is one decoded sourcemap: the raw `sources` / `sourceRoot` / `names` strings and,
 // per generated line, the segments in generated-column order. Costed by the ROW's size_bytes in
-// the cache, never by its own footprint (§4.4, cache paragraph).
+// the cache, never by its own footprint (§4.4, cache paragraph). For an index map (index true)
+// sources/names/lines are empty and `sections` carries one parsedMap per section.
 type parsedMap struct {
 	sources    []string
 	sourceRoot string
@@ -43,6 +54,19 @@ type parsedMap struct {
 	// lines[i] holds generated line i (0-based) in ascending generated-column order, as the
 	// mappings string lists them. Lines with no segments are empty slices.
 	lines [][]segment
+
+	// index is set when the bytes were the `sections` form; sections is then every section in
+	// the file's order, strictly ascending by (line, column) -- the route guarantees it and
+	// parseSourcemap re-checks, so section() can binary-search.
+	index    bool
+	sections []parsedSection
+}
+
+// parsedSection is one entry of an index map's `sections`: its 0-based generated offset and the
+// flat map decoded from its `map`, with that map's own sources / sourceRoot / names.
+type parsedSection struct {
+	line, column int32
+	pm           *parsedMap
 }
 
 // segment is one decoded mappings entry. Fields after genCol are only meaningful when hasSource
@@ -57,30 +81,52 @@ type segment struct {
 	hasSource bool
 }
 
-// rawMap is exactly the fields of a v3 map this feature reads. `sourcesContent` and `file` are
-// deliberately absent (decision 35; D4).
+// rawMap is exactly the fields of a v3 map this feature reads. `sourcesContent`, `ignoreList`,
+// `file` and `debugId` are deliberately absent (decision 35; D4) -- for the index form the same
+// struct decodes each section's `map`, so they are dropped per section in the same Unmarshal.
 type rawMap struct {
-	Version    int      `json:"version"`
-	Sources    []string `json:"sources"`
-	SourceRoot string   `json:"sourceRoot"`
-	Names      []string `json:"names"`
-	Mappings   *string  `json:"mappings"`
-	Sections   []any    `json:"sections"`
+	Version    int          `json:"version"`
+	Sources    []string     `json:"sources"`
+	SourceRoot string       `json:"sourceRoot"`
+	Names      []string     `json:"names"`
+	Mappings   *string      `json:"mappings"`
+	Sections   []rawSection `json:"sections"`
 }
 
-var errNotV3 = errors.New("sourcemap: not a v3 flat map")
+// rawSection is one entry of an index map's `sections` (index-maps §4.3): the 0-based generated
+// offset the section starts at, and EITHER an inline `map` OR a `url` -- the latter is refused.
+type rawSection struct {
+	Offset struct{ Line, Column int32 } `json:"offset"`
+	URL    *string                      `json:"url"`
+	Map    *rawMap                      `json:"map"`
+}
 
-// parseSourcemap decodes raw bytes into a parsedMap. Every structural fault -- not JSON, not
-// version 3, an index map, a missing `mappings`, a malformed VLQ run -- is an error; the caller
-// counts it `map_error`.
+var errNotV3 = errors.New("sourcemap: not a v3 map")
+
+// parseSourcemap decodes raw bytes into a parsedMap, dispatching on the bytes (index-maps §4.3):
+// version 3 with a string `mappings` is the flat form; version 3 with a `sections` array is the
+// index form; both at once, neither, or another version is errNotV3. Every structural fault --
+// not JSON, a malformed VLQ run, a bad section -- is an error; the caller counts it `map_error`.
 func parseSourcemap(raw []byte) (*parsedMap, error) {
 	var m rawMap
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("sourcemap: %w", err)
 	}
-	if m.Version != 3 || m.Sections != nil || m.Mappings == nil {
+	switch {
+	case m.Version != 3:
 		return nil, errNotV3
+	case m.Mappings != nil && m.Sections != nil:
+		return nil, errNotV3 // D5: the two forms are exclusive (the route's R14)
+	case m.Mappings != nil:
+		return parseFlat(&m)
+	case m.Sections != nil:
+		return parseIndex(&m)
 	}
+	return nil, errNotV3
+}
+
+// parseFlat is the flat form: `mappings` decoded once, sources / sourceRoot / names kept verbatim.
+func parseFlat(m *rawMap) (*parsedMap, error) {
 	lines, err := decodeMappings(*m.Mappings)
 	if err != nil {
 		return nil, err
@@ -98,6 +144,50 @@ func parseSourcemap(raw []byte) (*parsedMap, error) {
 		pm.names = []string{}
 	}
 	return pm, nil
+}
+
+// parseIndex is the index form: each section is checked (§4.3 step 4) and its `map` decoded by
+// parseFlat into a parsedMap of its own. Zero sections is a valid parse -- the route never stores
+// one (§4.1 R1-R3), so the case exists only so the parser has no undefined input.
+func parseIndex(m *rawMap) (*parsedMap, error) {
+	pm := &parsedMap{
+		sources:  []string{},
+		names:    []string{},
+		index:    true,
+		sections: make([]parsedSection, 0, len(m.Sections)),
+	}
+	for i, s := range m.Sections {
+		switch {
+		case s.URL != nil:
+			return nil, fmt.Errorf("sourcemap: section %d: url sections are not supported", i)
+		case s.Map == nil:
+			return nil, fmt.Errorf("sourcemap: section %d: no map", i)
+		case s.Map.Sections != nil:
+			return nil, fmt.Errorf("sourcemap: section %d: nested index maps are not supported", i)
+		case s.Map.Version != 3 || s.Map.Mappings == nil:
+			return nil, fmt.Errorf("sourcemap: section %d: map is not a v3 flat map", i)
+		case s.Offset.Line < 0 || s.Offset.Column < 0:
+			return nil, fmt.Errorf("sourcemap: section %d: negative offset (%d,%d)", i, s.Offset.Line, s.Offset.Column)
+		}
+		if i > 0 {
+			prev := pm.sections[i-1]
+			if !lessPos(prev.line, prev.column, s.Offset.Line, s.Offset.Column) {
+				return nil, fmt.Errorf("sourcemap: section %d: offset (%d,%d) is not after section %d's (%d,%d)",
+					i, s.Offset.Line, s.Offset.Column, i-1, prev.line, prev.column)
+			}
+		}
+		inner, err := parseFlat(s.Map)
+		if err != nil {
+			return nil, fmt.Errorf("sourcemap: section %d: %w", i, err)
+		}
+		pm.sections = append(pm.sections, parsedSection{line: s.Offset.Line, column: s.Offset.Column, pm: inner})
+	}
+	return pm, nil
+}
+
+// lessPos is the lexicographic order on 0-based generated positions: (l1,c1) < (l2,c2).
+func lessPos(l1, c1, l2, c2 int32) bool {
+	return l1 < l2 || (l1 == l2 && c1 < c2)
 }
 
 // decodeMappings splits the mappings string into lines (`;`) and segments (`,`) and decodes each
@@ -268,6 +358,80 @@ func (pm *parsedMap) resolve(line, column int32) (resolved, bool) {
 		r.name = pm.names[seg.name]
 	}
 	return r, true
+}
+
+// resolveStatus is resolveFrame's three-valued answer, so the service can tell §4.4's
+// `no_section` (no section reaches the frame's position -- an index-map fact) from `no_mapping`
+// (the map, or the section's map, has nothing for the position) without re-deriving either.
+type resolveStatus uint8
+
+const (
+	resolveFound resolveStatus = iota
+	resolveNoMapping
+	resolveNoSection
+)
+
+// resolveFrame is resolve for either form of map, on a WIRE position. A flat map is resolve as
+// above; an index map (index-maps §4.3 "resolve on an index map") is:
+//
+//  1. line < 1 or column < 1 → no mapping, as for a flat map (the service never sends column 0;
+//     it is `no_column` before any lookup);
+//  2. the section whose offset is the greatest <= (line-1, column-1) lexicographically -- none
+//     (the frame precedes the first section, or the map has no sections) → no section;
+//  3. local line gl - s.line; local column gc - s.column when the frame is ON the offset's line,
+//     else gc unchanged (the column offset applies only to the section's first line);
+//  4. the section's own resolve on that local position, 1-based again -- the flat rule unchanged,
+//     with the section's sources / sourceRoot / names.
+//
+// A section is never bounded by the NEXT section's offset: a map whose mappings run past it is
+// a producer bug the decoder does not police, and the frame resolves through the earlier
+// section as every other consumer does.
+func (pm *parsedMap) resolveFrame(line, column int32) (resolved, resolveStatus) {
+	if !pm.index {
+		if r, ok := pm.resolve(line, column); ok {
+			return r, resolveFound
+		}
+		return resolved{}, resolveNoMapping
+	}
+	if line < 1 || column < 1 {
+		return resolved{}, resolveNoMapping
+	}
+	gl, gc := line-1, column-1
+	i, ok := pm.section(gl, gc)
+	if !ok {
+		return resolved{}, resolveNoSection
+	}
+	s := pm.sections[i]
+	ll := gl - s.line
+	lc := gc
+	if gl == s.line {
+		lc = gc - s.column
+	}
+	if r, ok := s.pm.resolve(ll+1, lc+1); ok {
+		return r, resolveFound
+	}
+	return resolved{}, resolveNoMapping
+}
+
+// section picks the index of the section whose offset is the greatest at-or-before the 0-based
+// generated position (gl, gc); false when no section starts at or before it. Binary search over
+// the strictly ascending offsets parseIndex verified.
+func (pm *parsedMap) section(gl, gc int32) (int, bool) {
+	// First section with offset > (gl, gc); the one before it is the nearest at-or-before.
+	lo, hi := 0, len(pm.sections)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		s := pm.sections[mid]
+		if !lessPos(gl, gc, s.line, s.column) { // s.offset <= (gl, gc)
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return 0, false
+	}
+	return lo - 1, true
 }
 
 // JoinSourceRoot is §4.4 step 6's identity rule (decision 21): an empty sourceRoot leaves source
