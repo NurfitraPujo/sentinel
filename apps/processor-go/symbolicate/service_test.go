@@ -499,6 +499,281 @@ func TestSymbolicate_InAppTable(t *testing.T) {
 	}
 }
 
+// ---- index maps: the §4.3 rows I1–I17 (sentinel-sourcemaps-index-maps) ------------------------
+
+const (
+	// The real Turbopack runtime chunk under decision 18's serverRoot shape, and the stub path
+	// for which the route stores NOTHING (index-maps §4.1 R1, D12).
+	indexRuntimePath = "/app/.next/server/chunks/[turbopack]_runtime.js"
+	indexStubPathMin = "/app/.next/server/app/page.js"
+	indexRuntimeKey  = "sourcemaps/p/r/turbopack-runtime.map"
+
+	// The hand-made two-section map of I15–I17: offsets (5,0) and (5,40), inner maps each
+	// `mappings: "AAAA"` (one segment at generated column 0 → the section's one source, 1:1).
+	// Section 0's source is app-shaped (in_app true), section 1's is a namespace root (false),
+	// so the `in_app` column below says which section resolved the frame.
+	twoSectionPath   = "/two-section.js"
+	twoSectionSrc0   = "src/section0.ts"
+	twoSectionSrc1   = "turbopack:///[turbopack]/section1.ts"
+	twoSectionMapRaw = `{"version":3,"sources":[],"sections":[` +
+		`{"offset":{"line":5,"column":0},"map":{"version":3,"sources":["` + twoSectionSrc0 + `"],"names":[],"mappings":"AAAA"}},` +
+		`{"offset":{"line":5,"column":40},"map":{"version":3,"sources":["` + twoSectionSrc1 + `"],"names":[],"mappings":"AAAA"}}]}`
+)
+
+// seedIndexRuntime adds the committed real Turbopack index map (testdata/turbopack-index) under
+// (projectA, releaseR, indexRuntimePath). Nothing is seeded for the stub path on purpose.
+func (h *harness) seedIndexRuntime(t *testing.T) *Sourcemap {
+	t.Helper()
+	raw := readTestdata(t, indexMapPath)
+	h.fetcher.objects[indexRuntimeKey] = raw
+	row := rowFor("map-turbopack-runtime", projectA, releaseR, indexRuntimePath, indexRuntimeKey, raw)
+	h.store.add(row)
+	return row
+}
+
+// indexMapCases are contract §4.3's rows I1–I17 VERBATIM: wire positions in, the outcome and the
+// stored frame out. I1–I12 were computed by the contract's independent decoder against the real
+// map (D9: a disagreement is reported, never edited into the row); I13/I14 are the stage's
+// existing rules; I15–I17 pin the column-offset arithmetic on the hand-made map. `file` is ""
+// for a row the stage does not rewrite (the frame keeps its path); wantInApp is the stored
+// in_app -- rule 2 (`[turbopack]` root) for the runtime map's rows, "as sent" (true) otherwise.
+var indexMapCases = []struct {
+	row          string
+	path         string
+	line, column int32
+	outcome      Outcome
+	file         string
+	oline, ocol  int32
+	wantInApp    bool
+}{
+	{"I1", indexRuntimePath, 1, 1, OutcomeNoSection, "", 0, 0, true},
+	{"I2", indexRuntimePath, 3, 1, OutcomeNoSection, "", 0, 0, true},
+	{"I3", indexRuntimePath, 4, 1, OutcomeApplied, "turbopack:///[turbopack]/shared/runtime-utils.ts", 1, 1, false},
+	{"I4", indexRuntimePath, 4, 10, OutcomeApplied, "turbopack:///[turbopack]/shared/runtime-utils.ts", 1, 1, false},
+	{"I5", indexRuntimePath, 300, 20, OutcomeApplied, "turbopack:///[turbopack]/shared/runtime-utils.ts", 456, 9, false},
+	{"I6", indexRuntimePath, 470, 1, OutcomeApplied, "turbopack:///[turbopack]/shared/runtime-utils.ts", 701, 1, false},
+	{"I7", indexRuntimePath, 471, 1, OutcomeApplied, "turbopack:///[turbopack]/shared-node/base-externals-utils.ts", 1, 1, false},
+	{"I8", indexRuntimePath, 600, 12, OutcomeApplied, "turbopack:///[turbopack]/nodejs/runtime.ts", 77, 7, false},
+	{"I9", indexRuntimePath, 555, 1, OutcomeApplied, "turbopack:///[turbopack]/nodejs/runtime.ts", 4, 1, false},
+	{"I10", indexRuntimePath, 754, 1, OutcomeNoMapping, "", 0, 0, true},
+	{"I11", indexRuntimePath, 755, 1, OutcomeNoMapping, "", 0, 0, true},
+	{"I12", indexRuntimePath, 760, 1, OutcomeNoMapping, "", 0, 0, true},
+	{"I13", indexRuntimePath, 600, 0, OutcomeNoColumn, "", 0, 0, true},
+	{"I14", indexStubPathMin, 1, 5, OutcomeNoMap, "", 0, 0, true},
+	{"I15", twoSectionPath, 6, 41, OutcomeApplied, twoSectionSrc1, 1, 1, false},
+	{"I16", twoSectionPath, 6, 39, OutcomeApplied, twoSectionSrc0, 1, 1, true},
+	{"I17", twoSectionPath, 7, 3, OutcomeNoMapping, "", 0, 0, true},
+}
+
+// TestSymbolicate_IndexMap drives I1–I17 through Service.Symbolicate over a Store stub that
+// returns a row for the runtime path and nil for the stub path (flows P1–P5): the outcome, the
+// stored file / line:column, in_app and raw.in_app of every row equal the contract's table. I13
+// is `no_column` before any lookup; I14 is `no_map` with the Fetcher uncalled for it and the
+// triple negatively cached, exactly as today. The runtime map is fetched ONCE across the table:
+// the parsed sections live in the positive entry (§4.4 "cached like any map").
+func TestSymbolicate_IndexMap(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seedIndexRuntime(t)
+	h.seedCrafted("map-two-section", twoSectionPath, twoSectionMapRaw)
+	for _, c := range indexMapCases {
+		t.Run(c.row, func(t *testing.T) {
+			fetchesBefore := h.fetcher.calls.Load()
+			storeBefore := h.store.callCount()
+			fr := frame(c.path, c.line, c.column) // InApp true, Function "minified", as sent
+			frames := []Frame{fr}
+			res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+			f := frames[0]
+			if res.Outcomes[0] != c.outcome {
+				t.Fatalf("outcome %s, want %s", res.Outcomes[0], c.outcome)
+			}
+			if f.InApp != c.wantInApp {
+				t.Fatalf("in_app = %v, want %v", f.InApp, c.wantInApp)
+			}
+			if f.Function != "minified" {
+				t.Fatalf("function = %q; every section has names: [] so the frame's is kept", f.Function)
+			}
+			switch c.outcome {
+			case OutcomeApplied:
+				if !f.Symbolicated || f.Raw == nil {
+					t.Fatal("applied frame must carry symbolicated=true and raw")
+				}
+				if f.File != c.file || f.Line != c.oline || f.Column != c.ocol {
+					t.Fatalf("resolved to %s:%d:%d, want %s:%d:%d", f.File, f.Line, f.Column, c.file, c.oline, c.ocol)
+				}
+				if f.Raw.File != c.path || f.Raw.Line != c.line || f.Raw.Column != c.column || f.Raw.Function != "minified" || !f.Raw.InApp {
+					t.Fatalf("raw = %+v; want the values the SDK sent (in_app true)", *f.Raw)
+				}
+			default:
+				if f.Symbolicated || f.Raw != nil {
+					t.Fatalf("a frame the stage did not rewrite carries no raw and no symbolicated: %+v", f)
+				}
+				if f.File != c.path || f.Line != c.line || f.Column != c.column {
+					t.Fatalf("unrewritten frame moved: %s:%d:%d", f.File, f.Line, f.Column)
+				}
+			}
+			switch c.outcome {
+			case OutcomeNoColumn:
+				if h.store.callCount() != storeBefore {
+					t.Fatal("no_column is decided before any lookup (§4.4 step 2)")
+				}
+			case OutcomeNoMap:
+				if h.fetcher.calls.Load() != fetchesBefore {
+					t.Fatal("no_map: nothing was stored for the stub, so nothing is fetched")
+				}
+				if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}); !ok || reason != OutcomeNoMap {
+					t.Fatalf("negative entry = (%s, %v); want no_map (negatively cached as today)", reason, ok)
+				}
+			case OutcomeNoSection, OutcomeNoMapping:
+				if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}); ok {
+					t.Fatalf("%s must not be negatively cached: the map is fine", c.outcome)
+				}
+			}
+		})
+	}
+	if n := h.fetcher.calls.Load(); n != 2 {
+		t.Fatalf("fetcher called %d times across the table; want 2 (the runtime map once, the two-section map once)", n)
+	}
+}
+
+// TestSymbolicate_IndexMap_NoSectionThenApplied: no_section is a per-frame fact on a good map
+// (index-maps §4.4, D14): in ONE event, a frame before the first section is `no_section` and the
+// next frame on the same map is `applied`; the event is applied_partial; the map is fetched once
+// and nothing negative is cached. The same holds across events (P2's "the next frame on the same
+// map still resolves").
+func TestSymbolicate_IndexMap_NoSectionThenApplied(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seedIndexRuntime(t)
+	frames := []Frame{frame(indexRuntimePath, 1, 1), frame(indexRuntimePath, 600, 12)}
+	res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+	if res.Outcomes[0] != OutcomeNoSection || res.Outcomes[1] != OutcomeApplied {
+		t.Fatalf("%v, want [no_section applied]", res.Outcomes)
+	}
+	if res.EventOutcome() != EventAppliedPartial {
+		t.Fatalf("event outcome %s, want applied_partial", res.EventOutcome())
+	}
+	if frames[0].Symbolicated || frames[0].File != indexRuntimePath || frames[0].Line != 1 || !frames[0].InApp {
+		t.Fatalf("no_section frame must pass through untouched: %+v", frames[0])
+	}
+	if frames[1].File != "turbopack:///[turbopack]/nodejs/runtime.ts" || frames[1].Line != 77 || frames[1].Column != 7 || frames[1].InApp {
+		t.Fatalf("I8 after a no_section on the same map: %+v", frames[1])
+	}
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexRuntimePath}); ok {
+		t.Fatal("no_section must not be negatively cached")
+	}
+	if OutcomeNoSection.negativelyCacheable() {
+		t.Fatal("no_section is never in negativelyCacheable()")
+	}
+	// The next event on the same map: a positive-cache hit, no fetch, and the same two answers.
+	frames = []Frame{frame(indexRuntimePath, 2, 1), frame(indexRuntimePath, 471, 1)}
+	res = h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+	if res.Outcomes[0] != OutcomeNoSection || res.Outcomes[1] != OutcomeApplied {
+		t.Fatalf("second event: %v, want [no_section applied]", res.Outcomes)
+	}
+	if n := h.fetcher.calls.Load(); n != 1 {
+		t.Fatalf("fetcher called %d times; the index map is fetched once and its sections cached", n)
+	}
+}
+
+// TestSymbolicate_IndexMap_ColumnOffsetOnlyOnFirstLine pins the local-coordinate rule of §3
+// ("the column offset applies only to the first line of the section") on inputs I15–I17 cannot
+// tell apart: their one-segment inner maps answer 1:1 for ANY local column >= 0, so a decoder
+// that never subtracts the column offset, or subtracts it on every line, passes all three. Here
+// section 1 at (5,40) has an inner map with two segments on its first line (`AAAA,EACA`: gen col
+// 0 → 1:1, gen col 2 → 2:1) and one on its second (`AACA`: gen col 0 → 3:1), so:
+//   - wire (6,42) is local column 1 → 1:1, and (6,43) is local column 2 → 2:1 -- a decoder
+//     that never subtracts lands both on 2:1;
+//   - wire (7,1) is local (1,0) → 3:1 -- a decoder that subtracts on every line gets column -40
+//     and answers no_mapping.
+func TestSymbolicate_IndexMap_ColumnOffsetOnlyOnFirstLine(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seedCrafted("map-col-offset", "/col-offset.js", `{"version":3,"sources":[],"sections":[`+
+		`{"offset":{"line":5,"column":0},"map":{"version":3,"sources":["s0.ts"],"names":[],"mappings":"AAAA"}},`+
+		`{"offset":{"line":5,"column":40},"map":{"version":3,"sources":["s1.ts"],"names":[],"mappings":"AAAA,EACA;AACA"}}]}`)
+	cases := []struct {
+		line, column int32
+		outcome      Outcome
+		file         string
+		oline, ocol  int32
+	}{
+		{6, 41, OutcomeApplied, "s1.ts", 1, 1}, // local column 0
+		{6, 42, OutcomeApplied, "s1.ts", 1, 1}, // local column 1: still the first segment
+		{6, 43, OutcomeApplied, "s1.ts", 2, 1}, // local column 2: the second segment
+		{6, 40, OutcomeApplied, "s0.ts", 1, 1}, // wire column 40 is generated column 39 < 40: section 0
+		{7, 1, OutcomeApplied, "s1.ts", 3, 1},  // the line after: local (1, 0), the column offset does not apply
+		{7, 50, OutcomeApplied, "s1.ts", 3, 1}, // local (1, 49): greatest segment at-or-before is gen col 0
+		{8, 1, OutcomeNoMapping, "", 0, 0},     // local line 2, which the two-line inner map does not have
+	}
+	for _, c := range cases {
+		frames := []Frame{frame("/col-offset.js", c.line, c.column)}
+		res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+		f := frames[0]
+		if res.Outcomes[0] != c.outcome {
+			t.Errorf("(%d,%d): outcome %s, want %s", c.line, c.column, res.Outcomes[0], c.outcome)
+			continue
+		}
+		if c.outcome == OutcomeApplied && (f.File != c.file || f.Line != c.oline || f.Column != c.ocol) {
+			t.Errorf("(%d,%d): resolved to %s:%d:%d, want %s:%d:%d", c.line, c.column, f.File, f.Line, f.Column, c.file, c.oline, c.ocol)
+		}
+	}
+}
+
+// TestSymbolicate_IndexMap_ZeroSectionsIsNoSection is flow P9: a zero-section index map put into
+// storage by hand (the route never stores one -- D12) parses fine and answers `no_section` for
+// every frame, not negatively cached, not map_error.
+func TestSymbolicate_IndexMap_ZeroSectionsIsNoSection(t *testing.T) {
+	h := newHarness(t, nil)
+	h.seedCrafted("map-stub-by-hand", indexStubPathMin, string(readTestdata(t, indexStubPath)))
+	frames := []Frame{frame(indexStubPathMin, 1, 5), frame(indexStubPathMin, 999, 999)}
+	res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+	if res.Outcomes[0] != OutcomeNoSection || res.Outcomes[1] != OutcomeNoSection {
+		t.Fatalf("%v, want [no_section no_section]", res.Outcomes)
+	}
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexStubPathMin}); ok {
+		t.Fatal("a valid zero-section parse is not negatively cached")
+	}
+	if _, cached := h.svc.cache.pos["map-stub-by-hand"]; !cached {
+		t.Fatal("the parsed stub is a positive entry like any map")
+	}
+}
+
+// TestSymbolicate_IndexMap_ParseErrorsAreMapError is flow P8 through the service: an index map
+// with a `url` section, a nested map, unsorted offsets or a bad inner VLQ is `map_error` for every
+// frame on it, negatively cached, one map at a time -- while the good index map in the same
+// event still resolves. And an inner map indexing past its own `sources` panics in resolve and is
+// recovered per map (decision 19, unchanged inside a section).
+func TestSymbolicate_IndexMap_ParseErrorsAreMapError(t *testing.T) {
+	const inner = `{"version":3,"sources":["a.ts"],"names":[],"mappings":"AAAA"}`
+	h := newHarness(t, nil)
+	h.seedIndexRuntime(t)
+	bad := map[string]string{
+		"/url-section.js":        `{"version":3,"sections":[{"offset":{"line":0,"column":0},"url":"x.map"}]}`,
+		"/nested.js":             `{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":{"version":3,"sections":[]}}]}`,
+		"/unsorted.js":           `{"version":3,"sections":[{"offset":{"line":5,"column":0},"map":` + inner + `},{"offset":{"line":5,"column":0},"map":` + inner + `}]}`,
+		"/inner-bad-vlq.js":      `{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["a.ts"],"names":[],"mappings":"AAAA,!!!!"}}]}`,
+		"/inner-past-sources.js": `{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["a.ts"],"names":[],"mappings":"AGAA"}}]}`,
+	}
+	i := 0
+	for path, raw := range bad {
+		i++
+		h.seedCrafted(fmt.Sprintf("map-bad-index-%d", i), path, raw)
+	}
+	for path := range bad {
+		t.Run(path, func(t *testing.T) {
+			frames := []Frame{frame(path, 1, 1), frame(indexRuntimePath, 600, 12), frame(path, 1, 2)}
+			res := h.svc.Symbolicate(context.Background(), projectA, releaseR, frames)
+			if res.Outcomes[0] != OutcomeMapError || res.Outcomes[2] != OutcomeMapError {
+				t.Fatalf("%v, want map_error for the bad map's frames", res.Outcomes)
+			}
+			if res.Outcomes[1] != OutcomeApplied || frames[1].Line != 77 {
+				t.Fatalf("the good index map's frame must still symbolicate: %s %+v", res.Outcomes[1], frames[1])
+			}
+			if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, path}); !ok || reason != OutcomeMapError {
+				t.Fatalf("negative entry = (%s, %v); want map_error", reason, ok)
+			}
+		})
+	}
+}
+
 // TestSymbolicate_InAppReadsOnlyTheResolvedFile: contract §4.2 -- "the rule never reads the
 // minified name and never reads function". The same map is seeded under a minified path rule 1
 // would reject and the frame's function is a string rule 2 would reject; an app row (A3) is still
