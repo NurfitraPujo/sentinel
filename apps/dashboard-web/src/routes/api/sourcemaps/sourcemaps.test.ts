@@ -30,6 +30,7 @@ const upsertReleaseSourcemaps = vi.fn();
 const findReferencedStorageKeys = vi.fn();
 const bestEffortDeleteObjects = vi.fn();
 const recordSourcemapUpload = vi.fn();
+const logInfo = vi.fn();
 
 const mockEnv: Record<string, string | undefined> = {};
 
@@ -45,6 +46,7 @@ vi.mock('$lib/db/queries/sourcemaps', async () => {
 	return { ...actual, readReleaseState, upsertReleaseSourcemaps, findReferencedStorageKeys };
 });
 vi.mock('$lib/server/metrics', () => ({ recordSourcemapUpload }));
+vi.mock('$lib/server/observability/log', () => ({ log: { info: logInfo, warn: vi.fn(), error: vi.fn() } }));
 
 const { POST } = await import('./+server');
 const { ReleaseFullError } = await import('$lib/db/queries/sourcemaps');
@@ -587,7 +589,7 @@ describe('POST /api/sourcemaps -- per-file validation, in order, all-or-nothing 
 		['no_mappings', rawFile(JSON.stringify({ version: 3, mappings: ['AAAA'], sources: [] }))],
 		['no_sources', rawFile(JSON.stringify({ version: 3, mappings: 'AAAA' }))],
 		['no_sources', rawFile(JSON.stringify({ version: 3, mappings: 'AAAA', sources: 'src/a.ts' }))],
-	])('U8: 422 invalid_sourcemap { index: 1, reason: %s }, and the valid part 0 is NOT written', async (reason, bad) => {
+	])('U8 / R19: 422 invalid_sourcemap { index: 1, reason: %s }, and the valid part 0 is NOT written', async (reason, bad) => {
 		const { res, body } = await post(form([['/a.js', mapFile('a')], ['/bad.js', bad]]));
 		expect(res.status).toBe(422);
 		expect(body.error).toEqual({
@@ -743,5 +745,396 @@ describe('POST /api/sourcemaps -- the three phases (U12, U18)', () => {
 		expect(res.status).toBe(500);
 		expect(body.error.code).toBe('internal');
 		expect(putObject).not.toHaveBeenCalled();
+	});
+});
+
+describe('POST /api/sourcemaps -- index maps (sentinel-sourcemaps-index-maps §4.1 R1–R25, flows U1–U10)', () => {
+	// Each row is one `file` part 1 in a two-part request whose part 0 is a NEW valid flat map --
+	// `created`, so the request is 201 whenever part 1 passes and the all-or-nothing rule is
+	// asserted with it. Rows the table marks "alone" are single-part.
+	const FLAT_PATH = '/chunks/flat-9a0d4e.js';
+	const STUB_PATH = '/app/page.js';
+	const RUNTIME_PATH = '/chunks/[turbopack]_runtime.js';
+
+	/** R1's bytes: Turbopack's route-entry stub, verbatim. */
+	const STUB_TEXT = '{"version":3,"sources":[],"sections":[]}';
+	const stubBytes = () => new TextEncoder().encode(STUB_TEXT);
+
+	/** A flat inner map for one section; `seed` makes the source distinct. */
+	function innerMap(seed = 'inner', extra: Record<string, unknown> = {}): Record<string, unknown> {
+		return { version: 3, sources: [`turbopack:///[turbopack]/${seed}.ts`], names: [], mappings: 'AAAA', ...extra };
+	}
+	function section(line: number, column: number, map: unknown = innerMap()): Record<string, unknown> {
+		return { offset: { line, column }, map };
+	}
+	function indexMapText(sections: unknown[], extra: Record<string, unknown> = {}): string {
+		return JSON.stringify({ version: 3, sources: [], sections, ...extra });
+	}
+	function indexMapFile(sections: unknown[], extra: Record<string, unknown> = {}): File {
+		return rawFile(indexMapText(sections, extra));
+	}
+
+	/**
+	 * R4's shape (§4.6's real `chunks/[turbopack]_runtime.js.map`, abridged): five sections at the
+	 * real 0-based offsets over the real `turbopack:///[turbopack]/…` sources, each with
+	 * `sourcesContent` and `ignoreList` -- keys the route must ignore, not reject.
+	 */
+	const RUNTIME_SECTIONS: Array<[number, string]> = [
+		[3, 'shared/runtime-utils'],
+		[470, 'shared-node/base-externals-utils'],
+		[511, 'shared-node/node-externals-utils'],
+		[532, 'shared-node/node-wasm-utils'],
+		[553, 'nodejs/runtime'],
+	];
+	const runtimeMapText = () =>
+		indexMapText(
+			RUNTIME_SECTIONS.map(([line, source]) =>
+				section(line, 0, innerMap(source, { sourcesContent: ['// abridged'], mappings: 'AAAA;AACA;', ignoreList: [0] }))
+			)
+		);
+	const runtimeBytes = () => new TextEncoder().encode(runtimeMapText());
+
+	/** What a `skipped_empty` part must leave behind: nothing, anywhere. */
+	function expectNothingWrittenFor(path: string, bytes: Uint8Array) {
+		const sha = sha256(bytes);
+		for (const [key, put] of putObject.mock.calls) {
+			expect(key).not.toContain(sha);
+			expect(key).not.toContain(h16(path));
+			expect(Buffer.from(put)).not.toEqual(Buffer.from(bytes));
+		}
+		for (const [args] of upsertReleaseSourcemaps.mock.calls) {
+			for (const f of args.files) {
+				expect(f.minifiedPath).not.toBe(path);
+				expect(f.sha256).not.toBe(sha);
+			}
+		}
+		expect(outcomesRecorded()).not.toContain('skipped_empty');
+	}
+
+	function acceptedLog() {
+		const calls = logInfo.mock.calls.filter((c) => c[0] === 'sourcemap_uploads.accepted');
+		expect(calls).toHaveLength(1);
+		return calls[0][1];
+	}
+
+	it.each([
+		['R1', STUB_TEXT, "Turbopack's stub"],
+		['R2', '{"version":3,"sources":null,"sections":[],"debugId":"1f8f0d6e-2b0a-4c1d-9e1f-2a3b4c5d6e7f"}', 'the Sentry-wrapped stub'],
+		['R3', '{"version":3,"sections":[]}', 'no top-level sources at all'],
+	])('%s: a zero-section index map (%s) beside a new flat map is 201, part 1 skipped_empty, no row and no object for it', async (_row, text, _what) => {
+		const bytes = new TextEncoder().encode(text);
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [STUB_PATH, rawFile(text)]]));
+
+		expect(res.status).toBe(201);
+		expect(body.files).toEqual([
+			{ minified_path: FLAT_PATH, sha256: sha256(mapBytes('a')), size_bytes: mapBytes('a').byteLength, outcome: 'created' },
+			{ minified_path: STUB_PATH, sha256: sha256(bytes), size_bytes: bytes.byteLength, outcome: 'skipped_empty' },
+		]);
+		// `release_file_count` counts part 0 only.
+		expect(body.release_file_count).toBe(1);
+
+		// Phase 1c still reads every path, the stub's included (the duplicate-path refusal above it
+		// covers a stub's path as before); the stub simply never becomes a row.
+		expect(readReleaseState).toHaveBeenCalledWith(CTX.projectId, RELEASE, [FLAT_PATH, STUB_PATH]);
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expect(putObject).toHaveBeenCalledWith(
+			sourcemapStorageKey(CTX.projectId, RELEASE, FLAT_PATH, sha256(mapBytes('a'))),
+			expect.any(Uint8Array),
+			'application/json'
+		);
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledTimes(1);
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
+			expect.objectContaining({ files: [expect.objectContaining({ minifiedPath: FLAT_PATH })] })
+		);
+		expectNothingWrittenFor(STUB_PATH, bytes);
+		expect(outcomesRecorded()).toEqual(['created']);
+		expect(acceptedLog()).toMatchObject({ files: 2, created: 1, replaced: 0, unchanged: 0, skipped_empty: 1 });
+	});
+
+	it('R4 / U1: the real five-section runtime map is 201 created -- the object stored byte-for-byte as sent, a row with its sha256/size', async () => {
+		const bytes = runtimeBytes();
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [RUNTIME_PATH, rawFile(runtimeMapText())]]));
+
+		expect(res.status).toBe(201);
+		expect(body.files[1]).toEqual({
+			minified_path: RUNTIME_PATH,
+			sha256: sha256(bytes),
+			size_bytes: bytes.byteLength,
+			outcome: 'created',
+		});
+		expect(body.release_file_count).toBe(2);
+
+		const key = sourcemapStorageKey(CTX.projectId, RELEASE, RUNTIME_PATH, sha256(bytes));
+		expect(putObject).toHaveBeenCalledTimes(2);
+		expect(putObject).toHaveBeenNthCalledWith(2, key, expect.any(Uint8Array), 'application/json');
+		expect(Buffer.from(putObject.mock.calls[1][1])).toEqual(Buffer.from(bytes));
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
+			expect.objectContaining({
+				files: [
+					expect.objectContaining({ minifiedPath: FLAT_PATH }),
+					{ minifiedPath: RUNTIME_PATH, storageKey: key, sizeBytes: bytes.byteLength, sha256: sha256(bytes) },
+				],
+			})
+		);
+		expect(outcomesRecorded()).toEqual(['created', 'created']);
+		expect(acceptedLog()).toMatchObject({ created: 2, skipped_empty: 0 });
+	});
+
+	it('R5: one section at (0,0) whose inner map has mappings "" is 201 created -- structural, not a decode', async () => {
+		const { res, body } = await post(
+			form([[FLAT_PATH, mapFile('a')], [RUNTIME_PATH, indexMapFile([section(0, 0, innerMap('one', { mappings: '' }))])]])
+		);
+		expect(res.status).toBe(201);
+		expect(body.files.map((f: any) => f.outcome)).toEqual(['created', 'created']);
+		expect(body.release_file_count).toBe(2);
+		expect(putObject).toHaveBeenCalledTimes(2);
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
+			expect.objectContaining({ files: [expect.anything(), expect.objectContaining({ minifiedPath: RUNTIME_PATH })] })
+		);
+		expect(outcomesRecorded()).toEqual(['created', 'created']);
+	});
+
+	it('R6: two sections at (0,0) and (0,40) -- same line, ascending column -- is 201 created', async () => {
+		const { res, body } = await post(
+			form([[FLAT_PATH, mapFile('a')], [RUNTIME_PATH, indexMapFile([section(0, 0, innerMap('s0')), section(0, 40, innerMap('s1'))])]])
+		);
+		expect(res.status).toBe(201);
+		expect(body.files.map((f: any) => f.outcome)).toEqual(['created', 'created']);
+		expect(body.release_file_count).toBe(2);
+		expect(putObject).toHaveBeenCalledTimes(2);
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledTimes(1);
+		expect(outcomesRecorded()).toEqual(['created', 'created']);
+	});
+
+	/** Every 4xx row: §7's envelope with exactly the row's details, and part 0 NOT written. */
+	async function expectRejected(bad: File, details: Record<string, unknown>) {
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [RUNTIME_PATH, bad]]));
+		expect(res.status).toBe(422);
+		expect(body.error).toEqual({
+			code: 'invalid_sourcemap',
+			message: expect.stringContaining(String(details.reason)),
+			details: { index: 1, ...details },
+		});
+		expect(readReleaseState).not.toHaveBeenCalled();
+		expect(putObject).not.toHaveBeenCalled();
+		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['rejected']);
+		expect(logInfo).not.toHaveBeenCalledWith('sourcemap_uploads.accepted', expect.anything());
+	}
+
+	it('R7 / U3: a url section is 422 { reason: section_url, section: 0 }, nothing written', async () => {
+		await expectRejected(rawFile('{"version":3,"sections":[{"offset":{"line":1,"column":0},"url":"other.map"}]}'), {
+			reason: 'section_url',
+			section: 0,
+		});
+	});
+
+	it('R8 / U3: a valid section followed by one carrying url AND map is 422 section_url naming section 1 -- url is checked before offset/map', async () => {
+		await expectRejected(indexMapFile([section(0, 0), { offset: { line: 9, column: 0 }, url: 'x', map: innerMap() }]), {
+			reason: 'section_url',
+			section: 1,
+		});
+	});
+
+	it('R9 / U4: a section that is not an object is 422 { reason: section_shape, section: 0 }', async () => {
+		await expectRejected(rawFile('{"version":3,"sections":["nope"]}'), { reason: 'section_shape', section: 0 });
+	});
+
+	it('R10 / U4: a section with no offset is 422 { reason: section_shape, section: 0 }', async () => {
+		await expectRejected(indexMapFile([{ map: innerMap() }]), { reason: 'section_shape', section: 0 });
+	});
+
+	it.each([
+		['line -1', { line: -1, column: 0 }],
+		['line "3" (a string)', { line: '3', column: 0 }],
+		['line 1.5', { line: 1.5, column: 0 }],
+		['no column', { line: 1 }],
+	])('R11 / U4: an offset with %s is 422 { reason: section_shape, section: 0 }', async (_what, offset) => {
+		await expectRejected(indexMapFile([{ offset, map: innerMap() }]), { reason: 'section_shape', section: 0 });
+	});
+
+	it('R12 / U4: an inner map without mappings is 422 { reason: section_map, section: 0, inner: no_mappings }', async () => {
+		await expectRejected(rawFile('{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":{"version":3,"sources":[]}}]}'), {
+			reason: 'section_map',
+			section: 0,
+			inner: 'no_mappings',
+		});
+	});
+
+	it('R13 / U4: a nested index map (an inner map carrying sections) is 422 { reason: section_map, section: 0, inner: nested }', async () => {
+		await expectRejected(indexMapFile([section(0, 0, { version: 3, mappings: 'AAAA', sources: [], sections: [] })]), {
+			reason: 'section_map',
+			section: 0,
+			inner: 'nested',
+		});
+	});
+
+	it('R14 / U5: both forms at the top level (a string mappings AND a sections array) is 422 { reason: both_mappings_and_sections }', async () => {
+		await expectRejected(rawFile('{"version":3,"mappings":"AAAA","sources":[],"sections":[]}'), {
+			reason: 'both_mappings_and_sections',
+		});
+	});
+
+	it('R15 / U4: two sections at equal offsets (3,0),(3,0) is 422 { reason: section_order, section: 1 }', async () => {
+		await expectRejected(indexMapFile([section(3, 0, innerMap('s0')), section(3, 0, innerMap('s1'))]), {
+			reason: 'section_order',
+			section: 1,
+		});
+	});
+
+	it('R16 / U4: descending offsets (470,0),(3,0) is 422 { reason: section_order, section: 1 }', async () => {
+		await expectRejected(indexMapFile([section(470, 0, innerMap('s0')), section(3, 0, innerMap('s1'))]), {
+			reason: 'section_order',
+			section: 1,
+		});
+	});
+
+	it('R17 / U8: a version-3 map with neither mappings nor sections is still 422 { reason: no_mappings } -- no section key', async () => {
+		await expectRejected(rawFile('{"version":3,"sources":[]}'), { reason: 'no_mappings' });
+	});
+
+	it('R18: mappings that is an array beside sections: [] takes the index path -- 201, skipped_empty, no row', async () => {
+		const text = '{"version":3,"mappings":["AAAA"],"sources":[],"sections":[]}';
+		const bytes = new TextEncoder().encode(text);
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [STUB_PATH, rawFile(text)]]));
+		expect(res.status).toBe(201);
+		expect(body.files.map((f: any) => f.outcome)).toEqual(['created', 'skipped_empty']);
+		expect(body.release_file_count).toBe(1);
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expectNothingWrittenFor(STUB_PATH, bytes);
+		expect(outcomesRecorded()).toEqual(['created']);
+	});
+
+	it('R20 / U6: R4\'s bytes again under the same path, alone, is 200 unchanged -- nothing put, nothing upserted', async () => {
+		const bytes = runtimeBytes();
+		readReleaseState.mockResolvedValue({
+			current: 3,
+			existing: new Map([[RUNTIME_PATH, { sha256: sha256(bytes), storageKey: 'k-runtime' }]]),
+		});
+		const { res, body } = await post(form([[RUNTIME_PATH, rawFile(runtimeMapText())]]));
+		expect(res.status).toBe(200);
+		expect(body.files).toEqual([{ minified_path: RUNTIME_PATH, sha256: sha256(bytes), size_bytes: bytes.byteLength, outcome: 'unchanged' }]);
+		expect(body.release_file_count).toBe(3);
+		expect(putObject).not.toHaveBeenCalled();
+		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['unchanged']);
+	});
+
+	it('R21 / U7: R4\'s path re-uploaded with a valid flat map, alone, is 201 replaced -- the row moves, the displaced object is cleaned up after commit', async () => {
+		readReleaseState.mockResolvedValue({
+			current: 3,
+			existing: new Map([[RUNTIME_PATH, { sha256: sha256(runtimeBytes()), storageKey: 'k-runtime-old' }]]),
+		});
+		upsertReleaseSourcemaps.mockResolvedValue({ releaseFileCount: 3, displacedKeys: ['k-runtime-old'] });
+		const flat = mapBytes('rebuilt');
+		const { res, body } = await post(form([[RUNTIME_PATH, fileOf(flat, 'r.js.map', 'application/json')]]));
+		expect(res.status).toBe(201);
+		expect(body.files).toEqual([{ minified_path: RUNTIME_PATH, sha256: sha256(flat), size_bytes: flat.byteLength, outcome: 'replaced' }]);
+		expect(body.release_file_count).toBe(3);
+		const key = sourcemapStorageKey(CTX.projectId, RELEASE, RUNTIME_PATH, sha256(flat));
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expect(putObject).toHaveBeenCalledWith(key, expect.any(Uint8Array), 'application/json');
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
+			expect.objectContaining({ files: [{ minifiedPath: RUNTIME_PATH, storageKey: key, sizeBytes: flat.byteLength, sha256: sha256(flat) }] })
+		);
+		expect(findReferencedStorageKeys).toHaveBeenCalledWith(['k-runtime-old']);
+		expect(bestEffortDeleteObjects).toHaveBeenCalledWith(['k-runtime-old'], 'sourcemaps.replaced');
+		expect(outcomesRecorded()).toEqual(['replaced']);
+	});
+
+	it('R22 / U10: a request of nothing but stubs (three parts) is 200, every part skipped_empty, nothing written, release_file_count unmoved, and the log says skipped_empty: 3', async () => {
+		readReleaseState.mockResolvedValue({ current: 7, existing: new Map() });
+		const paths = ['/app/page.js', '/app/api/health/route.js', '/instrumentation.js'];
+		const { res, body } = await post(form(paths.map((p) => [p, rawFile(STUB_TEXT)] as [string, File])));
+
+		expect(res.status).toBe(200);
+		expect(body.files).toEqual(
+			paths.map((p) => ({ minified_path: p, sha256: sha256(stubBytes()), size_bytes: stubBytes().byteLength, outcome: 'skipped_empty' }))
+		);
+		expect(body.release_file_count).toBe(7);
+		expect(readReleaseState).toHaveBeenCalledWith(CTX.projectId, RELEASE, paths);
+		expect(putObject).not.toHaveBeenCalled();
+		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		// Not one call: the metric's five-value set does not grow (metrics.ts, §4.1).
+		expect(recordSourcemapUpload).not.toHaveBeenCalled();
+		expect(acceptedLog()).toEqual({
+			projectId: CTX.projectId,
+			keyId: CTX.keyId,
+			files: 3,
+			created: 0,
+			replaced: 0,
+			unchanged: 0,
+			skipped_empty: 3,
+			objectsRepaired: 0,
+			releaseFileCount: 7,
+		});
+	});
+
+	it('R23: an already-stored flat map (unchanged) beside a stub is 200 -- nothing written, only the unchanged part recorded', async () => {
+		readReleaseState.mockResolvedValue({
+			current: 1,
+			existing: new Map([[FLAT_PATH, { sha256: sha256(mapBytes('a')), storageKey: 'k-flat' }]]),
+		});
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [STUB_PATH, rawFile(STUB_TEXT)]]));
+		expect(res.status).toBe(200);
+		expect(body.files.map((f: any) => f.outcome)).toEqual(['unchanged', 'skipped_empty']);
+		expect(body.release_file_count).toBe(1);
+		expect(putObject).not.toHaveBeenCalled();
+		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['unchanged']);
+		expect(acceptedLog()).toMatchObject({ unchanged: 1, skipped_empty: 1 });
+	});
+
+	it('R24: a stub under a path that already holds a flat-map row leaves that row and its object exactly as they are', async () => {
+		readReleaseState.mockResolvedValue({
+			current: 1,
+			existing: new Map([[STUB_PATH, { sha256: sha256(mapBytes('page')), storageKey: 'k-page-flat' }]]),
+		});
+		upsertReleaseSourcemaps.mockImplementation(async ({ files, ensureObjectsPresent }: any) => {
+			await ensureObjectsPresent(files.map((f: any) => f.storageKey));
+			return { releaseFileCount: 2, displacedKeys: [] };
+		});
+		const { res, body } = await post(form([[FLAT_PATH, mapFile('a')], [STUB_PATH, rawFile(STUB_TEXT)]]));
+
+		expect(res.status).toBe(201);
+		expect(body.files.map((f: any) => f.outcome)).toEqual(['created', 'skipped_empty']);
+		expect(body.release_file_count).toBe(2);
+		// Only part 0 moves: the stub neither replaces, deletes nor "empties" the existing row.
+		expect(putObject).toHaveBeenCalledTimes(1);
+		expect(upsertReleaseSourcemaps).toHaveBeenCalledWith(
+			expect.objectContaining({ files: [expect.objectContaining({ minifiedPath: FLAT_PATH })] })
+		);
+		expectNothingWrittenFor(STUB_PATH, stubBytes());
+		expect(headObject).not.toHaveBeenCalledWith('k-page-flat');
+		expect(findReferencedStorageKeys).not.toHaveBeenCalled();
+		expect(bestEffortDeleteObjects).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['created']);
+	});
+
+	it('R25 / U9: a release at the 2000 cap takes a stub alone -- 200 skipped_empty, not release_full; the next flat part on a new path is 422 release_full as today', async () => {
+		readReleaseState.mockResolvedValue({ current: 2000, existing: new Map() });
+		const stub = await post(form([[STUB_PATH, rawFile(STUB_TEXT)]]));
+		expect(stub.res.status).toBe(200);
+		expect(stub.body.files).toEqual([
+			{ minified_path: STUB_PATH, sha256: sha256(stubBytes()), size_bytes: stubBytes().byteLength, outcome: 'skipped_empty' },
+		]);
+		expect(stub.body.release_file_count).toBe(2000);
+		expect(putObject).not.toHaveBeenCalled();
+		expect(upsertReleaseSourcemaps).not.toHaveBeenCalled();
+		expect(recordSourcemapUpload).not.toHaveBeenCalled();
+
+		vi.clearAllMocks();
+		readReleaseState.mockResolvedValue({ current: 2000, existing: new Map() });
+		const flat = await post(form([['/chunks/new-1a2b3c.js', mapFile('new')]]));
+		expect(flat.res.status).toBe(422);
+		expect(flat.body.error).toEqual({
+			code: 'release_full',
+			message: expect.any(String),
+			details: { max: 2000, current: 2000 },
+		});
+		expect(putObject).not.toHaveBeenCalled();
+		expect(outcomesRecorded()).toEqual(['rejected']);
 	});
 });

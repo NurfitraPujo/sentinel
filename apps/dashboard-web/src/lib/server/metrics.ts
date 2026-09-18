@@ -100,7 +100,10 @@ export type EscalationOutcome = (typeof ESCALATION_OUTCOME)[keyof typeof ESCALAT
  * (§4.1, *Orphan objects*): every failure that leaves an object with no row -- a `putObject`
  * that failed mid-request, a `replaced` delete that failed, a race lost at the per-release cap
  * inside the transaction -- is counted under it, which is why it is incremented from more than
- * one place in the route.
+ * one place in the route. A `files[].outcome` of `skipped_empty` (a zero-section index map,
+ * sentinel-sourcemaps-index-maps §4.1, D12) is NOT recorded here: it is neither a write nor a
+ * refusal nor an orphan, so the set stays five and the `sourcemap_uploads.accepted` log line is
+ * where those are counted.
  */
 export const SOURCEMAP_UPLOAD_OUTCOME = {
 	/** One `files[]` entry written for the first time (`201`). Per file, not per request. */
