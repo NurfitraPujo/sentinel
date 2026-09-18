@@ -17,7 +17,11 @@ type Answer = 'ok' | { rejected: { status: number; code: string } } | { unavaila
 interface Script {
   browser: Answer;
   server: Answer;
+  /** The route's `files[].outcome` for the fixture's empty entry stub (`app/page.js`) — `skipped_empty` (the default) is what the real route answers (D19); `created` proves the summary line reads the response, not the walk. */
+  stubOutcome?: 'created' | 'skipped_empty';
 }
+/** The fixture's one empty index map, the entry stub the route acknowledges and does not store. */
+const STUB_MAP = '{"version":3,"sources":[],"sections":[]}';
 
 const calls: UploadSourcemapsOptions[] = [];
 /** Per-call pair counts, so a test can tell "called on an empty walk" from "called with maps". */
@@ -43,7 +47,12 @@ vi.mock('../../src/upload/index.js', async (importOriginal) => {
       for (let attempt = 1; attempt < 4; attempt++) opts.onEvent?.({ type: 'retry', attempt, delayMs: 2000 * 2 ** (attempt - 1), status: u.status, line });
       throw new actual.SourcemapUploadError('unavailable', `${line} after 4 attempts`, { status: u.status, code: u.code, text: u.text, attempts: 4 });
     }
-    const files = pairs.map((p, i) => ({ minified_path: p.minifiedPath, sha256: `${String(i).padStart(4, '0')}${'cd'.repeat(30)}`, size_bytes: p.sizeBytes, outcome: 'created' }));
+    const files = pairs.map((p, i) => ({
+      minified_path: p.minifiedPath,
+      sha256: `${String(i).padStart(4, '0')}${'cd'.repeat(30)}`,
+      size_bytes: p.sizeBytes,
+      outcome: readFileSync(p.path, 'utf8') === STUB_MAP ? (script.stubOutcome ?? 'skipped_empty') : 'created',
+    }));
     const batch = { index: 0, status: 201, attempts: 1, contentLength: 0, sent: pairs, files, deleted: [] };
     opts.onEvent?.({ type: 'batch', batch } satisfies UploadEvent);
     return { dryRun: false, release: opts.release, pairs, requests: 1, batches: [batch], files, deleted: [] };
@@ -112,36 +121,53 @@ async function runHook(config: NextConfigLike, distDir: string): Promise<void> {
 }
 
 describe('W1 (BUG-01, Turbopack shape): every stored browser path is a chunk the browser loads, never the map’s own differently-hashed name', () => {
-  it('W1: the browser series reports `/_next/static/chunks/d69eb7d85499027c.js` for the map named `8f15d5d03090a0be.js.map`; the edge-wrapper and percent-encoded server pairs land under serverRoot; the skips are warns naming the series; every *.map is then deleted', async () => {
+  it('W1: the browser series reports `/_next/static/chunks/d69eb7d85499027c.js` for the map named `8f15d5d03090a0be.js.map`; the edge-wrapper, percent-encoded and both index-map pairs land under serverRoot (seven); the skips are warns naming the series, the `url`-section map the one index-map warn; every *.map is then deleted', async () => {
     const dir = copyTree(TURBOPACK);
     const out = withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS });
     await runHook(out, dir);
     const browser = logs.filter((l) => l.startsWith('Sentinel: browser  created  ')).map((l) => l.split(/\s{2,}/)[2]);
     expect(browser).toEqual(['/_next/static/chunks/9a8b7c6d5e4f3a2b.js', '/_next/static/chunks/d69eb7d85499027c.js', '/_next/static/chunks/turbopack-4364a8ae2a6af640.js']);
     expect(logs.join('\n')).not.toMatch(/\/_next\/static\/chunks\/(8f15d5d03090a0be|e96569a392fa278c)\.js/);
-    const server = logs.filter((l) => l.startsWith('Sentinel: server  created  ')).map((l) => l.split(/\s{2,}/)[2]);
+    const server = logs.filter((l) => l.startsWith('Sentinel: server  ')).map((l) => l.split(/\s{2,}/).slice(1, 3));
+    // `sentinel-sourcemaps-index-maps` §4.5 (D19): the entry stub and the runtime's sections map are uploaded with the
+    // rest; the route's `skipped_empty` for the stub is printed per file like any outcome and counted on the summary line.
     expect(server).toEqual([
-      `${DEFAULT_SERVER_ROOT}/chunks/[root-of-the-server]__a6734ae3._.js`,
-      `${DEFAULT_SERVER_ROOT}/chunks/_0fe1378c._.js`,
-      `${DEFAULT_SERVER_ROOT}/chunks/f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js`,
-      `${DEFAULT_SERVER_ROOT}/edge/chunks/edge-wrapper_8937e6f3.js`,
-      `${DEFAULT_SERVER_ROOT}/edge/chunks/turbopack-edge-wrapper_56e5ba59.js`,
+      ['skipped_empty', `${DEFAULT_SERVER_ROOT}/app/page.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/chunks/[root-of-the-server]__a6734ae3._.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/chunks/[turbopack]_runtime.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/chunks/_0fe1378c._.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/chunks/f9941_@sentinel_sdk-js_dist_nextjs_edge_d8f68d22.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/edge/chunks/edge-wrapper_8937e6f3.js`],
+      ['created', `${DEFAULT_SERVER_ROOT}/edge/chunks/turbopack-edge-wrapper_56e5ba59.js`],
     ]);
     // The walker's skip lines, through the hook's warn with the series named (the orphan's "beside it" line is the real uploader's, tested in tests/cli).
     expect(warns).toEqual([
       expect.stringMatching(/^Sentinel: browser sourcemaps: .*60394cfab7bcbc98\.js: its sourceMappingURL names 4c218c652b8c48af\.js\.map, which does not exist/),
       expect.stringMatching(/^Sentinel: browser sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*3f9721961e8f2ba6\.js/),
       expect.stringMatching(/^Sentinel: server sourcemaps: 1 script\(s\) under .* carry no sourceMappingURL comment .*page_client-reference-manifest\.js/),
-      // BUG-02 (decision 44): the entry stub's empty index map and the runtime's sections map are skipped, never posted, and the sweep below still deletes them.
-      expect.stringMatching(/^Sentinel: server sourcemaps: .*server\/app\/page\.js\.map: empty index map \(no mappings, no sections\) — nothing to symbolicate; skipping it$/),
-      expect.stringMatching(/^Sentinel: server sourcemaps: .*server\/chunks\/\[turbopack\]_runtime\.js\.map: index map \(sections, no mappings\) — the route stores flat maps only; skipping it$/),
+      // D7: the one index map still skipped — a `url` section, which the route rejects for the whole batch; the sweep below still deletes it.
+      expect.stringMatching(/^Sentinel: server sourcemaps: .*server\/chunks\/url-section_0d1e2f3a\.js\.map: index map with a url section — the route does not accept url sections; skipping it$/),
     ]);
-    expect(server).not.toContain(`${DEFAULT_SERVER_ROOT}/app/page.js`);
-    expect(server).not.toContain(`${DEFAULT_SERVER_ROOT}/chunks/[turbopack]_runtime.js`);
-    for (const rel of ['static/chunks/8f15d5d03090a0be.js.map', 'static/chunks/e96569a392fa278c.js.map', 'static/chunks/9a8b7c6d5e4f3a2b.js.map', 'static/chunks/20c20fcd5d02c4c2.css.map', 'server/edge/chunks/edge-wrapper_56e5ba59.js.map', 'server/chunks/[root-of-the-server]__a6734ae3._.js.map', 'server/app/page.js.map', 'server/chunks/[turbopack]_runtime.js.map']) {
+    expect(warns.filter((w) => w.includes('index map'))).toHaveLength(1);
+    expect(server.map(([, path]) => path)).not.toContain(`${DEFAULT_SERVER_ROOT}/chunks/url-section_0d1e2f3a.js`);
+    expect(logs.filter((l) => l.startsWith('Sentinel: server sourcemaps — '))).toEqual([
+      `Sentinel: server sourcemaps — 6 file(s) stored, 1 empty index map(s) acknowledged and not stored, in 1 request(s) under release ${RELEASE}`,
+    ]);
+    expect(logs.filter((l) => l.startsWith('Sentinel: browser sourcemaps — '))).toEqual([`Sentinel: browser sourcemaps — 3 file(s) stored in 1 request(s) under release ${RELEASE}`]);
+    for (const rel of ['static/chunks/8f15d5d03090a0be.js.map', 'static/chunks/e96569a392fa278c.js.map', 'static/chunks/9a8b7c6d5e4f3a2b.js.map', 'static/chunks/20c20fcd5d02c4c2.css.map', 'server/edge/chunks/edge-wrapper_56e5ba59.js.map', 'server/chunks/[root-of-the-server]__a6734ae3._.js.map', 'server/app/page.js.map', 'server/chunks/[turbopack]_runtime.js.map', 'server/chunks/url-section_0d1e2f3a.js.map']) {
       expect(existsSync(join(dir, rel)), rel).toBe(false);
     }
     expect(existsSync(join(dir, 'static/chunks/d69eb7d85499027c.js'))).toBe(true);
+  });
+
+  it('W1: the summary line’s `<k>` comes from the response, not the walk — the same tree with the stub answered `created` prints the 0.1.1 line, no clause', async () => {
+    const dir = copyTree(TURBOPACK);
+    script = { browser: 'ok', server: 'ok', stubOutcome: 'created' };
+    await runHook(withSentinelConfig({}, { release: RELEASE, sourcemaps: CREDS }), dir);
+    expect(walked).toEqual([3, 7]);
+    expect(logs.filter((l) => l.startsWith('Sentinel: server sourcemaps — '))).toEqual([`Sentinel: server sourcemaps — 7 file(s) stored in 1 request(s) under release ${RELEASE}`]);
+    expect(logs.join('\n')).not.toMatch(/acknowledged/);
+    expect(logs.filter((l) => l.startsWith('Sentinel: server  skipped_empty'))).toEqual([]);
   });
 });
 

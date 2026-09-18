@@ -38,14 +38,23 @@ shape it has to handle; the webpack tree above is unchanged, because webpack's c
   differently-named pair, stored under `<serverRoot>/edge/chunks/turbopack-edge-wrapper_56e5ba59.js`;
   `edge-wrapper_8937e6f3.js` ↔ its own map.
 - `server/app/page.js` ↔ `page.js.map` = `{"version":3,"sources":[],"sections":[]}` — Turbopack's one-line entry
-  stub and its **empty index map** (BUG-02; 11 of the scratch app's 62 server maps: `app/*/page.js`, `pages/_app.js`,
-  `instrumentation.js`, `app/api/*/route.js`). The route refuses it `422 no_mappings` and decision 29 would fail the
-  build, so the walker skips it with one warn naming the file (decision 44); the wrapper's sweep still deletes it.
+  stub and its **empty index map** (11 of the scratch app's 62 server maps: `app/*/page.js`, `pages/_app.js`,
+  `instrumentation.js`, `app/api/*/route.js`). Since `0.1.2` (`sentinel-sourcemaps-index-maps` D19) the walker
+  uploads it like any other map — the pair is listed, `--dry-run` counts it — and the route answers `skipped_empty`
+  (acknowledged, not stored); the upload's summary line counts those from the response. The wrapper's sweep still
+  deletes it, and so does the CLI's `--delete` after its batch's 2xx.
 - `server/chunks/[turbopack]_runtime.js` ↔ `[turbopack]_runtime.js.map` (a percent-encoded comment) — the
   **non-empty index map** Turbopack writes for its own runtime (`sections` over `turbopack:///[turbopack]/…` with
   `ignoreList`, no top-level `mappings`, no app source; the real one is ≈ 48 KiB with five sections, this is two).
-  The same 422 refuses it, so the walker skips every index map, not only the empty ones, each with a warn naming
-  the file (decision 44 as widened); the wrapper's sweep still deletes it.
+  Uploaded and stored since `0.1.2`; the route accepts `sections` maps and the processor decodes them, so the
+  runtime's frames symbolicate to `turbopack:///[turbopack]/…`.
+- `server/chunks/url-section_0d1e2f3a.js` ↔ `url-section_0d1e2f3a.js.map` — an index map whose one section carries
+  a **`url`** key instead of an inline `map`. No Turbopack build emits this; it pins the one index map the walker
+  still skips (D7): the route rejects a `url` section for the whole batch (`422 invalid_sourcemap section_url`), and
+  a shape this feature chose not to serve must not be a red build, so the walk leaves it out with one warn naming
+  the file. The wrapper's sweep still deletes it.
 
 `sentinel-sourcemaps upload tests/fixtures-build/turbopack/.next/static /_next/static --dry-run …` prints three
-pairs (the two comment pairs and the orphan) and two warnings; the server walk prints five pairs and three.
+pairs (the two comment pairs and the orphan) and two warnings; the server walk prints seven pairs (including
+`app/page.js` and `chunks/[turbopack]_runtime.js`) and two warnings — the manifest's "no comment" line and the
+`url`-section map's skip.

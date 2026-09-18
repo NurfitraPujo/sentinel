@@ -19,16 +19,23 @@
 //     never a skip (the original step 1);
 //   - a map two chunks reference is one pair per chunk (the route is keyed by `minified_path`); the uploader
 //     unlinks it once, after the last batch that carried it;
-//   - an INDEX MAP — no string `mappings`, whatever `sections` holds — is left out with one warn per file (BUG-02,
-//     the seat's decision 44). Turbopack 15.5.21 writes `{"version":3,"sources":[],"sections":[]}` for every
+//   - an INDEX MAP — a JSON object with no string `mappings` — is UPLOADED like any other map since `0.1.2`
+//     (`sentinel-sourcemaps-index-maps` D19: the walker uploads everything and lets the route answer; BUG-02's
+//     decision 44 skip is withdrawn). Turbopack 15.5.21 writes `{"version":3,"sources":[],"sections":[]}` for every
 //     one-line server entry stub (`app/*/page.js`, `pages/_app.js`, `instrumentation.js`, `app/api/*/route.js` —
 //     11 of the scratch app's 62 server maps) and a five-section index map of its OWN runtime
 //     (`chunks/[turbopack]_runtime.js.map`, `chunks/ssr/[turbopack]_runtime.js.map` — `turbopack:///[turbopack]/…`
-//     sources, no app code); the route answers `422 invalid_sourcemap no_mappings` for the whole batch, decision 29
-//     turns that into a red build, and the processor counts a `sections` map `map_error` anyway, so nothing that
-//     could symbolicate is lost by leaving them out. The warn line is the signal that index-map support is
-//     missing on the sentinel side until a card gives the route and processor `sections`; a map that is not JSON,
-//     not an object, or larger than `INDEX_MAP_CHECK_MAX_BYTES` is uploaded as written for the route to judge.
+//     sources, no app code). The route stores the runtime map and answers `skipped_empty` for the stub (not
+//     stored; the uploader's summary line counts those from the response). The ONE index map still skipped, with
+//     one warn per file, is one any of whose `sections` entries carries a `url` key (`'url'`): the route rejects a
+//     `url` section for the whole batch (`422 invalid_sourcemap section_url`) and decision 29 turns any 4xx into a
+//     red build, and a shape this feature chose not to serve must not be a red build (D7). Every other rejection
+//     the route can give an index map is a MALFORMED map, and a malformed map failing the build is the policy
+//     flat maps already have (the walker pre-validates neither) — so a v3 map with neither a string `mappings`
+//     nor a `sections` array is still classed `'empty'`, uploaded, and takes the route's `422 no_mappings` (no
+//     producer emits it). A map that is not JSON, not an object, or larger than `INDEX_MAP_CHECK_MAX_BYTES` is
+//     uploaded as written for the route to judge; the check runs once per file (a map two chunks reference is
+//     one read).
 // The prefix need not be a URL path: §4.9's server walk passes `serverRoot` (`/app/.next/server`, decision 18)
 // and gets the absolute filesystem path the node runtime prints. Only regular files are walked (`find -type
 // f`); a `.css.map` is ignored here — sweeping every `*.map` out of a Next output is the wrapper's job (§4.9
@@ -158,13 +165,15 @@ const NAMED_SKIPS = 10;
  */
 export const INDEX_MAP_CHECK_MAX_BYTES = 1024 * 1024;
 
-export type IndexMapKind = 'empty' | 'sections';
+export type IndexMapKind = 'empty' | 'sections' | 'url';
 
 /**
- * `'empty'` for an index map with nothing in it (`sections` absent or `[]`), `'sections'` for one with sections,
- * both meaning a JSON object with no string `mappings` — `{"version":3,"sources":[],"sections":[]}` and Turbopack's
- * runtime map. `undefined` for a flat map (a `mappings` string, even `""`, which the route accepts) and for what
- * this check does not judge: not JSON, not an object, or over `INDEX_MAP_CHECK_MAX_BYTES` — uploaded as written.
+ * `'url'` for an index map any of whose `sections` entries carries a `url` key (the one class the walk skips —
+ * D7), `'empty'` for one with nothing in it (`sections` absent, not an array, or `[]`), `'sections'` for one with
+ * sections — all meaning a JSON object with no string `mappings`: `{"version":3,"sources":[],"sections":[]}` and
+ * Turbopack's runtime map. `undefined` for a flat map (a `mappings` string, even `""`, which the route accepts)
+ * and for what this check does not judge: not JSON, not an object, or over `INDEX_MAP_CHECK_MAX_BYTES` —
+ * uploaded as written.
  */
 export async function indexMapKind(path: string, sizeBytes: number): Promise<IndexMapKind | undefined> {
   if (sizeBytes > INDEX_MAP_CHECK_MAX_BYTES) return undefined;
@@ -177,7 +186,9 @@ export async function indexMapKind(path: string, sizeBytes: number): Promise<Ind
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
   const map = parsed as Record<string, unknown>;
   if (typeof map.mappings === 'string') return undefined;
-  return Array.isArray(map.sections) && map.sections.length > 0 ? 'sections' : 'empty';
+  if (!Array.isArray(map.sections) || map.sections.length === 0) return 'empty';
+  const hasUrl = map.sections.some((section: unknown) => typeof section === 'object' && section !== null && !Array.isArray(section) && 'url' in section);
+  return hasUrl ? 'url' : 'sections';
 }
 
 /** The pairs of contract §4.8 step 1 (as amended by BUG-01), in walk order. `usage` when the directory cannot be read; `[]` when it holds no map. */
@@ -216,17 +227,17 @@ export async function walkSourcemaps(buildDir: string, publicPrefix: string, opt
     warn(`${withoutComment.length} script(s) under ${buildDir} carry no sourceMappingURL comment and have no map to upload: ${named}${more}`);
   }
 
-  // Pass 2: the pairs, in walk order of the file that produced each. An index map is checked once per file (a map
-  // two chunks reference is one read) and left out with one warn naming it.
+  // Pass 2: the pairs, in walk order of the file that produced each. The index-map check runs once per file (a map
+  // two chunks reference is one read); only a `url`-section map is left out, with one warn naming it — an empty
+  // stub and a sections map are uploaded for the route to answer (D19).
   const indexChecked = new Map<string, boolean>();
   const skipIfIndexMap = async (key: string, mapPath: string, sizeBytes: number): Promise<boolean> => {
     let skip = indexChecked.get(key);
     if (skip === undefined) {
       const kind = await indexMapKind(mapPath, sizeBytes);
-      skip = kind !== undefined;
+      skip = kind === 'url';
       indexChecked.set(key, skip);
-      if (kind === 'empty') warn(`${mapPath}: empty index map (no mappings, no sections) — nothing to symbolicate; skipping it`);
-      else if (kind === 'sections') warn(`${mapPath}: index map (sections, no mappings) — the route stores flat maps only; skipping it`);
+      if (skip) warn(`${mapPath}: index map with a url section — the route does not accept url sections; skipping it`);
     }
     return skip;
   };

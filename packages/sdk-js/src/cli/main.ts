@@ -146,7 +146,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
       (json ? io.stderr : io.stdout)(summary);
       return 0;
     }
-    io.stderr(`${report.files.length} file(s) stored in ${report.requests} request(s), release ${report.release}\n`);
+    // D19 (`sentinel-sourcemaps-index-maps`): the stubs the route acknowledged and did not store are counted from
+    // the response's `files[].outcome`, never re-derived from the walk; the clause appears only when there were any.
+    const skippedEmpty = report.files.filter((f) => f.outcome === 'skipped_empty').length;
+    const storedCount = report.files.length - skippedEmpty;
+    const acknowledged = skippedEmpty > 0 ? `, ${skippedEmpty} empty index map(s) acknowledged and not stored,` : '';
+    io.stderr(`${storedCount} file(s) stored${acknowledged} in ${report.requests} request(s), release ${report.release}\n`);
     return 0;
   } catch (err) {
     if (isSourcemapUploadError(err)) {

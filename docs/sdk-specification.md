@@ -197,9 +197,10 @@ sentinel-sourcemaps upload <build dir> <public prefix> [options]
   chunk's map by a different hash than the chunk (`d69eb7d85499027c.js` carries
   `//# sourceMappingURL=8f15d5d03090a0be.js.map`), so the name-based loop below stores paths no
   browser frame ever carries. Webpack writes `<chunk>.js.map` beside `<chunk>.js`, and the two
-  rules agree there. An **index map** (a `sections` map with no string `mappings` — Turbopack
-  emits one per server entry stub) is skipped with one `warn` per file, because the route stores
-  flat maps only and answers `422 invalid_sourcemap` for one.
+  rules agree there. An **index map** (`sections`, no string `mappings`) is uploaded and accepted since
+  `sentinel-sourcemaps-index-maps`; one with zero sections is acknowledged `skipped_empty` and not
+  stored; only one with a `url` section is skipped (one `warn`) — the route answers `422
+  invalid_sourcemap { reason: "section_url" }` for those.
 - **Batches** of ≤ 50 files **and** ≤ 100 MiB serialised per request (multipart overhead
   included — the dashboard host's `BODY_SIZE_LIMIT` is 110M and a breach is the adapter's
   plain-text `413`, not the envelope); a single map over the budget goes alone in its own request.

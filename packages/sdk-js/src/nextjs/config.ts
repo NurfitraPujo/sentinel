@@ -301,7 +301,14 @@ async function runSeries(plan: SeriesPlan, ctx: SeriesContext): Promise<UploadRe
       projectKey: ctx.projectKey,
       onEvent,
     });
-    if (!ctx.silent) console.log(`Sentinel: ${series} sourcemaps — ${report.files.length} file(s) stored in ${report.requests} request(s) under release ${report.release}`);
+    if (!ctx.silent) {
+      // D19 (`sentinel-sourcemaps-index-maps`): the stubs the route acknowledged and did not store are counted from
+      // the response's `files[].outcome`, never from the walk; the clause appears only when there were any.
+      const skippedEmpty = report.files.filter((f) => f.outcome === 'skipped_empty').length;
+      const storedCount = report.files.length - skippedEmpty;
+      const acknowledged = skippedEmpty > 0 ? `, ${skippedEmpty} empty index map(s) acknowledged and not stored,` : '';
+      console.log(`Sentinel: ${series} sourcemaps — ${storedCount} file(s) stored${acknowledged} in ${report.requests} request(s) under release ${report.release}`);
+    }
     return report;
   } catch (err) {
     if (!isSourcemapUploadError(err)) throw err;
