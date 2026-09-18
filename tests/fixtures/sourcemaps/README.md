@@ -14,6 +14,7 @@ directory out of every image build context.
 | `app/` | the source: `src/main.ts` + five lazy routes (`cart`, `checkout`, `search`, `auth`, `analytics`) + `src/lib/{money,http}.ts`; `vite.config.ts` says how the two builds differ. `pnpm install && pnpm build` rebuilds both (vite 5.4.21, typescript 5.9.3, pinned; `pnpm-lock.yaml` pins the rest) |
 | `dist-a/` | **build A** — `assets/[name]-[hash].js` with `hashCharacters: 'hex'`; **8 chunks, 8 maps, 18,030 bytes of maps** (15,245 bytes of JS beside them) |
 | `dist-b/` | **build B** — the same source, `assets/[name]-[hash]_b2.js`; **8 chunks, 8 maps, 18,054 bytes of maps**. Every path differs from build A's (the `_b2` suffix), so uploading it under the same release `create`s 8 rows; two chunks (`money`, `http`) keep their content hash because their content did not change — the suffix is what makes them new `minified_path`s |
+| `turbopack/` | **the real Turbopack index map and stub** (`sentinel-sourcemaps-index-maps` §4.6, D8, D15): `chunks/[turbopack]_runtime.js` + `.js.map` and `app/page.js` + `.js.map`, read by `TestS1S2_SymbolicateBeforeFingerprint` step 5 — see the section below |
 | `vlq.mjs` | base64 VLQ encode/decode, no dependency; shared by the two generators |
 | `generate-capsize-map.mjs` | the **cap-size map generator** (decision 39): `node generate-capsize-map.mjs <out>` writes a valid v3 map of **51,904,515 bytes** = `SOURCEMAP_MAX_BYTES` (52,428,800) − 524,285, whose `mappings` string (9,973,070 segments over 4,988 lines) is the padding — never `sourcesContent`. Never committed; the seed runs it |
 | `generate-events.mjs` | the **event generator**: `node generate-events.mjs <out dir> [project_key]` derives the four 1,000-event sets (20 batch files of 50 each, one `/ingest/batch` body per file), the partial event, M2's two touch events and a `manifest.json` from the committed builds (below) |
@@ -92,3 +93,55 @@ after build A's events the project has 60 issues; after build B's, still 60.
   `<hash>_b2` is 6–64 chars of `[A-Za-z0-9_]` with a digit. `[name]-[hash]-b2.js` or
   `[name]-[hash].b2.js` would not (the rule examines one token, immediately before the extension
   run), and the no-maps run would then see two identities per source position.
+
+## `turbopack/` — the real Turbopack index map and the empty stub (`sentinel-sourcemaps-index-maps`)
+
+Four files taken **verbatim** from a real `next build --turbopack` of `tuju-ai/web` — the
+**Sentry-wrapped baseline build** named in that contract's *Basis*
+(`~/works/worktrees/ws-web-sentinel-baseline/web` @ `8ec24a0fb`, built 2026-09-17, copied from
+its `.next/server/`). Nothing is hand-edited and there is no build step: to regenerate, rebuild
+`web` at that commit and copy the same four paths. They are the SAME four files committed under
+`apps/processor-go/symbolicate/testdata/turbopack-index/` for the unit table (D8 — the Go unit
+tests read `testdata/` beside the package and the e2e reads this directory); the sha256s below are
+the guard that the two copies agree, and that README's table must carry the same values.
+
+Because the build is Sentry-wrapped (not sdk-js-wrapped), the fixture has the *baseline* shape of
+the contract's §4.6: the stub's map carries a `debugId` key (`sources: null`, `sections: []` — the
+route's R2 shape), and both `.js` files carry a Sentry debug-id prelude as line 1 and a trailing
+`//# debugId=` line, so the chunk is **759 lines**.
+
+| path (under `turbopack/`) | bytes | sha256 |
+| --- | ---: | --- |
+| `chunks/[turbopack]_runtime.js` | 28 814 | `5bea1bdae81fd6c2787aefd28a9aa5faa60862c27409eea616e365b8bb895878` |
+| `chunks/[turbopack]_runtime.js.map` | 48 500 | `a7ecaf6d11192504778cfaea46ba3fb7114a02edcc138f84e170998545ae26e1` |
+| `app/page.js` | 1 418 | `a25eae849738b162eecd7f24f7b3d74f02c95648610bc48ab55d0d91dcca1ba5` |
+| `app/page.js.map` | 91 | `ef70533167e6e9c1a1d0d1893cd67933ba6816f0af0e26afbecca99ae5939714` |
+
+Check with `(cd turbopack && sha256sum chunks/* app/*)`.
+
+**`chunks/[turbopack]_runtime.js.map` is an index map** — `{"version":3,"sources":[],"sections":[…]}`
+with **five sections**, each `{ offset, map }` where `map` is a v3 flat map with one `sources`
+entry and an empty `names` (so `function` is always kept from the frame). The five offsets are
+**0-based generated positions** (ECMA-426 §5), all `column: 0`:
+
+| # | offset `(line, column)` | `sources[0]` | inner map lines |
+| --- | --- | --- | ---: |
+| 0 | `(3, 0)` | `turbopack:///[turbopack]/shared/runtime-utils.ts` | 467 |
+| 1 | `(470, 0)` | `turbopack:///[turbopack]/shared-node/base-externals-utils.ts` | 41 |
+| 2 | `(511, 0)` | `turbopack:///[turbopack]/shared-node/node-externals-utils.ts` | 21 |
+| 3 | `(532, 0)` | `turbopack:///[turbopack]/shared-node/node-wasm-utils.ts` | 21 |
+| 4 | `(553, 0)` | `turbopack:///[turbopack]/nodejs/runtime.ts` | 201 |
+
+On the wire (1-based) the first section starts at line 4, so wire line 1 precedes every section
+and is `no_section`; wire line 600 column 12 (`const chunkCache = new Map();`) resolves through
+section 4 to `turbopack:///[turbopack]/nodejs/runtime.ts:77:7` — the two frames step 5 of the e2e
+posts under `/app/.next/server/chunks/[turbopack]_runtime.js`.
+
+**`app/page.js.map` is the empty stub** — `{"version":3,"sources":null,"sections":[],"debugId":"…"}`,
+91 bytes, zero sections. The route acknowledges it `skipped_empty` and stores **no row** (D12), so
+the e2e's frame on `/app/.next/server/app/page.js` is `no_map` and the release's row count after
+both builds plus this pair is **17** (8 + 8 + 1).
+
+`manifest.json` / `generate-events.mjs` / the seed (`apps/dashboard-web/scripts/sourcemaps-seed.sh`)
+do **not** know about these files; the seed is unchanged (D15). The map count above ("16 maps, 8
+per build") describes the Vite builds the seed uploads and is still correct.
