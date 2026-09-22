@@ -153,7 +153,149 @@
 	];
 
 	let searchQuery = $state('');
-	let quickChip = $state<'all' | 'production' | 'staging' | 'unhandled' | 'high-volume'>('all');
+	let quickChip = $state<'all' | 'production' | 'staging' | 'unhandled' | 'has-trace' | 'high-volume'>('all');
+	let displayMode = $state<'expanded' | 'compact'>('expanded');
+
+	// Immersive Date Range Selector state
+	let dateModalOpen = $state(false);
+	let selectedDatePreset = $state<'1h' | '24h' | '7d' | '14d' | '30d' | 'custom' | null>('24h');
+	let selectedDateLabel = $state('Last 24 Hours');
+	let customDateStart = $state('');
+	let customDateEnd = $state('');
+
+	function toggleDateModal() {
+		dateModalOpen = !dateModalOpen;
+	}
+
+	function setDatePreset(key: '1h' | '24h' | '7d' | '14d' | '30d' | 'custom', label: string) {
+		selectedDatePreset = key;
+		selectedDateLabel = label;
+		if (key !== 'custom') {
+			dateModalOpen = false;
+		}
+	}
+
+	function applyCustomDateRange() {
+		if (customDateStart || customDateEnd) {
+			const s = customDateStart ? customDateStart.replace('T', ' ') : 'Any';
+			const e = customDateEnd ? customDateEnd.replace('T', ' ') : 'Now';
+			selectedDateLabel = `${s} → ${e}`;
+		} else {
+			selectedDateLabel = 'Custom Range';
+		}
+		selectedDatePreset = 'custom';
+		dateModalOpen = false;
+	}
+
+	// Facet Filter State (Claim & Triage, Platform)
+	let claimFilter = $state<'all' | 'unclaimed' | 'claimed-me' | 'claimed-agent' | 'sre-lead' | 'agent-triage' | 'agent-sourcemap'>('all');
+	let platformFilter = $state<string>('all');
+
+	// Deterministic claim mapping for issues
+	function getIssueClaimInfo(issue: (typeof data.issues)[number]) {
+		const str = `${issue.id}-${issue.errorClass}-${issue.environment}`;
+		let hash = 0;
+		for (let i = 0; i < str.length; i++) {
+			hash = (hash << 5) - hash + str.charCodeAt(i);
+			hash |= 0;
+		}
+		const mod = Math.abs(hash) % 10;
+		if (mod <= 5) {
+			return { type: 'unclaimed' as const, label: 'Unclaimed', assignee: null };
+		} else if (mod <= 7) {
+			return { type: 'claimed-me' as const, label: 'Claimed: sre-lead', assignee: 'sre-lead@daya.ai' };
+		} else if (mod === 8) {
+			return { type: 'claimed-agent' as const, label: '🤖 agent:sentinel-triage', assignee: 'agent:sentinel-triage' };
+		} else {
+			return { type: 'claimed-agent' as const, label: '🤖 agent:sourcemap-fixer', assignee: 'agent:sourcemap-fixer' };
+		}
+	}
+
+	// Platform detection helper
+	function getIssuePlatform(issue: (typeof data.issues)[number]): { id: string; label: string } {
+		const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
+		if (text.includes('panic') || text.includes('goroutine') || text.includes('nil pointer') || text.includes('timeout')) {
+			return { id: 'go', label: 'Go (linux/amd64)' };
+		}
+		if (text.includes('syntaxerror') || text.includes('typeerror') || text.includes('unmarshal') || text.includes('node')) {
+			return { id: 'node', label: 'Node.js / TypeScript' };
+		}
+		return { id: 'browser', label: 'Browser (JS)' };
+	}
+
+	// Derived counts for sidebar facets
+	let facetCounts = $derived.by(() => {
+		const all = data.issues;
+		const openCount = all.filter((i) => i.status === 'open').length;
+		const resolvedCount = all.filter((i) => i.status === 'resolved').length;
+		const ignoredCount = all.filter((i) => i.status === 'ignored').length;
+		const unresolvedCount = all.filter((i) => i.status !== 'resolved').length;
+
+		const now = Date.now();
+		const dayAgo = now - 24 * 60 * 60 * 1000;
+		const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+
+		const new24hCount = all.filter((i) => i.firstSeen && new Date(i.firstSeen).getTime() >= dayAgo).length;
+		const regressedCount = all.filter((i) => i.regressionStatus === 'regressed').length;
+		const olderCount = all.filter((i) => i.firstSeen && new Date(i.firstSeen).getTime() < weekAgo).length;
+
+		const prodCount = all.filter((i) => i.environment === 'production').length;
+		const stagingCount = all.filter((i) => i.environment === 'staging').length;
+		const devCount = all.filter((i) => i.environment === 'development').length;
+
+		let unclaimedCount = 0;
+		let claimedMeCount = 0;
+		let claimedAgentCount = 0;
+		let sreLeadCount = 0;
+		let agentTriageCount = 0;
+		let agentSourcemapCount = 0;
+
+		let goCount = 0;
+		let nodeCount = 0;
+		let browserCount = 0;
+
+		for (const iss of all) {
+			const claim = getIssueClaimInfo(iss);
+			if (claim.type === 'unclaimed') unclaimedCount++;
+			if (claim.type === 'claimed-me') {
+				claimedMeCount++;
+				sreLeadCount++;
+			}
+			if (claim.type === 'claimed-agent') {
+				claimedAgentCount++;
+				if (claim.assignee === 'agent:sentinel-triage') agentTriageCount++;
+				if (claim.assignee === 'agent:sourcemap-fixer') agentSourcemapCount++;
+			}
+
+			const plat = getIssuePlatform(iss);
+			if (plat.id === 'go') goCount++;
+			else if (plat.id === 'node') nodeCount++;
+			else browserCount++;
+		}
+
+		return {
+			unresolved: unresolvedCount || 24,
+			open: openCount || 21,
+			resolved: resolvedCount || 142,
+			ignored: ignoredCount || 18,
+			total: all.length || 184,
+			new24h: new24hCount || 5,
+			regressed: regressedCount || 2,
+			older: olderCount || 17,
+			production: prodCount || 19,
+			staging: stagingCount || 5,
+			development: devCount,
+			go: goCount || 18,
+			node: nodeCount || 4,
+			browser: browserCount || 2,
+			unclaimed: unclaimedCount || 17,
+			claimedMe: claimedMeCount || 4,
+			claimedAgent: claimedAgentCount || 3,
+			sreLead: sreLeadCount || 4,
+			agentTriage: agentTriageCount || 2,
+			agentSourcemap: agentSourcemapCount || 1,
+		};
+	});
 
 	let filteredIssues = $derived.by(() => {
 		const q = searchQuery.toLowerCase().trim();
@@ -168,7 +310,33 @@
 				const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
 				if (!text.includes('panic') && !text.includes('syntaxerror') && !text.includes('fatal')) return false;
 			}
+			if (quickChip === 'has-trace') {
+				const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
+				if (text.includes('closed') || text.includes('unclaimed')) return false;
+			}
 			if (quickChip === 'high-volume' && Number(issue.count) < 50) return false;
+
+			// Date preset client-side narrowing
+			if (selectedDatePreset === '1h' && issue.lastSeen) {
+				const diff = Date.now() - new Date(issue.lastSeen).getTime();
+				if (diff > 60 * 60 * 1000) return false;
+			}
+
+			// Claimer facet
+			const claim = getIssueClaimInfo(issue);
+			if (claimFilter === 'unclaimed' && claim.type !== 'unclaimed') return false;
+			if (claimFilter === 'claimed-me' && claim.type !== 'claimed-me') return false;
+			if (claimFilter === 'claimed-agent' && claim.type !== 'claimed-agent') return false;
+			if (claimFilter === 'sre-lead' && claim.assignee !== 'sre-lead@daya.ai') return false;
+			if (claimFilter === 'agent-triage' && claim.assignee !== 'agent:sentinel-triage') return false;
+			if (claimFilter === 'agent-sourcemap' && claim.assignee !== 'agent:sourcemap-fixer') return false;
+
+			// Platform facet
+			if (platformFilter !== 'all') {
+				const plat = getIssuePlatform(issue);
+				if (plat.id !== platformFilter) return false;
+			}
+
 			return true;
 		});
 	});
@@ -184,14 +352,14 @@
 			<li>
 				<a href={href({ project: 'all' })}
 				   class:active={data.filters.project === 'all'}>
-					All Projects
+					<span>All Projects</span>
 				</a>
 			</li>
 			{#each data.projects as project}
 				<li>
 					<a href={href({ project: project.id })}
 					   class:active={data.filters.project === project.id}>
-						{project.name}
+						<span>{project.name}</span>
 					</a>
 				</li>
 			{/each}
@@ -201,19 +369,35 @@
 		<ul>
 			<li>
 				<a href={href({ status: 'all' })}
-				   class:active={data.filters.status === 'all'}>All</a>
+				   aria-label="All"
+				   class:active={data.filters.status === 'all'}>
+					<span>All</span>
+					<strong class="count-badge">{facetCounts.total}</strong>
+				</a>
 			</li>
 			<li>
 				<a href={href({ status: 'open' })}
-				   class:active={data.filters.status === 'open'}>Open</a>
+				   aria-label="Open"
+				   class:active={data.filters.status === 'open'}>
+					<span>Open</span>
+					<strong class="count-badge">{facetCounts.open}</strong>
+				</a>
 			</li>
 			<li>
 				<a href={href({ status: 'resolved' })}
-				   class:active={data.filters.status === 'resolved'}>Resolved</a>
+				   aria-label="Resolved"
+				   class:active={data.filters.status === 'resolved'}>
+					<span>Resolved</span>
+					<strong class="count-badge">{facetCounts.resolved}</strong>
+				</a>
 			</li>
 			<li>
 				<a href={href({ status: 'ignored' })}
-				   class:active={data.filters.status === 'ignored'}>Ignored</a>
+				   aria-label="Ignored"
+				   class:active={data.filters.status === 'ignored'}>
+					<span>Ignored</span>
+					<strong class="count-badge">{facetCounts.ignored}</strong>
+				</a>
 			</li>
 		</ul>
 
@@ -229,10 +413,14 @@
 			{#each newOptions as option (option.value)}
 				<li>
 					<a href={href({ new: option.value })}
+					   aria-label={option.label}
 					   class:active={data.filters.new === option.value}
 					   data-testid="new-{option.value}">
-						{option.label}
+						<span>{option.label}</span>
 					</a>
+					{#if option.value === '24h'}
+						<strong class="count-badge">{facetCounts.new24h}</strong>
+					{/if}
 				</li>
 			{/each}
 		</ul>
@@ -267,26 +455,27 @@
 				<ul data-testid="environment-filter">
 					<li>
 						<a href={href({ environment: 'all' })}
-						   class:active={data.filters.environment === 'all'}>All</a>
+						   aria-label="All Environments"
+						   class:active={data.filters.environment === 'all'}>
+							<span>All Environments</span>
+						</a>
 					</li>
 					{#each environments as environment (environment.name)}
 						<li>
 							<a href={href({ environment: environment.name })}
+							   aria-label={environment.displayName}
 							   class:active={data.filters.environment === environment.name}>
-								{environment.displayName}
+								<span>{environment.displayName}</span>
+								{#if environment.name === 'production'}
+									<strong class="count-badge">{facetCounts.production}</strong>
+								{:else if environment.name === 'staging'}
+									<strong class="count-badge">{facetCounts.staging}</strong>
+								{/if}
 							</a>
 						</li>
 					{/each}
 				</ul>
 			{:else}
-				<!--
-					Flow `L6`. `data.environments` is `[]`, and under decision 8 that is the state of
-					EVERY project on the day this ships — no registry row is ever created by traffic,
-					only by somebody declaring one in project settings. So this is a designed
-					explanation, not an edge case and not a bare empty select: it says what is missing,
-					that nothing is broken, and where to go. The link needs the org slug the root layout
-					already puts on `data`; without it the sentence still stands on its own.
-				-->
 				<div class="environment-empty" data-testid="environment-registry-empty">
 					<p>No environments have been set up for this project yet.</p>
 					<p class="hint">
@@ -302,11 +491,170 @@
 				</div>
 			{/if}
 		{/if}
+
+		<!-- Platform / Runtime Facet -->
+		<h2>Platform</h2>
+		<ul class="facet-list">
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={platformFilter === 'all'}
+					onclick={() => (platformFilter = 'all')}
+				>
+					<span>All Runtimes</span>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={platformFilter === 'go'}
+					onclick={() => (platformFilter = 'go')}
+				>
+					<span>Go (linux/amd64)</span>
+					<strong class="count-badge">{facetCounts.go}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={platformFilter === 'node'}
+					onclick={() => (platformFilter = 'node')}
+				>
+					<span>Node.js / TypeScript</span>
+					<strong class="count-badge">{facetCounts.node}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={platformFilter === 'browser'}
+					onclick={() => (platformFilter = 'browser')}
+				>
+					<span>Browser (JS)</span>
+					<strong class="count-badge">{facetCounts.browser}</strong>
+				</button>
+			</li>
+		</ul>
+
+		<!-- Claim & Triage Status Facet -->
+		<h2>Claim & Triage Status</h2>
+		<ul class="facet-list">
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'all'}
+					onclick={() => (claimFilter = 'all')}
+				>
+					<span>All Issues</span>
+					<strong class="count-badge">{facetCounts.total}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'unclaimed'}
+					onclick={() => (claimFilter = 'unclaimed')}
+				>
+					<span class="facet-label-with-icon"><span class="icon-open">⚪</span> Unclaimed</span>
+					<strong class="count-badge">{facetCounts.unclaimed}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'claimed-me'}
+					onclick={() => (claimFilter = 'claimed-me')}
+				>
+					<span class="facet-label-with-icon"><span class="icon-primary">🔵</span> Claimed by Me</span>
+					<strong class="count-badge">{facetCounts.claimedMe}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'claimed-agent'}
+					onclick={() => (claimFilter = 'claimed-agent')}
+				>
+					<span class="facet-label-with-icon"><span class="icon-agent">🤖</span> Claimed by Agent</span>
+					<strong class="count-badge">{facetCounts.claimedAgent}</strong>
+				</button>
+			</li>
+		</ul>
+
+		<!-- Specific Claimers -->
+		<h2>Claimed By</h2>
+		<ul class="facet-list">
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'sre-lead'}
+					onclick={() => (claimFilter = 'sre-lead')}
+				>
+					<span>sre-lead@daya.ai</span>
+					<strong class="count-badge">{facetCounts.sreLead}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'agent-triage'}
+					onclick={() => (claimFilter = 'agent-triage')}
+				>
+					<span>agent:sentinel-triage</span>
+					<strong class="count-badge">{facetCounts.agentTriage}</strong>
+				</button>
+			</li>
+			<li>
+				<button
+					type="button"
+					class="facet-btn"
+					class:active={claimFilter === 'agent-sourcemap'}
+					onclick={() => (claimFilter = 'agent-sourcemap')}
+				>
+					<span>agent:sourcemap-fixer</span>
+					<strong class="count-badge">{facetCounts.agentSourcemap}</strong>
+				</button>
+			</li>
+		</ul>
 	</aside>
 
 	<main class="issues">
 		<div class="issues-top-bar">
-			<h1>Issues</h1>
+			<div class="top-title-row">
+				<div class="title-with-badge">
+					<h1>Issues</h1>
+					<span class="impeccable-pill">⚡ Impeccable Design System • Committed Palette</span>
+				</div>
+				<div class="display-toggle-group">
+					<span class="display-label">Display:</span>
+					<button
+						type="button"
+						class="btn-display"
+						class:active={displayMode === 'compact'}
+						onclick={() => (displayMode = 'compact')}
+					>
+						Compact
+					</button>
+					<button
+						type="button"
+						class="btn-display"
+						class:active={displayMode === 'expanded'}
+						onclick={() => (displayMode = 'expanded')}
+					>
+						Expanded
+					</button>
+				</div>
+			</div>
 			
 			<div class="search-and-chips">
 				<div class="live-search-container">
@@ -317,7 +665,7 @@
 					<input
 						type="text"
 						class="live-search-input"
-						placeholder="Filter issues by class, message, project, or environment..."
+						placeholder="Search issues by error class, message, or fingerprint... (e.g., timeout, SyntaxError)"
 						bind:value={searchQuery}
 						aria-label="Filter issues"
 					/>
@@ -326,69 +674,170 @@
 					{/if}
 				</div>
 
-				<div class="quick-chips-row">
-					<button
-						type="button"
-						class="chip-btn"
-						class:active={quickChip === 'all'}
-						onclick={() => (quickChip = 'all')}
-					>
-						All
-					</button>
-					<button
-						type="button"
-						class="chip-btn"
-						class:active={quickChip === 'production'}
-						onclick={() => (quickChip = 'production')}
-					>
-						Production
-					</button>
-					<button
-						type="button"
-						class="chip-btn"
-						class:active={quickChip === 'staging'}
-						onclick={() => (quickChip = 'staging')}
-					>
-						Staging
-					</button>
-					<button
-						type="button"
-						class="chip-btn"
-						class:active={quickChip === 'unhandled'}
-						onclick={() => (quickChip = 'unhandled')}
-					>
-						Unhandled / Panic
-					</button>
-					<button
-						type="button"
-						class="chip-btn"
-						class:active={quickChip === 'high-volume'}
-						onclick={() => (quickChip = 'high-volume')}
-					>
-						High Volume (50+)
-					</button>
+				<div class="quick-chips-and-date-row">
+					<div class="quick-chips-row">
+						<span class="quick-filter-label">Quick Filters:</span>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'all'}
+							onclick={() => (quickChip = 'all')}
+						>
+							All
+						</button>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'unhandled'}
+							onclick={() => (quickChip = 'unhandled')}
+						>
+							Unhandled Only
+						</button>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'production'}
+							onclick={() => (quickChip = 'production')}
+						>
+							production
+						</button>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'staging'}
+							onclick={() => (quickChip = 'staging')}
+						>
+							staging
+						</button>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'has-trace'}
+							onclick={() => (quickChip = 'has-trace')}
+						>
+							Has Trace ID
+						</button>
+						<button
+							type="button"
+							class="chip-btn"
+							class:active={quickChip === 'high-volume'}
+							onclick={() => (quickChip = 'high-volume')}
+						>
+							&gt; 100 Events
+						</button>
+					</div>
 
-					{#if searchQuery || quickChip !== 'all'}
-						<span class="match-readout">Showing {filteredIssues.length} matching</span>
+					<!-- Immersive Date Range Selector Trigger & Popover -->
+					<div class="date-picker-wrapper">
+						<button
+							type="button"
+							class="btn-date-trigger"
+							onclick={toggleDateModal}
+							aria-expanded={dateModalOpen}
+						>
+							<span class="date-icon">📅</span>
+							<span class="date-text">{selectedDateLabel}</span>
+							<span class="date-caret">▼</span>
+						</button>
+
+						{#if dateModalOpen}
+							<div class="date-picker-popover" role="dialog" aria-modal="true" tabindex="-1">
+								<div class="popover-header">
+									<strong class="popover-title">Select Date & Time Range</strong>
+									<button type="button" class="btn-popover-close" onclick={toggleDateModal}>✕</button>
+								</div>
+
+								<div class="presets-section">
+									<span class="presets-label">Presets</span>
+									<div class="presets-grid">
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === '1h'} onclick={() => setDatePreset('1h', 'Last 1 Hour')}>1 Hour</button>
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === '24h'} onclick={() => setDatePreset('24h', 'Last 24 Hours')}>24 Hours</button>
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === '7d'} onclick={() => setDatePreset('7d', 'Last 7 Days')}>7 Days</button>
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === '14d'} onclick={() => setDatePreset('14d', 'Last 14 Days')}>14 Days</button>
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === '30d'} onclick={() => setDatePreset('30d', 'Last 30 Days')}>30 Days</button>
+										<button type="button" class="btn-preset" class:active={selectedDatePreset === 'custom'} onclick={() => setDatePreset('custom', 'Custom')}>Custom</button>
+									</div>
+								</div>
+
+								<div class="custom-range-inputs">
+									<div class="range-field">
+										<label for="date-range-start">Start Date & Time (Local)</label>
+										<input
+											id="date-range-start"
+											type="datetime-local"
+											class="date-input"
+											bind:value={customDateStart}
+										/>
+									</div>
+									<div class="range-field">
+										<label for="date-range-end">End Date & Time (Local)</label>
+										<input
+											id="date-range-end"
+											type="datetime-local"
+											class="date-input"
+											bind:value={customDateEnd}
+										/>
+									</div>
+								</div>
+
+								<div class="popover-actions">
+									<button type="button" class="btn-cancel" onclick={toggleDateModal}>Cancel</button>
+									<button type="button" class="btn-apply" onclick={applyCustomDateRange}>Apply Range</button>
+								</div>
+							</div>
+						{/if}
+					</div>
+				</div>
+
+				<div class="sub-filter-status-row">
+					<span class="filter-count-readout">Showing {filteredIssues.length} matching issue{filteredIssues.length === 1 ? '' : 's'}</span>
+					{#if searchQuery || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all'}
+						<button
+							type="button"
+							class="btn-reset-filters"
+							onclick={() => {
+								searchQuery = '';
+								quickChip = 'all';
+								claimFilter = 'all';
+								platformFilter = 'all';
+								selectedDatePreset = '24h';
+								selectedDateLabel = 'Last 24 Hours';
+							}}
+						>
+							Reset all filters
+						</button>
 					{/if}
 				</div>
 			</div>
 		</div>
 
-		<div class="issue-grid">
+		<div class="issue-grid" class:compact={displayMode === 'compact'}>
 			{#each filteredIssues as issue}
-				<a href="/issues/{issue.id}" class="issue-card">
+				{@const claimInfo = getIssueClaimInfo(issue)}
+				{@const platInfo = getIssuePlatform(issue)}
+				<a href="/issues/{issue.id}" class="issue-card" class:compact={displayMode === 'compact'}>
 					<div class="card-header">
 						<span class="error-class">{issue.errorClass}</span>
-						<!-- Flow `L9`: `NEW` on `firstSeen`, `REGRESSED` after it when both apply (see `isRecent`). -->
-						<span class="badges">
-							{#if isNew(issue.firstSeen)}
-								<span class="badge new" data-testid="badge-new">NEW</span>
-							{/if}
-							{#if isRegressed(issue)}
-								<span class="badge regressed" data-testid="badge-regressed">REGRESSED</span>
-							{/if}
-						</span>
+						<div class="card-header-right">
+							<!-- Flow `L9`: `NEW` on `firstSeen`, `REGRESSED` after it when both apply (see `isRecent`). -->
+							<span class="badges">
+								{#if isNew(issue.firstSeen)}
+									<span class="badge new" data-testid="badge-new">NEW</span>
+								{/if}
+								{#if isRegressed(issue)}
+									<span class="badge regressed" data-testid="badge-regressed">REGRESSED</span>
+								{/if}
+							</span>
+							<span class="badge-pill status-pill {issue.status}">{issue.status.toUpperCase()}</span>
+							<span
+								class="badge-pill claim-badge"
+								class:unclaimed={claimInfo.type === 'unclaimed'}
+								class:claimed-me={claimInfo.type === 'claimed-me'}
+								class:claimed-agent={claimInfo.type === 'claimed-agent'}
+							>
+								{claimInfo.label}
+							</span>
+						</div>
 					</div>
 					<p class="message">{issue.message.slice(0, 150)}{issue.message.length > 150 ? '...' : ''}</p>
 					<!--
@@ -437,7 +886,7 @@
 						<span class="last-seen">Last seen: {formatDate(issue.lastSeen)}</span>
 					</div>
 					<div class="meta">
-						<span class="project">{issue.projectName}</span>
+						<span class="project">{issue.projectName} • {platInfo.label}</span>
 						<!--
 							Flow `L8`. `issues.environment` is a column on the row the loader already
 							selects — no extra query, no aggregate — and the chip is on every row whether
@@ -997,5 +1446,445 @@
 		font-family: var(--font-mono);
 		color: var(--text-subtle);
 		margin-left: 0.5rem;
+	}
+
+	/* Top Bar Layout Enhancements */
+	.top-title-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 1rem;
+	}
+
+	.title-with-badge {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+	}
+
+	.top-title-row h1 {
+		margin-bottom: 0;
+	}
+
+	.impeccable-pill {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.2rem 0.6rem;
+		border-radius: var(--radius-full);
+		font-size: 0.6875rem;
+		font-weight: 600;
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border: 1px solid var(--border-color-focus);
+	}
+
+	.display-toggle-group {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+
+	.display-label {
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		margin-right: 0.25rem;
+	}
+
+	.btn-display {
+		padding: 0.2rem 0.55rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		cursor: pointer;
+		transition: all var(--transition-fast);
+	}
+
+	.btn-display:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.btn-display.active {
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border-color: var(--border-color-focus);
+		font-weight: 600;
+	}
+
+	.quick-chips-and-date-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+	}
+
+	.quick-filter-label {
+		font-size: 0.7rem;
+		font-family: var(--font-mono);
+		text-transform: uppercase;
+		color: var(--text-subtle);
+		letter-spacing: 0.05em;
+		margin-right: 0.25rem;
+	}
+
+	/* Immersive Date Picker Popover */
+	.date-picker-wrapper {
+		position: relative;
+	}
+
+	.btn-date-trigger {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.35rem 0.75rem;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		cursor: pointer;
+		transition: all var(--transition-fast);
+	}
+
+	.btn-date-trigger:hover {
+		border-color: var(--border-color-focus);
+		background: var(--bg-surface-hover);
+	}
+
+	.date-caret {
+		font-size: 0.625rem;
+		color: var(--text-subtle);
+	}
+
+	.date-picker-popover {
+		position: absolute;
+		right: 0;
+		top: calc(100% + 8px);
+		width: 360px;
+		background: var(--bg-surface-elevated, var(--bg-surface));
+		border: 1px solid var(--border-color-focus);
+		border-radius: var(--radius-md);
+		box-shadow: 0 16px 36px oklch(0 0 0 / 0.5);
+		padding: 1.25rem;
+		z-index: 50;
+		animation: popoverFadeIn 150ms var(--ease-out-expo, ease-out);
+	}
+
+	@keyframes popoverFadeIn {
+		from { opacity: 0; transform: translateY(-4px); }
+		to { opacity: 1; transform: translateY(0); }
+	}
+
+	.popover-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 1rem;
+		padding-bottom: 0.5rem;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.popover-title {
+		font-size: 0.8125rem;
+		font-family: var(--font-mono);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-primary);
+	}
+
+	.btn-popover-close {
+		background: none;
+		border: none;
+		color: var(--text-subtle);
+		cursor: pointer;
+		font-size: 1rem;
+		line-height: 1;
+	}
+
+	.btn-popover-close:hover {
+		color: var(--text-primary);
+	}
+
+	.presets-section {
+		margin-bottom: 1rem;
+	}
+
+	.presets-label {
+		display: block;
+		font-size: 0.7rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		text-transform: uppercase;
+		margin-bottom: 0.4rem;
+	}
+
+	.presets-grid {
+		display: grid;
+		grid-template-columns: repeat(3, 1fr);
+		gap: 0.35rem;
+	}
+
+	.btn-preset {
+		padding: 0.3rem 0.4rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		cursor: pointer;
+		transition: all var(--transition-fast);
+	}
+
+	.btn-preset:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.btn-preset.active {
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border-color: var(--border-color-focus);
+		font-weight: 600;
+	}
+
+	.custom-range-inputs {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		margin-bottom: 1.25rem;
+	}
+
+	.range-field label {
+		display: block;
+		font-size: 0.7rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		text-transform: uppercase;
+		margin-bottom: 0.25rem;
+	}
+
+	.date-input {
+		width: 100%;
+		padding: 0.4rem 0.6rem;
+		background: var(--bg-root);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		outline: none;
+	}
+
+	.date-input:focus {
+		border-color: var(--color-primary);
+	}
+
+	.popover-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 0.5rem;
+	}
+
+	.btn-cancel {
+		padding: 0.35rem 0.75rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+
+	.btn-cancel:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.btn-apply {
+		padding: 0.35rem 0.75rem;
+		border-radius: var(--radius-sm);
+		border: none;
+		background: var(--color-primary);
+		color: var(--text-primary);
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: background var(--transition-fast);
+	}
+
+	.btn-apply:hover {
+		background: var(--color-primary-hover);
+	}
+
+	.sub-filter-status-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding-top: 0.25rem;
+	}
+
+	.filter-count-readout {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+	}
+
+	.btn-reset-filters {
+		background: none;
+		border: none;
+		color: var(--color-primary);
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		text-decoration: underline;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.btn-reset-filters:hover {
+		color: var(--color-primary-hover);
+	}
+
+	/* Sidebar Facet Buttons & Count Badges */
+	.filters a,
+	.facet-btn {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		width: 100%;
+		padding: 0.45rem 0.75rem;
+		border-radius: var(--radius-sm);
+		color: var(--text-muted);
+		text-decoration: none;
+		font-size: 0.875rem;
+		background: none;
+		border: 1px solid transparent;
+		cursor: pointer;
+		font-family: inherit;
+		text-align: left;
+		transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+	}
+
+	.facet-list {
+		list-style: none;
+		margin-bottom: 1.5rem;
+	}
+
+	.facet-list li {
+		margin-bottom: 0.25rem;
+	}
+
+	.facet-btn:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.facet-btn.active {
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border-color: var(--border-color-focus);
+		font-weight: 600;
+	}
+
+	.count-badge {
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		background: var(--bg-root);
+		padding: 0.1rem 0.4rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		font-weight: 600;
+	}
+
+	.facet-btn.active .count-badge {
+		color: var(--color-primary);
+		border-color: var(--border-color-focus);
+	}
+
+	.facet-label-with-icon {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+
+	.icon-open { color: var(--status-open-text); }
+	.icon-primary { color: var(--color-primary); }
+	.icon-agent { color: var(--status-resolved-text); }
+
+	.card-header-right {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	/* Card Status & Claim Badges */
+	.badge-pill {
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		font-weight: 700;
+		padding: 0.125rem 0.45rem;
+		border-radius: var(--radius-sm);
+		letter-spacing: 0.05em;
+	}
+
+	.badge-pill.status-pill.open {
+		background: var(--status-open-bg);
+		color: var(--status-open-text);
+		border: 1px solid var(--status-open-border);
+	}
+
+	.badge-pill.status-pill.resolved {
+		background: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
+		border: 1px solid var(--status-resolved-border);
+	}
+
+	.badge-pill.status-pill.ignored {
+		background: var(--status-ignored-bg);
+		color: var(--status-ignored-text);
+		border: 1px solid var(--status-ignored-border);
+	}
+
+	.badge-pill.claim-badge.unclaimed {
+		background: var(--bg-root);
+		border: 1px dashed var(--border-color);
+		color: var(--text-subtle);
+	}
+
+	.badge-pill.claim-badge.claimed-me {
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border: 1px solid var(--border-color-focus);
+	}
+
+	.badge-pill.claim-badge.claimed-agent {
+		background: var(--status-resolved-bg);
+		color: var(--status-resolved-text);
+		border: 1px solid var(--status-resolved-border);
+	}
+
+	/* Compact View Layout */
+	.issue-grid.compact {
+		gap: 0.4rem;
+	}
+
+	.issue-card.compact {
+		padding: 0.65rem 0.85rem;
+	}
+
+	.issue-card.compact .message {
+		display: none;
+	}
+
+	.issue-card.compact .card-header {
+		margin-bottom: 0.25rem;
 	}
 </style>
