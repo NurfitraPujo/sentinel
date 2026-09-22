@@ -45,7 +45,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
 	const environmentFilter = url.searchParams.get('environment') ?? 'all';
 	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
-	const limit = 20;
+	const ALLOWED_LIMITS = [20, 50, 100] as const;
+	const parsedLimit = parseInt(url.searchParams.get('limit') ?? '20', 10);
+	const limit = ALLOWED_LIMITS.includes(parsedLimit as any) ? parsedLimit : 20;
 
 	// Decision 55 (`OQ-41` = (a)): on `project=all` the loader coerces `environment` to `all` and
 	// adds NO environment predicate. An environment name is only meaningful inside a project, so

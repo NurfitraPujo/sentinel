@@ -77,12 +77,16 @@
 	}
 
 	.app-header {
-		height: 48px;
+		height: 52px;
 		background-color: var(--bg-surface);
 		border-bottom: 1px solid var(--border-color);
 		display: flex;
 		align-items: center;
 		padding: 0 1.5rem;
+		position: sticky;
+		top: 0;
+		z-index: 40;
+		backdrop-filter: blur(8px);
 	}
 
 	.header-content {
@@ -103,23 +107,29 @@
 		gap: 0.5rem;
 		text-decoration: none;
 		color: var(--text-primary);
+		transition: opacity var(--transition-fast);
+	}
+
+	.logo:hover {
+		opacity: 0.9;
 	}
 
 	.logo-icon {
-		font-size: 1rem;
+		font-size: 1.125rem;
+		color: var(--color-primary);
 	}
 
 	.logo-text {
 		font-family: var(--font-mono);
 		font-weight: 700;
 		font-size: 0.875rem;
-		letter-spacing: 0.1em;
+		letter-spacing: 0.12em;
 		color: var(--text-primary);
 	}
 
 	.nav-menu {
 		display: flex;
-		gap: 1.5rem;
+		gap: 1.25rem;
 		align-items: center;
 	}
 
@@ -128,11 +138,20 @@
 		text-decoration: none;
 		font-size: 0.875rem;
 		font-weight: 500;
-		transition: color 0.15s ease;
+		padding: 0.375rem 0.625rem;
+		border-radius: var(--radius-sm);
+		transition: color var(--transition-fast), background-color var(--transition-fast);
 	}
 
-	.nav-link:hover, .nav-link.active {
+	.nav-link:hover {
 		color: var(--text-primary);
+		background-color: var(--bg-surface-hover);
+	}
+
+	.nav-link.active {
+		color: var(--text-primary);
+		background-color: var(--color-primary-subtle);
+		font-weight: 600;
 	}
 
 	.user-menu {
@@ -144,11 +163,15 @@
 	.user-email {
 		font-family: var(--font-mono);
 		font-size: 0.75rem;
-		color: var(--text-subtle);
+		color: var(--text-muted);
+		background: var(--bg-root);
+		padding: 0.2rem 0.5rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
 	}
 
 	.btn-signout, .btn-signin {
-		background: transparent;
+		background: var(--bg-surface);
 		border: 1px solid var(--border-color);
 		color: var(--text-muted);
 		padding: 0.25rem 0.625rem;
@@ -157,17 +180,20 @@
 		font-weight: 500;
 		cursor: pointer;
 		text-decoration: none;
-		transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+		transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 	}
 
 	.btn-signout:hover, .btn-signin:hover {
 		background-color: var(--bg-surface-hover);
 		color: var(--text-primary);
-		border-color: var(--text-muted);
+		border-color: var(--border-color-focus);
 	}
 
 	.app-main {
 		flex: 1;
-		padding: 1.5rem;
+		padding: 1.75rem 1.5rem;
+		max-width: 1400px;
+		width: 100%;
+		margin: 0 auto;
 	}
 </style>

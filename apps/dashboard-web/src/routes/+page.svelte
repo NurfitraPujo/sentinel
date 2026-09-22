@@ -104,6 +104,7 @@
 		sort?: IssueSortValue;
 		new?: IssueNewValue;
 		page?: number;
+		limit?: number;
 	}) {
 		const status = params.status ?? data.filters.status;
 		const project = params.project ?? data.filters.project;
@@ -114,6 +115,7 @@
 				: (params.environment ?? data.filters.environment);
 		const sort = params.sort ?? data.filters.sort;
 		const newFilter = params.new ?? data.filters.new;
+		const limit = params.limit ?? data.pagination.limit;
 
 		const q = new URLSearchParams();
 		q.set('status', status);
@@ -121,6 +123,7 @@
 		if (environment && environment !== 'all') q.set('environment', environment);
 		if (sort && sort !== 'last_seen') q.set('sort', sort);
 		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
+		if (limit && limit !== 20) q.set('limit', String(limit));
 		if (params.page && params.page > 1) q.set('page', String(params.page));
 		return `?${q.toString()}`;
 	}
@@ -377,20 +380,49 @@
 			{/each}
 		</div>
 
-		{#if data.pagination.totalPages > 1}
-			<nav class="pagination">
-				{#if data.pagination.page > 1}
-					<!-- Flow `L7`: the environment survives a page change; `href()` carries it. -->
-					<a href={href({ page: data.pagination.page - 1 })}>
-						Previous
-					</a>
-				{/if}
-				<span>Page {data.pagination.page} of {data.pagination.totalPages}</span>
-				{#if data.pagination.page < data.pagination.totalPages}
-					<a href={href({ page: data.pagination.page + 1 })}>
-						Next
-					</a>
-				{/if}
+		{#if data.pagination.total > 0}
+			<nav class="pagination" aria-label="Pagination Navigation">
+				<div class="pagination-info">
+					Showing <span class="highlight">{Math.min((data.pagination.page - 1) * data.pagination.limit + 1, data.pagination.total)}–{Math.min(data.pagination.page * data.pagination.limit, data.pagination.total)}</span> of <span class="highlight">{data.pagination.total.toLocaleString()}</span> issues
+				</div>
+
+				<div class="pagination-actions">
+					{#if data.pagination.totalPages > 1}
+						<div class="pagination-stepper">
+							{#if data.pagination.page > 1}
+								<a href={href({ page: data.pagination.page - 1 })} class="page-nav" data-testid="pagination-prev">
+									Previous
+								</a>
+							{:else}
+								<span class="page-nav disabled" aria-disabled="true">Previous</span>
+							{/if}
+
+							<span class="page-current">Page {data.pagination.page} of {data.pagination.totalPages}</span>
+
+							{#if data.pagination.page < data.pagination.totalPages}
+								<a href={href({ page: data.pagination.page + 1 })} class="page-nav" data-testid="pagination-next">
+									Next
+								</a>
+							{:else}
+								<span class="page-nav disabled" aria-disabled="true">Next</span>
+							{/if}
+						</div>
+					{/if}
+
+					<div class="per-page-selector">
+						<span class="per-page-label">Per page:</span>
+						{#each [20, 50, 100] as limitOption}
+							<a
+								href={href({ limit: limitOption, page: 1 })}
+								class="limit-option"
+								class:active={data.pagination.limit === limitOption}
+								data-testid="limit-{limitOption}"
+							>
+								{limitOption}
+							</a>
+						{/each}
+					</div>
+				</div>
 			</nav>
 		{/if}
 	</main>
@@ -474,14 +506,16 @@
 	}
 
 	.filters a.active {
-		background: var(--color-primary);
-		color: var(--text-primary);
-		font-weight: 500;
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border: 1px solid var(--border-color-focus);
+		font-weight: 600;
 	}
 
 	.issues h1 {
 		font-size: 1.5rem;
 		font-weight: 600;
+		letter-spacing: -0.01em;
 		margin-bottom: 1.5rem;
 		color: var(--text-primary);
 	}
@@ -493,18 +527,19 @@
 
 	.issue-card {
 		display: block;
-		padding: 1rem;
+		padding: 1.125rem;
 		background-color: var(--bg-surface);
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-md);
 		text-decoration: none;
 		color: inherit;
-		transition: border-color 0.15s ease, background-color 0.15s ease;
+		transition: border-color var(--transition-fast), background-color var(--transition-fast), box-shadow var(--transition-fast);
 	}
 
 	.issue-card:hover {
-		border-color: var(--color-primary);
+		border-color: var(--border-color-focus);
 		background-color: var(--bg-surface-hover);
+		box-shadow: 0 4px 12px oklch(0 0 0 / 0.2);
 	}
 
 	.card-header {
@@ -519,6 +554,7 @@
 		font-family: var(--font-mono);
 		color: var(--severity-critical-text);
 		font-size: 0.875rem;
+		letter-spacing: -0.01em;
 	}
 
 	.badges {
@@ -545,13 +581,13 @@
 	.badge.regressed {
 		background: var(--status-open-bg);
 		color: var(--status-open-text);
-		border: 1px solid var(--status-open-bg);
+		border: 1px solid var(--status-open-border);
 	}
 
 	.message {
-		color: var(--text-muted);
+		color: var(--text-secondary);
 		margin-bottom: 0.75rem;
-		line-height: 1.4;
+		line-height: 1.45;
 		font-size: 0.875rem;
 	}
 
@@ -664,29 +700,110 @@
 
 	.pagination {
 		display: flex;
-		justify-content: center;
+		flex-wrap: wrap;
+		justify-content: space-between;
 		align-items: center;
-		gap: 1rem;
-		margin-top: 2rem;
+		gap: 1.25rem;
+		margin-top: 2.5rem;
+		padding: 1rem 1.25rem;
+		background: var(--bg-card);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
 		font-size: 0.875rem;
 		color: var(--text-muted);
 	}
 
-	.pagination a {
-		padding: 0.5rem 1rem;
-		min-height: 44px;
+	.pagination-info {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+
+	.pagination-info .highlight {
+		color: var(--text-primary);
+		font-weight: 600;
+	}
+
+	.pagination-actions {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 1.5rem;
+	}
+
+	.pagination-stepper {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+
+	.page-nav {
+		padding: 0.375rem 0.875rem;
+		min-height: 36px;
 		display: inline-flex;
 		align-items: center;
-		background: var(--color-primary);
+		background: var(--bg-card);
+		border: 1px solid var(--border-color);
 		color: var(--text-primary);
 		border-radius: var(--radius-sm);
 		text-decoration: none;
 		font-weight: 500;
-		transition: background 0.15s ease;
+		font-size: 0.8125rem;
+		transition: all 0.15s ease;
 	}
 
-	.pagination a:hover {
-		background: var(--color-primary-hover);
+	.page-nav:hover:not(.disabled) {
+		background: var(--bg-card-hover);
+		border-color: var(--border-color-hover);
+	}
+
+	.page-nav.disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+		border-color: var(--border-color);
+		color: var(--text-muted);
+	}
+
+	.page-current {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+		padding: 0 0.25rem;
+	}
+
+	.per-page-selector {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		font-size: 0.8125rem;
+	}
+
+	.per-page-label {
+		color: var(--text-muted);
+		margin-right: 0.25rem;
+	}
+
+	.limit-option {
+		padding: 0.25rem 0.625rem;
+		min-height: 28px;
+		display: inline-flex;
+		align-items: center;
+		border-radius: var(--radius-sm);
+		text-decoration: none;
+		color: var(--text-muted);
+		font-weight: 500;
+		font-size: 0.8125rem;
+		border: 1px solid transparent;
+		transition: all 0.15s ease;
+	}
+
+	.limit-option:hover {
+		color: var(--text-primary);
+		background: var(--bg-card-hover);
+	}
+
+	.limit-option.active {
+		background: var(--color-primary);
+		color: var(--text-primary);
+		font-weight: 600;
 	}
 
 	.empty {

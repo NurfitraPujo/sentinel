@@ -319,9 +319,9 @@
 		border: none;
 		border-radius: var(--radius-sm);
 		font-size: 0.8125rem;
-		font-weight: 500;
+		font-weight: 600;
 		cursor: pointer;
-		transition: background 0.15s ease;
+		transition: background-color var(--transition-fast);
 	}
 
 	.btn-search:hover {
@@ -337,12 +337,13 @@
 		text-decoration: none;
 		font-size: 0.8125rem;
 		text-align: center;
-		transition: background 0.15s ease;
+		transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 	}
 
 	.clear-btn:hover {
 		background: var(--bg-surface-hover);
 		color: var(--text-primary);
+		border-color: var(--border-color-focus);
 	}
 
 	.results-header {
@@ -371,18 +372,19 @@
 
 	.result-card {
 		display: block;
-		padding: 1rem;
+		padding: 1.125rem;
 		background: var(--bg-surface);
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-md);
 		text-decoration: none;
 		color: inherit;
-		transition: border-color 0.15s ease, background 0.15s ease;
+		transition: border-color var(--transition-fast), background-color var(--transition-fast), box-shadow var(--transition-fast);
 	}
 
 	.result-card:hover {
-		border-color: var(--color-primary);
+		border-color: var(--border-color-focus);
 		background: var(--bg-surface-hover);
+		box-shadow: 0 4px 12px oklch(0 0 0 / 0.2);
 	}
 
 	.result-header {

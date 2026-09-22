@@ -449,3 +449,32 @@ describe('GET / page load — new filter, regression fields and trend24h (sentin
 		expect(data.filters.new).toBe('24h');
 	});
 });
+
+describe('GET / page load — pagination limit', () => {
+	it('defaults to limit=20 when limit query param is absent', async () => {
+		const data = await loadWith('');
+		expect(data.pagination.limit).toBe(20);
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 20);
+	});
+
+	it('accepts allowed limits 50 and 100', async () => {
+		const data50 = await loadWith('?limit=50');
+		expect(data50.pagination.limit).toBe(50);
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 50);
+
+		const data100 = await loadWith('?limit=100');
+		expect(data100.pagination.limit).toBe(100);
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 100);
+	});
+
+	it('falls back to 20 for invalid or unallowed limits', async () => {
+		const dataInvalid = await loadWith('?limit=999');
+		expect(dataInvalid.pagination.limit).toBe(20);
+
+		const dataNegative = await loadWith('?limit=-10');
+		expect(dataNegative.pagination.limit).toBe(20);
+
+		const dataNaN = await loadWith('?limit=foo');
+		expect(dataNaN.pagination.limit).toBe(20);
+	});
+});

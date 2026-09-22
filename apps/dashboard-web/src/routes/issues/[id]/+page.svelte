@@ -728,11 +728,12 @@
 		font-size: 0.75rem;
 		font-weight: 500;
 		cursor: pointer;
-		transition: background 0.15s ease, color 0.15s ease;
+		transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 	}
 
 	.btn-status:hover:not(:disabled) {
 		background: var(--bg-surface-hover);
+		border-color: var(--border-color-focus);
 	}
 
 	.btn-status:disabled {
@@ -740,11 +741,11 @@
 		cursor: not-allowed;
 	}
 
-	.btn-resolve { border-color: var(--status-resolved-text); color: var(--status-resolved-text); }
+	.btn-resolve { border-color: var(--status-resolved-border); color: var(--status-resolved-text); }
 	.btn-resolve:hover:not(:disabled) { background: var(--status-resolved-bg); }
-	.btn-ignore { border-color: var(--status-ignored-text); color: var(--status-ignored-text); }
+	.btn-ignore { border-color: var(--status-ignored-border); color: var(--status-ignored-text); }
 	.btn-ignore:hover:not(:disabled) { background: var(--status-ignored-bg); }
-	.btn-reopen { border-color: var(--status-open-text); color: var(--status-open-text); }
+	.btn-reopen { border-color: var(--status-open-border); color: var(--status-open-text); }
 	.btn-reopen:hover:not(:disabled) { background: var(--status-open-bg); }
 	.btn-cancel { color: var(--text-muted); }
 
@@ -763,11 +764,11 @@
 		max-height: calc(100vh - 2rem);
 		overflow: auto;
 		padding: 1.25rem;
-		background: var(--bg-surface);
+		background: var(--bg-surface-elevated);
 		color: var(--text-primary);
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-md);
-		box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+		box-shadow: 0 20px 40px oklch(0 0 0 / 0.5);
 		z-index: 50;
 	}
 
@@ -938,8 +939,9 @@
 		background: var(--bg-surface);
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-md);
-		padding: 1rem;
+		padding: 1.125rem;
 		margin-bottom: 0.75rem;
+		box-shadow: 0 2px 8px oklch(0 0 0 / 0.15);
 	}
 
 	.occurrence-header {
@@ -978,7 +980,7 @@
 		background: var(--bg-root);
 		color: var(--text-primary);
 		border: 1px solid var(--border-color);
-		padding: 0.875rem;
+		padding: 1rem;
 		border-radius: var(--radius-sm);
 		overflow-x: auto;
 	}
@@ -1008,7 +1010,7 @@
 	.badge.symbolication {
 		background: var(--status-resolved-bg);
 		color: var(--status-resolved-text);
-		border-color: transparent;
+		border-color: var(--status-resolved-border);
 	}
 
 	.raw-frames-toggle {
@@ -1021,19 +1023,20 @@
 		font-size: 0.6875rem;
 		font-family: var(--font-mono);
 		cursor: pointer;
-		transition: background 0.15s ease, color 0.15s ease;
+		transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 	}
 
 	.raw-frames-toggle:hover {
 		background: var(--bg-surface-hover);
 		color: var(--text-primary);
+		border-color: var(--border-color-focus);
 	}
 
 	.stacktrace pre {
 		margin: 0;
 		font-family: var(--font-mono);
 		font-size: 0.75rem;
-		line-height: 1.4;
+		line-height: 1.5;
 	}
 
 	.metadata-toggle {
@@ -1046,12 +1049,13 @@
 		font-size: 0.75rem;
 		font-family: var(--font-mono);
 		cursor: pointer;
-		transition: background 0.15s ease, color 0.15s ease;
+		transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 	}
 
 	.metadata-toggle:hover {
 		background: var(--bg-surface-hover);
 		color: var(--text-primary);
+		border-color: var(--border-color-focus);
 	}
 
 	.metadata {
@@ -1073,7 +1077,7 @@
 	.metadata pre {
 		font-family: var(--font-mono);
 		font-size: 0.75rem;
-		color: var(--text-muted);
+		color: var(--text-secondary);
 		overflow-x: auto;
 	}
 

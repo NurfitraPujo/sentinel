@@ -1,42 +1,54 @@
 :root {
 	/* Fonts */
-	--font-sans: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	--font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 	--font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-	/* Color Tokens */
-	--bg-root: #0f172a;
-	--bg-surface: #1e293b;
-	--bg-surface-hover: #334155;
+	/* Color Tokens - OKLCH Palette (Impeccable Committed Product Palette) */
+	--bg-root: oklch(0.16 0.024 260);
+	--bg-surface: oklch(0.20 0.025 260);
+	--bg-surface-elevated: oklch(0.24 0.028 260);
+	--bg-surface-hover: oklch(0.26 0.028 260);
 
-	--border-color: #334155;
-	--border-color-muted: rgba(51, 65, 85, 0.5);
+	--border-color: oklch(0.28 0.022 260);
+	--border-color-muted: oklch(0.24 0.02 260 / 0.7);
+	--border-color-focus: oklch(0.65 0.18 250);
 
-	--text-primary: #f8fafc;
-	--text-muted: #94a3b8;
-	--text-subtle: #64748b;
+	--text-primary: oklch(0.96 0.008 260);
+	--text-secondary: oklch(0.78 0.015 260);
+	--text-muted: oklch(0.64 0.018 260);
+	--text-subtle: oklch(0.50 0.018 260);
 
 	/* Brand & Interactive */
-	--color-primary: #3b82f6;
-	--color-primary-hover: #1d4ed8;
+	--color-primary: oklch(0.62 0.19 255);
+	--color-primary-hover: oklch(0.55 0.20 255);
+	--color-primary-subtle: oklch(0.62 0.19 255 / 0.15);
 
 	/* Severities & Statuses */
-	--severity-critical-bg: rgba(239, 68, 68, 0.15);
-	--severity-critical-text: #ef4444;
-	--severity-critical-border: rgba(239, 68, 68, 0.3);
+	--severity-critical-bg: oklch(0.35 0.12 25 / 0.25);
+	--severity-critical-text: oklch(0.75 0.19 25);
+	--severity-critical-border: oklch(0.48 0.14 25);
 
-	--status-open-bg: rgba(245, 158, 11, 0.15);
-	--status-open-text: #f59e0b;
+	--status-open-bg: oklch(0.40 0.10 75 / 0.25);
+	--status-open-text: oklch(0.80 0.15 75);
+	--status-open-border: oklch(0.52 0.12 75);
 
-	--status-resolved-bg: rgba(16, 185, 129, 0.15);
-	--status-resolved-text: #10b981;
+	--status-resolved-bg: oklch(0.35 0.10 150 / 0.25);
+	--status-resolved-text: oklch(0.76 0.14 150);
+	--status-resolved-border: oklch(0.46 0.10 150);
 
-	--status-ignored-bg: rgba(148, 163, 184, 0.15);
-	--status-ignored-text: #94a3b8;
+	--status-ignored-bg: oklch(0.30 0.02 260 / 0.35);
+	--status-ignored-text: oklch(0.72 0.02 260);
+	--status-ignored-border: oklch(0.38 0.02 260);
 
 	/* Spacing & Radii */
 	--radius-sm: 4px;
 	--radius-md: 6px;
 	--radius-lg: 8px;
+
+	/* Motion Timing Functions (Exponential Ease-out) */
+	--ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+	--transition-fast: 150ms var(--ease-out-expo);
+	--transition-normal: 220ms var(--ease-out-expo);
 }
 
 * {
