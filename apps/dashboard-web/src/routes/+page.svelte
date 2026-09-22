@@ -151,6 +151,27 @@
 		{ value: 'all', label: 'All' },
 		{ value: '24h', label: 'New in the last 24 hours' },
 	];
+
+	let searchQuery = $state('');
+	let quickChip = $state<'all' | 'production' | 'staging' | 'unhandled' | 'high-volume'>('all');
+
+	let filteredIssues = $derived.by(() => {
+		const q = searchQuery.toLowerCase().trim();
+		return data.issues.filter((issue) => {
+			if (q) {
+				const matchText = `${issue.errorClass} ${issue.message} ${issue.projectName} ${issue.environment}`.toLowerCase();
+				if (!matchText.includes(q)) return false;
+			}
+			if (quickChip === 'production' && issue.environment !== 'production') return false;
+			if (quickChip === 'staging' && issue.environment !== 'staging') return false;
+			if (quickChip === 'unhandled') {
+				const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
+				if (!text.includes('panic') && !text.includes('syntaxerror') && !text.includes('fatal')) return false;
+			}
+			if (quickChip === 'high-volume' && Number(issue.count) < 50) return false;
+			return true;
+		});
+	});
 </script>
 
 <!-- Decision 16's zero shape, stated once: the dash replaces the number only, on its own span. -->
@@ -284,10 +305,78 @@
 	</aside>
 
 	<main class="issues">
-		<h1>Issues</h1>
+		<div class="issues-top-bar">
+			<h1>Issues</h1>
+			
+			<div class="search-and-chips">
+				<div class="live-search-container">
+					<svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+						<circle cx="11" cy="11" r="8"></circle>
+						<line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+					</svg>
+					<input
+						type="text"
+						class="live-search-input"
+						placeholder="Filter issues by class, message, project, or environment..."
+						bind:value={searchQuery}
+						aria-label="Filter issues"
+					/>
+					{#if searchQuery}
+						<button type="button" class="btn-clear-search" onclick={() => (searchQuery = '')} aria-label="Clear search">✕</button>
+					{/if}
+				</div>
+
+				<div class="quick-chips-row">
+					<button
+						type="button"
+						class="chip-btn"
+						class:active={quickChip === 'all'}
+						onclick={() => (quickChip = 'all')}
+					>
+						All
+					</button>
+					<button
+						type="button"
+						class="chip-btn"
+						class:active={quickChip === 'production'}
+						onclick={() => (quickChip = 'production')}
+					>
+						Production
+					</button>
+					<button
+						type="button"
+						class="chip-btn"
+						class:active={quickChip === 'staging'}
+						onclick={() => (quickChip = 'staging')}
+					>
+						Staging
+					</button>
+					<button
+						type="button"
+						class="chip-btn"
+						class:active={quickChip === 'unhandled'}
+						onclick={() => (quickChip = 'unhandled')}
+					>
+						Unhandled / Panic
+					</button>
+					<button
+						type="button"
+						class="chip-btn"
+						class:active={quickChip === 'high-volume'}
+						onclick={() => (quickChip = 'high-volume')}
+					>
+						High Volume (50+)
+					</button>
+
+					{#if searchQuery || quickChip !== 'all'}
+						<span class="match-readout">Showing {filteredIssues.length} matching</span>
+					{/if}
+				</div>
+			</div>
+		</div>
 
 		<div class="issue-grid">
-			{#each data.issues as issue}
+			{#each filteredIssues as issue}
 				<a href="/issues/{issue.id}" class="issue-card">
 					<div class="card-header">
 						<span class="error-class">{issue.errorClass}</span>
@@ -810,5 +899,103 @@
 		text-align: center;
 		color: var(--text-subtle);
 		padding: 3rem;
+	}
+
+	/* Search & Quick Chips Bar */
+	.issues-top-bar {
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.search-and-chips {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.live-search-container {
+		position: relative;
+		display: flex;
+		align-items: center;
+		width: 100%;
+	}
+
+	.search-icon {
+		position: absolute;
+		left: 0.875rem;
+		color: var(--text-subtle);
+		pointer-events: none;
+	}
+
+	.live-search-input {
+		width: 100%;
+		padding: 0.625rem 2.25rem 0.625rem 2.5rem;
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		color: var(--text-primary);
+		font-size: 0.875rem;
+		transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+	}
+
+	.live-search-input:focus {
+		outline: none;
+		border-color: var(--border-color-focus);
+		box-shadow: 0 0 0 1px var(--color-primary);
+	}
+
+	.btn-clear-search {
+		position: absolute;
+		right: 0.75rem;
+		background: none;
+		border: none;
+		color: var(--text-muted);
+		cursor: pointer;
+		font-size: 0.875rem;
+		padding: 0.25rem;
+	}
+
+	.btn-clear-search:hover {
+		color: var(--text-primary);
+	}
+
+	.quick-chips-row {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.chip-btn {
+		padding: 0.25rem 0.75rem;
+		border-radius: var(--radius-full);
+		font-size: 0.75rem;
+		font-weight: 500;
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		border: 1px solid var(--border-color);
+		cursor: pointer;
+		transition: all var(--transition-fast);
+	}
+
+	.chip-btn:hover {
+		background: var(--bg-surface-hover);
+		color: var(--text-primary);
+	}
+
+	.chip-btn.active {
+		background: var(--color-primary-subtle);
+		color: var(--color-primary);
+		border-color: var(--border-color-focus);
+		font-weight: 600;
+	}
+
+	.match-readout {
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+		margin-left: 0.5rem;
 	}
 </style>

@@ -169,6 +169,24 @@
 		return groups;
 	}, []));
 
+	let activeOccurrenceId = $state<string | null>(null);
+	let allOccurrencesModalOpen = $state(false);
+
+	let selectedOccurrence = $derived.by(() => {
+		const occs = (data.occurrences as Occurrence[]) || [];
+		if (occs.length === 0) return null;
+		if (!activeOccurrenceId) return occs[0];
+		return occs.find((o) => o.id === activeOccurrenceId) ?? occs[0];
+	});
+
+	function selectOccurrence(id: string) {
+		activeOccurrenceId = id;
+	}
+
+	function toggleAllOccurrencesModal() {
+		allOccurrencesModalOpen = !allOccurrencesModalOpen;
+	}
+
 	// data.relations comes straight off the issue_relations DB column, which is a plain varchar
 	// with no DB-level enum — TypeScript only ever knows it as `relationType: string`. Narrow to
 	// the three values the migration's CHECK constraint (and the relations API) actually permit
@@ -484,45 +502,49 @@
 		</dialog>
 	{/if}
 
-	<div class="issue-info">
-		<p class="message">{data.issue.message}</p>
-		<div class="meta-info">
-			<span class="meta-item"><strong class="meta-label">Project:</strong> {data.project?.name ?? 'Unknown'}</span>
-			<!--
-				sentinel-project-environments task 2, flows `D1`/`D3`. `environmentDisplayName` is the
-				registry's label falling back to the raw `issues.environment` name, and the FALLBACK IS
-				THE NORMAL PATH — under decisions 8 and 9 an environment can be present in the data and
-				absent from the registry indefinitely, so there is deliberately no warning, no
-				placeholder and no "unregistered" marker here. A page that flagged the miss would be
-				shouting on every environment's first day.
-			-->
-			<span class="meta-item"><strong class="meta-label">Environment:</strong> {data.environmentDisplayName ?? data.issue.environment}</span>
-			<span class="meta-item"><strong class="meta-label">First seen:</strong> {formatDate(data.issue.firstSeen)}</span>
-			<span class="meta-item"><strong class="meta-label">Last seen:</strong> {formatDate(data.issue.lastSeen)}</span>
-			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>
-			<!--
-				sentinel-affected-users §4.2, flow `D1` (decisions 12, 15, 16, 21). Two more items after
-				Occurrences, each label carrying the window — `retentionDays` is page data from the
-				loader, never a literal 30, because a template cannot read `$env/dynamic/private`. A `0`
-				takes the list card's zero shape: the dash replaces only the number, on its own span, and
-				its `title` says why — no usable id inside the window is not "nobody was affected".
-			-->
-			<span class="meta-item" data-testid="issue-affected-users"><strong class="meta-label">Affected users (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedUserCount, 'user')}</span>
-			<span class="meta-item" data-testid="issue-affected-tenants"><strong class="meta-label">Affected tenants (last {data.retentionDays} days):</strong> {@render affectedFigure(data.issue.affectedTenantCount, 'tenant')}</span>
-			<!--
-				sentinel-releases-snooze §4.1, flow `D1`. Three facts after the two affected counts, in
-				this order. `Introduced in:` is always there (`—` when the issue's first occurrence
-				carried no version, or retention swept it before the backfill ran — decision 22).
-				`Resolved in:` only while `resolved`: the version, *next release (waiting for it)* for the
-				reserved literal (decision 21), *no version* for `null`. `Ignored:` only while `ignored`:
-				*until …*, *for N more occurrences (n so far)*, both joined with *or*, or *indefinitely*.
-			-->
-			<span class="meta-item" data-testid="issue-introduced-in"><strong class="meta-label">Introduced in:</strong> {data.issue.firstReleaseVersion ?? '—'}</span>
+	<p class="issue-message">{data.issue.message}</p>
+
+	<div class="issue-info-ribbon">
+		<div class="ribbon-grid">
+			<div class="ribbon-card">
+				<span class="ribbon-label">Project & Environment</span>
+				<strong class="ribbon-value">{data.project?.name ?? 'Unknown'} • {data.environmentDisplayName ?? data.issue.environment}</strong>
+			</div>
+			<div class="ribbon-card">
+				<span class="ribbon-label">First Seen</span>
+				<span class="ribbon-value mono">{formatDate(data.issue.firstSeen)}</span>
+			</div>
+			<div class="ribbon-card">
+				<span class="ribbon-label">Last Seen</span>
+				<span class="ribbon-value mono">{formatDate(data.issue.lastSeen)}</span>
+			</div>
+			<div class="ribbon-card">
+				<span class="ribbon-label">Total Occurrences</span>
+				<strong class="ribbon-value count-highlight">{Number(data.issue.count).toLocaleString()}</strong>
+			</div>
+			<div class="ribbon-card" data-testid="issue-affected-users">
+				<span class="ribbon-label">Affected Users (30d)</span>
+				<span class="ribbon-value mono">{@render affectedFigure(data.issue.affectedUserCount, 'user')}</span>
+			</div>
+			<div class="ribbon-card" data-testid="issue-affected-tenants">
+				<span class="ribbon-label">Affected Tenants (30d)</span>
+				<span class="ribbon-value mono">{@render affectedFigure(data.issue.affectedTenantCount, 'tenant')}</span>
+			</div>
+			<div class="ribbon-card" data-testid="issue-introduced-in">
+				<span class="ribbon-label">Introduced In</span>
+				<strong class="ribbon-value release-highlight">{data.issue.firstReleaseVersion ?? '—'}</strong>
+			</div>
 			{#if data.issue.status === 'resolved'}
-				<span class="meta-item" data-testid="issue-resolved-in"><strong class="meta-label">Resolved in:</strong> {resolvedInFact}</span>
+				<div class="ribbon-card" data-testid="issue-resolved-in">
+					<span class="ribbon-label">Resolved In</span>
+					<span class="ribbon-value">{resolvedInFact}</span>
+				</div>
 			{/if}
 			{#if data.issue.status === 'ignored'}
-				<span class="meta-item" data-testid="issue-ignored"><strong class="meta-label">Ignored:</strong> {ignoredFact}</span>
+				<div class="ribbon-card" data-testid="issue-ignored">
+					<span class="ribbon-label">Ignored</span>
+					<span class="ribbon-value">{ignoredFact}</span>
+				</div>
 			{/if}
 		</div>
 	</div>
@@ -567,50 +589,55 @@
 	/>
 
 	<section class="occurrences">
-		<!--
-			sentinel-project-environments task 1, flow `D2`. This read `({data.occurrences.length})`,
-			which is the PAGE SIZE — `getOccurrencesByIssueId` caps at 100 — presented as a total. The
-			heading now carries the loader's real `COUNT(*)` and the line below says how many of them
-			are actually listed, so the two numbers can differ on screen without either one lying.
-		-->
-		<h2 class="section-title">Occurrence History ({Number(data.occurrenceTotal ?? data.occurrences.length).toLocaleString()})</h2>
-		{#if (data.occurrenceTotal ?? data.occurrences.length) > data.occurrences.length}
-			<p class="occurrence-window">
-				Showing the {data.occurrences.length.toLocaleString()} most recent.
-			</p>
-		{/if}
+		<div class="occurrences-section-header">
+			<h2 class="section-title">Occurrence Workspace ({Number(data.occurrenceTotal ?? data.occurrences.length).toLocaleString()})</h2>
+			{#if (data.occurrenceTotal ?? data.occurrences.length) > data.occurrences.length}
+				<p class="occurrence-window">
+					Showing the {data.occurrences.length.toLocaleString()} most recent.
+				</p>
+			{/if}
+		</div>
 
-		{#each occurrenceGroups as group}
-			<div class="date-group">
-				<h3 class="date-header">{group.date}</h3>
-				{#each group.occurrences as occurrence}
-					<div class="occurrence-card">
-						<div class="occurrence-header">
-							<span class="timestamp">{formatDate(occurrence.createdAt)}</span>
-							<span class="badge env">{occurrence.environment}</span>
-							<span class="badge platform">{occurrence.platform}</span>
-						</div>
-
-						{#if occurrence.traceId}
-							<div class="trace-info">
-								<span class="trace-id">Trace: {occurrence.traceId}</span>
-								{#if occurrence.spanId}
-									<span class="span-id">Span: {occurrence.spanId}</span>
+		{#if (data.occurrences as Occurrence[]).length === 0}
+			<div class="occurrences-empty-state">
+				<p class="empty-title">No occurrences recorded</p>
+				<p class="empty-desc">This issue was created without attached runtime occurrences (e.g. user report or manual intake).</p>
+			</div>
+		{:else if selectedOccurrence}
+			<div class="occurrence-workspace-layout">
+				<!-- Left Main: Active Selected Occurrence -->
+				<div class="occurrence-main-panel">
+					<!-- Active Occurrence Hero Banner -->
+					<div class="occurrence-hero-banner">
+						<div class="hero-top-row">
+							<div class="hero-id-badge">
+								<strong class="hero-id">#{selectedOccurrence.id.slice(0, 10)}</strong>
+								{#if selectedOccurrence.id === (data.occurrences[0]?.id)}
+									<span class="badge new">LATEST</span>
 								{/if}
 							</div>
-						{/if}
+							<span class="hero-time">{formatDate(selectedOccurrence.createdAt)}</span>
+						</div>
+						<div class="hero-meta-row">
+							<span>Env: <strong class="highlight-text">{selectedOccurrence.environment}</strong></span>
+							<span>Platform: <strong class="highlight-text">{selectedOccurrence.platform}</strong></span>
+							{#if selectedOccurrence.traceId}
+								<span>Trace: <strong class="trace-id">{selectedOccurrence.traceId}</strong></span>
+								{#if selectedOccurrence.spanId}
+									<span>Span: <strong class="span-id">{selectedOccurrence.spanId}</strong></span>
+								{/if}
+							{/if}
+						</div>
+					</div>
 
-						{#if occurrence.stacktrace && occurrence.stacktrace.length > 0}
-							{@const badge = symbolicationBadge(occurrence.stacktrace)}
-							{@const showRaw = rawFrames.has(occurrence.id)}
-							<!--
-								sentinel-sourcemaps §4.7, flows `D1`–`D5`. The badge and the raw toggle sit on the
-								heading line and exist only when at least one frame is symbolicated — a pre-feature
-								occurrence renders this block exactly as before, heading and frames alike.
-							-->
-							<div class="stacktrace">
-								<div class="stacktrace-heading">
-									<h4>Stack Trace</h4>
+					<!-- Stack Trace Viewer -->
+					{#if selectedOccurrence.stacktrace && selectedOccurrence.stacktrace.length > 0}
+						{@const badge = symbolicationBadge(selectedOccurrence.stacktrace)}
+						{@const showRaw = rawFrames.has(selectedOccurrence.id)}
+						<div class="stacktrace-container">
+							<div class="stacktrace-heading">
+								<h3>Stack Trace</h3>
+								<div class="stacktrace-tools">
 									{#if badge}
 										<span class="badge symbolication" data-testid="symbolication-badge">{badge}</span>
 										<button
@@ -618,41 +645,140 @@
 											class="raw-frames-toggle"
 											data-testid="raw-frames-toggle"
 											aria-pressed={showRaw}
-											onclick={() => toggleRawFrames(occurrence.id)}
+											onclick={() => toggleRawFrames(selectedOccurrence!.id)}
 										>
 											{showRaw ? 'Show symbolicated frames' : 'Show raw frames'}
 										</button>
 									{/if}
 								</div>
-								<pre><code>{#each occurrence.stacktrace as frame}{formatStackFrame(displayedFrame(frame, showRaw))}
+							</div>
+							<pre class="stacktrace-code"><code>{#each selectedOccurrence.stacktrace as frame}{formatStackFrame(displayedFrame(frame, showRaw))}
 {/each}</code></pre>
-							</div>
-						{/if}
+						</div>
+					{/if}
 
-						<button
-							type="button"
-							class="metadata-toggle"
-							data-testid="metadata-toggle"
-							aria-pressed={expandedMetadata.has(occurrence.id)}
-							onclick={() => toggleMetadata(occurrence.id)}
-						>
-							{expandedMetadata.has(occurrence.id) ? 'Hide' : 'Show'} Metadata
-						</button>
+					<!-- Runtime Request & Metadata Box -->
+					<div class="metadata-container">
+						<div class="metadata-heading">
+							<h3>Request & Runtime Metadata</h3>
+							<button
+								type="button"
+								class="metadata-toggle"
+								data-testid="metadata-toggle"
+								aria-pressed={expandedMetadata.has(selectedOccurrence.id)}
+								onclick={() => toggleMetadata(selectedOccurrence!.id)}
+							>
+								{expandedMetadata.has(selectedOccurrence.id) ? 'Collapse' : 'Expand'}
+							</button>
+						</div>
 
-						{#if expandedMetadata.has(occurrence.id)}
-							<div class="metadata" data-testid="occurrence-metadata">
-								<h4>Metadata</h4>
-								{#if occurrence.metadata && Object.keys(occurrence.metadata).length > 0}
-									<pre><code>{JSON.stringify(occurrence.metadata, null, 2)}</code></pre>
-								{:else}
-									<p class="metadata-empty">No metadata recorded.</p>
-								{/if}
-							</div>
-						{/if}
+						<div class="metadata-code-block" data-testid="occurrence-metadata">
+							{#if selectedOccurrence.metadata && Object.keys(selectedOccurrence.metadata).length > 0}
+								<pre><code>{JSON.stringify(selectedOccurrence.metadata, null, 2)}</code></pre>
+							{:else}
+								<p class="metadata-empty">No metadata recorded for this event.</p>
+							{/if}
+						</div>
 					</div>
-				{/each}
+				</div>
+
+				<!-- Right Sidebar: Occurrence History Timeline -->
+				<aside class="occurrence-sidebar-panel">
+					<div class="sidebar-header">
+						<h3 class="sidebar-title">Recent Timeline</h3>
+						<span class="sidebar-count">{data.occurrences.length} events</span>
+					</div>
+
+					<div class="sidebar-list">
+						{#each (data.occurrences as Occurrence[]).slice(0, 10) as occ, i}
+							<button
+								type="button"
+								class="sidebar-item"
+								class:active={selectedOccurrence.id === occ.id}
+								onclick={() => selectOccurrence(occ.id)}
+							>
+								<div class="sidebar-item-top">
+									<strong class="sidebar-item-id">
+										#{occ.id.slice(0, 10)}
+										{#if i === 0}<span class="latest-tag">(Latest)</span>{/if}
+									</strong>
+									<span class="sidebar-item-time">{formatDate(occ.createdAt)}</span>
+								</div>
+								<div class="sidebar-item-meta">
+									<span class="badge env-micro">{occ.environment}</span>
+									{#if occ.traceId}
+										<span class="trace-micro">trace: {occ.traceId.slice(0, 8)}...</span>
+									{/if}
+								</div>
+							</button>
+						{/each}
+					</div>
+
+					{#if data.occurrences.length > 0}
+						<div class="sidebar-actions">
+							<button
+								type="button"
+								class="btn-status btn-view-all"
+								onclick={toggleAllOccurrencesModal}
+							>
+								View All {data.occurrences.length} Occurrences
+							</button>
+						</div>
+					{/if}
+				</aside>
 			</div>
-		{/each}
+		{/if}
+
+		<!-- All Occurrences Modal / Drawer -->
+		{#if allOccurrencesModalOpen}
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<div class="modal-backdrop" onclick={toggleAllOccurrencesModal} role="presentation">
+				<div class="modal-dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="all-occ-modal-title">
+					<div class="modal-header">
+						<div>
+							<h2 id="all-occ-modal-title" class="modal-title">All Occurrences History</h2>
+							<p class="modal-subtitle">Full recorded events for {data.issue.errorClass}</p>
+						</div>
+						<button type="button" class="btn-status btn-close" onclick={toggleAllOccurrencesModal}>✕ Close</button>
+					</div>
+
+					<div class="modal-body">
+						{#each (data.occurrences as Occurrence[]) as occ, i}
+							<div class="modal-occ-row" class:active={selectedOccurrence?.id === occ.id}>
+								<div class="modal-occ-info">
+									<div class="modal-occ-tags">
+										<strong class="modal-occ-id">#{occ.id}</strong>
+										<span class="badge env">{occ.environment}</span>
+										<span class="badge platform">{occ.platform}</span>
+									</div>
+									<div class="modal-occ-details">
+										{#if occ.traceId}
+											<span>Trace: <code>{occ.traceId}</code></span>
+										{/if}
+										<span>• {formatDate(occ.createdAt)}</span>
+									</div>
+								</div>
+								<button
+									type="button"
+									class="btn-status btn-inspect"
+									onclick={() => {
+										selectOccurrence(occ.id);
+										toggleAllOccurrencesModal();
+									}}
+								>
+									Inspect
+								</button>
+							</div>
+						{/each}
+					</div>
+
+					<div class="modal-footer">
+						<span>Showing {data.occurrences.length} events</span>
+						<button type="button" class="btn-status" onclick={toggleAllOccurrencesModal}>Done</button>
+					</div>
+				</div>
+			</div>
+		{/if}
 	</section>
 </div>
 
@@ -985,26 +1111,13 @@
 		overflow-x: auto;
 	}
 
-	.stacktrace h4 {
-		color: var(--text-subtle);
-		margin-bottom: 0.5rem;
-		font-size: 0.6875rem;
-		font-family: var(--font-mono);
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-	}
-
-	/* sentinel-sourcemaps §4.7 — the heading line: the h4, then the badge, then the toggle. */
+		/* sentinel-sourcemaps §4.7 — the heading line: the h4, then the badge, then the toggle. */
 	.stacktrace-heading {
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
 		flex-wrap: wrap;
 		margin-bottom: 0.5rem;
-	}
-
-	.stacktrace-heading h4 {
-		margin-bottom: 0;
 	}
 
 	.badge.symbolication {
@@ -1032,15 +1145,7 @@
 		border-color: var(--border-color-focus);
 	}
 
-	.stacktrace pre {
-		margin: 0;
-		font-family: var(--font-mono);
-		font-size: 0.75rem;
-		line-height: 1.5;
-	}
-
 	.metadata-toggle {
-		margin-top: 0.75rem;
 		padding: 0.25rem 0.625rem;
 		border: 1px solid var(--border-color);
 		border-radius: var(--radius-sm);
@@ -1058,33 +1163,465 @@
 		border-color: var(--border-color-focus);
 	}
 
-	.metadata {
-		margin-top: 0.75rem;
-		background: var(--bg-root);
-		border: 1px solid var(--border-color);
-		padding: 0.875rem;
-		border-radius: var(--radius-sm);
-	}
-
-	.metadata h4 {
-		font-size: 0.6875rem;
-		font-family: var(--font-mono);
-		text-transform: uppercase;
-		color: var(--text-subtle);
-		margin-bottom: 0.5rem;
-	}
-
-	.metadata pre {
-		font-family: var(--font-mono);
-		font-size: 0.75rem;
-		color: var(--text-secondary);
-		overflow-x: auto;
-	}
-
 	.metadata-empty {
 		font-family: var(--font-mono);
 		font-size: 0.75rem;
 		color: var(--text-subtle);
 		margin: 0;
+	}
+
+	/* Metadata Ribbon Grid */
+	.issue-info-ribbon {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 1.125rem;
+		margin-bottom: 2rem;
+	}
+
+	.ribbon-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: 1rem;
+		font-size: 0.8125rem;
+	}
+
+	.ribbon-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.ribbon-label {
+		color: var(--text-subtle);
+		font-size: 0.7rem;
+		font-family: var(--font-mono);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.ribbon-value {
+		color: var(--text-primary);
+		font-size: 0.8125rem;
+	}
+
+	.ribbon-value.mono {
+		font-family: var(--font-mono);
+		color: var(--text-muted);
+	}
+
+	.ribbon-value.count-highlight {
+		font-family: var(--font-mono);
+		font-size: 1rem;
+		color: var(--text-primary);
+		font-weight: 700;
+	}
+
+	.ribbon-value.release-highlight {
+		font-family: var(--font-mono);
+		color: var(--color-primary);
+		font-weight: 600;
+	}
+
+	/* 2-Column Occurrence Workspace Layout */
+	.occurrences-section-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		margin-bottom: 1rem;
+	}
+
+	.occurrences-empty-state {
+		background: var(--bg-surface);
+		border: 1px dashed var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 3rem 1.5rem;
+		text-align: center;
+	}
+
+	.empty-title {
+		font-size: 1rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin-bottom: 0.5rem;
+	}
+
+	.empty-desc {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+		margin: 0;
+	}
+
+	.occurrence-workspace-layout {
+		display: grid;
+		grid-template-columns: 1fr 340px;
+		gap: 1.5rem;
+		align-items: start;
+	}
+
+	@media (max-width: 900px) {
+		.occurrence-workspace-layout {
+			grid-template-columns: 1fr;
+		}
+	}
+
+	.occurrence-hero-banner {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 1rem 1.25rem;
+		margin-bottom: 1rem;
+	}
+
+	.hero-top-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 0.5rem;
+	}
+
+	.hero-id-badge {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.hero-id {
+		font-family: var(--font-mono);
+		font-size: 0.95rem;
+		color: var(--color-primary);
+	}
+
+	.hero-time {
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		color: var(--text-subtle);
+	}
+
+	.hero-meta-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1.25rem;
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+	}
+
+	.highlight-text {
+		color: var(--text-primary);
+	}
+
+	.stacktrace-container {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		margin-bottom: 1rem;
+		overflow: hidden;
+	}
+
+	.stacktrace-container .stacktrace-heading {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.75rem 1rem;
+		border-bottom: 1px solid var(--border-color);
+		background: var(--bg-surface-hover);
+	}
+
+	.stacktrace-container .stacktrace-heading h3 {
+		font-size: 0.8125rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin: 0;
+	}
+
+	.stacktrace-tools {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.stacktrace-code {
+		padding: 1rem;
+		margin: 0;
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		line-height: 1.5;
+		color: var(--text-secondary);
+		overflow-x: auto;
+		background: var(--bg-surface);
+	}
+
+	.metadata-container {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		overflow: hidden;
+	}
+
+	.metadata-heading {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.75rem 1rem;
+		border-bottom: 1px solid var(--border-color);
+		background: var(--bg-surface-hover);
+	}
+
+	.metadata-heading h3 {
+		font-size: 0.8125rem;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin: 0;
+	}
+
+	.metadata-code-block {
+		padding: 1rem;
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		line-height: 1.45;
+		color: var(--text-secondary);
+		background: var(--bg-surface);
+		overflow-x: auto;
+	}
+
+	.metadata-code-block pre {
+		margin: 0;
+	}
+
+	/* Sidebar Timeline */
+	.occurrence-sidebar-panel {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-md);
+		padding: 1rem;
+		position: sticky;
+		top: 1rem;
+	}
+
+	.sidebar-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		margin-bottom: 0.75rem;
+		padding-bottom: 0.5rem;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.sidebar-title {
+		font-size: 0.8125rem;
+		font-family: var(--font-mono);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-primary);
+		font-weight: 700;
+		margin: 0;
+	}
+
+	.sidebar-count {
+		font-size: 0.7rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+	}
+
+	.sidebar-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.sidebar-item {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		padding: 0.625rem 0.75rem;
+		border: 1px solid var(--border-color);
+		background: var(--bg-root);
+		border-radius: var(--radius-sm);
+		text-align: left;
+		cursor: pointer;
+		transition: all var(--transition-fast);
+		width: 100%;
+	}
+
+	.sidebar-item:hover {
+		background: var(--bg-surface-hover);
+		border-color: var(--border-color-focus);
+	}
+
+	.sidebar-item.active {
+		border-color: var(--border-color-focus);
+		background: var(--color-primary-subtle);
+	}
+
+	.sidebar-item-top {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+	}
+
+	.sidebar-item-id {
+		color: var(--color-primary);
+	}
+
+	.latest-tag {
+		color: var(--status-open-text);
+		font-size: 0.6875rem;
+		margin-left: 0.25rem;
+	}
+
+	.sidebar-item-time {
+		font-size: 0.6875rem;
+		color: var(--text-subtle);
+	}
+
+	.sidebar-item-meta {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.6875rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+	}
+
+	.badge.env-micro {
+		padding: 0.05rem 0.35rem;
+		font-size: 0.625rem;
+		border-radius: var(--radius-sm);
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+	}
+
+	.trace-micro {
+		color: var(--text-muted);
+	}
+
+	.sidebar-actions {
+		margin-top: 1rem;
+		text-align: center;
+	}
+
+	.btn-view-all {
+		width: 100%;
+		font-size: 0.75rem;
+		background: var(--color-primary);
+		color: var(--text-primary);
+		font-weight: 600;
+	}
+
+	/* Modal Dialog */
+	.modal-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 1000;
+		background: rgba(0, 0, 0, 0.75);
+		backdrop-filter: blur(4px);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.modal-dialog {
+		background: var(--bg-surface);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-lg);
+		width: 90%;
+		max-width: 850px;
+		max-height: 85vh;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+		box-shadow: var(--shadow-xl);
+	}
+
+	.modal-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 1.25rem 1.5rem;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.modal-title {
+		font-size: 1.125rem;
+		font-weight: 700;
+		color: var(--text-primary);
+		margin: 0 0 0.25rem 0;
+	}
+
+	.modal-subtitle {
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+		margin: 0;
+	}
+
+	.modal-body {
+		padding: 1.25rem 1.5rem;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 0.625rem;
+	}
+
+	.modal-occ-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.75rem 1rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		background: var(--bg-root);
+		transition: background var(--transition-fast);
+	}
+
+	.modal-occ-row.active {
+		border-color: var(--border-color-focus);
+		background: var(--color-primary-subtle);
+	}
+
+	.modal-occ-info {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.modal-occ-tags {
+		display: flex;
+		align-items: center;
+		gap: 0.625rem;
+	}
+
+	.modal-occ-id {
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		color: var(--color-primary);
+	}
+
+	.modal-occ-details {
+		font-size: 0.75rem;
+		font-family: var(--font-mono);
+		color: var(--text-subtle);
+	}
+
+	.modal-occ-details code {
+		color: var(--text-secondary);
+	}
+
+	.btn-inspect {
+		padding: 0.25rem 0.625rem;
+		font-size: 0.75rem;
+	}
+
+	.modal-footer {
+		padding: 1rem 1.5rem;
+		border-top: 1px solid var(--border-color);
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		background: var(--bg-root);
+		font-size: 0.8125rem;
+		color: var(--text-subtle);
 	}
 </style>
