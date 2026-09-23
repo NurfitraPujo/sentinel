@@ -45,6 +45,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
 	const environmentFilter = url.searchParams.get('environment') ?? 'all';
 	const claimFilter = url.searchParams.get('claim') ?? 'all';
+	const searchQuery = url.searchParams.get('q')?.trim() || '';
 	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
 	const ALLOWED_LIMITS = [20, 50, 100] as const;
 	const parsedLimit = parseInt(url.searchParams.get('limit') ?? '20', 10);
@@ -85,6 +86,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		environmentScopes,
 		// The SAME `Date` to both queries (below), never recomputed per call.
 		firstSeenAfter,
+		q: searchQuery || undefined,
 	};
 
 	const filters = {
@@ -207,6 +209,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			// every anchor from this echo, so `banana` echoes `all`, never the bad string.
 			new: newFilter,
 			claim: claimFilter,
+			q: searchQuery,
 		},
 		// §4.1, decision 21 — top level, beside `filters`. The window every count label carries
 		// ("in the last N days"); a template cannot read `$env/dynamic/private`, and the number has

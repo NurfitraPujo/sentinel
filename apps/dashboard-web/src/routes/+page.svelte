@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
+	import { goto } from '$app/navigation';
 	import TrendSparkline from '$lib/components/issues/TrendSparkline.svelte';
 
 	let { data } = $props();
@@ -104,6 +105,7 @@
 		sort?: IssueSortValue;
 		new?: IssueNewValue;
 		claim?: string;
+		q?: string;
 		page?: number;
 		limit?: number;
 	}) {
@@ -117,6 +119,7 @@
 		const sort = params.sort ?? data.filters.sort;
 		const newFilter = params.new ?? data.filters.new;
 		const claim = params.claim ?? data.filters.claim ?? 'all';
+		const searchQueryParam = params.q !== undefined ? params.q : (data.filters.q ?? '');
 		const limit = params.limit ?? data.pagination.limit;
 
 		const q = new URLSearchParams();
@@ -126,6 +129,7 @@
 		if (sort && sort !== 'last_seen') q.set('sort', sort);
 		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
 		if (claim && claim !== 'all') q.set('claim', claim);
+		if (searchQueryParam && searchQueryParam.trim()) q.set('q', searchQueryParam.trim());
 		if (limit && limit !== 20) q.set('limit', String(limit));
 		if (params.page && params.page > 1) q.set('page', String(params.page));
 		return `?${q.toString()}`;
@@ -155,7 +159,16 @@
 		{ value: '24h', label: 'New in the last 24 hours' },
 	];
 
-	let searchQuery = $state('');
+	let searchQuery = $state(data.filters.q ?? '');
+	$effect(() => {
+		searchQuery = data.filters.q ?? '';
+	});
+
+	function handleSearchCommit(term: string) {
+		const targetHref = href({ q: term.trim(), page: 1 });
+		goto(targetHref, { keepFocus: true, noScroll: true });
+	}
+
 	let quickChip = $state<'all' | 'production' | 'staging' | 'unhandled' | 'has-trace' | 'high-volume'>('all');
 	let displayMode = $state<'expanded' | 'compact'>('expanded');
 
@@ -362,12 +375,7 @@
 	});
 
 	let filteredIssues = $derived.by(() => {
-		const q = searchQuery.toLowerCase().trim();
 		return data.issues.filter((issue) => {
-			if (q) {
-				const matchText = `${issue.errorClass} ${issue.message} ${issue.projectName} ${issue.environment}`.toLowerCase();
-				if (!matchText.includes(q)) return false;
-			}
 			if (quickChip === 'production' && issue.environment !== 'production') return false;
 			if (quickChip === 'staging' && issue.environment !== 'staging') return false;
 			if (quickChip === 'unhandled') {
@@ -711,10 +719,24 @@
 						class="live-search-input"
 						placeholder="Search issues by error class, message, or fingerprint... (e.g., timeout, SyntaxError)"
 						bind:value={searchQuery}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') {
+								e.preventDefault();
+								handleSearchCommit(searchQuery);
+							}
+						}}
 						aria-label="Filter issues"
 					/>
 					{#if searchQuery}
-						<button type="button" class="btn-clear-search" onclick={() => (searchQuery = '')} aria-label="Clear search">✕</button>
+						<button
+							type="button"
+							class="btn-clear-search"
+							onclick={() => {
+								searchQuery = '';
+								handleSearchCommit('');
+							}}
+							aria-label="Clear search"
+						>✕</button>
 					{/if}
 				</div>
 
@@ -835,7 +857,7 @@
 
 				<div class="sub-filter-status-row">
 					<span class="filter-count-readout">Showing {filteredIssues.length} matching issue{filteredIssues.length === 1 ? '' : 's'}</span>
-					{#if searchQuery || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all'}
+					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all'}
 						<button
 							type="button"
 							class="btn-reset-filters"
@@ -845,6 +867,9 @@
 								platformFilter = 'all';
 								selectedDatePreset = '24h';
 								selectedDateLabel = 'Last 24 Hours';
+								if (data.filters.q) {
+									handleSearchCommit('');
+								}
 							}}
 						>
 							Reset all filters

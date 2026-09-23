@@ -552,3 +552,20 @@ describe('GET / page load — claimant facets and organization users', () => {
 	});
 });
 
+describe('GET / page load — search query q', () => {
+	it('passes q search filter through to listIssues, countIssues, and claimantFacets, and echoes in filters.q', async () => {
+		const data = await loadWith('?q=timeout');
+		expect(data.filters.q).toBe('timeout');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
+		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
+		expect(getClaimantFacetCountsMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
+	});
+
+	it('trims q search query and handles empty string as undefined in query calls', async () => {
+		const data = await loadWith('?q=%20%20');
+		expect(data.filters.q).toBe('');
+		expect(listIssuesMock.mock.calls[0][0].q).toBeUndefined();
+		expect(countIssuesMock.mock.calls[0][0].q).toBeUndefined();
+		expect(getClaimantFacetCountsMock.mock.calls[0][0].q).toBeUndefined();
+	});
+});

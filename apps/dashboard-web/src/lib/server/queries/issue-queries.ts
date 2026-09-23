@@ -66,6 +66,10 @@ export interface IssueFilters {
      * Current authenticated user ID (and optionally email) used to resolve 'claimed-me'.
      */
     currentUserId?: string;
+    /**
+     * Search query across error_class, fingerprint (ILIKE) and message (FTS vector).
+     */
+    q?: string;
 }
 
 export interface ClaimantFacetCounts {
@@ -176,6 +180,14 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
             // Specific claimant identifier (user ID, agent ID, or email)
             conditions.push(eq(issues.assignedTo, filters.claim));
         }
+    }
+
+    if (filters.q && filters.q.trim()) {
+        const rawQ = filters.q.trim();
+        const term = `%${rawQ}%`;
+        conditions.push(
+            sql`(${issues.errorClass} ILIKE ${term} OR ${issues.fingerprint} ILIKE ${term} OR to_tsvector('english', ${issues.message}) @@ plainto_tsquery('english', ${rawQ}))`
+        );
     }
 
     return conditions;
