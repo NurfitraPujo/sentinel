@@ -388,10 +388,34 @@
 			}
 			if (quickChip === 'high-volume' && Number(issue.count) < 50) return false;
 
-			// Date preset client-side narrowing
-			if (selectedDatePreset === '1h' && issue.lastSeen) {
-				const diff = Date.now() - new Date(issue.lastSeen).getTime();
-				if (diff > 60 * 60 * 1000) return false;
+			// Date preset / custom range client-side narrowing
+			if (selectedDatePreset && selectedDatePreset !== 'custom') {
+				const now = Date.now();
+				const targetTimestamp = issue.lastSeen ? new Date(issue.lastSeen).getTime() : 0;
+				if (!targetTimestamp) return false;
+
+				let windowMs = 0;
+				if (selectedDatePreset === '1h') windowMs = 60 * 60 * 1000;
+				else if (selectedDatePreset === '24h') windowMs = 24 * 60 * 60 * 1000;
+				else if (selectedDatePreset === '7d') windowMs = 7 * 24 * 60 * 60 * 1000;
+				else if (selectedDatePreset === '14d') windowMs = 14 * 24 * 60 * 60 * 1000;
+				else if (selectedDatePreset === '30d') windowMs = 30 * 24 * 60 * 60 * 1000;
+
+				if (windowMs > 0 && now - targetTimestamp > windowMs) {
+					return false;
+				}
+			} else if (selectedDatePreset === 'custom') {
+				const targetTimestamp = issue.lastSeen ? new Date(issue.lastSeen).getTime() : 0;
+				if (!targetTimestamp) return false;
+
+				if (customDateStart) {
+					const startMs = new Date(customDateStart).getTime();
+					if (!isNaN(startMs) && targetTimestamp < startMs) return false;
+				}
+				if (customDateEnd) {
+					const endMs = new Date(customDateEnd).getTime();
+					if (!isNaN(endMs) && targetTimestamp > endMs) return false;
+				}
 			}
 
 			// Claimer facet
@@ -857,7 +881,7 @@
 
 				<div class="sub-filter-status-row">
 					<span class="filter-count-readout">Showing {filteredIssues.length} matching issue{filteredIssues.length === 1 ? '' : 's'}</span>
-					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all'}
+					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all' || selectedDatePreset !== '24h'}
 						<button
 							type="button"
 							class="btn-reset-filters"
@@ -867,6 +891,8 @@
 								platformFilter = 'all';
 								selectedDatePreset = '24h';
 								selectedDateLabel = 'Last 24 Hours';
+								customDateStart = '';
+								customDateEnd = '';
 								if (data.filters.q) {
 									handleSearchCommit('');
 								}
