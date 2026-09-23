@@ -174,8 +174,8 @@
 
 	// Immersive Date Range Selector state
 	let dateModalOpen = $state(false);
-	let selectedDatePreset = $state<'1h' | '24h' | '7d' | '14d' | '30d' | 'custom' | null>('24h');
-	let selectedDateLabel = $state('Last 24 Hours');
+	let selectedDatePreset = $state<'1h' | '24h' | '7d' | '14d' | '30d' | 'custom' | null>(null);
+	let selectedDateLabel = $state('Date Range');
 	let customDateStart = $state('');
 	let customDateEnd = $state('');
 
@@ -881,7 +881,7 @@
 
 				<div class="sub-filter-status-row">
 					<span class="filter-count-readout">Showing {filteredIssues.length} matching issue{filteredIssues.length === 1 ? '' : 's'}</span>
-					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all' || selectedDatePreset !== '24h'}
+					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all' || selectedDatePreset !== null}
 						<button
 							type="button"
 							class="btn-reset-filters"
@@ -889,8 +889,8 @@
 								searchQuery = '';
 								quickChip = 'all';
 								platformFilter = 'all';
-								selectedDatePreset = '24h';
-								selectedDateLabel = 'Last 24 Hours';
+								selectedDatePreset = null;
+								selectedDateLabel = 'Date Range';
 								customDateStart = '';
 								customDateEnd = '';
 								if (data.filters.q) {
