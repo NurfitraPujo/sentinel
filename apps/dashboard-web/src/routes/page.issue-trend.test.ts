@@ -404,3 +404,48 @@ describe('/ everything else on the card is unchanged (flow L11)', () => {
 		expect(text(document.querySelector('.meta .status'))).toBe('open');
 	});
 });
+
+describe('/ true claimant detection and dynamic claimers', () => {
+	it('renders Unclaimed when assignedTo is null', () => {
+		render(Page, {
+			data: pageData({
+				issues: [issue({ assignedTo: null, assigneeType: null })],
+			}) as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('Unclaimed');
+	});
+
+	it('renders Claimed by Me when assignedTo matches currentUser email or id', () => {
+		render(Page, {
+			data: {
+				...pageData({
+					issues: [issue({ assignedTo: 'fitrapujo@gmail.com', assigneeType: 'user' })],
+				}),
+				currentUser: { id: 'usr-1', email: 'fitrapujo@gmail.com' },
+			} as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed by Me');
+	});
+
+	it('renders Claimed: <assignee> when assigned to another user', () => {
+		render(Page, {
+			data: {
+				...pageData({
+					issues: [issue({ assignedTo: 'alice@example.com', assigneeType: 'user' })],
+				}),
+				currentUser: { id: 'usr-1', email: 'fitrapujo@gmail.com' },
+			} as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed: alice@example.com');
+	});
+
+	it('renders 🤖 <agent> when assigneeType is agent', () => {
+		render(Page, {
+			data: pageData({
+				issues: [issue({ assignedTo: 'sentinel-bot', assigneeType: 'agent' })],
+			}) as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('🤖 sentinel-bot');
+	});
+});
+

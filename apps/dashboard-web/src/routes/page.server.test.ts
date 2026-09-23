@@ -122,6 +122,13 @@ describe('GET / page load (§4.4)', () => {
 		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ environment: 'production' });
 	});
 
+	it('returns the authenticated currentUser in page data', async () => {
+		getUserMock.mockResolvedValueOnce({ id: 'user-42', email: 'fitrapujo@gmail.com' });
+		const data = await loadWith('');
+
+		expect(data.currentUser).toEqual({ id: 'user-42', email: 'fitrapujo@gmail.com' });
+	});
+
 	it('echoes "all" when the caller did not ask for an environment', async () => {
 		const data = await loadWith('');
 

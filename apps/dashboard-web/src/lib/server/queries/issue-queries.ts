@@ -237,7 +237,7 @@ export const issueQueries = {
                 firstSeen: issues.firstSeen,
                 lastSeen: issues.lastSeen,
                 count: issues.count,
-                // §4.1 page data: `0` is `0`, never omitted — NOT NULL DEFAULT 0 on the column.
+                // sentinel-affected-users §4.1 page data: `0` is `0`, never omitted — NOT NULL DEFAULT 0 on the column.
                 affectedUserCount: issues.affectedUserCount,
                 affectedTenantCount: issues.affectedTenantCount,
                 // sentinel-issue-trend §4.1, decision 22 — two EXISTING columns added to the
@@ -246,6 +246,8 @@ export const issueQueries = {
                 // `last_regressed_at` is null until the processor's regression UPDATE has run.
                 regressionStatus: issues.regressionStatus,
                 lastRegressedAt: issues.lastRegressedAt,
+                assignedTo: issues.assignedTo,
+                assigneeType: issues.assigneeType,
             })
             .from(issues)
             .where(and(...conditions))

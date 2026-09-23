@@ -188,27 +188,38 @@
 	}
 
 	// Facet Filter State (Claim & Triage, Platform)
-	let claimFilter = $state<'all' | 'unclaimed' | 'claimed-me' | 'claimed-agent' | 'sre-lead' | 'agent-triage' | 'agent-sourcemap'>('all');
+	// Supports 'all', 'unclaimed', 'claimed-me', 'claimed-agent', or a specific claimant identifier string
+	let claimFilter = $state<string>('all');
 	let platformFilter = $state<string>('all');
 
-	// Deterministic claim mapping for issues
+	// True database claimant detection helper
 	function getIssueClaimInfo(issue: (typeof data.issues)[number]) {
-		const str = `${issue.id}-${issue.errorClass}-${issue.environment}`;
-		let hash = 0;
-		for (let i = 0; i < str.length; i++) {
-			hash = (hash << 5) - hash + str.charCodeAt(i);
-			hash |= 0;
+		const assignedTo = issue.assignedTo;
+		const assigneeType = issue.assigneeType;
+
+		if (!assignedTo) {
+			return { type: 'unclaimed' as const, label: 'Unclaimed', assignee: null, assigneeType: null };
 		}
-		const mod = Math.abs(hash) % 10;
-		if (mod <= 5) {
-			return { type: 'unclaimed' as const, label: 'Unclaimed', assignee: null };
-		} else if (mod <= 7) {
-			return { type: 'claimed-me' as const, label: 'Claimed: sre-lead', assignee: 'sre-lead@daya.ai' };
-		} else if (mod === 8) {
-			return { type: 'claimed-agent' as const, label: '🤖 agent:sentinel-triage', assignee: 'agent:sentinel-triage' };
-		} else {
-			return { type: 'claimed-agent' as const, label: '🤖 agent:sourcemap-fixer', assignee: 'agent:sourcemap-fixer' };
+
+		const isMe =
+			Boolean(data.currentUser) &&
+			(assignedTo === data.currentUser?.id || assignedTo === data.currentUser?.email);
+
+		if (assigneeType === 'agent') {
+			return {
+				type: 'claimed-agent' as const,
+				label: `🤖 ${assignedTo}`,
+				assignee: assignedTo,
+				assigneeType: 'agent' as const,
+			};
 		}
+
+		return {
+			type: isMe ? ('claimed-me' as const) : ('claimed-other' as const),
+			label: isMe ? 'Claimed by Me' : `Claimed: ${assignedTo}`,
+			assignee: assignedTo,
+			assigneeType: 'user' as const,
+		};
 	}
 
 	// Platform detection helper
@@ -222,6 +233,26 @@
 		}
 		return { id: 'browser', label: 'Browser (JS)' };
 	}
+
+	// Derived distinct claimants and counts from real database data
+	let distinctClaimants = $derived.by(() => {
+		const map = new Map<string, { assignee: string; assigneeType: string | null; count: number }>();
+		for (const iss of data.issues) {
+			if (iss.assignedTo) {
+				const existing = map.get(iss.assignedTo);
+				if (existing) {
+					existing.count++;
+				} else {
+					map.set(iss.assignedTo, {
+						assignee: iss.assignedTo,
+						assigneeType: iss.assigneeType ?? null,
+						count: 1,
+					});
+				}
+			}
+		}
+		return Array.from(map.values()).sort((a, b) => b.count - a.count || a.assignee.localeCompare(b.assignee));
+	});
 
 	// Derived counts for sidebar facets
 	let facetCounts = $derived.by(() => {
@@ -246,9 +277,6 @@
 		let unclaimedCount = 0;
 		let claimedMeCount = 0;
 		let claimedAgentCount = 0;
-		let sreLeadCount = 0;
-		let agentTriageCount = 0;
-		let agentSourcemapCount = 0;
 
 		let goCount = 0;
 		let nodeCount = 0;
@@ -257,15 +285,8 @@
 		for (const iss of all) {
 			const claim = getIssueClaimInfo(iss);
 			if (claim.type === 'unclaimed') unclaimedCount++;
-			if (claim.type === 'claimed-me') {
-				claimedMeCount++;
-				sreLeadCount++;
-			}
-			if (claim.type === 'claimed-agent') {
-				claimedAgentCount++;
-				if (claim.assignee === 'agent:sentinel-triage') agentTriageCount++;
-				if (claim.assignee === 'agent:sourcemap-fixer') agentSourcemapCount++;
-			}
+			if (claim.type === 'claimed-me') claimedMeCount++;
+			if (claim.type === 'claimed-agent') claimedAgentCount++;
 
 			const plat = getIssuePlatform(iss);
 			if (plat.id === 'go') goCount++;
@@ -274,26 +295,23 @@
 		}
 
 		return {
-			unresolved: unresolvedCount || 24,
-			open: openCount || 21,
-			resolved: resolvedCount || 142,
-			ignored: ignoredCount || 18,
-			total: all.length || 184,
-			new24h: new24hCount || 5,
-			regressed: regressedCount || 2,
-			older: olderCount || 17,
-			production: prodCount || 19,
-			staging: stagingCount || 5,
+			unresolved: unresolvedCount,
+			open: openCount,
+			resolved: resolvedCount,
+			ignored: ignoredCount,
+			total: all.length,
+			new24h: new24hCount,
+			regressed: regressedCount,
+			older: olderCount,
+			production: prodCount,
+			staging: stagingCount,
 			development: devCount,
-			go: goCount || 18,
-			node: nodeCount || 4,
-			browser: browserCount || 2,
-			unclaimed: unclaimedCount || 17,
-			claimedMe: claimedMeCount || 4,
-			claimedAgent: claimedAgentCount || 3,
-			sreLead: sreLeadCount || 4,
-			agentTriage: agentTriageCount || 2,
-			agentSourcemap: agentSourcemapCount || 1,
+			go: goCount,
+			node: nodeCount,
+			browser: browserCount,
+			unclaimed: unclaimedCount,
+			claimedMe: claimedMeCount,
+			claimedAgent: claimedAgentCount,
 		};
 	});
 
@@ -324,12 +342,16 @@
 
 			// Claimer facet
 			const claim = getIssueClaimInfo(issue);
-			if (claimFilter === 'unclaimed' && claim.type !== 'unclaimed') return false;
-			if (claimFilter === 'claimed-me' && claim.type !== 'claimed-me') return false;
-			if (claimFilter === 'claimed-agent' && claim.type !== 'claimed-agent') return false;
-			if (claimFilter === 'sre-lead' && claim.assignee !== 'sre-lead@daya.ai') return false;
-			if (claimFilter === 'agent-triage' && claim.assignee !== 'agent:sentinel-triage') return false;
-			if (claimFilter === 'agent-sourcemap' && claim.assignee !== 'agent:sourcemap-fixer') return false;
+			if (claimFilter === 'unclaimed') {
+				if (claim.type !== 'unclaimed') return false;
+			} else if (claimFilter === 'claimed-me') {
+				if (claim.type !== 'claimed-me') return false;
+			} else if (claimFilter === 'claimed-agent') {
+				if (claim.type !== 'claimed-agent') return false;
+			} else if (claimFilter !== 'all') {
+				// Specific claimant filter (matches real assignedTo identifier)
+				if (claim.assignee !== claimFilter) return false;
+			}
 
 			// Platform facet
 			if (platformFilter !== 'all') {
@@ -589,43 +611,25 @@
 			</li>
 		</ul>
 
-		<!-- Specific Claimers -->
-		<h2>Claimed By</h2>
-		<ul class="facet-list">
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={claimFilter === 'sre-lead'}
-					onclick={() => (claimFilter = 'sre-lead')}
-				>
-					<span>sre-lead@daya.ai</span>
-					<strong class="count-badge">{facetCounts.sreLead}</strong>
-				</button>
-			</li>
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={claimFilter === 'agent-triage'}
-					onclick={() => (claimFilter = 'agent-triage')}
-				>
-					<span>agent:sentinel-triage</span>
-					<strong class="count-badge">{facetCounts.agentTriage}</strong>
-				</button>
-			</li>
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={claimFilter === 'agent-sourcemap'}
-					onclick={() => (claimFilter = 'agent-sourcemap')}
-				>
-					<span>agent:sourcemap-fixer</span>
-					<strong class="count-badge">{facetCounts.agentSourcemap}</strong>
-				</button>
-			</li>
-		</ul>
+		<!-- Specific Claimers (dynamically derived from real issues in database) -->
+		{#if distinctClaimants.length > 0}
+			<h2>Claimed By</h2>
+			<ul class="facet-list">
+				{#each distinctClaimants as claimant (claimant.assignee)}
+					<li>
+						<button
+							type="button"
+							class="facet-btn"
+							class:active={claimFilter === claimant.assignee}
+							onclick={() => (claimFilter = claimant.assignee)}
+						>
+							<span>{claimant.assigneeType === 'agent' ? '🤖 ' : ''}{claimant.assignee}</span>
+							<strong class="count-badge">{claimant.count}</strong>
+						</button>
+					</li>
+				{/each}
+			</ul>
+		{/if}
 	</aside>
 
 	<main class="issues">
@@ -633,7 +637,6 @@
 			<div class="top-title-row">
 				<div class="title-with-badge">
 					<h1>Issues</h1>
-					<span class="impeccable-pill">⚡ Impeccable Design System • Committed Palette</span>
 				</div>
 				<div class="display-toggle-group">
 					<span class="display-label">Display:</span>
@@ -1465,18 +1468,6 @@
 
 	.top-title-row h1 {
 		margin-bottom: 0;
-	}
-
-	.impeccable-pill {
-		display: inline-flex;
-		align-items: center;
-		padding: 0.2rem 0.6rem;
-		border-radius: var(--radius-full);
-		font-size: 0.6875rem;
-		font-weight: 600;
-		background: var(--color-primary-subtle);
-		color: var(--color-primary);
-		border: 1px solid var(--border-color-focus);
 	}
 
 	.display-toggle-group {

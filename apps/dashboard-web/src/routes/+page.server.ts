@@ -139,6 +139,10 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		issues: issuesWithProject,
 		projects: userProjects,
 		environments,
+		currentUser: {
+			id: user.id,
+			email: user.email,
+		},
 		filters: {
 			status: statusFilter,
 			project: projectIdFilter,
