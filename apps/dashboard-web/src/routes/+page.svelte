@@ -209,9 +209,10 @@
 			(assignedTo === data.currentUser?.id || assignedTo === data.currentUser?.email);
 
 		if (assigneeType === 'agent') {
+			const agentName = data.agentsById?.[assignedTo]?.name || assignedTo;
 			return {
 				type: 'claimed-agent' as const,
-				label: `🤖 ${assignedTo}`,
+				label: `🤖 ${agentName}`,
 				assignee: assignedTo,
 				assigneeType: 'agent' as const,
 			};
@@ -261,14 +262,29 @@
 			}
 		}
 
-		// 2. Any additional claimants in database (e.g. agents or claimants not in orgUsers list)
+		// 2. All agents in the organizations (shows 0 if no claimed issues)
+		if (data.orgAgents && data.orgAgents.length > 0) {
+			for (const a of data.orgAgents) {
+				const count = data.claimantFacets?.byClaimant?.[a.id] ?? 0;
+				list.push({
+					id: a.id,
+					label: a.name,
+					count,
+					isAgent: true,
+				});
+				addedIds.add(a.id);
+			}
+		}
+
+		// 3. Any additional claimants in database (e.g. claimants not in orgUsers/orgAgents list)
 		if (data.claimantFacets?.byClaimant) {
 			for (const [assigneeId, count] of Object.entries(data.claimantFacets.byClaimant)) {
 				if (!addedIds.has(assigneeId)) {
 					const isAgent = data.claimantFacets.claimantTypes?.[assigneeId] === 'agent';
 					const matchedUser = data.usersById?.[assigneeId];
+					const matchedAgent = data.agentsById?.[assigneeId];
 					const label = isAgent
-						? assigneeId
+						? (matchedAgent ? matchedAgent.name : assigneeId)
 						: (matchedUser ? (matchedUser.name || matchedUser.email) : assigneeId);
 					list.push({
 						id: assigneeId,

@@ -454,13 +454,42 @@ describe('/ true claimant detection and dynamic claimers', () => {
 		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed: Alice Wonderland');
 	});
 
-	it('renders 🤖 <agent> when assigneeType is agent', () => {
+	it('renders 🤖 <agent> when assigneeType is agent, falling back to ID if not in agentsById', () => {
 		render(Page, {
 			data: pageData({
 				issues: [issue({ assignedTo: 'sentinel-bot', assigneeType: 'agent' })],
 			}) as unknown as PageData,
 		});
 		expect(text(document.querySelector('.claim-badge'))).toBe('🤖 sentinel-bot');
+	});
+
+	it('resolves agent UUID to agent name in issue claim badge and sidebar facets using agentsById', () => {
+		render(Page, {
+			data: {
+				...pageData({
+					issues: [issue({ assignedTo: 'agent-uuid-456', assigneeType: 'agent' })],
+				}),
+				agentsById: {
+					'agent-uuid-456': { id: 'agent-uuid-456', name: 'AutoFix Agent' },
+				},
+				claimantFacets: {
+					total: 1,
+					unclaimed: 0,
+					claimedMe: 0,
+					claimedAgent: 1,
+					byClaimant: { 'agent-uuid-456': 1 },
+					claimantTypes: { 'agent-uuid-456': 'agent' },
+				},
+			} as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('🤖 AutoFix Agent');
+		const facetButtons = Array.from(document.querySelectorAll('.filters .facet-list a.facet-btn'));
+		const buttonTexts = facetButtons.map(b => text(b));
+		expect(buttonTexts).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining('🤖 AutoFix Agent'),
+			])
+		);
 	});
 
 	it('renders sidebar Claimed By facet buttons for org users with database counts', () => {

@@ -95,7 +95,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 
 	const orgIds = Array.from(new Set(accessibleProjects.map((p) => p.organizationId).filter(Boolean)));
 
-	const [results, userProjects, total, claimantFacets, orgUsersList] = await Promise.all([
+	const [results, userProjects, total, claimantFacets, orgUsersList, orgAgentsList] = await Promise.all([
 		// `sort` goes to the list ONLY. It changes the `ORDER BY` of the guarded query and nothing
 		// about its `WHERE` — `buildIssueConditions` never reads it — and `countIssues` takes the
 		// filters WITHOUT it: `pagination.total` does not change with the order.
@@ -104,7 +104,15 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		issueQueries.countIssues(filters),
 		issueQueries.getClaimantFacetCounts(baseFilters, user.id),
 		issueQueries.listOrgUsers(orgIds),
+		issueQueries.listOrgAgents(orgIds),
 	]);
+
+	// De-duplicate and map orgAgents
+	const agentsById: Record<string, { id: string; name: string }> = {};
+	for (const a of orgAgentsList) {
+		agentsById[a.id] = a;
+	}
+	const orgAgents = orgAgentsList.slice().sort((a, b) => a.name.localeCompare(b.name));
 
 	// De-duplicate and sort orgUsers
 	const usersById: Record<string, { id: string; name: string | null; email: string }> = {};
@@ -180,6 +188,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		claimantFacets,
 		usersById,
 		orgUsers,
+		agentsById,
+		orgAgents,
 		currentUser: {
 			id: user.id,
 			email: user.email,

@@ -24,6 +24,7 @@ const listProjectsMock = vi.fn();
 const trendForIssuesMock = vi.fn();
 const getClaimantFacetCountsMock = vi.fn();
 const listOrgUsersMock = vi.fn();
+const listOrgAgentsMock = vi.fn();
 
 // sentinel-affected-users decision 21: `retentionDays` is read through `$lib/server/retention-window`,
 // which reads `DATA_RETENTION_DAYS` fresh from `$env/dynamic/private` on every call — so the env is a
@@ -66,6 +67,7 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		trendForIssues: trendForIssuesMock,
 		getClaimantFacetCounts: getClaimantFacetCountsMock,
 		listOrgUsers: listOrgUsersMock,
+		listOrgAgents: listOrgAgentsMock,
 	},
 }));
 
@@ -118,6 +120,7 @@ beforeEach(() => {
 		claimantTypes: {},
 	});
 	listOrgUsersMock.mockResolvedValue([]);
+	listOrgAgentsMock.mockResolvedValue([]);
 	listProjectsMock.mockResolvedValue([
 		{ id: PROJECT_A, name: 'Alpha' },
 		{ id: PROJECT_B, name: 'Beta' },
@@ -520,6 +523,9 @@ describe('GET / page load — claimant facets and organization users', () => {
 			{ id: 'user-2', name: 'Alice Smith', email: 'alice@example.com' },
 			{ id: 'user-3', name: null, email: 'bob@example.com' },
 		]);
+		listOrgAgentsMock.mockResolvedValueOnce([
+			{ id: 'agent-1', name: 'AutoFix Agent' },
+		]);
 		getUserMock.mockResolvedValueOnce({ id: 'user-1', email: 'me@example.com', name: 'Current User' });
 
 		const data = await loadWith('');
@@ -533,6 +539,10 @@ describe('GET / page load — claimant facets and organization users', () => {
 		});
 		expect(data.usersById['user-2']).toEqual({ id: 'user-2', name: 'Alice Smith', email: 'alice@example.com' });
 		expect(data.usersById['user-1']).toMatchObject({ id: 'user-1', email: 'me@example.com' });
+		expect(data.agentsById['agent-1']).toEqual({ id: 'agent-1', name: 'AutoFix Agent' });
+		expect(data.orgAgents).toEqual([
+			{ id: 'agent-1', name: 'AutoFix Agent' },
+		]);
 		expect(data.orgUsers).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ id: 'user-2', name: 'Alice Smith' }),

@@ -1,5 +1,5 @@
 import { db } from "$lib/server/db";
-import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers } from "$lib/db/schema";
+import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers, agents } from "$lib/db/schema";
 import { eq, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort } from "$lib/server/issue-sort";
@@ -507,5 +507,19 @@ export const issueQueries = {
             .from(users)
             .innerJoin(organizationMembers, eq(organizationMembers.userId, users.id))
             .where(inArray(organizationMembers.organizationId, orgIds));
+    },
+
+    /**
+     * Lists agents belonging to the given organizations, used to resolve agent IDs to names.
+     */
+    async listOrgAgents(orgIds: string[]) {
+        if (orgIds.length === 0) return [];
+        return await db
+            .select({
+                id: agents.id,
+                name: agents.name,
+            })
+            .from(agents)
+            .where(inArray(agents.orgId, orgIds));
     },
 };
