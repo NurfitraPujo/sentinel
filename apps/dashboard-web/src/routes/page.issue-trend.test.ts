@@ -439,6 +439,21 @@ describe('/ true claimant detection and dynamic claimers', () => {
 		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed: alice@example.com');
 	});
 
+	it('resolves claimant user ID to user name or email using usersById', () => {
+		render(Page, {
+			data: {
+				...pageData({
+					issues: [issue({ assignedTo: 'user-uuid-123', assigneeType: 'user' })],
+				}),
+				currentUser: { id: 'usr-1', email: 'fitrapujo@gmail.com' },
+				usersById: {
+					'user-uuid-123': { id: 'user-uuid-123', name: 'Alice Wonderland', email: 'alice@wonderland.org' },
+				},
+			} as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed: Alice Wonderland');
+	});
+
 	it('renders 🤖 <agent> when assigneeType is agent', () => {
 		render(Page, {
 			data: pageData({
@@ -447,5 +462,40 @@ describe('/ true claimant detection and dynamic claimers', () => {
 		});
 		expect(text(document.querySelector('.claim-badge'))).toBe('🤖 sentinel-bot');
 	});
+
+	it('renders sidebar Claimed By facet buttons for org users with database counts', () => {
+		render(Page, {
+			data: {
+				...pageData({ issues: [] }),
+				claimantFacets: {
+					total: 4,
+					unclaimed: 1,
+					claimedMe: 1,
+					claimedAgent: 1,
+					byClaimant: { 'user-1': 1, 'agent-x': 1 },
+					claimantTypes: { 'agent-x': 'agent' },
+				},
+				orgUsers: [
+					{ id: 'user-1', name: 'Bob Builder', email: 'bob@build.com' },
+					{ id: 'user-2', name: 'Charlie', email: 'charlie@build.com' },
+				],
+				usersById: {
+					'user-1': { id: 'user-1', name: 'Bob Builder', email: 'bob@build.com' },
+					'user-2': { id: 'user-2', name: 'Charlie', email: 'charlie@build.com' },
+				},
+			} as unknown as PageData,
+		});
+
+		const facetButtons = Array.from(document.querySelectorAll('.filters .facet-list a.facet-btn'));
+		const buttonTexts = facetButtons.map(b => text(b));
+		expect(buttonTexts).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining('Bob Builder'),
+				expect.stringContaining('Charlie'),
+				expect.stringContaining('🤖 agent-x'),
+			])
+		);
+	});
 });
+
 

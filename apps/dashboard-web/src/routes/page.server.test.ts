@@ -22,6 +22,8 @@ const listProjectsMock = vi.fn();
 // for a set of ids against a real Postgres is issue-queries.trend.integration.test.ts's boundary;
 // this file owns WHICH ids it is asked about, and that it is never asked about none.
 const trendForIssuesMock = vi.fn();
+const getClaimantFacetCountsMock = vi.fn();
+const listOrgUsersMock = vi.fn();
 
 // sentinel-affected-users decision 21: `retentionDays` is read through `$lib/server/retention-window`,
 // which reads `DATA_RETENTION_DAYS` fresh from `$env/dynamic/private` on every call — so the env is a
@@ -62,6 +64,8 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		countIssues: countIssuesMock,
 		listProjects: listProjectsMock,
 		trendForIssues: trendForIssuesMock,
+		getClaimantFacetCounts: getClaimantFacetCountsMock,
+		listOrgUsers: listOrgUsersMock,
 	},
 }));
 
@@ -105,6 +109,15 @@ beforeEach(() => {
 	listIssuesMock.mockResolvedValue([]);
 	countIssuesMock.mockResolvedValue(0);
 	trendForIssuesMock.mockResolvedValue(new Map());
+	getClaimantFacetCountsMock.mockResolvedValue({
+		total: 0,
+		unclaimed: 0,
+		claimedMe: 0,
+		claimedAgent: 0,
+		byClaimant: {},
+		claimantTypes: {},
+	});
+	listOrgUsersMock.mockResolvedValue([]);
 	listProjectsMock.mockResolvedValue([
 		{ id: PROJECT_A, name: 'Alpha' },
 		{ id: PROJECT_B, name: 'Beta' },
@@ -485,3 +498,47 @@ describe('GET / page load — pagination limit', () => {
 		expect(dataNaN.pagination.limit).toBe(20);
 	});
 });
+
+describe('GET / page load — claimant facets and organization users', () => {
+	it('passes claim filter through to listIssues and countIssues and echoes in filters.claim', async () => {
+		const data = await loadWith('?claim=claimed-me');
+		expect(data.filters.claim).toBe('claimed-me');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ claim: 'claimed-me' });
+		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ claim: 'claimed-me' });
+	});
+
+	it('returns claimantFacets and maps orgUsers and usersById with human-readable attributes', async () => {
+		getClaimantFacetCountsMock.mockResolvedValueOnce({
+			total: 5,
+			unclaimed: 2,
+			claimedMe: 1,
+			claimedAgent: 1,
+			byClaimant: { 'user-1': 1, 'agent-1': 1, 'unclaimed': 2 },
+			claimantTypes: { 'agent-1': 'agent', 'user-1': 'user' },
+		});
+		listOrgUsersMock.mockResolvedValueOnce([
+			{ id: 'user-2', name: 'Alice Smith', email: 'alice@example.com' },
+			{ id: 'user-3', name: null, email: 'bob@example.com' },
+		]);
+		getUserMock.mockResolvedValueOnce({ id: 'user-1', email: 'me@example.com', name: 'Current User' });
+
+		const data = await loadWith('');
+		expect(data.claimantFacets).toEqual({
+			total: 5,
+			unclaimed: 2,
+			claimedMe: 1,
+			claimedAgent: 1,
+			byClaimant: { 'user-1': 1, 'agent-1': 1, 'unclaimed': 2 },
+			claimantTypes: { 'agent-1': 'agent', 'user-1': 'user' },
+		});
+		expect(data.usersById['user-2']).toEqual({ id: 'user-2', name: 'Alice Smith', email: 'alice@example.com' });
+		expect(data.usersById['user-1']).toMatchObject({ id: 'user-1', email: 'me@example.com' });
+		expect(data.orgUsers).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: 'user-2', name: 'Alice Smith' }),
+				expect.objectContaining({ id: 'user-3', email: 'bob@example.com' }),
+			])
+		);
+	});
+});
+

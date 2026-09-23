@@ -44,6 +44,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const statusFilter = url.searchParams.get('status') ?? 'all';
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
 	const environmentFilter = url.searchParams.get('environment') ?? 'all';
+	const claimFilter = url.searchParams.get('claim') ?? 'all';
 	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
 	const ALLOWED_LIMITS = [20, 50, 100] as const;
 	const parsedLimit = parseInt(url.searchParams.get('limit') ?? '20', 10);
@@ -76,7 +77,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const newFilter = coerceIssueNewFilter(url.searchParams.get('new'));
 	const firstSeenAfter = firstSeenLowerBound(newFilter, now);
 
-	const filters = {
+	const baseFilters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
 		projectIds: authorizedProjectIds,
@@ -86,14 +87,51 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		firstSeenAfter,
 	};
 
-	const [results, userProjects, total] = await Promise.all([
+	const filters = {
+		...baseFilters,
+		claim: claimFilter,
+		currentUserId: user.id,
+	};
+
+	const orgIds = Array.from(new Set(accessibleProjects.map((p) => p.organizationId).filter(Boolean)));
+
+	const [results, userProjects, total, claimantFacets, orgUsersList] = await Promise.all([
 		// `sort` goes to the list ONLY. It changes the `ORDER BY` of the guarded query and nothing
 		// about its `WHERE` — `buildIssueConditions` never reads it — and `countIssues` takes the
 		// filters WITHOUT it: `pagination.total` does not change with the order.
 		issueQueries.listIssues({ ...filters, sort }, page, limit),
 		issueQueries.listProjects(authorizedProjectIds),
-		issueQueries.countIssues(filters)
+		issueQueries.countIssues(filters),
+		issueQueries.getClaimantFacetCounts(baseFilters, user.id),
+		issueQueries.listOrgUsers(orgIds),
 	]);
+
+	// De-duplicate and sort orgUsers
+	const usersById: Record<string, { id: string; name: string | null; email: string }> = {};
+	for (const u of orgUsersList) {
+		usersById[u.id] = u;
+		if (u.email) {
+			usersById[u.email] = u;
+		}
+	}
+	// Also ensure currentUser is in usersById
+	if (user.id) {
+		usersById[user.id] = { id: user.id, name: (user as any).name ?? null, email: user.email };
+		if (user.email) {
+			usersById[user.email] = { id: user.id, name: (user as any).name ?? null, email: user.email };
+		}
+	}
+
+	const uniqueOrgUsersMap = new Map<string, { id: string; name: string | null; email: string }>();
+	for (const u of orgUsersList) {
+		uniqueOrgUsersMap.set(u.id, u);
+	}
+	if (user.id && !uniqueOrgUsersMap.has(user.id)) {
+		uniqueOrgUsersMap.set(user.id, { id: user.id, name: (user as any).name ?? null, email: user.email });
+	}
+	const orgUsers = Array.from(uniqueOrgUsersMap.values()).sort((a, b) =>
+		(a.name || a.email).localeCompare(b.name || b.email)
+	);
 
 	// §4.4: `[]` when `project=all`, and the environment control is not rendered. An environment
 	// name is only meaningful inside a project — two projects may both report `production` and they
@@ -139,6 +177,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		issues: issuesWithProject,
 		projects: userProjects,
 		environments,
+		claimantFacets,
+		usersById,
+		orgUsers,
 		currentUser: {
 			id: user.id,
 			email: user.email,
@@ -155,6 +196,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			// sentinel-issue-trend §4.1: the coerced value, for the same reason — `href()` builds
 			// every anchor from this echo, so `banana` echoes `all`, never the bad string.
 			new: newFilter,
+			claim: claimFilter,
 		},
 		// §4.1, decision 21 — top level, beside `filters`. The window every count label carries
 		// ("in the last N days"); a template cannot read `$env/dynamic/private`, and the number has

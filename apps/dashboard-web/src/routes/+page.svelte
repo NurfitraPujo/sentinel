@@ -103,6 +103,7 @@
 		environment?: string;
 		sort?: IssueSortValue;
 		new?: IssueNewValue;
+		claim?: string;
 		page?: number;
 		limit?: number;
 	}) {
@@ -115,6 +116,7 @@
 				: (params.environment ?? data.filters.environment);
 		const sort = params.sort ?? data.filters.sort;
 		const newFilter = params.new ?? data.filters.new;
+		const claim = params.claim ?? data.filters.claim ?? 'all';
 		const limit = params.limit ?? data.pagination.limit;
 
 		const q = new URLSearchParams();
@@ -123,6 +125,7 @@
 		if (environment && environment !== 'all') q.set('environment', environment);
 		if (sort && sort !== 'last_seen') q.set('sort', sort);
 		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
+		if (claim && claim !== 'all') q.set('claim', claim);
 		if (limit && limit !== 20) q.set('limit', String(limit));
 		if (params.page && params.page > 1) q.set('page', String(params.page));
 		return `?${q.toString()}`;
@@ -189,7 +192,7 @@
 
 	// Facet Filter State (Claim & Triage, Platform)
 	// Supports 'all', 'unclaimed', 'claimed-me', 'claimed-agent', or a specific claimant identifier string
-	let claimFilter = $state<string>('all');
+	let claimFilter = $derived(data.filters.claim ?? 'all');
 	let platformFilter = $state<string>('all');
 
 	// True database claimant detection helper
@@ -214,9 +217,12 @@
 			};
 		}
 
+		const matchedUser = data.usersById?.[assignedTo];
+		const displayIdentifier = matchedUser ? (matchedUser.name || matchedUser.email) : assignedTo;
+
 		return {
 			type: isMe ? ('claimed-me' as const) : ('claimed-other' as const),
-			label: isMe ? 'Claimed by Me' : `Claimed: ${assignedTo}`,
+			label: isMe ? 'Claimed by Me' : `Claimed: ${displayIdentifier}`,
 			assignee: assignedTo,
 			assigneeType: 'user' as const,
 		};
@@ -234,24 +240,48 @@
 		return { id: 'browser', label: 'Browser (JS)' };
 	}
 
-	// Derived distinct claimants and counts from real database data
+	// Derived distinct claimants and counts from all issues in database across organization
 	let distinctClaimants = $derived.by(() => {
-		const map = new Map<string, { assignee: string; assigneeType: string | null; count: number }>();
-		for (const iss of data.issues) {
-			if (iss.assignedTo) {
-				const existing = map.get(iss.assignedTo);
-				if (existing) {
-					existing.count++;
-				} else {
-					map.set(iss.assignedTo, {
-						assignee: iss.assignedTo,
-						assigneeType: iss.assigneeType ?? null,
-						count: 1,
+		const list: Array<{ id: string; label: string; count: number; isAgent: boolean }> = [];
+		const addedIds = new Set<string>();
+
+		// 1. All users in the organizations (shows 0 if no claimed issues)
+		if (data.orgUsers && data.orgUsers.length > 0) {
+			for (const u of data.orgUsers) {
+				const count = (data.claimantFacets?.byClaimant?.[u.id] ?? 0) +
+					(u.email ? (data.claimantFacets?.byClaimant?.[u.email] ?? 0) : 0);
+				list.push({
+					id: u.id,
+					label: u.name || u.email,
+					count,
+					isAgent: false,
+				});
+				addedIds.add(u.id);
+				if (u.email) addedIds.add(u.email);
+			}
+		}
+
+		// 2. Any additional claimants in database (e.g. agents or claimants not in orgUsers list)
+		if (data.claimantFacets?.byClaimant) {
+			for (const [assigneeId, count] of Object.entries(data.claimantFacets.byClaimant)) {
+				if (!addedIds.has(assigneeId)) {
+					const isAgent = data.claimantFacets.claimantTypes?.[assigneeId] === 'agent';
+					const matchedUser = data.usersById?.[assigneeId];
+					const label = isAgent
+						? assigneeId
+						: (matchedUser ? (matchedUser.name || matchedUser.email) : assigneeId);
+					list.push({
+						id: assigneeId,
+						label,
+						count,
+						isAgent,
 					});
+					addedIds.add(assigneeId);
 				}
 			}
 		}
-		return Array.from(map.values()).sort((a, b) => b.count - a.count || a.assignee.localeCompare(b.assignee));
+
+		return list.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 	});
 
 	// Derived counts for sidebar facets
@@ -566,66 +596,61 @@
 		<h2>Claim & Triage Status</h2>
 		<ul class="facet-list">
 			<li>
-				<button
-					type="button"
+				<a
+					href={href({ claim: 'all', page: 1 })}
 					class="facet-btn"
-					class:active={claimFilter === 'all'}
-					onclick={() => (claimFilter = 'all')}
+					class:active={data.filters.claim === 'all'}
 				>
 					<span>All Issues</span>
-					<strong class="count-badge">{facetCounts.total}</strong>
-				</button>
+					<strong class="count-badge">{data.claimantFacets?.total ?? facetCounts.total}</strong>
+				</a>
 			</li>
 			<li>
-				<button
-					type="button"
+				<a
+					href={href({ claim: 'unclaimed', page: 1 })}
 					class="facet-btn"
-					class:active={claimFilter === 'unclaimed'}
-					onclick={() => (claimFilter = 'unclaimed')}
+					class:active={data.filters.claim === 'unclaimed'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-open">⚪</span> Unclaimed</span>
-					<strong class="count-badge">{facetCounts.unclaimed}</strong>
-				</button>
+					<strong class="count-badge">{data.claimantFacets?.unclaimed ?? facetCounts.unclaimed}</strong>
+				</a>
 			</li>
 			<li>
-				<button
-					type="button"
+				<a
+					href={href({ claim: 'claimed-me', page: 1 })}
 					class="facet-btn"
-					class:active={claimFilter === 'claimed-me'}
-					onclick={() => (claimFilter = 'claimed-me')}
+					class:active={data.filters.claim === 'claimed-me'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-primary">🔵</span> Claimed by Me</span>
-					<strong class="count-badge">{facetCounts.claimedMe}</strong>
-				</button>
+					<strong class="count-badge">{data.claimantFacets?.claimedMe ?? facetCounts.claimedMe}</strong>
+				</a>
 			</li>
 			<li>
-				<button
-					type="button"
+				<a
+					href={href({ claim: 'claimed-agent', page: 1 })}
 					class="facet-btn"
-					class:active={claimFilter === 'claimed-agent'}
-					onclick={() => (claimFilter = 'claimed-agent')}
+					class:active={data.filters.claim === 'claimed-agent'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-agent">🤖</span> Claimed by Agent</span>
-					<strong class="count-badge">{facetCounts.claimedAgent}</strong>
-				</button>
+					<strong class="count-badge">{data.claimantFacets?.claimedAgent ?? facetCounts.claimedAgent}</strong>
+				</a>
 			</li>
 		</ul>
 
-		<!-- Specific Claimers (dynamically derived from real issues in database) -->
+		<!-- Specific Claimers (derived across all issues in database and organization users) -->
 		{#if distinctClaimants.length > 0}
 			<h2>Claimed By</h2>
 			<ul class="facet-list">
-				{#each distinctClaimants as claimant (claimant.assignee)}
+				{#each distinctClaimants as claimant (claimant.id)}
 					<li>
-						<button
-							type="button"
+						<a
+							href={href({ claim: claimant.id, page: 1 })}
 							class="facet-btn"
-							class:active={claimFilter === claimant.assignee}
-							onclick={() => (claimFilter = claimant.assignee)}
+							class:active={data.filters.claim === claimant.id}
 						>
-							<span>{claimant.assigneeType === 'agent' ? '🤖 ' : ''}{claimant.assignee}</span>
+							<span>{claimant.isAgent ? '🤖 ' : ''}{claimant.label}</span>
 							<strong class="count-badge">{claimant.count}</strong>
-						</button>
+						</a>
 					</li>
 				{/each}
 			</ul>
@@ -801,7 +826,6 @@
 							onclick={() => {
 								searchQuery = '';
 								quickChip = 'all';
-								claimFilter = 'all';
 								platformFilter = 'all';
 								selectedDatePreset = '24h';
 								selectedDateLabel = 'Last 24 Hours';

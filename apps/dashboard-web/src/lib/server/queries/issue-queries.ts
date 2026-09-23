@@ -1,6 +1,6 @@
 import { db } from "$lib/server/db";
-import { issues, errorOccurrences, projects, issueOccurrenceBuckets } from "$lib/db/schema";
-import { eq, gte, lte, desc, asc, sql, and, inArray, type SQL } from "drizzle-orm";
+import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers } from "$lib/db/schema";
+import { eq, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort } from "$lib/server/issue-sort";
 import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
@@ -58,6 +58,23 @@ export interface IssueFilters {
      * `countIssues`; `undefined` (the `all` case) adds nothing.
      */
     firstSeenAfter?: Date;
+    /**
+     * Claimant filter: 'all' | 'unclaimed' | 'claimed-me' | 'claimed-agent' | specific claimant string (user ID or email).
+     */
+    claim?: string;
+    /**
+     * Current authenticated user ID (and optionally email) used to resolve 'claimed-me'.
+     */
+    currentUserId?: string;
+}
+
+export interface ClaimantFacetCounts {
+    total: number;
+    unclaimed: number;
+    claimedMe: number;
+    claimedAgent: number;
+    byClaimant: Record<string, number>;
+    claimantTypes: Record<string, string | null>;
 }
 
 /**
@@ -143,6 +160,22 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
     // so the count narrows with the list by construction.
     if (filters.firstSeenAfter) {
         conditions.push(gte(issues.firstSeen, filters.firstSeenAfter));
+    }
+
+    if (filters.claim && filters.claim !== "all") {
+        if (filters.claim === "unclaimed") {
+            conditions.push(isNull(issues.assignedTo));
+        } else if (filters.claim === "claimed-me") {
+            const meCondition = filters.currentUserId
+                ? eq(issues.assignedTo, filters.currentUserId)
+                : sql`false`;
+            conditions.push(and(isNotNull(issues.assignedTo), eq(issues.assigneeType, "user"), meCondition)!);
+        } else if (filters.claim === "claimed-agent") {
+            conditions.push(and(isNotNull(issues.assignedTo), eq(issues.assigneeType, "agent"))!);
+        } else {
+            // Specific claimant identifier (user ID, agent ID, or email)
+            conditions.push(eq(issues.assignedTo, filters.claim));
+        }
     }
 
     return conditions;
@@ -267,6 +300,55 @@ export const issueQueries = {
             .where(and(...conditions));
 
         return Number(totalResult[0]?.count ?? 0);
+    },
+
+    /**
+     * Aggregates claimant counts across all matching issues in the database under active project/environment guards.
+     * Evaluated WITHOUT applying `filters.claim`, so the sidebar shows true facet totals across all issues.
+     */
+    async getClaimantFacetCounts(filters: Omit<IssueFilters, 'claim'>, currentUserId?: string): Promise<ClaimantFacetCounts> {
+        const conditions = buildIssueConditions(filters);
+
+        // Overall summary counts
+        const [summaryRow] = await db
+            .select({
+                total: sql<number>`cast(count(*) as integer)`,
+                unclaimed: sql<number>`cast(count(*) filter (where ${issues.assignedTo} is null) as integer)`,
+                claimedAgent: sql<number>`cast(count(*) filter (where ${issues.assignedTo} is not null and ${issues.assigneeType} = 'agent') as integer)`,
+                claimedMe: sql<number>`cast(count(*) filter (where ${issues.assignedTo} is not null and ${issues.assigneeType} = 'user' and ${issues.assignedTo} = ${currentUserId ?? ''}) as integer)`,
+            })
+            .from(issues)
+            .where(and(...conditions));
+
+        // Group by assigned_to and assignee_type for distinct claimants
+        const claimantRows = await db
+            .select({
+                assignedTo: issues.assignedTo,
+                assigneeType: issues.assigneeType,
+                count: sql<number>`cast(count(*) as integer)`,
+            })
+            .from(issues)
+            .where(and(...conditions, isNotNull(issues.assignedTo)))
+            .groupBy(issues.assignedTo, issues.assigneeType);
+
+        const byClaimant: Record<string, number> = {};
+        const claimantTypes: Record<string, string | null> = {};
+
+        for (const row of claimantRows) {
+            if (row.assignedTo) {
+                byClaimant[row.assignedTo] = Number(row.count ?? 0);
+                claimantTypes[row.assignedTo] = row.assigneeType ?? null;
+            }
+        }
+
+        return {
+            total: Number(summaryRow?.total ?? 0),
+            unclaimed: Number(summaryRow?.unclaimed ?? 0),
+            claimedMe: currentUserId ? Number(summaryRow?.claimedMe ?? 0) : 0,
+            claimedAgent: Number(summaryRow?.claimedAgent ?? 0),
+            byClaimant,
+            claimantTypes,
+        };
     },
 
     /**
@@ -409,5 +491,21 @@ export const issueQueries = {
             .where(eq(projects.id, id))
             .limit(1);
         return project || null;
+    },
+
+    /**
+     * Lists users belonging to the given organizations, used to populate claimant facets and resolve IDs.
+     */
+    async listOrgUsers(orgIds: string[]) {
+        if (orgIds.length === 0) return [];
+        return await db
+            .select({
+                id: users.id,
+                name: users.name,
+                email: users.email,
+            })
+            .from(users)
+            .innerJoin(organizationMembers, eq(organizationMembers.userId, users.id))
+            .where(inArray(organizationMembers.organizationId, orgIds));
     },
 };
