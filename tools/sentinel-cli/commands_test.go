@@ -187,6 +187,39 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 			wantMethod: "GET",
 			wantPath:   "/api/agent/projects",
 		},
+		{
+			name:       "members list",
+			args:       []string{"members", "list"},
+			wantMethod: "GET",
+			wantPath:   "/api/agent/members",
+		},
+		{
+			name:       "members list with role",
+			args:       []string{"members", "list", "--role", "engineer"},
+			wantMethod: "GET",
+			wantPath:   "/api/agent/members",
+			wantQuery:  map[string]string{"role": "engineer"},
+		},
+		{
+			name:       "members add default role",
+			args:       []string{"members", "add", "alice@example.com"},
+			wantMethod: "POST",
+			wantPath:   "/api/agent/members",
+			wantBody:   map[string]interface{}{"email": "alice@example.com", "role": "engineer"},
+		},
+		{
+			name:       "members add explicit role",
+			args:       []string{"members", "add", "bob@example.com", "--role", "admin"},
+			wantMethod: "POST",
+			wantPath:   "/api/agent/members",
+			wantBody:   map[string]interface{}{"email": "bob@example.com", "role": "admin"},
+		},
+		{
+			name:       "members remove",
+			args:       []string{"members", "remove", "mem-123"},
+			wantMethod: "DELETE",
+			wantPath:   "/api/agent/members/mem-123",
+		},
 	}
 
 	for _, tc := range cases {

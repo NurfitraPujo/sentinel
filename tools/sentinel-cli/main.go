@@ -41,6 +41,9 @@
 //	sentinel link <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
 //	sentinel unlink <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
 //	sentinel projects
+//	sentinel members list [--role <role>]
+//	sentinel members add <email> [--role <role>]
+//	sentinel members remove <memberId>
 //	sentinel whoami
 //	sentinel key rotate
 //	sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me] [--follow] [--interval SEC]
@@ -81,7 +84,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	format := fs.String("format", "json", `output format: "json" (default) or "table" (list-shaped commands only)`)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]")
-		fmt.Fprintln(stderr, "commands: issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, whoami, key, events, batch, upload")
+		fmt.Fprintln(stderr, "commands: issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
 	}
 
 	if err := fs.Parse(args); err != nil {

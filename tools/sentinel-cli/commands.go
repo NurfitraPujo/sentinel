@@ -40,6 +40,7 @@ var commands = map[string]cmdFunc{
 	"link":       cmdLink,
 	"unlink":     cmdUnlink,
 	"projects":   cmdProjects,
+	"members":    cmdMembers,
 	"whoami":     cmdWhoami,
 	"events":     cmdEvents,
 	"batch":      cmdBatch,
@@ -611,6 +612,88 @@ func cmdProjects(ctx context.Context, e *env, args []string) int {
 		return e.networkErr(err)
 	}
 	return e.respond(res, "projects")
+}
+
+// --- members ------------------------------------------------------------------------------------------
+
+var validOrgRoles = map[string]bool{
+	"owner":    true,
+	"admin":    true,
+	"engineer": true,
+	"support":  true,
+	"viewer":   true,
+}
+
+func cmdMembers(ctx context.Context, e *env, args []string) int {
+	if len(args) == 0 {
+		return usageErr(e, "usage: sentinel members <list|add|remove> [args...]")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "list":
+		fs := flag.NewFlagSet("members list", flag.ContinueOnError)
+		fs.SetOutput(e.stderr)
+		role := fs.String("role", "", "filter by role: owner|admin|engineer|support|viewer")
+		if err := fs.Parse(rest); err != nil {
+			return ExitUsage
+		}
+		q := url.Values{}
+		if *role != "" {
+			if !validOrgRoles[*role] {
+				return usageErr(e, "--role must be one of: owner, admin, engineer, support, viewer")
+			}
+			q.Set("role", *role)
+		}
+		res, err := e.client.Do(ctx, "GET", "/api/agent/members", q, nil)
+		if err != nil {
+			return e.networkErr(err)
+		}
+		return e.respond(res, "members")
+
+	case "add":
+		fs := flag.NewFlagSet("members add", flag.ContinueOnError)
+		fs.SetOutput(e.stderr)
+		rest = reorderArgs(rest, nil)
+		role := fs.String("role", "engineer", "role: owner|admin|engineer|support|viewer (default engineer)")
+		if err := fs.Parse(rest); err != nil {
+			return ExitUsage
+		}
+		pos := fs.Args()
+		if len(pos) != 1 {
+			return usageErr(e, "usage: sentinel members add <email> [--role <role>]")
+		}
+		if !validOrgRoles[*role] {
+			return usageErr(e, "--role must be one of: owner, admin, engineer, support, viewer")
+		}
+		body := map[string]interface{}{
+			"email": pos[0],
+			"role":  *role,
+		}
+		res, err := e.client.Do(ctx, "POST", "/api/agent/members", nil, body)
+		if err != nil {
+			return e.networkErr(err)
+		}
+		return e.respond(res, "")
+
+	case "remove":
+		fs := flag.NewFlagSet("members remove", flag.ContinueOnError)
+		fs.SetOutput(e.stderr)
+		if err := fs.Parse(rest); err != nil {
+			return ExitUsage
+		}
+		pos := fs.Args()
+		if len(pos) != 1 {
+			return usageErr(e, "usage: sentinel members remove <memberId>")
+		}
+		res, err := e.client.Do(ctx, "DELETE", "/api/agent/members/"+url.PathEscape(pos[0]), nil, nil)
+		if err != nil {
+			return e.networkErr(err)
+		}
+		return e.respond(res, "")
+
+	default:
+		return usageErr(e, "unknown members subcommand %q; expected list, add, or remove", sub)
+	}
 }
 
 // cmdWhoami. R1a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): upgraded to call the

@@ -58,6 +58,9 @@ if it finds the file group- or world-readable.
 | `sentinel link <issueId> <targetIssueId> --type <linked_to\|caused_by\|duplicate_of>` | `POST /api/agent/issues/:id/relations` | |
 | `sentinel unlink <issueId> <targetIssueId> --type <...>` | `DELETE /api/agent/issues/:id/relations` | see mismatch note below |
 | `sentinel projects` | `GET /api/agent/projects` | |
+| `sentinel members list [--role <role>]` | `GET /api/agent/members` | list org members, optional role filter |
+| `sentinel members add <email> [--role <role>]` | `POST /api/agent/members` | invites a user to the organization (default role engineer) |
+| `sentinel members remove <memberId>` | `DELETE /api/agent/members/:id` | revokes an organization member's access |
 | `sentinel whoami` | `GET /api/agent/self` | prints agentId/name/organizationId + key id/prefix/expiresAt |
 | `sentinel key rotate` | `POST /api/agent/key/rotate` | mints a new secret, prints it to stdout ONCE; old key stays valid for its grace window |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` | one page |
@@ -70,7 +73,7 @@ Global flags (`-url`, `-key`, `-format json|table`) go **before** the subcommand
 per-command flag is accepted either before or after its positional arguments.
 
 `-format table` renders list-shaped responses (`issues list`, `issues occurrences`, `comments`,
-`projects`, `events`, `batch`) as a column table instead of pretty JSON.
+`projects`, `members list`, `events`, `batch`) as a column table instead of pretty JSON.
 
 ## Exit codes
 

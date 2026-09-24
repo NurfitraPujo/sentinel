@@ -614,3 +614,32 @@ export async function createProject(
 		return project;
 	});
 }
+
+/**
+ * Fetches all organization members for an organization with user details.
+ */
+export async function listOrganizationMembers(organizationId: string) {
+	const members = await db
+		.select({
+			id: organizationMembers.id,
+			role: organizationMembers.role,
+			user: {
+				id: users.id,
+				name: users.name,
+				email: users.email,
+			},
+		})
+		.from(organizationMembers)
+		.innerJoin(users, eq(organizationMembers.userId, users.id))
+		.where(eq(organizationMembers.organizationId, organizationId));
+
+	return members.map((m) => ({
+		id: m.id,
+		userId: m.user.id,
+		user: {
+			name: m.user.name ?? m.user.email,
+			email: m.user.email,
+		},
+		role: m.role,
+	}));
+}

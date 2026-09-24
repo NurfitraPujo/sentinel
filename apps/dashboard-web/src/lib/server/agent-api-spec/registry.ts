@@ -347,4 +347,42 @@ export const agentApiRegistry: RegistryEntry[] = [
 			'401': S.UnauthorizedErrorSchema,
 		},
 	},
+	{
+		path: '/api/agent/members',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/members/+server.ts',
+		operationId: 'listMembers',
+		summary: "List organization members in the calling key's organization",
+		request: { querySchema: S.ListMembersQuerySchema },
+		responses: {
+			'200': S.ListMembersResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/members',
+		method: 'post',
+		routeFile: 'src/routes/api/agent/members/+server.ts',
+		operationId: 'inviteMember',
+		summary: "Invite a new member to the calling key's organization",
+		request: { bodySchema: S.InviteMemberBodySchema },
+		responses: {
+			'201': S.InviteMemberResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/members/{id}',
+		method: 'delete',
+		routeFile: 'src/routes/api/agent/members/[id]/+server.ts',
+		operationId: 'removeMember',
+		summary: "Remove a member from the calling key's organization",
+		responses: {
+			'200': S.RemoveMemberResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
 ];

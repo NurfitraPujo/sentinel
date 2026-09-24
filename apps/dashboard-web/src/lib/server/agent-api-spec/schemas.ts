@@ -664,3 +664,67 @@ export const RepoCredentialsResponseSchema = z
 		),
 	})
 	.strict();
+
+// ---------------------------------------------------------------------------
+// GET /api/agent/members
+// ---------------------------------------------------------------------------
+
+export const ListMembersQuerySchema = z
+	.object({
+		role: z.enum(['owner', 'admin', 'engineer', 'support', 'viewer']).optional(),
+	})
+	.strict();
+
+export const ListMembersResponseSchema = z
+	.object({
+		members: z.array(
+			z
+				.object({
+					id: z.string(),
+					userId: z.string(),
+					role: z.string(),
+					user: z
+						.object({
+							name: z.string(),
+							email: z.string(),
+						})
+						.strict(),
+				})
+				.strict()
+		),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
+// POST /api/agent/members
+// ---------------------------------------------------------------------------
+
+export const InviteMemberBodySchema = z
+	.object({
+		email: z.string(),
+		role: z.enum(['owner', 'admin', 'engineer', 'support', 'viewer']),
+	})
+	.strict();
+
+export const InviteMemberResponseSchema = z
+	.object({
+		id: z.string(),
+		email: z.string(),
+		role: z.string(),
+		status: z.string(),
+		expiresAt: z.coerce.date(),
+		delivered: z.boolean(),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
+// DELETE /api/agent/members/{id}
+// ---------------------------------------------------------------------------
+
+export const RemoveMemberResponseSchema = z
+	.object({
+		success: z.literal(true),
+		memberId: z.string(),
+		userId: z.string(),
+	})
+	.strict();
