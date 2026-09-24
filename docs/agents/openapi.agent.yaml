@@ -415,6 +415,166 @@ paths:
                           - string
                           - "null"
                         format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
                     required:
                       - id
                       - environment
@@ -424,6 +584,23 @@ paths:
                       - metadata
                       - traceId
                       - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
                     additionalProperties: false
                   relations:
                     type: array
@@ -721,6 +898,166 @@ paths:
                           - string
                           - "null"
                         format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
                     required:
                       - id
                       - environment
@@ -730,6 +1067,23 @@ paths:
                       - metadata
                       - traceId
                       - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
                     additionalProperties: false
                   relations:
                     type: array
@@ -877,6 +1231,166 @@ paths:
                             - string
                             - "null"
                           format: date-time
+                        level:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - fatal
+                            - error
+                            - warning
+                            - info
+                            - debug
+                        message:
+                          type:
+                            - string
+                            - "null"
+                        errorClass:
+                          type:
+                            - string
+                            - "null"
+                        logger:
+                          type:
+                            - string
+                            - "null"
+                        serverName:
+                          type:
+                            - string
+                            - "null"
+                        transaction:
+                          type:
+                            - string
+                            - "null"
+                        dist:
+                          type:
+                            - string
+                            - "null"
+                        source:
+                          type:
+                            - string
+                            - "null"
+                        traceFlags:
+                          type:
+                            - integer
+                            - "null"
+                        receivedAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        sdk:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            name:
+                              type: string
+                            version:
+                              type: string
+                          additionalProperties: true
+                        user:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            id:
+                              type: string
+                            username:
+                              type: string
+                            email:
+                              type: string
+                            ip_address:
+                              type: string
+                            geo:
+                              type: object
+                              properties:
+                                city:
+                                  type: string
+                                region:
+                                  type: string
+                                country_code:
+                                  type: string
+                                subdivision:
+                                  type: string
+                              additionalProperties: true
+                          additionalProperties: true
+                        tags:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        contexts:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        request:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            method:
+                              type: string
+                            url:
+                              type: string
+                            query_string:
+                              type: string
+                            headers:
+                              type: object
+                              additionalProperties: true
+                            data: {}
+                            env:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                        breadcrumbs:
+                          type:
+                            - array
+                            - "null"
+                          items:
+                            type: object
+                            properties:
+                              timestamp:
+                                type: string
+                              type:
+                                type: string
+                              category:
+                                type: string
+                              level:
+                                type: string
+                              message:
+                                type: string
+                              data:
+                                type: object
+                                additionalProperties: true
+                            additionalProperties: true
+                        exception:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            values:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  type:
+                                    type: string
+                                  value:
+                                    type: string
+                                  mechanism:
+                                    type: object
+                                    properties:
+                                      type:
+                                        type: string
+                                      handled:
+                                        type: boolean
+                                    additionalProperties: true
+                                  stacktrace: {}
+                                additionalProperties: true
+                          required:
+                            - values
+                          additionalProperties: true
                       required:
                         - id
                         - environment
@@ -886,6 +1400,23 @@ paths:
                         - metadata
                         - traceId
                         - createdAt
+                        - level
+                        - message
+                        - errorClass
+                        - logger
+                        - serverName
+                        - transaction
+                        - dist
+                        - source
+                        - traceFlags
+                        - receivedAt
+                        - sdk
+                        - user
+                        - tags
+                        - contexts
+                        - request
+                        - breadcrumbs
+                        - exception
                       additionalProperties: false
                 required:
                   - occurrences

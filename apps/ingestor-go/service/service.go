@@ -26,7 +26,7 @@ import (
 
 // maxEventIDLength matches error_occurrences.event_id VARCHAR(64) / the proto's "error_event.event_id"
 // CEL rule (packages/proto/sentinel/v1/error_event.proto) - see docs/plans/IDEMPOTENCY_PLAN.md D-a/D-b.
-const maxEventIDLength = 64
+const maxEventIDLength = validation.MaxEventIDLength
 
 // MaxFutureSkew and MaxEventAge bound the window around receipt time (T_recv) inside which a
 // client-supplied timestamp is believed (sentinel-ingest-timestamp-clamp contract §4.1, decisions 4,
@@ -79,6 +79,10 @@ type IngestService struct {
 	// timestampReplacedCounter records obs.MetricIngestTimestampReplaced{reason}
 	// (sentinel-ingest-timestamp-clamp §4.3). Same degradation posture as the two above.
 	timestampReplacedCounter metric.Int64Counter
+
+	// fieldsTruncatedCounter records obs.MetricIngestFieldsTruncated{field} (sentinel-event-schema-v2
+	// spec §4.2). Same degradation posture as the three above.
+	fieldsTruncatedCounter metric.Int64Counter
 }
 
 func NewIngestService(publisher eventPublisher) (*IngestService, error) {
@@ -127,12 +131,25 @@ func NewIngestService(publisher eventPublisher) (*IngestService, error) {
 			slog.String("error", err.Error()))
 	}
 
+	fieldsTruncatedCounter, err := otel.Meter(tracerName).Int64Counter(
+		obs.MetricIngestFieldsTruncated,
+		metric.WithDescription("Ingest events with a field the bounds step truncated, dropped or replaced, per field"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		// Same degradation posture as the counters above: "not recorded as a metric", never a refused
+		// ingest or a failed construction.
+		slog.Default().Error("obs: failed to create ingest fields-truncated counter; field truncations will not be recorded as a metric",
+			slog.String("error", err.Error()))
+	}
+
 	return &IngestService{
 		publisher:                publisher,
 		validator:                v,
 		publishFailureCounter:    failureCounter,
 		eventIDReplacedCounter:   eventIDReplacedCounter,
 		timestampReplacedCounter: timestampReplacedCounter,
+		fieldsTruncatedCounter:   fieldsTruncatedCounter,
 	}, nil
 }
 
@@ -234,18 +251,25 @@ func (s *IngestService) IngestAt(ctx context.Context, payload *validation.ErrorP
 		s.recordTimestampReplaced(ctx, tsReason, payload.Timestamp, receivedAt, payload.ProjectKey)
 	}
 	payload.Timestamp = effectiveTS
+	// sentinel-event-schema-v2 (spec §4.1): proto field 30 is T_recv, stamped here and nowhere else.
+	// ErrorPayload.ReceivedAt is json:"-", so whatever a client sent was never decoded.
+	payload.ReceivedAt = receivedAt.UTC()
 
-	// sentinel-sourcemaps §4.3: a negative column is a producer bug, not an unknown (0 is the
-	// unknown value), and the proto deliberately carries no rule for it. Checked HERE, on the live
-	// path, because validation.ValidatePayload -- where the contract places the rule and where the
-	// same check also lives -- is not called by any handler (docs/memory/BUGS.md B3: superseded by
-	// protovalidate). The error text is the contract's, prefixed "validation failed" so
-	// handleIngest/handleBatchIngest map it to 400 exactly as a protovalidate failure.
-	for i, frame := range payload.Stacktrace {
-		if frame.Column < 0 {
-			return fmt.Errorf("validation failed: stacktrace[%d].column must be >= 0", i)
+	// sentinel-event-schema-v2 spec §4.2-§4.3: the per-field bounds step, run on the live path. It
+	// truncates, drops or replaces every oversized v2 value IN PLACE, writes the server_truncated
+	// markers into metadata and shrinks an oversized metadata map; the one rule it rejects on is a
+	// negative top-level stacktrace[i].column (sentinel-sourcemaps §4.3), which the proto cannot
+	// express. Every other rejection is protovalidate's, below. The error text is prefixed
+	// "validation failed" so handleIngest/handleBatchIngest map it to 400 exactly as a protovalidate
+	// failure.
+	if result := validation.ValidatePayload(payload); !result.Valid {
+		msgs := make([]string, len(result.Errors))
+		for i, e := range result.Errors {
+			msgs[i] = e.Message
 		}
+		return fmt.Errorf("validation failed: %s", strings.Join(msgs, "; "))
 	}
+	s.recordFieldsTruncated(ctx, payload)
 
 	event := mapping.MapPayloadToEvent(payload)
 
@@ -319,6 +343,26 @@ func (s *IngestService) recordTimestampReplaced(ctx context.Context, reason stri
 	logFn(ctx, "ingest: client timestamp replaced with receipt time", attrs...)
 	if s.timestampReplacedCounter != nil {
 		s.timestampReplacedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelReason, reason)))
+	}
+}
+
+// recordFieldsTruncated is the loud half of the bounds step (spec §4.2 "Marker"): one counter Add and
+// one Debug line per field the step cut, read back from the server-owned metadata.server_truncated
+// marker it just wrote - which is why a client value under that key can never inflate the counter:
+// the step overwrites or removes it first. Debug, not Warn, for the reason recordTimestampReplaced
+// gives for "empty": an SDK that routinely sends oversized context would otherwise log at ingest
+// volume. Never the value, its length or the project as a label.
+func (s *IngestService) recordFieldsTruncated(ctx context.Context, payload *validation.ErrorPayload) {
+	fields, _ := payload.Metadata[validation.MetadataKeyServerTruncated].([]interface{})
+	for _, f := range fields {
+		field, _ := f.(string)
+		slog.Default().DebugContext(ctx, "ingest: field cut by the bounds step",
+			slog.String("field", field),
+			slog.String("project_key", payload.ProjectKey),
+		)
+		if s.fieldsTruncatedCounter != nil {
+			s.fieldsTruncatedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelField, field)))
+		}
 	}
 }
 

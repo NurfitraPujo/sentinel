@@ -178,7 +178,7 @@ type ErrorOccurrence struct {
 	SpanID         string
 	CreatedAt      time.Time
 	// EventID is the idempotency key (docs/plans/IDEMPOTENCY_PLAN.md D-a/D-b), copied from the wire by
-	// event.Deserialize BEFORE Normalize (D-h) and bounds-clamped to "" for anything that would not fit
+	// event.Deserialize BEFORE Prepare (D-h) and bounds-clamped to "" for anything that would not fit
 	// VARCHAR(64) or carries a control character (D-g). "" here means "no key" — StoreEvent maps it to
 	// SQL NULL via NULLIF at the insert site, never storing the empty string (D-b's tripwire CHECK
 	// constraint rejects '' outright). Never log this value verbatim in a metric label (D15); it is a
@@ -187,7 +187,7 @@ type ErrorOccurrence struct {
 	// AffectedUserID / AffectedTenantID feed sentinel-affected-users §4.3's rollup: one
 	// issue_affected_users / issue_affected_tenants row per distinct (issue, id) pair, and a bump of
 	// issues.affected_user_count / affected_tenant_count only when the pair is NEW. Carried exactly as
-	// EventID is: read by event.Normalize from the PRE-normalisation metadata (decision 3 — after
+	// EventID is: read by event.Prepare from the raw metadata (decision 3 — after
 	// normalisation a UUID reads "<UUID>"), bounds-clamped by event.BoundAffectedID to "" for anything
 	// empty, over 255 bytes or carrying a control character (decision 5), and NEVER normalised or
 	// masked (decision 6: identity is the exact byte string). "" here means "nothing usable" — StoreEvent
@@ -202,6 +202,29 @@ type ErrorOccurrence struct {
 	// back — a duplicate above all — never counts.
 	AffectedUserSkipReason   string
 	AffectedTenantSkipReason string
+	// ---- sentinel-event-schema-v2 §6.1 (TASK-05): the per-occurrence v2 columns (migration
+	// 1725300000). Level is never "" (the service defaults it to "error"); ErrorClass is required;
+	// Message, Logger, ServerName, Transaction, Dist and Source are written through NULLIF(...,'')
+	// so "" is SQL NULL. TraceFlags is nil (NULL) when the event has no trace id; ReceivedAt is nil for
+	// a message published before the ingestor stamped it. Each json.RawMessage is the wire JSON of its
+	// field, nil (NULL) when the event carried none.
+	Level       string
+	Message     string
+	ErrorClass  string
+	Logger      string
+	ServerName  string
+	Transaction string
+	Dist        string
+	Source      string
+	TraceFlags  *int64
+	ReceivedAt  *time.Time
+	SDK         json.RawMessage
+	User        json.RawMessage
+	Tags        json.RawMessage
+	Contexts    json.RawMessage
+	Request     json.RawMessage
+	Breadcrumbs json.RawMessage
+	Exception   json.RawMessage
 	// ReleaseInserted is WRITTEN BACK by StoreEvent, never read by it — the same idiom as IssueID
 	// above. It is true exactly when this delivery committed and step 4c's `releases` upsert INSERTed
 	// the (project_id, ReleaseVersion) row (RETURNING xmax = 0): a first sighting of that version by
@@ -1035,10 +1058,17 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 
 	occ.IssueID = issue.ID
 	occ.ProjectID = issue.ProjectID
+	// sentinel-event-schema-v2 §6.1: the 17 v2 columns ride the same statement, in the same
+	// transaction, under the same arbiter. NULLIF on exactly the six nullable strings (message,
+	// logger, server_name, transaction, dist, source); level is never "" and error_class is required.
 	occQuery := `
 		INSERT INTO error_occurrences (id, issue_id, environment, platform, release_version,
-			stacktrace, metadata, trace_id, span_id, created_at, event_id, project_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''), $12)
+			stacktrace, metadata, trace_id, span_id, created_at, event_id, project_id,
+			level, message, error_class, logger, server_name, transaction, dist, source,
+			trace_flags, received_at, sdk, event_user, tags, contexts, request, breadcrumbs, exception)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''), $12,
+			$13, NULLIF($14,''), $15, NULLIF($16,''), NULLIF($17,''), NULLIF($18,''), NULLIF($19,''), NULLIF($20,''),
+			$21, $22, $23, $24, $25, $26, $27, $28, $29)
 		ON CONFLICT (project_id, event_id) WHERE project_id IS NOT NULL AND event_id IS NOT NULL DO NOTHING
 	`
 	tag, err := tx.Exec(ctx, occQuery,
@@ -1054,6 +1084,23 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		occ.CreatedAt,
 		occ.EventID,
 		issue.ProjectID,
+		occ.Level,
+		occ.Message,
+		occ.ErrorClass,
+		occ.Logger,
+		occ.ServerName,
+		occ.Transaction,
+		occ.Dist,
+		occ.Source,
+		occ.TraceFlags,
+		occ.ReceivedAt,
+		nullableJSON(occ.SDK),
+		nullableJSON(occ.User),
+		nullableJSON(occ.Tags),
+		nullableJSON(occ.Contexts),
+		nullableJSON(occ.Request),
+		nullableJSON(occ.Breadcrumbs),
+		nullableJSON(occ.Exception),
 	)
 	if err != nil {
 		// The rollout-window tolerance (sentinel-occurrence-dedup-project decision 12, OQ-3 (a)):
@@ -1364,4 +1411,13 @@ func (s *pgStore) GetIssueIDByFingerprint(ctx context.Context, projectID, enviro
 		projectID, environment, fingerprint,
 	).Scan(&issueID)
 	return issueID, err
+}
+
+// nullableJSON binds a JSONB column: SQL NULL for a nil RawMessage, the bytes otherwise. An untyped
+// nil makes the NULL explicit instead of relying on how the driver encodes a nil []byte.
+func nullableJSON(raw json.RawMessage) interface{} {
+	if raw == nil {
+		return nil
+	}
+	return []byte(raw)
 }

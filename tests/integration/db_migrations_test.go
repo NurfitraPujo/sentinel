@@ -483,3 +483,202 @@ func TestOncallWeekdayCheckReplayOverIsoRow(t *testing.T) {
 		 WHERE table_name = 'oncall_schedules' AND column_name = 'rotation_anchor_at'`).Scan(&anchorCols))
 	assert.Equal(t, 1, anchorCols, "up must leave rotation_anchor_at in place")
 }
+
+// ---- sentinel-event-schema-v2 §5 (TASK-04): 1725300000_add_error_occurrences_event_v2_fields.sql.
+
+const (
+	eventV2MigrationVersion int64 = 1725300000
+	eventV2MigrationFile          = "1725300000_add_error_occurrences_event_v2_fields.sql"
+	eventV2TagsIndex              = "idx_error_occurrences_tags"
+)
+
+// eventV2Columns is spec §5.2 in order, as information_schema renders each type.
+var eventV2Columns = []struct{ name, dataType string }{
+	{"level", "character varying(16)"},
+	{"message", "text"},
+	{"error_class", "character varying(255)"},
+	{"logger", "character varying(64)"},
+	{"server_name", "character varying(256)"},
+	{"transaction", "character varying(200)"},
+	{"dist", "character varying(64)"},
+	{"source", "character varying(64)"},
+	{"trace_flags", "bigint"},
+	{"received_at", "timestamp with time zone"},
+	{"sdk", "jsonb"},
+	{"event_user", "jsonb"},
+	{"tags", "jsonb"},
+	{"contexts", "jsonb"},
+	{"request", "jsonb"},
+	{"breadcrumbs", "jsonb"},
+	{"exception", "jsonb"},
+}
+
+// eventV2ColumnShape returns name -> "type nullable default" for every §5.2 column that exists.
+func eventV2ColumnShape(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT column_name,
+		       CASE WHEN character_maximum_length IS NOT NULL
+		            THEN data_type || '(' || character_maximum_length || ')'
+		            ELSE data_type END,
+		       is_nullable, COALESCE(column_default, '')
+		  FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = 'error_occurrences'`)
+	require.NoError(t, err)
+	defer rows.Close()
+	want := map[string]bool{}
+	for _, c := range eventV2Columns {
+		want[c.name] = true
+	}
+	out := map[string]string{}
+	for rows.Next() {
+		var name, typ, nullable, def string
+		require.NoError(t, rows.Scan(&name, &typ, &nullable, &def))
+		if want[name] {
+			out[name] = fmt.Sprintf("%s nullable=%s default=%q", typ, nullable, def)
+		}
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+func assertEventV2Shape(t *testing.T, db *sql.DB) {
+	t.Helper()
+	got := eventV2ColumnShape(t, db)
+	want := map[string]string{}
+	for _, c := range eventV2Columns {
+		want[c.name] = fmt.Sprintf("%s nullable=YES default=%q", c.dataType, "")
+	}
+	assert.Equal(t, want, got, "the 17 §5.2 columns: exact types, all nullable, no default")
+
+	var valid bool
+	var def string
+	require.NoError(t, db.QueryRowContext(context.Background(), `
+		SELECT i.indisvalid, pg_get_indexdef(i.indexrelid)
+		  FROM pg_index i
+		 WHERE i.indexrelid = to_regclass($1)`, eventV2TagsIndex).Scan(&valid, &def),
+		"%s must exist", eventV2TagsIndex)
+	assert.True(t, valid, "%s must be valid (indisvalid)", eventV2TagsIndex)
+	assert.Equal(t, "CREATE INDEX idx_error_occurrences_tags ON public.error_occurrences USING gin (tags) WHERE (tags IS NOT NULL)", def)
+}
+
+func assertEventV2Gone(t *testing.T, db *sql.DB) {
+	t.Helper()
+	assert.Empty(t, eventV2ColumnShape(t, db), "Down drops all 17 columns")
+	for _, idx := range []string{eventV2TagsIndex, eventV2TagsIndex + "_invalid"} {
+		var reg sql.NullString
+		require.NoError(t, db.QueryRowContext(context.Background(), `SELECT to_regclass($1)::text`, idx).Scan(&reg))
+		assert.False(t, reg.Valid, "Down drops %s", idx)
+	}
+}
+
+// seedEventV2Rows inserts one project, one issue, one pre-v2 occurrence and one with every v2 column
+// populated, and returns the two occurrence ids.
+func seedEventV2Rows(t *testing.T, db *sql.DB, label string, createdAt time.Time) (preV2, v2 string) {
+	t.Helper()
+	ctx := context.Background()
+	var projectID, issueID string
+	suffix := fmt.Sprintf("%s-%d", label, time.Now().UnixNano())
+	require.NoError(t, db.QueryRowContext(ctx,
+		`INSERT INTO projects (name, api_key, api_key_hash) VALUES ($1, $2, $3) RETURNING id`,
+		"esv2-"+suffix, "k-"+suffix, "h-"+suffix).Scan(&projectID))
+	require.NoError(t, db.QueryRowContext(ctx,
+		`INSERT INTO issues (project_id, fingerprint, message, error_class, environment)
+		 VALUES ($1, $2, 'm', 'E', 'production') RETURNING id`,
+		projectID, "fp-"+suffix).Scan(&issueID))
+	require.NoError(t, db.QueryRowContext(ctx,
+		`INSERT INTO error_occurrences (issue_id, environment, platform, created_at)
+		 VALUES ($1, 'production', 'go', $2) RETURNING id`, issueID, createdAt).Scan(&preV2))
+	require.NoError(t, db.QueryRowContext(ctx, `
+		INSERT INTO error_occurrences (issue_id, environment, platform, created_at,
+			level, message, error_class, logger, server_name, transaction, dist, source, trace_flags, received_at,
+			sdk, event_user, tags, contexts, request, breadcrumbs, exception)
+		VALUES ($1, 'production', 'javascript', $2,
+			'warning', 'charge [REDACTED_PAN] failed', 'TypeError', 'checkout', 'web-1', '/checkout/pay', '4127', 'onerror', 1, $2,
+			'{"name":"sentinel.javascript","version":"1.8.0"}', '{"id":"u1","email":"a@b.co"}', '{"tenant_id":"acme"}',
+			'{"device":{"model":"Pixel 8"}}', '{"method":"POST","headers":{"Cookie":"***REDACTED***"}}',
+			'[{"message":"/cart -> /checkout"}]', '{"values":[{"type":"TypeError","value":"x"}]}')
+		RETURNING id`, issueID, createdAt).Scan(&v2))
+	return preV2, v2
+}
+
+// TestEventSchemaV2MigrationUpDownReplay is V4a (spec §9.2): the file replayed over a schema that
+// already has it, its exact shape, Down with seeded rows, the Up again, and a second fresh ledger.
+func TestEventSchemaV2MigrationUpDownReplay(t *testing.T) {
+	db := migTestDB(t, "eventv2")
+	ctx := context.Background()
+	absDir, err := filepath.Abs("../../packages/db-migrations/migrations")
+	require.NoError(t, err)
+	opts := dbmigrations.MigrationOptions{TableName: "eventv2_a_migrations", Directory: absDir}
+
+	// The clone is the whole directory applied (prod's schema by construction). A fresh ledger replays
+	// every file over it, this one included: the idempotency A1 makes routine.
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, eventV2MigrationVersion, opts),
+		"replaying the directory up to %d over a schema that already has it", eventV2MigrationVersion)
+	assertEventV2Shape(t, db)
+
+	preV2, v2 := seedEventV2Rows(t, db, "updown", time.Now())
+
+	// Down one step: the 17 columns and both index names go; both rows stay.
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "down", opts))
+	assertEventV2Gone(t, db)
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM error_occurrences WHERE id IN ($1, $2)`, preV2, v2).Scan(&n))
+	assert.Equal(t, 2, n, "Down drops columns, never rows")
+
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, eventV2MigrationVersion, opts), "Up again after Down")
+	assertEventV2Shape(t, db)
+
+	// The seeded issue has to go first: 1724400000's decision-7 guard refuses to run over a database
+	// that has any issue row, and the fresh ledger below replays it.
+	_, err = db.ExecContext(ctx, `
+		WITH o AS (DELETE FROM error_occurrences WHERE id IN ($1, $2) RETURNING issue_id)
+		DELETE FROM issues WHERE id IN (SELECT issue_id FROM o)`, preV2, v2)
+	require.NoError(t, err)
+
+	// A second fresh ledger replays the whole directory (A1: three targets, one physical database).
+	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "up",
+		dbmigrations.MigrationOptions{TableName: "eventv2_b_migrations", Directory: absDir}))
+	assertEventV2Shape(t, db)
+}
+
+// TestEventSchemaV2RetentionDeletesWholeRow is V4c: the statement retention.ts issues
+// (DELETE FROM error_occurrences WHERE created_at < $1 RETURNING id) removes an old occurrence with
+// every v2 column populated, its error_search_index row cascades, and a newer row is intact.
+func TestEventSchemaV2RetentionDeletesWholeRow(t *testing.T) {
+	db := migTestDB(t, "eventv2ret")
+	ctx := context.Background()
+	assertEventV2Shape(t, db)
+
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	oldPre, oldV2 := seedEventV2Rows(t, db, "retold", old)
+	newPre, newV2 := seedEventV2Rows(t, db, "retnew", time.Now())
+	_, err := db.ExecContext(ctx, `INSERT INTO error_search_index (occurrence_id, user_id, tenant_id) VALUES ($1, 'u1', 'acme'), ($2, 'u2', 'acme')`, oldV2, newV2)
+	require.NoError(t, err)
+
+	cutoff := time.Now().Add(-30 * 24 * time.Hour)
+	rows, err := db.QueryContext(ctx, `DELETE FROM error_occurrences WHERE created_at < $1 RETURNING id`, cutoff)
+	require.NoError(t, err)
+	var deleted []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		deleted = append(deleted, id)
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+	assert.ElementsMatch(t, []string{oldPre, oldV2}, deleted)
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM error_search_index WHERE occurrence_id = $1`, oldV2).Scan(&n))
+	assert.Equal(t, 0, n, "the search index row cascades with the occurrence")
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM error_search_index WHERE occurrence_id = $1`, newV2).Scan(&n))
+	assert.Equal(t, 1, n)
+
+	var tags, level string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT tags::text, level FROM error_occurrences WHERE id = $1`, newV2).Scan(&tags, &level))
+	assert.JSONEq(t, `{"tenant_id":"acme"}`, tags)
+	assert.Equal(t, "warning", level)
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT count(*) FROM error_occurrences WHERE id = $1`, newPre).Scan(&n))
+	assert.Equal(t, 1, n)
+}

@@ -1,0 +1,22 @@
+{
+  "capture-message.json": "777d8eed5e5121ae",
+  "component-stack-100kib.json": "88c84739c97f379a",
+  "environment-normalised.json": "4363331626946a0e",
+  "message-cut-code-point.json": "8f6848ad2126461f",
+  "metadata-near-the-cap.json": "8f6848ad2126461f",
+  "node-modules-frame.json": "88c84739c97f379a",
+  "normalizable-class.json": "003d7df4ba7a7e5b",
+  "pii-object-with-array.json": "4f584ae7b4ccf038",
+  "sdk-go-contract-event.json": "13989104f819b675",
+  "spidermonkey-stack.json": "34a812af908a0f66",
+  "stackless-non-error.json": "718e8a9b881702ac",
+  "traceparent-flags-01.json": "0caf1a2b3e676945",
+  "traceparent-flags-10.json": "0caf1a2b3e676945",
+  "turbopack-chunk-frame.json": "cf58c7a0a84fd473",
+  "v8-form-as-alias.json": "893b20d81ca5f884",
+  "v8-form-async.json": "0df68a28a2dbda5c",
+  "v8-form-eval-outer-location.json": "bbefc462db0cfef3",
+  "v8-form-new.json": "5509522e99405a9f",
+  "v8-form-object-anonymous.json": "66976ec262b1bf62",
+  "v8-stack.json": "3328bd0bf696556c"
+}

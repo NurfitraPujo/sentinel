@@ -173,6 +173,56 @@ export const AgentReportDetailSchema = z
 	})
 	.strict();
 
+// sentinel-event-schema-v2 §8.1: the inner objects describe the STORED wire JSON (snake_case, as
+// `stacktrace`/`metadata` already are) and are deliberately NOT strict -- a stored key this document does
+// not list must not fail the contract test. Every field is null on an occurrence written before the
+// feature (migration 1725300000). The outer object stays `.strict()`, the existing freeze.
+const OccurrenceSdkSchema = z.object({ name: z.string().optional(), version: z.string().optional() });
+
+const OccurrenceUserSchema = z.object({
+	id: z.string().optional(),
+	username: z.string().optional(),
+	email: z.string().optional(),
+	ip_address: z.string().optional(),
+	geo: z
+		.object({
+			city: z.string().optional(),
+			region: z.string().optional(),
+			country_code: z.string().optional(),
+			subdivision: z.string().optional(),
+		})
+		.optional(),
+});
+
+const OccurrenceRequestSchema = z.object({
+	method: z.string().optional(),
+	url: z.string().optional(),
+	query_string: z.string().optional(),
+	headers: z.record(z.string()).optional(),
+	data: z.unknown().optional(),
+	env: z.record(z.string()).optional(),
+});
+
+const OccurrenceBreadcrumbSchema = z.object({
+	timestamp: z.string().optional(),
+	type: z.string().optional(),
+	category: z.string().optional(),
+	level: z.string().optional(),
+	message: z.string().optional(),
+	data: z.record(z.unknown()).optional(),
+});
+
+const OccurrenceExceptionSchema = z.object({
+	values: z.array(
+		z.object({
+			type: z.string().optional(),
+			value: z.string().optional(),
+			mechanism: z.object({ type: z.string().optional(), handled: z.boolean().optional() }).optional(),
+			stacktrace: z.unknown().optional(),
+		})
+	),
+});
+
 export const AgentOccurrenceSchema = z
 	.object({
 		id: z.string(),
@@ -183,6 +233,26 @@ export const AgentOccurrenceSchema = z
 		metadata: z.unknown(),
 		traceId: z.string().nullable(),
 		createdAt: z.coerce.date().nullable(),
+		level: z.enum(['fatal', 'error', 'warning', 'info', 'debug']).nullable(),
+		message: z.string().nullable(),
+		errorClass: z.string().nullable(),
+		logger: z.string().nullable(),
+		serverName: z.string().nullable(),
+		transaction: z.string().nullable(),
+		dist: z.string().nullable(),
+		source: z.string().nullable(),
+		// bigint('trace_flags', { mode: 'number' }) in the Drizzle mirror -- a string here would fail.
+		traceFlags: z.number().int().nullable(),
+		receivedAt: z.coerce.date().nullable(),
+		sdk: OccurrenceSdkSchema.nullable(),
+		// Stored in the `event_user` column (`user` is reserved in PostgreSQL); the API field is `user`.
+		user: OccurrenceUserSchema.nullable(),
+		tags: z.record(z.string()).nullable(),
+		// A value is usually an object, but a context under a sensitive key is the string '***REDACTED***'.
+		contexts: z.record(z.unknown()).nullable(),
+		request: OccurrenceRequestSchema.nullable(),
+		breadcrumbs: z.array(OccurrenceBreadcrumbSchema).nullable(),
+		exception: OccurrenceExceptionSchema.nullable(),
 	})
 	.strict();
 

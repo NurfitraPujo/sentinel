@@ -1,0 +1,14 @@
+{
+  "event_id": "5d1f7a52-8c3e-4b0f-9a61-2e4c8b7d9f10",
+  "platform": "go",
+  "environment": "production",
+  "error_class": "Timeout after 123456ms on 7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "message": "upstream call timed out",
+  "timestamp": "2026-09-23T12:00:00Z",
+  "stacktrace": [
+    {"function": "billing.Charge", "file": "/srv/app/billing/charge.go", "line": 88, "in_app": true},
+    {"function": "billing.Handler", "file": "/srv/app/billing/handler.go", "line": 41, "in_app": true},
+    {"function": "net/http.HandlerFunc.ServeHTTP", "file": "/usr/local/go/src/net/http/server.go", "line": 2220, "in_app": false}
+  ],
+  "metadata": {"order_id": "123456789"}
+}

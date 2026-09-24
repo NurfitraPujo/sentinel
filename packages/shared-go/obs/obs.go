@@ -59,6 +59,11 @@ const (
 	// than service.MaxFutureSkew ahead, or more than service.MaxEventAge behind. Never records the
 	// value, the delta or the project as a label - only the fixed TimestampReason* below.
 	MetricIngestTimestampReplaced = "sentinel_ingest_timestamp_replaced_total"
+	// MetricIngestFieldsTruncated counts, per field, the events whose value the ingestor's bounds
+	// step (validation.ValidatePayload, sentinel-event-schema-v2 spec §4.2) truncated, dropped or
+	// replaced. One Add per field per event, labelled LabelField with a TruncatedField* value below —
+	// never the value, its length or the project.
+	MetricIngestFieldsTruncated = "sentinel_ingest_fields_truncated_total"
 
 	// The four sentinel-project-environments §12 instruments. They are declared here, beside the
 	// eight above, for the same B5 reason: infra's Prometheus rules (a THIRD repo — see decision 17)
@@ -179,6 +184,9 @@ const (
 	// differs from the value the SDK sent (raw.in_app).
 	LabelTo      = "to"
 	LabelChanged = "changed"
+	// LabelField is MetricIngestFieldsTruncated's one label: which field the bounds step cut, as a
+	// TruncatedField* value. Nothing else records it.
+	LabelField = "field"
 )
 
 // Permitted values for LabelOutcome. Fixed sets, so a typo at one call site cannot invent an eighth
@@ -320,3 +328,62 @@ const (
 	SourcemapUploadRejected     = "rejected"
 	SourcemapUploadStorageError = "storage_error"
 )
+
+// Permitted values for LabelField on MetricIngestFieldsTruncated, and the entries the ingestor writes
+// into metadata.server_truncated (sentinel-event-schema-v2 spec §4.2, "The vocabulary"). CLOSED: the
+// spec's vocabulary verbatim. TruncatedFieldVocabulary is also the emission order of the marker.
+const (
+	TruncatedFieldLevel               = "level"
+	TruncatedFieldLogger              = "logger"
+	TruncatedFieldServerName          = "server_name"
+	TruncatedFieldTransaction         = "transaction"
+	TruncatedFieldDist                = "dist"
+	TruncatedFieldSource              = "source"
+	TruncatedFieldSDK                 = "sdk"
+	TruncatedFieldUserID              = "user.id"
+	TruncatedFieldUserUsername        = "user.username"
+	TruncatedFieldUserEmail           = "user.email"
+	TruncatedFieldUserIPAddress       = "user.ip_address"
+	TruncatedFieldUserGeo             = "user.geo"
+	TruncatedFieldTags                = "tags"
+	TruncatedFieldContexts            = "contexts"
+	TruncatedFieldRequestMethod       = "request.method"
+	TruncatedFieldRequestURL          = "request.url"
+	TruncatedFieldRequestQueryString  = "request.query_string"
+	TruncatedFieldRequestHeaders      = "request.headers"
+	TruncatedFieldRequestEnv          = "request.env"
+	TruncatedFieldRequestData         = "request.data"
+	TruncatedFieldBreadcrumbs         = "breadcrumbs"
+	TruncatedFieldBreadcrumbsType     = "breadcrumbs.type"
+	TruncatedFieldBreadcrumbsCategory = "breadcrumbs.category"
+	TruncatedFieldBreadcrumbsLevel    = "breadcrumbs.level"
+	TruncatedFieldBreadcrumbsMessage  = "breadcrumbs.message"
+	TruncatedFieldBreadcrumbsData     = "breadcrumbs.data"
+	TruncatedFieldException           = "exception"
+	TruncatedFieldExceptionType       = "exception.type"
+	TruncatedFieldExceptionValue      = "exception.value"
+	TruncatedFieldExceptionMechanism  = "exception.mechanism"
+	TruncatedFieldExceptionStacktrace = "exception.stacktrace"
+	TruncatedFieldStacktraceModule    = "stacktrace.module"
+	TruncatedFieldStacktraceAbsPath   = "stacktrace.abs_path"
+	TruncatedFieldStacktraceContext   = "stacktrace.context"
+	TruncatedFieldMetadata            = "metadata"
+)
+
+// TruncatedFieldVocabulary returns the closed TruncatedField* set in the spec's order, which is the
+// order metadata.server_truncated lists its entries in. A fresh slice on every call.
+func TruncatedFieldVocabulary() []string {
+	return []string{
+		TruncatedFieldLevel, TruncatedFieldLogger, TruncatedFieldServerName, TruncatedFieldTransaction,
+		TruncatedFieldDist, TruncatedFieldSource, TruncatedFieldSDK, TruncatedFieldUserID,
+		TruncatedFieldUserUsername, TruncatedFieldUserEmail, TruncatedFieldUserIPAddress, TruncatedFieldUserGeo,
+		TruncatedFieldTags, TruncatedFieldContexts, TruncatedFieldRequestMethod, TruncatedFieldRequestURL,
+		TruncatedFieldRequestQueryString, TruncatedFieldRequestHeaders, TruncatedFieldRequestEnv,
+		TruncatedFieldRequestData, TruncatedFieldBreadcrumbs, TruncatedFieldBreadcrumbsType,
+		TruncatedFieldBreadcrumbsCategory, TruncatedFieldBreadcrumbsLevel, TruncatedFieldBreadcrumbsMessage,
+		TruncatedFieldBreadcrumbsData, TruncatedFieldException, TruncatedFieldExceptionType,
+		TruncatedFieldExceptionValue, TruncatedFieldExceptionMechanism, TruncatedFieldExceptionStacktrace,
+		TruncatedFieldStacktraceModule, TruncatedFieldStacktraceAbsPath, TruncatedFieldStacktraceContext,
+		TruncatedFieldMetadata,
+	}
+}

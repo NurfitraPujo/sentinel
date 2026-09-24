@@ -148,21 +148,64 @@ export interface AgentOccurrence {
 	metadata: unknown;
 	traceId: string | null;
 	createdAt: Date | null;
+	// sentinel-event-schema-v2 §8.1: the per-occurrence v2 fields (migration 1725300000). Every one is
+	// null on a row written before that release. The JSONB bodies are the stored wire JSON, snake_case.
+	level: string | null;
+	message: string | null;
+	errorClass: string | null;
+	logger: string | null;
+	serverName: string | null;
+	transaction: string | null;
+	dist: string | null;
+	source: string | null;
+	traceFlags: number | null;
+	receivedAt: Date | null;
+	sdk: unknown;
+	user: unknown;
+	tags: unknown;
+	contexts: unknown;
+	request: unknown;
+	breadcrumbs: unknown;
+	exception: unknown;
 }
+
+/**
+ * The one column object both agent occurrence reads select (sentinel-event-schema-v2 §8.1), so the
+ * latest-occurrence read and the paged list cannot drift apart -- they used to be two identical copies.
+ * `user` is read from the `event_user` column (`user` is a reserved word in PostgreSQL).
+ */
+export const agentOccurrenceColumns = {
+	id: errorOccurrences.id,
+	environment: errorOccurrences.environment,
+	platform: errorOccurrences.platform,
+	releaseVersion: errorOccurrences.releaseVersion,
+	stacktrace: errorOccurrences.stacktrace,
+	metadata: errorOccurrences.metadata,
+	traceId: errorOccurrences.traceId,
+	createdAt: errorOccurrences.createdAt,
+	level: errorOccurrences.level,
+	message: errorOccurrences.message,
+	errorClass: errorOccurrences.errorClass,
+	logger: errorOccurrences.logger,
+	serverName: errorOccurrences.serverName,
+	transaction: errorOccurrences.transaction,
+	dist: errorOccurrences.dist,
+	source: errorOccurrences.source,
+	traceFlags: errorOccurrences.traceFlags,
+	receivedAt: errorOccurrences.receivedAt,
+	sdk: errorOccurrences.sdk,
+	user: errorOccurrences.eventUser,
+	tags: errorOccurrences.tags,
+	contexts: errorOccurrences.contexts,
+	request: errorOccurrences.request,
+	breadcrumbs: errorOccurrences.breadcrumbs,
+	exception: errorOccurrences.exception,
+};
 
 /** `system_error` issues only -- most recent occurrence, or null if none exist. */
 export async function getLatestAgentOccurrence(issueId: string): Promise<AgentOccurrence | null> {
 	const rows = await db
-		.select({
-			id: errorOccurrences.id,
-			environment: errorOccurrences.environment,
-			platform: errorOccurrences.platform,
-			releaseVersion: errorOccurrences.releaseVersion,
-			stacktrace: errorOccurrences.stacktrace,
-			metadata: errorOccurrences.metadata,
-			traceId: errorOccurrences.traceId,
-			createdAt: errorOccurrences.createdAt,
-		})
+		.select(agentOccurrenceColumns)
 		.from(errorOccurrences)
 		.where(eq(errorOccurrences.issueId, issueId))
 		.orderBy(desc(errorOccurrences.createdAt))
@@ -190,16 +233,7 @@ export async function listAgentOccurrences(options: ListAgentOccurrencesOptions)
 	}
 
 	const rows = await db
-		.select({
-			id: errorOccurrences.id,
-			environment: errorOccurrences.environment,
-			platform: errorOccurrences.platform,
-			releaseVersion: errorOccurrences.releaseVersion,
-			stacktrace: errorOccurrences.stacktrace,
-			metadata: errorOccurrences.metadata,
-			traceId: errorOccurrences.traceId,
-			createdAt: errorOccurrences.createdAt,
-		})
+		.select(agentOccurrenceColumns)
 		.from(errorOccurrences)
 		.where(and(...conditions))
 		.orderBy(desc(errorOccurrences.createdAt))

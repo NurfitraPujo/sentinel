@@ -1,0 +1,38 @@
+{
+  "event_id": "7cdbe8e8-1bac-4b41-bb0d-4917ff210a1f",
+  "project_key": "contract-test-project",
+  "platform": "go",
+  "error_class": "*errors.errorString",
+  "message": "contract probe: simulated failure for wire-contract verification",
+  "stacktrace": [
+    {
+      "function": "github.com/NurfitraPujo/sentinel/tests/contract.buildFullyPopulatedEvent",
+      "file": "/home/runner/work/sentinel/sentinel/tests/contract/sdk_ingestor_test.go",
+      "line": 71,
+      "in_app": true
+    },
+    {
+      "function": "github.com/NurfitraPujo/sentinel/tests/contract.TestSDKToIngestorContract_SingleEvent",
+      "file": "/home/runner/work/sentinel/sentinel/tests/contract/sdk_ingestor_test.go",
+      "line": 259,
+      "in_app": true
+    },
+    {
+      "function": "testing.tRunner",
+      "file": "/opt/hostedtoolcache/go/1.26.4/x64/src/testing/testing.go",
+      "line": 2036,
+      "in_app": false
+    }
+  ],
+  "timestamp": "2026-09-23T14:19:54.901622476Z",
+  "environment": "production",
+  "release_version": "1.4.2",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "trace_flags": 0,
+  "metadata": {
+    "plan": "enterprise",
+    "region": "us-east-1",
+    "user_id": "u_00000000-0000-0000-0000-000000000000"
+  }
+}

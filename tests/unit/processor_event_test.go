@@ -9,7 +9,6 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/fingerprint"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
-	"github.com/NurfitraPujo/sentinel/apps/processor-go/normalizer"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/golang/protobuf/proto"
@@ -410,7 +409,10 @@ func TestDeserialize_RecomputesProvidedFingerprintWhenOverrideIsTrue(t *testing.
 	assert.NotEqual(t, "provided-fingerprint", got.Fingerprint)
 }
 
-func TestNormalize_NormalizesThenMasksEventFields(t *testing.T) {
+// TestPrepare_StoresVerbatim is V6b (sentinel-event-schema-v2 §6.2, TASK-06), replacing
+// TestNormalize_NormalizesThenMasksEventFields on the same input: stored values keep paths, ids and
+// UUIDs verbatim (decision 5: normalization is for grouping only), and masking still applies.
+func TestPrepare_StoresVerbatim(t *testing.T) {
 	subject := &event.ErrorEvent{
 		Message:    "failed at /home/johndoe/config with api_key: abcdefghijklmnopqrstuv",
 		ErrorClass: "Failure 123456789",
@@ -419,18 +421,20 @@ func TestNormalize_NormalizesThenMasksEventFields(t *testing.T) {
 		Metadata: map[string]interface{}{
 			"path":     "/home/johndoe/project",
 			"password": "supersecret",
+			"note":     "password: hunter2hunter2",
 		},
 	}
 
-	subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+	subject.Prepare(masker.NewMasker())
 
-	assert.Equal(t, "failed at /<USER_PATH>/config with api_key=***REDACTED***", subject.Message)
-	assert.Equal(t, "Failure <NUMERIC_ID>", subject.ErrorClass)
-	assert.Equal(t, "<UUID>", subject.TraceID)
-	assert.Equal(t, "<HEX_ADDR>", subject.SpanID)
+	assert.Equal(t, "failed at /home/johndoe/config with api_key=***REDACTED***", subject.Message)
+	assert.Equal(t, "Failure 123456789", subject.ErrorClass)
+	assert.Equal(t, "123e4567-e89b-12d3-a456-426614174000", subject.TraceID)
+	assert.Equal(t, "0xabcdef123456", subject.SpanID)
 	assert.Equal(t, map[string]interface{}{
-		"path":     "/<USER_PATH>/project",
+		"path":     "/home/johndoe/project",
 		"password": "***REDACTED***",
+		"note":     "password=***REDACTED***",
 	}, subject.Metadata)
 }
 
@@ -449,14 +453,14 @@ func affectedProtoEvent(t *testing.T, metadata map[string]interface{}) *sentinel
 	return protoEvent
 }
 
-// TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical is the sentinel-affected-users twin of
+// TestDeserialize_AffectedIDsSurvivePrepareByteIdentical is the sentinel-affected-users twin of
 // TestDeserialize_EventIDSurvivesNormalizeByteIdentical (contract §11, boundary 3; decisions 3 and 6):
-// the three id shapes the normaliser destroys — a UUID ("<UUID>"), a run of >= 6 digits
-// ("<NUMERIC_ID>") and an email ("<EMAIL>") — must come out of Deserialize+Normalize on
-// AffectedUserID / AffectedTenantID byte-for-byte identical to what went in, while the SAME values
-// in the metadata map are rewritten as they always were. This test MUST fail if either field is ever
-// added to Normalize's rewrite list; the field comment in event.go names it for exactly that reason.
-func TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical(t *testing.T) {
+// the three id shapes the normaliser used to destroy — a UUID ("<UUID>"), a run of >= 6 digits
+// ("<NUMERIC_ID>") and an email ("<EMAIL>") — must come out of Deserialize+Prepare on
+// AffectedUserID / AffectedTenantID byte-for-byte identical to what went in. Since
+// sentinel-event-schema-v2 (decision 5) the metadata map keeps them verbatim too. This test MUST fail
+// if either field is ever normalised or masked; the field comment in event.go names it for that reason.
+func TestDeserialize_AffectedIDsSurvivePrepareByteIdentical(t *testing.T) {
 	t.Run("uuid user_id and 7-digit tenant_id", func(t *testing.T) {
 		got, err := event.Deserialize(marshalProtoEvent(t, affectedProtoEvent(t, map[string]interface{}{
 			"user_id":   "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -472,11 +476,11 @@ func TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical(t *testing.T) {
 		assert.Empty(t, got.AffectedUserSkipReason)
 		assert.Empty(t, got.AffectedTenantSkipReason)
 
-		// The map itself is still normalised — the read happens BEFORE NormalizeMap, it does not
-		// exempt the metadata from it (decision 13's security review point iii: the masker and
-		// normaliser still run on metadata).
-		assert.Equal(t, "<UUID>", got.Metadata["user_id"])
-		assert.Equal(t, "<NUMERIC_ID>", got.Metadata["tenant_id"])
+		// The map is no longer normalised (sentinel-event-schema-v2 decision 5): it keeps the UUID and
+		// the 7-digit id verbatim. The masker still runs on it (neither value is PAN-shaped or under a
+		// sensitive key).
+		assert.Equal(t, "7c9e6679-7425-40de-944b-e07fc1f90ae7", got.Metadata["user_id"])
+		assert.Equal(t, "1234567", got.Metadata["tenant_id"])
 	})
 
 	t.Run("email under the user key", func(t *testing.T) {
@@ -487,15 +491,15 @@ func TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical(t *testing.T) {
 
 		assert.Equal(t, "alice@example.com", got.AffectedUserID,
 			"an email id must survive byte-identical — \"<EMAIL>\" means it was normalised or masked")
-		assert.Equal(t, "<EMAIL>", got.Metadata["user"])
+		assert.Equal(t, "alice@example.com", got.Metadata["user"])
 	})
 }
 
-// TestNormalize_ReadsAffectedIDsBeforeNormalizeMap pins the PLACE of the read (contract §4.3: "before
-// the MaskMap(NormalizeMap(…)) line, exactly where release_version is read") on a hand-built event,
-// without Deserialize in the way: the fields hold the raw values and the map holds the placeholders
-// after one Normalize call.
-func TestNormalize_ReadsAffectedIDsBeforeNormalizeMap(t *testing.T) {
+// TestPrepare_ReadsAffectedIDsBeforeMasking pins the PLACE of the read (contract §4.3, and
+// sentinel-event-schema-v2 §6.2 step 2) on a hand-built event, without Deserialize in the way: the
+// fields hold the raw values, and the map keeps them verbatim (neither is PAN-shaped or under a
+// sensitive key).
+func TestPrepare_ReadsAffectedIDsBeforeMasking(t *testing.T) {
 	subject := &event.ErrorEvent{
 		Metadata: map[string]interface{}{
 			"userId":   "9f1c2a3b-4d5e-4f60-8a7b-1c2d3e4f5a6b",
@@ -503,12 +507,12 @@ func TestNormalize_ReadsAffectedIDsBeforeNormalizeMap(t *testing.T) {
 		},
 	}
 
-	subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+	subject.Prepare(masker.NewMasker())
 
 	assert.Equal(t, "9f1c2a3b-4d5e-4f60-8a7b-1c2d3e4f5a6b", subject.AffectedUserID)
 	assert.Equal(t, "9876543", subject.AffectedTenantID)
-	assert.Equal(t, "<UUID>", subject.Metadata["userId"])
-	assert.Equal(t, "<NUMERIC_ID>", subject.Metadata["tenantId"])
+	assert.Equal(t, "9f1c2a3b-4d5e-4f60-8a7b-1c2d3e4f5a6b", subject.Metadata["userId"])
+	assert.Equal(t, "9876543", subject.Metadata["tenantId"])
 }
 
 // TestNormalize_AffectedIDPrecedenceIsTheIndexersVerbatim pins decision 24: the key precedence is
@@ -518,27 +522,27 @@ func TestNormalize_ReadsAffectedIDsBeforeNormalizeMap(t *testing.T) {
 func TestNormalize_AffectedIDPrecedenceIsTheIndexersVerbatim(t *testing.T) {
 	t.Run("empty user_id beats a good userId and is counted as empty", func(t *testing.T) {
 		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"user_id": "", "userId": "u1"}}
-		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		subject.Prepare(masker.NewMasker())
 		assert.Empty(t, subject.AffectedUserID, "the indexer's precedence picks user_id even when it is empty")
 		assert.Equal(t, obs.AffectedRollupReasonEmpty, subject.AffectedUserSkipReason)
 	})
 
 	t.Run("a non-string user_id falls through to userId", func(t *testing.T) {
 		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"user_id": 42.0, "userId": "u1"}}
-		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		subject.Prepare(masker.NewMasker())
 		assert.Equal(t, "u1", subject.AffectedUserID)
 		assert.Empty(t, subject.AffectedUserSkipReason)
 	})
 
 	t.Run("organization_id is the last tenant key", func(t *testing.T) {
 		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"organization_id": "org-7"}}
-		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		subject.Prepare(masker.NewMasker())
 		assert.Equal(t, "org-7", subject.AffectedTenantID)
 	})
 
 	t.Run("no key at all is absent, not empty", func(t *testing.T) {
 		subject := &event.ErrorEvent{Metadata: map[string]interface{}{"path": "/tmp"}}
-		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		subject.Prepare(masker.NewMasker())
 		assert.Empty(t, subject.AffectedUserID)
 		assert.Empty(t, subject.AffectedUserSkipReason, "no key present must increment nothing — reason stays \"\"")
 		assert.Empty(t, subject.AffectedTenantID)
@@ -547,7 +551,7 @@ func TestNormalize_AffectedIDPrecedenceIsTheIndexersVerbatim(t *testing.T) {
 
 	t.Run("nil metadata leaves everything empty", func(t *testing.T) {
 		subject := &event.ErrorEvent{}
-		subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+		subject.Prepare(masker.NewMasker())
 		assert.Empty(t, subject.AffectedUserID)
 		assert.Empty(t, subject.AffectedUserSkipReason)
 	})
@@ -613,14 +617,16 @@ func TestDeserialize_UnusableAffectedIDsAreDroppedNotFailed(t *testing.T) {
 	assert.Equal(t, obs.AffectedRollupReasonControlChar, got.AffectedUserSkipReason)
 }
 
-func TestNormalize_NormalizesBeforeMasking(t *testing.T) {
+// TestPrepare_MasksWithoutNormalizing replaces TestNormalize_NormalizesBeforeMasking
+// (sentinel-event-schema-v2 §6.7): nothing normalises the number into "<NUMERIC_ID>" first any more, so
+// the masker sees the value as sent. It is a single 20-digit group, which the PAN rule leaves alone
+// (more than 19 digits is never a PAN), and the existing api_key pattern redacts it.
+func TestPrepare_MasksWithoutNormalizing(t *testing.T) {
 	subject := &event.ErrorEvent{Message: "api_key: 12345678901234567890"}
 
-	subject.Normalize(normalizer.NewNormalizer(), masker.NewMasker())
+	subject.Prepare(masker.NewMasker())
 
-	// The numeric value is normalized first. The masker's API-key pattern no
-	// longer matches the resulting angle-bracket placeholder.
-	assert.Equal(t, "api_key: <NUMERIC_ID>", subject.Message)
+	assert.Equal(t, "api_key=***REDACTED***", subject.Message)
 }
 
 func TestStructpbToMap_NilReturnsNil(t *testing.T) {
@@ -639,4 +645,142 @@ func TestStructpbToMap_ConvertsMixedValues(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, input, structpbToMap(value))
+}
+
+// ---------------------------------------------------------------------------------------------------
+// sentinel-event-schema-v2 §6.2/§6.3/§6.7 — Prepare over the v2 fields
+// ---------------------------------------------------------------------------------------------------
+
+// TestPrepare_MasksV2Fields is V5b: one assertion per masked row of spec §6.2 (P3, P4, P10, P11 in a
+// breadcrumb message and an exception value, P14 tags); user, sdk and the labels verbatim; a context
+// under a sensitive key redacted whole.
+func TestPrepare_MasksV2Fields(t *testing.T) {
+	handled := false
+	subject := &event.ErrorEvent{
+		Message:     "charge 4111111111111111 failed",
+		Level:       "warning",
+		Logger:      "checkout",
+		ServerName:  "web-1",
+		Transaction: "/checkout/pay",
+		Dist:        "4127",
+		Source:      "onerror",
+		SDK:         &event.SDK{Name: "sentinel.javascript.browser", Version: "1.8.0"},
+		User:        &event.User{ID: "u1", Username: "4111111111111111", Email: "alice@example.com", IPAddress: "10.0.0.1", Geo: &event.Geo{City: "Berlin"}},
+		Tags:        map[string]string{"auth_method": "otp", "tenant_id": "4111111111111111", "region": "eu"},
+		Contexts: map[string]interface{}{
+			"device": map[string]interface{}{"model": "Pixel 8"},
+			"auth":   map[string]interface{}{"provider": "okta"},
+		},
+		Request: &event.Request{
+			URL:         "https://shop.example.com/pay?token=abcdefghijklmnopqrstuvwxyz",
+			QueryString: "card=4111111111111111",
+			Headers: map[string]string{
+				"Authorization": "Bearer x",
+				"Cookie":        "sid=abc",
+				"Set-Cookie":    "sid=abc; HttpOnly",
+				"X-API-Key":     "sk_live_x",
+				"User-Agent":    "Mozilla/5.0",
+			},
+			Data: map[string]interface{}{"password": "hunter2", "amount": 42.0},
+			Env:  map[string]string{"SECRET_KEY": "s3", "REMOTE_ADDR": "10.1.2.3"},
+		},
+		Breadcrumbs: []event.Breadcrumb{{
+			Message: "paid with 4111-1111-1111-1111",
+			Data:    map[string]interface{}{"password": "p", "status_code": 402.0},
+		}},
+		Exception: &event.Exception{Values: []event.ExceptionValue{{
+			Type: "PaymentDeclined", Value: "card 4111 1111 1111 1111 declined",
+			Mechanism: &event.Mechanism{Type: "onerror", Handled: &handled},
+		}}},
+	}
+
+	subject.Prepare(masker.NewMasker())
+
+	assert.Equal(t, "charge [REDACTED_PAN] failed", subject.Message, "P11: message")
+	assert.Equal(t, "***REDACTED***", subject.Request.Headers["Authorization"], "P3")
+	assert.Equal(t, "***REDACTED***", subject.Request.Headers["Cookie"], "P10")
+	assert.Equal(t, "***REDACTED***", subject.Request.Headers["Set-Cookie"], "P10")
+	assert.Equal(t, "***REDACTED***", subject.Request.Headers["X-API-Key"], "P10")
+	assert.Equal(t, "Mozilla/5.0", subject.Request.Headers["User-Agent"])
+	assert.Equal(t, "https://shop.example.com/pay?token=***REDACTED***", subject.Request.URL)
+	assert.Equal(t, "card=[REDACTED_PAN]", subject.Request.QueryString)
+	assert.Equal(t, map[string]interface{}{"password": "***REDACTED***", "amount": 42.0}, subject.Request.Data)
+	assert.Equal(t, map[string]string{"SECRET_KEY": "***REDACTED***", "REMOTE_ADDR": "10.1.2.3"}, subject.Request.Env)
+	assert.Equal(t, "paid with [REDACTED_PAN]", subject.Breadcrumbs[0].Message, "P11: breadcrumb message")
+	assert.Equal(t, map[string]interface{}{"password": "***REDACTED***", "status_code": 402.0}, subject.Breadcrumbs[0].Data, "P4")
+	assert.Equal(t, "card [REDACTED_PAN] declined", subject.Exception.Values[0].Value, "P11: exception value")
+	assert.Equal(t, "PaymentDeclined", subject.Exception.Values[0].Type)
+	assert.Equal(t, map[string]interface{}{"model": "Pixel 8"}, subject.Contexts["device"], "P5")
+	assert.Equal(t, "***REDACTED***", subject.Contexts["auth"], "a context under a sensitive key is redacted whole")
+	assert.Equal(t, map[string]string{"auth_method": "***REDACTED***", "tenant_id": "[REDACTED_PAN]", "region": "eu"}, subject.Tags, "P14")
+
+	// Stored as sent: user (decision 1), sdk, the labels.
+	assert.Equal(t, &event.User{ID: "u1", Username: "4111111111111111", Email: "alice@example.com", IPAddress: "10.0.0.1", Geo: &event.Geo{City: "Berlin"}}, subject.User)
+	assert.Equal(t, &event.SDK{Name: "sentinel.javascript.browser", Version: "1.8.0"}, subject.SDK)
+	assert.Equal(t, []string{"warning", "checkout", "web-1", "/checkout/pay", "4127", "onerror"},
+		[]string{subject.Level, subject.Logger, subject.ServerName, subject.Transaction, subject.Dist, subject.Source})
+	assert.False(t, *subject.Exception.Values[0].Mechanism.Handled)
+
+	t.Run("request.data shapes: array, string, scalar", func(t *testing.T) {
+		for _, tc := range []struct{ in, want interface{} }{
+			{[]interface{}{map[string]interface{}{"token": "t"}, "4111111111111111"}, []interface{}{map[string]interface{}{"token": "***REDACTED***"}, "[REDACTED_PAN]"}},
+			{"pwd=hunter2hunter2", "pwd=***REDACTED***"},
+			{42.0, 42.0},
+		} {
+			e := &event.ErrorEvent{Request: &event.Request{Data: tc.in}}
+			e.Prepare(masker.NewMasker())
+			assert.Equal(t, tc.want, e.Request.Data)
+		}
+	})
+}
+
+// TestPrepare_AffectedIDPrecedence is V5c (spec §6.3, OQ-3): the typed user.id and the tenant_id tag
+// take precedence over metadata; an unusable typed value wins without fallback; and the read happens
+// on the raw value, before tags are masked (P14).
+func TestPrepare_AffectedIDPrecedence(t *testing.T) {
+	prep := func(e *event.ErrorEvent) *event.ErrorEvent {
+		e.Prepare(masker.NewMasker())
+		return e
+	}
+	t.Run("typed user.id only", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{User: &event.User{ID: "u1"}})
+		assert.Equal(t, "u1", e.AffectedUserID)
+	})
+	t.Run("metadata only: unchanged from before", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{Metadata: map[string]interface{}{"user_id": "u2", "tenant_id": "t2"}})
+		assert.Equal(t, "u2", e.AffectedUserID)
+		assert.Equal(t, "t2", e.AffectedTenantID)
+	})
+	t.Run("both: the typed value wins (P7)", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{User: &event.User{ID: "u1"}, Metadata: map[string]interface{}{"user_id": "u2"}})
+		assert.Equal(t, "u1", e.AffectedUserID)
+		assert.Empty(t, e.AffectedUserSkipReason)
+	})
+	t.Run("an empty typed id falls back to metadata", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{User: &event.User{Email: "a@b.co"}, Metadata: map[string]interface{}{"user_id": "u2"}})
+		assert.Equal(t, "u2", e.AffectedUserID)
+	})
+	t.Run("a typed id with a control character wins, unusable, with no fallback", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{User: &event.User{ID: "u\x011"}, Metadata: map[string]interface{}{"user_id": "u2"}})
+		assert.Empty(t, e.AffectedUserID)
+		assert.Equal(t, obs.AffectedRollupReasonControlChar, e.AffectedUserSkipReason)
+	})
+	t.Run("the tenant_id tag beats metadata", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{Tags: map[string]string{"tenant_id": "tag-t"}, Metadata: map[string]interface{}{"tenant_id": "meta-t"}})
+		assert.Equal(t, "tag-t", e.AffectedTenantID)
+	})
+	t.Run("P14: a PAN-shaped tenant tag reaches the rollup raw and is stored redacted", func(t *testing.T) {
+		e := prep(&event.ErrorEvent{Tags: map[string]string{"auth_method": "otp", "tenant_id": "4111111111111111", "region": "eu"}})
+		assert.Equal(t, "4111111111111111", e.AffectedTenantID)
+		assert.Equal(t, map[string]string{"auth_method": "***REDACTED***", "tenant_id": "[REDACTED_PAN]", "region": "eu"}, e.Tags)
+	})
+	t.Run("through Deserialize: the typed id reaches the search-index value too", func(t *testing.T) {
+		protoEvent := affectedProtoEvent(t, map[string]interface{}{"user_id": "meta-user"})
+		protoEvent.User = &sentinelv1.User{Id: "typed-user"}
+		protoEvent.Tags = map[string]string{"tenant_id": "typed-tenant"}
+		got, err := event.Deserialize(marshalProtoEvent(t, protoEvent))
+		require.NoError(t, err)
+		assert.Equal(t, "typed-user", got.AffectedUserID)
+		assert.Equal(t, "typed-tenant", got.AffectedTenantID)
+	})
 }

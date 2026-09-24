@@ -62,21 +62,21 @@ type ErrorEvent struct {
 	Timestamp      time.Time              `json:"timestamp"`
 	TraceFlags     uint32                 `json:"trace_flags"`
 	// EventID is the idempotency key (proto field 17, docs/plans/IDEMPOTENCY_PLAN.md D-a/D-h). Copied
-	// in Deserialize's struct literal alongside ProjectID/ReleaseVersion, BEFORE Normalize runs, and
+	// in Deserialize's struct literal alongside ProjectID/ReleaseVersion, BEFORE Prepare runs, and
 	// MUST NEVER be passed through normalizer.NormalizeString or masker.MaskString: the normalizer's
-	// regexes rewrite UUIDs to the literal "<UUID>" and >=6-digit runs to "<NUMERIC_ID>" (see
-	// TraceID/SpanID below in Normalize), which would collide every event in an issue onto one key —
+	// regexes rewrite UUIDs to the literal "<UUID>" and >=6-digit runs to "<NUMERIC_ID>" (as TraceID
+	// and SpanID were until sentinel-event-schema-v2), which would collide every event in an issue onto one key —
 	// the identical failure mode as F-TX-1 (D-b's NULLIF gap), on the fully-upgraded path (F-CT-2, B6
 	// verbatim). If you are tempted to add a line normalizing/masking this field here, don't — that is
 	// exactly the bug this comment exists to prevent, and it is pinned by a unit test that must fail
-	// if EventID is ever added to Normalize's field list.
+	// if EventID is ever added to Prepare's field list.
 	EventID string `json:"event_id"`
 	// AffectedUserID / AffectedTenantID feed the per-issue affected users/tenants rollup
 	// (sentinel-affected-users §4.3, decision 3) and, from the same release, error_search_index's
-	// user_id/tenant_id columns (decisions 13/19). They are read in Normalize BEFORE
-	// `e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))` runs — exactly where the
-	// release_version fallback is read, and for the same reason (VERIFIED_STATE.md S5 / B6): the
-	// normalizer rewrites every UUID in the map to the literal "<UUID>", every run of >= 6 digits to
+	// user_id/tenant_id columns (decisions 13/19). They are read in Prepare, from raw values, BEFORE
+	// `e.Metadata = masker.MaskMap(e.Metadata)` runs — exactly where the release_version fallback is
+	// read. The reason it was introduced (VERIFIED_STATE.md S5 / B6) was that the normalizer, which ran
+	// over the stored map until sentinel-event-schema-v2, rewrites every UUID in the map to the literal "<UUID>", every run of >= 6 digits to
 	// "<NUMERIC_ID>" and every email to "<EMAIL>", so a rollup fed from the post-normalisation map
 	// would count exactly one affected user — "<UUID>" — per issue (contract §1's second fact). The
 	// key precedence is indexer.UserIDFromMetadata / TenantIDFromMetadata, the search index's own,
@@ -88,12 +88,96 @@ type ErrorEvent struct {
 	// Like EventID above, these MUST NEVER be passed through normalizer.NormalizeString or
 	// masker.MaskString: identity is the exact byte string (decision 6), and a normalised id is the
 	// bug this feature exists to route around. If you are tempted to add a line normalising or
-	// masking either field in Normalize, don't — tests/unit/processor_event_test.go's
-	// TestDeserialize_AffectedIDsSurviveNormalizeByteIdentical fails the moment you do.
+	// masking either field in Prepare, don't — tests/unit/processor_event_test.go's
+	// TestDeserialize_AffectedIDsSurvivePrepareByteIdentical fails the moment you do.
 	AffectedUserID           string `json:"affected_user_id"`
 	AffectedUserSkipReason   string `json:"affected_user_skip_reason,omitempty"`
 	AffectedTenantID         string `json:"affected_tenant_id"`
 	AffectedTenantSkipReason string `json:"affected_tenant_skip_reason,omitempty"`
+
+	// ---- sentinel-event-schema-v2 §6.1 (TASK-05): the v2 fields, copied off the proto by Deserialize
+	// and stored per occurrence. JSON tags are the wire names with omitempty, so the processor's JSONB
+	// marshalling produces spec §5.2's shapes (proto field names, empty values omitted).
+	Level       string                 `json:"level,omitempty"`
+	Logger      string                 `json:"logger,omitempty"`
+	ServerName  string                 `json:"server_name,omitempty"`
+	Transaction string                 `json:"transaction,omitempty"`
+	Dist        string                 `json:"dist,omitempty"`
+	Source      string                 `json:"source,omitempty"`
+	SDK         *SDK                   `json:"sdk,omitempty"`
+	User        *User                  `json:"user,omitempty"`
+	Tags        map[string]string      `json:"tags,omitempty"`
+	Contexts    map[string]interface{} `json:"contexts,omitempty"`
+	Request     *Request               `json:"request,omitempty"`
+	Breadcrumbs []Breadcrumb           `json:"breadcrumbs,omitempty"`
+	Exception   *Exception             `json:"exception,omitempty"`
+	// ReceivedAt is proto field 30, the ingestor's T_recv; zero for a message published before the
+	// ingestor carried it (a DLQ replay), which the occurrence stores as NULL.
+	ReceivedAt time.Time `json:"received_at,omitempty"`
+}
+
+// SDK mirrors sentinel.v1.Sdk. Stored as sent.
+type SDK struct {
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// User mirrors sentinel.v1.User. Stored as sent (contract decision 1): never masked.
+type User struct {
+	ID        string `json:"id,omitempty"`
+	Username  string `json:"username,omitempty"`
+	Email     string `json:"email,omitempty"`
+	IPAddress string `json:"ip_address,omitempty"`
+	Geo       *Geo   `json:"geo,omitempty"`
+}
+
+// Geo mirrors sentinel.v1.Geo.
+type Geo struct {
+	City        string `json:"city,omitempty"`
+	Region      string `json:"region,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+	Subdivision string `json:"subdivision,omitempty"`
+}
+
+// Request mirrors sentinel.v1.Request. Data is any JSON value (object, array, string, number, bool).
+type Request struct {
+	Method      string            `json:"method,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	QueryString string            `json:"query_string,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Data        interface{}       `json:"data,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
+// Breadcrumb mirrors sentinel.v1.Breadcrumb. Timestamp is RFC 3339 (UTC), "" when the crumb had none.
+type Breadcrumb struct {
+	Timestamp string                 `json:"timestamp,omitempty"`
+	Type      string                 `json:"type,omitempty"`
+	Category  string                 `json:"category,omitempty"`
+	Level     string                 `json:"level,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+}
+
+// Exception mirrors sentinel.v1.ExceptionInterface, Sentry's {"values": [...]}: oldest first, the
+// exception that was raised LAST. Evidence only: it is never a fingerprint input (spec §6.4, OQ-2).
+type Exception struct {
+	Values []ExceptionValue `json:"values"`
+}
+
+// ExceptionValue mirrors sentinel.v1.ExceptionValue. Stacktrace is in Sentinel's frame order,
+// crashing frame first, like ErrorEvent.Stacktrace.
+type ExceptionValue struct {
+	Type       string       `json:"type,omitempty"`
+	Value      string       `json:"value,omitempty"`
+	Mechanism  *Mechanism   `json:"mechanism,omitempty"`
+	Stacktrace []StackFrame `json:"stacktrace,omitempty"`
+}
+
+// Mechanism mirrors sentinel.v1.Mechanism. Handled is tri-state: absent / true / false.
+type Mechanism struct {
+	Type    string `json:"type,omitempty"`
+	Handled *bool  `json:"handled,omitempty"`
 }
 
 type StackFrame struct {
@@ -115,43 +199,126 @@ type StackFrame struct {
 	// `frame.symbolicated === true`; Raw holds the file/line/column/function the SDK sent.
 	Symbolicated bool                  `json:"symbolicated,omitempty"`
 	Raw          *symbolicate.RawFrame `json:"raw,omitempty"`
+	// sentinel-event-schema-v2 §3.2: proto StackFrame fields 6-10. omitempty, so a pre-v2 frame
+	// serialises byte-identically into error_occurrences.stacktrace (the Column argument above).
+	Module      string   `json:"module,omitempty"`
+	AbsPath     string   `json:"abs_path,omitempty"`
+	ContextLine string   `json:"context_line,omitempty"`
+	PreContext  []string `json:"pre_context,omitempty"`
+	PostContext []string `json:"post_context,omitempty"`
 }
 
-func (e *ErrorEvent) Normalize(normalizer *normalizer.Normalizer, masker *masker.Masker) {
-	e.Message = normalizer.NormalizeString(e.Message)
-	e.Message = masker.MaskString(e.Message)
-	e.ErrorClass = normalizer.NormalizeString(e.ErrorClass)
-	e.TraceID = normalizer.NormalizeString(e.TraceID)
-	e.SpanID = normalizer.NormalizeString(e.SpanID)
-	if e.Metadata != nil {
-		// Read the legacy release_version-in-metadata fallback BEFORE
-		// NormalizeMap runs, not after (VERIFIED_STATE.md S5 / B6:
-		// normalizer.versionRegex rewrites any semver-looking string to the
-		// literal "<VERSION>", so reading it post-normalization always
-		// yielded that placeholder and regression detection could never
-		// fire). The first-class ErrorEvent.ReleaseVersion field (proto
-		// field 15, populated in Deserialize) always wins when present —
-		// this is purely a fallback for producers that still smuggle the
-		// version through metadata instead of sending the field directly.
-		if e.ReleaseVersion == "" {
-			if rv, ok := e.Metadata["release_version"].(string); ok {
-				e.ReleaseVersion = rv
-			}
+// Prepare is sentinel-event-schema-v2 §6.2 (TASK-06), the replacement for Normalize(n, m): it runs
+// the order-sensitive reads first and then masks. It NEVER calls the normalizer — stored values are
+// masked and verbatim (contract decision 5); normalization now runs only inside ComputeFingerprint, on
+// a copy of ErrorClass, which is the one fingerprint input it ever touched (the §6.2 proof). The order
+// is fixed:
+//
+//  1. the release_version fallback, read from the raw metadata;
+//  2. the OQ-3 affected-id reads (readAffectedIDs), from raw values;
+//  3. masking: Message through MaskString, Metadata through MaskMap (keys verbatim), the v2 fields per
+//     §6.2's table, and tags LAST among the reads' inputs — after step 2, so a PAN-shaped or
+//     sensitive-keyed tenant tag reaches the rollup as sent and only the stored copy is redacted.
+//
+// ErrorClass, TraceID and SpanID are stored raw.
+func (e *ErrorEvent) Prepare(masker *masker.Masker) {
+	// Read the legacy release_version-in-metadata fallback from the RAW map (VERIFIED_STATE.md S5 /
+	// B6: reading it after a rewrite yielded a placeholder, and regression detection never fired). The
+	// first-class ErrorEvent.ReleaseVersion field (proto field 15, populated in Deserialize) always
+	// wins when present — this is purely a fallback for producers that still smuggle the version
+	// through metadata instead of sending the field directly.
+	if e.ReleaseVersion == "" {
+		if rv, ok := e.Metadata["release_version"].(string); ok {
+			e.ReleaseVersion = rv
 		}
-		// sentinel-affected-users §4.3 (decision 3): the affected user/tenant identifiers, read here
-		// for the same reason release_version is — after the next line a UUID reads "<UUID>". See the
-		// AffectedUserID field comment. Bounded at the read (decision 5) so every consumer — the
-		// side tables in store.StoreEvent and the index overwrite in processEventInternal — sees one
-		// value; "present but unusable" is what the *SkipReason fields carry to the after-commit
-		// counter. Never normalised, never masked (pinned by a unit test — see the field comment).
-		if raw, present := indexer.UserIDFromMetadata(e.Metadata); present {
-			e.AffectedUserID, e.AffectedUserSkipReason = BoundAffectedID(raw)
-		}
-		if raw, present := indexer.TenantIDFromMetadata(e.Metadata); present {
-			e.AffectedTenantID, e.AffectedTenantSkipReason = BoundAffectedID(raw)
-		}
-		e.Metadata = masker.MaskMap(normalizer.NormalizeMap(e.Metadata))
 	}
+	// sentinel-affected-users §4.3 (decision 3) + sentinel-event-schema-v2 §6.3 (OQ-3): the affected
+	// user/tenant identifiers, read from raw values before anything is masked. Bounded at the read
+	// (decision 5) so every consumer — the side tables in store.StoreEvent and the index overwrite in
+	// processEventInternal — sees one value; "present but unusable" is what the *SkipReason fields
+	// carry to the after-commit counter. Never masked (pinned by a unit test — see the field comment).
+	e.readAffectedIDs()
+
+	e.Message = masker.MaskString(e.Message)
+	if e.Metadata != nil {
+		e.Metadata = masker.MaskMap(e.Metadata)
+	}
+	e.maskV2(masker)
+	// TASK-08 (amended decision 4): tag values are masked like metadata — a sensitive key's value is
+	// replaced, every other value goes through MaskString (PAN included). After readAffectedIDs.
+	e.Tags = maskStringMap(masker, e.Tags)
+}
+
+// readAffectedIDs is sentinel-event-schema-v2 §6.3 (OQ-3) over sentinel-affected-users §4.3: the
+// typed value takes precedence, metadata is the fallback. AffectedUserID comes from user.id when it
+// is non-empty, otherwise from indexer.UserIDFromMetadata exactly as before; AffectedTenantID comes
+// from tags["tenant_id"] when that key is present, otherwise from indexer.TenantIDFromMetadata. A
+// typed value that is present but unusable WINS and records its skip reason, with no fallback —
+// indexer's own "an empty string at a higher-precedence key wins" rule. It reads RAW values and must
+// run before anything masks or normalises (the field comment on AffectedUserID).
+func (e *ErrorEvent) readAffectedIDs() {
+	if e.User != nil && e.User.ID != "" {
+		e.AffectedUserID, e.AffectedUserSkipReason = BoundAffectedID(e.User.ID)
+	} else if raw, present := indexer.UserIDFromMetadata(e.Metadata); present {
+		e.AffectedUserID, e.AffectedUserSkipReason = BoundAffectedID(raw)
+	}
+	if raw, present := e.Tags["tenant_id"]; present {
+		e.AffectedTenantID, e.AffectedTenantSkipReason = BoundAffectedID(raw)
+	} else if raw, present := indexer.TenantIDFromMetadata(e.Metadata); present {
+		e.AffectedTenantID, e.AffectedTenantSkipReason = BoundAffectedID(raw)
+	}
+}
+
+// maskV2 is spec §6.2's table for the v2 fields: free text through MaskString, map-shaped values
+// through MaskMap (key-based redaction, recursive). User, SDK, the string labels and frames are
+// stored as sent. The v2 fields are masked but NEVER normalised (decision 5).
+func (e *ErrorEvent) maskV2(m *masker.Masker) {
+	if r := e.Request; r != nil {
+		r.URL = m.MaskString(r.URL)
+		r.QueryString = m.MaskString(r.QueryString)
+		r.Headers = maskStringMap(m, r.Headers)
+		r.Env = maskStringMap(m, r.Env)
+		switch data := r.Data.(type) {
+		case map[string]interface{}:
+			r.Data = m.MaskMap(data)
+		case []interface{}:
+			r.Data = m.MaskSlice(data)
+		case string:
+			r.Data = m.MaskString(data)
+		}
+	}
+	for i := range e.Breadcrumbs {
+		b := &e.Breadcrumbs[i]
+		b.Message = m.MaskString(b.Message)
+		if b.Data != nil {
+			b.Data = m.MaskMap(b.Data)
+		}
+	}
+	if e.Contexts != nil {
+		e.Contexts = m.MaskMap(e.Contexts)
+	}
+	if e.Exception != nil {
+		for i := range e.Exception.Values {
+			e.Exception.Values[i].Value = m.MaskString(e.Exception.Values[i].Value)
+		}
+	}
+}
+
+// maskStringMap runs MaskMap over a string->string map and back. Every value stays a string: a
+// sensitive key's value becomes "***REDACTED***", every other value goes through MaskString.
+func maskStringMap(m *masker.Masker, in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	asAny := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		asAny[k] = v
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range m.MaskMap(asAny) {
+		out[k], _ = v.(string)
+	}
+	return out
 }
 
 // BoundAffectedID is sentinel-affected-users decision 5, modelled on the D-g event_id clamp in
@@ -197,8 +364,8 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		// Deserialize never copied them onto ErrorEvent — so the processor
 		// silently dropped both on every event (VERIFIED_STATE.md S5, and
 		// the processor half of S6's project_id plumbing). Copying them
-		// here, before Normalize runs, is what makes the first-class
-		// ReleaseVersion field win over the metadata fallback in Normalize
+		// here, before Prepare runs, is what makes the first-class
+		// ReleaseVersion field win over the metadata fallback in Prepare
 		// above.
 		ProjectID:      protoEvent.ProjectId,
 		ReleaseVersion: protoEvent.ReleaseVersion,
@@ -257,19 +424,10 @@ func Deserialize(data []byte) (*ErrorEvent, error) {
 		event.Metadata = structpbToMap(protoEvent.Metadata)
 	}
 
-	for _, frame := range protoEvent.Stacktrace {
-		event.Stacktrace = append(event.Stacktrace, StackFrame{
-			File:     frame.File,
-			Line:     frame.Line,
-			Function: frame.Function,
-			InApp:    frame.InApp,
-			Column:   frame.Column,
-		})
-	}
+	event.Stacktrace = framesFromProto(protoEvent.Stacktrace)
+	copyV2Fields(event, &protoEvent)
 
-	norm := normalizer.NewNormalizer()
-	mask := masker.NewMasker()
-	event.Normalize(norm, mask)
+	event.Prepare(masker.NewMasker())
 
 	// The fingerprint is NOT computed here any more (sentinel-sourcemaps §4.4, be.md task 4): it
 	// used to be the last thing Deserialize did, which made it impossible to symbolicate the
@@ -320,8 +478,13 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 	e.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
 		// sentinel-project-environments §4.9: the environment is part of issue identity, so it is
 		// part of the hash input.
-		Environment:        e.Environment,
-		ErrorClass:         e.ErrorClass,
+		Environment: e.Environment,
+		// sentinel-event-schema-v2 §6.2 (TASK-06): the one place normalization still runs. ErrorClass
+		// used to reach Compute already normalized by Normalize; it is now stored raw, so the SAME pure,
+		// stateless, idempotent function is applied to it here, on the way into the hash. Fingerprints
+		// are byte-identical (tests/unit/fingerprint_golden_test.go, whose normalizable-class fixture
+		// goes red if this call is removed).
+		ErrorClass:         normalizer.NewNormalizer().NormalizeString(e.ErrorClass),
 		Stacktrace:         frames,
 		Platform:           e.Platform,
 		NormalisePlatforms: normalisePlatforms,
@@ -335,7 +498,7 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 // Symbolicated/Raw carry step 6's record; a frame that passed through is left exactly as it was
 // — InApp included, no key, not `symbolicated: false` (step 7). projectID MUST be the resolved
 // project (store.ResolveProjectID's return), never anything read from a frame; releaseVersion is
-// e.ReleaseVersion after Normalize's metadata fallback. The caller has already passed
+// e.ReleaseVersion after Prepare's metadata fallback. The caller has already passed
 // symbolicate.Gate and counts the returned per-frame outcomes; this method never fails the
 // event (the stage returns a Result, not an error — D7).
 //
@@ -389,4 +552,83 @@ func structpbToMap(s *structpb.Struct) map[string]interface{} {
 		result[k] = v
 	}
 	return result
+}
+
+// framesFromProto copies proto frames, the v2 fields (6-10) included. nil for no frames, as before.
+func framesFromProto(in []*sentinelv1.StackFrame) []StackFrame {
+	var out []StackFrame
+	for _, frame := range in {
+		out = append(out, StackFrame{
+			File:        frame.File,
+			Line:        frame.Line,
+			Function:    frame.Function,
+			InApp:       frame.InApp,
+			Column:      frame.Column,
+			Module:      frame.Module,
+			AbsPath:     frame.AbsPath,
+			ContextLine: frame.ContextLine,
+			PreContext:  frame.PreContext,
+			PostContext: frame.PostContext,
+		})
+	}
+	return out
+}
+
+// copyV2Fields is spec §6.1's Deserialize half: every v2 field, source and received_at, off the
+// proto. Struct/Value go through AsMap/AsInterface. An absent message stays nil, so the occurrence
+// column is NULL.
+func copyV2Fields(e *ErrorEvent, p *sentinelv1.ErrorEvent) {
+	e.Level = p.Level
+	e.Logger = p.Logger
+	e.ServerName = p.ServerName
+	e.Transaction = p.Transaction
+	e.Dist = p.Dist
+	e.Source = p.Source
+	if p.ReceivedAt != nil {
+		e.ReceivedAt = p.ReceivedAt.AsTime()
+	}
+	if sdk := p.Sdk; sdk != nil {
+		e.SDK = &SDK{Name: sdk.Name, Version: sdk.Version}
+	}
+	if u := p.User; u != nil {
+		e.User = &User{ID: u.Id, Username: u.Username, Email: u.Email, IPAddress: u.IpAddress}
+		if g := u.Geo; g != nil {
+			e.User.Geo = &Geo{City: g.City, Region: g.Region, CountryCode: g.CountryCode, Subdivision: g.Subdivision}
+		}
+	}
+	if len(p.Tags) > 0 {
+		e.Tags = make(map[string]string, len(p.Tags))
+		for k, v := range p.Tags {
+			e.Tags[k] = v
+		}
+	}
+	if len(p.Contexts) > 0 {
+		e.Contexts = make(map[string]interface{}, len(p.Contexts))
+		for k, v := range p.Contexts {
+			e.Contexts[k] = structpbToMap(v)
+		}
+	}
+	if r := p.Request; r != nil {
+		e.Request = &Request{Method: r.Method, URL: r.Url, QueryString: r.QueryString, Headers: r.Headers, Env: r.Env}
+		if r.Data != nil {
+			e.Request.Data = r.Data.AsInterface()
+		}
+	}
+	for _, b := range p.Breadcrumbs {
+		crumb := Breadcrumb{Type: b.Type, Category: b.Category, Level: b.Level, Message: b.Message, Data: structpbToMap(b.Data)}
+		if b.Timestamp != nil {
+			crumb.Timestamp = b.Timestamp.AsTime().UTC().Format(time.RFC3339Nano)
+		}
+		e.Breadcrumbs = append(e.Breadcrumbs, crumb)
+	}
+	if ex := p.Exception; ex != nil && len(ex.Values) > 0 {
+		e.Exception = &Exception{}
+		for _, v := range ex.Values {
+			val := ExceptionValue{Type: v.Type, Value: v.Value, Stacktrace: framesFromProto(v.Stacktrace)}
+			if mech := v.Mechanism; mech != nil {
+				val.Mechanism = &Mechanism{Type: mech.Type, Handled: mech.Handled}
+			}
+			e.Exception.Values = append(e.Exception.Values, val)
+		}
+	}
 }

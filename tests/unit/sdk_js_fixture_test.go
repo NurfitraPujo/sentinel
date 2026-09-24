@@ -163,3 +163,31 @@ func TestSDKJSFixtures_PinnedValues(t *testing.T) {
 		require.Equal(t, map[string]interface{}{"password": "in-array"}, items[0])
 	})
 }
+
+// V1c's second row (sentinel-event-schema-v2 spec §3.5, §9.2): the Go SDK's event is the other old-payload
+// producer. tests/fixtures/events/sdk-go-contract-event.json is a COMMITTED JSON copy of the event
+// tests/contract/sdk_ingestor_test.go builds with packages/sdk-go — copied, not imported, because CI's go-root
+// job runs with GOWORK=off and one unresolvable import disables this whole package (B4). Unlike the JS SDK the
+// Go SDK sends project_key (the project's name), so the stamp here only adds the credential's project id.
+func TestSDKGoContractFixture_AcceptedByIngestor(t *testing.T) {
+	raw, err := os.ReadFile("../fixtures/events/sdk-go-contract-event.json")
+	require.NoError(t, err)
+
+	var payload validation.ErrorPayload
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	require.NoError(t, dec.Decode(&payload), "strict decode into validation.ErrorPayload")
+	require.NotEmpty(t, payload.ProjectKey, "the Go SDK sends project_key as the project name")
+	require.Empty(t, payload.ProjectID, "no SDK sends project_id")
+	payload.ProjectID = "0f7c1a2e-3b4d-4c5e-8f6a-7b8c9d0e1f2a"
+
+	result := validation.ValidatePayload(&payload)
+	require.True(t, result.Valid, "ValidatePayload errors: %s", result.ToJSON())
+
+	v, err := protovalidate.New()
+	require.NoError(t, err)
+	event := mapping.MapPayloadToEvent(&payload)
+	require.NoError(t, v.Validate(event), "protovalidate must report zero violations")
+	require.Equal(t, "go", event.GetPlatform())
+	require.NotEmpty(t, event.GetStacktrace())
+}

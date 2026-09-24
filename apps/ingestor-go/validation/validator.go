@@ -77,6 +77,94 @@ type ErrorPayload struct {
 	// mismatch, deleting the by-name project lookup) is P3-1's job, not this
 	// change's.
 	ProjectID string `json:"project_id"`
+
+	// ---- sentinel-event-schema-v2 (spec §4.1): Sentry-parity metadata, mirroring ErrorEvent fields
+	// 14 and 18-29. The JSON names are exactly the proto field names. Decode posture is unchanged: an
+	// unknown key is ignored (a future SDK key must not 400 an old ingestor), and a value of the WRONG
+	// JSON type fails the whole decode with a 400, as for every field above. ValidatePayload bounds
+	// every one of these in place before the proto is built (spec §4.2); none of them ever costs the
+	// event.
+	Level       string                            `json:"level"`
+	Logger      string                            `json:"logger"`
+	ServerName  string                            `json:"server_name"`
+	Transaction string                            `json:"transaction"`
+	Dist        string                            `json:"dist"`
+	Source      string                            `json:"source"`
+	SDK         *SDKInfo                          `json:"sdk"`
+	User        *UserInfo                         `json:"user"`
+	Tags        map[string]string                 `json:"tags"`
+	Contexts    map[string]map[string]interface{} `json:"contexts"`
+	Request     *RequestInfo                      `json:"request"`
+	Breadcrumbs []Breadcrumb                      `json:"breadcrumbs"`
+	Exception   *ExceptionInterface               `json:"exception"`
+	// ReceivedAt is T_recv, stamped by IngestAt and mapped to proto field 30. json:"-": a client can
+	// never set it (compare ProjectID's rule above); a body carrying "received_at" is ignored.
+	ReceivedAt time.Time `json:"-"`
+}
+
+// SDKInfo mirrors sentinel.v1.Sdk.
+type SDKInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// UserInfo mirrors sentinel.v1.User. Stored as sent (contract decision 1).
+type UserInfo struct {
+	ID        string   `json:"id"`
+	Username  string   `json:"username"`
+	Email     string   `json:"email"`
+	IPAddress string   `json:"ip_address"`
+	Geo       *GeoInfo `json:"geo"`
+}
+
+// GeoInfo mirrors sentinel.v1.Geo.
+type GeoInfo struct {
+	City        string `json:"city"`
+	Region      string `json:"region"`
+	CountryCode string `json:"country_code"`
+	Subdivision string `json:"subdivision"`
+}
+
+// RequestInfo mirrors sentinel.v1.Request. Data is any JSON value.
+type RequestInfo struct {
+	Method      string            `json:"method"`
+	URL         string            `json:"url"`
+	QueryString string            `json:"query_string"`
+	Headers     map[string]string `json:"headers"`
+	Data        interface{}       `json:"data"`
+	Env         map[string]string `json:"env"`
+}
+
+// Breadcrumb mirrors sentinel.v1.Breadcrumb. Timestamp is RFC 3339, decoded as `timestamp` is; a Unix
+// float fails the decode (400), as any type mismatch does.
+type Breadcrumb struct {
+	Timestamp time.Time              `json:"timestamp"`
+	Type      string                 `json:"type"`
+	Category  string                 `json:"category"`
+	Level     string                 `json:"level"`
+	Message   string                 `json:"message"`
+	Data      map[string]interface{} `json:"data"`
+}
+
+// ExceptionInterface mirrors sentinel.v1.ExceptionInterface: Sentry's {"values": [...]}, oldest first
+// (the root cause), the exception that was raised LAST.
+type ExceptionInterface struct {
+	Values []ExceptionValue `json:"values"`
+}
+
+// ExceptionValue mirrors sentinel.v1.ExceptionValue. Stacktrace is in Sentinel's order, crashing frame
+// first, the same as ErrorPayload.Stacktrace.
+type ExceptionValue struct {
+	Type       string       `json:"type"`
+	Value      string       `json:"value"`
+	Mechanism  *Mechanism   `json:"mechanism"`
+	Stacktrace []StackFrame `json:"stacktrace"`
+}
+
+// Mechanism mirrors sentinel.v1.Mechanism. Handled is tri-state: absent / true / false.
+type Mechanism struct {
+	Type    string `json:"type"`
+	Handled *bool  `json:"handled"`
 }
 
 type StackFrame struct {
@@ -89,137 +177,44 @@ type StackFrame struct {
 	// field 5 by mapping.MapPayloadToEvent; a negative value is a 400 from ValidatePayload
 	// (`stacktrace[i].column must be >= 0`) -- the proto carries no CEL rule for it.
 	Column int32 `json:"column"`
+	// sentinel-event-schema-v2 (spec §4.1): proto StackFrame fields 6-10.
+	Module      string   `json:"module"`
+	AbsPath     string   `json:"abs_path"`
+	ContextLine string   `json:"context_line"`
+	PreContext  []string `json:"pre_context"`
+	PostContext []string `json:"post_context"`
 }
 
-const (
-	MaxStacktraceFrames = 100
-	// MaxFingerprintLength matches issues.fingerprint VARCHAR(64) (1716508800_init.sql)
-	// and the "error_event.fingerprint" CEL rule in the proto. A client fingerprint
-	// is stored unhashed, so exceeding the column is a real failure mode, not a
-	// theoretical one.
-	MaxFingerprintLength = 64
-	MaxMetadataSize     = 64 * 1024
-	MaxMessageLength    = 10000
-	MaxFilePathLength   = 512
-)
-
+// ValidatePayload is the ingestor's per-field bounds step (sentinel-event-schema-v2 spec §4.2-§4.3),
+// run by service.IngestAt after the event_id/timestamp resolution and before the proto is built.
+//
+// It works IN PLACE on payload: every v2 value over its bound is truncated, dropped or replaced
+// exactly as the spec's rule table says, every such cut is recorded in the server-owned
+// metadata.server_truncated / metadata.server_truncated_keys markers, and an oversized metadata map is
+// shrunk. None of that ever costs the event (spec S2).
+//
+// Valid=false is returned ONLY for a rule the proto cannot express, which is exactly one:
+// stacktrace[i].column < 0. Every other rejection (project_key, platform, environment, message,
+// error_class, trace/span ids, release_version, fingerprint, frame count, the new v2 CEL tripwires)
+// belongs to protovalidate alone, because two overlapping validators with different semantics are how
+// a bug hides (error_event.proto's own rule; spec §4.3 lists the four byte-vs-code-point splits the
+// old duplicated checks here would have introduced had they been wired).
 func ValidatePayload(payload *ErrorPayload) ValidationResult {
 	result := ValidationResult{Valid: true}
 
-	if payload.ProjectKey == "" {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "project_key", Message: "project_key is required"})
-	} else if len(payload.ProjectKey) > 64 {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "project_key", Message: "project_key must not exceed 64 characters"})
-	}
-
-	if payload.Platform == "" {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "platform", Message: "platform is required"})
-	} else if !isValidAlphanumeric(payload.Platform) {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "platform", Message: "platform must be lowercase alphanumeric"})
-	}
-
-	if payload.Environment == "" {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "environment", Message: "environment is required"})
-	} else if !isValidEnvironmentName(payload.Environment) {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "environment", Message: "environment must match ^[a-z0-9][a-z0-9._-]{0,49}$"})
-	}
-
-	if len(payload.Message) > MaxMessageLength {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "message", Message: fmt.Sprintf("message must not exceed %d characters", MaxMessageLength)})
-	}
-
-	if payload.ErrorClass == "" {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "error_class", Message: "error_class is required"})
-	}
-
-	if len(payload.Stacktrace) > MaxStacktraceFrames {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "stacktrace", Message: fmt.Sprintf("stacktrace must not exceed %d frames", MaxStacktraceFrames)})
-	}
-
-	metadataBytes, _ := json.Marshal(payload.Metadata)
-	if len(metadataBytes) > MaxMetadataSize {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "metadata", Message: fmt.Sprintf("metadata must not exceed %d bytes", MaxMetadataSize)})
-	}
-
-	// Rejected here rather than truncated: silently shortening a grouping key would
-	// merge issues the caller meant to keep apart, which is worse than a 400 that
-	// says what was wrong.
-	if len(payload.Fingerprint) > MaxFingerprintLength {
-		result.Valid = false
-		result.Errors = append(result.Errors, ValidationError{Field: "fingerprint", Message: fmt.Sprintf("fingerprint must not exceed %d characters", MaxFingerprintLength)})
-	}
-
 	for i, frame := range payload.Stacktrace {
-		if frame.InApp && frame.File != "" && len(frame.File) > MaxFilePathLength {
-			result.Valid = false
-			result.Errors = append(result.Errors, ValidationError{Field: fmt.Sprintf("stacktrace[%d].file", i), Message: fmt.Sprintf("file path must not exceed %d characters", MaxFilePathLength)})
-		}
 		// A negative column is a producer bug, not an unknown: 0 is the "unknown" value
-		// (sentinel-sourcemaps §4.3), so nothing below zero has a meaning to store.
+		// (sentinel-sourcemaps §4.3), so nothing below zero has a meaning to store. A top-level frame
+		// is not a v2 field, so it keeps its 400; a chain frame's column is clamped instead (bounds.go).
 		if frame.Column < 0 {
 			result.Valid = false
 			result.Errors = append(result.Errors, ValidationError{Field: fmt.Sprintf("stacktrace[%d].column", i), Message: fmt.Sprintf("stacktrace[%d].column must be >= 0", i)})
 		}
 	}
 
+	applyBounds(payload)
+
 	return result
-}
-
-// isValidEnvironmentName implements sentinel-project-environments §4.8's widened set, decision 10:
-//
-//	^[a-z0-9][a-z0-9._-]{0,49}$
-//
-// i.e. a lowercase-alphanumeric first character followed by up to 49 more characters drawn from
-// lowercase alphanumerics, dot, underscore and hyphen. `pre-prod`, `eu-west-1`, `staging-2` and
-// `prod_eu` — the four names operators actually use — are accepted; `Production` (uppercase) and
-// `-prod` (leading separator) are not. The 50-character bound is folded into the pattern rather than
-// checked separately, exactly as the proto CEL rule now does it.
-//
-// This is a NEW function and isValidAlphanumeric is deliberately left exactly as it was. That
-// function is SHARED with payload.Platform, whose own CEL rule (error_event.platform) is unchanged
-// by this feature: widening it in place would widen `platform` on the Go side only, leaving the Go
-// check and the wire check disagreeing about what a platform is — a split that surfaces months later
-// as an event rejected by protovalidate after the ingestor accepted it. §11 makes "platform still
-// rejects all four names" an assertion for exactly this reason.
-//
-// Written as an explicit scan rather than a regexp because this runs on every ingested event and the
-// pattern is simple enough that a regexp would be the more surprising choice here.
-func isValidEnvironmentName(s string) bool {
-	if len(s) == 0 || len(s) > 50 {
-		return false
-	}
-	for i, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-			continue
-		case i > 0 && (c == '.' || c == '_' || c == '-'):
-			continue
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// isValidAlphanumeric is payload.Platform's check and, since decision 10, ONLY payload.Platform's.
-// Do not widen it: see isValidEnvironmentName above.
-func isValidAlphanumeric(s string) bool {
-	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-			return false
-		}
-	}
-	return true
 }
 
 func WriteValidationError(w http.ResponseWriter, result ValidationResult) {

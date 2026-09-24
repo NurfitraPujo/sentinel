@@ -232,6 +232,22 @@ function issueOrder(sort: string | undefined): SQL[] {
     }
 }
 
+/** The pre-v2 `error_occurrences` columns the issue page receives (sentinel-event-schema-v2 §8.3). */
+export const issuePageOccurrenceColumns = {
+    id: errorOccurrences.id,
+    issueId: errorOccurrences.issueId,
+    environment: errorOccurrences.environment,
+    platform: errorOccurrences.platform,
+    releaseVersion: errorOccurrences.releaseVersion,
+    stacktrace: errorOccurrences.stacktrace,
+    metadata: errorOccurrences.metadata,
+    traceId: errorOccurrences.traceId,
+    spanId: errorOccurrences.spanId,
+    eventId: errorOccurrences.eventId,
+    projectId: errorOccurrences.projectId,
+    createdAt: errorOccurrences.createdAt,
+};
+
 export const issueQueries = {
     async getIssueById(id: string) {
         const [issue] = await db
@@ -242,9 +258,13 @@ export const issueQueries = {
         return issue || null;
     },
 
+    // sentinel-event-schema-v2 §8.3: an explicit projection of the pre-v2 columns. A bare select()
+    // would start shipping every v2 JSONB body (breadcrumbs, contexts, request, ...) of up to 100
+    // occurrences to the issue page the moment the Drizzle table declared them -- a UI-visible payload
+    // change in a feature that promises none. The agent API is where the v2 fields are read.
     async getOccurrencesByIssueId(issueId: string, limit = 100) {
         return await db
-            .select()
+            .select(issuePageOccurrenceColumns)
             .from(errorOccurrences)
             .where(eq(errorOccurrences.issueId, issueId))
             .orderBy(desc(errorOccurrences.createdAt))

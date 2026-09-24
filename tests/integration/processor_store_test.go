@@ -7,8 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
+	ingestservice "github.com/NurfitraPujo/sentinel/apps/ingestor-go/service"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
+	processorservice "github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	sharednats "github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	tc "github.com/NurfitraPujo/sentinel/tests/integration/testcontainers"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -438,4 +444,283 @@ func TestStorePackage_PersistAuditLog_FailureIncrementsCounter(t *testing.T) {
 	after := store.GetAuditPersistFailureCount()
 	assert.Equal(t, before+1, after,
 		"PersistAuditLog must increment GetAuditPersistFailureCount on failure")
+}
+
+// ---- sentinel-event-schema-v2 §6.1 (TASK-05): the v2 occurrence columns, through StoreEvent.
+
+// TestStoreEvent_V2FieldsPersisted is V5a: every v2 column is written by the occurrence INSERT and
+// read back; the six NULLIF strings are NULL for "", trace_flags is NULL without a trace id, and every
+// JSONB column is NULL when the occurrence carried none.
+func TestStoreEvent_V2FieldsPersisted(t *testing.T) {
+	s, pool := storeFromTest(t)
+	projectID, _ := seedProjectU13(t, pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	receivedAt := time.Date(2026, 9, 23, 12, 0, 1, 0, time.UTC)
+	flags := int64(1)
+	full := eidOccurrence("evt-v5a-full-" + uuid.New().String())
+	full.Level = "warning"
+	full.Message = "charge [REDACTED_PAN] failed"
+	full.ErrorClass = "TypeError"
+	full.Logger = "checkout"
+	full.ServerName = "web-7f9c-pod-2"
+	full.Transaction = "/checkout/pay"
+	full.Dist = "4127"
+	full.Source = "onerror"
+	full.TraceFlags = &flags
+	full.ReceivedAt = &receivedAt
+	full.SDK = json.RawMessage(`{"name":"sentinel.javascript.browser","version":"1.8.0"}`)
+	full.User = json.RawMessage(`{"id":"u1","email":"alice@example.com","geo":{"country_code":"DE"}}`)
+	full.Tags = json.RawMessage(`{"tenant_id":"tenant-acme"}`)
+	full.Contexts = json.RawMessage(`{"device":{"model":"Pixel 8"}}`)
+	full.Request = json.RawMessage(`{"method":"POST","headers":{"Authorization":"***REDACTED***"}}`)
+	full.Breadcrumbs = json.RawMessage(`[{"type":"http","message":"POST /api/pay 402"}]`)
+	full.Exception = json.RawMessage(`{"values":[{"type":"TypeError","mechanism":{"type":"onerror","handled":false}}]}`)
+	_, stored, err := s.StoreEvent(ctx, eidIssue(projectID, "fp-v5a-"+uuid.New().String()), full, "")
+	require.NoError(t, err)
+	require.True(t, stored)
+
+	var (
+		level, errorClass                                   string
+		message, logger, serverName, transaction, dist, src *string
+		traceFlags                                          *int64
+		gotReceivedAt                                       *time.Time
+		sdk, user, tags, contexts, request, crumbs, exc     *string
+	)
+	readBack := func(id string) {
+		t.Helper()
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT level, message, error_class, logger, server_name, transaction, dist, source, trace_flags, received_at,
+			       sdk::text, event_user::text, tags::text, contexts::text, request::text, breadcrumbs::text, exception::text
+			  FROM error_occurrences WHERE id = $1`, id).Scan(
+			&level, &message, &errorClass, &logger, &serverName, &transaction, &dist, &src, &traceFlags, &gotReceivedAt,
+			&sdk, &user, &tags, &contexts, &request, &crumbs, &exc))
+	}
+	readBack(full.ID)
+	assert.Equal(t, "warning", level)
+	assert.Equal(t, "TypeError", errorClass)
+	for name, got := range map[string]*string{"message": message, "logger": logger, "server_name": serverName, "transaction": transaction, "dist": dist, "source": src} {
+		require.NotNil(t, got, "%s must be stored", name)
+	}
+	assert.Equal(t, "charge [REDACTED_PAN] failed", *message)
+	assert.Equal(t, "checkout", *logger)
+	assert.Equal(t, "web-7f9c-pod-2", *serverName)
+	assert.Equal(t, "/checkout/pay", *transaction)
+	assert.Equal(t, "4127", *dist)
+	assert.Equal(t, "onerror", *src)
+	require.NotNil(t, traceFlags)
+	assert.Equal(t, int64(1), *traceFlags)
+	require.NotNil(t, gotReceivedAt)
+	assert.True(t, gotReceivedAt.Equal(receivedAt))
+	for name, pair := range map[string][2]interface{}{
+		"sdk": {sdk, full.SDK}, "event_user": {user, full.User}, "tags": {tags, full.Tags}, "contexts": {contexts, full.Contexts},
+		"request": {request, full.Request}, "breadcrumbs": {crumbs, full.Breadcrumbs}, "exception": {exc, full.Exception},
+	} {
+		got := pair[0].(*string)
+		require.NotNil(t, got, "%s must be stored", name)
+		assert.JSONEq(t, string(pair[1].(json.RawMessage)), *got, name)
+	}
+
+	// The empty occurrence: "" strings are NULL through NULLIF, no trace flags, every JSONB NULL.
+	empty := eidOccurrence("evt-v5a-empty-" + uuid.New().String())
+	empty.Level = "error"
+	empty.ErrorClass = "E"
+	empty.TraceID = ""
+	_, stored, err = s.StoreEvent(ctx, eidIssue(projectID, "fp-v5a-empty-"+uuid.New().String()), empty, "")
+	require.NoError(t, err)
+	require.True(t, stored)
+	readBack(empty.ID)
+	assert.Equal(t, "error", level)
+	for name, got := range map[string]*string{"message": message, "logger": logger, "server_name": serverName, "transaction": transaction, "dist": dist, "source": src,
+		"sdk": sdk, "event_user": user, "tags": tags, "contexts": contexts, "request": request, "breadcrumbs": crumbs, "exception": exc} {
+		assert.Nil(t, got, "%s must be NULL for an occurrence that carried none", name)
+	}
+	assert.Nil(t, traceFlags, "trace_flags is NULL without a trace id")
+	assert.Nil(t, gotReceivedAt)
+}
+
+// TestStoreEvent_PerOccurrenceMessage is V5a's second half (spec P8): two occurrences of one issue with
+// different messages each keep their own message and class; issues.message keeps the first.
+func TestStoreEvent_PerOccurrenceMessage(t *testing.T) {
+	s, pool := storeFromTest(t)
+	projectID, _ := seedProjectU13(t, pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fp := "fp-v5a-per-occ-" + uuid.New().String()
+	var ids []string
+	for i, msg := range []string{"first failure for order 1", "second failure for order 2"} {
+		issue := eidIssue(projectID, fp)
+		issue.Message = msg
+		occ := eidOccurrence(fmt.Sprintf("evt-v5a-per-%d-%s", i, uuid.New().String()))
+		occ.Level = "error"
+		occ.Message = msg
+		occ.ErrorClass = fmt.Sprintf("Class%d", i)
+		_, stored, err := s.StoreEvent(ctx, issue, occ, "")
+		require.NoError(t, err)
+		require.True(t, stored)
+		ids = append(ids, occ.ID)
+	}
+	for i, want := range []string{"first failure for order 1", "second failure for order 2"} {
+		var msg, class string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT message, error_class FROM error_occurrences WHERE id = $1`, ids[i]).Scan(&msg, &class))
+		assert.Equal(t, want, msg)
+		assert.Equal(t, fmt.Sprintf("Class%d", i), class)
+	}
+	var issueMessage string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT message FROM issues WHERE project_id = $1 AND fingerprint = $2`, projectID, fp).Scan(&issueMessage))
+	assert.Equal(t, "first failure for order 1", issueMessage, "issues.message is written on the INSERT arm only (T6)")
+}
+
+// TestStoreEvent_NULInOccurrenceMessage is V5e (spec P15, §6.1): an occurrence of an EXISTING issue
+// whose message carries U+0000 commits, with the NUL removed from the stored occurrence message. It
+// goes through ProcessorService, because the strip is the service's fill (fillOccurrenceV2): the
+// ingestor leaves top-level fields as sent, and Postgres would reject the NUL with 22021 (class 22,
+// Permanent), dead-lettering an occurrence that stored fine before this change.
+func TestStoreEvent_NULInOccurrenceMessage(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+	projectName := uniqueProjectName("v5e-nul")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("v5e-nul-key"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	first := buildValidProtoEvent(projectName)
+	first.EventId = "evt-v5e-first-" + uuid.New().String()
+	data, err := proto.Marshal(first)
+	require.NoError(t, err)
+	require.NoError(t, svc.ProcessEvent(ctx, data), "the first occurrence creates the issue")
+
+	second := buildValidProtoEvent(projectName) // same fingerprint: the same, existing issue
+	second.EventId = "evt-v5e-second-" + uuid.New().String()
+	second.Message = "a\x00b"
+	data, err = proto.Marshal(second)
+	require.NoError(t, err)
+	require.NoError(t, svc.ProcessEvent(ctx, data), "a NUL in the message must not dead-letter the occurrence")
+
+	var msg string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT message FROM error_occurrences WHERE event_id = $1`, second.EventId).Scan(&msg))
+	assert.Equal(t, "ab", msg)
+	var count int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count FROM issues WHERE project_id = $1`, projectID).Scan(&count))
+	assert.Equal(t, int64(2), count)
+}
+
+// TestStoreEvent_NULInTagKeyAndContextName is the integration case for review finding
+// esv2-rev-nul-tag-key-dlq (spec §4.2 NUL row, I7c): a U+0000 in a tag key, and in a context name that
+// collides with one the client sent as-is, used to reach metadata.server_truncated_keys raw. The
+// processor stores metadata as JSONB, Postgres rejects \u0000 there with 22P05 (class 22, Permanent),
+// and the event was dead-lettered. It runs the real ingestor bounds step and mapper, then the processor,
+// and requires the occurrence to be stored with the tag key stripped to its valid form.
+func TestStoreEvent_NULInTagKeyAndContextName(t *testing.T) {
+	svc, pool, _ := newServiceAndPoolFromEnv(t)
+	projectName := uniqueProjectName("v2-nul-key")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("v2-nul-key"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	payload := &validation.ErrorPayload{
+		EventID:     "evt-v2-nul-key-" + uuid.New().String(),
+		ProjectKey:  projectName,
+		Platform:    "go",
+		Environment: "test",
+		Message:     "integration test error",
+		ErrorClass:  "IntegrationRuntimeError",
+		Fingerprint: "fp-nul-" + uuid.New().String(),
+		Timestamp:   time.Now().UTC(),
+		Metadata:    map[string]interface{}{"user_id": "u-nul"},
+		Tags:        map[string]string{"env\x00x": "v"},
+		Contexts: map[string]map[string]interface{}{
+			"dev\x00ice": {"model": "stripped"},
+			"device":     {"model": "sent"},
+		},
+	}
+	res := validation.ValidatePayload(payload)
+	require.True(t, res.Valid, "%+v", res.Errors)
+	data, err := proto.Marshal(mapping.MapPayloadToEvent(payload))
+	require.NoError(t, err)
+	require.NoError(t, svc.ProcessEvent(ctx, data), "a NUL in a tag key or context name must not dead-letter the event")
+
+	var metadata, tags, contexts string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT metadata::text, tags::text, contexts::text FROM error_occurrences WHERE event_id = $1`, payload.EventID).
+		Scan(&metadata, &tags, &contexts))
+	assert.JSONEq(t, `{"envx":"v"}`, tags, "the tag key is stripped to its valid form, not dropped")
+	assert.JSONEq(t, `{"device":{"model":"sent"}}`, contexts)
+	var md map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(metadata), &md))
+	assert.NotContains(t, md, "server_truncated_keys", "contexts.device is stored, so nothing is recorded as removed (esv2-rev2-nul-collision-markers)")
+	assert.Equal(t, []interface{}{"tags", "contexts"}, md["server_truncated"])
+	assert.Equal(t, "u-nul", md["user_id"])
+}
+
+// capturePublisher records what IngestService.IngestAt publishes, so a test can hand the exact wire
+// bytes to the processor without a NATS round trip.
+type capturePublisher struct{ published [][]byte }
+
+func (c *capturePublisher) PublishWithHeaders(_ context.Context, data []byte, _ sharednats.Header) error {
+	c.published = append(c.published, append([]byte(nil), data...))
+	return nil
+}
+
+// TestStoreEvent_LevelDefaultsToError is spec P1/I6 through ProcessorService: an event with no level,
+// or an invalid one the ingestor replaced with "", is stored with level 'error' (fillOccurrenceV2).
+// Every other integration test sets occ.Level by hand at the store layer, so without this one a
+// regression would store NULL for every event from today's SDKs, none of which sends a level (review
+// finding esv2-rev2-level-default-untested).
+//
+// storeFromTest, not newServiceAndPoolFromEnv: the latter skips when its env-configured Postgres is
+// gone, which is how every test on it skipped in a full `task test-integration` run on this change.
+func TestStoreEvent_LevelDefaultsToError(t *testing.T) {
+	_, pool := storeFromTest(t)
+	svc := processorservice.NewProcessorService(pool)
+	projectName := uniqueProjectName("v2-level")
+	projectID := createTestProject(t, pool, projectName, uniqueAPIKey("v2-level-key"))
+	t.Cleanup(func() { cleanupServiceRows(t, pool, projectID) })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	storedLevel := func(t *testing.T, eventID string) *string {
+		t.Helper()
+		var level *string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT level FROM error_occurrences WHERE event_id = $1`, eventID).Scan(&level))
+		return level
+	}
+
+	t.Run("a pre-v2 proto with no level", func(t *testing.T) {
+		evt := buildValidProtoEvent(projectName)
+		evt.EventId = "evt-v2-level-none-" + uuid.New().String()
+		require.Empty(t, evt.GetLevel())
+		data, err := proto.Marshal(evt)
+		require.NoError(t, err)
+		require.NoError(t, svc.ProcessEvent(ctx, data))
+		level := storedLevel(t, evt.EventId)
+		require.NotNil(t, level, "level must never be stored NULL")
+		assert.Equal(t, "error", *level)
+	})
+
+	t.Run("level WARN through IngestAt", func(t *testing.T) {
+		pub := &capturePublisher{}
+		ingest, err := ingestservice.NewIngestService(pub)
+		require.NoError(t, err)
+		payload := &validation.ErrorPayload{
+			EventID:     "evt-v2-level-warn-" + uuid.New().String(),
+			ProjectKey:  projectName,
+			Platform:    "go",
+			Environment: "test",
+			Message:     "integration test error",
+			ErrorClass:  "IntegrationRuntimeError",
+			Fingerprint: "fp-level-" + uuid.New().String(),
+			Timestamp:   time.Now().UTC(),
+			Level:       "WARN",
+		}
+		require.NoError(t, ingest.IngestAt(ctx, payload, time.Now().UTC()))
+		require.Len(t, pub.published, 1)
+		require.NoError(t, svc.ProcessEvent(ctx, pub.published[0]))
+		level := storedLevel(t, payload.EventID)
+		require.NotNil(t, level, "level must never be stored NULL")
+		assert.Equal(t, "error", *level, "the ingestor replaces an invalid level with \"\", which is stored as error")
+	})
 }

@@ -1,17 +1,28 @@
 package unit
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
+	"buf.build/go/protovalidate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 )
+
+// sentinel-event-schema-v2 spec §4.3: validation.ValidatePayload is now the live-path bounds step, and
+// the rejections it used to DUPLICATE from the proto's CEL rules were deleted from it - protovalidate is
+// the single rejection authority. Every row that asserted one of those rejections against ValidatePayload
+// now asserts the same input through IngestAt, which is what a request actually meets: an error prefixed
+// "validation failed" (main.go maps it to 400) carrying protovalidate's field path and rule id. One
+// assertion per rule, at the layer that enforces it.
 
 // validPayload returns a minimal payload that satisfies every validation rule.
 func validPayload() *validation.ErrorPayload {
@@ -26,310 +37,186 @@ func validPayload() *validation.ErrorPayload {
 	}
 }
 
+// ingestViolation is one protovalidate violation: its field path ("" for a message-level CEL rule)
+// and its rule id.
+type ingestViolation struct{ Field, RuleID string }
+
+// ingestViolations runs p through IngestAt, requires a "validation failed" rejection that published
+// nothing, and returns the protovalidate violations it carries.
+func ingestViolations(t *testing.T, p *validation.ErrorPayload) []ingestViolation {
+	t.Helper()
+	svc, pub := newTestIngestService(t)
+	err := svc.Ingest(context.Background(), p)
+	require.Error(t, err)
+	require.True(t, strings.HasPrefix(err.Error(), "validation failed: "), "got %q", err)
+	assert.Empty(t, pub.published, "a rejected event must never reach the publisher")
+	var verr *protovalidate.ValidationError
+	require.True(t, errors.As(err, &verr), "want a wrapped *protovalidate.ValidationError, got %T: %v", err, err)
+	out := make([]ingestViolation, 0, len(verr.Violations))
+	for _, v := range verr.Violations {
+		out = append(out, ingestViolation{Field: protovalidate.FieldPathString(v.Proto.GetField()), RuleID: v.Proto.GetRuleId()})
+	}
+	return out
+}
+
+func requireIngestAccepted(t *testing.T, p *validation.ErrorPayload) {
+	t.Helper()
+	svc, pub := newTestIngestService(t)
+	require.NoError(t, svc.Ingest(context.Background(), p))
+	require.Len(t, pub.published, 1)
+}
+
 func TestValidatePayload_HappyPath(t *testing.T) {
 	result := validation.ValidatePayload(validPayload())
 
 	require.True(t, result.Valid, "expected Valid=true for minimal payload")
 	require.Empty(t, result.Errors, "expected no errors for minimal payload")
+	requireIngestAccepted(t, validPayload())
 }
 
-func TestValidatePayload_RequiredFields(t *testing.T) {
+func TestIngestValidation_RequiredFields(t *testing.T) {
 	tests := []struct {
-		name      string
-		mutate    func(p *validation.ErrorPayload)
-		field     string
-		wantMsgSub string
+		name   string
+		mutate func(p *validation.ErrorPayload)
+		want   []ingestViolation
 	}{
-		{
-			name: "empty project_key",
-			mutate: func(p *validation.ErrorPayload) {
-				p.ProjectKey = ""
-			},
-			field:      "project_key",
-			wantMsgSub: "required",
-		},
-		{
-			name: "empty platform",
-			mutate: func(p *validation.ErrorPayload) {
-				p.Platform = ""
-			},
-			field:      "platform",
-			wantMsgSub: "required",
-		},
-		{
-			name: "empty environment",
-			mutate: func(p *validation.ErrorPayload) {
-				p.Environment = ""
-			},
-			field:      "environment",
-			wantMsgSub: "required",
-		},
-		{
-			name: "empty error_class",
-			mutate: func(p *validation.ErrorPayload) {
-				p.ErrorClass = ""
-			},
-			field:      "error_class",
-			wantMsgSub: "required",
-		},
+		// An empty required string fails both its field-level `required` rule and its message-level
+		// CEL rule.
+		{name: "empty project_key", mutate: func(p *validation.ErrorPayload) { p.ProjectKey = "" }, want: []ingestViolation{{"", "error_event.project_key"}, {"project_key", "required"}}},
+		{name: "empty platform", mutate: func(p *validation.ErrorPayload) { p.Platform = "" }, want: []ingestViolation{{"", "error_event.platform"}, {"platform", "required"}}},
+		{name: "empty environment", mutate: func(p *validation.ErrorPayload) { p.Environment = "" }, want: []ingestViolation{{"", "error_event.environment"}, {"environment", "required"}}},
+		// I12's shape: field path error_class, rule id required (error_event.proto:88) - not the old
+		// ValidatePayload sentence "error_class is required", which never ran live.
+		{name: "empty error_class", mutate: func(p *validation.ErrorPayload) { p.ErrorClass = "" }, want: []ingestViolation{{"error_class", "required"}}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := validPayload()
 			tt.mutate(p)
-
-			result := validation.ValidatePayload(p)
-
-			require.False(t, result.Valid, "expected Valid=false")
-			require.Len(t, result.Errors, 1, "expected exactly one field error")
-			assert.Equal(t, tt.field, result.Errors[0].Field)
-			assert.Contains(t, strings.ToLower(result.Errors[0].Message), tt.wantMsgSub)
+			require.ElementsMatch(t, tt.want, ingestViolations(t, p))
 		})
 	}
 }
 
-func TestValidatePayload_ProjectKeyLength(t *testing.T) {
+func TestIngestValidation_ProjectKeyLength(t *testing.T) {
 	p := validPayload()
+	p.ProjectKey = strings.Repeat("a", 64)
+	requireIngestAccepted(t, p)
+
+	p = validPayload()
 	p.ProjectKey = strings.Repeat("a", 65)
-
-	result := validation.ValidatePayload(p)
-
-	require.False(t, result.Valid)
-	require.Len(t, result.Errors, 1)
-	assert.Equal(t, "project_key", result.Errors[0].Field)
-	assert.Contains(t, result.Errors[0].Message, "64")
+	require.Equal(t, []ingestViolation{{"", "error_event.project_key"}}, ingestViolations(t, p))
 }
 
-func TestValidatePayload_PlatformFormat(t *testing.T) {
-	tests := []struct {
-		name     string
-		platform string
-	}{
-		{name: "uppercase letters", platform: "Go"},
-		{name: "underscore", platform: "go_lang"},
-		{name: "hyphen", platform: "go-lang"},
-		{name: "non-ASCII", platform: "gö"},
-		{name: "space", platform: "go lang"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+func TestIngestValidation_PlatformFormat(t *testing.T) {
+	for _, platform := range []string{"Go", "go_lang", "go-lang", "gö", "go lang"} {
+		t.Run(platform, func(t *testing.T) {
 			p := validPayload()
-			p.Platform = tt.platform
-
-			result := validation.ValidatePayload(p)
-
-			require.False(t, result.Valid)
-			require.Len(t, result.Errors, 1)
-			assert.Equal(t, "platform", result.Errors[0].Field)
-			assert.Contains(t, result.Errors[0].Message, "lowercase alphanumeric")
+			p.Platform = platform
+			require.Equal(t, []ingestViolation{{"", "error_event.platform"}}, ingestViolations(t, p))
 		})
 	}
 }
 
-// TestValidatePayload_EnvironmentFormat covers sentinel-project-environments §4.8 / decision 10's
-// widened accepted set: ^[a-z0-9][a-z0-9._-]{0,49}$.
-//
-// The four accepted names are the ones the operator actually named, and they are here rather than as
-// generic "a hyphen works" cases because that is what the widening is FOR — `prod-env` passing tells
-// you a character class changed, `eu-west-1` passing tells you a real environment can now be
-// reported. The rejections keep the two ends of the pattern honest: the character set (uppercase,
-// non-ASCII) and the anchor (a leading separator).
-//
-// The direction is permissive, so nothing deployed breaks: ^[a-z0-9]+$ is a subset of the new
-// pattern, and `production` — every existing caller's value — is still accepted.
-func TestValidatePayload_EnvironmentFormat(t *testing.T) {
-	accepted := []string{"pre-prod", "eu-west-1", "staging-2", "prod_eu", "production", "a", "prod.eu"}
-	for _, env := range accepted {
+// TestIngestValidation_EnvironmentFormat covers sentinel-project-environments §4.8 / decision 10's
+// widened accepted set: ^[a-z0-9][a-z0-9._-]{0,49}$, now asserted where it is enforced (the
+// error_event.environment CEL rule).
+func TestIngestValidation_EnvironmentFormat(t *testing.T) {
+	for _, env := range []string{"pre-prod", "eu-west-1", "staging-2", "prod_eu", "production", "a", "prod.eu"} {
 		t.Run("accepted/"+env, func(t *testing.T) {
 			p := validPayload()
 			p.Environment = env
-
-			result := validation.ValidatePayload(p)
-
-			assert.True(t, result.Valid, "expected %q to be accepted under decision 10's widened set", env)
-			assert.Empty(t, result.Errors)
+			requireIngestAccepted(t, p)
 		})
 	}
 
-	rejected := []struct {
-		name string
-		env  string
-	}{
-		{name: "uppercase letters", env: "Production"},
-		{name: "leading hyphen", env: "-prod"},
-		{name: "leading dot", env: ".prod"},
-		{name: "leading underscore", env: "_prod"},
-		{name: "non-ASCII", env: "pröd"},
-		{name: "space", env: "pre prod"},
-		{name: "slash", env: "eu/west"},
-		{name: "51 characters", env: strings.Repeat("a", 51)},
-	}
-	for _, tt := range rejected {
-		t.Run("rejected/"+tt.name, func(t *testing.T) {
+	for _, env := range []string{"Production", "-prod", ".prod", "_prod", "pröd", "pre prod", "eu/west", strings.Repeat("a", 51)} {
+		t.Run("rejected/"+env, func(t *testing.T) {
 			p := validPayload()
-			p.Environment = tt.env
-
-			result := validation.ValidatePayload(p)
-
-			require.False(t, result.Valid)
-			require.Len(t, result.Errors, 1)
-			assert.Equal(t, "environment", result.Errors[0].Field)
-			assert.Contains(t, result.Errors[0].Message, "^[a-z0-9][a-z0-9._-]{0,49}$")
+			p.Environment = env
+			require.Equal(t, []ingestViolation{{"", "error_event.environment"}}, ingestViolations(t, p))
 		})
 	}
 }
 
-// TestValidatePayload_PlatformStillRejectsWidenedEnvironmentNames is the assertion §11 names as the
-// one that catches a widened-in-place isValidAlphanumeric.
-//
-// validator.go shares isValidAlphanumeric between payload.Platform and payload.Environment, and
-// `platform` has its own CEL rule (error_event.platform) that decision 10 does NOT change. Widening
-// the shared function would leave the Go check and the wire check disagreeing about what a platform
-// is — a split that surfaces months later as an event the ingestor accepted and protovalidate
-// rejected. The four names the environment rule now accepts must therefore still be rejected here.
-func TestValidatePayload_PlatformStillRejectsWidenedEnvironmentNames(t *testing.T) {
+// The four names the environment rule accepts must still be rejected as a platform: the platform rule
+// (error_event.platform) was not widened alongside it.
+func TestIngestValidation_PlatformStillRejectsWidenedEnvironmentNames(t *testing.T) {
 	for _, platform := range []string{"pre-prod", "eu-west-1", "staging-2", "prod_eu"} {
 		t.Run(platform, func(t *testing.T) {
 			p := validPayload()
 			p.Platform = platform
-
-			result := validation.ValidatePayload(p)
-
-			require.False(t, result.Valid, "platform must NOT have been widened alongside environment")
-			require.Len(t, result.Errors, 1)
-			assert.Equal(t, "platform", result.Errors[0].Field)
-			assert.Contains(t, result.Errors[0].Message, "lowercase alphanumeric")
+			require.Equal(t, []ingestViolation{{"", "error_event.platform"}}, ingestViolations(t, p))
 		})
 	}
 }
 
-func TestValidatePayload_MessageLength(t *testing.T) {
-	t.Run("at the limit passes", func(t *testing.T) {
-		p := validPayload()
-		p.Message = strings.Repeat("a", 10000)
+// message is bounded in CODE POINTS by CEL. The deleted ValidatePayload check counted bytes, so a
+// 4000-character CJK message (12000 bytes) is accepted - it would newly 400 had that check been wired.
+func TestIngestValidation_MessageLength(t *testing.T) {
+	p := validPayload()
+	p.Message = strings.Repeat("a", 10000)
+	requireIngestAccepted(t, p)
 
-		result := validation.ValidatePayload(p)
+	p = validPayload()
+	p.Message = strings.Repeat("界", 4000)
+	requireIngestAccepted(t, p)
 
-		require.True(t, result.Valid, "expected 10000-char message to pass")
-		require.Empty(t, result.Errors)
-	})
-
-	t.Run("over the limit fails", func(t *testing.T) {
-		p := validPayload()
-		p.Message = strings.Repeat("a", 10001)
-
-		result := validation.ValidatePayload(p)
-
-		require.False(t, result.Valid)
-		require.Len(t, result.Errors, 1)
-		assert.Equal(t, "message", result.Errors[0].Field)
-		assert.Contains(t, result.Errors[0].Message, "10000")
-	})
+	p = validPayload()
+	p.Message = strings.Repeat("a", 10001)
+	require.Equal(t, []ingestViolation{{"", "error_event.message"}}, ingestViolations(t, p))
 }
 
-func TestValidatePayload_StacktraceLength(t *testing.T) {
-	t.Run("at the limit passes", func(t *testing.T) {
-		p := validPayload()
-		frames := make([]validation.StackFrame, 100)
-		for i := range frames {
-			frames[i] = validation.StackFrame{File: "f.go", Line: int32(i), Function: "f", InApp: false}
+func TestIngestValidation_StacktraceLength(t *testing.T) {
+	frames := func(n int) []validation.StackFrame {
+		out := make([]validation.StackFrame, n)
+		for i := range out {
+			out[i] = validation.StackFrame{File: "f.go", Line: int32(i), Function: "f"}
 		}
-		p.Stacktrace = frames
+		return out
+	}
+	p := validPayload()
+	p.Stacktrace = frames(100)
+	requireIngestAccepted(t, p)
 
-		result := validation.ValidatePayload(p)
-
-		require.True(t, result.Valid, "expected 100 frames to pass")
-		require.Empty(t, result.Errors)
-	})
-
-	t.Run("over the limit fails", func(t *testing.T) {
-		p := validPayload()
-		frames := make([]validation.StackFrame, 101)
-		for i := range frames {
-			frames[i] = validation.StackFrame{File: "f.go", Line: int32(i), Function: "f", InApp: false}
-		}
-		p.Stacktrace = frames
-
-		result := validation.ValidatePayload(p)
-
-		require.False(t, result.Valid)
-		require.Len(t, result.Errors, 1)
-		assert.Equal(t, "stacktrace", result.Errors[0].Field)
-		assert.Contains(t, result.Errors[0].Message, "100")
-	})
+	p = validPayload()
+	p.Stacktrace = frames(101)
+	require.Equal(t, []ingestViolation{{"stacktrace", "repeated.max_items"}}, ingestViolations(t, p))
 }
 
-func TestValidatePayload_MetadataSize(t *testing.T) {
-	t.Run("under the limit passes", func(t *testing.T) {
-		p := validPayload()
-		// Build a JSON-encoded metadata body well under 64 KB.
-		p.Metadata = map[string]interface{}{
-			"key": strings.Repeat("v", 1000),
-		}
+// metadata over 64 KiB is TRUNCATED by shrink now (spec §4.2, I2), never rejected: the full rule is
+// asserted in ingestor_bounds_test.go. What stays here is the old row's input, now accepted.
+func TestIngestValidation_MetadataOverLimitIsAcceptedAndShrunk(t *testing.T) {
+	p := validPayload()
+	md := make(map[string]interface{}, 1000)
+	for i := 0; i < 1000; i++ {
+		md[fmt.Sprintf("key-%04d", i)] = strings.Repeat("v", 60)
+	}
+	p.Metadata = md
+	encoded, _ := json.Marshal(p.Metadata)
+	require.Greater(t, len(encoded), validation.MaxMetadataSize, "metadata must exceed 64 KiB to exercise the rule")
 
-		result := validation.ValidatePayload(p)
-
-		require.True(t, result.Valid, "expected small metadata to pass")
-		require.Empty(t, result.Errors)
-	})
-
-	t.Run("over the limit fails", func(t *testing.T) {
-		p := validPayload()
-		// Construct a metadata map whose JSON-encoded form exceeds 64 KB.
-		// Each entry encodes as ~70 bytes of JSON; 1000 distinct entries
-		// produce ~70 KB, comfortably above the 64 KB threshold.
-		md := make(map[string]interface{}, 1000)
-		for i := 0; i < 1000; i++ {
-			md[fmt.Sprintf("key-%04d", i)] = strings.Repeat("v", 60)
-		}
-		p.Metadata = md
-
-		encoded, _ := json.Marshal(p.Metadata)
-		require.Greater(t, len(encoded), 64*1024, "metadata must exceed 64 KB to exercise rule")
-
-		result := validation.ValidatePayload(p)
-
-		require.False(t, result.Valid)
-		require.Len(t, result.Errors, 1)
-		assert.Equal(t, "metadata", result.Errors[0].Field)
-		assert.Contains(t, result.Errors[0].Message, "65536")
-	})
+	requireIngestAccepted(t, p)
+	encoded, _ = json.Marshal(p.Metadata)
+	assert.LessOrEqual(t, len(encoded), validation.MaxMetadataSize)
+	assert.Equal(t, []interface{}{"metadata"}, p.Metadata[validation.MetadataKeyServerTruncated])
 }
 
-func TestValidatePayload_StackFrameFileLength(t *testing.T) {
-	t.Run("in_app=true and file > 512 chars produces per-frame error", func(t *testing.T) {
-		p := validPayload()
-		p.Stacktrace = []validation.StackFrame{
-			{File: strings.Repeat("a", 513), Line: 1, Function: "f", InApp: true},
-		}
-
-		result := validation.ValidatePayload(p)
-
-		require.False(t, result.Valid)
-		require.Len(t, result.Errors, 1)
-		assert.Equal(t, "stacktrace[0].file", result.Errors[0].Field)
-		assert.Contains(t, result.Errors[0].Message, "512")
-	})
-
-	t.Run("in_app=false and file > 512 chars does NOT produce an error", func(t *testing.T) {
-		p := validPayload()
-		p.Stacktrace = []validation.StackFrame{
-			{File: strings.Repeat("a", 513), Line: 1, Function: "f", InApp: false},
-		}
-
-		result := validation.ValidatePayload(p)
-
-		require.True(t, result.Valid, "in_app=false should bypass the file length rule")
-		require.Empty(t, result.Errors)
-	})
+// A top-level in-app file over 512 is NOT enforced by the server (spec §4.2, S4): file is a fingerprint
+// input, and cutting or refusing it would change the grouping of every existing issue whose events carry
+// a longer path. The deleted ValidatePayload check would have newly 400'd this.
+func TestIngestValidation_TopLevelFileOver512IsNotEnforced(t *testing.T) {
+	long := strings.Repeat("a", 513)
+	p := validPayload()
+	p.Stacktrace = []validation.StackFrame{{File: long, Line: 1, Function: "f", InApp: true}}
+	requireIngestAccepted(t, p)
+	assert.Equal(t, long, p.Stacktrace[0].File, "a top-level file is never cut")
 }
 
-// sentinel-sourcemaps §4.3: `column` on the wire frame is optional and 1-based; 0 is "unknown"
-// and anything below zero is a producer bug the ingestor refuses with the per-frame field name
-// the browser producer will need to locate it. Beside the MaxFilePathLength check because it is
-// the same per-frame loop.
+// sentinel-sourcemaps §4.3: `column` on the wire frame is optional and 1-based; 0 is "unknown" and
+// anything below zero is a producer bug refused with the per-frame field name. This is the one rule
+// ValidatePayload still rejects on, because the proto carries no rule for it.
 func TestValidatePayload_StackFrameColumn(t *testing.T) {
 	t.Run("a 1-based column is accepted", func(t *testing.T) {
 		p := validPayload()
@@ -383,7 +270,7 @@ func TestValidatePayload_StackFrameColumn(t *testing.T) {
 		assert.Equal(t, "stacktrace[0].column", result.Errors[0].Field)
 	})
 
-	t.Run("the column error is reported beside the file-length error on the same frame", func(t *testing.T) {
+	t.Run("an over-long file on the same frame adds no second error: only the column is rejected", func(t *testing.T) {
 		p := validPayload()
 		p.Stacktrace = []validation.StackFrame{
 			{File: strings.Repeat("a", 513), Line: 1, Column: -1, Function: "f", InApp: true},
@@ -392,59 +279,8 @@ func TestValidatePayload_StackFrameColumn(t *testing.T) {
 		result := validation.ValidatePayload(p)
 
 		require.False(t, result.Valid)
-		require.Len(t, result.Errors, 2)
-		assert.Equal(t, "stacktrace[0].file", result.Errors[0].Field)
-		assert.Equal(t, "stacktrace[0].column", result.Errors[1].Field)
-	})
-}
-
-func TestIsValidAlphanumeric(t *testing.T) {
-	// isValidAlphanumeric is package-private; we exercise it via the public
-	// ValidatePayload path by observing platform/environment error messages.
-	tests := []struct {
-		name      string
-		value     string
-		wantValid bool
-	}{
-		{name: "lowercase alphanumeric", value: "abc123", wantValid: true},
-		{name: "uppercase only", value: "ABC", wantValid: false},
-		{name: "with hyphen", value: "abc-def", wantValid: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := validPayload()
-			p.Platform = tt.value
-
-			result := validation.ValidatePayload(p)
-
-			if tt.wantValid {
-				require.True(t, result.Valid, "expected %q to be valid", tt.value)
-				require.Empty(t, result.Errors)
-			} else {
-				require.False(t, result.Valid, "expected %q to be invalid", tt.value)
-				require.Len(t, result.Errors, 1)
-				assert.Equal(t, "platform", result.Errors[0].Field)
-				assert.Contains(t, result.Errors[0].Message, "lowercase alphanumeric")
-			}
-		})
-	}
-
-	t.Run("empty string is vacuously valid via the format check", func(t *testing.T) {
-		// isValidAlphanumeric("") returns true (vacuously valid: the loop
-		// never runs). When the platform is empty, ValidatePayload short-
-		// circuits on the "required" rule and never reaches the format check,
-		// so we observe a "required" error rather than "lowercase alphanumeric".
-		// This confirms the empty-string case does not produce a format error.
-		p := validPayload()
-		p.Platform = ""
-
-		result := validation.ValidatePayload(p)
-
-		require.False(t, result.Valid)
 		require.Len(t, result.Errors, 1)
-		assert.Equal(t, "platform", result.Errors[0].Field)
-		assert.Contains(t, result.Errors[0].Message, "required")
+		assert.Equal(t, "stacktrace[0].column", result.Errors[0].Field)
 	})
 }
 

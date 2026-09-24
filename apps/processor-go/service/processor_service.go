@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
@@ -329,15 +330,16 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		SpanID:    evt.SpanID,
 		CreatedAt: evt.Timestamp,
 		EventID:   evt.EventID,
-		// sentinel-affected-users §4.3: the pre-normalisation, decision-5-bounded identifiers and the
-		// reason each was dropped when it was — read by event.Normalize (decision 3), never from
-		// evt.Metadata, which by now holds "<UUID>" where a UUID was. StoreEvent writes the side
-		// tables from the ids and counts the reasons after commit.
+		// sentinel-affected-users §4.3: the raw, decision-5-bounded identifiers and the reason each
+		// was dropped when it was — read by event.Prepare before masking (decision 3), never from
+		// evt.Metadata, which by now is masked (a sensitive key's value is "***REDACTED***"). StoreEvent
+		// writes the side tables from the ids and counts the reasons after commit.
 		AffectedUserID:           evt.AffectedUserID,
 		AffectedTenantID:         evt.AffectedTenantID,
 		AffectedUserSkipReason:   evt.AffectedUserSkipReason,
 		AffectedTenantSkipReason: evt.AffectedTenantSkipReason,
 	}
+	fillOccurrenceV2(ctx, occ, evt)
 
 	var stored bool
 	// outcome is the class of the issue row's status AFTER the write (store.IssueOutcome, decision
@@ -514,10 +516,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
 	searchEntry.OccurrenceID = occ.ID
 	// sentinel-affected-users §4.3 (last paragraph; decisions 13 and 19): error_search_index receives
-	// the SAME raw ids the side tables got. ExtractSearchFields just read them out of the
-	// post-normalisation map, where a UUID is "<UUID>" and an email "<EMAIL>" — so /search by user id
-	// has never matched a UUID-, numeric- or email-keyed producer. Overwrite both with the event's
-	// pre-normalisation, decision-5-bounded fields: "" when the value was unusable, which
+	// the SAME raw ids the side tables got. ExtractSearchFields just read them out of the masked map
+	// (until sentinel-event-schema-v2 also normalised, where a UUID was "<UUID>"), and the typed
+	// user.id / tenant_id tag (OQ-3) are not in the map at all. Overwrite both with the event's raw,
+	// decision-5-bounded fields: "" when the value was unusable, which
 	// IndexOccurrence's nullString already writes as NULL — so a 300-byte id is ABSENT from the index
 	// instead of failing this after-commit VARCHAR(255) insert as it would have. ExtractSearchFields,
 	// its key list, the columns and every reader are untouched; only these two values differ.
@@ -629,4 +631,58 @@ func (s *ProcessorService) dispatchAlert(ctx context.Context, issueID, projectID
 		}
 	}()
 	s.alerts.Dispatch(ctx, issueID, projectID, environment, errorClass, message)
+}
+
+// fillOccurrenceV2 is sentinel-event-schema-v2 §6.1: the per-occurrence v2 columns from the event.
+//
+//   - Level is the event's, or "error" when it sent none (the ingestor replaced an invalid one with "").
+//   - Message and ErrorClass are the occurrence's own values, as Prepare left them, with
+//     every U+0000 removed: the ingestor leaves top-level fields as sent, and Postgres rejects NUL in
+//     text (22021, class 22, Permanent) - without the strip an occurrence of an EXISTING issue whose
+//     message carries a NUL would newly dead-letter (spec P15, T27).
+//   - TraceFlags is nil when the event has no trace id: W3C trace-flags only exist as part of a
+//     traceparent.
+//   - ReceivedAt is nil for a message that predates the ingestor stamping it.
+//   - each JSONB body is the wire JSON of its field, nil when the event carried none.
+func fillOccurrenceV2(ctx context.Context, occ *store.ErrorOccurrence, evt *event.ErrorEvent) {
+	occ.Level = evt.Level
+	if occ.Level == "" {
+		occ.Level = "error"
+	}
+	occ.Message = strings.ReplaceAll(evt.Message, "\x00", "")
+	occ.ErrorClass = strings.ReplaceAll(evt.ErrorClass, "\x00", "")
+	occ.Logger = evt.Logger
+	occ.ServerName = evt.ServerName
+	occ.Transaction = evt.Transaction
+	occ.Dist = evt.Dist
+	occ.Source = evt.Source
+	if evt.TraceID != "" {
+		flags := int64(evt.TraceFlags)
+		occ.TraceFlags = &flags
+	}
+	if !evt.ReceivedAt.IsZero() {
+		receivedAt := evt.ReceivedAt
+		occ.ReceivedAt = &receivedAt
+	}
+	marshal := func(column string, v interface{}, present bool) json.RawMessage {
+		if !present {
+			return nil
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			// Unreachable for decoded JSON; a non-JSON value (a NaN from a hand-built proto) must not
+			// cost the event, so the column is stored NULL and the reason logged.
+			slog.WarnContext(ctx, "processor: v2 field is not JSON-encodable; storing NULL",
+				slog.String("column", column), slog.String("error", err.Error()))
+			return nil
+		}
+		return b
+	}
+	occ.SDK = marshal("sdk", evt.SDK, evt.SDK != nil)
+	occ.User = marshal("event_user", evt.User, evt.User != nil)
+	occ.Tags = marshal("tags", evt.Tags, len(evt.Tags) > 0)
+	occ.Contexts = marshal("contexts", evt.Contexts, len(evt.Contexts) > 0)
+	occ.Request = marshal("request", evt.Request, evt.Request != nil)
+	occ.Breadcrumbs = marshal("breadcrumbs", evt.Breadcrumbs, len(evt.Breadcrumbs) > 0)
+	occ.Exception = marshal("exception", evt.Exception, evt.Exception != nil)
 }

@@ -54,6 +54,24 @@ vi.mock('$lib/db/schema', () => ({
 		metadata: 'metadata',
 		traceId: 'traceId',
 		createdAt: 'createdAt',
+		// sentinel-event-schema-v2 §5.5: the v2 columns, each mocked as its own property name.
+		level: 'level',
+		message: 'message',
+		errorClass: 'errorClass',
+		logger: 'logger',
+		serverName: 'serverName',
+		transaction: 'transaction',
+		dist: 'dist',
+		source: 'source',
+		traceFlags: 'traceFlags',
+		receivedAt: 'receivedAt',
+		sdk: 'sdk',
+		eventUser: 'eventUser',
+		tags: 'tags',
+		contexts: 'contexts',
+		request: 'request',
+		breadcrumbs: 'breadcrumbs',
+		exception: 'exception',
 	},
 }));
 
@@ -244,5 +262,61 @@ describe('listAgentProjects', () => {
 				},
 			},
 		]);
+	});
+});
+
+// sentinel-event-schema-v2 §8.1 / V7c: both agent occurrence reads pass ONE shared column object to
+// select(), binding every v2 key to its errorOccurrences column -- `user` to `eventUser` (the column is
+// event_user). Asserted on the ARGUMENT of the select call, not on a mock's return value (B10): a
+// mock that returns whatever it is told cannot tell a read that selects the column from one that does not.
+describe('agent occurrence column object (V7c)', () => {
+	const v2Bindings = {
+		level: 'level',
+		message: 'message',
+		errorClass: 'errorClass',
+		logger: 'logger',
+		serverName: 'serverName',
+		transaction: 'transaction',
+		dist: 'dist',
+		source: 'source',
+		traceFlags: 'traceFlags',
+		receivedAt: 'receivedAt',
+		sdk: 'sdk',
+		user: 'eventUser',
+		tags: 'tags',
+		contexts: 'contexts',
+		request: 'request',
+		breadcrumbs: 'breadcrumbs',
+		exception: 'exception',
+	};
+	const preV2Bindings = {
+		id: 'id',
+		environment: 'environment',
+		platform: 'platform',
+		releaseVersion: 'releaseVersion',
+		stacktrace: 'stacktrace',
+		metadata: 'metadata',
+		traceId: 'traceId',
+		createdAt: 'createdAt',
+	};
+
+	it('getLatestAgentOccurrence selects every pre-v2 and v2 column', async () => {
+		dbMock.__result = [];
+		await getLatestAgentOccurrence('issue-1');
+		expect(dbMock.select).toHaveBeenCalledTimes(1);
+		expect(dbMock.select.mock.calls[0][0]).toEqual({ ...preV2Bindings, ...v2Bindings });
+	});
+
+	it('listAgentOccurrences selects the same object', async () => {
+		dbMock.__result = [];
+		await listAgentOccurrences({ issueId: 'issue-1' });
+		expect(dbMock.select).toHaveBeenCalledTimes(1);
+		expect(dbMock.select.mock.calls[0][0]).toEqual({ ...preV2Bindings, ...v2Bindings });
+	});
+
+	it('the two reads share one object, so they cannot drift', async () => {
+		await getLatestAgentOccurrence('issue-1');
+		await listAgentOccurrences({ issueId: 'issue-1' });
+		expect(dbMock.select.mock.calls[0][0]).toBe(dbMock.select.mock.calls[1][0]);
 	});
 });

@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/masker"
@@ -134,6 +135,24 @@ func TestMaskString(t *testing.T) {
 			input:    `ssn: 123-45-6789, api_key: "secret12345678901234567890"`,
 			expected: `ssn: XXX-XX-XXXX, api_key=***REDACTED***`,
 		},
+		// sentinel-event-schema-v2 §6.7 / V8b: Luhn-checked PAN redaction, run first.
+		{name: "PAN 16 digits (visa test number)", input: "4111111111111111", expected: "[REDACTED_PAN]"},
+		{name: "PAN 16 digits (mastercard test number)", input: "5500005555555559", expected: "[REDACTED_PAN]"},
+		{name: "PAN 15 digits (amex test number)", input: "378282246310005", expected: "[REDACTED_PAN]"},
+		{name: "PAN 13 digits, Luhn-valid", input: "1727000000007", expected: "[REDACTED_PAN]"},
+		{name: "PAN in free text", input: "charge 4111111111111111 failed", expected: "charge [REDACTED_PAN] failed"},
+		{name: "PAN dash-separated, surrounding text kept", input: "card 4111-1111-1111-1111 declined", expected: "card [REDACTED_PAN] declined"},
+		{name: "PAN space-separated, surrounding text kept", input: "card 4111 1111 1111 1111 declined", expected: "card [REDACTED_PAN] declined"},
+		{name: "longest Luhn-valid candidate: 18 digits fail, 16 pass", input: "4111111111111111 12", expected: "[REDACTED_PAN] 12"},
+		{name: "a digit run next to a letter is still a group", input: "id4111111111111111", expected: "id[REDACTED_PAN]"},
+		{name: "Luhn-invalid 16 digits left alone", input: "4111111111111112", expected: "4111111111111112"},
+		{name: "Luhn-invalid 13-digit millisecond timestamp left alone", input: "1727000000000", expected: "1727000000000"},
+		{name: "Luhn-invalid 13 digits left alone", input: "1234567890123", expected: "1234567890123"},
+		{name: "more than 19 digits is never a PAN", input: "12345678901234567890", expected: "12345678901234567890"},
+		{name: "a Luhn-valid 12-digit run is too short", input: "123456789015", expected: "123456789015"},
+		{name: "a double separator breaks the chain", input: "4111--1111-1111-1111", expected: "4111--1111-1111-1111"},
+		{name: "two Luhn-failing 13-digit runs stored verbatim (P13)", input: "order 1727000000000 at 1234567890123", expected: "order 1727000000000 at 1234567890123"},
+		{name: "a 20-digit api key is left to the api_key rule", input: "api_key: 12345678901234567890", expected: "api_key=***REDACTED***"},
 	}
 
 	for _, tt := range tests {
@@ -259,6 +278,21 @@ func TestMaskMap(t *testing.T) {
 				return got["Api_Key"] == "***REDACTED***"
 			},
 		},
+		// sentinel-event-schema-v2 §6.7 / V8a: `cookie` and `api-key`, substring and case-insensitive.
+		{name: "Cookie", input: map[string]interface{}{"Cookie": "sid=abc"}, checkFn: redactedKey("Cookie")},
+		{name: "Set-Cookie", input: map[string]interface{}{"Set-Cookie": "sid=abc; HttpOnly"}, checkFn: redactedKey("Set-Cookie")},
+		{name: "cookie_consent", input: map[string]interface{}{"cookie_consent": "yes"}, checkFn: redactedKey("cookie_consent")},
+		{name: "X-API-Key", input: map[string]interface{}{"X-API-Key": "sk_live_x"}, checkFn: redactedKey("X-API-Key")},
+		{name: "x-api-key-id", input: map[string]interface{}{"x-api-key-id": "k1"}, checkFn: redactedKey("x-api-key-id")},
+		{name: "api_key still redacted", input: map[string]interface{}{"api_key": "k"}, checkFn: redactedKey("api_key")},
+		{name: "apikey still redacted", input: map[string]interface{}{"apikey": "k"}, checkFn: redactedKey("apikey")},
+		{
+			name:  "a PAN in a metadata value is redacted by MaskString",
+			input: map[string]interface{}{"note": "paid with 4111 1111 1111 1111"},
+			checkFn: func(got map[string]interface{}) bool {
+				return got["note"] == "paid with [REDACTED_PAN]"
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -310,5 +344,31 @@ func TestMaskSlice(t *testing.T) {
 				t.Errorf("MaskSlice() = %v, check failed", got)
 			}
 		})
+	}
+}
+
+func redactedKey(key string) func(map[string]interface{}) bool {
+	return func(got map[string]interface{}) bool { return got[key] == "***REDACTED***" }
+}
+
+// V8d's other half (sentinel-event-schema-v2 §9.2): SensitiveKeys is the sorted key list, including the
+// two TASK-08 keys, and a copy the caller cannot use to change the masker.
+func TestSensitiveKeys(t *testing.T) {
+	keys := masker.SensitiveKeys()
+	if !sort.StringsAreSorted(keys) {
+		t.Fatalf("SensitiveKeys() is not sorted: %v", keys)
+	}
+	has := map[string]bool{}
+	for _, k := range keys {
+		has[k] = true
+	}
+	for _, k := range []string{"cookie", "api-key", "password", "authorization"} {
+		if !has[k] {
+			t.Errorf("SensitiveKeys() lacks %q: %v", k, keys)
+		}
+	}
+	keys[0] = "mutated"
+	if masker.SensitiveKeys()[0] == "mutated" {
+		t.Error("SensitiveKeys() must return a fresh copy")
 	}
 }

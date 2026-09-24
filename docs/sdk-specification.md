@@ -73,20 +73,201 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
     "http_method": "GET",
     "http_url": "/api/users/99",
     "user_id": "usr_7712"
+  },
+  "source": "onerror",
+  "level": "error",
+  "logger": "user-service",
+  "server_name": "api-7f9c-pod-2",
+  "transaction": "GET /api/users/:id",
+  "dist": "4127",
+  "sdk": { "name": "sentinel.go", "version": "1.4.0" },
+  "user": {
+    "id": "usr_7712",
+    "username": "alice",
+    "email": "alice@example.com",
+    "ip_address": "203.0.113.7",
+    "geo": { "city": "Berlin", "region": "Berlin", "country_code": "DE", "subdivision": "BE" }
+  },
+  "tags": { "tenant_id": "acme", "region": "eu-central-1" },
+  "contexts": {
+    "os": { "name": "Linux", "version": "6.8" },
+    "runtime": { "name": "go", "version": "1.22.4" }
+  },
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/api/users/99",
+    "query_string": "expand=profile",
+    "headers": { "Accept": "application/json" },
+    "data": null,
+    "env": { "REMOTE_ADDR": "10.1.2.3" }
+  },
+  "breadcrumbs": [
+    {
+      "timestamp": "2026-07-25T13:59:58Z",
+      "type": "http",
+      "category": "db",
+      "level": "info",
+      "message": "SELECT users WHERE id = 99",
+      "data": { "rows": 0 }
+    }
+  ],
+  "exception": {
+    "values": [
+      {
+        "type": "NilPointerReference",
+        "value": "runtime error: invalid memory address",
+        "mechanism": { "type": "panic", "handled": false },
+        "stacktrace": [
+          {
+            "file": "service/user.go",
+            "line": 42,
+            "function": "GetUserProfile",
+            "in_app": true,
+            "module": "example.com/app/service",
+            "abs_path": "/srv/app/service/user.go",
+            "context_line": "return u.Profile.Name, nil",
+            "pre_context": ["u, err := s.repo.Find(id)"],
+            "post_context": ["}"]
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
+Every key after `metadata` is a **v2 field** (`sentinel-event-schema-v2`): optional, additive, and ignored by
+nothing — an older ingestor drops unknown keys, a newer one stores each of them per occurrence. `metadata` is Sentry's
+`extra`. The server never accepts `received_at` from a client (see "Field semantics" below).
+
 ### Protocol Validation Constraints
 
-- **`project_key`**: 1–64 characters. Resolved against `projects.name` **within the authenticated key's organization only** — a name belonging to another organization is 403, never a cross-tenant write.
-- **`platform`**: Matches `^[a-z0-9]+$` (lowercase alphanumeric), maximum 50 characters.
-- **`environment`**: Matches `^[a-z0-9][a-z0-9._-]{0,49}$` (`sentinel-project-environments` — lowercase alphanumeric first character, then `.`, `_` and `-` allowed, at most 50 characters).
-- **`message`**: Maximum 10,000 **bytes** — an oversized message is **rejected** with `400`, not truncated (the validator's `len()` counts bytes, so a multi-byte message hits the cap earlier than its character count suggests). The SDK truncates client-side on a code-point boundary and records the cut (the JS SDK in `metadata.truncated`).
-- **`stacktrace`**: Maximum 100 frames. File paths maximum 512 bytes, `function` 255 bytes, `error_class` 255 bytes — the same bytes-not-characters rule as `message`, and the same client-side truncation.
-- **`stacktrace[].column`**: Optional integer, **1-based as browsers print it** (V8, SpiderMonkey and JavaScriptCore stack strings are `file:line:column`, 1-based — pass the number through unchanged). Omit it, or send `0`, when the platform has no column (Go, Python, Java frames); `0` means "unknown" and the frame is stored as-is. A negative value is rejected with `400` and `field: stacktrace[i].column`. Symbolication (§8) needs it: a frame without a column is stored raw. The JS SDK passes the engine's number through unchanged and **omits** the key when the engine printed none (never an explicit `0`, never `null`).
-- **`metadata`**: Maximum 64 KB total serialized size, **as the validator re-serialises it** (Go's `json.Marshal` escapes `<`, `>`, `&`, U+2028 and U+2029, so a client counting `JSON.stringify` bytes under-counts by up to 5 bytes per such character).
+One table covers every field the server bounds (`sentinel-event-schema-v2` §4.2). **Units:** a string bound counts **code
+points** (Unicode characters), the unit protovalidate's `size()` and a Postgres `VARCHAR` both count in, unless the Unit column
+says **bytes** (serialized size as Go's `json.Marshal` produces it, which escapes `<`, `>`, `&`, U+2028 and U+2029, so a client
+counting `JSON.stringify` bytes under-counts by up to 5 bytes per such character) or **items** (a count). The code constant in
+each Bound cell is the one the ingestor enforces (`apps/ingestor-go/validation`); `tests/unit/sdk_spec_limits_test.go` fails
+when this table and the code disagree.
+
+**Two postures.** A field that existed before v2 keeps its behaviour: an oversized value is **rejected** with `400` (the SDK
+must truncate client-side and record the cut, as the JS SDK does in `metadata.truncated`). A **v2 field never costs the event**:
+an oversized value is **truncated** (cut to the bound on a code-point boundary, no ellipsis), or **dropped** when it is an
+identifier (a truncated identifier is a different identifier), or **replaced**, and the event is stored.
+
+| Field | Bound | Unit | Over the bound | Marker |
+|:---|:---|:---|:---|:---|
+| `project_key` | ≤ 64 (`MaxProjectKeyLength`) | code points | reject 400; required. Resolved against `projects.name` **within the authenticated key's organization only** — a name belonging to another organization is 403, never a cross-tenant write. | — |
+| `platform` | ≤ 50 (`MaxPlatformLength`) | code points | reject 400; required, must match `^[a-z0-9]+$` | — |
+| `environment` | ≤ 50 (`MaxEnvironmentLength`) | code points | reject 400; required, must match `^[a-z0-9][a-z0-9._-]{0,49}$` (`sentinel-project-environments`) | — |
+| `message` | ≤ 10000 (`MaxMessageLength`) | code points | reject 400 | — |
+| `error_class` | ≤ 255 (`MaxErrorClassLength`) | code points | reject 400; required, also when an `exception` chain is sent | — |
+| `trace_id` | ≤ 64 (`MaxTraceIDLength`) | code points | reject 400 | — |
+| `span_id` | ≤ 64 (`MaxSpanIDLength`) | code points | reject 400 | — |
+| `release_version` | ≤ 100 (`MaxReleaseVersionLength`) | code points | reject 400 | — |
+| `fingerprint` | ≤ 64 (`MaxFingerprintLength`) | code points | reject 400 (a shortened grouping key would merge issues) | — |
+| `event_id` | ≤ 64 (`MaxEventIDLength`) | code points | replace with a server-minted UUIDv4 (also when empty or holding a control character) | — |
+| `timestamp` | 60 s ahead / 30 days behind receipt | — | replace with the receipt time (see the note below) | — |
+| `stacktrace` | ≤ 100 (`MaxStacktraceFrames`) | items | reject 400 | — |
+| `stacktrace[].file` | ≤ 512 (`MaxFilePathLength`) | bytes | **SDK-side MUST truncate; the server does not enforce it.** `file` is a fingerprint input, and cutting it at the server would split existing issues. | — |
+| `stacktrace[].function` | ≤ 255 (`MaxFunctionNameLength`) | bytes | **SDK-side MUST truncate; the server does not enforce it**, for the same reason as `file`. | — |
+| `stacktrace[].column` | ≥ 0 | — | reject 400 with `field: stacktrace[i].column` (see the note below) | — |
+| `metadata` | ≤ 65536 (`MaxMetadataSize`) | bytes | truncate by shrink: while over, remove the top-level key whose `"key":value` is largest (ties to the lexically smallest key), every other key before the routing keys `user_id userId user tenant_id tenantId organization_id trace_id traceId trace-id span_id spanId span-id request_id requestId request-id release_version truncated truncated_keys`; the two server markers are never removed; each removed key goes to `server_truncated_keys` | `metadata` |
+| `level` | `""` or `fatal`, `error`, `warning`, `info`, `debug` (exact lowercase) | — | replace with `""` (stored as `error`) | `level` |
+| `logger` | ≤ 64 (`MaxLoggerLength`) | code points | truncate | `logger` |
+| `server_name` | ≤ 256 (`MaxServerNameLength`) | code points | truncate | `server_name` |
+| `transaction` | ≤ 200 (`MaxTransactionLength`) | code points | truncate | `transaction` |
+| `dist` | ≤ 64 (`MaxDistLength`) | code points | truncate | `dist` |
+| `source` | ≤ 64 (`MaxSourceLength`) | code points | truncate | `source` |
+| `sdk.name` | ≤ 128 (`MaxSDKNameLength`) | code points | truncate | `sdk` |
+| `sdk.version` | ≤ 64 (`MaxSDKVersionLength`) | code points | truncate | `sdk` |
+| `user.id` | ≤ 255 (`MaxUserIDBytes`) | bytes | drop | `user.id` |
+| `user.username` | ≤ 128 (`MaxUsernameLength`) | code points | truncate | `user.username` |
+| `user.email` | ≤ 254 (`MaxUserEmailLength`) | code points | drop | `user.email` |
+| `user.ip_address` | ≤ 45 (`MaxUserIPAddressLength`) | code points | drop; the format is not validated (stored as sent) | `user.ip_address` |
+| `user.geo.city` / `.region` / `.subdivision` | ≤ 128 (`MaxGeoTextLength`) | code points | truncate | `user.geo` |
+| `user.geo.country_code` | ≤ 8 (`MaxGeoCountryCodeLength`) | code points | drop | `user.geo` |
+| `tags` | ≤ 50 (`MaxTags`) | items | invalid entries are dropped first; then the 50 lexically smallest keys are kept | `tags` (+ `tags.<key>` in `server_truncated_keys`) |
+| `tags` key | ≤ 32 (`MaxTagKeyLength`) | code points | must match `^[a-zA-Z0-9_.:-]{1,32}$`; the entry is dropped | `tags` (+ `tags.<key>`) |
+| `tags` value | ≤ 200 (`MaxTagValueLength`) | code points | at least 1, no `\n`; the entry is dropped | `tags` (+ `tags.<key>`) |
+| `contexts` | ≤ 32 (`MaxContexts`) | items | invalid names are dropped first; then, while over the count or the byte total, remove one context: other names before the well-known `device os app runtime browser culture`, largest serialized first, ties lexical | `contexts` (+ `contexts.<name>`) |
+| `contexts` name | ≤ 64 (`MaxContextKeyLength`) | code points | at least 1; the context is dropped | `contexts` (+ `contexts.<name>`) |
+| `contexts` total | ≤ 65536 (`MaxContextsSize`) | bytes | as `contexts` | `contexts` (+ `contexts.<name>`) |
+| `request.method` | ≤ 16 (`MaxRequestMethodLength`) | code points | truncate | `request.method` |
+| `request.url` | ≤ 2048 (`MaxRequestURLLength`) | code points | truncate | `request.url` |
+| `request.query_string` | ≤ 4096 (`MaxRequestQueryStringLength`) | code points | truncate | `request.query_string` |
+| `request.headers` | ≤ 64 (`MaxRequestHeaders`) | items | entries past 64 are dropped, lexically largest first | `request.headers` |
+| `request.headers` key | ≤ 256 (`MaxRequestHeaderKeyLength`) | code points | at least 1; the entry is dropped | `request.headers` |
+| `request.headers` value | ≤ 4096 (`MaxRequestHeaderValueLength`) | code points | truncate | `request.headers` |
+| `request.env` | ≤ 64 (`MaxRequestEnv`) | items | as `request.headers` | `request.env` |
+| `request.env` key | ≤ 256 (`MaxRequestEnvKeyLength`) | code points | at least 1; the entry is dropped | `request.env` |
+| `request.env` value | ≤ 1024 (`MaxRequestEnvValueLength`) | code points | truncate | `request.env` |
+| `request.data` | ≤ 16384 (`MaxRequestDataSize`) | bytes | drop (set to absent) | `request.data` |
+| `breadcrumbs` | ≤ 100 (`MaxBreadcrumbs`) | items | keep the **last** 100 (the most recent; the list is oldest first) | `breadcrumbs` |
+| `breadcrumbs` total | ≤ 131072 (`MaxBreadcrumbsSize`) | bytes | drop the oldest while over | `breadcrumbs` |
+| `breadcrumbs[].type` | ≤ 64 (`MaxBreadcrumbTypeLength`) | code points | truncate | `breadcrumbs.type` |
+| `breadcrumbs[].category` | ≤ 128 (`MaxBreadcrumbCategoryLength`) | code points | truncate | `breadcrumbs.category` |
+| `breadcrumbs[].level` | as `level` | — | replace with `""` | `breadcrumbs.level` |
+| `breadcrumbs[].message` | ≤ 8192 (`MaxBreadcrumbMessageLength`) | code points | truncate | `breadcrumbs.message` |
+| `breadcrumbs[].data` | ≤ 4096 (`MaxBreadcrumbDataSize`) | bytes | drop that crumb's `data` | `breadcrumbs.data` |
+| `exception.values` | ≤ 20 (`MaxExceptionValues`) | items | keep the **last** 20 (the raised exception is last) | `exception` |
+| `exception.values[].type` | ≤ 255 (`MaxExceptionTypeLength`) | code points | truncate | `exception.type` |
+| `exception.values[].value` | ≤ 10000 (`MaxExceptionValueLength`) | code points | truncate | `exception.value` |
+| `exception.values[].mechanism.type` | ≤ 64 (`MaxMechanismTypeLength`) | code points | truncate | `exception.mechanism` |
+| `exception.values[].stacktrace` | ≤ 100 (`MaxExceptionFrames`) | items | keep the **first** 100 (the crashing end) | `exception.stacktrace` |
+| chain frame `.file` | ≤ 512 (`MaxFilePathLength`) | code points | truncate (a chain frame is not a fingerprint input) | `exception.stacktrace` |
+| chain frame `.function` | ≤ 255 (`MaxFunctionNameLength`) | code points | truncate | `exception.stacktrace` |
+| chain frame with `in_app` and no `file` | — | — | replace `in_app` with `false`; the frame and its `module`/`abs_path` are kept | `exception.stacktrace` |
+| chain frame `.column` | ≥ 0 | — | replace a negative value with `0` (unknown) | `exception.stacktrace` |
+| any frame `.module` | ≤ 255 (`MaxFrameModuleLength`) | code points | truncate | `stacktrace.module` |
+| any frame `.abs_path` | ≤ 1024 (`MaxFrameAbsPathLength`) | code points | truncate | `stacktrace.abs_path` |
+| any frame `.context_line` | ≤ 1024 (`MaxFrameContextLineLength`) | code points | truncate | `stacktrace.context` |
+| any frame `.pre_context` / `.post_context` | ≤ 5 (`MaxFrameContextLines`) | items | keep the last 5 of `pre_context` and the first 5 of `post_context` (nearest the line); each line is truncated to 1024 | `stacktrace.context` |
+| `metadata.server_truncated_keys` | ≤ 50 (`MaxServerTruncatedKeys`) | items | the server's own marker: the first 50 removed keys are listed, then one `+N more` entry counts the rest | — |
+| `metadata.server_truncated_keys[]` | ≤ 128 (`MaxServerTruncatedKeyBytes`) | bytes | each listed key is cut to 128 bytes on a UTF-8 boundary and never carries a U+0000; both markers are counted inside the `metadata` bound and are never removed by its shrink | — |
+| every v2 string, `source`, and every key and string value inside `sdk`, `user`, `tags`, `contexts`, `request`, `breadcrumbs`, `exception` | no U+0000 | — | strip every U+0000 before the length rules run (Postgres rejects it) | the field's own entry |
+
+**Server markers.** Every truncate, drop or replace appends the field's entry to `metadata.server_truncated`, an array of strings,
+deduplicated and in the vocabulary order below. Removed map keys (`metadata` keys, `tags.<key>`, `contexts.<name>`) go to
+`metadata.server_truncated_keys`. Both keys are **server-owned**: a client value under either is overwritten or removed. They are
+separate from the JS SDK's client-side `truncated` / `truncated_keys`, so a reader can always tell who cut what. Each event with
+a cut also adds 1 per field to `sentinel_ingest_fields_truncated_total{field}`.
+
+**The vocabulary** (the closed set of `server_truncated` entries and `field` label values, in emission order):
+`level logger server_name transaction dist source sdk user.id user.username user.email user.ip_address user.geo tags contexts request.method request.url request.query_string request.headers request.env request.data breadcrumbs breadcrumbs.type breadcrumbs.category breadcrumbs.level breadcrumbs.message breadcrumbs.data exception exception.type exception.value exception.mechanism exception.stacktrace stacktrace.module stacktrace.abs_path stacktrace.context metadata`
+
+**Wrong JSON type → `400 Invalid JSON payload` for the whole event.** Unknown keys are ignored, so a newer SDK never breaks an older
+ingestor. But a value of the wrong JSON type for a known field (a numeric tag value, a context that is not an object, a Unix-float
+breadcrumb `timestamp`) fails the decode of the whole body, as it does for every field.
+
+**Notes on three rows.**
+- **`stacktrace[].column`**: optional integer, **1-based as browsers print it** (V8, SpiderMonkey and JavaScriptCore stack strings are `file:line:column`, 1-based — pass the number through unchanged). Omit it, or send `0`, when the platform has no column (Go, Python, Java frames); `0` means "unknown" and the frame is stored as-is. Symbolication (§8) needs it: a frame without a column is stored raw. The JS SDK passes the engine's number through unchanged and **omits** the key when the engine printed none (never an explicit `0`, never `null`).
 - **`timestamp`**: Optional, RFC 3339 (fractional seconds and any offset accepted; stored as the same instant in UTC). The JS SDK **always sends one** (`new Date().toISOString()` at capture) and **ignores the echo** below — it reads only `errors[]` from the batch response, so a skewed browser clock is corrected server-side with nothing for the client to do. When absent, `null`, or the zero `0001-01-01T00:00:00Z`, the server **defaults it to its own receipt time** (`reason="empty"`). A value more than **60 s ahead** of receipt time (`MaxFutureSkew`, `reason="future"`) or more than **30 days behind** it (`MaxEventAge`, `reason="ancient"`) is **replaced with the receipt time** — never rejected. Every replacement is counted in `sentinel_ingest_timestamp_replaced_total{reason}`; the value the client sent is **not stored** anywhere — it survives only in the ingestor's log line. The effective value is echoed back as `timestamp` in the `202` body (and per `event_ids[]` item on `/ingest/batch`), so a client can diff what it sent against what was used. A `timestamp` that does not parse as RFC 3339 is still `400 Invalid JSON payload`.
+- **`stacktrace[].file` / `.function`**: the byte bounds are the SDK's to apply on a code-point boundary before sending. The server stores top-level frames exactly as sent, because both fields feed the fingerprint.
+
+
+### Field semantics
+
+- **`level`**: `""` (absent) or exactly one of `fatal`, `error`, `warning`, `info`, `debug`. Absent is stored as `error`.
+  Any other value is replaced with `""` (and so stored as `error`) and marked `level` in `server_truncated`.
+- **`received_at` is server-set.** The ingestor stamps the time it received the request (one reading per HTTP request,
+  shared by every item of a batch) and stores it per occurrence. It is not part of the JSON surface: a client value is
+  ignored. `timestamp` stays the client's capture time (bounded as above).
+- **Order of `exception.values`**: Sentry's — oldest first (the root cause), and the exception that was actually
+  raised **last**. The order of **frames**, in both `stacktrace` and `exception.values[].stacktrace`, is Sentinel's:
+  the crashing frame **first**. A mapper from Sentry's frame list (outermost caller first) reverses it.
+- **`metadata` is Sentry's `extra`**: free-form context with no schema.
+- **The exception chain never groups.** Issue identity is computed from the top-level `environment`, `error_class`
+  and `stacktrace` only, whether or not a chain is present; the chain is stored per occurrence as evidence. The
+  top-level `error_class` is still **required**: an event that carries only an `exception` chain is rejected with
+  `400` (`validation failed:` with protovalidate's violation for field `error_class`, rule `required`).
+- **Affected user and tenant.** The affected-users rollup and the search index read the user from the typed
+  `user.id` when it is non-empty, otherwise from `metadata.user_id` → `userId` → `user` as before; and the tenant
+  from `tags.tenant_id` when present, otherwise from `metadata.tenant_id` → `tenantId` → `organization_id`. A typed
+  value that is present but unusable (a control character) wins and is not replaced by the metadata fallback; a
+  `user.id` over 255 bytes is dropped by the ingestor, so the metadata fallback applies.
+- **Stored per occurrence.** Every v2 field, and the occurrence's own `message` and `error_class`, are stored on each
+  occurrence, masked as §5 describes and **never normalized**. Two occurrences of one issue each keep their own
+  message.
 
 ---
 
@@ -104,15 +285,37 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
 
 ## 5. Security & PII Sanitization Rules
 
-SDKs MUST execute client-side PII scrubbing on `metadata` before HTTP payload transmission.
+SDKs MUST execute client-side PII scrubbing on `metadata` before HTTP payload transmission. The server masks again
+(below) as a backstop; it backs up the SDK's scrubbing but does not replace it.
 
 ### Mandatory Masking Keys
-Any metadata key matching the following case-insensitive patterns MUST be replaced with `"[FILTERED]"`:
-- `password`, `pass`, `passwd`
-- `authorization`, `auth`, `token`, `bearer`
-- `api_key`, `apikey`, `secret`
-- `credit_card`, `card_number`, `cvv`
-- `ssn`, `social_security`
+Any map key that **contains** one of the following strings, compared case-insensitively (a substring match, so
+`Set-Cookie`, `X-API-Key` and `user_password` are covered), has its whole value replaced. An SDK replaces it with
+`"[FILTERED]"`; the server replaces it with `"***REDACTED***"`. The server's list, exactly:
+
+`access_token` `api-key` `api_key` `apikey` `auth` `authorization` `bearer` `card_number` `client_secret` `cookie` `credential` `credentials` `credit_card` `cvv` `passwd` `password` `private_key` `pwd` `refresh_token` `secret` `social_security` `ssn` `token`
+
+### Card numbers
+In every string the server masks, a card number is replaced with `[REDACTED_PAN]`: a run of 13 to 19 ASCII digits,
+bare or split into groups by single spaces or single dashes (`4111 1111 1111 1111`, `4111-1111-1111-1111`), **whose
+digits pass the Luhn check**. Numbers that fail Luhn are left alone, which is how ids and millisecond timestamps
+survive; about one in ten arbitrary 13-19 digit numbers passes by chance and is redacted.
+
+### What the server masks, and what it stores as sent
+- **Masked**: `message`; `metadata`; `tags` (values; a sensitive key's value is replaced); `contexts` (a context whose
+  name is a sensitive key is replaced whole); `request` — `url`, `query_string`, `headers`, `data` and `env`;
+  `breadcrumbs` — `message` and `data`; and `exception.values[].value`. Map values go through key-based redaction;
+  free text goes through the card-number rule and the server's pattern rules (`password=`, `token=`, `api_key=`,
+  `Bearer …`, SSN-shaped numbers, passport numbers).
+- **Stored as sent**: `user` (email, IP address and geo included), `sdk`, and the labels `level`, `logger`,
+  `server_name`, `transaction`, `dist` and `source`; frames; `error_class`.
+- **Not normalized.** Stored values are masked and otherwise **verbatim**: ids, UUIDs, emails, versions and paths are
+  kept as sent. Normalization (UUID → `<UUID>`, digit runs → `<NUMERIC_ID>`, …) is used for grouping only.
+
+### What the server does NOT mask
+- One-time codes and other short secrets in free text (`your code is 492817`).
+- Short passwords: the `password=` pattern needs at least 8 characters (`pwd=1234567` is stored).
+- Account numbers, IBANs, national ids other than the SSN pattern, and any number that fails Luhn.
 
 ---
 

@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type TestConfig struct {
@@ -539,4 +540,231 @@ func TestIngestAndProcess_NoTimestampIsStoredAtReceipt(t *testing.T) {
 	assert.True(t, echoed.Truncate(time.Microsecond).Equal(createdAt.Truncate(time.Microsecond)),
 		"the 202 body's timestamp (%s) must equal the stored created_at (%s) at microsecond precision",
 		echoed.Format(time.RFC3339Nano), createdAt.UTC().Format(time.RFC3339Nano))
+}
+
+// ---- sentinel-event-schema-v2 (TASK-02, TASK-05): v2 events through the testcontainers ingestor and
+// processor into error_occurrences.
+
+func eventV2E2EConfig() TestConfig {
+	return TestConfig{
+		PostgresHost:     os.Getenv("POSTGRES_HOST"),
+		PostgresUser:     os.Getenv("POSTGRES_USER"),
+		PostgresPassword: os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDB:       os.Getenv("POSTGRES_DB"),
+		NATSURL:          os.Getenv("NATS_URL"),
+		IngesterURL:      os.Getenv("INGESTOR_URL"),
+	}
+}
+
+// loadEventV2FullBody returns the shared fixture as a JSON object with project_key and event_id set.
+func loadEventV2FullBody(t *testing.T, projectKey, eventID string) map[string]interface{} {
+	t.Helper()
+	raw, err := os.ReadFile("../fixtures/events/event-v2-full.json")
+	require.NoError(t, err)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &body))
+	body["project_key"] = projectKey
+	body["event_id"] = eventID
+	delete(body, "timestamp") // stored at receipt, inside the window
+	return body
+}
+
+func postJSON(t *testing.T, url, apiKey string, body interface{}) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", apiKey)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	requireInfra(t, err, fmt.Sprintf("ingester HTTP service at %s", url))
+	return resp
+}
+
+// waitForOccurrence polls until the processor has stored the occurrence of eventID, and returns its id.
+func waitForOccurrence(t *testing.T, pool *pgxpool.Pool, projectID, eventID string) string {
+	t.Helper()
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		var id string
+		err := pool.QueryRow(context.Background(),
+			`SELECT id::text FROM error_occurrences WHERE project_id = $1 AND event_id = $2`, projectID, eventID).Scan(&id)
+		if err == nil {
+			return id
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("occurrence of event %s was not stored within 45s: %v", eventID, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// TestEventV2_JSONFingerprintAndSourceStored is V2d: two events with different error_class, the same
+// JSON fingerprint and source "onerror" are grouped into exactly one issue whose fingerprint is the value
+// sent, and both occurrence rows store source.
+func TestEventV2_JSONFingerprintAndSourceStored(t *testing.T) {
+	cfg := eventV2E2EConfig()
+	pool := newPostgresPool(t, cfg)
+	defer pool.Close()
+	projectName := fmt.Sprintf("esv2-v2d-%d", time.Now().UnixNano())
+	apiKey := "esv2-v2d-key-" + projectName
+	projectID := createTestProject(t, pool, projectName, apiKey)
+	defer cleanupProject(t, pool, projectID)
+
+	fp := fmt.Sprintf("fp-json-%d", time.Now().UnixNano())
+	var eventIDs []string
+	for i, class := range []string{"FirstClass", "SecondClass"} {
+		eventID := fmt.Sprintf("evt-v2d-%d-%d", i, time.Now().UnixNano())
+		eventIDs = append(eventIDs, eventID)
+		resp := postJSON(t, cfg.IngesterURL+"/ingest", apiKey, map[string]interface{}{
+			"project_key": projectName, "platform": "javascript", "environment": "test",
+			"error_class": class, "message": "grouped by the client", "fingerprint": fp,
+			"source": "onerror", "event_id": eventID,
+		})
+		resp.Body.Close()
+		require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	}
+	for _, eventID := range eventIDs {
+		waitForOccurrence(t, pool, projectID, eventID)
+	}
+
+	var issues int
+	var gotFP string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*), max(fingerprint) FROM issues WHERE project_id = $1`, projectID).Scan(&issues, &gotFP))
+	assert.Equal(t, 1, issues, "one issue: the client fingerprint groups both classes")
+	assert.Equal(t, fp, gotFP, "issues.fingerprint is the value sent, unhashed")
+
+	var sources []string
+	rows, err := pool.Query(context.Background(),
+		`SELECT coalesce(source, '<null>') FROM error_occurrences WHERE project_id = $1`, projectID)
+	require.NoError(t, err)
+	for rows.Next() {
+		var s string
+		require.NoError(t, rows.Scan(&s))
+		sources = append(sources, s)
+	}
+	rows.Close()
+	assert.Equal(t, []string{"onerror", "onerror"}, sources)
+}
+
+// eventV2StoredRow is the error_occurrences row V5d reads back, JSONB columns decoded.
+type eventV2StoredRow struct {
+	Level, Message, ErrorClass, Logger, ServerName, Transaction, Dist, Source string
+	TraceID                                                                   string
+	TraceFlags                                                                *int64
+	ReceivedAt                                                                *time.Time
+	Metadata, SDK, User, Tags, Contexts, Request                              map[string]interface{}
+	Breadcrumbs                                                               []map[string]interface{}
+	Exception                                                                 map[string]interface{}
+}
+
+func readEventV2Row(t *testing.T, pool *pgxpool.Pool, occurrenceID string) eventV2StoredRow {
+	t.Helper()
+	var r eventV2StoredRow
+	var md, sdk, user, tags, contexts, request, crumbs, exc []byte
+	require.NoError(t, pool.QueryRow(context.Background(), `
+		SELECT level, coalesce(message, ''), error_class, coalesce(logger, ''), coalesce(server_name, ''),
+		       coalesce(transaction, ''), coalesce(dist, ''), coalesce(source, ''), coalesce(trace_id, ''),
+		       trace_flags, received_at, metadata, sdk, event_user, tags, contexts, request, breadcrumbs, exception
+		  FROM error_occurrences WHERE id = $1`, occurrenceID).Scan(
+		&r.Level, &r.Message, &r.ErrorClass, &r.Logger, &r.ServerName, &r.Transaction, &r.Dist, &r.Source, &r.TraceID,
+		&r.TraceFlags, &r.ReceivedAt, &md, &sdk, &user, &tags, &contexts, &request, &crumbs, &exc))
+	for _, pair := range []struct {
+		raw []byte
+		out interface{}
+	}{{md, &r.Metadata}, {sdk, &r.SDK}, {user, &r.User}, {tags, &r.Tags}, {contexts, &r.Contexts},
+		{request, &r.Request}, {crumbs, &r.Breadcrumbs}, {exc, &r.Exception}} {
+		require.NotNil(t, pair.raw, "every v2 JSONB column is populated for the full fixture")
+		require.NoError(t, json.Unmarshal(pair.raw, pair.out))
+	}
+	return r
+}
+
+// TestEventV2_IngestToStoredOccurrence is V5d: event-v2-full.json posted to /ingest and, with a fresh
+// event_id, to /ingest/batch; both occurrence rows carry every v2 column, masked where spec §6.2 says
+// and verbatim otherwise, with received_at set.
+func TestEventV2_IngestToStoredOccurrence(t *testing.T) {
+	cfg := eventV2E2EConfig()
+	pool := newPostgresPool(t, cfg)
+	defer pool.Close()
+	projectName := fmt.Sprintf("esv2-v5d-%d", time.Now().UnixNano())
+	apiKey := "esv2-v5d-key-" + projectName
+	projectID := createTestProject(t, pool, projectName, apiKey)
+	defer cleanupProject(t, pool, projectID)
+
+	single := fmt.Sprintf("evt-v5d-single-%d", time.Now().UnixNano())
+	batch := fmt.Sprintf("evt-v5d-batch-%d", time.Now().UnixNano())
+	resp := postJSON(t, cfg.IngesterURL+"/ingest", apiKey, loadEventV2FullBody(t, projectName, single))
+	resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	resp = postJSON(t, cfg.IngesterURL+"/ingest/batch", apiKey, []interface{}{loadEventV2FullBody(t, projectName, batch)})
+	resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	for _, eventID := range []string{single, batch} {
+		t.Run(eventID, func(t *testing.T) {
+			row := readEventV2Row(t, pool, waitForOccurrence(t, pool, projectID, eventID))
+			assertEventV2StoredRow(t, pool, projectID, row)
+		})
+	}
+}
+
+// assertEventV2StoredRow is V5d's per-row assertion over the event-v2-full.json fixture.
+func assertEventV2StoredRow(t *testing.T, pool *pgxpool.Pool, projectID string, row eventV2StoredRow) {
+	t.Helper()
+	assert.Equal(t, "warning", row.Level)
+	assert.Equal(t, "TypeError", row.ErrorClass)
+	assert.Equal(t, "checkout", row.Logger)
+	assert.Equal(t, "web-7f9c-pod-2", row.ServerName)
+	assert.Equal(t, "/checkout/pay", row.Transaction)
+	assert.Equal(t, "4127", row.Dist)
+	assert.Equal(t, "onerror", row.Source)
+	require.NotNil(t, row.TraceFlags)
+	assert.Equal(t, int64(1), *row.TraceFlags)
+	require.NotNil(t, row.ReceivedAt, "received_at is stamped by the ingestor")
+	assert.WithinDuration(t, time.Now(), *row.ReceivedAt, 5*time.Minute)
+
+	assert.Equal(t, map[string]interface{}{"name": "sentinel.javascript.browser", "version": "1.8.0"}, row.SDK)
+	assert.Equal(t, "alice@example.com", row.User["email"], "user is stored as sent (decision 1)")
+	assert.Equal(t, "2001:db8::1", row.User["ip_address"])
+	assert.Equal(t, "Pixel 8", row.Contexts["device"].(map[string]interface{})["model"], "P5: contexts verbatim")
+
+	headers := row.Request["headers"].(map[string]interface{})
+	assert.Equal(t, "***REDACTED***", headers["Authorization"], "P3")
+	assert.Equal(t, "***REDACTED***", headers["Cookie"], "P10 (TASK-08)")
+	assert.Equal(t, "***REDACTED***", headers["X-API-Key"], "P10 (TASK-08)")
+	assert.Equal(t, "charge [REDACTED_PAN] failed for order 7c9e6679-7425-40de-944b-e07fc1f90ae7", row.Message,
+		"P11: the PAN is redacted and the UUID is stored verbatim, not normalised")
+	assert.Equal(t, map[string]interface{}{"tenant_id": "tenant-acme", "region": "eu-central-1", "feature.flag": "new-checkout"}, row.Tags)
+	assert.Equal(t, "alice@example.com", row.Metadata["email"], "P6: verbatim, no longer <EMAIL>")
+	assert.Equal(t, "7c9e6679-7425-40de-944b-e07fc1f90ae7", row.Metadata["request_id"], "P9")
+	assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", row.TraceID, "P9: error_occurrences.trace_id verbatim")
+	assert.Equal(t, "***REDACTED***", row.Request["data"].(map[string]interface{})["password"])
+	assert.Equal(t, "***REDACTED***", row.Breadcrumbs[1]["data"].(map[string]interface{})["password"], "P4")
+	assert.Equal(t, "POST /api/pay 402", row.Breadcrumbs[1]["message"])
+
+	values := row.Exception["values"].([]interface{})
+	require.Len(t, values, 2)
+	assert.Equal(t, "TypeError", values[1].(map[string]interface{})["type"])
+
+	// P9: the search index holds the request and trace ids verbatim (it used to hold "<UUID>"-style
+	// placeholders); P7: its user id is the typed one.
+	var idxUser, idxTenant, idxTrace, idxRequest string
+	require.NoError(t, pool.QueryRow(context.Background(), `
+		SELECT coalesce(s.user_id, ''), coalesce(s.tenant_id, ''), coalesce(s.trace_id, ''), coalesce(s.request_id, '')
+		  FROM error_search_index s JOIN error_occurrences o ON o.id = s.occurrence_id
+		 WHERE o.project_id = $1 LIMIT 1`, projectID).Scan(&idxUser, &idxTenant, &idxTrace, &idxRequest))
+	assert.Equal(t, "user-typed-42", idxUser)
+	assert.Equal(t, "tenant-acme", idxTenant)
+	assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", idxTrace)
+	assert.Equal(t, "7c9e6679-7425-40de-944b-e07fc1f90ae7", idxRequest)
+
+	// OQ-3 (P7): the typed user.id feeds the rollup and the search index, not metadata.user_id.
+	var affected int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM issue_affected_users u JOIN issues i ON i.id = u.issue_id
+		  WHERE i.project_id = $1 AND u.user_id = 'user-typed-42'`, projectID).Scan(&affected))
+	assert.Equal(t, 1, affected)
 }

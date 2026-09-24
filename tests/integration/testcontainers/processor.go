@@ -32,6 +32,12 @@ func StartProcessor(ctx context.Context, pgHost, pgPort, pgUser, pgPassword, pgD
 				"POSTGRES_PASSWORD": pgPassword,
 				"POSTGRES_DB":       pgDB,
 				"NATS_URL":          natsURL,
+				// Symbolication off (decision 27's kill switch). With it on — the default when
+				// unset — decision 32 makes the processor refuse to start without S3_ACCESS_KEY /
+				// S3_SECRET_KEY, and this harness supplies no sourcemap store, so nothing ingested
+				// would ever be stored. A test that needs symbolication must start its own
+				// processor with a store.
+				"SYMBOLICATE_PLATFORMS": "",
 			},
 			// Use host network mode so container can reach host ports
 			NetworkMode: "host",

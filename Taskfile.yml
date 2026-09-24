@@ -176,17 +176,39 @@ tasks:
 
     # ============ Testing ============
 
+    # sentinel-event-schema-v2 §9.1 (coordinator ruling 2): the dashboard's vitest suite is part of the
+    # unit gate, because the agent API, the Drizzle mirror and the retention proofs are vitest tests and
+    # no gate ran them. `install` is here so this gate does not depend on `task build` having run first.
+    # Known gap: the real-Postgres vitest suites (schema-drift, retention.*.integration) still SKIP here
+    # when no migrated Postgres answers at DATABASE_URL.
     test-unit:
-        desc: Run unit tests
+        desc: Run unit tests (Go tests/unit and the dashboard vitest suite)
         cmds:
             - go test ./tests/unit/... -v
+            - pnpm --dir apps/dashboard-web install --frozen-lockfile
+            - pnpm --dir apps/dashboard-web test
 
+    # sentinel-event-schema-v2 §9.1 (rulings 3 and 4): FORCE_TESTCONTAINERS=1 so the suite never falls
+    # back to the compose stack's SHARED dev database when something answers localhost:8080/health
+    # (tests/integration/setup_test.go), and the two images the suite runs are rebuilt first under the
+    # exact tags tests/integration/testcontainers/{ingestor,processor}.go pull -- a stale image never
+    # processes the events a change adds. An explicit -t, not `docker compose build`, because compose
+    # names images after the project directory.
+    #
+    # -timeout 15m (coordinator ruling on review finding esv2-rev-taskfile-timeout-gate-edit): Go's 10m
+    # default killed the suite at 634 s, but that run was every ingest test waiting 45 s while the
+    # processor container refused to start (BUG-01, fixed in the harness). After that fix the suite
+    # measured about 466 s. 15m leaves headroom over that without letting a new hang pass the gate;
+    # raise it only with a recorded measurement.
     test-integration:
-        desc: Run integration tests with testcontainers
+        desc: Run integration tests with testcontainers (never the shared dev database)
         env:
             TESTCONTAINERS_PROVIDER: '{{.TESTCONTAINERS_PROVIDER | default "docker"}}'
+            FORCE_TESTCONTAINERS: "1"
         cmds:
-            - go test ./tests/integration/... -v -count=1
+            - docker build -t localhost/sentinel_ingestor:latest -f apps/ingestor-go/Dockerfile .
+            - docker build -t localhost/sentinel_processor:latest -f apps/processor-go/Dockerfile .
+            - go test ./tests/integration/... -v -count=1 -timeout 15m
 
     test-load:
         desc: Run load tests

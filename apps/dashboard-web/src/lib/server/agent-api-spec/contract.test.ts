@@ -940,3 +940,122 @@ describe('AgentIssueListItemSchema (decision 54)', () => {
 		expect(S.AgentIssueListItemSchema.safeParse({ ...base, affectedUserCount: -1, affectedTenantCount: 0 }).success).toBe(false);
 	});
 });
+
+// sentinel-event-schema-v2 §8.1 / V7a: an occurrence carrying every v2 field, in the shape the
+// processor stores it (snake_case JSONB bodies, a context redacted whole to a string, traceFlags as a
+// number), parses under the occurrence list and issue-detail response schemas; so does a pre-v2 row with
+// every v2 field null.
+describe('agent occurrence v2 fields (V7a)', () => {
+	const PRE_V2_OCCURRENCE = {
+		id: 'occ-pre',
+		environment: 'production',
+		platform: 'go',
+		releaseVersion: null,
+		stacktrace: [],
+		metadata: {},
+		traceId: null,
+		createdAt: new Date('2026-09-01T00:00:00Z').toISOString(),
+		level: null,
+		message: null,
+		errorClass: null,
+		logger: null,
+		serverName: null,
+		transaction: null,
+		dist: null,
+		source: null,
+		traceFlags: null,
+		receivedAt: null,
+		sdk: null,
+		user: null,
+		tags: null,
+		contexts: null,
+		request: null,
+		breadcrumbs: null,
+		exception: null,
+	};
+	const FULL_V2_OCCURRENCE = {
+		...PRE_V2_OCCURRENCE,
+		id: 'occ-v2',
+		platform: 'javascript',
+		releaseVersion: '2.3.1',
+		stacktrace: [{ file: 'src/pay/checkout.ts', line: 88, function: 'pay', in_app: true, module: 'pay.checkout' }],
+		metadata: { email: 'alice@example.com', server_truncated: ['tags'] },
+		traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+		level: 'warning',
+		message: 'charge [REDACTED_PAN] failed',
+		errorClass: 'TypeError',
+		logger: 'checkout',
+		serverName: 'web-7f9c-pod-2',
+		transaction: '/checkout/pay',
+		dist: '4127',
+		source: 'onerror',
+		traceFlags: 1,
+		receivedAt: new Date('2026-09-23T12:00:01Z').toISOString(),
+		sdk: { name: 'sentinel.javascript.browser', version: '1.8.0' },
+		user: {
+			id: 'user-typed-42',
+			username: 'alice',
+			email: 'alice@example.com',
+			ip_address: '2001:db8::1',
+			geo: { city: 'Berlin', region: 'Berlin', country_code: 'DE', subdivision: 'BE' },
+		},
+		tags: { tenant_id: 'tenant-acme', auth_method: '***REDACTED***' },
+		contexts: { device: { model: 'Pixel 8', memory_size: 8589934592 }, auth: '***REDACTED***' },
+		request: {
+			method: 'POST',
+			url: 'https://shop.example.com/checkout/pay?step=2',
+			query_string: 'step=2',
+			headers: { Authorization: '***REDACTED***', Cookie: '***REDACTED***' },
+			data: { amount: 4200, password: '***REDACTED***' },
+			env: { REMOTE_ADDR: '10.1.2.3' },
+		},
+		breadcrumbs: [
+			{ timestamp: '2026-09-23T11:59:58Z', type: 'http', category: 'xhr', level: 'error', message: 'POST /api/pay 402', data: { status_code: 402 } },
+		],
+		exception: {
+			values: [
+				{ type: 'PaymentDeclined', value: 'card declined', mechanism: { type: 'generic', handled: true } },
+				{ type: 'TypeError', value: 'x', mechanism: { type: 'onerror', handled: false }, stacktrace: [{ function: 'pay', abs_path: '/a.js' }] },
+			],
+		},
+	};
+
+	it('a fully populated v2 occurrence parses under OccurrencesResponseSchema, through the route', async () => {
+		listAgentOccurrences.mockResolvedValue([FULL_V2_OCCURRENCE, PRE_V2_OCCURRENCE]);
+		const res = await occurrencesRoute.GET(
+			makeEvent('http://localhost/api/agent/issues/issue-1/occurrences', { issueId: 'issue-1' })
+		);
+		expect(res.status).toBe(200);
+		const body = S.OccurrencesResponseSchema.parse(await res.json());
+		expect(JSON.stringify(body)).toContain('"traceFlags":1');
+	});
+
+	it('a fully populated v2 occurrence parses under IssueDetailResponseSchema as latestOccurrence', async () => {
+		getAgentIssueDetail.mockResolvedValue(ISSUE_ROW);
+		getAgentReportDetail.mockResolvedValue(null);
+		getLatestAgentOccurrence.mockResolvedValue(FULL_V2_OCCURRENCE);
+		getIssueRelations.mockResolvedValue([]);
+		const res = await issueDetailRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1', { issueId: 'issue-1' }));
+		expect(res.status).toBe(200);
+		const body = S.IssueDetailResponseSchema.parse(await res.json());
+		expect(body.latestOccurrence?.level).toBe('warning');
+		expect(body.latestOccurrence?.user?.ip_address).toBe('2001:db8::1');
+	});
+
+	it('a pre-v2 row (every v2 field null) parses', () => {
+		expect(S.AgentOccurrenceSchema.safeParse(PRE_V2_OCCURRENCE).success).toBe(true);
+	});
+
+	it('traceFlags must be a number: the string a bigint column returns without mode "number" is rejected', () => {
+		expect(S.AgentOccurrenceSchema.safeParse({ ...FULL_V2_OCCURRENCE, traceFlags: '1' }).success).toBe(false);
+	});
+
+	it('the outer object stays strict; the inner stored JSON does not', () => {
+		expect(S.AgentOccurrenceSchema.safeParse({ ...FULL_V2_OCCURRENCE, unexpected: 1 }).success).toBe(false);
+		expect(S.AgentOccurrenceSchema.safeParse({ ...FULL_V2_OCCURRENCE, sdk: { name: 'x', integrations: ['a'] } }).success).toBe(true);
+	});
+
+	it('an unknown level is rejected', () => {
+		expect(S.AgentOccurrenceSchema.safeParse({ ...FULL_V2_OCCURRENCE, level: 'WARN' }).success).toBe(false);
+	});
+});

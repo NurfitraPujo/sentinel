@@ -60,6 +60,50 @@ message ErrorEvent {
         id: "error_event.event_id"
         message: "event_id must not exceed 64 characters"
         expression: "this.event_id.size() <= 64"
+      },
+      // sentinel-event-schema-v2 (spec §3.3): the v2 bounds. The ingestor's ValidatePayload step
+      // truncates/drops every v2 value to within these BEFORE Validate runs (spec §4.2), so each rule
+      // below is a tripwire: a regression in that step fails loudly with a 400 instead of reaching a
+      // VARCHAR column and dead-lettering. size() counts code points, as every bound here does.
+      {
+        id: "error_event.level"
+        message: "level must be empty or one of fatal, error, warning, info, debug"
+        expression: "this.level == '' || this.level in ['fatal', 'error', 'warning', 'info', 'debug']"
+      },
+      {
+        id: "error_event.logger"
+        message: "logger must not exceed 64 characters"
+        expression: "this.logger.size() <= 64"
+      },
+      {
+        id: "error_event.server_name"
+        message: "server_name must not exceed 256 characters"
+        expression: "this.server_name.size() <= 256"
+      },
+      {
+        id: "error_event.transaction"
+        message: "transaction must not exceed 200 characters"
+        expression: "this.transaction.size() <= 200"
+      },
+      {
+        id: "error_event.dist"
+        message: "dist must not exceed 64 characters"
+        expression: "this.dist.size() <= 64"
+      },
+      {
+        id: "error_event.source"
+        message: "source must not exceed 64 characters"
+        expression: "this.source.size() <= 64"
+      },
+      {
+        id: "error_event.tags"
+        message: "tags must have at most 50 entries, keys matching ^[a-zA-Z0-9_.:-]{1,32}$ and values of 1-200 characters without a newline"
+        expression: "this.tags.size() <= 50 && this.tags.all(k, k.matches('^[a-zA-Z0-9_.:-]{1,32}$') && this.tags[k].size() >= 1 && this.tags[k].size() <= 200 && !this.tags[k].contains('\\n'))"
+      },
+      {
+        id: "error_event.contexts"
+        message: "contexts must have at most 32 entries with keys of 1-64 characters"
+        expression: "this.contexts.size() <= 32 && this.contexts.all(k, k.size() >= 1 && k.size() <= 64)"
       }
     ]
   };
@@ -106,9 +150,10 @@ message ErrorEvent {
   // VERIFIED_STATE.md S14.
   string fingerprint = 12;
   bool fingerprint_override = 13;
-  // Free-form event source label. Not currently persisted to any column by
-  // apps/processor-go (verified: no store/indexer write path reads this
-  // field), so it carries no storage-width constraint today.
+  // Free-form event source label (e.g. the JS SDK's "onerror"). Accepted over
+  // JSON and stored in error_occurrences.source VARCHAR(64) as of
+  // sentinel-event-schema-v2; upper bound (64 chars) is enforced by the
+  // "error_event.source" CEL rule above.
   string source = 14;
   // Application release/version string (e.g. semver, git SHA). First-class
   // field so it survives Normalize()'s metadata rewriting untouched — see
@@ -137,6 +182,182 @@ message ErrorEvent {
   // never rejected (D-a's invalid-id policy) - see the sibling "error_event.message" field's comment
   // for why this file never mixes a field-level `max_len` with the CEL-only bound already covering it.
   string event_id = 17;
+
+  // ---- sentinel-event-schema-v2 (spec §3.1): Sentry-parity metadata. Every field is additive and
+  // optional; the bounds are the CEL rules above and on the messages below, and the ingestor
+  // truncates/drops to within them first (spec §4.2), so none of these ever costs the event.
+
+  // "" or one of fatal|error|warning|info|debug. "" means absent; the processor stores "error".
+  // A string rather than an enum so the JSON form is Sentry's with no enum-name mapping.
+  string level = 18;
+  string logger = 19;
+  // Host or pod.
+  string server_name = 20;
+  // Route or screen name. A label, not a span.
+  string transaction = 21;
+  // Build number (Sentry `dist`).
+  string dist = 22;
+  Sdk sdk = 23;
+  // Stored as sent (contract decision 1): no masking, no enrichment.
+  User user = 24;
+  map<string, string> tags = 25;
+  // Well-known keys device, os, app, runtime, browser, culture; any other key is allowed.
+  map<string, google.protobuf.Struct> contexts = 26;
+  Request request = 27;
+  // Sentry's order: oldest first.
+  repeated Breadcrumb breadcrumbs = 28 [(buf.validate.field).repeated.max_items = 100];
+  // Sentry's {"values": [...]} wrapper. Evidence only: never a fingerprint input and never the
+  // issue's display (spec §6.4, OQ-2).
+  ExceptionInterface exception = 29;
+  // Server-stamped receipt time: the ingestor's T_recv, the one clock reading per HTTP request.
+  // MUST be populated server-side by the ingestor and MUST NOT be trusted from a client: it is not
+  // decodable from the JSON payload at all (validation.ErrorPayload's `json:"-"`), and the ingestor
+  // overwrites it on every event. Stored in error_occurrences.received_at; absent on a message
+  // published before the ingestor carried it (for example a DLQ replay).
+  google.protobuf.Timestamp received_at = 30;
+}
+
+message Sdk {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "sdk.bounds"
+        message: "sdk.name must not exceed 128 characters and sdk.version 64"
+        expression: "this.name.size() <= 128 && this.version.size() <= 64"
+      }
+    ]
+  };
+
+  string name = 1;
+  string version = 2;
+}
+
+message User {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        // id is really bounded at 255 BYTES by the ingestor (spec §4.2, ruling 6); every value of at
+        // most 255 bytes has at most 255 code points, so this row can never reject what it kept.
+        id: "user.bounds"
+        message: "user.id must not exceed 255 characters, username 128, email 254 and ip_address 45"
+        expression: "this.id.size() <= 255 && this.username.size() <= 128 && this.email.size() <= 254 && this.ip_address.size() <= 45"
+      }
+    ]
+  };
+
+  string id = 1;
+  string username = 2;
+  string email = 3;
+  string ip_address = 4;
+  Geo geo = 5;
+}
+
+message Geo {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "geo.bounds"
+        message: "geo.city, region and subdivision must not exceed 128 characters and country_code 8"
+        expression: "this.city.size() <= 128 && this.region.size() <= 128 && this.subdivision.size() <= 128 && this.country_code.size() <= 8"
+      }
+    ]
+  };
+
+  string city = 1;
+  string region = 2;
+  string country_code = 3;
+  string subdivision = 4;
+}
+
+message Request {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "request.bounds"
+        message: "request.method must not exceed 16 characters, url 2048 and query_string 4096"
+        expression: "this.method.size() <= 16 && this.url.size() <= 2048 && this.query_string.size() <= 4096"
+      },
+      {
+        id: "request.headers"
+        message: "request.headers must have at most 64 entries, keys of 1-256 characters and values of at most 4096"
+        expression: "this.headers.size() <= 64 && this.headers.all(k, k.size() >= 1 && k.size() <= 256 && this.headers[k].size() <= 4096)"
+      },
+      {
+        id: "request.env"
+        message: "request.env must have at most 64 entries, keys of 1-256 characters and values of at most 1024"
+        expression: "this.env.size() <= 64 && this.env.all(k, k.size() >= 1 && k.size() <= 256 && this.env[k].size() <= 1024)"
+      }
+    ]
+  };
+
+  string method = 1;
+  string url = 2;
+  string query_string = 3;
+  map<string, string> headers = 4;
+  // Any JSON: object, array, string, number, bool. Its 16 KiB serialized bound is ingestor-only.
+  google.protobuf.Value data = 5;
+  map<string, string> env = 6;
+}
+
+message Breadcrumb {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "breadcrumb.bounds"
+        message: "breadcrumb type must not exceed 64 characters, category 128, message 8192, and level must be empty or one of fatal, error, warning, info, debug"
+        expression: "this.type.size() <= 64 && this.category.size() <= 128 && this.message.size() <= 8192 && (this.level == '' || this.level in ['fatal', 'error', 'warning', 'info', 'debug'])"
+      }
+    ]
+  };
+
+  google.protobuf.Timestamp timestamp = 1;
+  string type = 2;
+  string category = 3;
+  // "" or fatal|error|warning|info|debug.
+  string level = 4;
+  string message = 5;
+  // Its 4 KiB serialized bound is ingestor-only.
+  google.protobuf.Struct data = 6;
+}
+
+message ExceptionInterface {
+  // Sentry's order: oldest first (the root cause), the exception that was raised LAST.
+  repeated ExceptionValue values = 1 [(buf.validate.field).repeated.max_items = 20];
+}
+
+message ExceptionValue {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "exception_value.bounds"
+        message: "exception type must not exceed 255 characters and value 10000"
+        expression: "this.type.size() <= 255 && this.value.size() <= 10000"
+      }
+    ]
+  };
+
+  string type = 1;
+  string value = 2;
+  Mechanism mechanism = 3;
+  // Sentinel's frame order, the same as ErrorEvent.stacktrace: crashing frame first.
+  // A Phase 4 Sentry mapper reverses Sentry's frames list, whose order is outermost caller first.
+  repeated StackFrame stacktrace = 4 [(buf.validate.field).repeated.max_items = 100];
+}
+
+message Mechanism {
+  option (buf.validate.message) = {
+    cel: [
+      {
+        id: "mechanism.bounds"
+        message: "mechanism.type must not exceed 64 characters"
+        expression: "this.type.size() <= 64"
+      }
+    ]
+  };
+
+  string type = 1;
+  // Tri-state, as in Sentry: absent / true / false.
+  optional bool handled = 2;
 }
 
 message StackFrame {
@@ -146,6 +367,11 @@ message StackFrame {
         id: "stack_frame.file_required"
         message: "file is required for app frames"
         expression: "!this.in_app || this.file.size() > 0"
+      },
+      {
+        id: "stack_frame.v2_bounds"
+        message: "frame module must not exceed 255 characters, abs_path 1024, and context_line and each pre/post context line 1024"
+        expression: "this.module.size() <= 255 && this.abs_path.size() <= 1024 && this.context_line.size() <= 1024 && this.pre_context.all(l, l.size() <= 1024) && this.post_context.all(l, l.size() <= 1024)"
       }
     ]
   };
@@ -163,4 +389,11 @@ message StackFrame {
   // descriptor never sees one); an old processor ignores field 5 and a new one reads 0 from an
   // old message (§8).
   int32 column = 5;
+  // sentinel-event-schema-v2 (spec §3.2): Sentry-parity frame fields. Bounds are the
+  // "stack_frame.v2_bounds" rule above; the ingestor truncates to them first (spec §4.2).
+  string module = 6;
+  string abs_path = 7;
+  string context_line = 8;
+  repeated string pre_context = 9 [(buf.validate.field).repeated.max_items = 5];
+  repeated string post_context = 10 [(buf.validate.field).repeated.max_items = 5];
 }

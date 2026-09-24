@@ -472,6 +472,32 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	// unique index is declared below. Same hand-maintained-mirror caveat as eventId: the migration is
 	// the source of truth, not this file. No dashboard code reads this yet.
 	projectId: uuid('project_id'),
+	// sentinel-event-schema-v2 §5.2/§5.5 (1725300000_add_error_occurrences_event_v2_fields.sql): the 17
+	// per-occurrence v2 columns, all nullable, no default, and NULL on every row written before that
+	// release. The processor is the only writer. Same hand-maintained-mirror caveat as eventId: the
+	// migration is the source of truth (tests/event-v2-mirror.test.ts compares the two). Two choices:
+	// traceFlags is bigint in 'number' mode, as issues.count is, because without it the driver returns
+	// a string (a W3C trace-flags value is at most 255, so number is exact); and the user column is
+	// event_user, because `user` is a reserved word in PostgreSQL. The partial GIN index on tags is NOT
+	// mirrored: drizzle-orm 0.30.x cannot name an access method, so the only declaration available would
+	// claim a btree index that does not exist.
+	level: varchar('level', { length: 16 }),
+	message: text('message'),
+	errorClass: varchar('error_class', { length: 255 }),
+	logger: varchar('logger', { length: 64 }),
+	serverName: varchar('server_name', { length: 256 }),
+	transaction: varchar('transaction', { length: 200 }),
+	dist: varchar('dist', { length: 64 }),
+	source: varchar('source', { length: 64 }),
+	traceFlags: bigint('trace_flags', { mode: 'number' }),
+	receivedAt: timestamp('received_at', { withTimezone: true }),
+	sdk: jsonb('sdk'),
+	eventUser: jsonb('event_user'),
+	tags: jsonb('tags'),
+	contexts: jsonb('contexts'),
+	request: jsonb('request'),
+	breadcrumbs: jsonb('breadcrumbs'),
+	exception: jsonb('exception'),
 	createdAt: timestamp('created_at').defaultNow(),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),
