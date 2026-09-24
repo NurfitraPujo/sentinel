@@ -8,9 +8,11 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/enrich"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
@@ -94,4 +96,62 @@ func TestFingerprintGolden_ExistingFixturesUnchanged(t *testing.T) {
 			require.Equal(t, fp, got[name], "%s: the fingerprint moved; existing issues would split or merge (contract §2)", name)
 		})
 	}
+}
+
+// TestFingerprintGolden_EnrichedFixturesUnchanged (sentinel-event-enrichment §7.3, §10.2 "fingerprints
+// unchanged"): every golden fixture, run through enrich.Apply with a full request Info (public IP
+// 81.2.69.142, a Chrome UA) and the fixture GeoLite2 database, still has its golden fingerprint. No
+// enriched field is a fingerprint input. A fixture with no IP is given "{{auto}}" so the IP rule fills
+// it on every platform (I1; a browser-runtime item is otherwise excluded by I3t), and the case asserts
+// geo WAS filled and contexts were derived, so it is not vacuous.
+func TestFingerprintGolden_EnrichedFixturesUnchanged(t *testing.T) {
+	raw, err := os.ReadFile(fingerprintGoldenPath)
+	require.NoError(t, err)
+	var want map[string]string
+	require.NoError(t, json.Unmarshal(raw, &want))
+
+	_, enricher := enrReadyLoader(t)
+	var geoFilled, uaFilled int
+	for _, path := range fingerprintGoldenCorpus(t) {
+		name := filepath.Base(path)
+		t.Run(name, func(t *testing.T) {
+			b, err := os.ReadFile(path)
+			require.NoError(t, err)
+			var payload validation.ErrorPayload
+			require.NoError(t, json.NewDecoder(bytes.NewReader(b)).Decode(&payload))
+			if payload.ProjectKey == "" {
+				payload.ProjectKey = "proj-fingerprint-golden"
+			}
+			if payload.ProjectID == "" {
+				payload.ProjectID = "0f7c1a2e-3b4d-4c5e-8f6a-7b8c9d0e1f2a"
+			}
+			sentGeo := payload.User != nil && payload.User.Geo != nil
+			if payload.User == nil {
+				payload.User = &validation.UserInfo{}
+			}
+			if payload.User.IPAddress == "" {
+				payload.User.IPAddress = enrich.AutoIP
+			}
+			_, sentBrowser := payload.Contexts["browser"]
+
+			enrich.Apply(&payload, enrFullInfo(), enricher)
+			require.NotNil(t, payload.User.Geo, "geo is set (sent or filled)")
+			if !sentGeo {
+				require.Equal(t, "GB", payload.User.Geo.CountryCode, "the lookup filled geo")
+				geoFilled++
+			}
+			if !sentBrowser && payload.Contexts["browser"] != nil {
+				uaFilled++
+			}
+
+			data, err := proto.Marshal(mapping.MapPayloadToEvent(&payload))
+			require.NoError(t, err)
+			evt, err := event.Deserialize(data)
+			require.NoError(t, err)
+			evt.ComputeFingerprint(symbolicate.DefaultPlatforms)
+			require.Equal(t, want[name], evt.Fingerprint, "%s: enrichment moved the fingerprint", name)
+		})
+	}
+	assert.Positive(t, geoFilled, "at least one fixture had geo filled by the lookup")
+	assert.Positive(t, uaFilled, "at least one fixture had a browser context derived")
 }

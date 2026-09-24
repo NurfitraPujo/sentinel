@@ -155,6 +155,13 @@ config:
   ingestor:
     # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
     ratelimitStrictMode: "true"
+    # TRUSTED_PROXY_CIDRS (sentinel-event-enrichment spec §3.3) -- a YAML list of CIDR prefixes (a bare
+    # address is a single-address prefix), rendered comma-joined as plain env on the ingestor container
+    # only (templates/ingestor.yaml), never in the shared ConfigMap. X-Forwarded-For is believed only
+    # through proxies in these ranges. Empty = trust nothing: the caller is the connection's peer, and
+    # a derived caller IP is stored only if it is public. An unparseable or IPv4-mapped entry makes
+    # the ingestor exit 1 at startup.
+    trustedProxyCidrs: []
   processor:
     # sentinel-sourcemaps §12: the symbolication knobs (decisions 9, 11, 27, 37, 38). Rendered as
     # plain env on the processor container (templates/processor.yaml), never in the ConfigMap the
@@ -242,7 +249,9 @@ ingestor:
     elbId: ""
     tlsCertIds: ""
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    # 256Mi (was 128Mi, sentinel-event-enrichment spec §8.4): +~60 MiB resident GeoLite2-City database,
+    # ~2x transiently while a reload swaps it.
+    requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 512Mi }
   autoscaling:
     enabled: true
@@ -255,6 +264,60 @@ ingestor:
   # HTTP probes hit /health on the container port.
   livenessPath: /health
   readinessPath: /health
+
+# -----------------------------------------------------------------------------
+# geoip — server-side geo enrichment (sentinel-event-enrichment spec §5, §8). Ingestor pods load a
+# GeoLite2-City database from S3-compatible object storage and reload a newer copy without a restart;
+# they NEVER contact MaxMind. The refresh CronJob (`ingestor geoip-refresh`, the ingestor image) is the
+# only thing that does: twice a week, downloading only when MaxMind has a newer file. Every failure
+# (no database, missing, corrupt, stale) means no geo, never an unready pod. Moving from OBS to AWS S3
+# is a values-and-secret change only (spec §8.3).
+# -----------------------------------------------------------------------------
+geoip:
+  # Renders the ingestor's GEOIP_* env. Off: the ingestor logs geoip.state to=disabled and stores no geo.
+  enabled: false
+  # GEOIP_POLL_INTERVAL -- a Go duration >= 1m; how often pods check the object's ETag.
+  pollInterval: "1h"
+  # GEOIP_MAX_AGE -- a Go duration >= 1h; a database older than this (by build time) answers nothing.
+  # 720h is the GeoLite EULA's 30 days.
+  maxAge: "720h"
+  storage:
+    # GEOIP_S3_ENDPOINT -- URL with scheme (https = TLS). "" = config.s3.endpoint (else bundled MinIO).
+    endpoint: ""
+    # GEOIP_S3_REGION -- the SigV4 region.
+    region: "us-east-1"
+    # GEOIP_S3_BUCKET -- "" = config.s3.bucket.
+    bucket: ""
+    # GEOIP_S3_PREFIX -- key prefix, used verbatim; the object is <prefix>GeoLite2-City.mmdb.
+    prefix: "geoip/"
+    # GEOIP_S3_FORCE_PATH_STYLE -- "" = by host shape (a dotted host is virtual-hosted, which OBS
+    # requires); otherwise true/false.
+    forcePathStyle: ""
+    # NAMES of keys in the chart Secret that hold the S3 credentials (GEOIP_S3_ACCESS_KEY /
+    # GEOIP_S3_SECRET_KEY). Until the AWS S3 move this is the existing read-write key, an accepted risk
+    # (contract decision 8); at the move, point these at a read-only key scoped to <prefix>*.
+    accessKeySecretKey: S3_ACCESS_KEY
+    secretKeySecretKey: S3_SECRET_KEY
+  refreshCron:
+    # Ships OFF (chart convention). Needs MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY in the Secret;
+    # without them the Job starts, logs why, and fails (geo stays empty).
+    enabled: false
+    # Wed + Sat 06:00 UTC: after MaxMind's Tue/Fri GeoLite releases. At most one download per run.
+    schedule: "0 6 * * 3,6"
+    timeZone: "Etc/UTC"
+    startingDeadlineSeconds: 3600
+    activeDeadlineSeconds: 900
+    # 0: a retry could be a second download; the next run is 3-4 days away.
+    backoffLimit: 0
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    # NAMES of the Secret keys the CronJob writes with. "" = geoip.storage.accessKeySecretKey /
+    # secretKeySecretKey; set to the write key at the AWS S3 move, when the ingestor's becomes read-only.
+    accessKeySecretKey: ""
+    secretKeySecretKey: ""
+    resources:
+      requests: { cpu: 50m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
 
 # -----------------------------------------------------------------------------
 # processor-go — NATS consumer, no inbound app traffic. :8081 serves /health,/metrics,/dlq.

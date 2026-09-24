@@ -729,6 +729,22 @@ func sortVictims(v []sizedKey) {
 	})
 }
 
+// ContextFits reports whether p.Contexts, with v inserted under name, still fits MaxContexts and
+// MaxContextsSize, measured exactly as boundContexts measures it (entrySize / objectSize), so the two
+// cannot drift. Enrichment inserts a derived context only when this holds, so a derived context can
+// never make the bounds step evict a context the SDK sent (sentinel-event-enrichment spec §6.3).
+func ContextFits(p *ErrorPayload, name string, v map[string]interface{}) bool {
+	body, n := entrySize(name, v), 1
+	for k, c := range p.Contexts {
+		if k == name {
+			continue
+		}
+		body += entrySize(k, c)
+		n++
+	}
+	return n <= MaxContexts && objectSize(body, n) <= MaxContextsSize
+}
+
 // objectSize is the json.Marshal size of an object with n entries whose `"key":value` sizes sum to
 // body: the braces and one comma between entries.
 func objectSize(body, n int) int {

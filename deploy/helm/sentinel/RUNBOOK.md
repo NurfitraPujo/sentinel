@@ -33,7 +33,7 @@ scoped to the target namespace, then paste the ciphertext into
 `values-huawei-<env>.yml` under `secrets.sealedData`:
 
 ```bash
-# Example per key (repeat for all 11 keys in secrets.sealedData):
+# Example per key (repeat for all 11 keys in secrets.sealedData, plus TASK-07's two MAXMIND_* keys):
 curl -s -X POST https://kubeseal-encryptor-daya-cce-production.daya.ai/encrypt \
   -H 'Content-Type: application/json' \
   -d '{"namespace":"sentinel-staging","secretName":"sentinel-secrets","key":"POSTGRES_PASSWORD","value":"<plaintext>"}'
@@ -52,6 +52,8 @@ Required keys and generation (same contract as DEPLOYMENT.md §1):
 | `CRON_SECRET` | `openssl rand -hex 32` |
 | `EMAIL_SERVER` | SMTP DSN, e.g. `smtp://user:pass@smtp.host:587` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | empty string sealed if SSO unused |
+| `MAXMIND_ACCOUNT_ID` | the numeric MaxMind account id (sentinel-event-enrichment TASK-07); read only by the geoip-refresh CronJob |
+| `MAXMIND_LICENSE_KEY` | a GeoLite licence key from that MaxMind account; never paste it anywhere but the encryptor. Read only by the geoip-refresh CronJob |
 
 ## 2. Deploy order
 
@@ -365,6 +367,46 @@ it earlier than 72 h and read a zero as the proof: before the window has turned
 over, a zero only says nothing was redelivered yet. A row with `last` after the
 deploy is a `23505`-shaped hole in the key — read the processor's duplicate log
 lines for that `event_id` (`matched_key`, below) before touching the row.
+
+### GeoIP refresh (sentinel-event-enrichment)
+
+The ingestor fills `user.geo` from a GeoLite2-City database it loads from this env's bucket,
+`geoip/GeoLite2-City.mmdb` (`geoip.storage.*`). Ingestor pods only READ that object — they never
+contact MaxMind, so pod starts, rollouts, autoscaling and crash loops cost no MaxMind download.
+
+- **What the job does.** `sentinel-sentinel-geoip-refresh` (the ingestor image, `args: ["geoip-refresh"]`)
+  runs Wed + Sat 06:00 UTC. It reads the stored object's `maxmind-md5` metadata, asks MaxMind whether
+  GeoLite2-City changed (a metadata check that does not count against the download limit) and, only
+  when it did, downloads it once, checks its MD5, opens and verifies it, checks it is `GeoLite2-City`,
+  and uploads it (one atomic object replacement). `backoffLimit: 0` + `concurrencyPolicy: Forbid`:
+  at most 2 downloads a week per env against the free account's 30 per 24 h.
+- **Manual run** (costs at most one download):
+
+  ```bash
+  kubectl -n sentinel-<env> create job --from=cronjob/sentinel-sentinel-geoip-refresh geoip-refresh-manual-$(date +%s)
+  ```
+
+- **Reading the job log** (`kubectl -n sentinel-<env> logs job/<name>`):
+  - `geoip-refresh: uploaded` (md5, build_time, bytes): a newer database is in the bucket.
+  - `geoip-refresh: up to date` (md5): nothing to do; no download happened.
+  - `geoip-refresh: MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY not set; MaxMind not contacted`: the
+    keys are not sealed yet (TASK-07, §1).
+  - any other `geoip-refresh:` error: nothing was uploaded; the stored object stays the last good one.
+- **Confirming the pods loaded it:** every ingestor replica logs `geoip.state … to=ready` with
+  `build_time` at start, and `geoip.reloaded` (with `build_time`, `etag`) when a newer object is
+  picked up, within `geoip.pollInterval` (1h) and with no restart:
+
+  ```bash
+  kubectl -n sentinel-<env> logs deploy/sentinel-sentinel-ingestor | grep -E 'geoip\.(state|reloaded)'
+  ```
+
+- **Moving from OBS to AWS S3** is a values-and-secret change, no code: set `geoip.storage.endpoint`
+  (`https://s3.<region>.amazonaws.com`), `region`, `bucket`, `forcePathStyle: ""`; seal a read-only key
+  scoped to `geoip/*` as `GEOIP_S3_ACCESS_KEY` / `GEOIP_S3_SECRET_KEY` and point
+  `geoip.storage.accessKeySecretKey` / `secretKeySecretKey` at it; point
+  `geoip.refreshCron.accessKeySecretKey` / `secretKeySecretKey` at a key that can write that prefix.
+  Until then both workloads use the existing read-write `S3_ACCESS_KEY` / `S3_SECRET_KEY`, an accepted
+  risk (contract decision 8).
 
 ## 3. Rollback
 
@@ -734,6 +776,13 @@ running new-tag processor that is an ingest outage.
 | Large uploads fail, small work | `S3_PUBLIC_ENDPOINT` not browser-reachable | must resolve from end-user browsers (DEPLOYMENT.md §2) |
 | Dashboard 503 on repo credentials | `SENTINEL_ENCRYPTION_KEY` unset/invalid | must be base64 of exactly 32 bytes |
 | Cron 401s | `CRON_SECRET` mismatch | retention CronJob reads the same chart Secret |
+| geoip-refresh Job fails at start | MaxMind keys not sealed (TASK-07) | the step-1 log line (`MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY not set`) |
+| Ingestor logs `geoip.state to=unavailable reason=not_found` | the refresh job has not run yet | run the job manually (§2 "GeoIP refresh") |
+| Ingestor logs `geoip.state to=stale` | the refresh job has been failing for ~30 days | the job history: `kubectl -n sentinel-<env> get jobs \| grep geoip-refresh` |
+| `{{auto}}` events posted straight to the ingestor (not through the tunnel) are stored with an empty IP | Expected on Huawei: no forwarding header is believed and the ingestor's peer is infrastructure, which is never stored (contract decision 11, spec §3.6) | Not a fault. Send the real IP in `user.ip_address`, or send browser events through the sdk-js ≥ 0.2.0 tunnel. Do **not** add ranges to `trustedProxyCidrs` to "fix" it. |
+| Browser events from web carry no IP | web still runs sdk-js < 0.2.0, whose tunnel writes no IP (contract decision 5) | web's `@sentinel/sdk-js` version |
+| A stored IP is a private, `100.64.0.0/10` or `100.125.x.x` address | It came from a body, which is stored as sent. The ingestor never derives such an address (spec §3.5) | The sender: an SDK that set it, or a tunnel whose `trustedProxyHops` does not match its proxy count |
+| Tunnelled browser events (web on sdk-js ≥ 0.2.0) are stored with an IP the browser chose, e.g. P5(b)'s `6.6.6.6` | web's public ELB listener (master Ingress `argocd/argocd-public-production`, owned by another team) stopped inserting `X-Forwarded-For`, or a proxy was added in front of web without changing web's `TRUSTED_PROXY_HOPS` | Re-run P5(b) (sentinel-event-enrichment spec §10.3). Until it passes, roll web back to the sdk-js version before 0.2.0, whose tunnel writes no IP (`sentinel-sdk-js-rich-context/TASK-06` owns web's pin). Then get the listener's owner to restore the insertion, or set the hop count to the real proxy count. |
 | Processor `CrashLoopBackOff`, `RESTARTS` climbing, `lastState.terminated.reason: Error` | processor rendered without `S3_ACCESS_KEY`/`S3_SECRET_KEY` while `SYMBOLICATE_PLATFORMS` is non-empty (startup fatal, contract decision 32) | last log line names the two variables; the §2 pre-deploy render above |
 | Processor `RESTARTS` climbing, `lastState.terminated.reason: OOMKilled` | parsed source maps exceed `1Gi` despite `GOMEMLIMIT` | §2's RESTARTS note: `SOURCEMAP_MAX_PARSE_BYTES`, `SOURCEMAP_CACHE_BYTES`, or the limit + `GOMEMLIMIT` |
 | Browser events for a mapped release stay unsymbolicated | maps uploaded after the events (Known limit 1), no `column` from the producer, or storage unreachable from the processor | `sentinel_symbolication_events_total{outcome="none"}` vs `sourcemaps` rows; `frames_total` by `outcome` |

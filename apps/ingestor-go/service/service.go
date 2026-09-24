@@ -17,6 +17,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/clientip"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/enrich"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -83,9 +85,22 @@ type IngestService struct {
 	// fieldsTruncatedCounter records obs.MetricIngestFieldsTruncated{field} (sentinel-event-schema-v2
 	// spec §4.2). Same degradation posture as the three above.
 	fieldsTruncatedCounter metric.Int64Counter
+
+	// enricher carries the geo lookup and the User-Agent parser enrich.Apply uses
+	// (sentinel-event-enrichment spec §7.2). nil means those fills are off; the IP rule always runs.
+	enricher *enrich.Enricher
 }
 
-func NewIngestService(publisher eventPublisher) (*IngestService, error) {
+// Option configures an IngestService. The variadic form keeps every existing NewIngestService(publisher)
+// caller compiling unchanged (tests/unit is one flat package, B4).
+type Option func(*IngestService)
+
+// WithEnricher sets the in-process lookups enrich.Apply uses (sentinel-event-enrichment spec §7.2).
+func WithEnricher(e *enrich.Enricher) Option {
+	return func(s *IngestService) { s.enricher = e }
+}
+
+func NewIngestService(publisher eventPublisher, opts ...Option) (*IngestService, error) {
 	v, err := protovalidate.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize validator: %w", err)
@@ -143,14 +158,18 @@ func NewIngestService(publisher eventPublisher) (*IngestService, error) {
 			slog.String("error", err.Error()))
 	}
 
-	return &IngestService{
+	s := &IngestService{
 		publisher:                publisher,
 		validator:                v,
 		publishFailureCounter:    failureCounter,
 		eventIDReplacedCounter:   eventIDReplacedCounter,
 		timestampReplacedCounter: timestampReplacedCounter,
 		fieldsTruncatedCounter:   fieldsTruncatedCounter,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // resolveEventID applies D-a's event_id policy (docs/plans/IDEMPOTENCY_PLAN.md): a client-supplied id
@@ -254,6 +273,15 @@ func (s *IngestService) IngestAt(ctx context.Context, payload *validation.ErrorP
 	// sentinel-event-schema-v2 (spec §4.1): proto field 30 is T_recv, stamped here and nowhere else.
 	// ErrorPayload.ReceivedAt is json:"-", so whatever a client sent was never decoded.
 	payload.ReceivedAt = receivedAt.UTC()
+
+	// sentinel-event-enrichment spec §7.1: fill the client IP, geo and User-Agent contexts the SDK left
+	// empty, BEFORE the bounds step so a derived value is bounded and marked exactly as a sent one. The
+	// per-request Info (caller IP, connection User-Agent) was put on the context by clientip.Middleware;
+	// a context without one (unit tests, Ingest) means no caller IP and no connection UA.
+	// The handlers also put a per-request enrich.Budget on the context, so every item of a batch shares
+	// one bounded User-Agent allowance (enr-code-ua-parse-cpu-amplification).
+	info, _ := clientip.RequestInfoFromContext(ctx)
+	enrich.ApplyWithBudget(payload, info, s.enricher, enrich.BudgetFromContext(ctx))
 
 	// sentinel-event-schema-v2 spec §4.2-§4.3: the per-field bounds step, run on the live path. It
 	// truncates, drops or replaces every oversized v2 value IN PLACE, writes the server_truncated

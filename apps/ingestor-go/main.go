@@ -15,6 +15,10 @@ import (
 	"time"
 
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/clientip"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/enrich"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/geoip"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/geoip/refresh"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
@@ -23,6 +27,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ua-parser/uap-go/uaparser"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -59,6 +64,29 @@ func main() {
 	logger := obs.Setup("ingestor-go")
 	slog.SetDefault(logger)
 
+	// sentinel-event-enrichment spec §8.1: `ingestor geoip-refresh` is the twice-weekly CronJob's
+	// entry point, the only code that contacts MaxMind. It dispatches before anything else, ahead of the
+	// DB and NATS connections, which it does not need. The serving path below never reaches it.
+	if len(os.Args) > 1 && os.Args[1] == "geoip-refresh" {
+		os.Exit(refresh.Main(ctx, logger))
+	}
+
+	// sentinel-event-enrichment spec §3.3: the trusted-proxy list is parsed before anything connects or
+	// listens. An unparseable or IPv4-mapped entry is fatal, as a bad S3_FORCE_PATH_STYLE is for the
+	// processor: a typo in a trust boundary must not become silent, and a rollout with a bad value never
+	// becomes ready. Unset or empty trusts nothing (both Huawei overlays, contract decision 11).
+	trustedProxies, err := clientip.ParseTrusted(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		logger.Error(err.Error(), slog.String(obs.LogKeyEvent, "clientip.config_invalid"))
+		os.Exit(1)
+	}
+	trustedStrs := make([]string, len(trustedProxies))
+	for i, p := range trustedProxies {
+		trustedStrs[i] = p.String()
+	}
+	logger.Info("trusted proxy ranges", slog.Any("trusted_proxy_cidrs", trustedStrs))
+	clientResolver := clientip.NewResolver(trustedProxies)
+
 	// obs.Bootstrap wires OpenTelemetry traces+metrics (OTLP/HTTP exporter, Prometheus scrape
 	// endpoint) and registers them as the process-wide otel globals. Degradation is load-bearing here,
 	// not an afterthought: Bootstrap never blocks on, or fails because of, an unreachable collector —
@@ -92,7 +120,6 @@ func main() {
 	defer connCancel()
 
 	var db *pgxpool.Pool
-	var err error
 	for {
 		db, err = database.NewConnection(connCtx, dbCfg)
 		if err == nil {
@@ -127,7 +154,22 @@ func main() {
 	}
 	defer publisher.Close()
 
-	ingestService, err := service.NewIngestService(publisher)
+	// sentinel-event-enrichment spec §5.4: the GeoLite2-City loader. Start returns at once; one goroutine
+	// fetches from object storage and polls. Readiness never waits for it, and every failure (no config,
+	// missing, corrupt, stale) only means no geo, logged once per state change.
+	geoLoader := geoip.NewLoader(geoip.ConfigFromEnv(os.LookupEnv, logger), logger)
+	geoLoader.Start(ctx)
+
+	// sentinel-event-enrichment spec §6.1: one User-Agent parser over the embedded uap-core regexes, with
+	// a 1024-entry cache, shared by every request.
+	uaParser, err := uaparser.New(uaparser.WithCacheSize(1024))
+	if err != nil {
+		logger.ErrorContext(ctx, fmt.Sprintf("Failed to build the User-Agent parser: %v", err), slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	ingestService, err := service.NewIngestService(publisher,
+		service.WithEnricher(&enrich.Enricher{Geo: geoLoader, UA: uaParser}))
 	if err != nil {
 		logger.ErrorContext(ctx, fmt.Sprintf("Failed to create ingest service: %v", err), slog.Any("error", err))
 		os.Exit(1)
@@ -213,21 +255,28 @@ func main() {
 			slog.String("error", err.Error()))
 	}
 
+	// clientip.Middleware (sentinel-event-enrichment spec §7.2) sits INSIDE observeMiddleware and outside
+	// auth, so the caller IP and User-Agent are on the context before the handler runs. It never rejects,
+	// so auth, rate limiting and the handler see exactly what they did before.
 	ingestChain := observeMiddleware(ingestRequestCounter,
-		authenticator.Middleware(auth.ScopesIngest,
-			rateLimiter.Middleware(
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					handleIngest(ingestService, db, logger).ServeHTTP(w, r)
-				}),
+		clientip.Middleware(clientResolver,
+			authenticator.Middleware(auth.ScopesIngest,
+				rateLimiter.Middleware(
+					http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						handleIngest(ingestService, db, logger).ServeHTTP(w, r)
+					}),
+				),
 			),
 		),
 	)
 	batchChain := observeMiddleware(ingestRequestCounter,
-		authenticator.Middleware(auth.ScopesIngest,
-			rateLimiter.Middleware(
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					handleBatchIngest(ingestService, db, logger).ServeHTTP(w, r)
-				}),
+		clientip.Middleware(clientResolver,
+			authenticator.Middleware(auth.ScopesIngest,
+				rateLimiter.Middleware(
+					http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						handleBatchIngest(ingestService, db, logger).ServeHTTP(w, r)
+					}),
+				),
 			),
 		),
 	)
@@ -498,6 +547,10 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 		// order. An item refused by scope below never reaches the rule (flows W8).
 		receivedAt := time.Now().UTC()
 
+		// One User-Agent budget for the whole request (enr-code-ua-parse-cpu-amplification): each distinct
+		// User-Agent is parsed at most once, and at most enrich.MaxUAParsesPerRequest uncached ones.
+		enrichCtx := enrich.WithBudget(r.Context(), enrich.NewBudget())
+
 		result := batchResult{}
 		for i := range payloads {
 			if err := applyAuthenticatedScope(r.Context(), db, &payloads[i]); err != nil {
@@ -505,7 +558,7 @@ func handleBatchIngest(svc *service.IngestService, db *pgxpool.Pool, logger *slo
 				result.Errors = append(result.Errors, batchItemError{Index: i, Message: err.Error()})
 				continue
 			}
-			if err := svc.IngestAt(r.Context(), &payloads[i], receivedAt); err != nil {
+			if err := svc.IngestAt(enrichCtx, &payloads[i], receivedAt); err != nil {
 				logger.ErrorContext(r.Context(), fmt.Sprintf("Failed to ingest batch item %d: %v", i, err),
 					slog.Int("batch_index", i), slog.Any("error", err))
 				result.Failed++

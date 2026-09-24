@@ -358,9 +358,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned with Taskfile.yml test-unit's `npx -y pnpm@10.34.5`; bump both together
+      # (tests/unit/pnpm_pin_test.go holds them equal; sentinel-event-enrichment contract decision 9).
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 10.34.5
 
       - uses: actions/setup-node@v4
         with:
@@ -399,6 +401,17 @@ jobs:
       - name: pnpm test
         if: github.event_name != 'pull_request'
         run: pnpm test
+
+      # Tunnel-fixture drift (sentinel-event-enrichment spec §4.5). Under CI the fixture test never writes, so
+      # it is the primary red signal; these two are the backstop. The pathspec is `tests/tunnel-fixtures`, NOT
+      # `packages/sdk-js/tests/tunnel-fixtures`: this job's working-directory is packages/sdk-js and a git
+      # pathspec resolves against the current directory, so the repo-root spelling would match nothing and
+      # both checks would pass without checking anything (enr-rev2-ci-drift-pathspec).
+      - name: tunnel fixtures committed and unchanged
+        if: github.event_name != 'pull_request'
+        run: |
+          git diff --exit-code -- tests/tunnel-fixtures
+          test -z "$(git ls-files --others --exclude-standard -- tests/tunnel-fixtures)"
 
       # Report-only (decision 40): prints sdk_js_client_entry_gzip_bytes, exits 0 whatever the number.
       - name: pnpm size

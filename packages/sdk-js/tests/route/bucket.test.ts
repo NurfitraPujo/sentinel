@@ -1,7 +1,8 @@
 // The tunnel route's token bucket (contract §4.5 step 4, decision 19; flows T14, T16, T17): 60/min per client by
 // default, capacity 60 refilling one per second, `Retry-After: ceil(seconds to the next token)`; the key from
-// `clientKey` when given (`null` → the shared bucket, a throw ≡ `null`) else `X-Forwarded-For`'s first non-empty
-// hop; step 4 sits after the origin check so a cross-site flood spends no token; the numeric options fall back
+// `clientKey` when given (`null` → the shared bucket, a throw ≡ `null`) else the client address the forward also
+// writes — `X-Forwarded-For`'s entry at `len − trustedProxyHops`, the RIGHTMOST by default, never the leftmost the
+// browser writes (sentinel-event-enrichment spec §4.2-§4.3); step 4 sits after the origin check so a cross-site flood spends no token; the numeric options fall back
 // with one `warn` each and the factory never throws; and the store is bounded — ≤ 10 000 keys, the least
 // recently seen evicted, a bucket full for ≥ 60 s swept. Fake timers drive the clock; `fetch` is stubbed.
 // Shuffle-safe: every test builds its own handler and restores the clock.
@@ -169,13 +170,43 @@ describe('T14: the default rateLimit { perMinute: 60 } (decision 19)', () => {
     expect(store?.has('')).toBe(false);
   });
 
-  it('T14: whitespace around a hop is trimmed and a later hop is never the key — "  9.9.9.9 , 10.0.0.1" keys on 9.9.9.9', async () => {
+  it('T14: whitespace around a hop is trimmed and an earlier (browser-written) hop is never the key — "  9.9.9.9 , 10.0.0.1 " keys on 10.0.0.1', async () => {
     const { POST } = createSentinelRouteHandler();
-    await POST(request({ headers: { 'x-forwarded-for': '  9.9.9.9 , 10.0.0.1' } }));
-    await POST(request({ headers: { 'x-forwarded-for': '9.9.9.9' } }));
+    await POST(request({ headers: { 'x-forwarded-for': '  9.9.9.9 , 10.0.0.1 ' } }));
+    await POST(request({ headers: { 'x-forwarded-for': '10.0.0.1' } }));
     const store = storeOf.get(POST);
     expect(store?.size).toBe(1);
-    expect(store?.has('9.9.9.9')).toBe(true);
+    expect(store?.has('10.0.0.1')).toBe(true);
+    expect(store?.has('9.9.9.9')).toBe(false);
+  });
+
+  it('T14: 61 requests whose LEFTMOST hop varies and whose rightmost hop is fixed share one bucket — the 61st is 429 (a browser cannot mint a bucket per request)', async () => {
+    const { POST } = createSentinelRouteHandler();
+    const statuses: number[] = [];
+    for (let i = 0; i < 61; i++) {
+      statuses.push((await POST(request({ headers: { 'x-forwarded-for': `6.6.${i >> 8}.${i & 255}, 198.51.100.23` } }))).status);
+    }
+    expect(statuses.slice(0, 60).every((s) => s === 202)).toBe(true);
+    expect(statuses[60]).toBe(429);
+    expect(storeOf.get(POST)?.size).toBe(1);
+    expect(storeOf.get(POST)?.has('198.51.100.23')).toBe(true);
+  });
+
+  it('T14: trustedProxyHops: 2 keys on the entry second from the right; a hop count past the header keys on the shared bucket, never the socket', async () => {
+    const { POST } = createSentinelRouteHandler({ trustedProxyHops: 2 });
+    await POST(request({ headers: { 'x-forwarded-for': '6.6.6.6, 198.51.100.23, 10.0.0.1' } }));
+    expect(storeOf.get(POST)?.has('198.51.100.23')).toBe(true);
+    const short = Object.assign(request({ headers: { 'x-forwarded-for': '198.51.100.23' } }), { socket: { remoteAddress: '203.0.113.9' } });
+    await POST(short);
+    expect(storeOf.get(POST)?.has(SHARED_KEY)).toBe(true);
+    expect(storeOf.get(POST)?.has('203.0.113.9')).toBe(false);
+  });
+
+  it('T14: a non-IP rightmost entry keys on the shared bucket — the header text itself is never a key', async () => {
+    const { POST } = createSentinelRouteHandler();
+    await POST(request({ headers: { 'x-forwarded-for': '1.1.1.1, evil.example' } }));
+    expect(storeOf.get(POST)?.size).toBe(1);
+    expect(storeOf.get(POST)?.has(SHARED_KEY)).toBe(true);
   });
 
   it('T14: X-Forwarded-For: "," (no non-empty hop) and a whitespace-only header fall through to the shared bucket, like no header at all', async () => {
@@ -258,13 +289,27 @@ describe('T16: the key without a header, and the clientKey option', () => {
     expect(storeOf.get(POST)?.size).toBe(1);
   });
 
-  it('T16: a Request that exposes ip / socket.remoteAddress is keyed on it when the header has no hop', async () => {
+  it('T16: a Request that exposes ip / socket.remoteAddress is keyed on it when there is NO header; a header with no usable hop never falls back to the socket', async () => {
     const { POST } = createSentinelRouteHandler({ rateLimit: { perMinute: 1 } });
-    const withIp = Object.assign(request({ headers: { 'x-forwarded-for': ',' } }), { ip: '203.0.113.5' });
+    const withIp = Object.assign(request(), { ip: '203.0.113.5' });
     expect((await POST(withIp)).status).toBe(202);
     const withSocket = Object.assign(request(), { socket: { remoteAddress: '203.0.113.5' } });
     expect((await POST(withSocket)).status).toBe(429);
     expect(storeOf.get(POST)?.has('203.0.113.5')).toBe(true);
+    // Behind a proxy the socket IS the proxy: an unreadable rightmost hop means "no address", not the socket.
+    const headerNoHop = Object.assign(request({ headers: { 'x-forwarded-for': ',' } }), { ip: '203.0.113.6' });
+    expect((await POST(headerNoHop)).status).toBe(202);
+    expect(storeOf.get(POST)?.has(SHARED_KEY)).toBe(true);
+    expect(storeOf.get(POST)?.has('203.0.113.6')).toBe(false);
+  });
+
+  it('T16: trustedProxyHops: 0 never reads X-Forwarded-For — a plain Request (the Next App Router shape) keys on the shared bucket; a socket, when one exists, is the key', async () => {
+    const { POST } = createSentinelRouteHandler({ trustedProxyHops: 0 });
+    await POST(request({ headers: { 'x-forwarded-for': '6.6.6.6' } }));
+    expect(storeOf.get(POST)?.has(SHARED_KEY)).toBe(true);
+    expect(storeOf.get(POST)?.has('6.6.6.6')).toBe(false);
+    await POST(Object.assign(request({ headers: { 'x-forwarded-for': '6.6.6.6' } }), { socket: { remoteAddress: '203.0.113.9' } }));
+    expect(storeOf.get(POST)?.has('203.0.113.9')).toBe(true);
   });
 });
 

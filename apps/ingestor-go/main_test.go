@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -24,9 +25,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/ua-parser/uap-go/uaparser"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/enrich"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/service"
 	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -240,4 +243,55 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// enr-code-ua-parse-cpu-amplification: the per-request User-Agent cost is bounded. A 500-item batch
+// (maxBatchSize) whose items each carry a DISTINCT ~1000-byte request.headers User-Agent is the worst
+// case an ingest key can send: every item misses the parser's cache. Enrichment must stay far below the
+// 200 ms bound; at 019a197 each item cost two uncached uap-go parses (~9-10 ms), several seconds in all.
+func TestHandleBatchIngest_DistinctLongUserAgentsAreBounded(t *testing.T) {
+	const bound = 200 * time.Millisecond
+	parser, err := uaparser.New(uaparser.WithCacheSize(1024))
+	require.NoError(t, err)
+	parser.Parse("warm-up/1.0") // a running pod's parser is past its first use; measure the steady state
+
+	items := make([]string, maxBatchSize)
+	base := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+	for i := range items {
+		ua := fmt.Sprintf("%s item-%04d ", base, i)
+		for len(ua) < 990 {
+			ua += fmt.Sprintf("ext%d/%d.%d ", len(ua), i, len(ua)%7)
+		}
+		require.LessOrEqual(t, len(ua), 1024)
+		items[i] = singleBodyPrefix + `,"request":{"url":"https://example.com/","headers":{"User-Agent":"` + ua + `"}}}`
+	}
+	body := "[" + strings.Join(items, ",") + "]"
+
+	// The same batch with enrichment off is the baseline: validation, mapping and publishing.
+	run := func(e *enrich.Enricher) (time.Duration, *capturingPublisher) {
+		pub := &capturingPublisher{}
+		opts := []service.Option{}
+		if e != nil {
+			opts = append(opts, service.WithEnricher(e))
+		}
+		svc, err := service.NewIngestService(pub, opts...)
+		require.NoError(t, err)
+		handler := handleBatchIngest(svc, nil, slog.Default())
+		rec := httptest.NewRecorder()
+		start := time.Now()
+		handler.ServeHTTP(rec, authedRequest(t, "/ingest/batch", body))
+		elapsed := time.Since(start)
+		require.Equal(t, http.StatusAccepted, rec.Code, "body: %.300s", rec.Body.String())
+		require.Len(t, pub.published, maxBatchSize)
+		return elapsed, pub
+	}
+	baseline, _ := run(nil)
+	enriched, pub := run(&enrich.Enricher{UA: parser})
+	cost := enriched - baseline
+	t.Logf("500 distinct ~1000-byte User-Agents: batch %v, baseline %v, enrichment %v (bound %v)", enriched, baseline, cost, bound)
+	assert.Less(t, cost, bound, "User-Agent enrichment of one batch must be bounded")
+
+	// Items within the budget are still enriched: the bound is a budget, not "UA parsing off".
+	first := decodePublished(t, pub.published[0])
+	assert.Equal(t, "Chrome", first.GetContexts()["browser"].GetFields()["name"].GetStringValue())
 }

@@ -181,12 +181,24 @@ tasks:
     # no gate ran them. `install` is here so this gate does not depend on `task build` having run first.
     # Known gap: the real-Postgres vitest suites (schema-drift, retention.*.integration) still SKIP here
     # when no migrated Postgres answers at DATABASE_URL.
+    #
+    # sentinel-event-enrichment contract decision 9 (coordinator ruling on enr-rev-tunnel-no-gate), following
+    # the sentinel-event-schema-v2 precedent above: the gate also runs the ingestor's package tests and the
+    # sdk-js suite, so the tunnel's spoofing tests are proven by a gate. The sdk-js lines pin pnpm to the
+    # exact 10.34.5 CI's sdk-js-node job uses (pnpm 11 rewrites packages/sdk-js/pnpm-lock.yaml); bump both
+    # together, tests/unit/pnpm_pin_test.go holds them equal. The two git lines fail on tunnel-fixture drift
+    # the sdk-js suite wrote locally, including a new untracked fixture `git diff` cannot see (spec §4.5).
     test-unit:
-        desc: Run unit tests (Go tests/unit and the dashboard vitest suite)
+        desc: Run unit tests (Go tests/unit, ingestor packages, dashboard and sdk-js vitest suites)
         cmds:
             - go test ./tests/unit/... -v
+            - go test ./apps/ingestor-go/...
             - pnpm --dir apps/dashboard-web install --frozen-lockfile
             - pnpm --dir apps/dashboard-web test
+            - npx -y pnpm@10.34.5 --dir packages/sdk-js install --frozen-lockfile
+            - npx -y pnpm@10.34.5 --dir packages/sdk-js test
+            - git diff --exit-code -- packages/sdk-js/tests/tunnel-fixtures
+            - test -z "$(git ls-files --others --exclude-standard -- packages/sdk-js/tests/tunnel-fixtures)"
 
     # sentinel-event-schema-v2 §9.1 (rulings 3 and 4): FORCE_TESTCONTAINERS=1 so the suite never falls
     # back to the compose stack's SHARED dev database when something answers localhost:8080/health

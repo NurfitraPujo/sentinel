@@ -62,6 +62,10 @@ secrets:
     # Shared-cluster NATS DSN (with credentials) — seal via kubeseal-encrypt-string
     # scoped to namespace sentinel-production, name sentinel-sentinel-secrets.
     NATS_URL: "AgAFy2YlWqvKTikE55FDzp/gT4z8/VvDvzAMxh0eI/GtJ9ygtTAyJ+NSJykVUD45Lb4EFwv5/WAZw8PpzB9gpXakiJezFcdikdJ0z2UMLkG6+u3vHVnQGyGeRP6uEzoLfNlxvfX6XIg9aFO6HmkUrNE3ShckSrgq1wHVqujrX3TBwj15WCwVujkgCHmSn+eQN1AlPtUrOiObIUVd9uCORJP2ocjmUtkHZUuo57xUMxi81XmEFVHJdr6kTA/sBIkbkiHYpy/jGYpIwk9qXJXUp6rvSCGYit3pjCN/0ChiTbRxjCMmE5VIR0A6kcByhs0i7qWIGqIJCBQqpzE+wdi5F55IpWlmW6OflrEwCAclZFOOY43/N+koD/6KJRQ8PgRL5RypH1uXK43ZIBV6Gh4Sw0iyILMwpTd8xEhP2/0NeqmXfNyIrq7Ow9l/NDpLtJD+uZkV6xeXBbFPYMUeJpmBMuU8wmJo+GlM2BO2ygnBVXqwHb7XH8fSrRZymJM+zFSBBRctUbkLdCShmsJgcM7LzIvLRjstNVJAbARWUWcXjY447yp6BFfiPudNvn/N2vGYBTeuUOXe84w1nPCKH9rS/OLYv4G5ZHiPQdSRvJx4qBRz7KtmdCQBahPcQ6tzlwNSqZX0yEIrigzItSHGIUN4LJ7UJEZnt4XMgKrQx+ofCFLUixiDTw/opmOXA6a5IOHFURohC1E/aDY7qi7thSG9uMMd7DBhD0hyyHTR0+t3gxqegvxpBWCvJ8RAulM0tfITdRRjQf4PdR/PVR2S+SSCnNYaVzYBIhPvOFXAxWpeSFDcXg=="
+    # sentinel-event-enrichment TASK-07: sealed by the operator 2026-09-24 via kubeseal-encryptor,
+    # scope namespace sentinel-production, name sentinel-sentinel-secrets. Read only by the geoip-refresh CronJob.
+    MAXMIND_ACCOUNT_ID: "AgBkUZh992929VsRY1hGQ0hHbJS1+HH+qYojKJDj332aXgYEvaCCskOFCoM4WXaJ1d1YRsU81b6MKT3JAPY9M1JsVIdbkugSLqUvLPFJxd/putNJiSpWuX7GrZWtbMYYkh/FvQjwo62ggtPd4UAvE+B7QZb363ypWXnc9uxs0XKFTsCq+YvVcMJ+Hi2AKR6fZQOpwwcoLeaEMIrSVWwusPjlTvbMa8Yi7WC/X/O419w/knK57jzi2e/XJj25cnuS9JGvMT2YsTkXOm0x2DvA73GIWJ+ZSwpHROLXsYG3/j8Fo/VCu7zy93uIQ6wQyx1Z9GjT7xVvHs2Ww1YmayJtl56StGl73PwslGBRD3kW1oAzKyUxZlJSbmbSI75jYUgN0aeWCxEv6X7V1l2g0/Daf2dCYen9FPBXKcCIaLHuXPdJCHq+iE4yUw/fX7P6arjiIuuFm9ZU5wdOOU/UwLwmBe1lTg6pVz/7Je1PjT5TNeHYw5HpU/UZfXvcgwU+cOY7BG9QR3TbWut/iyMlOFqZQGSV+KoQ4Zu7L6z8yZccwTPT7TuTIofNYxswiCzkI76sQETN/1wn+r606OqVVL3VME0BQbJ6WfPpBTdJLFuj1ooV3lfj+HQDUXn7m0VypvlJ9zZt/HheWJpeHOaGZFG+tNKY0WCo7fBoX+wgC8v0RrTGM4u5qNOqT1+L8gfgOPyNAxbVdK7weU/K"
+    MAXMIND_LICENSE_KEY: "AgABgq/PvCZlMIOfE6Pm+NgQ3UOTqlSfWHTyHJZCS/iz96pKmjMU4xoxuG3EwEn61qe1oDemmLtUOFYyTqzxVpnZZ2jRRcrZY6lMbcmuiQYqlnEsPkdpC3+Fnkr0QmhlpAF+5MnUq/76H+Ze7HJXmHlhycfRXRe2j8kihnzpgtVa4MPHEcjWAO0ucROvOfyOpb5BXCK5yTAHJOSVI0uwWef5TCzL1Xd9pqe355Eo3oeLcn5papxb2cx6qGrQjLqzMy9QVE/N1z6+y6usuUeo2SfMFx17NxR+BRJONHjlo41FCU84T5BEIIk7hUnOGKmMJ25Puxmyye99v9vFdB0Gg/UNsuFSM2JgHt63CktOs3t8CrwVSglbHvuOFqEs89tqml6/txmjJsfVcLbxeZq38N9DzuEyjH7Cm4rjJWkjJ/GKU0VJn/x8VRHvaOKR8eQ+Q//3tNThjdZu9GkFsDjVBqC6bQ/cn/yscH9EsAeqsR1alW+c6MdgL7EDWUvYhgDdhmRDBJJ7C/Dc7w8QOdKk6rhRCMnXX2HJQWuwbY935nqv0tslg3p8jCXlfC46jjz+m4msxIHATSbPfrE5JD4an5ykspCTxSZMzi2vM7z0vfa6Tsk5HnLXPnQKCtLK4uHXv44faP9JbV92RcI4Nff/BMcICOOJQj9IOS751Oxuge/6LERCnXETe/X0MFLHje88oVwiRWc9/46UfuuktimBG3TTzkmj7qW7KuSqKYh1ndc2sSivOa+uSzCW"
 
 # -----------------------------------------------------------------------------
 # Managed VPC endpoints. CCE Standard cannot route pod traffic to these IPs
@@ -117,6 +121,10 @@ config:
     sourcemapMaxFilesPerRelease: "2000"
   ingestor:
     ratelimitStrictMode: "true"
+    # Contract decision 11: no forwarding header is believed on Huawei. The tunnel writes the browser's
+    # IP into the body. Phase 4 (public endpoint) configures this; do not add node, pod or ELB ranges
+    # here. (sentinel-event-enrichment spec §3.3, §3.6; tests/unit/helm_geoip_test.go asserts it empty.)
+    trustedProxyCidrs: []
 
 migrate:
   enabled: true
@@ -146,8 +154,21 @@ ingestor:
     enabled: true
     minAvailable: 1
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    # 256Mi: the resident GeoLite2-City database (sentinel-event-enrichment spec §8.4).
+    requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: "1", memory: 512Mi }
+
+# sentinel-event-enrichment (spec §8.3, §8.4): geo from GeoLite2-City in this env's OBS bucket. Storage is
+# pinned to the same endpoint and bucket as config.s3; the AWS S3 move edits these lines and the key names.
+geoip:
+  enabled: true
+  storage:
+    endpoint: "https://obs.ap-southeast-3.myhuaweicloud.com"
+    bucket: sentinel-production
+    region: "us-east-1"
+    prefix: "geoip/"
+  refreshCron:
+    enabled: true
 
 processor:
   replicaCount: 2

@@ -269,6 +269,44 @@ breadcrumb `timestamp`) fails the decode of the whole body, as it does for every
   occurrence, masked as §5 describes and **never normalized**. Two occurrences of one issue each keep their own
   message.
 
+### Server-side enrichment
+
+The ingestor fills three things an SDK left empty, the way Sentry's server does (`sentinel-event-enrichment`). **A value
+you send always wins**: a sent `user.ip_address`, `user.geo`, `contexts.browser`, `contexts.os` or `contexts.client_os`
+(even `{}`, and every key inside a sent context) is stored exactly as sent. None of these fields feeds the fingerprint,
+and every derived value is bounded exactly as a sent one (enrichment runs before the size limits above).
+
+- **`user.ip_address`**, from the request's connection:
+  - `"{{auto}}"` (exact, case-sensitive) on **any** platform asks for the caller's address; with no public caller it is
+    stored as `""`, never as the literal.
+  - An absent (or `""`) IP is filled only for a **client-platform** event: `platform` ∈ {`javascript`, `browser`,
+    `cocoa`, `objc`, `dart`, `flutter`}, except `javascript` whose `metadata.runtime` is `"node"` or `"edge"`. A server
+    event's connection is a pod, never a user, so it stays empty. An Android SDK gets its IP by sending `"{{auto}}"`.
+  - The caller is the connection's peer unless that peer is one of the deployment's configured trusted proxies
+    (`TRUSTED_PROXY_CIDRS`), in which case `X-Forwarded-For` is walked right to left past them. The Huawei deployments
+    trust no proxy, so no forwarding header is believed there.
+  - **A derived IP is stored only if it is public**: never a private, loopback, link-local, carrier-grade-NAT
+    (`100.64.0.0/10`), shared-ELB (`100.125.0.0/16`) or other non-routable address. A body value is stored as sent,
+    private or not.
+  - A request carrying the header `X-Sentinel-Derive-IP` (any value) gets **no** connection-derived IP; the sdk-js
+    tunnel sends it as `off` on every forward. Neither does a `javascript` item whose `metadata.runtime` is
+    `"browser"`, which only a tunnel can deliver. The one residual: behind a tunnel older than sdk-js 0.2.0, on a
+    deployment where the ingestor sees that tunnel's server at a public address, a browser that rewrites its own
+    `metadata.runtime` gets its **own** event stored under the tunnel server's address.
+- **`user.geo`**, when not sent, from a local GeoLite2-City lookup of `user.ip_address` (sent or derived; public and
+  parseable exactly as stored): `country_code` ← the ISO country code, `city` ← the city, `subdivision` ← the first
+  subdivision, and `region` ← **the country name** (Sentry's mapping; the example above shows an SDK-sent value). No
+  database, or a lookup miss, fills nothing. Never a per-event network call.
+- **`contexts.browser` and `contexts.os`**, each only when that key is absent, from a User-Agent: first the body's
+  `request.headers` (the first key, in lexical order, equal to `User-Agent` case-insensitively; any platform), else —
+  client-platform events only — the ingest request's own `User-Agent` header. Written as `{name, version}` (no
+  `type`); `Other` fills nothing; a UA over 1024 bytes is not parsed. A non-client-platform event gets
+  `contexts.client_os` instead of `os`, so an end user's OS is never recorded as the server's.
+- **The Next.js tunnel** (`@sentinel/sdk-js/nextjs/route`) writes the browser's IP — derived from the rightmost trusted
+  `X-Forwarded-For` hop, `trustedProxyHops` — into every forwarded item's `user.ip_address`, replacing any value the
+  browser sent. It forwards only the exact `id`, `username` and `email` string values of a sent `user`, never a sent
+  `geo`, and forwards the browser's `User-Agent` but never `X-Forwarded-For`.
+
 ---
 
 ## 4. HTTP Transport & Ingestion Handshake
@@ -307,7 +345,8 @@ survive; about one in ten arbitrary 13-19 digit numbers passes by chance and is 
   `breadcrumbs` — `message` and `data`; and `exception.values[].value`. Map values go through key-based redaction;
   free text goes through the card-number rule and the server's pattern rules (`password=`, `token=`, `api_key=`,
   `Bearer …`, SSN-shaped numbers, passport numbers).
-- **Stored as sent**: `user` (email, IP address and geo included), `sdk`, and the labels `level`, `logger`,
+- **Stored as sent**: `user` (email, IP address and geo included; the one exception is the literal `"{{auto}}"` IP,
+  which the server replaces, *Server-side enrichment* above), `sdk`, and the labels `level`, `logger`,
   `server_name`, `transaction`, `dist` and `source`; frames; `error_class`.
 - **Not normalized.** Stored values are masked and otherwise **verbatim**: ids, UUIDs, emails, versions and paths are
   kept as sent. Normalization (UUID → `<UUID>`, digit runs → `<NUMERIC_ID>`, …) is used for grouping only.

@@ -204,9 +204,15 @@ minus its `NEXT_PUBLIC_FRONTEND_URL` lookup — pass the real one to get byte-id
 closed: `isCrossSite` → `403`, `clientKey` → the shared bucket. The route refuses a cross-site
 request with `403 cross_site_request`, anything but `application/json` with `415`, more than
 256 KiB or 50 items with `413` / `400`, deletes `project_key` / `project_id` from every item,
-forwards **no** client header, never retries its single forward (the browser SDK owns retries) and
-relays the ingestor's status and body verbatim — so a `429` reaches the browser SDK with its
-`Retry-After`. Its own errors use `{ "error": { "code", "message", "details" } }`.
+forwards **one** client header — the browser's `User-Agent` (1–1024 bytes, no control character),
+so the ingestor can fill `contexts.browser` / `contexts.os` — and never `X-Forwarded-For` or any
+other, never retries its single forward (the browser SDK owns retries) and relays the ingestor's
+status and body verbatim — so a `429` reaches the browser SDK with its `Retry-After`. Its own
+errors use `{ "error": { "code", "message", "details" } }`.
+
+**The browser's IP goes in the body** (*The tunnel's client IP*, below): the route writes it into
+every forwarded item's `user.ip_address`, replacing any value the browser sent, and sends
+`x-sentinel-derive-ip: off` so the ingestor never fills an item from the web server's own address.
 
 ### 5. `next.config.mjs`
 
@@ -405,13 +411,41 @@ shared across replicas, bounded at 10 000 keys per instance (least-recently-seen
 buckets swept), and an abuse speed bump rather than a guarantee — the ingestor's own per-key
 limit is the real cap. `rateLimit: false` disables it; `rateLimit: { perMinute: n }` resizes it.
 
-The default key is the first non-empty hop of `X-Forwarded-For`. Next 15.5 fills a missing
-`x-forwarded-for` from the socket, so behind a proxy that does not transfer the client IP **every
-user of the app shares one 60/min bucket per pod** — and the first hop is caller-writable. So
-**log one request's `x-forwarded-for` on the tunnel before trusting the default**; pass
-`clientKey: getClientIp` (`web`'s `src/app/api/client-ip.ts`, rightmost-by-`TRUSTED_PROXY_HOPS`,
-what its other routes key on — the mount above); and pass `rateLimit: false` or a higher
-`perMinute` if the logged header shows the proxy's address.
+The default key is the client address the route also writes into the body (*The tunnel's client
+IP*, below): the `X-Forwarded-For` entry at `len − trustedProxyHops` — the **rightmost** by default
+— never the leftmost, which the browser writes (it used to be the first non-empty hop, which let a
+client mint a fresh bucket per request by varying the header). With no usable address every client
+shares one bucket per pod. `clientKey`, when given, decides the key exactly as before: `web` passes
+`clientKey: getClientIp` (`web`'s `src/app/api/client-ip.ts`, rightmost-by-`TRUSTED_PROXY_HOPS`, the
+mount above). **Log one request's `x-forwarded-for` on the tunnel before trusting the default**, and
+pass `rateLimit: false` or a higher `perMinute` if it shows the proxy's address.
+
+## The tunnel's client IP
+
+The browser never talks to the ingestor, so the ingestor cannot see its address. The route derives
+it — `clientKey(req)` when given (web's `getClientIp`), else the `X-Forwarded-For` entry at
+`len − trustedProxyHops` (option, default `1`, an integer ≥ 0) — re-serialises it canonically (an
+IPv4-mapped IPv6 address becomes dotted IPv4; anything that is not an IP gives no address), and
+writes it into **every** forwarded item's `user.ip_address`. It **overwrites** a value the browser
+sent, because a browser-chosen IP is not evidence. A `user` the browser sent is **rebuilt** from its
+exact `id`, `username` and `email` string values only, so no spelling of `ip_address` or `geo` that
+the ingestor's case-folding JSON decoder would read (`IP_ADDRESS`, `Ip_Address`, a folded `GEO`)
+survives, and a browser-sent `geo` never does. With no address, no IP is written and none can be
+filled later: every forward carries `x-sentinel-derive-ip: off`, which tells the ingestor never to use
+the web server's own connection address. The ingestor looks the written IP up for `user.geo`.
+
+The derivation relies on your proxy chain, so set `trustedProxyHops` to match it:
+
+> `trustedProxyHops` must equal the number of reverse proxies in front of your app that append to `X-Forwarded-For`. The default, 1,
+> assumes exactly one. A value larger than your real proxy count lets a client choose the IP your events are stored under.
+>
+> `0` means "never read `X-Forwarded-For`; use the socket address on the request". **The Next.js App Router exposes no socket**: a
+> route handler gets a plain `Request`, and `NextRequest.ip` was removed in Next 15. So under the App Router, `0` makes the tunnel
+> derive **no IP for any event**, and the default rate-limit key falls back to one shared bucket for every client. That is safe (no
+> event is stored under a wrong address), but it turns the feature off. Next's own server fills `X-Forwarded-For` from the socket
+> only when the request carries none, and keeps a client-sent header as it is. So with **no** proxy in front of the app, no hop count
+> is trustworthy: `1` would store an address the client can choose. To get a real IP there, put a proxy that appends
+> `X-Forwarded-For` in front of the app and count it, or pass a `clientKey` that reads an address you trust.
 
 ## Which frames are in-app
 

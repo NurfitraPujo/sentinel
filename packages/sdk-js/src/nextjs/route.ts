@@ -9,7 +9,15 @@
 // BEFORE the body is read, so only a request that could be the same-origin client's spends a token and a
 // cross-site flood cannot exhaust a legitimate client's bucket:
 //   1 method → 405   2 origin → 403   3 media type → 415   4 rate limit → 429   5 size → 413
-//   6 shape → 400 (the taxonomy)   7 configuration → 503   8 one forward, no client header   9 relay
+//   6 shape → 400 (the taxonomy)   7 configuration → 503   9 relay
+//   8 one forward: the browser's User-Agent is the only client header; the derived IP is written into each
+//     item's `user.ip_address`, `user` is rebuilt from an exact-key allow-list, and `x-sentinel-derive-ip: off`
+//     tells the ingestor never to derive an IP from this connection (sentinel-event-enrichment spec §4.4).
+//
+// The client IP (sentinel-event-enrichment spec §4.2, contract decision 11): ONE derivation, the entry at
+// `len − trustedProxyHops` of `X-Forwarded-For` (web's shape: one proxy, the rightmost entry), re-serialised in
+// canonical form, feeds both the IP the forward writes into every item and the default rate-limit key. The
+// leftmost entry is the browser's to write and is never used. `clientKey`, when given, decides both instead.
 //
 // What the route never does (contract §4.5): echo the key or the endpoint in any response; forward to a host
 // other than the configured endpoint; accept `project_key` / `project_id` from the body; log a body; relay any
@@ -45,6 +53,14 @@ export interface RouteHandlerOptions {
   forwardTimeoutMs?: number;
   /** Default `{ perMinute: 60 }` (decision 19); `false` disables; `perMinute` non-finite or ≤ 0 ≡ `false`. */
   rateLimit?: { perMinute: number } | false;
+  /**
+   * Trusted reverse proxies in front of the app (web's TRUSTED_PROXY_HOPS). Default 1; an integer ≥ 0; anything
+   * else → default, one `warn`. It MUST equal the number of proxies that append to `X-Forwarded-For`: a larger
+   * value lets a client choose the IP its events are stored under. `0` never reads the header and uses the
+   * socket address on the request, which the Next.js App Router does not expose — so under Next, `0` derives no
+   * IP at all (sentinel-event-enrichment spec §4.3).
+   */
+  trustedProxyHops?: number;
 }
 
 export type SentinelRouteHandler = (req: Request) => Promise<Response>;
@@ -53,6 +69,19 @@ export const DEFAULT_MAX_BODY_BYTES = 262_144;
 export const DEFAULT_MAX_ITEMS = 50;
 export const DEFAULT_FORWARD_TIMEOUT_MS = 5000;
 export const DEFAULT_PER_MINUTE = 60;
+export const DEFAULT_TRUSTED_PROXY_HOPS = 1;
+/** The forwarded `user-agent` must be 1–1024 bytes (the ingestor parses no longer one, spec §6.2). */
+export const MAX_FORWARDED_USER_AGENT_BYTES = 1024;
+/** The no-derive marker (spec §3.8): sent as `off` on every forward, never copied from the inbound request. */
+export const DERIVE_IP_HEADER = 'x-sentinel-derive-ip';
+
+/**
+ * The `user` keys a forward may carry from the item it was given (spec §4.4): the schema-v2 `UserInfo` string
+ * fields, EXACT names only. `ip_address` and `geo` are deliberately absent — the ingestor decodes `user` with Go's
+ * case-folding `encoding/json`, so `IP_ADDRESS`, `Ip_Address` or `ip_addreſſ` left in place would be read as the
+ * IP. The route rebuilds `user` from these names and writes `ip_address` itself.
+ */
+export const USER_KEYS: readonly string[] = ['id', 'username', 'email'];
 /** `Retry-After` on `503 upstream_unavailable` (contract §4.5 step 9's guidance). */
 export const UPSTREAM_RETRY_AFTER_SECONDS = 5;
 
@@ -139,6 +168,17 @@ function positive(name: string, given: unknown, fallback: number): number {
   return fallback;
 }
 
+/** An integer option ≥ 0: anything else → the default, one `warn` per option per process. */
+function nonNegativeInteger(name: string, given: unknown, fallback: number): number {
+  if (given === undefined) return fallback;
+  if (typeof given === 'number' && Number.isInteger(given) && given >= 0) return given;
+  if (!warnedOptions.has(name)) {
+    warnedOptions.add(name);
+    warn(`createSentinelRouteHandler: ${name} ${String(given)} is not an integer ≥ 0; using ${fallback}`);
+  }
+  return fallback;
+}
+
 /** A guarded `process.env[name]` read — the edge may have no `process`; unset or empty is `undefined`. */
 function readEnv(name: string): string | undefined {
   try {
@@ -194,29 +234,122 @@ function mediaType(req: Request): string {
   return (semicolon === -1 ? value : value.slice(0, semicolon)).trim().toLowerCase();
 }
 
+const IPV4 = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/;
+const IPV6_CHARS = /^[0-9A-Fa-f:.]+$/;
+const MAPPED = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/;
+
 /**
- * The default rate-limit key (contract §4.5 step 4): `X-Forwarded-For`'s first non-empty hop after trimming —
- * `, 1.2.3.4` keys on `1.2.3.4`, never on the empty string every spoofer would share; `,` alone, or no header,
- * falls through to the socket address when the runtime exposes one (a plain `Request` has none — under Next the
- * header is already filled from the socket), else the shared bucket.
+ * An address's canonical text, or `null` when `value` is not an IP (spec §4.2): parsed and re-serialised, never
+ * the substring as received. IPv4 is four decimal octets 0–255 with no leading zeros, whitespace or port. A
+ * string with `:` takes the IPv6 path: only hex digits, `:` and `.` are admitted BEFORE any URL parsing (so no
+ * zone, bracket, `@`, `/`, `?`, port, or the tab/LF/CR the WHATWG parser silently deletes — `::1]@6.6.6.6:80/?[`
+ * would otherwise parse as host `6.6.6.6`), then the WHATWG parser must accept it as an IPv6 literal, and an
+ * IPv4-mapped address is unmapped to dotted IPv4, the form the ingestor stores. Pure: no `node:net`, so it runs
+ * on the edge runtime too.
+ *
+ * There is deliberately no second check that the parsed hostname is bracketed: with the input limited to
+ * `[0-9A-Fa-f:.]`, `http://[s]` has no `]`, `@` or `/` to end the host early, so the parser either throws or
+ * returns `[…]`. Such a check could never fail, and no test could prove it (enr-code-canonicalip-guards-
+ * individually-unproven); the character filter is the one guard, and route.test.ts proves it alone.
  */
-function defaultClientKey(req: Request): BucketKey {
-  const xff = header(req, 'x-forwarded-for');
-  if (xff !== null) {
-    for (const hop of xff.split(',')) {
-      const trimmed = hop.trim();
-      if (trimmed !== '') return trimmed;
+export function canonicalIp(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const s = value.trim();
+  if (!s.includes(':')) {
+    const m = IPV4.exec(s);
+    if (m === null) return null;
+    const octets = m.slice(1, 5).map(Number);
+    return octets.every((o) => o <= 255) ? octets.join('.') : null;
+  }
+  if (!IPV6_CHARS.test(s)) return null;
+  let host: string;
+  try {
+    host = new URL(`http://[${s}]`).hostname;
+  } catch {
+    return null;
+  }
+  const v6 = host.slice(1, -1).toLowerCase();
+  const mapped = MAPPED.exec(v6);
+  if (mapped !== null) {
+    const hi = parseInt(mapped[1] as string, 16);
+    const lo = parseInt(mapped[2] as string, 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  return v6;
+}
+
+/**
+ * The client's address (spec §4.2), canonical, or `null`:
+ *   1. `hops === 0`: skip to 3.
+ *   2. `X-Forwarded-For` present: the entry at `len − hops`, trimmed and canonical; out of range, empty or not an
+ *      IP → `null`, NEVER the socket (behind a proxy the socket is the proxy).
+ *   3. `hops` 0 or no header: the socket address (`req.ip`, else `req.socket.remoteAddress`) when the runtime
+ *      exposes one, canonical. The Next.js App Router exposes none, so under Next this step yields `null`.
+ */
+export function clientAddress(req: Request, hops: number): string | null {
+  if (hops > 0) {
+    const xff = header(req, 'x-forwarded-for');
+    if (xff !== null) {
+      const entries = xff.split(',');
+      const index = entries.length - hops;
+      return index >= 0 ? canonicalIp(entries[index]) : null;
     }
   }
   try {
     const r = req as { ip?: unknown; socket?: { remoteAddress?: unknown } };
-    if (typeof r.ip === 'string' && r.ip !== '') return r.ip;
-    const remote = r.socket?.remoteAddress;
-    if (typeof remote === 'string' && remote !== '') return remote;
+    if (typeof r.ip === 'string' && r.ip !== '') return canonicalIp(r.ip);
+    return canonicalIp(r.socket?.remoteAddress);
   } catch {
     // No socket on this runtime's Request.
+    return null;
   }
-  return SHARED_KEY;
+}
+
+/**
+ * The default rate-limit key (step 4): the written IP's derivation — `clientAddress(req, trustedProxyHops)` — else
+ * the shared bucket. It used to be `X-Forwarded-For`'s LEFTMOST hop, which the browser writes, so any client could
+ * mint a fresh bucket per request (spec §4.3).
+ */
+function defaultClientKey(clientIp: string | null): BucketKey {
+  return clientIp ?? SHARED_KEY;
+}
+
+/**
+ * Write the request's derived IP into every item (spec §4.4, contract decision 11), on the items `normaliseBody`
+ * returned, just before step 8 serialises them. A plain-object `user` is REBUILT, never edited: only the exact
+ * `USER_KEYS` with string values are copied, then `ip_address` last when `ip` is an address — so no key Go's
+ * case-folding decoder could read as `ip_address` or `geo` survives, whatever its spelling, and a browser-sent
+ * `geo` is always dropped. Per item:
+ *   B1 ip, no/null user → `{ ip_address: ip }`     B2 ip, object → rebuilt + `ip_address: ip`
+ *   B3 user not a plain object → left as it is (the ingestor rejects the batch)
+ *   B4 no ip, object → rebuilt without any IP      B5 no ip, no/null user → unchanged
+ */
+export function applyClientIp(items: Record<string, unknown>[], ip: string | null): void {
+  for (const item of items) {
+    const user = item.user;
+    if (user === undefined || user === null) {
+      if (ip !== null) item.user = { ip_address: ip };
+      continue;
+    }
+    if (!isPlainObject(user)) continue;
+    const rebuilt: Record<string, string> = {};
+    for (const name of USER_KEYS) {
+      const value = Object.prototype.hasOwnProperty.call(user, name) ? user[name] : undefined;
+      if (typeof value === 'string') rebuilt[name] = value;
+    }
+    if (ip !== null) rebuilt.ip_address = ip;
+    item.user = rebuilt;
+  }
+}
+
+/** The inbound `user-agent` when it may be forwarded: 1–1024 bytes, no control character (spec §4.4). */
+function forwardableUserAgent(req: Request): string | undefined {
+  const ua = header(req, 'user-agent');
+  if (ua === null || ua === '') return undefined;
+  if (new TextEncoder().encode(ua).byteLength > MAX_FORWARDED_USER_AGENT_BYTES) return undefined;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(ua)) return undefined;
+  return ua;
 }
 
 /**
@@ -308,6 +441,7 @@ export function createSentinelRouteHandler(options: RouteHandlerOptions = {}): {
   const forwardTimeoutMs = positive('forwardTimeoutMs', given.forwardTimeoutMs, DEFAULT_FORWARD_TIMEOUT_MS);
   const isCrossSite = typeof given.isCrossSite === 'function' ? given.isCrossSite : undefined;
   const clientKey = typeof given.clientKey === 'function' ? given.clientKey : undefined;
+  const trustedProxyHops = nonNegativeInteger('trustedProxyHops', given.trustedProxyHops, DEFAULT_TRUSTED_PROXY_HOPS);
   // Presence, not value: `{ apiKey: process.env.SENTINEL_TUNNEL_API_KEY }` with the variable unset is an own
   // property holding `undefined`, and it means "the tunnel's own key" — never `SENTINEL_API_KEY`.
   const apiKeyGiven = Object.prototype.hasOwnProperty.call(given, 'apiKey');
@@ -350,21 +484,27 @@ export function createSentinelRouteHandler(options: RouteHandlerOptions = {}): {
       return errorResponse(415, 'unsupported_media_type', 'Content-Type must be application/json.');
     }
 
+    // The client: ONE clientKey call (or one derivation) per request, before step 4 and whether or not rate
+    // limiting is on. It gives the rate-limit key and the IP step 8 writes into every item (spec §4.2).
+    let keyed: string | null = null;
+    let clientIp: string | null;
+    if (clientKey !== undefined) {
+      let returned: unknown = null;
+      try {
+        returned = clientKey(req);
+      } catch (cause) {
+        debugLine(`route: clientKey threw (${nameOf(cause)}); the request is keyed on the shared bucket`);
+        returned = null;
+      }
+      keyed = typeof returned === 'string' && returned !== '' ? returned : null;
+      clientIp = canonicalIp(returned);
+    } else {
+      clientIp = clientAddress(req, trustedProxyHops);
+    }
+
     // 4. Rate limit — before the body is read (a refused request costs no parsing).
     if (store !== undefined) {
-      let key: BucketKey;
-      if (clientKey !== undefined) {
-        let returned: unknown = null;
-        try {
-          returned = clientKey(req);
-        } catch (cause) {
-          debugLine(`route: clientKey threw (${nameOf(cause)}); the request is keyed on the shared bucket`);
-          returned = null;
-        }
-        key = typeof returned === 'string' && returned !== '' ? returned : SHARED_KEY;
-      } else {
-        key = defaultClientKey(req);
-      }
+      const key: BucketKey = clientKey !== undefined ? (keyed ?? SHARED_KEY) : defaultClientKey(clientIp);
       const taken = store.take(key);
       if (!taken.ok) {
         return errorResponse(429, 'rate_limited', 'Too many requests; retry later.', {}, { 'retry-after': String(taken.retryAfterSeconds) });
@@ -424,9 +564,15 @@ export function createSentinelRouteHandler(options: RouteHandlerOptions = {}): {
       return errorResponse(503, 'sentinel_not_configured', 'The Sentinel tunnel is not configured.');
     }
 
-    // 8. Forward — one attempt, no client header, within the timeout.
+    // 8. Forward — one attempt within the timeout. Headers are built from scratch: the browser's User-Agent is
+    // the only client header; no X-Forwarded-For, ever (the IP's only channel is the body); and the constant
+    // no-derive marker, so the ingestor never fills an item from this connection (spec §3.8, §4.4).
     const headers: Record<string, string> = { 'content-type': 'application/json', 'x-api-key': apiKey };
     if (projectKey !== undefined) headers['x-project-key'] = projectKey;
+    const userAgent = forwardableUserAgent(req);
+    if (userAgent !== undefined) headers['user-agent'] = userAgent;
+    headers[DERIVE_IP_HEADER] = 'off';
+    applyClientIp(shape.items, clientIp);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), forwardTimeoutMs);
     (timer as { unref?: () => void }).unref?.();

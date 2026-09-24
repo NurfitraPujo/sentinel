@@ -4,6 +4,45 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+### Unreleased — the tunnel writes the browser's IP (ships with the next tag, planned v0.2.0)
+
+Not tagged by this change (`sentinel-event-enrichment` contract decision 5); it reaches `web` with
+`sentinel-sdk-js-rich-context/TASK-05` (0.2.0) and `TASK-06`.
+
+#### Changed
+
+- **The tunnel route writes the browser's IP into every forwarded item's `user.ip_address`**
+  (`sentinel-event-enrichment` TASK-06). The IP is `clientKey(req)` when given, else the
+  `X-Forwarded-For` entry at `len − trustedProxyHops` (new option, default `1`, an integer ≥ 0;
+  anything else → the default with one `warn`), in canonical form (IPv4-mapped IPv6 → dotted
+  IPv4; anything that is not an IP → no address). It **overwrites** any value the browser sent. A
+  browser-sent `user` is **rebuilt** from its exact `id` / `username` / `email` string values, then
+  `ip_address`; no other key, no `geo`, and no case-folded spelling of either survives. With no
+  address, no `user` is created and an existing one is rebuilt without an IP.
+- **The forward carries two new headers**: the browser's `user-agent` (1–1024 bytes, no control
+  character), so the ingestor can fill `contexts.browser` / `contexts.os`, and
+  `x-sentinel-derive-ip: off` on every forward, so the ingestor never fills an item from the web
+  server's own address. It still forwards **no** `X-Forwarded-For` and no other client header.
+- **The default rate-limit key moved from the leftmost `X-Forwarded-For` hop to the same
+  derivation** (the rightmost-trusted entry). The leftmost hop is written by the browser, so any
+  client could mint a fresh bucket per request. `clientKey`, when given, keys exactly as before.
+- New exports from `@sentinel/sdk-js/nextjs/route`: `applyClientIp`, `canonicalIp`,
+  `clientAddress`, `USER_KEYS`, `DEFAULT_TRUSTED_PROXY_HOPS`, `DERIVE_IP_HEADER`,
+  `MAX_FORWARDED_USER_AGENT_BYTES`. **No wire-vocabulary change** to `metadata`.
+
+**`trustedProxyHops`:**
+
+> `trustedProxyHops` must equal the number of reverse proxies in front of your app that append to `X-Forwarded-For`. The default, 1,
+> assumes exactly one. A value larger than your real proxy count lets a client choose the IP your events are stored under.
+>
+> `0` means "never read `X-Forwarded-For`; use the socket address on the request". **The Next.js App Router exposes no socket**: a
+> route handler gets a plain `Request`, and `NextRequest.ip` was removed in Next 15. So under the App Router, `0` makes the tunnel
+> derive **no IP for any event**, and the default rate-limit key falls back to one shared bucket for every client. That is safe (no
+> event is stored under a wrong address), but it turns the feature off. Next's own server fills `X-Forwarded-For` from the socket
+> only when the request carries none, and keeps a client-sent header as it is. So with **no** proxy in front of the app, no hop count
+> is trustworthy: `1` would store an address the client can choose. To get a real IP there, put a proxy that appends
+> `X-Forwarded-For` in front of the app and count it, or pass a `clientKey` that reads an address you trust.
+
 ## v0.1.2 — Index maps upload
 
 ```sh

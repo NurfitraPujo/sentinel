@@ -7,7 +7,8 @@
 // Shuffle-safe: every test builds its own handler; the env is stubbed per test and restored.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createSentinelRouteHandler, isCrossSiteRequest, normaliseBody } from '../../src/nextjs/route.js';
+import { storeOf } from '../../src/nextjs/rate-limit.js';
+import { applyClientIp, canonicalIp, createSentinelRouteHandler, isCrossSiteRequest, normaliseBody } from '../../src/nextjs/route.js';
 import { ENDPOINT, envelope, freshRoute, ITEM, KEY, PROJECT_KEY, request, stubUpstream, type Upstream } from './helpers.js';
 
 let upstream: Upstream;
@@ -568,9 +569,13 @@ describe('the step order (contract §4.5): each step answers before the next is 
 });
 
 describe('what the route never does (contract §4.5)', () => {
-  it('no client header reaches the upstream in any forwarded row — not Cookie, Authorization, X-Forwarded-For, traceparent, Host or Origin', async () => {
+  it('no client header but the User-Agent reaches the upstream in any forwarded row — not Cookie, Authorization, X-Forwarded-For, traceparent, Host, Origin or an inbound x-sentinel-derive-ip; the marker is always off', async () => {
     const { POST } = createSentinelRouteHandler();
     const client = {
+      'x-real-ip': '6.6.6.6',
+      forwarded: 'for=6.6.6.6',
+      'x-client-ip': '6.6.6.6',
+      'x-sentinel-derive-ip': 'on',
       cookie: 'session=abc',
       authorization: 'Bearer user-token',
       'x-forwarded-for': '203.0.113.9, 10.0.0.1',
@@ -588,7 +593,10 @@ describe('what the route never does (contract §4.5)', () => {
     for (const row of rows) await POST(row);
     expect(upstream.calls).toHaveLength(rows.length);
     for (const call of upstream.calls) {
-      expect(Object.keys(call.headers).sort()).toEqual(['content-type', 'x-api-key', 'x-project-key']);
+      expect(Object.keys(call.headers).sort()).toEqual(['content-type', 'user-agent', 'x-api-key', 'x-project-key', 'x-sentinel-derive-ip']);
+      expect(call.headers['user-agent']).toBe('browser/1');
+      expect(call.headers['x-sentinel-derive-ip']).toBe('off');
+      expect(call.headers).not.toHaveProperty('x-forwarded-for');
     }
   });
 
@@ -646,5 +654,205 @@ describe('what the route never does (contract §4.5)', () => {
     const { POST } = createSentinelRouteHandler();
     await POST(request({ headers: { host: 'localhost:3001', 'x-forwarded-host': 'localhost:3001' }, body: JSON.stringify([{ ...ITEM, endpoint: 'http://evil.example' }]) }));
     expect(upstream.calls.map((c) => c.url)).toEqual([`${ENDPOINT}/batch`]);
+  });
+});
+
+// ---- sentinel-event-enrichment TASK-06 (spec §4.2-§4.5): the browser's IP, derived from the rightmost trusted
+// X-Forwarded-For hop, is written into every forwarded item's user.ip_address; `user` is rebuilt from an exact-key
+// allow-list; the forward carries the browser's user-agent and x-sentinel-derive-ip: off, and never X-Forwarded-For.
+
+const IP = '198.51.100.23';
+
+async function forwardedItems(xff: string | null, opts: Parameters<typeof createSentinelRouteHandler>[0] = {}, body?: unknown, extra: Record<string, unknown> = {}): Promise<Record<string, unknown>[]> {
+  const { POST } = createSentinelRouteHandler({ rateLimit: false, ...opts });
+  const req = Object.assign(request({ headers: { 'x-forwarded-for': xff }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }), extra);
+  const res = await POST(req);
+  expect(res.status).toBe(202);
+  const call = upstream.calls.at(-1);
+  return call?.items as Record<string, unknown>[];
+}
+
+describe('TASK-06: the client IP derivation, observed in the forwarded body (spec §4.2, §4.5)', () => {
+  it('x-forwarded-for: 6.6.6.6, 198.51.100.23 → every item carries user.ip_address 198.51.100.23 — never 6.6.6.6, never the inbound string', async () => {
+    const items = await forwardedItems('6.6.6.6, 198.51.100.23', {}, [ITEM, { ...ITEM, event_id: 'b' }, { ...ITEM, event_id: 'c' }]);
+    expect(items).toHaveLength(3);
+    for (const item of items) expect(item.user).toEqual({ ip_address: IP });
+    expect(upstream.calls[0]?.body).not.toContain('6.6.6.6');
+  });
+
+  it('trustedProxyHops: 2 over "6.6.6.6, 198.51.100.23, 10.0.0.1" → 198.51.100.23; ", 1.2.3.4" → 1.2.3.4; an out-of-range hop count → no user', async () => {
+    expect((await forwardedItems('6.6.6.6, 198.51.100.23, 10.0.0.1', { trustedProxyHops: 2 }))[0]?.user).toEqual({ ip_address: IP });
+    expect((await forwardedItems(', 1.2.3.4'))[0]?.user).toEqual({ ip_address: '1.2.3.4' });
+    expect((await forwardedItems(IP, { trustedProxyHops: 3 }))[0]).not.toHaveProperty('user');
+  });
+
+  it('canonical form: a trailing space is trimmed; ::FFFF:C633:6417 and ::ffff:198.51.100.23 unmap to 198.51.100.23; 2001:DB8::1 → 2001:db8::1', async () => {
+    expect((await forwardedItems(`${IP} `))[0]?.user).toEqual({ ip_address: IP });
+    expect((await forwardedItems('::FFFF:C633:6417'))[0]?.user).toEqual({ ip_address: IP });
+    expect((await forwardedItems('::ffff:198.51.100.23'))[0]?.user).toEqual({ ip_address: IP });
+    expect((await forwardedItems('2001:DB8::1'))[0]?.user).toEqual({ ip_address: '2001:db8::1' });
+  });
+
+  it('non-IP hops give no user: a hostname, a zone, brackets, a port, and ::1]@6.6.6.6:80/?[ (which must never yield 6.6.6.6)', async () => {
+    for (const hop of ['evil.example', 'fe80::1%eth0', '[2001:db8::1]', '2001:db8::1]:80', '::1]@6.6.6.6:80/?[', '198.51.100.23:443', '01.2.3.4', '256.1.1.1']) {
+      const items = await forwardedItems(`6.6.6.6, ${hop}`);
+      expect(items[0], hop).not.toHaveProperty('user');
+    }
+    expect(upstream.calls.map((c) => c.body).join('')).not.toContain('6.6.6.6');
+  });
+
+  it('trustedProxyHops: 0 with a plain Request (no ip, no socket: the Next App Router shape) → no user on any item, and the shared bucket', async () => {
+    const items = await forwardedItems('6.6.6.6', { trustedProxyHops: 0 }, [ITEM, { ...ITEM, event_id: 'b' }]);
+    for (const item of items) expect(item).not.toHaveProperty('user');
+  });
+
+  it('trustedProxyHops: 0 on a runtime that exposes the socket (NOT the Next path) → the socket address, and the header is still ignored', async () => {
+    const items = await forwardedItems('6.6.6.6', { trustedProxyHops: 0 }, undefined, { socket: { remoteAddress: '203.0.113.9' } });
+    expect(items[0]?.user).toEqual({ ip_address: '203.0.113.9' });
+  });
+
+  it('no header and no socket → no user; a bad trustedProxyHops falls back to 1 with one warn', async () => {
+    expect((await forwardedItems(null))[0]).not.toHaveProperty('user');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const route = await freshRoute();
+    for (const bad of [-1, 1.5, NaN, '2' as unknown as number]) route.createSentinelRouteHandler({ trustedProxyHops: bad });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('trustedProxyHops');
+    const { POST } = route.createSentinelRouteHandler({ trustedProxyHops: -1, rateLimit: false });
+    await POST(request({ headers: { 'x-forwarded-for': `6.6.6.6, ${IP}` } }));
+    expect((upstream.calls.at(-1)?.items as Record<string, unknown>[])[0]?.user).toEqual({ ip_address: IP });
+  });
+});
+
+describe('TASK-06: canonicalIp, its IPv6 character guard proven on its own (enr-code-canonicalip-guards-individually-unproven)', () => {
+  it('the character pre-filter rejects an entry the WHATWG parser would repair: an embedded tab, LF or CR', () => {
+    // new URL() deletes ASCII tab and newline anywhere in its input, so without the filter each of these
+    // canonicalises to a clean address its author never wrote.
+    for (const hop of ['2001:db8::\t1', '::\n1', '::ffff:198.51.\r100.23']) {
+      expect(canonicalIp(hop), JSON.stringify(hop)).toBeNull();
+    }
+  });
+
+  it('the character pre-filter alone stops ::1]@6.6.6.6:80/?[ from parsing as host 6.6.6.6', () => {
+    expect(canonicalIp('::1]@6.6.6.6:80/?[')).toBeNull();
+    expect(canonicalIp('::1]@[2001:db8::66]')).toBeNull();
+  });
+
+  it('a real IPv6 entry still canonicalises: lower case, and an IPv4-mapped one unmapped', () => {
+    expect(canonicalIp(' 2001:DB8:0::1 ')).toBe('2001:db8::1');
+    expect(canonicalIp('::FFFF:C633:6417')).toBe('198.51.100.23');
+    expect(canonicalIp('::ffff:198.51.100.23')).toBe('198.51.100.23');
+  });
+});
+
+describe('TASK-06: applyClientIp rebuilds user from the exact-key allow-list (spec §4.4, B1-B5)', () => {
+  const run = (user: unknown, ip: string | null): Record<string, unknown> => {
+    const item: Record<string, unknown> = { event_id: 'e', platform: 'javascript' };
+    if (user !== undefined) item.user = user;
+    applyClientIp([item], ip);
+    return item;
+  };
+  const base = { event_id: 'e', platform: 'javascript' };
+
+  it('B2: a browser-sent ip_address is overwritten; id is carried; {{auto}} is replaced', () => {
+    expect(run({ ip_address: '6.6.6.6', id: 'u1' }, IP)).toEqual({ ...base, user: { id: 'u1', ip_address: IP } });
+    expect(run({ ip_address: '{{auto}}' }, IP)).toEqual({ ...base, user: { ip_address: IP } });
+  });
+
+  it('B2: keys Go folds to ip_address never survive — IP_ADDRESS beside ip_address (either filled), Ip_Address, ip_addreſſ', () => {
+    expect(run({ ip_address: '6.6.6.6', IP_ADDRESS: '6.6.6.6' }, IP)).toEqual({ ...base, user: { ip_address: IP } });
+    expect(run({ ip_address: '', IP_ADDRESS: '6.6.6.6' }, IP)).toEqual({ ...base, user: { ip_address: IP } });
+    expect(run({ Ip_Address: '6.6.6.6' }, IP)).toEqual({ ...base, user: { ip_address: IP } });
+    expect(run({ 'ip_addreſſ': '6.6.6.6' }, IP)).toEqual({ ...base, user: { ip_address: IP } });
+  });
+
+  it('B2: a browser-sent geo is dropped in every spelling', () => {
+    expect(run({ id: 'u1', geo: { country_code: 'XX', city: 'Fake' } }, IP)).toEqual({ ...base, user: { id: 'u1', ip_address: IP } });
+    expect(run({ id: 'u1', GEO: { country_code: 'XX' } }, IP)).toEqual({ ...base, user: { id: 'u1', ip_address: IP } });
+  });
+
+  it('B2: only exact allow-listed names with string values are copied', () => {
+    expect(run({ id: 'u1', ID: 'u2', Username: 'n', email: 5, extra: 'x' }, IP)).toEqual({ ...base, user: { id: 'u1', ip_address: IP } });
+    expect(JSON.parse('{"__proto__":{"ip_address":"6.6.6.6"},"id":"u1"}')).toHaveProperty('__proto__');
+    expect(run(JSON.parse('{"__proto__":{"ip_address":"6.6.6.6"},"id":"u1"}'), IP)).toEqual({ ...base, user: { id: 'u1', ip_address: IP } });
+  });
+
+  it('B2: the serialised user keys are in the order id, username, email, ip_address', () => {
+    const item = run({ ip_address: '6.6.6.6', email: 'a@b.c', username: 'n', id: 'u1' }, IP);
+    expect(JSON.stringify(item.user)).toBe(`{"id":"u1","username":"n","email":"a@b.c","ip_address":"${IP}"}`);
+  });
+
+  it('B1: no user, or user: null → { ip_address }; B3: a non-object user is left as it is', () => {
+    expect(run(undefined, IP)).toEqual({ ...base, user: { ip_address: IP } });
+    expect(run(null, IP)).toEqual({ ...base, user: { ip_address: IP } });
+    expect(run('x', IP)).toEqual({ ...base, user: 'x' });
+    expect(run(['x'], IP)).toEqual({ ...base, user: ['x'] });
+  });
+
+  it('B4: with no IP a plain-object user is rebuilt with no ip_address in any spelling; B5: no user stays absent', () => {
+    expect(run({ ip_address: '6.6.6.6', id: 'u1' }, null)).toEqual({ ...base, user: { id: 'u1' } });
+    expect(run({ Ip_Address: '6.6.6.6' }, null)).toEqual({ ...base, user: {} });
+    expect(run({ 'ip_addreſſ': '6.6.6.6' }, null)).toEqual({ ...base, user: {} });
+    expect(run({ IP_ADDRESS: '6.6.6.6', GEO: {} }, null)).toEqual({ ...base, user: {} });
+    expect(run(undefined, null)).toEqual(base);
+    expect(run(null, null)).toEqual({ ...base, user: null });
+  });
+});
+
+describe('TASK-06: through the route — overwrite, the top-level filter, clientKey (spec §4.5)', () => {
+  it('an inbound user.ip_address is never forwarded: with a derivable IP the item carries the derived one; with none, no user at all', async () => {
+    // ITEM_KEYS removes `user` today (T10), so the item arrives at applyClientIp with none (B1 / B5).
+    expect((await forwardedItems(IP, {}, [{ ...ITEM, user: { ip_address: '6.6.6.6' } }]))[0]?.user).toEqual({ ip_address: IP });
+    expect((await forwardedItems(null, {}, [{ ...ITEM, user: { ip_address: '6.6.6.6' } }]))[0]).not.toHaveProperty('user');
+  });
+
+  it('USER (or any key only case-folding to an ITEM_KEYS name) never reaches the forward', async () => {
+    const items = await forwardedItems(IP, {}, [{ ...ITEM, user: { ip_address: '6.6.6.6' }, USER: { ip_address: '6.6.6.6' }, Platform: 'x' }]);
+    expect(Object.keys(items[0] as object).sort()).toEqual([...Object.keys(ITEM), 'user'].sort());
+    expect(upstream.calls.at(-1)?.body).not.toContain('6.6.6.6');
+  });
+
+  it('clientKey returning 10.0.0.7 writes 10.0.0.7; one returning a non-IP writes no IP but still keys the bucket on it; a throwing one writes no IP', async () => {
+    expect((await forwardedItems('6.6.6.6', { clientKey: () => '10.0.0.7' }))[0]?.user).toEqual({ ip_address: '10.0.0.7' });
+    const { POST } = createSentinelRouteHandler({ clientKey: () => 'bucket-a' });
+    await POST(request({ headers: { 'x-forwarded-for': IP } }));
+    expect((upstream.calls.at(-1)?.items as Record<string, unknown>[])[0]).not.toHaveProperty('user');
+    expect(storeOf.get(POST)?.has('bucket-a')).toBe(true);
+    vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    expect(
+      (
+        await forwardedItems(IP, {
+          clientKey: () => {
+            throw new Error('x');
+          },
+        })
+      )[0],
+    ).not.toHaveProperty('user');
+  });
+});
+
+describe('TASK-06: the forward’s header set (spec §4.4)', () => {
+  it('headers ⊆ {content-type, x-api-key, x-project-key, user-agent, x-sentinel-derive-ip}; x-forwarded-for never, derived IP or not; the marker off on every forward', async () => {
+    const { POST } = createSentinelRouteHandler({ rateLimit: false });
+    await POST(request({ headers: { 'x-forwarded-for': `6.6.6.6, ${IP}`, 'user-agent': 'Mozilla/5.0 test' } }));
+    await POST(request({ headers: { 'x-forwarded-for': null, 'user-agent': 'Mozilla/5.0 test', 'x-sentinel-derive-ip': 'on' } }));
+    await POST(request({ headers: { 'x-forwarded-for': 'evil.example', 'user-agent': null } }));
+    const allowed = ['content-type', 'user-agent', 'x-api-key', 'x-project-key', 'x-sentinel-derive-ip'];
+    for (const call of upstream.calls) {
+      for (const name of Object.keys(call.headers)) expect(allowed).toContain(name);
+      expect(call.headers).not.toHaveProperty('x-forwarded-for');
+      expect(call.headers['x-sentinel-derive-ip']).toBe('off');
+    }
+    expect(upstream.calls[0]?.headers['user-agent']).toBe('Mozilla/5.0 test');
+    expect(upstream.calls[1]?.headers['user-agent']).toBe('Mozilla/5.0 test');
+    expect(upstream.calls[2]?.headers).not.toHaveProperty('user-agent');
+  });
+
+  it('a 1025-byte user-agent is not forwarded; 1024 bytes is', async () => {
+    const { POST } = createSentinelRouteHandler({ rateLimit: false });
+    await POST(request({ headers: { 'user-agent': 'a'.repeat(1025) } }));
+    await POST(request({ headers: { 'user-agent': 'a'.repeat(1024) } }));
+    expect(upstream.calls[0]?.headers).not.toHaveProperty('user-agent');
+    expect(upstream.calls[1]?.headers['user-agent']).toBe('a'.repeat(1024));
   });
 });

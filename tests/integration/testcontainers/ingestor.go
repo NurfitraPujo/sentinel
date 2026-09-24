@@ -130,6 +130,14 @@ func fetchLogs(ctx context.Context, container testcontainers.Container) string {
 // test's project id leak into this run within the TTL window, producing
 // "project not found" failures that have nothing to do with auth.
 func StartIngestor(ctx context.Context, pgHost, pgPort, pgUser, pgPassword, pgDB, natsURL, redisAddr string) (*IngestorContainer, error) {
+	return StartIngestorWithEnv(ctx, pgHost, pgPort, pgUser, pgPassword, pgDB, natsURL, redisAddr, nil)
+}
+
+// StartIngestorWithEnv is StartIngestor with extra container environment (sentinel-event-enrichment spec
+// §10.2): TRUSTED_PROXY_CIDRS, GEOIP_* and the like, for a second ingestor configured differently from
+// the suite's shared one. extraEnv is applied over the base environment above; every other rule of
+// StartIngestor (private port, mandatory isolated redis, health on OUR port) holds unchanged.
+func StartIngestorWithEnv(ctx context.Context, pgHost, pgPort, pgUser, pgPassword, pgDB, natsURL, redisAddr string, extraEnv map[string]string) (*IngestorContainer, error) {
 	provider := ConfigureProvider()
 
 	if redisAddr == "" {
@@ -142,27 +150,32 @@ func StartIngestor(ctx context.Context, pgHost, pgPort, pgUser, pgPassword, pgDB
 	}
 	portStr := strconv.Itoa(port)
 
-	fmt.Printf("Starting ingestor with pgHost=%s, pgPort=%s, natsURL=%s, redisAddr=%s, port=%s\n", pgHost, pgPort, natsURL, redisAddr, portStr)
+	fmt.Printf("Starting ingestor with pgHost=%s, pgPort=%s, natsURL=%s, redisAddr=%s, port=%s, extraEnv=%v\n", pgHost, pgPort, natsURL, redisAddr, portStr, extraEnv)
+
+	env := map[string]string{
+		"POSTGRES_HOST":     pgHost,
+		"POSTGRES_PORT":     pgPort,
+		"POSTGRES_USER":     pgUser,
+		"POSTGRES_PASSWORD": pgPassword,
+		"POSTGRES_DB":       pgDB,
+		"NATS_URL":          natsURL,
+		// Must be the isolated redis testcontainer's address — see the
+		// redisAddr doc above for why this cannot be left to default.
+		"REDIS_ADDR": redisAddr,
+		// PORT exists precisely so a second, standalone ingestor can run
+		// alongside the compose one without a port clash — see
+		// apps/ingestor-go/main.go's getEnv("PORT", "8080") handling.
+		"PORT": portStr,
+	}
+	for k, v := range extraEnv {
+		env[k] = v
+	}
 
 	req := testcontainers.GenericContainerRequest{
 		ProviderType: provider,
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image: "localhost/sentinel_ingestor:latest",
-			Env: map[string]string{
-				"POSTGRES_HOST":     pgHost,
-				"POSTGRES_PORT":     pgPort,
-				"POSTGRES_USER":     pgUser,
-				"POSTGRES_PASSWORD": pgPassword,
-				"POSTGRES_DB":       pgDB,
-				"NATS_URL":          natsURL,
-				// Must be the isolated redis testcontainer's address — see the
-				// redisAddr doc above for why this cannot be left to default.
-				"REDIS_ADDR": redisAddr,
-				// PORT exists precisely so a second, standalone ingestor can run
-				// alongside the compose one without a port clash — see
-				// apps/ingestor-go/main.go's getEnv("PORT", "8080") handling.
-				"PORT": portStr,
-			},
+			Image:        "localhost/sentinel_ingestor:latest",
+			Env:          env,
 			ExposedPorts: []string{portStr + "/tcp"},
 			// Use host network mode so container can reach host ports.
 			NetworkMode: "host",
