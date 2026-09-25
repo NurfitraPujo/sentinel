@@ -90,6 +90,7 @@
 	}
 
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
+	import IssueTagFacets from '$lib/components/issues/IssueTagFacets.svelte';
 	import TrendBarChart from '$lib/components/issues/TrendBarChart.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
 
@@ -578,6 +579,9 @@
 			/>
 		</div>
 	</section>
+
+	<!-- sentinel-issue-tag-facets §7.1: the tag distribution, between the trend and the relations. -->
+	<IssueTagFacets facets={data.tagFacets ?? []} />
 
 	<IssueRelations
 		currentIssueId={data.issue.id}

@@ -220,7 +220,11 @@ tasks:
         cmds:
             - docker build -t localhost/sentinel_ingestor:latest -f apps/ingestor-go/Dockerfile .
             - docker build -t localhost/sentinel_processor:latest -f apps/processor-go/Dockerfile .
-            - go test ./tests/integration/... -v -count=1 -timeout 15m
+            # sentinel-issue-tag-facets §10.1 (decision 5) + tfr-gate-dashboard-proofs-never-run: runs the Go
+            # integration suite AND the dashboard's real-Postgres tag-facets suites (TAG_FACETS_INTEGRATION_REQUIRED=1
+            # so they cannot skip) INDEPENDENTLY, aggregating both exit codes, so a pre-existing Go failure can
+            # never again stop the dashboard proofs from running. tests/unit/tag_facets_gate_test.go asserts this.
+            - ./scripts/test-integration-gate.sh
 
     test-load:
         desc: Run load tests

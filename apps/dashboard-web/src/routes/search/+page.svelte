@@ -32,12 +32,27 @@
 		(data as typeof data & { environments?: EnvironmentOption[] }).environments ?? []
 	);
 
-	function buildSearchUrl(params: Record<string, string | undefined>): string {
+	// sentinel-issue-tag-facets §6.7: the active tag filters (from `tag` parameters and `key:value` box
+	// tokens), each with its formatTagParam string and a link to the same search without it.
+	interface ActiveTag {
+		key: string;
+		value: string;
+		param: string;
+		removeHref: string;
+	}
+	let activeTags = $derived(((data.filters as { tags?: ActiveTag[] }).tags ?? []) as ActiveTag[]);
+	let ignoredTagTerms = $derived(((data as { ignoredTagTerms?: string[] }).ignoredTagTerms ?? []) as string[]);
+
+	function buildSearchUrl(params: Record<string, unknown>): string {
 		const searchParams = new URLSearchParams();
 		for (const [key, value] of Object.entries(params)) {
-			if (value) {
+			if (typeof value === 'string' && value) {
 				searchParams.set(key, value);
 			}
+		}
+		// Every active tag rides along, so paging keeps them (one `tag` entry each).
+		for (const tag of activeTags) {
+			searchParams.append('tag', tag.param);
 		}
 		searchParams.set('page', '1');
 		return `/search?${searchParams.toString()}`;
@@ -47,7 +62,7 @@
 <div class="search-page">
 	<header class="search-header">
 		<h1>Advanced Error Search</h1>
-		<p class="subtitle">Search across user_id, trace_id, span_id, request_id, and full-text message search</p>
+		<p class="subtitle">Search across user_id, trace_id, span_id, request_id, <code>key:value</code> tags (e.g. <code>device.model:SM-A115F</code>), and full-text message search</p>
 	</header>
 
 	<aside class="search-filters">
@@ -57,8 +72,12 @@
 				
 				<label>
 					<span>Search Message</span>
-					<input type="text" name="search" value={data.filters.search || ''} placeholder="e.g., connection refused" />
+					<input type="text" name="search" value={data.filters.search || ''} placeholder="e.g., connection refused release:1.2" />
 				</label>
+				<!-- Every active tag filter is carried on the form; tags ANDed with everything else. -->
+				{#each activeTags as tag (tag.param)}
+					<input type="hidden" name="tag" value={tag.param} />
+				{/each}
 			</div>
 
 			<div class="filter-section">
@@ -150,7 +169,20 @@
 	</aside>
 
 	<main class="search-results">
-		{#if data.filters.search || data.filters.userId || data.filters.tenantId || data.filters.traceId || data.filters.spanId || data.filters.requestId}
+		{#if activeTags.length > 0 || ignoredTagTerms.length > 0}
+			<div class="tag-chips" data-testid="search-tag-chips">
+				{#each activeTags as tag (tag.param)}
+					<span class="tag-chip" data-testid="search-tag-chip">
+						<span class="tag-chip-text">{tag.key}: {tag.value}</span>
+						<a class="tag-chip-remove" href={tag.removeHref} aria-label="Remove filter {tag.key}: {tag.value}">×</a>
+					</span>
+				{/each}
+				{#if ignoredTagTerms.length > 0}
+					<p class="ignored-terms" data-testid="search-ignored-terms">Ignored: {ignoredTagTerms.join(', ')}</p>
+				{/if}
+			</div>
+		{/if}
+		{#if data.filters.search || data.filters.userId || data.filters.tenantId || data.filters.traceId || data.filters.spanId || data.filters.requestId || activeTags.length > 0}
 			<div class="results-header">
 				<span class="results-count">{data.pagination.total.toLocaleString()} results</span>
 				{#if data.pagination.total > 0}
@@ -238,6 +270,51 @@
 </div>
 
 <style>
+	.tag-chips {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+	}
+
+	.tag-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		max-width: 100%;
+		padding: 0.25rem 0.5rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		background: var(--bg-surface);
+		font-family: var(--font-mono);
+		font-size: 0.8125rem;
+		color: var(--text-primary);
+	}
+
+	.tag-chip-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.tag-chip-remove {
+		color: var(--text-muted);
+		text-decoration: none;
+	}
+
+	.tag-chip-remove:hover,
+	.tag-chip-remove:focus-visible {
+		color: var(--text-primary);
+	}
+
+	.ignored-terms {
+		width: 100%;
+		margin: 0;
+		font-size: 0.75rem;
+		color: var(--text-muted);
+	}
+
 	.search-page {
 		display: grid;
 		grid-template-columns: 280px 1fr;

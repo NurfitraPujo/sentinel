@@ -690,7 +690,7 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 // Deadlock-freedom depends on this transaction acquiring its ONE contended lock (the issues row, via
 // ON CONFLICT DO UPDATE / the plain UPDATE) FIRST and holding it to commit — do not add audit
 // persistence, indexing, or any network I/O inside this transaction; move it after commit instead
-// (D-d). Four writes are the DELIBERATE exceptions to that sentence, and all four were added knowing it:
+// (D-d). Five writes are the DELIBERATE exceptions to that sentence, and all five were added knowing it:
 //
 //   - the registry touch of step 5 (sentinel-project-environments decision 9) — the first exception,
 //     best-effort behind a savepoint; see its own block comment below.
@@ -731,6 +731,20 @@ func (s *pgStore) UpsertIssueWithOutcome(ctx context.Context, issue *Issue, rele
 //     row — every occurrence of a project on its current release rewrites one releases row, the
 //     same cardinality as the project_environments row step 5 already rewrites; sentinel-releases-
 //     snooze §13 M1 reports it.
+//   - the tag rollup of sentinel-issue-tag-facets (issue_tag_values), written by the
+//     error_occurrences triggers when step 2's INSERT stores a row — the FIFTH deliberate exception, a
+//     first-class fact like the second to fourth. Exact counts are the contract's criterion, and after
+//     commit a NAK between the occurrence commit and the rollup write would lose the count or, on
+//     retry, find the occurrence deduplicated and never count it; inside, both land or neither does.
+//     It is written by triggers, not by this method, so that every pod version counts (the backfill's
+//     boundary, sentinel-issue-tag-facets spec §4.3); a duplicate that ON CONFLICT DO NOTHING skips
+//     fires nothing, and a rollback takes the trigger's work with it. The "one lock" property survives:
+//     the triggers re-assert the issues row lock (FOR NO KEY UPDATE, a no-op here, where step 1 already
+//     holds it) before they touch a rollup row, and every other writer of issue_tag_values and every
+//     deleter of occurrences (the retention sweep, the backfill) takes the issues rows first, in id
+//     order, so the order is issues → occurrence rows → issue_tag_values on every path and no cycle is
+//     possible. Cost, stated: +0.87 ms per stored occurrence on the hottest issue and one HOT row
+//     version per contributed pair (spec §3.5).
 //
 // The IssueOutcome return is the class of the row's status AFTER the write (sentinel-releases-snooze
 // decision 29) and the service reads it: New from `inserted` (xmax = 0) on the upsert; Regressed

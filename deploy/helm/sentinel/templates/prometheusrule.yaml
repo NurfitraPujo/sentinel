@@ -173,4 +173,60 @@ spec:
               POST /api/sourcemaps returned 503 storage_unavailable: putObject failed mid-request,
               no rows were written, and objects already put are orphans. The release deployed
               without maps unless CI failed on the 503. Contract sentinel-sourcemaps §4.1/§12.
+    {{- if .Values.retentionCron.enabled }}
+
+    # sentinel-issue-tag-facets §5 "The standing signal" — DORMANT where the other groups are: it renders
+    # only under prometheusRule.enabled, which production keeps false, and nothing consumes Sentinel's
+    # rule groups until the "Load Sentinel rule groups into the live Prometheus" card lands. Until then
+    # the RUNBOOK's hand-read of sentinel_retention_runs_total on each dashboard replica's /api/metrics,
+    # together with the retention Job list, stands in for it.
+    #
+    # sentinel_retention_runs_total{outcome} is incremented once per authorised POST /api/cron/retention
+    # (apps/dashboard-web/src/lib/server/metrics.ts RETENTION_RUN_OUTCOME). Summed across the dashboard
+    # replicas, increase() absorbing a restart, as every rule in this file.
+    - name: sentinel-retention
+      rules:
+        # A holder of the route lock older than any live run can be: a dead or wedged dashboard process,
+        # or a session that is not a run. Occurrence deletion AND every reaper on the route are stopped
+        # until `pg_terminate_backend(<holderPid>)` (RUNBOOK "retention_cron.lock_stale").
+        - alert: SentinelRetentionLockStale
+          expr: sum(increase(sentinel_retention_runs_total{outcome="lock_stale"}[{{ .Values.prometheusRule.retentionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionLockStale }}
+          annotations:
+            summary: "The retention route lock is held by a dead or wedged session"
+            description: >-
+              POST /api/cron/retention answered 503 retention_lock_stale: the route's advisory lock is
+              held past the stale bound. Retention and the reapers on the route are stopped until the
+              holder goes. See RUNBOOK.md (retention_cron.lock_stale).
+
+        - alert: SentinelRetentionRunFailing
+          expr: sum(increase(sentinel_retention_runs_total{outcome=~"deadline_exceeded|connection_lost|failed"}[{{ .Values.prometheusRule.retentionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionFailing }}
+          annotations:
+            summary: "Retention runs are failing"
+            description: >-
+              A retention run reached its deadline (usually a session holding rows a step needs), lost
+              its connection, or failed. The next hourly run continues from the oldest row. See
+              RUNBOOK.md (retention_cron.deadline_exceeded / connection_lost).
+
+        # Three hourly runs in a row did not complete: a Job that never reached the route (the dashboard
+        # down, a wrong CRON_SECRET), failures, or runs that finished `behind` (occurrence deletion
+        # stopped early). The `or vector(0)` makes it fire when no dashboard series was scraped at all,
+        # the very state it names; a present series is unaffected.
+        - alert: SentinelRetentionNotCompleting
+          expr: (sum(increase(sentinel_retention_runs_total{outcome="completed"}[{{ .Values.prometheusRule.retentionStalledWindow }}])) or vector(0)) == 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionNotCompleting }}
+          annotations:
+            summary: "Retention has not completed a run in three hours"
+            description: >-
+              No POST /api/cron/retention ended `completed` in the window: Jobs are failing before the
+              route, runs are failing, or runs finish `behind` (occurrence deletion stopped early). Read
+              the retention_cron.* lines and the retention Job list. See RUNBOOK.md.
+    {{- end }}
 {{- end }}

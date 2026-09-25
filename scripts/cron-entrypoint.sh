@@ -34,7 +34,7 @@ set -eu
 RETENTION_ENABLED="${RETENTION_CRON_ENABLED:-false}"
 RETENTION_INTERVAL_SECONDS="${RETENTION_CRON_INTERVAL_SECONDS:-3600}"
 RETENTION_TARGET_URL="${RETENTION_CRON_URL:-http://dashboard:3000/api/cron/retention}"
-RETENTION_TIMEOUT_SECONDS="${RETENTION_CRON_TIMEOUT_SECONDS:-30}"
+RETENTION_TIMEOUT_SECONDS="${RETENTION_CRON_TIMEOUT_SECONDS:-180}"
 
 # §4.4b: "This one runs every minute." 60s is the contract's interval, not a tuning default that
 # happens to be small — a sweep interval above ESCALATION_ACK_MINUTES makes the deadline meaningless.

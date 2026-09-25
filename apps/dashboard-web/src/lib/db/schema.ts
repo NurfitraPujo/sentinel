@@ -499,6 +499,11 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	breadcrumbs: jsonb('breadcrumbs'),
 	exception: jsonb('exception'),
 	createdAt: timestamp('created_at').defaultNow(),
+	// sentinel-issue-tag-facets §3.6 (the *_add_issue_tag_values.sql migration): the "counted at insert"
+	// marker. Nullable, no default: rows stored before that migration are NULL and are counted by the
+	// backfill; the BEFORE INSERT trigger sets TRUE on every row inserted since, whatever the insert names.
+	// No dashboard code reads or writes it (the agent API projects occurrence columns explicitly).
+	tagRollupApplied: boolean('tag_rollup_applied'),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),
 	// 1725200000: partial unique index on (project_id, event_id), built CONCURRENTLY by the migration.
@@ -514,6 +519,52 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	// REPORT_MATCH_WINDOW_MINUTES of the report. The release-keyed index above cannot serve that scan.
 	idxOccurrencesIssueCreated: index('idx_occurrences_issue_created').on(table.issueId, table.createdAt),
 }));
+
+// sentinel-issue-tag-facets §3.1 / §8.5: the per-issue tag rollup. WRITTEN ONLY BY THE error_occurrences
+// TRIGGERS the migration creates (every insert, delete, update and truncate of an occurrence keeps it exact
+// inside the same transaction); no dashboard code may insert, update or delete it. The panel and /search
+// read it. `value = ''` is the overflow row ("Other"): past 1000 named values per (issue, key) the rest are
+// counted there. first_seen / last_seen are BOUNDS, not exact values: the least and greatest created_at
+// of the occurrences ADDED to the row since it was created; retention's subtraction does not move them, so
+// after retention first_seen may predate every surviving occurrence. Nothing displays them.
+export const issueTagValues = pgTable('issue_tag_values', {
+	issueId: uuid('issue_id').notNull().references(() => issues.id, { onDelete: 'cascade' }),
+	key: varchar('key', { length: 32 }).notNull(),
+	value: text('value').notNull(),
+	count: bigint('count', { mode: 'number' }).notNull(),
+	firstSeen: timestamp('first_seen', { withTimezone: true }).notNull(),
+	lastSeen: timestamp('last_seen', { withTimezone: true }).notNull(),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.issueId, table.key, table.value] }),
+	idxIssueTagValuesKeyValue: index('idx_issue_tag_values_key_value').on(table.key, table.value, table.issueId),
+}));
+
+// The backfill's one-row state (§4.2): read by nothing in the dashboard; mirrored because
+// schema-drift.test.ts compares every table.
+export const issueTagValuesBackfill = pgTable('issue_tag_values_backfill', {
+	singleton: boolean('singleton').primaryKey().default(true),
+	cursorId: uuid('cursor_id'),
+	done: boolean('done').notNull().default(false),
+	rowsCounted: bigint('rows_counted', { mode: 'number' }).notNull().default(0),
+	startedAt: timestamp('started_at', { withTimezone: true }),
+	finishedAt: timestamp('finished_at', { withTimezone: true }),
+	updatedAt: timestamp('updated_at', { withTimezone: true }),
+});
+
+// Repaired rollup drift (§3.4 W11), written by the triggers; the retention route reports it
+// (reported_at), rebuilds deferred issues (rebuilt_at) and hands the too-large ones to the operator
+// (operator_only_at). No FK, so a record outlives its issue. `id` is GENERATED ALWAYS AS IDENTITY in the
+// database (drizzle-orm 0.30 cannot declare identity), so no dashboard code inserts into it.
+export const issueTagValuesDrift = pgTable('issue_tag_values_drift', {
+	id: bigint('id', { mode: 'number' }).primaryKey(),
+	issueId: uuid('issue_id').notNull(),
+	contributions: bigint('contributions', { mode: 'number' }).notNull(),
+	source: text('source').notNull(),
+	detectedAt: timestamp('detected_at', { withTimezone: true }).notNull().defaultNow(),
+	reportedAt: timestamp('reported_at', { withTimezone: true }),
+	rebuiltAt: timestamp('rebuilt_at', { withTimezone: true }),
+	operatorOnlyAt: timestamp('operator_only_at', { withTimezone: true }),
+});
 
 export const errorSearchIndex = pgTable('error_search_index', {
 	occurrenceId: uuid('occurrence_id').primaryKey().references(() => errorOccurrences.id, { onDelete: 'cascade' }),

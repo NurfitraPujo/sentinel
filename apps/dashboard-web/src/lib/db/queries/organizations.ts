@@ -249,8 +249,9 @@ export async function reapExpiredInvitations(
  * this is hygiene rather than a security control — but an expired invitation still blocks
  * re-inviting the same address cleanly, and the table otherwise grows without bound.
  */
-export async function reapAllExpiredInvitations(): Promise<number> {
-  const deleted = await db
+// sentinel-issue-tag-facets §5 rule 3: the retention route passes its run's connection as `exec`.
+export async function reapAllExpiredInvitations(exec: typeof db = db): Promise<number> {
+  const deleted = await exec
     .delete(organizationInvitations)
     .where(
       and(

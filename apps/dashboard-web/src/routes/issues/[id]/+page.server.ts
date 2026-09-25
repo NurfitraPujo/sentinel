@@ -12,6 +12,7 @@ import { listPickerReleases, type PickerRelease } from '$lib/db/queries/releases
 import { getRetentionDays } from '$lib/server/retention-window';
 import { detailTrendWindow } from '$lib/server/trend-window';
 import { cleanOccurrenceRow } from '$lib/server/json-safe';
+import { buildTagFacets } from '$lib/tag-facets';
 
 // sentinel-occurrence-detail-panels §3.2: the shape of an occurrence id. Tested against the lower-cased
 // parameter, so a malformed value (S4) never reaches a query, where Postgres would answer 22P02 → 500.
@@ -88,6 +89,9 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	// and `daily` (30). The window is taken from one instant so the two headings agree on "now".
 	const { windowStart, windowEnd } = detailTrendWindow(new Date());
 	const trend = await issueQueries.trendForIssue(issueId, windowStart, windowEnd);
+	// sentinel-issue-tag-facets §7.1 — AFTER both access checks, ONE read of the issue_tag_values rollup
+	// (every row belongs to this issue, whose environment the checks above already passed).
+	const tagFacets = buildTagFacets(await issueQueries.getTagFacets(issueId));
 	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
 	// sentinel-occurrence-detail-panels §3.2: the selected occurrence, read AFTER both access checks
 	// above, so their errors and order are unchanged. `url?.` is binding: a loader test that builds its
@@ -159,6 +163,9 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// sentinel-issue-trend §4.2 — top level beside `issue`: `{ hourly: TrendPoint[24], daily:
 		// TrendPoint[30] }`, dense, oldest first, the last entry of each the current partial slot.
 		trend,
+		// sentinel-issue-tag-facets §7.1 — top level beside `trend`: the tag distribution blocks
+		// (`TagFacetBlock[]`), `[]` for an issue with no rollup rows (the panel then renders nothing).
+		tagFacets,
 		// sentinel-affected-users §4.2, decision 21 — top level beside `issue`, the same number `/`
 		// returns and the retention sweep uses: `Affected users (last {retentionDays} days)`. The two
 		// counts themselves need no loader change; `getIssueById` selects the whole row.

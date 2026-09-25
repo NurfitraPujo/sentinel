@@ -81,6 +81,12 @@ vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 const { cleanupRetainedData, bestEffortDeleteObjects } = await import('./retention');
 
+// sentinel-issue-tag-facets §5 rule 3 (plan addition A1): called without a run, cleanupRetainedData opens
+// its own per-run client, which this double does not provide. The harness passes a run over the same
+// queue-based `db`: no deadline, no caps, and no abort signal (so object deletes are called exactly as
+// before and the R6 assertions below are unchanged).
+const runOverMock = { db: dbMock, left: () => Number.POSITIVE_INFINITY, setCaps: () => {}, signal: undefined } as never;
+
 beforeEach(() => {
 	vi.clearAllMocks();
 	isStorageConfigured.mockReturnValue(true);
@@ -89,17 +95,16 @@ beforeEach(() => {
 
 describe('cleanupRetainedData attachment cleanup (R6)', () => {
 	it('deletes storage objects for both issue-attached and comment-attached files on retention delete', async () => {
-		// Call sequence inside cleanupRetainedData (the two §4.5 side-table transactions and the
-		// bucket delete's `execute` between 1 and 2 go through the pass-through `transaction` /
-		// `execute` stubs and never touch this queue):
-		// 1) delete errorOccurrences .returning()
+		// Call sequence inside cleanupRetainedData (the occurrence step's batched reads and the drift
+		// report -- sentinel-issue-tag-facets §5, raw `execute`s that find nothing here -- the two §4.5
+		// side-table transactions, the bucket delete's `execute` and the deferred-rebuild step go through
+		// the pass-through `transaction` / `execute` stubs and never touch this queue):
 		// 2) select candidate issues (+innerJoin projects) .where() (thenable)
 		// 3) select comment ids for those issues .where() (thenable)
 		// 4) select attachment storageKeys .where() (thenable)
 		// 5) delete issues .returning()
 		// 6) insert issueTombstones .values() (thenable) -- N8, for the actually-deleted issue
 		// 7) delete stale issueTombstones .returning() -- N8 prune
-		resultQueue.push([]); // 1: deleted occurrences
 		resultQueue.push([{ id: 'issue-1', projectId: 'p1', organizationId: 'o1', message: 'm', issueType: 'system_error', assigneeType: null, assignedTo: null }]); // 2: candidate rows
 		resultQueue.push([{ id: 'comment-1' }]); // 3: comment ids under issue-1
 		resultQueue.push([{ storageKey: 'org/1/issue-file' }, { storageKey: 'org/1/comment-file' }]); // 4
@@ -107,7 +112,7 @@ describe('cleanupRetainedData attachment cleanup (R6)', () => {
 		resultQueue.push([]); // 6: tombstone insert result (unused)
 		resultQueue.push([]); // 7: pruned tombstones
 
-		const result = await cleanupRetainedData(30);
+		const result = await cleanupRetainedData(30, 365, 30, runOverMock);
 
 		expect(result.deletedOrphanedIssues).toBe(1);
 		expect(deleteObject).toHaveBeenCalledWith('org/1/issue-file');
@@ -116,12 +121,11 @@ describe('cleanupRetainedData attachment cleanup (R6)', () => {
 	});
 
 	it('does not touch storage when there are no orphaned candidates', async () => {
-		resultQueue.push([]); // deleted occurrences
 		resultQueue.push([]); // no candidate issue ids (skips comment/attachment selects)
 		resultQueue.push([]); // deleted issues (delete's WHERE re-evaluates, still empty)
 		resultQueue.push([]); // pruned tombstones (N8; no insert since nothing was deleted)
 
-		await cleanupRetainedData(30);
+		await cleanupRetainedData(30, 365, 30, runOverMock);
 
 		expect(deleteObject).not.toHaveBeenCalled();
 	});

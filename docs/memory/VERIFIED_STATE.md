@@ -166,6 +166,32 @@ current picture of module boundaries.
 
 ## Resolved
 
+### `sentinel-issue-tag-facets` — tag rollup, backfill, retention, tag panel, `key:value` search; the proofs cannot skip (VERIFIED 2026-09-25, branch `NurfitraPujo/sentinel-issue-tag-facets-implementing.sentinel`)
+
+What runs, and what proved it (plan §4, `GOFLAGS=-p=2`, vitest capped at 2 workers):
+
+| Gate | Command | Result |
+|---|---|---|
+| G1 | `task build` | exit 0 (at `34b9812`) |
+| go-root | `env GOWORK=off go build ./... && env GOWORK=off go vet ./... && env GOWORK=off go test ./tests/unit/... -count=1` | exit 0 (at `34b9812`); `tests/integration` re-vetted in both workspace modes at `6ade7bf` |
+| go-migrations | `cd packages/db-migrations && env GOWORK=off go build ./... && env GOWORK=off go test ./... -count=1` | exit 0 |
+| G2 | `task test-unit`'s commands | Go unit 1260 passed, 0 skipped; dashboard 178 files passed, 31 skipped (DB suites, no DB on 5432); sdk-js 27 files / 491 passed; tunnel fixtures clean |
+| G4 | `pnpm build && pnpm check && pnpm test --sequence.shuffle` | build ok; 2096 files, 0 errors, 0 warnings; 2223 passed, 250 skipped |
+| G5 | `helm lint`; `helm template --show-only templates/tag-facets-backfill-cronjob.yaml` × {values, staging, production}; `enabled=false`; kube-linter × 2 overlays | every assertion holds; nothing renders when disabled; kube-linter clean |
+| G3 (Go) | `task test-integration` (`FORCE_TESTCONTAINERS=1`, no `SENTINEL_E2E`) at `6ade7bf` | **32/32 `TestTagFacets*` PASS, 0 skipped**; the package FAILs only on the two pre-existing `TestOncallWeekdayCheckReplayOverIsoRow` (expected 0, actual 7) and `TestIngestAndProcess` (`e2e_test.go:283`) |
+| G3 (dashboard) | `./scripts/test-dashboard-pg.sh` at `bcc2469` | migrated to `1725400000`; **Test Files 2 passed (2), Tests 34 passed (34)**, none skipped |
+
+The script ran on its own because `task` stops at the failing `go test` line: while those two pre-existing
+failures stand, `task test-integration` never reaches `./scripts/test-dashboard-pg.sh`.
+
+Found on the way, both worth knowing before trusting this suite:
+- **`tc.Setup(PostgresResource)` clobbers `POSTGRES_*` for the rest of the run** under `FORCE_TESTCONTAINERS=1`
+  (`tests/integration/testcontainers/setup.go`: it starts its own container, overwrites the env process-wide, and its
+  cleanup terminates the container without restoring it). Every later env reader dials a dead port: **21 existing tests
+  skip on "postgres ping unavailable"** in an otherwise healthy run. The tag-facets proofs failed instead (they cannot
+  skip), which is how it surfaced; `tagFacetsDB` now reads `testConfig`. The harness itself is unfixed.
+- A socket `pg_isready` inside the postgres image reports its temporary initdb server ready; probe over TCP.
+
 ### `sentinel-user-report-issue` FE — every `run`/`shot` row walked against a live stack (VERIFIED 2026-09-05, branch `NurfitraPujo/sentinel-user-report-issue-be`)
 
 TASK-08, the INTEGRATE-AND-VERIFY half of `prd/sentinel-user-report-issue/fe.md`. TASK-07 shipped the

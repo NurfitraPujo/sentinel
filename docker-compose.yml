@@ -382,7 +382,7 @@ services:
             # Gate: ships OFF per repo convention. Flip to "true" to activate the schedule.
             RETENTION_CRON_ENABLED: "${RETENTION_CRON_ENABLED:-false}"
             RETENTION_CRON_INTERVAL_SECONDS: "3600" # how often it POSTs the endpoint (1h)
-            RETENTION_CRON_TIMEOUT_SECONDS: "30"
+            RETENTION_CRON_TIMEOUT_SECONDS: "180"
             # sentinel-user-report-issue §4.4b: the escalation sweep. Its own URL, gate and
             # interval — 60s, because a 15-minute ESCALATION_ACK_MINUTES swept hourly would be a
             # 75-minute deadline, which is the contract's stated reason this is not a piggyback on

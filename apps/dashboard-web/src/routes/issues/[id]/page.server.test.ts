@@ -66,6 +66,7 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		getOccurrencesByIssueId: getOccurrencesByIssueIdMock,
 		countOccurrencesByIssueId: countOccurrencesByIssueIdMock,
 		trendForIssue: trendForIssueMock,
+		getTagFacets: vi.fn(async () => []),
 	},
 }));
 

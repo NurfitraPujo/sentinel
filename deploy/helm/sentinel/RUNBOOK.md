@@ -408,6 +408,226 @@ contact MaxMind, so pod starts, rollouts, autoscaling and crash loops cost no Ma
   Until then both workloads use the existing read-write `S3_ACCESS_KEY` / `S3_SECRET_KEY`, an accepted
   risk (contract decision 8).
 
+### Tag facets backfill (sentinel-issue-tag-facets)
+
+The issue page's tag distribution panel and `/search`'s `key:value` filter read `issue_tag_values`, a
+per-issue rollup that triggers on `error_occurrences` keep exact from the moment the migration
+(`*_add_issue_tag_values.sql`) commits: every occurrence stored since is counted, by every pod version.
+Occurrences stored **before** it are counted once, by the backfill below. Until it finishes, the panel
+and tag search see a partial rollup.
+
+**Deploy date (fill in at the deploy, per env):** staging `____-__-__`, production `____-__-__`.
+(P5's retention window starts from the first retention run that deletes, spec §10.3.)
+
+- **What it is.** `sentinel-sentinel-tag-facets-backfill`, a CronJob that **never runs by itself**:
+  `suspend: true` is a literal in the template, the schedule is 31 February, and it carries no ArgoCD or
+  Helm hook annotation, so ArgoCD syncs it and never waits on it. The processor image,
+  `args: ["backfill-tag-facets", "-batch", "200", "-pause", "200ms", "-duty", "0.25"]`
+  (`tagFacetsBackfill.*`). It is resumable: a run cut short (a deleted Job, the 6 h
+  `activeDeadlineSeconds`) continues from its committed cursor on the next Job, and a finished run is a
+  no-op (`already_done`).
+- **Run it once per environment, staging first**, right after the sync that brings the migration (P1
+  passed). First check no run is live — never create a Job while one shows `Running`:
+
+  ```bash
+  kubectl -n sentinel-<env> get jobs | grep tag-facets-backfill
+  kubectl -n sentinel-<env> create job --from=cronjob/sentinel-sentinel-tag-facets-backfill tag-facets-backfill-$(date +%s)
+  ```
+
+  A second Job created by mistake exits **2** with `tag_facets.backfill.already_running` (the holder's
+  `pid`) and ends `Failed`; it changes nothing.
+- **Reading its log** (`kubectl -n sentinel-<env> logs -f job/tag-facets-backfill-<epoch>`), JSON lines
+  with `event`:
+  - `tag_facets.backfill.start` — `batch`, `pause`, `duty`, and the state row (`cursor_id`,
+    `rows_counted`, `done`).
+  - `tag_facets.backfill.progress` — at most every 10 s: `batches`, `rows_counted`, `cursor_id`,
+    `progress_pct` (the cursor's position in the uuid space: an unbiased estimate of the fraction done),
+    `rows_per_sec`, `batch_ms_p50`, `batch_ms_max`. Record `batch_ms_*` for P2.
+  - `tag_facets.backfill.retry` — a batch rolled back on `40001` / `40P01` / `55P03` (a lock wait over
+    5 s); it retries after 1 s, up to 10 times in a row, then the Job fails (re-create it: it resumes).
+  - `tag_facets.backfill.done` — `rows_counted` (final total), `batches`, `elapsed`. ~1.4 h at 4.4 M rows,
+    `N / 900` s for `N` rows.
+  - `tag_facets.backfill.already_done` — nothing to do.
+  - `tag_facets.backfill.failed` — the error; nothing half-done is left (each batch is one transaction).
+- **P2, the ingest check while it runs.** Every batch locks the `issues` rows it touches (every hot
+  issue) for its duration, capped at 25 % of the time. Sample the processor consumer's lag every 30 s for
+  the length of the run; **pass: `num_pending` ≤ 100 in every sample** (`num_ack_pending` ≤ 20):
+
+  Both Huawei overlays run `dependencies.nats.enabled: false` and reach a shared cluster NATS by DSN
+  (`nats.url`, sealed as `NATS_URL`) — no `svc/*-nats` renders in this chart to port-forward. Every app
+  pod already has `NATS_URL` and network reachability to it (production traffic depends on it), so sample
+  from inside one instead of assuming a Service name: the monitoring port (8222) is the same host as the
+  client port in `NATS_URL`.
+
+  This assumes the shared cluster NATS actually serves monitoring on 8222 at that host, and that the
+  processor pod's egress policy allows reaching it — unverified by review. Confirm it once per cluster
+  before relying on it during a real backfill: `kubectl -n sentinel-<env> exec deploy/<release>-sentinel-processor
+  -- sh -c 'host=$(echo "$NATS_URL" | sed -E "s#nats://([^@]*@)?([^:/]+).*#\2#"); wget -qO- "http://$host:8222/varz" | head -c 200'`
+  should return NATS server JSON (a `server_id` field), not a timeout or connection refused. There is no
+  in-repo fallback today (the processor exports no NATS consumer-lag metric of its own): if the monitoring
+  port is unreachable, P2 cannot be sampled as written and the QA seat should escalate rather than
+  approximate it.
+
+  ```bash
+  kubectl -n sentinel-<env> exec deploy/<release>-sentinel-processor -- sh -c '
+    host=$(echo "$NATS_URL" | sed -E "s#nats://([^@]*@)?([^:/]+).*#\2#")
+    while sleep 30; do wget -qO- "http://$host:8222/jsz?consumers=true"; echo; done' \
+    | jq '.account_details[].stream_detail[] | select(.name=="ERROR_EVENTS") | .consumer_detail[]
+          | select(.name=="processor-consumer") | {num_pending, num_ack_pending}'
+  ```
+
+  If it is exceeded, **delete the Job** (the cursor is committed; nothing is lost) and create a new one
+  with a larger `-pause`, a smaller `-duty` or a smaller `-batch`, by editing the args of a dry-run copy:
+
+  ```bash
+  kubectl -n sentinel-<env> delete job tag-facets-backfill-<epoch>
+  kubectl -n sentinel-<env> create job --from=cronjob/sentinel-sentinel-tag-facets-backfill \
+    tag-facets-backfill-$(date +%s) --dry-run=client -o json \
+    | jq '.spec.template.spec.containers[0].args = ["backfill-tag-facets","-batch","200","-pause","500ms","-duty","0.1"]' \
+    | kubectl -n sentinel-<env> apply -f -
+  ```
+
+  Record the `sentinel_process_duration_seconds` p99 over the
+  run window against the day before.
+- **P4, the reconciliation, after `done`.** For the 20 largest issues, in one `REPEATABLE READ`
+  transaction, spec §10.2's check query (also `tests/integration/tag_facets_db_test.go`
+  `tagFacetsCheckSQL`) with `$1` = those ids must return five zeros:
+
+  ```sql
+  BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+  -- $1 := ARRAY(SELECT id FROM issues ORDER BY count DESC LIMIT 20)
+  -- then the check query; columns named_mismatch, key_total_mismatch, value_nowhere, zero_rows, over_cap
+  COMMIT;
+  ```
+
+  Any non-zero: rebuild that issue (below) and file a finding with the query's output.
+- **`issue_tag_values_rebuild('<issue id>')`** recomputes one issue's rollup exactly from its counted
+  occurrences. It holds that issue's `issues` row lock for ~3-6 µs per occurrence (seconds for a
+  million-occurrence issue), so that issue's deliveries wait: run it **off-peak**, one issue at a time,
+  only for the issues P4 names and for every `operatorOnlyIssueIds` entry of
+  `retention.tag_rollup_rebuild_pending` or `retention.tag_rollup_rebuild_operator_only` (the retention
+  route will not retry those). Start it right after a `retention_cron.completed` line (the next run is an
+  hour away).
+
+  ```sql
+  SELECT issue_tag_values_rebuild('<issue id>');   -- returns the pairs counted
+  ```
+
+- **After P2 passed** an overlay may set `tagFacetsBackfill.enabled: false` in a later values change,
+  which removes the CronJob and its Jobs. Optional.
+- **Never disable the `trg_error_occurrences_tag_rollup_*` triggers** (not for a migration either: batch
+  an `UPDATE` of `error_occurrences` instead, it costs ~70 µs a row in the update trigger). A disabled
+  trigger lets the rollup drift silently, and the backfill refuses to run while one is missing.
+
+### Retention keep-up and route outcomes (sentinel-issue-tag-facets)
+
+`POST /api/cron/retention` (the hourly `sentinel-sentinel-retention` CronJob) now deletes aged occurrences in
+**paced, issue-locked batches**: 200 rows at a time, each batch locking its issues' rows first (in id order),
+bounded lock waits (250 ms per lock, 1 s for the lock phase, 1 s for the `DELETE`), a 50 % duty cycle, and a
+120 s budget per run. The delete trigger keeps `issue_tag_values` exact in the same transaction. One run at a
+time: a run holds the advisory lock `sentinel.retention.route` on its own connection
+(`application_name = 'sentinel.retention.run'`), runs every statement on it, and cannot outlive its 170 s
+deadline. curl's `--max-time` is 180 s (`retentionCron.timeoutSeconds`). Every
+`retention_cron.completed` line carries `outcome`, `routeMs`, `deletedOccurrences`, `occurrenceStopped`,
+`occurrenceBatches`, `occurrenceStepMs`, `occurrenceBatchSize`, `occurrenceHeldP95Ms`, `occurrenceHeldMaxMs`,
+`occurrenceBacklogSeconds`, `oldestOccurrenceAt`, `tagRollupDriftEvents`, `tagRollupRebuildsPending` and
+`rebuildStepMs`.
+
+**Keep-up.** The step keeps up with a margin of 2 when
+
+> floor(119,000 / c̄) × 200 ≥ 2 × A
+
+where c̄ = `occurrenceStepMs / occurrenceBatches` of a run with ≥ 20 batches, and A is the peak hourly aging
+rate (34,481 measured 2026-09-25; re-read it before judging a run):
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '120s';
+SELECT date_trunc('hour', created_at AT TIME ZONE 'UTC') AS hour, count(*)
+  FROM error_occurrences WHERE created_at >= now() - interval '12 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+COMMIT;
+```
+
+At the 150 ms p95 hold ceiling, c̄ = 325 ms → 73,200 rows a run = 2.12 × A; measured warm, c̄ ≈ 100 ms →
+~237,000. What each warning means:
+
+| Log line | Meaning | Act |
+|---|---|---|
+| `retention.occurrence_backlog` (warn) | the oldest surviving occurrence is > 2 h behind the cutoff | once, right after a DLQ replay of old messages: expected (the next run deletes them). Two runs in a row: a keep-up failure, apply the levers below |
+| `retention.occurrence_hold_p95_over_ceiling` (warn) | a run with ≥ 20 batches held its batches > 150 ms at p95: production's per-row cost is above what the margin was derived for | the levers below |
+| `retention.occurrence_hold_over_ceiling` (warn) | one or more batches held > 150 ms | informational alone (one slow batch among hundreds); act only on the p95 line or a failing inequality |
+| `retention.occurrence_batch_reduced` (warn) | a batch's `DELETE` ran past 1 s; the run went on at half the batch (`to` is the size reached) | the levers below |
+| `retention.occurrence_delete_timeout` (warn) | even a 25-row `DELETE` ran past 1 s and the step stopped | the levers below, and look for what made the rows that slow: an inline drift rebuild, a lock in the FK cascade |
+| `retention.occurrence_lock_timeout` (warn) | a batch waited > 250 ms for a lock (`phase`: `lock` = an `issues` row, `delete` = a row the `DELETE` or its cascade needs) and the step stopped; the next run continues from the oldest row | if it recurs, find the blocker (query below) |
+| `retention.occurrence_budget_exhausted` (warn) | the 120 s budget ran out with rows left | a backlog is draining; if it persists, the levers below |
+
+**The levers, in order — never suspend the retention CronJob for any of these** (suspending stops every
+deletion AND the invitation, attachment, stale-claim and idempotency reapers on the route, which makes the
+backlog strictly worse): (1) add runs: `retentionCron.schedule: "*/30 * * * *"` (a values change, no
+release; each halving of the interval doubles the capacity); (2) a smaller `RETENTION_OCCURRENCE_BATCH` in a
+release, **only together with** (1), because a smaller batch alone shortens each wait but lowers capacity.
+
+**Route outcomes** (`outcome` on `retention_cron.completed`, and `sentinel_retention_runs_total{outcome}`):
+
+- `completed` — the normal case.
+- `behind` (the Job is `Complete`, the counter's `behind` rises; three in a row fire
+  `SentinelRetentionNotCompleting`) — occurrence deletion stopped early (`occurrenceStopped` not `drained`)
+  with nothing deleted, or stopped early with the backlog over 2 h. A `drained` run is never `behind`; its
+  `retention.occurrence_backlog` line alone means an event was stored already aged, which the next run
+  deletes. Read the run's `retention.occurrence_lock_timeout`, `retention.occurrence_delete_timeout` or
+  `retention.occurrence_backlog` line; for a lock timeout find the blocker (below), otherwise apply the levers.
+- `retention_cron.skipped_concurrent` (200, `skipped`) — a second POST met a live run (a `backoffLimit`
+  re-POST or a manual Job) and did nothing.
+- **`retention_cron.deadline_exceeded`** (a Failed Job, 500) — a run reached its 170 s deadline and stopped.
+  It holds nothing afterwards, so there is nothing of it to kill. The usual cause is a session holding rows a
+  step needs; find it:
+
+  ```sql
+  SELECT pid, application_name, client_addr, state, xact_start, left(query, 200)
+    FROM pg_stat_activity
+   WHERE state LIKE 'idle in transaction%' AND xact_start < now() - interval '1 minute';
+  ```
+
+  End it with `SELECT pg_terminate_backend(<pid>)`, **unless it belongs to a dashboard pod** (`client_addr`
+  is a dashboard pod's): then restart that pod instead, because terminating a dashboard backend
+  mid-transaction crashes that process anyway (a postgres-js 3.4.9 defect, spec §12). The next hourly run
+  then completes.
+- **`retention_cron.lock_stale`** (a Failed Job, 503) — the route lock has been held past 4 min, longer than
+  any live run can hold it. The holder is a dead or wedged dashboard process, or a session that is not a run
+  (`holderApp` other than `sentinel.retention.run`). Record it, then end it:
+
+  ```sql
+  SELECT pid, application_name, client_addr, backend_start, state, wait_event_type, left(query, 200)
+    FROM pg_stat_activity WHERE pid = <holderPid>;
+  SELECT pg_terminate_backend(<holderPid>);
+  ```
+
+  That ends the lock and every statement of that run together (the run uses no other session). If the pod
+  at that `client_addr` is still running but unresponsive, restart it as well. The next hourly run proceeds
+  from the oldest row.
+- `retention_cron.connection_lost` (500) — a run's session ended under it (a terminate, a database
+  restart). The run stopped without reconnecting; the next run continues.
+
+**Operator rebuilds and retention.** Start an `issue_tag_values_rebuild` right after a
+`retention_cron.completed` line (the next run is an hour away). A run that meets it anyway ends its
+occurrence step within 1 s (`retention.occurrence_lock_timeout`) and the next run continues, so the CronJob is
+not suspended for it. `retention.tag_rollup_drift` (warn) reports drift the triggers repaired or deferred
+since the previous run (`events`, `issues`, `contributions`, `sources`, `issueIds`): a recurring cause is a
+bug to fix. `retention.tag_rollup_rebuild_pending` names the issues the route will still try (`issueIds`)
+and those handed to the operator (`operatorOnlyIssueIds`: too large for its 5 s budget, or timed out once);
+rebuild each of the latter with `SELECT issue_tag_values_rebuild('<id>')`, off-peak (see "Tag facets
+backfill" above). The route never retries them.
+
+**Alerts.** The `sentinel-retention` rule group (`SentinelRetentionLockStale`, `SentinelRetentionRunFailing`,
+`SentinelRetentionNotCompleting`) is dormant until Sentinel's rule groups are loaded into a Prometheus
+(`prometheusRule.enabled`, false in production). Until then, check by hand after a deploy and whenever
+retention is in doubt: `sentinel_retention_runs_total` on each dashboard replica's `/api/metrics`
+(`completed` rising hourly, the failure outcomes flat) and
+
+```bash
+kubectl -n sentinel-<env> get jobs -l app.kubernetes.io/component=retention-cron   # no Failed
+```
+
 ## 3. Rollback
 
 ```bash

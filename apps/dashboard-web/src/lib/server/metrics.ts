@@ -121,6 +121,27 @@ export const SOURCEMAP_UPLOAD_OUTCOME = {
 
 export type SourcemapUploadOutcome = (typeof SOURCEMAP_UPLOAD_OUTCOME)[keyof typeof SOURCEMAP_UPLOAD_OUTCOME];
 
+/**
+ * sentinel-issue-tag-facets §5 "The standing signal": the outcome of every authorised
+ * `POST /api/cron/retention`, recorded exactly once on the path the route returns by. `behind` is a run
+ * that finished (200) but stopped deleting occurrences early with nothing deleted or the backlog past
+ * 2 h (`retentionRunOutcome`); it is NOT a success, so `SentinelRetentionNotCompleting` (which counts
+ * `completed` alone) fires on three of them in a row.
+ */
+export const RETENTION_RUN_OUTCOME = {
+	Completed: 'completed',
+	Behind: 'behind',
+	/** 200 `skipped: 'already_running'`: a live run holds the route lock. */
+	Skipped: 'skipped',
+	/** 503: the route lock's holder is older than any live run can be. */
+	LockStale: 'lock_stale',
+	DeadlineExceeded: 'deadline_exceeded',
+	ConnectionLost: 'connection_lost',
+	Failed: 'failed',
+} as const;
+
+export type RetentionRunOutcomeLabel = (typeof RETENTION_RUN_OUTCOME)[keyof typeof RETENTION_RUN_OUTCOME];
+
 /** The one label this metric carries. Named once, so a typo cannot invent a second dimension. */
 const LABEL_OUTCOME = 'outcome';
 
@@ -140,6 +161,7 @@ interface MetricsState {
 	oncallUnresolved: Counter<string> | null;
 	releaseNextRewriteFailures: Counter<string> | null;
 	sourcemapUploads: Counter<typeof LABEL_OUTCOME> | null;
+	retentionRuns: Counter<typeof LABEL_OUTCOME> | null;
 }
 
 const GLOBAL_KEY = Symbol.for('sentinel.dashboard.metrics');
@@ -261,6 +283,24 @@ function createState(): MetricsState {
 		sourcemapUploads = null;
 	}
 
+	// sentinel-issue-tag-facets §5: one increment per authorised retention POST, every outcome at zero
+	// from the first scrape (a `== 0` / `> 0` alert over an absent series does not evaluate). A counter,
+	// not a gauge: a process-local gauge on the replica that did not run would keep a stale value.
+	let retentionRuns: Counter<typeof LABEL_OUTCOME> | null = null;
+	try {
+		retentionRuns = new Counter({
+			name: 'sentinel_retention_runs_total',
+			help: 'Retention cron runs (POST /api/cron/retention) by outcome (sentinel-issue-tag-facets §5): completed, behind, skipped, lock_stale, deadline_exceeded, connection_lost, failed.',
+			labelNames: [LABEL_OUTCOME],
+			registers: [registry],
+		});
+		for (const outcome of Object.values(RETENTION_RUN_OUTCOME)) {
+			retentionRuns.labels({ [LABEL_OUTCOME]: outcome }).inc(0);
+		}
+	} catch {
+		retentionRuns = null;
+	}
+
 	return {
 		registry,
 		reportsReceived,
@@ -270,6 +310,7 @@ function createState(): MetricsState {
 		oncallUnresolved,
 		releaseNextRewriteFailures,
 		sourcemapUploads,
+		retentionRuns,
 	};
 }
 
@@ -364,6 +405,17 @@ const KNOWN_SOURCEMAP_UPLOAD_OUTCOMES = new Set<string>(Object.values(SOURCEMAP_
 export function recordSourcemapUpload(outcome: SourcemapUploadOutcome): void {
 	if (!KNOWN_SOURCEMAP_UPLOAD_OUTCOMES.has(outcome)) return;
 	state().sourcemapUploads?.labels({ [LABEL_OUTCOME]: outcome }).inc();
+}
+
+const KNOWN_RETENTION_RUN_OUTCOMES = new Set<string>(Object.values(RETENTION_RUN_OUTCOME));
+
+/**
+ * sentinel-issue-tag-facets §5: increments `sentinel_retention_runs_total{outcome}`. The retention route
+ * calls it once per authorised POST. Same closed-set guard and never-throw contract as the others.
+ */
+export function recordRetentionRun(outcome: RetentionRunOutcomeLabel): void {
+	if (!KNOWN_RETENTION_RUN_OUTCOMES.has(outcome)) return;
+	state().retentionRuns?.labels({ [LABEL_OUTCOME]: outcome }).inc();
 }
 
 /** Renders the Prometheus text exposition format, with the content type a scraper expects. */

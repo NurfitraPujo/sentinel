@@ -1,9 +1,10 @@
 import { db } from './db';
 import { errorSearchIndex, errorOccurrences, issues, projects } from '$lib/db/schema';
-import { eq, and, or, inArray, sql, desc, asc } from 'drizzle-orm';
+import { eq, and, or, inArray, sql, desc, asc, type SQL } from 'drizzle-orm';
 import type { AuthUser } from './auth';
 import { getAccessibleProjects } from './issue-access';
 import { environmentScopeCondition, resolveEnvironmentScopes } from './environment-access';
+import type { TagFilter } from '$lib/tag-filter';
 
 export interface SearchFilters {
 	userId?: string;
@@ -15,6 +16,90 @@ export interface SearchFilters {
 	environment?: string;
 	platform?: string;
 	search?: string;
+	// sentinel-issue-tag-facets §6.3: parsed `tag` filters (≤ MAX_TAG_FILTERS), each ONE more ANDed
+	// element. Absent or empty: the search is exactly today's (§6.6).
+	tags?: TagFilter[];
+}
+
+/**
+ * sentinel-issue-tag-facets §6.4: branch (b)'s index hints for the DERIVED keys — an extra predicate every
+ * occurrence carrying (k, v) satisfies, so an index can serve the overflowed issue's probe. The one
+ * TypeScript structure keyed by derived-key names; an optimisation, never a definition (the key list is
+ * issue_tag_derived's, and `search.tag-hints.test.ts` pins every entry to it). `index` names the index the
+ * hint is written for (null: none needed — `environment` is part of an issue's identity so it never
+ * overflows; the OS/browser names are bounded vocabularies and scan the issue's occurrences).
+ */
+export const TAG_SEARCH_HINTS: Record<string, { index: string | null; predicate: (value: string) => SQL }> = {
+	release: { index: 'idx_occurrences_issue_release', predicate: (v) => sql`o2.release_version = ${v}` },
+	environment: { index: null, predicate: (v) => sql`o2.environment = ${v}` },
+	'os.name': { index: null, predicate: () => sql`TRUE` },
+	'client_os.name': { index: null, predicate: () => sql`TRUE` },
+	'device.model': {
+		index: 'idx_error_occurrences_device_model',
+		predicate: (v) =>
+			sql`jsonb_typeof(o2.contexts->'device'->'model') = 'string' AND (o2.contexts->'device'->>'model') = ${v}`,
+	},
+	'browser.name': { index: null, predicate: () => sql`TRUE` },
+	'user.id': {
+		index: 'idx_error_occurrences_user_id',
+		predicate: (v) => sql`jsonb_typeof(o2.event_user->'id') = 'string' AND (o2.event_user->>'id') = ${v}`,
+	},
+};
+
+/** The issue-scoped jsonb_path_ops GIN that serves branch (b) for a custom (non-derived) key. */
+export const CUSTOM_TAG_HINT_INDEX = 'idx_error_occurrences_issue_tags';
+
+/**
+ * sentinel-issue-tag-facets §6.4: one tag filter as ONE condition on the outer `issues` row. An issue
+ * matches iff one of its counted retained occurrences has (k, v) among issue_tag_pairs:
+ *   (a) v has its own rollup row — by I-cap it then holds every counted v; or
+ *   (b) k overflowed on this issue (its '' row exists) and one of the issue's occurrences carries v.
+ * Branch (b) is driven by the overflow row, so it reads occurrences only of issues whose key overflowed,
+ * stops at the first match, and is correlated to that issue through the key's hint index. The decision is
+ * always issue_tag_pairs'. For a custom key the issue-scoped containment REPLACES `o2.issue_id =
+ * ov.issue_id` (with both present the planner BitmapAnds the whole issue's issue_id entries).
+ */
+export function tagCondition({ key, value }: TagFilter): SQL {
+	const hint = Object.hasOwn(TAG_SEARCH_HINTS, key) ? TAG_SEARCH_HINTS[key] : undefined;
+	const correlate = hint
+		? sql`o2.issue_id = ov.issue_id AND ${hint.predicate(value)}`
+		: sql`o2.tags IS NOT NULL AND jsonb_set('{}'::jsonb, ARRAY[o2.issue_id::text], o2.tags) @> jsonb_set('{}'::jsonb, ARRAY[ov.issue_id::text], jsonb_build_object(${key}::text, ${value}::text))`;
+	return sql`(EXISTS (SELECT 1 FROM issue_tag_values t
+	                 WHERE t.issue_id = ${issues.id} AND t.key = ${key} AND t.value = ${value})
+	     OR EXISTS (SELECT 1 FROM issue_tag_values ov
+	                 CROSS JOIN LATERAL (
+	                       SELECT 1 FROM error_occurrences o2
+	                        CROSS JOIN LATERAL issue_tag_pairs(o2.tags, o2.contexts, o2.event_user, o2.release_version, o2.environment) p
+	                        WHERE ${correlate} AND p.key = ${key} AND p.value = ${value}
+	                        LIMIT 1) x
+	                 WHERE ov.issue_id = ${issues.id} AND ov.key = ${key} AND ov.value = ''))`;
+}
+
+/**
+ * sentinel-issue-tag-facets §6.4 "The bound": rows a plan read on the occurrence side — (Actual Rows + Rows
+ * Removed by Filter + Rows Removed by Index Recheck) × Actual Loops, summed over every scan node whose
+ * relation, or whose index's table (`indexTables`, from pg_index), is one of `tables`. The removed terms
+ * are what a scan read and its Filter discarded; without them a scan that reads an issue whole and keeps
+ * one row looks like a one-row read. Used by the (5c) proof and by P3 on staging.
+ */
+export function rowsReadFromPlan(
+	plan: { Plan?: unknown } | Record<string, unknown>,
+	indexTables: Map<string, string>,
+	tables: readonly string[] = ['error_occurrences', 'error_search_index']
+): number {
+	let total = 0;
+	const visit = (node: Record<string, unknown>) => {
+		const relation = node['Relation Name'] as string | undefined;
+		const index = node['Index Name'] as string | undefined;
+		const table = relation ?? (index ? indexTables.get(index) : undefined);
+		if (table && tables.includes(table)) {
+			const n = (k: string) => Number(node[k] ?? 0);
+			total += (n('Actual Rows') + n('Rows Removed by Filter') + n('Rows Removed by Index Recheck')) * n('Actual Loops');
+		}
+		for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) visit(child);
+	};
+	visit(((plan as { Plan?: unknown }).Plan ?? plan) as Record<string, unknown>);
+	return total;
 }
 
 export interface SearchResult {
@@ -88,6 +173,11 @@ export async function searchErrors(
 		conditions.push(inArray(issues.projectId, projectIds));
 	}
 
+	// sentinel-issue-tag-facets §6.4: with a tag filter and no id filter the search takes the per-issue form
+	// (form L), which reads the issue-level conditions on the outer row; `conditions` before the two
+	// occurrence-level filters is exactly that set, so it is kept apart here.
+	const issueLevelConditions: SQL[] = [...conditions];
+
 	if (filters.environment) {
 		conditions.push(eq(errorOccurrences.environment, filters.environment));
 	}
@@ -153,6 +243,33 @@ export async function searchErrors(
 	}
 	if (searchConditions.length > 0) {
 		allConditions.push(or(...searchConditions));
+	}
+
+	// sentinel-issue-tag-facets §6.3-§6.4: each tag filter is ONE more ANDed element — with each other, with
+	// project / environment / platform / FTS, and with the id OR-group as a whole. With no tag filter
+	// nothing below runs and the two queries after it are today's, statement for statement (§6.6).
+	const tags = filters.tags ?? [];
+	if (tags.length > 0) {
+		const tagConditions = tags.map(tagCondition);
+		if (searchConditions.length > 0) {
+			// Form J: an id filter drives today's join through error_search_index's own index; the tag
+			// conditions only filter the issues it reaches.
+			allConditions.push(...tagConditions);
+		} else {
+			return await searchPerIssue(
+				[
+					...issueLevelConditions,
+					...(ftsQuery ? [sql`to_tsvector('english', ${issues.message}) @@ to_tsquery('english', ${ftsQuery})`] : []),
+					// I-env: every occurrence's environment equals its issue's, so the issue-level test selects
+					// the same issues and the per-issue read needs no environment test at all.
+					...(filters.environment ? [eq(issues.environment, filters.environment)] : []),
+					...tagConditions,
+				],
+				filters.platform,
+				limit,
+				offset
+			);
+		}
 	}
 
 	// sentinel-project-environments/BUG-14 — one row per ISSUE, not one row per OCCURRENCE.
@@ -257,4 +374,85 @@ export async function searchErrors(
 	}));
 
 	return { results: searchResults, total: Number(total) };
+}
+
+/**
+ * sentinel-issue-tag-facets §6.4 form L: a tag search with no id filter. A tag matches ISSUES, and today's
+ * join would read every occurrence of every matching issue; here each issue that passes the issue-level
+ * and tag conditions reads only its most recent qualifying occurrence (with an index row, the inner join
+ * kept: §6.5) through a LATERAL — the same `(issue, occurrence)` rows as today's DISTINCT ON shape and the
+ * same total. The one occurrence-level filter left, `platform`, goes inside the LATERAL, served by
+ * idx_error_occurrences_issue_platform; `environment` is tested on `issues` by the caller (I-env).
+ */
+async function searchPerIssue(
+	issueConditions: SQL[],
+	platform: string | undefined,
+	limit: number,
+	offset: number
+): Promise<{ results: SearchResult[]; total: number }> {
+	const where = and(...issueConditions);
+	const platformCondition = platform ? sql` AND o.platform = ${platform}` : sql``;
+	const rows = await db.execute<Record<string, unknown>>(sql`
+		SELECT ${issues.id} AS issue_id, ${issues.projectId} AS project_id, ${issues.fingerprint} AS fingerprint,
+		       ${issues.message} AS message, ${issues.errorClass} AS error_class, ${issues.status} AS status,
+		       ${issues.count} AS count, ${issues.firstSeen} AS first_seen, ${issues.lastSeen} AS last_seen,
+		       ${projects.name} AS project_name, m.*
+		  FROM ${issues}
+		  JOIN ${projects} ON ${issues.projectId} = ${projects.id}
+		  CROSS JOIN LATERAL (SELECT o.id AS occurrence_id, o.environment AS occurrence_environment,
+		                             o.platform AS occurrence_platform, o.trace_id AS occurrence_trace_id,
+		                             o.span_id AS occurrence_span_id, o.created_at AS occurrence_created_at,
+		                             s.user_id AS search_user_id, s.tenant_id AS search_tenant_id,
+		                             s.trace_id AS search_trace_id, s.span_id AS search_span_id,
+		                             s.request_id AS search_request_id
+		                        FROM error_occurrences o
+		                        JOIN error_search_index s ON s.occurrence_id = o.id
+		                       WHERE o.issue_id = ${issues.id}${platformCondition}
+		                       ORDER BY o.created_at DESC, o.id DESC
+		                       LIMIT 1) m
+		 WHERE ${where}
+		 ORDER BY ${issues.lastSeen} DESC, ${issues.id}
+		 LIMIT ${limit} OFFSET ${offset}`);
+	// sentinel-issue-tag-facets §6.4 (5c): unlike the row query above, existence never needs the o.id DESC
+	// tiebreak — WHICH occurrence answers "at least one exists" is irrelevant. Ordering by created_at DESC
+	// alone is exactly presorted by idx_occurrences_issue_created (and, with a platform filter, by
+	// idx_error_occurrences_issue_platform), so the index scan + LIMIT 1 reads exactly one row with no
+	// lookahead. Adding the id tiebreak would force an Incremental Sort to read one extra row per group to
+	// confirm the group boundary — needless cost for a query that only asks "does one exist".
+	const [countRow] = await db.execute<{ count: number | string }>(sql`
+		SELECT count(*)::int AS count
+		  FROM ${issues}
+		  CROSS JOIN LATERAL (SELECT 1 FROM error_occurrences o
+		                        JOIN error_search_index s ON s.occurrence_id = o.id
+		                       WHERE o.issue_id = ${issues.id}${platformCondition}
+		                       ORDER BY o.created_at DESC
+		                       LIMIT 1) m
+		 WHERE ${where}`);
+	// The same driver-value mapping drizzle's builder applies to these columns in today's shape.
+	const ts = (column: { mapFromDriverValue: (v: never) => unknown }, v: unknown) =>
+		v === null || v === undefined ? null : (column.mapFromDriverValue(v as never) as Date);
+	const results: SearchResult[] = rows.map((r) => ({
+		issueId: r.issue_id as string,
+		projectId: r.project_id as string,
+		fingerprint: r.fingerprint as string,
+		message: r.message as string,
+		errorClass: r.error_class as string,
+		status: r.status as string,
+		count: Number(r.count),
+		firstSeen: ts(issues.firstSeen, r.first_seen),
+		lastSeen: ts(issues.lastSeen, r.last_seen),
+		projectName: r.project_name as string,
+		matchingOccurrence: {
+			id: r.occurrence_id as string,
+			environment: r.occurrence_environment as string,
+			platform: r.occurrence_platform as string,
+			traceId: (r.occurrence_trace_id as string | null) ?? null,
+			spanId: (r.occurrence_span_id as string | null) ?? null,
+			requestId: (r.search_request_id as string | null) ?? null,
+			userId: (r.search_user_id as string | null) ?? null,
+			tenantId: (r.search_tenant_id as string | null) ?? null,
+			createdAt: ts(errorOccurrences.createdAt, r.occurrence_created_at),
+		},
+	}));
+	return { results, total: Number(countRow?.count ?? 0) };
 }

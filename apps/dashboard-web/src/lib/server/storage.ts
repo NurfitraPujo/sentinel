@@ -206,7 +206,8 @@ export async function getObjectStream(key: string): Promise<GetObjectCommandOutp
 	);
 }
 
-export async function deleteObject(key: string): Promise<void> {
+// sentinel-issue-tag-facets §5 rule 3: `signal` (the retention run's deadline) aborts the request.
+export async function deleteObject(key: string, signal?: AbortSignal): Promise<void> {
 	const config = requireConfig();
 	const client = getClient(config);
 
@@ -214,7 +215,8 @@ export async function deleteObject(key: string): Promise<void> {
 		new DeleteObjectCommand({
 			Bucket: config.bucket,
 			Key: key,
-		})
+		}),
+		signal ? { abortSignal: signal } : undefined
 	);
 }
 

@@ -15,20 +15,49 @@ const connectionString = env.DATABASE_URL ?? 'postgres://sentinel:changeme@local
 // The cross-language consequence is why this matters beyond tidiness — the dashboard and the
 // processor write the SAME tables, and only the dashboard's rows were unreadable. Declaring the
 // jsonb types here makes postgres-js pass the already-serialized value through untouched.
-const client = postgres(connectionString, {
-	types: {
-		// 3802 = jsonb, 114 = json. Serialize once, on our side, and tell postgres-js the value is
-		// already a string so it does not encode it a second time.
-		jsonb: {
-			to: 3802,
-			from: [3802],
-			serialize: (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v)),
-			parse: (v: string) => JSON.parse(v)
-		}
+const types = {
+	// 3802 = jsonb, 114 = json. Serialize once, on our side, and tell postgres-js the value is
+	// already a string so it does not encode it a second time.
+	jsonb: {
+		to: 3802,
+		from: [3802],
+		serialize: (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v)),
+		parse: (v: string) => JSON.parse(v)
 	}
-});
+};
+
+const client = postgres(connectionString, { types });
 
 export const db = drizzle(client);
+
+/**
+ * sentinel-issue-tag-facets §5 "One run, one connection, one deadline" rule 1: the retention route's
+ * per-run client. A NEW client with its own single connection (`max: 1`), made per POST and ended in the
+ * route's `finally`. The run takes the route's advisory lock on this connection and runs every step on
+ * it through `openRetentionRun` (retention-run.ts), so the lock and the work are one session: ending the
+ * session ends both, and no pooled connection of the run is left waiting on anything.
+ *
+ * - `application_name` names the run's backend in pg_stat_activity (the RUNBOOK's queries use it).
+ * - The keepalives are startup parameters: the server drops the session of a pod whose node vanished in
+ *   ~2 min (60 + 10 × 6 s), not the kernel default's ~2 h.
+ * - `onclose` is how the run learns its session is gone: it sets `lost`, and run.db refuses every later
+ *   statement, because postgres-js would otherwise reconnect on a new session that does not hold the lock.
+ * - NOT `db`'s `reserve()` and NOT postgres-js `begin()`: each crashes the process when the backend is
+ *   terminated (an uncaught write on a closed socket, spec §5 rule 1, §12).
+ */
+export function openRetentionRunClient(onclose: () => void) {
+	return postgres(connectionString, {
+		max: 1,
+		types,
+		onclose,
+		connection: {
+			application_name: 'sentinel.retention.run',
+			tcp_keepalives_idle: 60,
+			tcp_keepalives_interval: 10,
+			tcp_keepalives_count: 6
+		}
+	});
+}
 
 // R15 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the Drizzle transaction callback param type,
 // exported so query modules that accept an optional/explicit `tx` (subscriptions, notify,

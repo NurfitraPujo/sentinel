@@ -12,6 +12,8 @@ import {
 	recordReleaseNextRewriteFailure,
 	SOURCEMAP_UPLOAD_OUTCOME,
 	recordSourcemapUpload,
+	RETENTION_RUN_OUTCOME,
+	recordRetentionRun,
 } from './metrics';
 
 /**
@@ -285,5 +287,37 @@ describe('§12 sentinel_sourcemap_uploads_total (sentinel-sourcemaps)', () => {
 			const labels = line.match(/\{([^}]*)\}/)?.[1] ?? '';
 			expect(labels).toMatch(/^outcome="[a-z_]+"$/);
 		}
+	});
+});
+
+/**
+ * sentinel-issue-tag-facets §5 "The standing signal": `sentinel_retention_runs_total{outcome}`, one
+ * increment per authorised retention POST. The seven outcomes exist at zero from the first scrape,
+ * because `SentinelRetentionNotCompleting` and `SentinelRetentionLockStale` read series that would
+ * otherwise be absent until the first such run.
+ */
+describe('sentinel_retention_runs_total (sentinel-issue-tag-facets)', () => {
+	beforeEach(() => {
+		resetMetricsForTest();
+	});
+
+	it('carries exactly the seven outcomes, behind among them', () => {
+		expect(Object.values(RETENTION_RUN_OUTCOME).sort()).toEqual(
+			['behind', 'completed', 'connection_lost', 'deadline_exceeded', 'failed', 'lock_stale', 'skipped'].sort()
+		);
+	});
+
+	it('exposes every outcome at zero, then counts one increment on its own series', async () => {
+		let { body } = await renderMetrics();
+		expect(body).toContain('# TYPE sentinel_retention_runs_total counter');
+		let series = parse(body);
+		for (const outcome of Object.values(RETENTION_RUN_OUTCOME)) {
+			expect(series.get(`sentinel_retention_runs_total{outcome="${outcome}"}`)).toBe(0);
+		}
+		recordRetentionRun(RETENTION_RUN_OUTCOME.LockStale);
+		({ body } = await renderMetrics());
+		series = parse(body);
+		expect(series.get('sentinel_retention_runs_total{outcome="lock_stale"}')).toBe(1);
+		expect(series.get('sentinel_retention_runs_total{outcome="completed"}')).toBe(0);
 	});
 });

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"log"
 	"log/slog"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/tagfacets"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/webhooks"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -88,6 +91,15 @@ func main() {
 		MinConns:        5,
 		MaxConnLifetime: 30 * time.Minute,
 		MaxConnIdleTime: 10 * time.Minute,
+	}
+
+	// sentinel-issue-tag-facets spec §4.1: `processor backfill-tag-facets` counts the occurrences stored
+	// before the rollup's triggers existed, run once per environment by an operator as a Job created from
+	// the chart's suspended CronJob. It dispatches before the symbolication checks and before NATS, which
+	// it does not need; it opens the same pgx pool and nothing else. Exit 2 means another runner holds the
+	// lock (a mistaken second Job ends Failed); exit 1 any other failure; a re-run resumes from the cursor.
+	if len(os.Args) > 1 && os.Args[1] == "backfill-tag-facets" {
+		os.Exit(runTagFacetsBackfill(ctx, logger, dbCfg, os.Args[2:]))
 	}
 
 	// sentinel-sourcemaps §4.4 / §12: the six symbolication knobs, each in the syntax the contract
@@ -536,4 +548,53 @@ func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.S
 		}
 	}()
 	return srv
+}
+
+// backfillFlags is the backfill-tag-facets flag set, split out so a test can parse it directly and pin
+// the flag names the chart's rendered CronJob args depend on (tfb-helm-backfill-test-weak,
+// tfb-backfill-safety-controls-unproven: renaming -duty must fail a test, not just the chart at deploy).
+func backfillFlags() (fs *flag.FlagSet, batch *int, pause *time.Duration, duty *float64) {
+	fs = flag.NewFlagSet("backfill-tag-facets", flag.ContinueOnError)
+	batch = fs.Int("batch", tagfacets.DefaultBatch, "rows per batch transaction (1-5000)")
+	pause = fs.Duration("pause", tagfacets.DefaultPause, "minimum sleep between batches")
+	duty = fs.Float64("duty", tagfacets.DefaultDuty, "maximum fraction of time a batch holds its issues, in (0, 1]")
+	return fs, batch, pause, duty
+}
+
+// backfillExitCode maps a tagfacets.Run outcome to the process exit code, split out so a test can pin it
+// without a database: ErrAlreadyRunning must map to 2 (not 0), which the deploy Job's Backoff/Complete
+// semantics depend on (main's own comment: "so a mistaken second Job ends Failed rather than Complete").
+func backfillExitCode(err error) int {
+	switch {
+	case errors.Is(err, tagfacets.ErrAlreadyRunning):
+		return 2
+	case err != nil:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// runTagFacetsBackfill is the `backfill-tag-facets` subcommand (sentinel-issue-tag-facets spec §4.1-§4.2).
+func runTagFacetsBackfill(parent context.Context, logger *slog.Logger, dbCfg database.Config, args []string) int {
+	fs, batch, pause, duty := backfillFlags()
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	dbCfg.MaxConns, dbCfg.MinConns = 2, 1
+	pool, err := database.NewConnection(ctx, dbCfg)
+	if err != nil {
+		logger.ErrorContext(ctx, "tag facets backfill: database connection failed",
+			slog.String("event", "tag_facets.backfill.failed"), slog.String("error", err.Error()))
+		return 1
+	}
+	defer pool.Close()
+	_, err = tagfacets.Run(ctx, pool, tagfacets.Options{Batch: *batch, Pause: *pause, Duty: *duty, Logger: logger})
+	if err != nil && !errors.Is(err, tagfacets.ErrAlreadyRunning) {
+		logger.ErrorContext(ctx, "tag facets backfill failed",
+			slog.String("event", "tag_facets.backfill.failed"), slog.String("error", err.Error()))
+	}
+	return backfillExitCode(err)
 }

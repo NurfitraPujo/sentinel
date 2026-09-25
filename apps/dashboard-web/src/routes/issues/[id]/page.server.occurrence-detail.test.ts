@@ -38,6 +38,7 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		trendForIssue: vi.fn(async () => ({ hourly: [], daily: [] })),
 		getOccurrenceDetail: getOccurrenceDetailMock,
 		occurrenceExistsOutsideIssue: occurrenceExistsOutsideIssueMock,
+		getTagFacets: vi.fn(async () => []),
 	},
 }));
 vi.mock('$lib/db/queries/issues', () => ({ getIssueRelations: vi.fn(async () => []) }));

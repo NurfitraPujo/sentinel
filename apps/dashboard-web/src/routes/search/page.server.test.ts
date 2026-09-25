@@ -145,3 +145,57 @@ describe('GET /search page load (§4.5 change 1)', () => {
 		expect(data.environments).toEqual([]);
 	});
 });
+
+/**
+ * sentinel-issue-tag-facets §6.7 (tfr-search-page-behaviour-unproven): the page-level tag behaviours the
+ * spec requires but no test failed if removed — the MAX_TAG_FILTERS cap, dedupe, removeTagHref dropping
+ * exactly the clicked tag, and the loader never emitting a raw {@html}-able string.
+ */
+describe('GET /search tag filter collection (§6.7)', () => {
+	it('keeps only the first MAX_TAG_FILTERS distinct tags, listing the rest as ignored', async () => {
+		const params = Array.from({ length: 12 }, (_, i) => `tag=k${i}:v${i}`).join('&');
+		const data = await loadWith(`?${params}`);
+
+		expect(data.filters.tags).toHaveLength(10);
+		expect(data.filters.tags.map((t: { key: string }) => t.key)).toEqual(
+			Array.from({ length: 10 }, (_, i) => `k${i}`)
+		);
+		expect(data.ignoredTagTerms).toEqual(['k10:v10', 'k11:v11']);
+	});
+
+	it('de-duplicates identical (key, value) pairs across tag= params and box tokens', async () => {
+		const data = await loadWith(`?tag=release:1.0&tag=release:1.0&search=${encodeURIComponent('release:1.0 boom')}`);
+
+		expect(data.filters.tags).toHaveLength(1);
+		expect(data.filters.tags[0]).toMatchObject({ key: 'release', value: '1.0' });
+		// data.filters.search is the box's raw original text (what re-populates the input); the box's
+		// remainder after pulling the tag token out is what searchErrors actually receives as `search`.
+		expect(data.filters.search).toBe('release:1.0 boom');
+		const searchErrorsFilters = searchErrorsMock.mock.calls[0][1];
+		expect(searchErrorsFilters.search.trim()).toBe('boom');
+	});
+
+	it("removeHref keeps every OTHER active tag and drops exactly the clicked one", async () => {
+		const data = await loadWith('?tag=release:1.0&tag=os.name:linux&environment=staging');
+		const tags = data.filters.tags as { key: string; value: string; removeHref: string }[];
+		expect(tags).toHaveLength(2);
+
+		const releaseTag = tags.find((t) => t.key === 'release')!;
+		const url = new URL(`http://x${releaseTag.removeHref}`);
+		const remaining = url.searchParams.getAll('tag');
+
+		expect(remaining).toEqual(['os.name:linux']);
+		expect(remaining).not.toContain('release:1.0');
+		expect(url.searchParams.get('environment')).toBe('staging');
+	});
+
+	it('TAG_KEY_PATTERN rejects a poisoned key outright, so it never reaches filters.tags', async () => {
+		// This is a loader-level test: it proves the key is REJECTED, not that any rendering is safe (the
+		// loader renders nothing). The {@html} rendering guarantee itself — that the raw ignoredTagTerms
+		// text this loader hands to the page is never interpreted as markup — is proven at the component
+		// level, in page.svelte.test.ts (tfr2-search-html-test-decoration).
+		const data = await loadWith(`?${new URLSearchParams({ tag: '<img src=x onerror=alert(1)>:v' }).toString()}`);
+		expect(data.filters.tags).toEqual([]);
+		expect(data.ignoredTagTerms.some((t: string) => t.includes('<img'))).toBe(true);
+	});
+});

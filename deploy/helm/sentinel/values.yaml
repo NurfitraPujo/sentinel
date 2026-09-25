@@ -437,17 +437,44 @@ retentionCron:
     # A plain curl image — the Job only makes one HTTP POST, no first-party code.
     repository: docker.io/curlimages/curl
     tag: "8.7.1"
-  timeoutSeconds: 30
+  # curl --max-time. sentinel-issue-tag-facets §5: a run may take up to its 170 s deadline (the occurrence
+  # step's 120 s budget, the deferred rebuilds' 9 s, 30 s for the rest), and the deadline must be <= this
+  # minus 10 s so a live run has answered before curl gives up. tests/unit/tag_facets_gate_test.go
+  # asserts it, and that the compose loop's RETENTION_CRON_TIMEOUT_SECONDS equals it.
+  timeoutSeconds: 180
   # If the controller misses a scheduled time by more than this (e.g. controller downtime), skip it.
   startingDeadlineSeconds: 120
   # Kill a run that hangs past this so a wedged Job cannot block the next (concurrencyPolicy: Forbid).
-  activeDeadlineSeconds: 120
+  # Three attempts of 180 s fit, still far inside the hourly interval.
+  activeDeadlineSeconds: 600
   backoffLimit: 2
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   resources:
     requests: { cpu: 10m, memory: 16Mi }
     limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# tagFacetsBackfill -- sentinel-issue-tag-facets spec §4.1. `processor backfill-tag-facets` (the processor
+# image) counts the occurrences stored before the issue_tag_values triggers existed, once per environment.
+# The template renders a SUSPENDED CronJob with a never-firing schedule and no sync hook: ArgoCD syncs it
+# and never runs it; the operator creates one Job from it (RUNBOOK.md "Tag facets backfill"). Enabled by
+# default so the operator can create that Job after the deploy; after P2 passes an overlay MAY set
+# enabled: false, which removes the CronJob and the Jobs it owns.
+# -----------------------------------------------------------------------------
+tagFacetsBackfill:
+  enabled: true
+  # -batch: rows per batch transaction (1-5000). Every batch locks every hot issue it touches for its
+  # duration, so the size bounds a delivery's wait (~26 ms p95 measured at 200), not throughput.
+  batch: 200
+  # -pause: the floor of the sleep between batches (a Go duration).
+  pause: 200ms
+  # -duty: the most of the wall-clock time a batch may hold its issues; the sleep after a batch of
+  # t is max(pause, t x (1 - duty) / duty).
+  duty: 0.25
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
 
 # -----------------------------------------------------------------------------
 # oncall-escalation cron — sentinel-user-report-issue §4.4b. A SECOND scheduled job, not a
@@ -500,6 +527,9 @@ prometheusRule:
   # The stalled-escalation backstop compares two counters over the same window, so the window has
   # to be long enough for a normal quiet period not to look like a stall.
   stalledWindow: 1h
+  # sentinel-retention: the failure alerts look back two hourly runs; "not completing" three.
+  retentionWindow: 2h
+  retentionStalledWindow: 3h
   severity:
     exhausted: critical
     unresolved: warning
@@ -510,6 +540,11 @@ prometheusRule:
     sourcemapFetchErrors: warning
     sourcemapCacheThrash: warning
     sourcemapUploadStorageErrors: warning
+    # The sentinel-retention group (sentinel-issue-tag-facets §5): a stale route lock stops occurrence
+    # deletion and every reaper on the route, so it pages.
+    retentionLockStale: critical
+    retentionFailing: warning
+    retentionNotCompleting: warning
 
 # -----------------------------------------------------------------------------
 # Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.

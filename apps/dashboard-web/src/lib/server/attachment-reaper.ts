@@ -29,8 +29,13 @@ import { log } from './observability/log';
 
 const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000;
 
+// sentinel-issue-tag-facets §5 rule 3: the retention route passes its run's connection as `exec` and
+// its deadline as `signal`; the loop stops before its next object once the signal has aborted (the
+// object is deleted before its row, so a stopped reaper leaves both for the next run).
 async function deleteOrphanRows(
-	rows: { id: string; storageKey: string }[]
+	rows: { id: string; storageKey: string }[],
+	exec: typeof db = db,
+	signal?: AbortSignal
 ): Promise<number> {
 	if (rows.length === 0) {
 		return 0;
@@ -38,9 +43,10 @@ async function deleteOrphanRows(
 
 	let deleted = 0;
 	for (const row of rows) {
+		if (signal?.aborted) break;
 		try {
 			if (isStorageConfigured()) {
-				await deleteObject(row.storageKey);
+				await (signal ? deleteObject(row.storageKey, signal) : deleteObject(row.storageKey));
 			}
 		} catch (err) {
 			// Storage delete failing must not stop the sweep for the OTHER rows, and must not delete
@@ -49,7 +55,7 @@ async function deleteOrphanRows(
 			continue;
 		}
 
-		const result = await db
+		const result = await exec
 			.delete(attachments)
 			.where(eq(attachments.id, row.id))
 			.returning({ id: attachments.id });
@@ -85,15 +91,15 @@ export async function reapOrgOrphanAttachments(organizationId: string): Promise<
 }
 
 /** Unconditional global sweep, driven by `POST /api/cron/retention` (mirrors D42's global reap). */
-export async function reapAllOrphanAttachments(): Promise<number> {
+export async function reapAllOrphanAttachments(exec: typeof db = db, signal?: AbortSignal): Promise<number> {
 	const cutoff = new Date(Date.now() - ORPHAN_AGE_MS);
 
-	const rows = await db
+	const rows = await exec
 		.select({ id: attachments.id, storageKey: attachments.storageKey })
 		.from(attachments)
 		.where(
 			and(isNull(attachments.issueId), isNull(attachments.commentId), lt(attachments.createdAt, cutoff))
 		);
 
-	return await deleteOrphanRows(rows);
+	return await deleteOrphanRows(rows, exec, signal);
 }

@@ -4,6 +4,7 @@ import { eq, ne, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort } from "$lib/server/issue-sort";
 import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
+import type { TagFacetRow } from "$lib/tag-facets";
 
 export interface IssueFilters {
     status?: string;
@@ -594,6 +595,41 @@ export const issueQueries = {
             .from(users)
             .innerJoin(organizationMembers, eq(organizationMembers.userId, users.id))
             .where(inArray(organizationMembers.organizationId, orgIds));
+    },
+
+    /**
+     * sentinel-issue-tag-facets spec §7.2 (TASK-02): the issue page's tag distribution, ONE statement
+     * per page load over the `issue_tag_values` rollup (never one per key): each key's top 5 named
+     * values (count descending, then value in byte order), its overflow row (`value = ''`) when it has
+     * one, and its total over every row. The derived-key display order comes from
+     * `issue_tag_derived(NULL, NULL, NULL, NULL)` (the one list of derived keys, in the migration), never
+     * from a TypeScript list. Callers have already passed both access checks for this issue; every row
+     * belongs to it. The PK `(issue_id, key, value)` serves the range.
+     */
+    async getTagFacets(issueId: string): Promise<TagFacetRow[]> {
+        const rows = await db.execute<{
+            key: string;
+            value: string;
+            count: string | number;
+            key_total: string | number;
+            derived_ord: number | null;
+        }>(sql`
+            SELECT s.key, s.value, s.count, s.key_total, d.ord AS derived_ord
+              FROM (SELECT t.key, t.value, t.count,
+                           sum(t.count) OVER (PARTITION BY t.key) AS key_total,
+                           row_number() OVER (PARTITION BY t.key ORDER BY (t.value = ''), t.count DESC, t.value COLLATE "C") AS rn
+                      FROM issue_tag_values t
+                     WHERE t.issue_id = ${issueId}) s
+              LEFT JOIN issue_tag_derived(NULL, NULL, NULL, NULL) d ON d.key = s.key
+             WHERE s.rn <= 5 OR s.value = ''
+             ORDER BY d.ord NULLS LAST, s.key COLLATE "C", s.rn`);
+        return rows.map((r) => ({
+            key: r.key,
+            value: r.value,
+            count: Number(r.count),
+            keyTotal: Number(r.key_total),
+            derivedOrd: r.derived_ord === null ? null : Number(r.derived_ord),
+        }));
     },
 
     /**
