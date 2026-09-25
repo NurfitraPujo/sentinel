@@ -11,8 +11,13 @@ import { getIssueRelations } from '$lib/db/queries/issues';
 import { listPickerReleases, type PickerRelease } from '$lib/db/queries/releases';
 import { getRetentionDays } from '$lib/server/retention-window';
 import { detailTrendWindow } from '$lib/server/trend-window';
+import { cleanOccurrenceRow } from '$lib/server/json-safe';
 
-export const load: PageServerLoad = async ({ params, locals }) => {
+// sentinel-occurrence-detail-panels §3.2: the shape of an occurrence id. Tested against the lower-cased
+// parameter, so a malformed value (S4) never reaches a query, where Postgres would answer 22P02 → 500.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export const load: PageServerLoad = async ({ params, locals, url }) => {
 	const session = await locals.auth();
 	if (!session?.user?.id) {
 		throw error(401, 'Unauthorized');
@@ -84,6 +89,45 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	const { windowStart, windowEnd } = detailTrendWindow(new Date());
 	const trend = await issueQueries.trendForIssue(issueId, windowStart, windowEnd);
 	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
+	// sentinel-occurrence-detail-panels §3.2: the selected occurrence, read AFTER both access checks
+	// above, so their errors and order are unchanged. `url?.` is binding: a loader test that builds its
+	// event without a `url` (page.server.test.ts's loadAs) must reach S1, not throw. The heavy JSONB
+	// bodies are read for this ONE occurrence only (§3.1, §3.3).
+	const raw = url?.searchParams.get('occurrence') ?? null;
+	const defaultId = occurrences[0]?.id ?? null;
+	let selectedOccurrenceId: string | null = defaultId;
+	let occurrenceDetail: Awaited<ReturnType<typeof issueQueries.getOccurrenceDetail>> | null = null;
+	let detailRead = false;
+	if (raw) {
+		const id = raw.toLowerCase();
+		if (occurrences.some((o) => o.id === id)) {
+			// S2: a listed occurrence.
+			selectedOccurrenceId = id;
+		} else if (UUID_RE.test(id)) {
+			const scoped = await issueQueries.getOccurrenceDetail(issueId, id);
+			if (scoped) {
+				// S3a: an occurrence of THIS issue older than the newest 100. It renders selected, whatever
+				// its level, and is not read again.
+				selectedOccurrenceId = id;
+				occurrenceDetail = scoped;
+				detailRead = true;
+			} else if (await issueQueries.occurrenceExistsOutsideIssue(issueId, id)) {
+				// S3b: another issue's (or project's) occurrence. Out of scope; the message says nothing
+				// about where the id lives.
+				throw error(404, 'Occurrence not found');
+			}
+			// S3c: unknown (never stored, or swept). The default, no error.
+		}
+		// S4: not UUID-shaped. The default, and the value never reaches a query.
+	}
+	if (!detailRead && selectedOccurrenceId !== null) {
+		// Only a v2 row (non-null `level`, T8) has panels, so a pre-v2 selection reads nothing. A null
+		// result (the row vanished between the two reads) is not an error: the page renders no panels.
+		const listed = occurrences.find((o) => o.id === selectedOccurrenceId);
+		if (listed && listed.level !== null && listed.level !== undefined) {
+			occurrenceDetail = await issueQueries.getOccurrenceDetail(issueId, selectedOccurrenceId);
+		}
+	}
 	// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
 	// `getOccurrencesByIssueId` caps at 100. The heading takes this real `COUNT(*)`; the list below
 	// says it is showing the most recent n.
@@ -104,7 +148,11 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 	return {
 		issue,
 		project: project ?? null,
-		occurrences,
+		// §3.4: every JSONB value passes through dropProtoKeys, so no stored `__proto__` key can make
+		// SvelteKit's serialiser throw (a 500 for the whole page, `metadata` included, before this).
+		occurrences: occurrences.map(cleanOccurrenceRow),
+		selectedOccurrenceId,
+		occurrenceDetail: occurrenceDetail ? cleanOccurrenceRow(occurrenceDetail) : null,
 		occurrenceTotal,
 		environmentDisplayName,
 		relations,

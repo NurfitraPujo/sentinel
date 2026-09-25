@@ -6,7 +6,8 @@ import {
   userSessionPreferences,
   projects,
   projectMembers,
-  projectEnvironmentGrants
+  projectEnvironmentGrants,
+  users
 } from '$lib/db/schema';
 import { eq, and, sql, count, lt } from 'drizzle-orm';
 import crypto from 'crypto';

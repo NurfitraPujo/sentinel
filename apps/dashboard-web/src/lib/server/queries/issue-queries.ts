@@ -1,6 +1,6 @@
 import { db } from "$lib/server/db";
 import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers, agents } from "$lib/db/schema";
-import { eq, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
+import { eq, ne, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort } from "$lib/server/issue-sort";
 import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
@@ -232,7 +232,12 @@ function issueOrder(sort: string | undefined): SQL[] {
     }
 }
 
-/** The pre-v2 `error_occurrences` columns the issue page receives (sentinel-event-schema-v2 §8.3). */
+/**
+ * The `error_occurrences` columns the issue page receives for every listed occurrence: the 12 pre-v2
+ * columns (sentinel-event-schema-v2 §8.3) plus the six light v2 header columns
+ * (sentinel-occurrence-detail-panels §3.1). The heavy JSONB bodies are not here; they go only to the
+ * selected occurrence, through `issuePageOccurrenceDetailColumns`.
+ */
 export const issuePageOccurrenceColumns = {
     id: errorOccurrences.id,
     issueId: errorOccurrences.issueId,
@@ -246,6 +251,29 @@ export const issuePageOccurrenceColumns = {
     eventId: errorOccurrences.eventId,
     projectId: errorOccurrences.projectId,
     createdAt: errorOccurrences.createdAt,
+    level: errorOccurrences.level,
+    message: errorOccurrences.message,
+    serverName: errorOccurrences.serverName,
+    transaction: errorOccurrences.transaction,
+    dist: errorOccurrences.dist,
+    sdk: errorOccurrences.sdk,
+};
+
+/**
+ * The whole row the issue page can render, for the ONE selected occurrence
+ * (sentinel-occurrence-detail-panels §3.1): the list keys (a selection older than the newest 100 has
+ * no listed row to borrow them from) plus the six heavy JSONB bodies. `user` is aliased to
+ * `eventUser` as `agentOccurrenceColumns` does. `logger`, `errorClass`, `source`, `traceFlags` and
+ * `receivedAt` are not rendered, so not selected.
+ */
+export const issuePageOccurrenceDetailColumns = {
+    ...issuePageOccurrenceColumns,
+    user: errorOccurrences.eventUser,
+    tags: errorOccurrences.tags,
+    contexts: errorOccurrences.contexts,
+    request: errorOccurrences.request,
+    breadcrumbs: errorOccurrences.breadcrumbs,
+    exception: errorOccurrences.exception,
 };
 
 export const issueQueries = {
@@ -258,10 +286,10 @@ export const issueQueries = {
         return issue || null;
     },
 
-    // sentinel-event-schema-v2 §8.3: an explicit projection of the pre-v2 columns. A bare select()
-    // would start shipping every v2 JSONB body (breadcrumbs, contexts, request, ...) of up to 100
-    // occurrences to the issue page the moment the Drizzle table declared them -- a UI-visible payload
-    // change in a feature that promises none. The agent API is where the v2 fields are read.
+    // sentinel-occurrence-detail-panels §3.1: an explicit projection. The list carries the light header
+    // fields of every listed occurrence; the heavy v2 JSONB bodies (breadcrumbs, contexts, request, ...)
+    // go only to the selected one, through getOccurrenceDetail. A bare select() would ship every body
+    // of up to 100 occurrences to the page (§3.3 measures it at about 7x today's payload).
     async getOccurrencesByIssueId(issueId: string, limit = 100) {
         return await db
             .select(issuePageOccurrenceColumns)
@@ -269,6 +297,33 @@ export const issueQueries = {
             .where(eq(errorOccurrences.issueId, issueId))
             .orderBy(desc(errorOccurrences.createdAt))
             .limit(limit);
+    },
+
+    /**
+     * sentinel-occurrence-detail-panels §3.1: the selected occurrence's whole renderable row, or null.
+     * BOTH predicates are required: the issueId one is what stops an occurrence id from being read
+     * through another issue's page.
+     */
+    async getOccurrenceDetail(issueId: string, occurrenceId: string) {
+        const [row] = await db
+            .select(issuePageOccurrenceDetailColumns)
+            .from(errorOccurrences)
+            .where(and(eq(errorOccurrences.id, occurrenceId), eq(errorOccurrences.issueId, issueId)))
+            .limit(1);
+        return row ?? null;
+    },
+
+    /**
+     * sentinel-occurrence-detail-panels §3.2 S3b: whether the id belongs to some OTHER issue. Selects the
+     * id only, so no column of another issue's occurrence is read into the load. A primary-key lookup.
+     */
+    async occurrenceExistsOutsideIssue(issueId: string, occurrenceId: string): Promise<boolean> {
+        const rows = await db
+            .select({ id: errorOccurrences.id })
+            .from(errorOccurrences)
+            .where(and(eq(errorOccurrences.id, occurrenceId), ne(errorOccurrences.issueId, issueId)))
+            .limit(1);
+        return rows.length > 0;
     },
 
     /**

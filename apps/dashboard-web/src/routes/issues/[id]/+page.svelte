@@ -2,6 +2,20 @@
 	import type { PageData } from './$types';
 	import { untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	import OccurrenceHeader from '$lib/components/issues/OccurrenceHeader.svelte';
+	import StackFrames from '$lib/components/issues/StackFrames.svelte';
+	import TagsTable from '$lib/components/issues/TagsTable.svelte';
+	import RequestPanel from '$lib/components/issues/RequestPanel.svelte';
+	import UserPanel from '$lib/components/issues/UserPanel.svelte';
+	import ExceptionChain from '$lib/components/issues/ExceptionChain.svelte';
+	import BreadcrumbTimeline from '$lib/components/issues/BreadcrumbTimeline.svelte';
+	import ContextCards from '$lib/components/issues/ContextCards.svelte';
+	import {
+		displayedFrame,
+		formatStackFrame,
+		frameObjects,
+		hasV2Fields,
+	} from '$lib/components/issues/occurrence-display';
 
 	let { data } = $props();
 
@@ -42,19 +56,9 @@
 		}
 	}
 
-	// sentinel-sourcemaps §4.7 / flow `D5`: `:column` is appended when present and > 0 — `0` is the
-	// wire's "unknown" (§4.3) and a pre-feature frame has no key at all, so both render exactly the
-	// pre-feature string. The 50-char truncation stays (decision 8: original paths are verbatim).
-	function formatStackFrame(frame: { file: string; line: number; column?: number; function: string }): string {
-		let file = frame.file;
-		if (file.length > 50) {
-			const start = file.slice(0, 20);
-			const end = file.slice(-25);
-			file = start + '...' + end;
-		}
-		const column = frame.column && frame.column > 0 ? `:${frame.column}` : '';
-		return `at ${frame.function} (${file}:${frame.line}${column})`;
-	}
+	// `formatStackFrame` and `displayedFrame` moved verbatim to occurrence-display.ts
+	// (sentinel-occurrence-detail-panels §4.5): the pre-v2 card's `<pre>` and the v2 frame renderer
+	// share them.
 
 	// §4.7 — the per-occurrence symbolication state, derived client-side from the frames (contract
 	// D6: there is no occurrence-level field). `k` counts `symbolicated === true` exactly; a frame
@@ -71,12 +75,6 @@
 		if (n === 0 || k === 0) return null;
 		if (k === n) return 'Symbolicated';
 		return `Partially symbolicated (${k} of ${n})`;
-	}
-
-	// `D4`: in raw mode a frame with `raw` renders `raw`'s values; a frame without `raw` renders as
-	// itself in both modes (it was never rewritten, so its raw form IS its form).
-	function displayedFrame(frame: StackFrame, raw: boolean): { file: string; line: number; column?: number; function: string } {
-		return raw && frame.raw ? frame.raw : frame;
 	}
 
 	function getDateGroup(dateStr: string | Date | null): string {
@@ -151,7 +149,28 @@
 		traceId: string | null;
 		spanId: string | null;
 		createdAt: string | Date | null;
+		// sentinel-occurrence-detail-panels §3.1: the six light v2 columns. Optional: the existing page
+		// fixtures and a stale loader build omit them, and `null` on every pre-v2 row.
+		level?: string | null;
+		message?: string | null;
+		serverName?: string | null;
+		transaction?: string | null;
+		dist?: string | null;
+		sdk?: unknown;
 	}
+
+	// sentinel-occurrence-detail-panels §3.2: the selected occurrence and its detail row (the heavy
+	// columns). An ABSENT key is `null`, as for `canWrite` and `releases` below: the existing page
+	// fixtures omit both, and so does a stale loader build.
+	let selectedOccurrenceId = $derived((data.selectedOccurrenceId ?? null) as string | null);
+	let occurrenceDetail = $derived((data.occurrenceDetail ?? null) as (Occurrence & Record<string, unknown>) | null);
+	// S3a: a selected occurrence of this issue older than the newest 100 has no listed card, so it is
+	// rendered above the date groups.
+	let selectedOutsideWindow = $derived(
+		occurrenceDetail && !(data.occurrences as Occurrence[]).some((o) => o.id === occurrenceDetail!.id)
+			? occurrenceDetail
+			: null,
+	);
 
 	interface OccurrenceGroup {
 		date: string;
@@ -567,6 +586,114 @@
 	/>
 
 	<section class="occurrences">
+		{#snippet occurrenceCard(occurrence: Occurrence)}
+			<!--
+				sentinel-occurrence-detail-panels §4.5: one card, rendered by the date groups and by the S3a block.
+				A pre-v2 card (level null, T8) renders exactly as at the merge base (§10, P4). A v2 card adds the
+				select link or marker, its header facts and the frame renderer; the selected one adds the panels.
+			-->
+			{@const v2 = hasV2Fields(occurrence)}
+			{@const selected = v2 && occurrence.id === selectedOccurrenceId}
+			<!-- The panels render on the selected v2 card only, from its detail row (the heavy columns). -->
+			{@const detail = selected && occurrenceDetail && occurrenceDetail.id === occurrence.id ? occurrenceDetail : null}
+			<div class="occurrence-card" aria-current={selected ? 'true' : undefined}>
+				<div class="occurrence-header">
+					<span class="timestamp">{formatDate(occurrence.createdAt)}</span>
+					<span class="badge env">{occurrence.environment}</span>
+					<span class="badge platform">{occurrence.platform}</span>{#if v2}{#if selected}<span
+								class="selected-marker"
+								data-testid="selected-occurrence">Event details below</span
+							>{:else}<a
+								class="select-occurrence"
+								href="?occurrence={occurrence.id}"
+								data-sveltekit-noscroll
+								data-testid="select-occurrence">Show event details</a
+							>{/if}{/if}
+				</div>
+
+				{#if v2}
+					<OccurrenceHeader occurrence={occurrence} issueMessage={data.issue.message} />
+				{/if}
+
+				{#if occurrence.traceId}
+					<div class="trace-info">
+						<span class="trace-id">Trace: {occurrence.traceId}</span>
+						{#if occurrence.spanId}
+							<span class="span-id">Span: {occurrence.spanId}</span>
+						{/if}
+					</div>
+				{/if}
+
+				{#if detail}
+					<TagsTable tags={detail.tags} />
+				{/if}
+
+				{#if occurrence.stacktrace && occurrence.stacktrace.length > 0}
+					<!-- A v2 card counts over frameObjects: a hand-written null frame would throw in countSymbolicated. -->
+					{@const badge = symbolicationBadge(v2 ? (frameObjects(occurrence.stacktrace) as unknown as StackFrame[]) : occurrence.stacktrace)}
+					{@const showRaw = rawFrames.has(occurrence.id)}
+					<!--
+						sentinel-sourcemaps §4.7, flows `D1`–`D5`. The badge and the raw toggle sit on the
+						heading line and exist only when at least one frame is symbolicated — a pre-feature
+						occurrence renders this block exactly as before, heading and frames alike.
+					-->
+					<div class="stacktrace">
+						<div class="stacktrace-heading">
+							<h4>Stack Trace</h4>
+							{#if badge}
+								<span class="badge symbolication" data-testid="symbolication-badge">{badge}</span>
+								<button
+									type="button"
+									class="raw-frames-toggle"
+									data-testid="raw-frames-toggle"
+									aria-pressed={showRaw}
+									onclick={() => toggleRawFrames(occurrence.id)}
+								>
+									{showRaw ? 'Show symbolicated frames' : 'Show raw frames'}
+								</button>
+							{/if}
+						</div>
+						{#if v2}
+							<StackFrames frames={occurrence.stacktrace} {showRaw} />
+						{:else}
+							<pre><code>{#each occurrence.stacktrace as frame}{formatStackFrame(displayedFrame(frame, showRaw))}
+{/each}</code></pre>
+						{/if}
+					</div>
+				{/if}
+
+				{#if detail}
+					<ExceptionChain exception={detail.exception} platform={occurrence.platform} />
+					<!-- §8.2: createdAt passed as the load returned it (a Date on the real page), never converted. -->
+					<BreadcrumbTimeline breadcrumbs={detail.breadcrumbs} occurredAt={detail.createdAt} />
+					<RequestPanel request={detail.request} />
+					<UserPanel user={detail.user} />
+					<ContextCards contexts={detail.contexts} />
+				{/if}
+
+				<button
+					type="button"
+					class="metadata-toggle"
+					data-testid="metadata-toggle"
+					aria-pressed={expandedMetadata.has(occurrence.id)}
+					onclick={() => toggleMetadata(occurrence.id)}
+				>
+					{expandedMetadata.has(occurrence.id) ? 'Hide' : 'Show'} Metadata
+				</button>
+
+				{#if expandedMetadata.has(occurrence.id)}
+					<div class="metadata" data-testid="occurrence-metadata">
+						<h4>Metadata</h4>
+						{#if occurrence.metadata && Object.keys(occurrence.metadata).length > 0}
+							<pre><code>{JSON.stringify(occurrence.metadata, null, 2)}</code></pre>
+						{:else}
+							<p class="metadata-empty">No metadata recorded.</p>
+						{/if}
+					</div>
+				{/if}
+			</div>
+		{/snippet}
+
 		<!--
 			sentinel-project-environments task 1, flow `D2`. This read `({data.occurrences.length})`,
 			which is the PAGE SIZE — `getOccurrencesByIssueId` caps at 100 — presented as a total. The
@@ -580,76 +707,27 @@
 			</p>
 		{/if}
 
-		{#each occurrenceGroups as group}
+		{#if selectedOutsideWindow}
+			<!-- §3.2 S3a: the selected occurrence is older than every listed one; the same card, selected. -->
+			<div class="selected-outside-window" data-testid="selected-outside-window">
+				<p class="occurrence-window">This event is older than the {data.occurrences.length} most recent shown below.</p>
+				<!-- Keyed: another outside-window selection must not inherit this one's panel state. -->
+				{#key selectedOutsideWindow.id}
+					{@render occurrenceCard(selectedOutsideWindow)}
+				{/key}
+			</div>
+		{/if}
+
+		<!--
+			Keyed by occurrence id: the panels keep local state (crumb filters, open data, expanded runs,
+			chain, text), and an unkeyed each would hand a newly selected occurrence the card instance —
+			and that state — of whichever occurrence held its index before a new event shifted the list.
+		-->
+		{#each occurrenceGroups as group (group.date)}
 			<div class="date-group">
 				<h3 class="date-header">{group.date}</h3>
-				{#each group.occurrences as occurrence}
-					<div class="occurrence-card">
-						<div class="occurrence-header">
-							<span class="timestamp">{formatDate(occurrence.createdAt)}</span>
-							<span class="badge env">{occurrence.environment}</span>
-							<span class="badge platform">{occurrence.platform}</span>
-						</div>
-
-						{#if occurrence.traceId}
-							<div class="trace-info">
-								<span class="trace-id">Trace: {occurrence.traceId}</span>
-								{#if occurrence.spanId}
-									<span class="span-id">Span: {occurrence.spanId}</span>
-								{/if}
-							</div>
-						{/if}
-
-						{#if occurrence.stacktrace && occurrence.stacktrace.length > 0}
-							{@const badge = symbolicationBadge(occurrence.stacktrace)}
-							{@const showRaw = rawFrames.has(occurrence.id)}
-							<!--
-								sentinel-sourcemaps §4.7, flows `D1`–`D5`. The badge and the raw toggle sit on the
-								heading line and exist only when at least one frame is symbolicated — a pre-feature
-								occurrence renders this block exactly as before, heading and frames alike.
-							-->
-							<div class="stacktrace">
-								<div class="stacktrace-heading">
-									<h4>Stack Trace</h4>
-									{#if badge}
-										<span class="badge symbolication" data-testid="symbolication-badge">{badge}</span>
-										<button
-											type="button"
-											class="raw-frames-toggle"
-											data-testid="raw-frames-toggle"
-											aria-pressed={showRaw}
-											onclick={() => toggleRawFrames(occurrence.id)}
-										>
-											{showRaw ? 'Show symbolicated frames' : 'Show raw frames'}
-										</button>
-									{/if}
-								</div>
-								<pre><code>{#each occurrence.stacktrace as frame}{formatStackFrame(displayedFrame(frame, showRaw))}
-{/each}</code></pre>
-							</div>
-						{/if}
-
-						<button
-							type="button"
-							class="metadata-toggle"
-							data-testid="metadata-toggle"
-							aria-pressed={expandedMetadata.has(occurrence.id)}
-							onclick={() => toggleMetadata(occurrence.id)}
-						>
-							{expandedMetadata.has(occurrence.id) ? 'Hide' : 'Show'} Metadata
-						</button>
-
-						{#if expandedMetadata.has(occurrence.id)}
-							<div class="metadata" data-testid="occurrence-metadata">
-								<h4>Metadata</h4>
-								{#if occurrence.metadata && Object.keys(occurrence.metadata).length > 0}
-									<pre><code>{JSON.stringify(occurrence.metadata, null, 2)}</code></pre>
-								{:else}
-									<p class="metadata-empty">No metadata recorded.</p>
-								{/if}
-							</div>
-						{/if}
-					</div>
+				{#each group.occurrences as occurrence (occurrence.id)}
+					{@render occurrenceCard(occurrence)}
 				{/each}
 			</div>
 		{/each}
@@ -972,6 +1050,34 @@
 		font-family: var(--font-mono);
 		color: var(--text-subtle);
 		margin-bottom: 0.75rem;
+	}
+
+	/* sentinel-occurrence-detail-panels §3.2: the select link or marker ends a v2 card's header line. */
+	.select-occurrence,
+	.selected-marker {
+		margin-left: auto;
+		font-size: 0.75rem;
+	}
+
+	.select-occurrence {
+		color: var(--color-primary);
+		text-decoration: none;
+	}
+
+	.select-occurrence:hover {
+		text-decoration: underline;
+	}
+
+	.selected-marker {
+		color: var(--text-muted);
+	}
+
+	.occurrence-card[aria-current='true'] {
+		border-color: var(--color-primary);
+	}
+
+	.selected-outside-window {
+		margin-bottom: 1.5rem;
 	}
 
 	.stacktrace {

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { PageData } from './$types';
 	import { goto } from '$app/navigation';
+	import { untrack } from 'svelte';
 	import TrendSparkline from '$lib/components/issues/TrendSparkline.svelte';
 
 	let { data } = $props();
@@ -159,7 +160,7 @@
 		{ value: '24h', label: 'New in the last 24 hours' },
 	];
 
-	let searchQuery = $state(data.filters.q ?? '');
+	let searchQuery = $state(untrack(() => data.filters.q ?? ''));
 	$effect(() => {
 		searchQuery = data.filters.q ?? '';
 	});
