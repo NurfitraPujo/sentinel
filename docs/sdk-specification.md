@@ -70,9 +70,7 @@ SDKs MUST construct a JSON HTTP POST body matching `sentinel.v1.ErrorEvent`:
     }
   ],
   "metadata": {
-    "http_method": "GET",
-    "http_url": "/api/users/99",
-    "user_id": "usr_7712"
+    "order_ref": "o-99881"
   },
   "source": "onerror",
   "level": "error",
@@ -355,6 +353,33 @@ survive; about one in ten arbitrary 13-19 digit numbers passes by chance and is 
 - One-time codes and other short secrets in free text (`your code is 492817`).
 - Short passwords: the `password=` pattern needs at least 8 characters (`pwd=1234567` is stored).
 - Account numbers, IBANs, national ids other than the SSN pattern, and any number that fails Luhn.
+
+### sdk-go: headers and query parameters
+
+`packages/sdk-go`'s `HTTPMiddleware`/`NewHTTPMiddleware` builds `request.headers` and `request.query_string`
+client-side, before an event ever reaches this server, using this same masking list plus header-specific rules
+it does not need for a query parameter:
+
+- **Credential headers are always dropped**, whatever the middleware's options: the five names
+  `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`; any header name containing `jwt`,
+  `assertion`, `oidc`, `principal` or `session` (identity-assertion headers set by an authenticating proxy —
+  Cloudflare Access, Google IAP, AWS ALB, Azure App Service, Pomerium — and session ids); and any header name
+  ending in `-key` (API-gateway keys such as `Ocp-Apim-Subscription-Key`, `X-Functions-Key`).
+- **Client-IP headers are always dropped**, whatever `MiddlewareOptions.CaptureClientIP` says: the seven names
+  `X-Forwarded-For`, `Forwarded`, `X-Real-Ip`, `True-Client-Ip`, `Cf-Connecting-Ip`, `X-Client-Ip`,
+  `X-Cluster-Client-Ip`; any header name containing `forwarded`, `client-ip`, `clientip`, `real-ip`,
+  `connecting-ip`, `connection-ip`, `originating-ip`, `remote-ip`, `remote-addr`, `external-address`, `user-ip`
+  or `socketip`; and any header whose value is nothing but IP addresses. `user.ip_address` is filled only on
+  opt-in, from the connection's own `r.RemoteAddr` — never from a header.
+- **A kept header whose value is a URL** (`Referer`, `Location`, `Content-Location`, `X-Original-Url`,
+  `X-Original-Uri`, `X-Rewrite-Url`) gets its query filtered by the same masking-key list as `query_string`
+  below, and its fragment and any `user:password@` userinfo removed; a value that does not parse as a URL drops
+  the whole header. `Link` is never recorded.
+- **`query_string`** keeps every parameter's name and order, replacing the value of any parameter whose
+  unescaped name matches this masking-key list with `[FILTERED]`. The query is split on `&` **and** `;`.
+
+Everything not listed above — `Accept`, `User-Agent`, `Host`, and any header or query parameter name this list
+does not match — is recorded as sent.
 
 ---
 

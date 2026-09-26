@@ -155,15 +155,31 @@ func TestU8_RealSDKEndToEndPipeline(t *testing.T) {
 		}
 		t.Errorf("occurrence.release_version = %s, want \"1.2.3-sdk-e2e\" (S5/B6: release_version must survive Normalize as a first-class field, not via metadata)", got)
 	}
-	if len(occ.Metadata) == 0 {
-		t.Error("occurrence.metadata is empty - want the SDK's context tags (user_id, case) to have survived to Postgres")
+	// sentinel.WithUser and sentinel.WithTag route to the typed event_user and tags columns (spec
+	// §3.4's metadata-routed table), not metadata - plan.md C8: this used to assert metadata["user_id"],
+	// which stopped proving anything once WithUser stopped writing there.
+	if len(occ.EventUser) == 0 {
+		t.Error("occurrence.event_user is empty - want the typed user set via sentinel.WithUser to have survived to Postgres")
 	} else {
-		var meta map[string]any
-		if err := json.Unmarshal(occ.Metadata, &meta); err != nil {
-			t.Fatalf("occurrence.metadata was not valid JSON: %v\n  raw: %s", err, occ.Metadata)
+		var user struct {
+			ID string `json:"id"`
 		}
-		if _, ok := meta["user_id"]; !ok {
-			t.Errorf("occurrence.metadata missing \"user_id\" tag set via sentinel.WithUser; got keys: %v", sdkMetaKeys(meta))
+		if err := json.Unmarshal(occ.EventUser, &user); err != nil {
+			t.Fatalf("occurrence.event_user was not valid JSON: %v\n  raw: %s", err, occ.EventUser)
+		}
+		if user.ID != "u8-user" {
+			t.Errorf("occurrence.event_user.id = %q, want \"u8-user\"", user.ID)
+		}
+	}
+	if len(occ.Tags) == 0 {
+		t.Error("occurrence.tags is empty - want the \"case\" tag set via sentinel.WithTag to have survived to Postgres")
+	} else {
+		var tags map[string]string
+		if err := json.Unmarshal(occ.Tags, &tags); err != nil {
+			t.Fatalf("occurrence.tags was not valid JSON: %v\n  raw: %s", err, occ.Tags)
+		}
+		if tags["case"] != "u8-real-sdk-pipeline" {
+			t.Errorf("occurrence.tags[\"case\"] = %q, want \"u8-real-sdk-pipeline\"; got tags: %v", tags["case"], tags)
 		}
 	}
 

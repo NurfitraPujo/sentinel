@@ -4,11 +4,117 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
+
+const (
+	SDKName    = "sentinel.go"
+	SDKVersion = "0.4.0" // equals the CHANGELOG's newest heading and the tag (spec §7, P4.1)
+)
+
+// Levels the ingestor accepts (apps/ingestor-go/validation/bounds.go: validLevels).
+const (
+	LevelFatal   = "fatal"
+	LevelError   = "error"
+	LevelWarning = "warning"
+	LevelInfo    = "info"
+	LevelDebug   = "debug"
+)
+
+// SDKInfo identifies the SDK that produced an event.
+type SDKInfo struct {
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// UserInfo identifies the user affected by an event. Geo is server-derived
+// and deliberately not exposed here.
+type UserInfo struct {
+	ID        string `json:"id,omitempty"`
+	Username  string `json:"username,omitempty"`
+	Email     string `json:"email,omitempty"`
+	IPAddress string `json:"ip_address,omitempty"`
+}
+
+// RequestInfo carries the HTTP request an event was captured for. Data and
+// Env are never set by the SDK itself (only a NewEvent caller may set them).
+type RequestInfo struct {
+	Method      string            `json:"method,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	QueryString string            `json:"query_string,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Data        interface{}       `json:"data,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
+// Breadcrumb is one entry of an event's trail of what happened before the
+// error. Timestamp is always set by the SDK (never omitempty, unlike every
+// other field here).
+type Breadcrumb struct {
+	Timestamp time.Time              `json:"timestamp"`
+	Type      string                 `json:"type,omitempty"`
+	Category  string                 `json:"category,omitempty"`
+	Level     string                 `json:"level,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+}
+
+// NormalizeLevel maps a level name to one the ingestor accepts, or "" when
+// there is none. Case-insensitive, surrounding whitespace ignored.
+func NormalizeLevel(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case LevelFatal:
+		return LevelFatal
+	case LevelError:
+		return LevelError
+	case LevelWarning:
+		return LevelWarning
+	case LevelInfo:
+		return LevelInfo
+	case LevelDebug:
+		return LevelDebug
+	case "warn":
+		return LevelWarning
+	case "panic":
+		return LevelFatal
+	case "trace":
+		return LevelDebug
+	default:
+		return ""
+	}
+}
+
+var (
+	resolvedHostname     string
+	resolvedHostnameOnce sync.Once
+)
+
+// hostname resolves os.Hostname() once per process (§3.2).
+func hostname() string {
+	resolvedHostnameOnce.Do(func() {
+		h, err := os.Hostname()
+		if err == nil {
+			resolvedHostname = h
+		}
+	})
+	return resolvedHostname
+}
+
+// goVersionForWire renders runtime.Version() the way docs/sdk-specification.md
+// §3's example shows it: a leading "go" is removed when a digit follows
+// ("go1.26.4" -> "1.26.4"); any other form ("devel ...") is sent as is.
+func goVersionForWire() string {
+	v := runtime.Version()
+	if strings.HasPrefix(v, "go") && len(v) > 2 && v[2] >= '0' && v[2] <= '9' {
+		return v[2:]
+	}
+	return v
+}
 
 type Frame struct {
 	Function string `json:"function"`
@@ -94,6 +200,48 @@ type Event struct {
 	// emitted as "context", which the ingestor never read (VERIFIED_STATE.md
 	// S4) - the field the server actually maps is "metadata".
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+
+	Level       string                            `json:"level,omitempty"`
+	SDK         *SDKInfo                          `json:"sdk,omitempty"`
+	ServerName  string                            `json:"server_name,omitempty"`
+	Transaction string                            `json:"transaction,omitempty"`
+	User        *UserInfo                         `json:"user,omitempty"`
+	Tags        map[string]string                 `json:"tags,omitempty"`
+	Contexts    map[string]map[string]interface{} `json:"contexts,omitempty"`
+	Request     *RequestInfo                      `json:"request,omitempty"`
+	Breadcrumbs []Breadcrumb                      `json:"breadcrumbs,omitempty"`
+
+	// preOptionsErrorClass and preOptionsFingerprint record what NewEvent
+	// itself computed for ErrorClass/Fingerprint, before opts ran, together
+	// with whether the SDK's own WithEventErrorClass/WithEventFingerprint
+	// options were used. ApplyContext's metadata row reads these so that an
+	// option always wins over the context's metadata keys on both fields
+	// (spec §3.2, §4.3). Never marshalled.
+	preOptionsErrorClass  string
+	preOptionsFingerprint string
+	optionSetErrorClass   bool
+	optionSetFingerprint  bool
+	builtByNewEvent       bool
+}
+
+// errorClassWasSet reports whether something other than NewEvent's own
+// default set ev.ErrorClass (spec §3.2): the SDK's WithEventErrorClass
+// option was used, or the value changed from what NewEvent computed. An
+// event not built by NewEvent counts a non-empty class as set.
+func (ev *Event) errorClassWasSet() bool {
+	if !ev.builtByNewEvent {
+		return ev.ErrorClass != ""
+	}
+	return ev.optionSetErrorClass || ev.ErrorClass != ev.preOptionsErrorClass
+}
+
+// fingerprintWasSet reports whether something other than NewEvent's own
+// default set ev.Fingerprint (spec §3.2). See errorClassWasSet.
+func (ev *Event) fingerprintWasSet() bool {
+	if !ev.builtByNewEvent {
+		return ev.Fingerprint != ""
+	}
+	return ev.optionSetFingerprint || ev.Fingerprint != ev.preOptionsFingerprint
 }
 
 func ExtractStacktrace(skip int) []Frame {
@@ -285,6 +433,7 @@ type EventOption func(*Event)
 func WithEventFingerprint(fingerprint string) EventOption {
 	return func(e *Event) {
 		e.Fingerprint = fingerprint
+		e.optionSetFingerprint = true
 	}
 }
 
@@ -292,6 +441,7 @@ func WithEventFingerprint(fingerprint string) EventOption {
 func WithEventErrorClass(errorClass string) EventOption {
 	return func(e *Event) {
 		e.ErrorClass = errorClass
+		e.optionSetErrorClass = true
 	}
 }
 
@@ -313,6 +463,23 @@ func NewEvent(cfg Config, err error, ctxTags map[string]interface{}, opts ...Eve
 		}
 	}
 
+	serverName := cfg.ServerName
+	if serverName == "" {
+		serverName = os.Getenv("SENTINEL_SERVER_NAME")
+	}
+	if serverName == "" {
+		serverName = hostname()
+	}
+
+	metadata := ScrubPII(ctxTags)
+	if metadata == nil {
+		// A NewEvent caller with no ctxTags (core's NewEvent(cfg, nil, nil))
+		// still gets a non-nil map, so it, an option or BeforeSend can write
+		// into it as it can into Tags (spec §3.2). The wire is unchanged:
+		// metadata is omitempty, so an empty map is omitted exactly as nil was.
+		metadata = make(map[string]interface{})
+	}
+
 	ev := &Event{
 		EventID:        newEventID(),
 		ProjectKey:     cfg.ProjectKey,
@@ -324,7 +491,21 @@ func NewEvent(cfg Config, err error, ctxTags map[string]interface{}, opts ...Eve
 		Timestamp:      time.Now().UTC(),
 		Environment:    cfg.Environment,
 		ReleaseVersion: cfg.ReleaseVersion,
-		Metadata:       ScrubPII(ctxTags),
+		Metadata:       metadata,
+
+		Level:      LevelError,
+		SDK:        &SDKInfo{Name: SDKName, Version: SDKVersion},
+		ServerName: serverName,
+		Tags:       make(map[string]string),
+		Contexts: map[string]map[string]interface{}{
+			"runtime": {"name": "go", "version": goVersionForWire()},
+			"os":      {"name": runtime.GOOS},
+			"device":  {"arch": runtime.GOARCH},
+		},
+
+		preOptionsErrorClass:  errClass,
+		preOptionsFingerprint: fp,
+		builtByNewEvent:       true,
 	}
 
 	for _, opt := range opts {

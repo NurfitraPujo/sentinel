@@ -565,6 +565,12 @@ type occurrenceRow struct {
 	// pre-W0/legacy rows and any event that never carried a usable id have this as nil, never "": D-b's
 	// NULLIF mapping and CHECK constraint both exist specifically to make "" unreachable in this column.
 	EventID *string
+	// EventUser and Tags are two of migration 1725300000's 17 v2 columns (sentinel-event-schema-v2
+	// §6.1): the event's typed user (processor_service.go's `marshal("event_user", evt.User, ...)`,
+	// event.User's json tags: id/username/email/ip_address) and its typed tags map, each NULL when the
+	// event carried none. plan.md C8: U8 asserts the SDK's WithUser lands here, not in metadata.
+	EventUser []byte
+	Tags      []byte
 }
 
 func (f *fixture) occurrences() []occurrenceRow {
@@ -572,7 +578,7 @@ func (f *fixture) occurrences() []occurrenceRow {
 	rows, err := pool.Query(context.Background(),
 		`SELECT eo.id::text, eo.issue_id::text, i.message, eo.platform, eo.environment,
 		        eo.release_version, eo.trace_id, eo.span_id, eo.metadata, eo.stacktrace, eo.created_at,
-		        eo.event_id
+		        eo.event_id, eo.event_user, eo.tags
 		   FROM error_occurrences eo
 		   JOIN issues i ON i.id = eo.issue_id
 		  WHERE i.project_id = $1
@@ -587,7 +593,7 @@ func (f *fixture) occurrences() []occurrenceRow {
 		var r occurrenceRow
 		if err := rows.Scan(&r.ID, &r.IssueID, &r.IssueMessage, &r.Platform, &r.Environment,
 			&r.ReleaseVersion, &r.TraceID, &r.SpanID, &r.Metadata, &r.Stacktrace, &r.CreatedAt,
-			&r.EventID); err != nil {
+			&r.EventID, &r.EventUser, &r.Tags); err != nil {
 			f.t.Fatalf("scanning occurrence: %v", err)
 		}
 		out = append(out, r)

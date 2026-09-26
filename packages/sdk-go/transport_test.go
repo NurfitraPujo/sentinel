@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,19 +10,101 @@ import (
 	"time"
 )
 
+func sliceContainsStr(s []interface{}, v string) bool {
+	for _, e := range s {
+		if str, ok := e.(string); ok && str == v {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPrepareEventIsolatesFailingMetadata proves step 2's isolation records
+// what it removed in the SDK's own truncated/truncated_keys marker (spec
+// §3.4), not just in the event's own copy - transport.go:88's removeFailingEntries
+// used to discard its own return values.
+func TestPrepareEventIsolatesFailingMetadata(t *testing.T) {
+	ev := NewEvent(Config{ProjectKey: "pk_test"}, nil, nil)
+	ev.Metadata = map[string]interface{}{"bad": math.NaN(), "good": "ok"}
+
+	raw, err := prepareEvent(ev, Config{ProjectKey: "pk_test", ServerName: "s"})
+	if err != nil {
+		t.Fatalf("prepareEvent: %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	metadata, _ := decoded["metadata"].(map[string]interface{})
+	if metadata == nil {
+		t.Fatal("expected metadata in the output")
+	}
+	if _, ok := metadata["bad"]; ok {
+		t.Error("expected the unmarshallable entry removed")
+	}
+	if metadata["good"] != "ok" {
+		t.Errorf("expected the surviving entry kept, got %v", metadata["good"])
+	}
+	truncated, _ := metadata["truncated"].([]interface{})
+	if !sliceContainsStr(truncated, "metadata") {
+		t.Errorf("truncated = %v, want it to contain %q", truncated, "metadata")
+	}
+	keys, _ := metadata["truncated_keys"].([]interface{})
+	if !sliceContainsStr(keys, "bad") {
+		t.Errorf("truncated_keys = %v, want it to contain %q", keys, "bad")
+	}
+}
+
+// TestPrepareEventIsolatesFailingContexts is TestPrepareEventIsolatesFailingMetadata's
+// contexts counterpart: an unmarshallable context is isolated per spec §3.5
+// step 2, and that removal is recorded in the SDK's marker under
+// "contexts.<name>" (spec §3.4).
+func TestPrepareEventIsolatesFailingContexts(t *testing.T) {
+	ev := NewEvent(Config{ProjectKey: "pk_test"}, nil, nil)
+	ev.Contexts = map[string]map[string]interface{}{
+		"bad":  {"v": math.NaN()},
+		"good": {"v": "ok"},
+	}
+
+	raw, err := prepareEvent(ev, Config{ProjectKey: "pk_test", ServerName: "s"})
+	if err != nil {
+		t.Fatalf("prepareEvent: %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	contexts, _ := decoded["contexts"].(map[string]interface{})
+	if _, ok := contexts["bad"]; ok {
+		t.Error("expected the unmarshallable context removed")
+	}
+	if _, ok := contexts["good"]; !ok {
+		t.Error("expected the surviving context kept")
+	}
+	metadata, _ := decoded["metadata"].(map[string]interface{})
+	if metadata == nil {
+		t.Fatal("expected metadata in the output")
+	}
+	truncated, _ := metadata["truncated"].([]interface{})
+	if !sliceContainsStr(truncated, "contexts") {
+		t.Errorf("truncated = %v, want it to contain %q", truncated, "contexts")
+	}
+	keys, _ := metadata["truncated_keys"].([]interface{})
+	if !sliceContainsStr(keys, "contexts.bad") {
+		t.Errorf("truncated_keys = %v, want it to contain %q", keys, "contexts.bad")
+	}
+}
+
 func TestTransportBatchFlushing(t *testing.T) {
 	var requestCount int32
 	var totalIngested int32
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requestCount, 1)
-		if r.URL.Path == "/batch" {
-			var events []Event
-			json.NewDecoder(r.Body).Decode(&events)
-			atomic.AddInt32(&totalIngested, int32(len(events)))
-		} else {
-			atomic.AddInt32(&totalIngested, 1)
-		}
+		// Every body, a lone event included, is now a JSON array at /batch (spec §3.5).
+		var events []Event
+		json.NewDecoder(r.Body).Decode(&events)
+		atomic.AddInt32(&totalIngested, int32(len(events)))
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer ts.Close()

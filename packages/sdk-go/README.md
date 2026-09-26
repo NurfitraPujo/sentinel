@@ -18,8 +18,15 @@ The official **Go Client SDK** for [Sentinel](https://github.com/tuju-ai/sentine
 - **Non-Blocking Lock-Free Capture**: Enqueues errors via a buffered Go channel (`chan *Event`) with ring-buffer FIFO eviction under heavy load.
 - **High-Throughput Batch Ingestion**: Sends event batches (`POST /ingest/batch`) with HTTP connection pooling (`http.Transport`).
 - **Telemetry & Tracing Correlation**: Automatically extracts W3C `trace_id` and `span_id` from OpenTelemetry active spans (`context.Context`).
-- **Context Wiring Helpers**: Set `user_id`, `tenant_id`, and custom service tags effortlessly with `sentinel.WithUser()`, `sentinel.WithTenant()`, `sentinel.WithTag()`.
-- **Client-Side PII Scrubbing**: Filters sensitive keys (`password`, `authorization`, `token`, `secret`, `credit_card`, `ssn`, `api_key`) automatically.
+- **Context Wiring Helpers**: Set `user_id`/full user info, `tenant_id`, low-cardinality tags, arbitrary
+  per-request metadata, a level and breadcrumbs, all read from `context.Context` via `sentinel.WithUser()`,
+  `sentinel.WithUserInfo()`, `sentinel.WithTenant()`, `sentinel.WithTag()`, `sentinel.WithContextMap()`,
+  `sentinel.WithLevel()` and `sentinel.AddBreadcrumb()`. `sentinel.ApplyContext(ctx, event)` is the single call
+  that copies all of it onto an `*Event`, for callers that build events without `Client` (see "Call order without
+  `Client`" below).
+- **Client-Side PII Scrubbing**: Filters sensitive keys (`password`, `authorization`, `token`, `secret`, `credit_card`, `ssn`, `api_key`, `cookie`, `credential`, `private_key`) automatically, recursively through metadata maps and lists.
+- **`BeforeSend` hook**: `Config.BeforeSend func(*Event) *Event` runs after every automatic field is set, to edit or drop an event before it is sent.
+- **HTTP request context**: `NewHTTPMiddleware(MiddlewareOptions{CaptureClientIP: bool})` fills `request` (method, URL, filtered query string and headers) and `transaction` (the route pattern on Go 1.23+ `ServeMux`, else the request path), and, on opt-in, `user.ip_address`.
 - **In-App Frame Detection**: Stack frames are automatically classified as in-app (your code) vs. not (standard library, module cache, `vendor/`), which the server uses to fingerprint and group issues correctly.
 - **Logging Adapters**: Plug into existing logging setups with zero code refactoring via `sentinelslog` (`slog.Handler`), `sentinelzerolog` (`zerolog.Hook`), and `sentinellog` (`io.Writer`).
 - **Retry with Backoff + Failure Visibility**: Ingest failures are no longer silent. 4xx responses are dropped immediately (not retried); 5xx/network errors are retried with capped exponential backoff before being dropped. Set `Config.OnError func(error)` to be notified whenever a batch is ultimately dropped, and `Config.Debug: true` to log the status/response body.
@@ -84,21 +91,43 @@ Sentinel supports two types of API keys for authentication (`X-API-Key`):
 
 ## Context Wiring & OpenTelemetry Tracing
 
-Pass request `context.Context` to capture OpenTelemetry `trace_id` / `span_id` and attach service tags:
+Pass request `context.Context` to capture OpenTelemetry `trace_id` / `span_id` and attach typed fields. `WithTag`
+is for low-cardinality values only (region, plan, feature flag) — every `tags` entry is rolled up per issue into
+a tag facet, so a value that differs per request (an order id, a timestamp) belongs in `WithContextMap`
+(metadata) instead. `request_id`/`requestId`/`request-id` passed to `WithTag` stay in metadata for this reason:
 
 ```go
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = sentinel.WithUser(ctx, "usr_99")
+	ctx = sentinel.WithUserInfo(ctx, sentinel.UserInfo{ID: "usr_99", Email: "user@example.test"})
 	ctx = sentinel.WithTenant(ctx, "org_acme")
-	ctx = sentinel.WithTag(ctx, "request_id", "req_12345")
+	ctx = sentinel.WithTag(ctx, "region", "eu")
+	ctx = sentinel.WithContextMap(ctx, map[string]interface{}{"order_ref": "ord_12345"})
+	sentinel.AddBreadcrumb(ctx, sentinel.Breadcrumb{Message: "order validated", Category: "order"})
 
 	if err := processOrder(ctx); err != nil {
-		// Automatically extracts OpenTelemetry trace_id, span_id, user_id, tenant_id, and tags
+		// Automatically extracts OpenTelemetry trace_id/span_id, the typed user, tags, metadata and breadcrumbs.
 		sentinel.CaptureErrorContext(ctx, err)
 	}
 }
 ```
+
+### Call order without `Client`
+
+A caller that never uses `Client` (for example a package that builds and pushes its own `*Event`) reproduces
+what `CaptureErrorContext` does by calling these in order:
+
+```go
+event := sentinel.NewEvent(cfg, err, ctxTags)   // level, sdk, server_name, runtime/os/device contexts
+sentinel.ApplyContext(ctx, event)               // metadata, level, user, tags, breadcrumbs, trace, request, transaction
+if event = cfg.ApplyBeforeSend(event); event == nil {
+	return
+}
+transport.Push(event)
+```
+
+`ApplyContext` only adds what the context carries and never clears a field the caller already set; it must run
+before your own assignments so that anything you set afterwards wins.
 
 ---
 
@@ -139,6 +168,9 @@ logger.Error().Msg("cache cluster unreachable")
 
 ## HTTP Middleware & Panic Recovery
 
+`HTTPMiddleware` is `NewHTTPMiddleware(MiddlewareOptions{})`. Use `NewHTTPMiddleware` directly to opt into
+recording the client IP, or to size the per-request breadcrumb buffer:
+
 ```go
 import (
 	"net/http"
@@ -149,10 +181,20 @@ import (
 mux := http.NewServeMux()
 mux.HandleFunc("/api/data", dataHandler)
 
-// Automatically recovers panics and attaches request metadata
-handler := sentinel.HTTPMiddleware(mux)
+// Automatically recovers panics and attaches request/transaction to every event
+// captured on this request's context; the recovered-panic event is sent through
+// the default client, so it reaches your project only if sentinel.Init was called.
+handler := sentinel.NewHTTPMiddleware(sentinel.MiddlewareOptions{
+	CaptureClientIP: true, // fills user.ip_address from r.RemoteAddr; off by default
+})(mux)
 http.ListenAndServe(":8080", handler)
 ```
+
+Client-IP headers (`X-Forwarded-For`, `Forwarded`, and every header the ingestor's documented header patterns
+match) are never read and never recorded in `request.headers`, whatever `CaptureClientIP` says; only the
+connection's own `r.RemoteAddr` is used, and only on opt-in. `transaction` is the `ServeMux` route pattern only
+when the program is built with Go 1.23+ **and** its main module's `go.mod` declares `go 1.22` or newer; otherwise
+it is the request path.
 
 ---
 

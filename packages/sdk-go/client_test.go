@@ -39,8 +39,13 @@ func TestClientLatencyAndAutoInit(t *testing.T) {
 func TestCaptureErrorContextCarriesFingerprintAndErrorClass(t *testing.T) {
 	var received Event
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
-			t.Errorf("failed to decode received event: %v", err)
+		var batch []Event
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Errorf("failed to decode received batch: %v", err)
+		} else if len(batch) != 1 {
+			t.Errorf("expected a one-element array, got %d", len(batch))
+		} else {
+			received = batch[0]
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}))

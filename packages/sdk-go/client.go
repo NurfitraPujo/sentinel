@@ -53,10 +53,7 @@ func (c *Client) CaptureErrorContext(ctx context.Context, err error, additionalC
 		return
 	}
 
-	ctxTags := getTagsMap(ctx)
-	if ctxTags == nil {
-		ctxTags = make(map[string]interface{})
-	}
+	ctxTags := getMetadataStore(ctx)
 
 	if len(additionalContext) > 0 && additionalContext[0] != nil {
 		merged := make(map[string]interface{}, len(ctxTags)+len(additionalContext[0]))
@@ -70,16 +67,10 @@ func (c *Client) CaptureErrorContext(ctx context.Context, err error, additionalC
 	}
 
 	event := NewEvent(c.cfg, err, ctxTags)
-	traceID, spanID, traceFlags := ExtractTraceContext(ctx)
-	event.TraceID = traceID
-	event.SpanID = spanID
-	event.TraceFlags = traceFlags
-
-	if fp := ExtractFingerprint(ctx); fp != "" {
-		event.Fingerprint = fp
-	}
-	if ec := ExtractErrorClass(ctx); ec != "" {
-		event.ErrorClass = ec
+	ApplyContext(ctx, event)
+	event = c.cfg.ApplyBeforeSend(event)
+	if event == nil {
+		return
 	}
 
 	c.transport.Push(event)

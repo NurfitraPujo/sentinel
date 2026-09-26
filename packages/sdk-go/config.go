@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"errors"
+	"log"
 	"strings"
 	"time"
 )
@@ -33,7 +34,19 @@ type Config struct {
 	BatchSize      int           `json:"batch_size"`
 	BatchWait      time.Duration `json:"batch_wait"`
 	MaxBreadcrumbs int           `json:"max_breadcrumbs"`
-	Debug          bool          `json:"debug"`
+	// ServerName, if set, is sent as every event's server_name. Otherwise the
+	// SENTINEL_SERVER_NAME environment variable (read per event, so tests can
+	// set it with t.Setenv), else os.Hostname() (the pod name on Kubernetes,
+	// resolved once per process), else "" (spec §3.2).
+	ServerName string `json:"server_name"`
+	Debug      bool   `json:"debug"`
+	// BeforeSend, if set, runs on every event just before it is queued:
+	// return nil to drop it, or the event (modified, or a different one) to
+	// send. It runs on the capturing goroutine and must be safe for
+	// concurrent use. It may edit an event's own maps/slices in place (spec
+	// §8 guarantee 1's per-event list), but must replace, never edit, a
+	// value that list marks shared.
+	BeforeSend func(*Event) *Event `json:"-"`
 	// OnError, if set, is invoked whenever a batch of events is dropped -
 	// after retries are exhausted on a 5xx/network error, or immediately on
 	// a non-retryable 4xx rejection. It is called from the SDK's internal
@@ -90,7 +103,33 @@ func (c *Config) withDefaults() Config {
 		cfg.BatchWait = 1 * time.Second
 	}
 	if cfg.MaxBreadcrumbs <= 0 {
-		cfg.MaxBreadcrumbs = 50
+		cfg.MaxBreadcrumbs = DefaultMaxBreadcrumbs
+	} else if cfg.MaxBreadcrumbs > MaxBreadcrumbsLimit {
+		cfg.MaxBreadcrumbs = MaxBreadcrumbsLimit
 	}
 	return cfg
+}
+
+// ApplyBeforeSend runs c.BeforeSend on ev and returns what should be
+// pushed, or nil to drop. nil c.BeforeSend returns ev unchanged; nil ev
+// returns nil. A panicking hook drops the event and is always logged (not
+// only under Debug): a BeforeSend hook is how a caller scrubs data it does
+// not want sent, and a hook that failed half-way may be the only thing
+// standing between that data and the wire, so the event is dropped rather
+// than sent unmodified. OnError is not called: it is documented as a
+// transport-worker callback for dropped batches.
+func (c *Config) ApplyBeforeSend(ev *Event) (result *Event) {
+	if ev == nil {
+		return nil
+	}
+	if c.BeforeSend == nil {
+		return ev
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("sentinel: Config.BeforeSend panicked; event %s dropped: %v", ev.EventID, r)
+			result = nil
+		}
+	}()
+	return c.BeforeSend(ev)
 }

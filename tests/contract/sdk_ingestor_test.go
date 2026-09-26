@@ -30,6 +30,7 @@ package contract
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -69,6 +70,16 @@ func buildFullyPopulatedEvent(t *testing.T) *sentinel.Event {
 	}
 
 	event := sentinel.NewEvent(cfg, probeErr, ctxTags)
+
+	// ApplyContext (spec §4.3, D6's golden bridge): exercises the typed
+	// fields a context adds on top of NewEvent's own, on the same path
+	// Client.CaptureErrorContext uses.
+	ctx := sentinel.WithUserInfo(context.Background(), sentinel.UserInfo{ID: "u-contract", Username: "contract-bot", Email: "contract@example.test"})
+	ctx = sentinel.WithTag(ctx, "region", "us-east-1")
+	ctx = sentinel.WithLevel(ctx, "warn")
+	buf := sentinel.WithBreadcrumbBuffer(ctx, 10)
+	sentinel.AddBreadcrumb(buf, sentinel.Breadcrumb{Message: "contract probe breadcrumb", Category: "test"})
+	sentinel.ApplyContext(buf, event)
 
 	// CaptureErrorContext (client.go) does exactly this after NewEvent:
 	//   traceID, spanID := ExtractTraceIDs(ctx)
@@ -251,21 +262,26 @@ func assertSemanticFieldsSurvived(t *testing.T, event *sentinelv1.ErrorEvent, wa
 	}
 }
 
-// TestSDKToIngestorContract_SingleEvent covers the single-event shape: the
-// SDK POSTs a bare object (not an array) to {endpoint} when the batch has
-// exactly one event (transport.go sendBatch).
+// TestSDKToIngestorContract_SingleEvent covers the single-event shape:
+// v0.4.0's transport now posts every body, a lone event included, to
+// {endpoint}/batch as a one-element JSON array (spec §3.5), where v0.3.x
+// posted a bare object to {endpoint}.
 func TestSDKToIngestorContract_SingleEvent(t *testing.T) {
 	event := buildFullyPopulatedEvent(t)
 
-	// Marshaled exactly as transport.go's sendBatch does for len(batch)==1:
-	// body, err = json.Marshal(batch[0])
-	body, err := json.Marshal(event)
+	// Marshaled exactly as transport.go's sendBatch does for every batch,
+	// len(batch)==1 included: body, err = json.Marshal(batch).
+	body, err := json.Marshal([]*sentinel.Event{event})
 	if err != nil {
-		t.Fatalf("json.Marshal(event): %v", err)
+		t.Fatalf("json.Marshal([]*Event{event}): %v", err)
 	}
 
-	var payload validation.ErrorPayload
-	decodeStrict(t, body, &payload)
+	var payloads []validation.ErrorPayload
+	decodeStrict(t, body, &payloads)
+	if len(payloads) != 1 {
+		t.Fatalf("decoded %d payloads, want 1", len(payloads))
+	}
+	payload := payloads[0]
 
 	assertPayloadMatchesEvent(t, event, &payload)
 

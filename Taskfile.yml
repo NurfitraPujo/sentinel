@@ -193,6 +193,7 @@ tasks:
         cmds:
             - go test ./tests/unit/... -v
             - go test ./apps/ingestor-go/...
+            - cd packages/sdk-go && GOWORK=off go test -race -count=1 ./...
             - pnpm --dir apps/dashboard-web install --frozen-lockfile
             - pnpm --dir apps/dashboard-web test
             - npx -y pnpm@10.34.5 --dir packages/sdk-js install --frozen-lockfile
