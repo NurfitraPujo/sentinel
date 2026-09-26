@@ -1,5 +1,21 @@
 # Huawei CCE staging values for the Sentinel chart.
 #
+# ⚠ FROZEN 2026-09-27 (cloud-migration.todo.md §3.1/§3.8) — replicas are pinned
+# to 0, the HPAs are disabled, and retention/oncall cron + the DLQ drainer are
+# off. sentinel-staging has been dumped and restored onto
+# rds.staging.internal.tuju.ai and the service now runs on AWS EKS staging
+# (deploy/helm/sentinel/values.aws.staging.yml). Nothing may write to Huawei
+# again until the burn-in ends, otherwise AWS goes stale.
+#
+# Why this is in git and not just a `kubectl scale`: the release workflow
+# deploys to BOTH clusters (deploy-eks-staging first, then this CCE app). A
+# staging release tag would otherwise sync these manifests and scale the
+# Huawei replicas straight back up. Freezing the values makes the tag-driven
+# release safe to use, and documents the freeze where the next reader looks.
+# The autoscaling blocks must be disabled rather than left at minReplicas: 2 —
+# the chart only renders the Deployment's `replicas` field when the HPA is off,
+# so an enabled HPA would keep a floor of 2 under the freeze.
+#
 # Fill every PLACEHOLDER before installing:
 #   - sealedData: paste kubeseal-encryptor ciphertext scoped to the
 #     sentinel-staging namespace (see RUNBOOK.md). Never commit plaintext.
@@ -134,7 +150,7 @@ migrate:
     - dashboard
 
 ingestor:
-  replicaCount: 2
+  replicaCount: 0
   containerPort: 8080
   service:
     type: NodePort
@@ -146,8 +162,8 @@ ingestor:
     elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
     tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
   autoscaling:
-    enabled: true
-    minReplicas: 2
+    enabled: false
+    minReplicas: 0
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
   podDisruptionBudget:
@@ -171,14 +187,14 @@ geoip:
     enabled: true
 
 processor:
-  replicaCount: 2
+  replicaCount: 0
   healthPort: 8081
   service:
     type: ClusterIP
     port: 8081
   autoscaling:
-    enabled: true
-    minReplicas: 2
+    enabled: false
+    minReplicas: 0
     maxReplicas: 8
     targetCPUUtilizationPercentage: 70
   podDisruptionBudget:
@@ -192,7 +208,7 @@ processor:
     limits: { cpu: "1", memory: 1Gi }
 
 dashboard:
-  replicaCount: 2
+  replicaCount: 0
   containerPort: 3000
   service:
     type: NodePort
@@ -204,8 +220,8 @@ dashboard:
     elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
     tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
   autoscaling:
-    enabled: true
-    minReplicas: 2
+    enabled: false
+    minReplicas: 0
     maxReplicas: 6
     targetCPUUtilizationPercentage: 70
   podDisruptionBudget:
@@ -228,7 +244,11 @@ dependencies:
 
 init:
   nats:
-    enabled: true
+    # Off while frozen. The streams AND consumers already exist on the CCE
+    # cluster, and scripts/nats-init.sh calls `nats consumer add` with no
+    # existence guard under `set -e` — so a sync would fail the wave-1 `Sync`
+    # hook Job on the existing processor-consumer. Same reason it is off on AWS.
+    enabled: false
     image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-nats-init
     tag: ""
     # ERROR_EVENTS limits on the shared-cluster JetStream store (infra
@@ -249,7 +269,7 @@ ingress:
   enabled: false
 
 retentionCron:
-  enabled: true
+  enabled: false
   schedule: "0 * * * *"
 
 oncallCron:
@@ -259,7 +279,7 @@ prometheusRule:
   enabled: false
 
 dlqDrainer:
-  enabled: true
+  enabled: false
   drainerEnabled: "false"
   drainerExecute: "false"
   # CCE has no default StorageClass — Everest CSI csi-disk provisions EVS.
