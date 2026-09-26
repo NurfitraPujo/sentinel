@@ -58,7 +58,7 @@ jobs:
             helm template sentinel ./deploy/helm/sentinel --values ./deploy/helm/sentinel/"$1" > ./tmp/"$1-$timestamp.yaml"
           }
 
-          for manifest in values-huawei-production.yml values-huawei-staging.yml; do
+          for manifest in values-huawei-production.yml values-huawei-staging.yml values.aws.production.yml values.aws.staging.yml; do
             generateManifests "$manifest"
             echo "Linting $manifest ..."
             kube-linter lint --config ./deploy/helm/sentinel/.kube-linter.yaml "./tmp/$manifest-$timestamp.yaml"

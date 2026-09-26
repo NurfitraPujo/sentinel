@@ -30,6 +30,33 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- end -}}
 
 {{/*
+Cloud provider selector. "generic" (default) and "huawei" keep the existing
+behavior (SealedSecret/plain Secret, CCE Ingresses, externalServices
+Endpoints). "aws" switches the secret template to an ExternalSecret synced
+from SSM Parameter Store via ESO, and expects .Values.externalSecrets.secrets
+to map ENV_VAR -> full SSM path. Set via global.provider (AWS values files;
+Huawei files set global.provider=huawei).
+
+NOTE: .Values.global must never be dereferenced directly — Helm leaves it nil
+(not an empty dict) when no `global` block exists, and chaining a field off nil
+aborts rendering.
+*/}}
+{{- define "sentinel.provider" -}}
+{{- $global := .Values.global | default dict -}}
+{{- $global.provider | default .Values.provider | default "generic" -}}
+{{- end -}}
+
+{{- define "sentinel.isAws" -}}
+{{- eq (include "sentinel.provider" .) "aws" -}}
+{{- end -}}
+
+{{/* ESO ClusterSecretStore name (cluster-scoped, infra-owned). */}}
+{{- define "sentinel.secretStore" -}}
+{{- $global := .Values.global | default dict -}}
+{{- $global.secretStore | default "aws-parameter-store" -}}
+{{- end -}}
+
+{{/*
 Secret name — either the pre-provisioned one or the chart-managed one.
 */}}
 {{- define "sentinel.secretName" -}}
@@ -65,14 +92,41 @@ external hosts come from config.* when provided.
 {{- end -}}
 
 {{/*
-Renders "true" when NATS_URL is supplied via secrets (sealedData/data) instead
-of the ConfigMap — e.g. an authenticated shared-cluster DSN. Guards hasKey
-against nil maps.
+Renders "true" when NATS_URL is supplied via secrets instead of the ConfigMap
+— e.g. an authenticated shared-cluster DSN. On AWS the ExternalSecret always
+carries NATS_URL, so provider=aws short-circuits to true. On CCE it is present
+only when the active pool (sealedData when backend=sealed, else data) has the
+key; guards hasKey against nil maps.
 */}}
 {{- define "sentinel.natsUrlIsSecret" -}}
+{{- if eq (include "sentinel.isAws" .) "true" -}}
+true
+{{- else -}}
 {{- $sealed := .Values.secrets.sealedData | default dict -}}
 {{- $plain := .Values.secrets.data | default dict -}}
 {{- if or (hasKey $sealed "NATS_URL") (hasKey $plain "NATS_URL") }}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Renders "true" when `key` exists in the ACTIVE secret pool. The pool is:
+  - AWS  : .Values.externalSecrets.secrets (ENV_VAR -> SSM path)
+  - CCE  : .Values.secrets.sealedData when backend=sealed, else .Values.secrets.data
+Call with (list $ "KEY"). Used by optional keys (Google OAuth) that must not
+produce a CreateContainerConfigError when the key is absent.
+*/}}
+{{- define "sentinel.secretPoolContains" -}}
+{{- $root := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $pool := dict -}}
+{{- if eq (include "sentinel.isAws" $root) "true" -}}
+{{- $pool = $root.Values.externalSecrets.secrets | default dict -}}
+{{- else if eq ($root.Values.secrets.backend | default "plain") "sealed" -}}
+{{- $pool = $root.Values.secrets.sealedData | default dict -}}
+{{- else -}}
+{{- $pool = $root.Values.secrets.data | default dict -}}
+{{- end -}}
+{{- if hasKey $pool $key }}true{{- end -}}
 {{- end -}}
 
 {{- define "sentinel.redisAddr" -}}

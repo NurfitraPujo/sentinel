@@ -11,7 +11,9 @@ type: application
 # Chart version — bump on any template change.
 # 0.2.0: Huawei Cloud CCE adaptation (per-service CCE ingresses, NodePort
 # services, external-services for RDS/Redis, SealedSecrets backend).
-version: 0.2.0
+# 0.3.0: AWS EKS dual-stack — ExternalSecret backend (global.provider=aws,
+# SSM Parameter Store via ESO) + values.aws.{staging,production}.yml.
+version: 0.3.0
 # The app version the default images track. Override image tags per-service in values.yaml.
 appVersion: "0.1.0"
 keywords:

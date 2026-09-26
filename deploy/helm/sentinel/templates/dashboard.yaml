@@ -98,18 +98,16 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: CRON_SECRET } }
             # Google OAuth is optional (email magic-link is the fallback auth).
             # These env entries render only when the keys exist in the ACTIVE
-            # secret pool (sealedData when backend=sealed, else data) — Helm
-            # deep-merges the base values, so the check must not look at the
-            # inactive pool. Omitting the keys disables Google SSO without a
-            # CreateContainerConfigError on missing secret keys.
-            {{- $sealed := .Values.secrets.sealedData | default dict }}
-            {{- $plain := .Values.secrets.data | default dict }}
-            {{- $pool := ternary $sealed $plain (eq (.Values.secrets.backend | default "plain") "sealed") }}
-            {{- if hasKey $pool "GOOGLE_CLIENT_ID" }}
+            # secret pool (externalSecrets on AWS; sealedData when
+            # backend=sealed; else data) — Helm deep-merges the base values, so
+            # the check must not look at the inactive pool. Omitting the keys
+            # disables Google SSO without a CreateContainerConfigError on
+            # missing secret keys.
+            {{- if include "sentinel.secretPoolContains" (list . "GOOGLE_CLIENT_ID") }}
             - name: GOOGLE_CLIENT_ID
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_ID } }
             {{- end }}
-            {{- if hasKey $pool "GOOGLE_CLIENT_SECRET" }}
+            {{- if include "sentinel.secretPoolContains" (list . "GOOGLE_CLIENT_SECRET") }}
             - name: GOOGLE_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_SECRET } }
             {{- end }}
