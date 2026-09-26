@@ -15,19 +15,35 @@
 #   - Canonical staging host: sentinel.staging.tuju.ai (mirrors Huawei
 #     sentinel-stg.daya.ai).
 #
-# DORMANT bootstrap: replicas 0 + every side-effecting hook OFF until the
-# staging dump/restore lands (cloud-migration.todo.md §3). Nothing runs yet:
-#   migrate.enabled=false (no DB migrations), init.nats.enabled=false (no
-#   JetStream stream creation — the §5 NATS cutover owns the streams),
-#   dlqDrainer/retentionCron/oncallCron=false, autoscaling.enabled=false +
-#   replicaCount=0. Re-enable at cutover.
+# STAGING CUTOVER — LIVE as of 2026-09-27 (tracker §3.8 / 2.11f).
+# Preconditions verified before flipping to live:
+#   1. sentinel-staging restored from Huawei RDS on the migration host
+#      (10.254.0.20): 50/50 tables, all row counts identical to source, the 3
+#      sequences carry the same last_value, ANALYZE run, 11 MB both sides.
+#      Ownership + grants handed to tuju-sentinel-user (--no-owner left every
+#      object owned by tuju-migration-user).
+#   2. CCE sentinel-staging drained to 0 and its ArgoCD app self-heal disabled
+#      (otherwise it reverts the scale and keeps writing to Huawei).
+#   3. All 4 JetStream streams (ERROR_EVENTS, ERROR_EVENTS_DLQ, API_KEYS,
+#      ALERT_CONFIG) and their consumers already restored by the §5 NATS cutover.
+#   4. Images in ECR via the dual-push release workflow (2.11u).
 #
-# Pre-flight before first sync:
-#   1. Create the 5 sentinel-* ECR repos (infra terraform/live/shared/ecr).
-#   2. Seed /tuju/staging/sentinel/shared/* (done 2026-09-26, 10/10).
-#   3. Push sentinel images to ECR and pin the tags below (none exist yet;
-#      replicas 0 means nothing pulls, but a scale-up before the push would
-#      ImagePullBackOff).
+# What is deliberately still off, and why:
+#   init.nats.enabled=false — the streams and consumers already exist from the
+#     NATS cutover, and scripts/nats-init.sh is NOT idempotent for consumers:
+#     it calls `nats consumer add` with no existence guard under `set -e`, so an
+#     existing `processor-consumer` makes the Job exit non-zero. It is a wave-1
+#     `Sync` hook, so that failure would block the whole deploy. Verified live:
+#     `nats consumer ls ERROR_EVENTS` -> processor-consumer (2026-09-21).
+#   dlqDrainer.enabled=false — its jobTemplate hardcodes replicas: 1 and its
+#     cursor lives on a PVC; enabling it needs a StorageClass decision first.
+#   autoscaling.enabled=false / podDisruptionBudget.enabled=false — one replica
+#     each, and a PDB with minAvailable: 1 on a single replica would block every
+#     voluntary disruption (spot node drains, cluster-autoscaler).
+#   init.minio.enabled=false — S3/OBS is in use, no MinIO.
+#
+# Image tags: pinned to a released tag; the release workflow injects the live
+# one at deploy time via `images.*.tag` helm parameters.
 
 global:
   provider: aws
@@ -129,16 +145,18 @@ config:
   ingestor:
     ratelimitStrictMode: "true"
 
-# Dormant: no DB migration Job until the staging dump/restore lands.
+# Live: run the db-migrate Job (a wave-1 `Sync` hook) so the restored schema is
+# reconciled with the app's expectations. The database is populated, so unlike
+# the dormant phase this is safe to run.
 migrate:
-  enabled: false
+  enabled: true
   targets:
     - processor
     - ingestor
     - dashboard
 
 ingestor:
-  replicaCount: 0
+  replicaCount: 1
   containerPort: 8080
   service:
     type: ClusterIP
@@ -155,7 +173,7 @@ ingestor:
     limits: { cpu: "1", memory: 512Mi }
 
 processor:
-  replicaCount: 0
+  replicaCount: 1
   healthPort: 8081
   service:
     type: ClusterIP
@@ -169,7 +187,7 @@ processor:
     limits: { cpu: "1", memory: 512Mi }
 
 dashboard:
-  replicaCount: 0
+  replicaCount: 1
   containerPort: 3000
   service:
     type: ClusterIP
@@ -196,7 +214,9 @@ dependencies:
   minio:
     enabled: false
 
-# Dormant: the §5 NATS cutover owns JetStream stream creation. Enable at cutover.
+# init.nats stays OFF even though we are live: the §5 NATS cutover already
+# restored the streams AND their consumers, and scripts/nats-init.sh would fail
+# on `nats consumer add` for the existing processor-consumer. See the header.
 init:
   nats:
     enabled: false
@@ -210,10 +230,10 @@ ingress:
   enabled: false
 
 retentionCron:
-  enabled: false
+  enabled: true
 
 oncallCron:
-  enabled: false
+  enabled: true
 
 prometheusRule:
   enabled: false
