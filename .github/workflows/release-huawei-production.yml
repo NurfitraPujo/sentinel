@@ -1,19 +1,32 @@
 name: Release Huawei Production
 
-# Production release: push tag v* WITHOUT the -staging suffix (e.g. v0.1.0).
+# Production release: push tag v* WITHOUT the -staging suffix (e.g. v0.1.0), or
+# dispatch this workflow manually with an explicit version_tag.
 # Every job is guarded with !endsWith(ref_name, '-staging') so staging tags
-# never trigger a production build/deploy. Otherwise identical flow to staging.
+# never trigger a production build/deploy. Otherwise identical flow to staging,
+# which each build ONE image to BOTH registries (SWR = rollback origin, ECR =
+# migration target) and then deploys EKS first, CCE second.
 # Mirrors cdc-pipeline's release-production.yml.
+#
+# The `name:` and the filename are intentionally NOT renamed: both are load-bearing
+# (branch-protection required checks bind the workflow `name:`, and
+# workflow/registry/repos.toml:637 references the release-huawei-* paths).
 
 on:
   push:
     # v* matches production tags; the negated pattern keeps staging tags from
     # ever starting this workflow (job-level !endsWith guards remain as backup).
     tags: ["v*", "!v*-staging"]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Version tag to build and deploy to production (e.g., v0.2.40)"
+        required: true
+        type: string
 
 permissions:
   contents: read
-  id-token: write # Required for AWS OIDC (ArgoCD SSM credentials)
+  id-token: write # Required for AWS OIDC (ECR push + ArgoCD SSM credentials)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -66,10 +79,13 @@ jobs:
 
   build-images:
     if: ${{ !endsWith(github.ref_name, '-staging') }}
-    name: Build & Push images to SWR
+    name: Build & Push images to SWR + ECR
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     timeout-minutes: 30
     needs: [lint-helm-huawei]
+    permissions:
+      contents: read
+      id-token: write # Required for AWS OIDC (ECR push)
     strategy:
       # A single image build failing must not cancel the others. The buildkit daemon on the
       # self-hosted runners dies mid-build under load ("received prior goaway ... graceful_stop"):
@@ -141,6 +157,17 @@ jobs:
           username: ${{ secrets.SWR_REGION }}@${{ secrets.SWR_ACCESS_KEY }}
           password: ${{ steps.derive-swr-password.outputs.swr_login_password }}
 
+      - name: Configure AWS credentials for ECR
+        uses: aws-actions/configure-aws-credentials@d0834ad3a60a024346910e522a81b0002bd37fea # v4.3.0
+        with:
+          role-to-assume: arn:aws:iam::576329195570:role/github-actions-ecr-push
+          aws-region: ap-southeast-1
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
       - name: Build and push Docker image
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.18.0
         with:
@@ -148,10 +175,20 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
-          tags: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ github.ref_name }}
+          # Single build (one digest/layer set), pushed to both registries. The
+          # ECR repo name is the bare matrix image (sentinel-ingestor, …) which
+          # matches the clean repo names created in infra shared/ecr — the
+          # reusable build-docker.yml would prefix daya-engineering/ instead.
+          tags: |
+            swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+      - name: Cleanup docker credentials
+        if: always()
+        run: rm -f ~/.docker/config.json 2>/dev/null || true
 
   gate-production:
     if: ${{ !endsWith(github.ref_name, '-staging') }}
@@ -163,9 +200,37 @@ jobs:
     steps:
       - run: echo "Production gate passed for ${{ github.ref_name }}"
 
-  deploy-production:
-    name: Deploy Production Environment
+  deploy-eks-production:
+    name: Deploy Production Environment (AWS EKS)
+    # EKS production stays DORMANT (0 replicas, migrate disabled) until the
+    # cutover window — this job only advances the image tags so the release is
+    # pre-staged, exactly like cdc-pipeline 2.11m.
+    if: ${{ !endsWith(github.ref_name, '-staging') }}
     needs: [gate-production]
+    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
+    with:
+      runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
+      app_name: "sentinel-tuju-production"
+      argocd_url: "argocd.tuju.ai"
+      argocd_username_aws_ssm_parameter_store_path: "/infra/tuju-production/argocd/ARGOCD_USERNAME"
+      argocd_password_aws_ssm_parameter_store_path: "/infra/tuju-production/argocd/ARGOCD_PASSWORD"
+      parameters: |
+        images.ingestor.tag=${{ inputs.version_tag || github.ref_name }}
+        images.processor.tag=${{ inputs.version_tag || github.ref_name }}
+        images.dashboard.tag=${{ inputs.version_tag || github.ref_name }}
+        images.migrate.tag=${{ inputs.version_tag || github.ref_name }}
+        images.dlqDrainer.tag=${{ inputs.version_tag || github.ref_name }}
+        init.nats.tag=${{ inputs.version_tag || github.ref_name }}
+      sync: true
+      wait: true
+      wait_timeout: 600
+
+  deploy-production:
+    name: Deploy Production Environment (Huawei CCE)
+    # Serialized AFTER the EKS deploy on purpose — see the staging workflow for
+    # the /tmp/argocd shared-runner race this avoids.
+    if: ${{ !endsWith(github.ref_name, '-staging') }}
+    needs: [gate-production, deploy-eks-production]
     uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
     with:
       runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
@@ -174,12 +239,12 @@ jobs:
       argocd_username_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_USER"
       argocd_password_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_PASSWORD"
       parameters: |
-        images.ingestor.tag=${{ github.ref_name }}
-        images.processor.tag=${{ github.ref_name }}
-        images.dashboard.tag=${{ github.ref_name }}
-        images.migrate.tag=${{ github.ref_name }}
-        images.dlqDrainer.tag=${{ github.ref_name }}
-        init.nats.tag=${{ github.ref_name }}
+        images.ingestor.tag=${{ inputs.version_tag || github.ref_name }}
+        images.processor.tag=${{ inputs.version_tag || github.ref_name }}
+        images.dashboard.tag=${{ inputs.version_tag || github.ref_name }}
+        images.migrate.tag=${{ inputs.version_tag || github.ref_name }}
+        images.dlqDrainer.tag=${{ inputs.version_tag || github.ref_name }}
+        init.nats.tag=${{ inputs.version_tag || github.ref_name }}
       sync: true
       wait: true
       wait_timeout: 600
