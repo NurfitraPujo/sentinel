@@ -42,8 +42,13 @@
 #     voluntary disruption (spot node drains, cluster-autoscaler).
 #   init.minio.enabled=false — S3/OBS is in use, no MinIO.
 #
-# Image tags: pinned to a released tag; the release workflow injects the live
-# one at deploy time via `images.*.tag` helm parameters.
+# Image tags: pinned to the released tag. This is a DECLARATIVE fallback — the
+# release workflow injects the live one at deploy time via `images.*.tag` helm
+# parameters, so a new release overrides these without a chart edit. It is
+# pinned rather than left empty because `""` falls back to `Chart.AppVersion`
+# (`0.1.0`), which exists in no registry: the migrate Job then sits in
+# ImagePullBackOff and, being a wave-1 `Sync` hook, blocks every sync until
+# someone notices. Verified live in ECR at 2026-09-27.
 
 global:
   provider: aws
@@ -80,19 +85,19 @@ externalSecrets:
 images:
   ingestor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-ingestor
-    tag: ""
+    tag: "v0.2.40-staging"
   processor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-processor
-    tag: ""
+    tag: "v0.2.40-staging"
   dashboard:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dashboard
-    tag: ""
+    tag: "v0.2.40-staging"
   migrate:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-db-migrate
-    tag: ""
+    tag: "v0.2.40-staging"
   dlqDrainer:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dlq-drainer
-    tag: ""
+    tag: "v0.2.40-staging"
 
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
@@ -221,7 +226,7 @@ init:
   nats:
     enabled: false
     image: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
-    tag: ""
+    tag: "v0.2.40-staging"
   minio:
     enabled: false
 
