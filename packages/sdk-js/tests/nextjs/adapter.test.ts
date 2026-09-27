@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 describe('N3: captureRequestError on the server build (@sentinel/sdk-js/nextjs/server)', () => {
-  it('N3: metadata.http_method / http_url / route / router_kind / route_type from Next’s three arguments, no metadata.source, and undefined returned synchronously', () => {
+  it('N3: request.method / request.url / transaction / metadata.route / router_kind / route_type from Next’s three arguments, no metadata.source or http_*, and undefined returned synchronously', () => {
     mockFetch();
     server.init({ endpoint: ENDPOINT, apiKey: 'k', batchWaitMs: 60_000 });
     const returned = server.captureRequestError(new Error('render failed'), REQUEST, CONTEXT);
@@ -56,14 +56,16 @@ describe('N3: captureRequestError on the server build (@sentinel/sdk-js/nextjs/s
     expect(event).toBeDefined();
     expect(event?.error_class).toBe('Error');
     expect(event?.message).toBe('render failed');
+    expect(event?.request).toMatchObject({ method: 'GET', url: '/chats' });
+    expect(event?.transaction).toBe('/chats');
     expect(event?.metadata).toMatchObject({
-      http_method: 'GET',
-      http_url: '/chats',
       route: '/chats',
       router_kind: 'App Router',
       route_type: 'render',
       runtime: 'node',
     });
+    expect(event?.metadata).not.toHaveProperty('http_method');
+    expect(event?.metadata).not.toHaveProperty('http_url');
     expect(event?.metadata).not.toHaveProperty('source');
     expect(event?.metadata).not.toHaveProperty('revalidate_reason');
     expect(event?.metadata).not.toHaveProperty('render_source');
@@ -105,7 +107,8 @@ describe('N3: captureRequestError on the server build (@sentinel/sdk-js/nextjs/s
     expect(() => server.captureRequestError(new Error('three'), null as unknown as RequestErrorRequest, undefined as unknown as RequestErrorContext)).not.toThrow();
     const events = queued();
     expect(events.map((e) => e.message)).toEqual(['one', 'two', 'three']);
-    expect(events[0]?.metadata).toMatchObject({ http_method: 'POST', http_url: '/a', route: '/chats' });
+    expect(events[0]?.request).toMatchObject({ method: 'POST', url: '/a' });
+    expect(events[0]?.metadata).toMatchObject({ route: '/chats' });
     expect(events[0]?.trace_id).toBeUndefined();
     expect(events[1]?.metadata).not.toHaveProperty('http_method');
   });
@@ -146,7 +149,10 @@ describe('N2 (adapter half): captureRequestError on the edge build (@sentinel/sd
     answer?.();
     expect(await settledWithin(returned, 200)).toBe('resolved');
     const [event] = fetched.posts[0]?.events ?? [];
-    expect(event?.metadata).toMatchObject({ runtime: 'edge', route_type: 'middleware', route: '/x', http_method: 'GET', http_url: '/x' });
+    expect(event?.metadata).toMatchObject({ runtime: 'edge', route_type: 'middleware', route: '/x' });
+    expect(event?.request).toMatchObject({ method: 'GET', url: '/x' });
+    expect(event?.metadata).not.toHaveProperty('http_method');
+    expect(event?.metadata).not.toHaveProperty('http_url');
     expect(event?.metadata).not.toHaveProperty('source');
     expect(fetched.posts[0]?.headers['x-api-key']).toBe('k');
   });
@@ -230,6 +236,70 @@ describe('the client build (@sentinel/sdk-js/nextjs/client)', () => {
     client.captureException(new Error('boundary'), { contexts: { react: { componentStack: '\n    at Page\n    at Layout' } } });
     const [event] = queued();
     expect(event?.metadata.react_component_stack).toBe('\n    at Page\n    at Layout');
+  });
+});
+
+describe('§11.2 TASK-04: captureRequestError filters credential headers, sensitive headers and reset_token query/referer', () => {
+  const PRIVATE_REQUEST: RequestErrorRequest = {
+    path: '/p',
+    method: 'GET',
+    headers: {
+      cookie: 'sid=s3cr3t',
+      authorization: 'Bearer abc',
+      'x-api-key': 'k-live',
+      'proxy-authorization': 'Basic xyz',
+      'set-cookie': 'sid=s3cr3t; Path=/',
+      'x-csrf-token': 'tok-abc',
+      referer: 'https://h/r?reset_token=X',
+    },
+  };
+
+  it('server build: cookie / authorization / x-api-key / proxy-authorization / set-cookie are absent, x-csrf-token is [Filtered], referer is filtered, and a reset_token query is filtered', () => {
+    mockFetch();
+    server.init({ endpoint: ENDPOINT, apiKey: 'k', batchWaitMs: 60_000 });
+    server.captureRequestError(new Error('leak check'), { ...PRIVATE_REQUEST, path: '/p?reset_token=X' }, CONTEXT);
+    const [event] = queued();
+    const headers = event?.request?.headers ?? {};
+    expect(headers).not.toHaveProperty('cookie');
+    expect(headers).not.toHaveProperty('authorization');
+    expect(headers).not.toHaveProperty('x-api-key');
+    expect(headers).not.toHaveProperty('proxy-authorization');
+    expect(headers).not.toHaveProperty('set-cookie');
+    expect(headers['x-csrf-token']).toBe('[Filtered]');
+    expect(headers.referer).not.toContain('X');
+    expect(headers.referer).toContain('[Filtered]');
+    expect(event?.request?.url).toBe('/p');
+    expect(event?.request?.query_string).toBe('reset_token=[Filtered]');
+    const serialized = JSON.stringify(event);
+    expect(serialized).not.toContain('s3cr3t');
+    expect(serialized).not.toContain('Bearer abc');
+    expect(serialized).not.toContain('k-live');
+    expect(serialized).not.toContain('tok-abc');
+    expect(serialized).not.toContain('reset_token=X');
+  });
+
+  it('edge build: the same headers/query/referer are filtered', async () => {
+    const fetched = mockFetch();
+    edge.init({ endpoint: ENDPOINT, apiKey: 'k' });
+    await edge.captureRequestError(new Error('leak check edge'), { ...PRIVATE_REQUEST, path: '/p?reset_token=X' }, CONTEXT);
+    const [event] = fetched.posts[0]?.events ?? [];
+    const headers = event?.request?.headers ?? {};
+    expect(headers).not.toHaveProperty('cookie');
+    expect(headers).not.toHaveProperty('authorization');
+    expect(headers).not.toHaveProperty('x-api-key');
+    expect(headers).not.toHaveProperty('proxy-authorization');
+    expect(headers).not.toHaveProperty('set-cookie');
+    expect(headers['x-csrf-token']).toBe('[Filtered]');
+    expect(headers.referer).not.toContain('X');
+    expect(headers.referer).toContain('[Filtered]');
+    expect(event?.request?.url).toBe('/p');
+    expect(event?.request?.query_string).toBe('reset_token=[Filtered]');
+    const serialized = JSON.stringify(event);
+    expect(serialized).not.toContain('s3cr3t');
+    expect(serialized).not.toContain('Bearer abc');
+    expect(serialized).not.toContain('k-live');
+    expect(serialized).not.toContain('tok-abc');
+    expect(serialized).not.toContain('reset_token=X');
   });
 });
 

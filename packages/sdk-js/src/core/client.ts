@@ -9,7 +9,7 @@ import type { InitPlan } from './options.js';
 import { type QueuedEvent, queuedEvent } from './queue.js';
 import { getSlot, type InternalClient } from './state.js';
 import { REQUEST_TIMEOUT_MS, Transport } from './transport/transport.js';
-import type { InitOptions, ResolvedOptions, Runtime, SentinelEvent } from './types.js';
+import type { AutoContexts, InitOptions, ResolvedOptions, Runtime, SentinelEvent } from './types.js';
 
 export const DEFAULT_MAX_BUFFER_SIZE = 100;
 export const DEFAULT_BATCH_SIZE = 10;
@@ -104,12 +104,14 @@ function installHideListeners(client: InternalClient, transport: Transport): voi
  * client with no transport and no queue: `push` drops with a `debug` line, and the plan's reports fire once
  * through the new client's `onError`.
  */
-export function createClient(core: ResolvedOptions, runtime: Runtime, given: InitOptions, plan: InitPlan): InternalClient {
+export function createClient(core: ResolvedOptions, runtime: Runtime, given: InitOptions, plan: InitPlan, sdkName: string, autoContexts?: () => AutoContexts): InternalClient {
   const plain: string[] = [];
   let transport: Transport | undefined;
   const client: InternalClient = {
     options: core,
     runtime,
+    sdkName,
+    autoContexts,
     noop: plan.noop,
     get transport() {
       return transport;

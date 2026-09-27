@@ -417,8 +417,8 @@ jobs:
       - name: tunnel fixtures committed and unchanged
         if: github.event_name != 'pull_request'
         run: |
-          git diff --exit-code -- tests/tunnel-fixtures
-          test -z "$(git ls-files --others --exclude-standard -- tests/tunnel-fixtures)"
+          git diff --exit-code -- tests/tunnel-fixtures tests/fixture-estimates tests/fixtures
+          test -z "$(git ls-files --others --exclude-standard -- tests/tunnel-fixtures tests/fixture-estimates tests/fixtures)"
 
       # Report-only (decision 40): prints sdk_js_client_entry_gzip_bytes, exits 0 whatever the number.
       - name: pnpm size

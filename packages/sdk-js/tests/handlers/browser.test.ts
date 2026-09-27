@@ -45,7 +45,7 @@ describe('B26: the global capture shapes', () => {
     window.dispatchEvent(ev);
     const events = queued();
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ error_class: 'Message', message: 'Script error.', stacktrace: [], metadata: { level: 'error', source: 'window.onerror', runtime: 'browser' } });
+    expect(events[0]).toMatchObject({ error_class: 'Message', message: 'Script error.', stacktrace: [], level: 'error', metadata: { source: 'window.onerror', runtime: 'browser' } });
     expect(hints).toEqual([{ originalException: 'Script error.' }]);
     expect(ev.defaultPrevented).toBe(false);
   });

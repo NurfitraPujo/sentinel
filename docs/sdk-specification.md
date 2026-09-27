@@ -34,7 +34,7 @@ Every Sentinel SDK MUST accept a configuration object or builder pattern with th
 | `platform` | `string` | **Yes** | — | Lowercase platform identifier (`golang`, `javascript`, `python`, `rust`, `java`) matching `^[a-z0-9]+$`, at most 50 characters. The JS SDK sends `javascript` from every runtime (browser, node, edge) and carries the runtime in `metadata.runtime`. |
 | `sample_rate` | `float` | No | `1.0` | Event sampling ratio (`0.0` to `1.0`). |
 | `max_buffer_size` | `int` | No | `100` | Maximum number of events buffered during network outages. |
-| `max_breadcrumbs` | `int` | No | `50` | Maximum diagnostic breadcrumbs retained in memory. **Unimplemented in the JS SDK** (`packages/sdk-js` has no breadcrumbs — the wire has no field for them). |
+| `max_breadcrumbs` | `int` | No | `50` | Maximum diagnostic breadcrumbs retained in memory. The JS SDK (`packages/sdk-js`, from 0.2.0) implements this as `maxBreadcrumbs`, an integer 0-100, default 100 — matching the ingestor's own retained count (`bounds.go: MaxBreadcrumbs`), not this table's 50. |
 | `debug` | `bool` | No | `false` | Enable SDK internal diagnostic logging to stdout. |
 
 ---
@@ -330,6 +330,17 @@ Any map key that **contains** one of the following strings, compared case-insens
 `"[FILTERED]"`; the server replaces it with `"***REDACTED***"`. The server's list, exactly:
 
 `access_token` `api-key` `api_key` `apikey` `auth` `authorization` `bearer` `card_number` `client_secret` `cookie` `credential` `credentials` `credit_card` `cvv` `passwd` `password` `private_key` `pwd` `refresh_token` `secret` `social_security` `ssn` `token`
+
+### The JS SDK's URL filter (from 0.2.0)
+
+Beside the masking above, `packages/sdk-js` filters every URL it records — breadcrumb `data.url` / `.from` /
+`.to`, `request.url` / `.query_string`, every `stacktrace[].file`, and the event `message` — replacing a
+sensitive query value with `"[Filtered]"` (distinct from this section's `"[FILTERED]"`, which is the metadata
+scrub's own spelling). A query key is sensitive by the same substring list this section pins, plus a segment-exact
+test (`code`, `state`, `key`, `signature`, `sig`, `jwt`, `otp`, `credential` — whole `-`/`_`/`.`/`[`/`]`-delimited
+segments only, so `zipcode` and `monkey` are untouched) that catches header-style keys such as `X-Amz-Signature` a
+substring test alone would miss. Userinfo (`user:pass@host`) is always removed. See `packages/sdk-js/README.md`'s
+*URL privacy* section for the full rule set and what is deliberately left unfiltered.
 
 ### Card numbers
 In every string the server masks, a card number is replaced with `[REDACTED_PAN]`: a run of 13 to 19 ASCII digits,

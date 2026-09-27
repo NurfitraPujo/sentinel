@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"buf.build/go/protovalidate"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
+	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 )
 
 // The wire, cross-language (sentinel-sdk-js contract §11 row 1, flows D6, decision 30): every JSON event the
@@ -31,6 +34,20 @@ import (
 // main; tests/contract carries `//go:build contract` and runs only from workflow_dispatch.
 
 const sdkJSFixtureDir = "../../packages/sdk-js/tests/fixtures"
+const sdkJSGoldenEstimateDir = "../../packages/sdk-js/tests/fixture-estimates/golden"
+
+// sdkJSGoldenEstimate loads the committed sidecar for a golden fixture (spec §7.3): the estimator's
+// protoSizeEstimate over the event `emit` wrote, an upper bound proto.Size must never exceed.
+func sdkJSGoldenEstimate(t *testing.T, fixtureName string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(sdkJSGoldenEstimateDir, fixtureName+".json"))
+	require.NoError(t, err, "%s: missing estimate sidecar under %s — run the sdk-js suite locally and commit it", fixtureName, sdkJSGoldenEstimateDir)
+	var sidecar struct {
+		ProtoSizeEstimate int `json:"protoSizeEstimate"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &sidecar))
+	return sidecar.ProtoSizeEstimate
+}
 
 // The lower bound contract §11 lists: one fixture per named rule (be.md acceptance criterion 2).
 const sdkJSFixtureMinimum = 13
@@ -97,11 +114,42 @@ func TestSDKJSFixtures_AcceptedByIngestor(t *testing.T) {
 			event := mapping.MapPayloadToEvent(&payload)
 			require.NoError(t, v.Validate(event), "%s: protovalidate must report zero violations", name)
 
+			// The estimate against Go's proto.Size (spec §7.3, R2): the SDK never sends project_key / project_id
+			// — sdkJSStampAuthenticatedScope's fill is the ingestor's, not §4.6's budget to cover — so they are
+			// cleared before the comparison.
+			clone := proto.Clone(event).(*sentinelv1.ErrorEvent)
+			clone.ProjectKey = ""
+			clone.ProjectId = ""
+			estimate := sdkJSGoldenEstimate(t, strings.TrimSuffix(name, ".json"))
+			require.LessOrEqualf(t, proto.Size(clone), estimate, "%s: proto.Size must not exceed the committed protoSizeEstimate", name)
+
 			// What the SDK writes on every event (contract §4.3): platform is the constant "javascript" on every
 			// runtime (D3) and metadata.runtime names the runtime.
 			require.Equal(t, "javascript", event.GetPlatform(), "%s: platform", name)
 			require.Contains(t, []string{"browser", "node", "edge"}, payload.Metadata["runtime"], "%s: metadata.runtime", name)
 		})
+	}
+}
+
+// TestFixtureEstimatesHaveFixtures (spec §7.3): a sidecar whose fixture was deleted is a stale file, and fails
+// here rather than silently going unchecked (the golden loop above only ever iterates the fixtures it finds).
+func TestFixtureEstimatesHaveFixtures(t *testing.T) {
+	sidecars, err := filepath.Glob(filepath.Join(sdkJSGoldenEstimateDir, "*.json"))
+	require.NoError(t, err)
+	require.NotEmpty(t, sidecars)
+	for _, sidecar := range sidecars {
+		name := strings.TrimSuffix(filepath.Base(sidecar), ".json")
+		_, err := os.Stat(filepath.Join(sdkJSFixtureDir, name+".json"))
+		require.NoErrorf(t, err, "%s: sidecar has no matching fixture under %s", name, sdkJSFixtureDir)
+	}
+
+	tunnelSidecars, err := filepath.Glob(filepath.Join("../../packages/sdk-js/tests/fixture-estimates/tunnel", "*.json"))
+	require.NoError(t, err)
+	require.NotEmpty(t, tunnelSidecars)
+	for _, sidecar := range tunnelSidecars {
+		name := strings.TrimSuffix(filepath.Base(sidecar), ".json")
+		_, err := os.Stat(filepath.Join(tunnelFixtureDir, name+".json"))
+		require.NoErrorf(t, err, "%s: sidecar has no matching tunnel fixture under %s", name, tunnelFixtureDir)
 	}
 }
 
@@ -141,7 +189,7 @@ func TestSDKJSFixtures_PinnedValues(t *testing.T) {
 		_, hasHTML := payload.Metadata["html"]
 		require.False(t, hasHTML, "the shrink must have removed html, the largest key by the Go count")
 		require.Equal(t, []interface{}{"html"}, payload.Metadata["truncated_keys"])
-		require.Equal(t, "usr_1", payload.Metadata["user_id"], "user_id is exempt from the shrink")
+		require.Equal(t, "req_1", payload.Metadata["request_id"], "request_id is exempt from the shrink (spec §3.7 — user_id no longer lives in metadata)")
 	})
 
 	t.Run("the 20 000-char message was cut on a code-point boundary to under the validator's 10 000 bytes", func(t *testing.T) {
@@ -161,6 +209,44 @@ func TestSDKJSFixtures_PinnedValues(t *testing.T) {
 		items, ok := payload.Metadata["items"].([]interface{})
 		require.True(t, ok)
 		require.Equal(t, map[string]interface{}{"password": "in-array"}, items[0])
+	})
+
+	t.Run("v2-rich-context: every typed field in its typed place, metadata carries none of it (spec §3.7, C4)", func(t *testing.T) {
+		payload := load(t, "v2-rich-context.json")
+		require.Equal(t, "error", payload.Level)
+		require.NotNil(t, payload.SDK)
+		require.Equal(t, "sentinel.javascript.node", payload.SDK.Name)
+		require.NotNil(t, payload.User)
+		require.Equal(t, "usr_1", payload.User.ID)
+		require.Equal(t, "ada", payload.User.Username)
+		require.Equal(t, "ada@example.com", payload.User.Email)
+		require.Equal(t, map[string]string{"tenant_id": "org_a", "feature": "chats"}, payload.Tags)
+		require.Equal(t, map[string]interface{}{"a": float64(1)}, payload.Contexts["ok"])
+		require.Len(t, payload.Breadcrumbs, 1)
+		require.Equal(t, "ui.click", payload.Breadcrumbs[0].Category)
+		require.NotContains(t, payload.Metadata, "user_id")
+		require.NotContains(t, payload.Metadata, "tenant_id")
+		require.NotContains(t, payload.Metadata, "feature")
+	})
+
+	t.Run("v2-hostile-before-send: no hook can make the ingestor 400 the event (spec §3.8, C6)", func(t *testing.T) {
+		payload := load(t, "v2-hostile-before-send.json")
+		require.Empty(t, payload.Logger)
+		require.Empty(t, payload.Dist)
+		require.Empty(t, payload.Source)
+		require.Nil(t, payload.Exception)
+		require.Equal(t, "production", payload.Environment, "the pre-hook value stands (an invalid 42 is rejected)")
+		require.Empty(t, payload.ReleaseVersion)
+		require.Empty(t, payload.Fingerprint)
+		require.Empty(t, payload.TraceID)
+		require.Equal(t, uint32(0), payload.TraceFlags)
+		require.Equal(t, int32(0), payload.Stacktrace[0].Line, "1e12 is over the int32 bound and was removed")
+		require.Contains(t, payload.Contexts, "ok")
+		require.NotContains(t, payload.Contexts, "when")
+		require.NotContains(t, payload.Contexts, "url")
+		require.NotContains(t, payload.Contexts, "arr")
+		require.Nil(t, payload.Breadcrumbs[0].Data)
+		require.Nil(t, payload.Request, "its only member (headers.a, a number) was removed, so the key is omitted")
 	})
 }
 

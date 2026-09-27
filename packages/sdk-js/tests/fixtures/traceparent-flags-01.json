@@ -17,7 +17,15 @@
     "runtime": "browser"
   },
   "timestamp": "2026-09-16T12:00:00.000Z",
+  "level": "error",
+  "sdk": {
+    "name": "sentinel.javascript.browser",
+    "version": "0.2.0"
+  },
   "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
   "span_id": "00f067aa0ba902b7",
-  "trace_flags": 1
+  "trace_flags": 1,
+  "user": {
+    "ip_address": "{{auto}}"
+  }
 }

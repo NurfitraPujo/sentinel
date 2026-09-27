@@ -59,6 +59,20 @@ describe('README.md (contract §4.10, D5)', () => {
     expect(readme).toContain('SOURCEMAP_MAX_FILES_PER_RELEASE');
     expect(readme).not.toMatch(/500 (files )?per release/);
   });
+
+  it("*What is not implemented* has no breadcrumbs entry, and still lists tracing and per-request server scope (spec §8)", () => {
+    const section = readme.slice(readme.indexOf('## What is not implemented'), readme.indexOf('## Bundle size'));
+    expect(section).not.toMatch(/breadcrumbs/i);
+    expect(section).toContain('Tracing');
+    expect(section).toContain('Per-request server scope');
+  });
+
+  it('the *Not filtered* list names every residual (spec §12.2(3)), and addBreadcrumb is documented', () => {
+    for (const token of ['scheme-less', 'location.search', 'location.hash', 'more than 3', 'keyless', 'next=reset_token%3DX', '#access_token=X', 'q=John Doe&token=abc']) {
+      expect(readme, token).toContain(token);
+    }
+    expect(readme).toContain('addBreadcrumb');
+  });
 });
 
 describe('CHANGELOG.md (contract §3 Versioning — one entry per tag)', () => {

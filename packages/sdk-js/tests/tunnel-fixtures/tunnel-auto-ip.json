@@ -9,7 +9,7 @@
       "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
       "x-forwarded-for": "198.51.100.23"
     },
-    "body": "[{\"event_id\":\"00000000-0000-4000-8003-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-auto-ip\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"user\":{\"ip_address\":\"{{auto}}\"}}]"
+    "body": "[{\"event_id\":\"00000000-0000-4000-8003-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-auto-ip\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"{{auto}}\"}}]"
   },
   "forwarded": {
     "path": "/ingest/batch",
@@ -19,7 +19,7 @@
       "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
       "x-sentinel-derive-ip": "off"
     },
-    "body": "[{\"event_id\":\"00000000-0000-4000-8003-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-auto-ip\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"user\":{\"ip_address\":\"198.51.100.23\"}}]"
+    "body": "[{\"event_id\":\"00000000-0000-4000-8003-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-auto-ip\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"198.51.100.23\"}}]"
   },
   "expect": {
     "client_ip": "198.51.100.23",

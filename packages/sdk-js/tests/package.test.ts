@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { SDK_VERSION } from '../src/core/version.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
@@ -130,6 +131,10 @@ describe('package.json (contract §4.1, flows D1)', () => {
     for (const [name, spec] of entries) {
       expect(spec, `${name}@${spec}`).toMatch(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/);
     }
+  });
+
+  it('SDK_VERSION (src/core/version.ts) equals package.json version (spec §3.3) — a literal, not a build-time define', () => {
+    expect(SDK_VERSION).toBe(pkg.version);
   });
 
   it('runs prepare through node or npm run, never pnpm (contract §4.1 rule 1)', () => {

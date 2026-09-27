@@ -5,7 +5,7 @@
 
 import type { QueuedEvent } from './queue.js';
 import type { Transport } from './transport/transport.js';
-import type { ResolvedOptions, Runtime, SentinelEvent } from './types.js';
+import type { AutoContexts, Breadcrumb, ResolvedOptions, Runtime, SentinelEvent, User } from './types.js';
 
 export const SDK_NAME = '@sentinel/sdk-js';
 
@@ -19,6 +19,14 @@ export const SLOT_KEY: unique symbol = Symbol.for(SDK_NAME);
 export interface InternalClient {
   readonly options: ResolvedOptions;
   readonly runtime: Runtime;
+  /** `sdk.name`'s entry half — `browser`, `node`, `edge` or `nextjs` (spec §3.3): `sentinel.javascript.<sdkName>`. */
+  readonly sdkName: string;
+  /**
+   * The runtime's automatic-context reader (spec §6), read fresh at every capture — `undefined` for a client
+   * built directly through `initCore` (the test helpers), which sends none. Each guarded reader is the entry's
+   * own (browser/contexts.ts, node/contexts.ts, edge.ts); a test's fixed provider replaces it (§7.3).
+   */
+  readonly autoContexts?: (() => AutoContexts) | undefined;
   /**
    * The no-op client of contract §4.2 (`not_configured`, or an unusable `endpoint` / `tunnel`): every capture is
    * accepted and dropped, nothing is ever posted, no handler is installed.
@@ -40,10 +48,16 @@ export interface InternalClient {
 }
 
 export interface Scope {
-  /** `setTag`'s tags in insertion order (the spread order, contract §4.3). */
-  readonly tags: Map<string, unknown>;
-  user_id?: string;
-  tenant_id?: string;
+  /** `setTag`'s tags in insertion order (the spread order, contract §4.3). Also carries `tenant_id` (§3.5 rule 5). */
+  readonly tags: Map<string, string>;
+  /** `setExtra` / `setExtras`' values in insertion order (spec §3.7), spread into `metadata` before `ctx.metadata`. */
+  readonly extras: Map<string, unknown>;
+  /** `setUser` (spec §3.4); replaced whole, never merged. */
+  user?: User;
+  /** `setContext` (spec §3.6), insertion order. */
+  readonly contexts: Map<string, Record<string, unknown>>;
+  /** The breadcrumb ring (spec §4.1), oldest first, capped at the current client's `maxBreadcrumbs`. */
+  breadcrumbs: Breadcrumb[];
 }
 
 export interface Slot {
@@ -68,7 +82,7 @@ export function getSlot(): Slot {
   const host = globalThis as SlotHost;
   let slot = host[SLOT_KEY];
   if (slot === undefined) {
-    slot = { scope: { tags: new Map() }, seen: new WeakMap(), pending: new Set() };
+    slot = { scope: { tags: new Map(), extras: new Map(), contexts: new Map(), breadcrumbs: [] }, seen: new WeakMap(), pending: new Set() };
     host[SLOT_KEY] = slot;
   }
   return slot;

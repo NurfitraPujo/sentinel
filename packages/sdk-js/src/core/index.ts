@@ -7,24 +7,30 @@
 
 export { SDK_NAME } from './state.js';
 export { captureException, captureMessage } from './capture.js';
-export { setTag, setTenant, setUser } from './scope.js';
+export { addBreadcrumb, setContext, setExtra, setExtras, setTag, setTags, setTenant, setUser } from './scope.js';
 export { getClient } from './init.js';
 export { close, flush } from './client.js';
 export { SentinelSdkError } from './types.js';
 export type {
+  BeforeBreadcrumb,
   BeforeSend,
   BeforeSendHint,
+  Breadcrumb,
+  BreadcrumbHint,
   CaptureContext,
   CoreOptions,
   InitOptions,
   Level,
+  RequestInfo,
   ResolvedCoreOptions,
   ResolvedOptions,
   ResolvedTransportOptions,
   Runtime,
+  SdkInfo,
   SentinelClient,
   SentinelEvent,
   SentinelSdkErrorCode,
   StackFrame,
   TransportOptions,
+  User,
 } from './types.js';

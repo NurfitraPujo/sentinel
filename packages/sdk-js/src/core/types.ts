@@ -14,6 +14,40 @@ export interface StackFrame {
   in_app: boolean;
 }
 
+/** `user`'s admitted keys (spec §3.4); a stringly-typed `id` is normalised at write time. */
+export interface User {
+  id?: string | number;
+  username?: string;
+  email?: string;
+  ip_address?: string;
+}
+
+/** `sdk` (spec §3.3): re-stamped after `beforeSend` like `event_id`. */
+export interface SdkInfo {
+  name: string;
+  version: string;
+}
+
+/** `request` (spec §3.10, §6): every key optional, filled automatically or by a `beforeSend`. */
+export interface RequestInfo {
+  method?: string;
+  url?: string;
+  query_string?: string;
+  headers?: Record<string, string>;
+  data?: unknown;
+  env?: Record<string, string>;
+}
+
+/** One breadcrumb (spec §4.2). */
+export interface Breadcrumb {
+  timestamp: string;
+  type?: string;
+  category?: string;
+  level?: string;
+  message?: string;
+  data?: Record<string, unknown>;
+}
+
 /** The wire event (contract §4.3). Every key is `validation.ErrorPayload`'s. */
 export interface SentinelEvent {
   event_id: string;
@@ -29,9 +63,25 @@ export interface SentinelEvent {
   trace_id?: string;
   span_id?: string;
   trace_flags?: number;
+  level: Level;
+  sdk: SdkInfo;
+  user?: User;
+  tags?: Record<string, string>;
+  contexts?: Record<string, Record<string, unknown>>;
+  request?: RequestInfo;
+  breadcrumbs?: Breadcrumb[];
+  transaction?: string;
+  server_name?: string;
 }
 
-export type Level = 'error' | 'warning' | 'info';
+export type Level = 'fatal' | 'error' | 'warning' | 'info' | 'debug';
+
+/** A `beforeBreadcrumb` hint (spec §4.3): whatever the integration that created the crumb chose to pass. */
+export interface BreadcrumbHint {
+  [key: string]: unknown;
+}
+
+export type BeforeBreadcrumb = (crumb: Breadcrumb, hint: BreadcrumbHint) => Breadcrumb | null;
 
 /** The per-capture context (contract §4.3). */
 export interface CaptureContext {
@@ -40,6 +90,14 @@ export interface CaptureContext {
   fingerprint?: string;
   traceparent?: string;
   level?: Level;
+  /** Replaces the scope's user for this one event (spec §3.7); `null` sends no user. */
+  user?: User | null;
+  /** Merged over the scope's tags for this one event (spec §3.7); `null` removes a scope tag; `tenant_id` allowed. */
+  tags?: Record<string, string | number | boolean | null>;
+  /** Set only by Next's captureRequestError (spec §6.4); not part of the public per-call API. */
+  request?: RequestInfo;
+  /** Set only by Next's captureRequestError (spec §6.4): `errorContext.routePath`. */
+  transaction?: string;
 }
 
 export type Runtime = 'browser' | 'node' | 'edge';
@@ -114,6 +172,10 @@ export interface CoreOptions {
   inApp?: (frame: StackFrame) => boolean | undefined;
   /** Accepted and ignored so `web`'s init object compiles unchanged (contract §4.2). */
   tracesSampleRate?: number;
+  /** The breadcrumb ring's capacity (spec §4.1): 0-100, default 100; `0` disables breadcrumbs. */
+  maxBreadcrumbs?: number;
+  /** Synchronous; drops or modifies a crumb before it enters the buffer (spec §4.3). */
+  beforeBreadcrumb?: BeforeBreadcrumb;
 }
 
 /** The options as `init` resolved them (contract §4.2 — defaults applied, degraded values replaced). */
@@ -126,6 +188,11 @@ export interface ResolvedCoreOptions {
   debug: boolean;
   onError?: (err: SentinelSdkError) => void;
   inApp?: (frame: StackFrame) => boolean | undefined;
+  /** Browser only (spec §3.4); resolved everywhere, default `true`, non-boolean degrades to it with `invalid_option`. */
+  autoIpAddress: boolean;
+  /** Spec §4.1: 0-100, default 100. */
+  maxBreadcrumbs: number;
+  beforeBreadcrumb?: BeforeBreadcrumb;
 }
 
 /**
@@ -183,13 +250,37 @@ export type ResolvedOptions = ResolvedCoreOptions & ResolvedTransportOptions & R
  * client file is a compile error, not a bundled key (B18); `./node` and `./edge` have `endpoint` / `apiKey` /
  * `projectKey`; only the browser and node entries have `installGlobalHandlers`.
  */
+/** Each automatic breadcrumb integration's switch (spec §5): default `true`. */
+export interface BreadcrumbSwitches {
+  console?: boolean;
+  fetch?: boolean;
+  xhr?: boolean;
+  navigation?: boolean;
+  click?: boolean;
+}
+
 export type BrowserInitOptions = CoreOptions &
   Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'tunnel' | 'flushOnHide'> &
-  HandlerOptions;
+  HandlerOptions & {
+    /** Browser only (spec §3.4): default `true`; when true, a browser event with no `ip_address` gets `"{{auto}}"`. */
+    autoIpAddress?: boolean;
+    /** `false` disables every automatic integration; an object switches them individually (spec §5). */
+    breadcrumbs?: boolean | BreadcrumbSwitches;
+  };
 export type NodeInitOptions = CoreOptions &
   Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'> &
-  HandlerOptions;
+  HandlerOptions & {
+    /** node only (spec §6.2): a non-empty string, cut to 256 code points, else `os.hostname()`. */
+    serverName?: string;
+  };
 export type EdgeInitOptions = CoreOptions & Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'>;
+
+/** What each runtime's automatic-context provider returns (spec §6), read fresh on every capture. */
+export interface AutoContexts {
+  contexts?: Record<string, Record<string, unknown>>;
+  request?: RequestInfo;
+  server_name?: string;
+}
 
 /** The opaque client of decision 36: nothing callable. */
 export interface SentinelClient {

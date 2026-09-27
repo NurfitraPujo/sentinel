@@ -7,12 +7,13 @@
 // idempotent and never throws — a second call drains the previous client and runs its teardown (the old global
 // handlers go) before the new client is installed.
 
+import { DEFAULT_MAX_BREADCRUMBS, MAX_BREADCRUMBS_CAP, replayBeforeBreadcrumb, trimBreadcrumbs } from './breadcrumbs.js';
 import { cutUtf8, utf8Bytes } from './bytes.js';
 import { createClient, replaceClient } from './client.js';
 import { type InitPlan, planPermissive } from './options.js';
 import { debug, reportError } from './report.js';
 import { getSlot, type InternalClient } from './state.js';
-import type { InitOptions, ResolvedOptions, Runtime, SentinelClient } from './types.js';
+import type { AutoContexts, InitOptions, ResolvedOptions, Runtime, SentinelClient } from './types.js';
 
 export const MAX_RELEASE_BYTES = 100;
 export const DEFAULT_ENVIRONMENT = 'production';
@@ -64,6 +65,30 @@ function resolve(client: InternalClient, given: InitOptions): void {
   }
 
   if (given.tracesSampleRate !== undefined) debug(client, 'tracesSampleRate is accepted and ignored');
+
+  const auto = (given as { autoIpAddress?: unknown }).autoIpAddress;
+  if (auto === undefined) {
+    opts.autoIpAddress = true;
+  } else if (typeof auto !== 'boolean') {
+    opts.autoIpAddress = true;
+    reportError(client, 'invalid_option', `autoIpAddress ${String(auto)} is not a boolean; using true`, { option: 'autoIpAddress' });
+  } else {
+    opts.autoIpAddress = auto;
+  }
+
+  const maxBreadcrumbs = given.maxBreadcrumbs;
+  if (maxBreadcrumbs === undefined) {
+    opts.maxBreadcrumbs = DEFAULT_MAX_BREADCRUMBS;
+  } else if (typeof maxBreadcrumbs !== 'number' || !Number.isInteger(maxBreadcrumbs) || maxBreadcrumbs < 0) {
+    opts.maxBreadcrumbs = DEFAULT_MAX_BREADCRUMBS;
+    reportError(client, 'invalid_option', `maxBreadcrumbs ${String(maxBreadcrumbs)} is not an integer 0-100; using ${DEFAULT_MAX_BREADCRUMBS}`, { option: 'maxBreadcrumbs' });
+  } else if (maxBreadcrumbs > MAX_BREADCRUMBS_CAP) {
+    opts.maxBreadcrumbs = MAX_BREADCRUMBS_CAP;
+    reportError(client, 'invalid_option', `maxBreadcrumbs ${maxBreadcrumbs} is over ${MAX_BREADCRUMBS_CAP}; the ingestor keeps only the last ${MAX_BREADCRUMBS_CAP}`, { option: 'maxBreadcrumbs' });
+  } else {
+    opts.maxBreadcrumbs = maxBreadcrumbs;
+  }
+  if (typeof given.beforeBreadcrumb === 'function') opts.beforeBreadcrumb = given.beforeBreadcrumb;
 }
 
 /**
@@ -71,7 +96,7 @@ function resolve(client: InternalClient, given: InitOptions): void {
  * options.ts's `planServer` / `planBrowser`; the permissive plan when a test calls this directly). Synchronous,
  * idempotent, never throws.
  */
-export function initCore(options: InitOptions | undefined, runtime: Runtime, plan?: InitPlan): InternalClient {
+export function initCore(options: InitOptions | undefined, runtime: Runtime, plan?: InitPlan, sdkName?: string, autoContexts?: () => AutoContexts): InternalClient {
   const given: InitOptions = options !== null && typeof options === 'object' ? options : {};
   const resolved: ResolvedOptions = {
     release: '',
@@ -83,6 +108,8 @@ export function initCore(options: InitOptions | undefined, runtime: Runtime, pla
     batchWaitMs: 1000,
     flushOnHide: true,
     installGlobalHandlers: true,
+    autoIpAddress: true,
+    maxBreadcrumbs: DEFAULT_MAX_BREADCRUMBS,
   };
   if (typeof given.beforeSend === 'function') resolved.beforeSend = given.beforeSend;
   if (typeof given.onError === 'function') resolved.onError = given.onError;
@@ -93,13 +120,21 @@ export function initCore(options: InitOptions | undefined, runtime: Runtime, pla
   } catch {
     planned = { noop: false, reports: [] };
   }
-  const client = createClient(resolved, runtime, given, planned);
+  const client = createClient(resolved, runtime, given, planned, sdkName ?? runtime, autoContexts);
   try {
     resolve(client, given);
   } catch (cause) {
     debug(client, `init: option resolution failed inside the SDK: ${String(cause)}`);
   }
   const slot = getSlot();
+  try {
+    // The existing buffer trimmed to the new capacity, then — when this client has a beforeBreadcrumb —
+    // every retained crumb replayed through it (spec §4.1), so nothing in the buffer skipped this client's hook.
+    trimBreadcrumbs(slot.scope, client.options.maxBreadcrumbs);
+    replayBeforeBreadcrumb(client, slot.scope);
+  } catch (cause) {
+    debug(client, `init: breadcrumb buffer trim/replay failed inside the SDK: ${String(cause)}`);
+  }
   const previous = slot.client;
   if (previous !== undefined) {
     // A second `init` drains the old client's not-yet-sent queue into the new one; a batch in flight or backing

@@ -8,7 +8,9 @@
 import { installNodeHandlers } from './core/handlers/node.js';
 import { initCore } from './core/init.js';
 import { planServer, withServerEnvDefaults } from './core/options.js';
+import { reportError } from './core/report.js';
 import type { NodeInitOptions } from './core/types.js';
+import { nodeAutoContexts } from './node/contexts.js';
 
 export * from './core/index.js';
 export type { NodeInitOptions } from './core/types.js';
@@ -19,14 +21,24 @@ export type { NodeInitOptions } from './core/types.js';
  * when either is still missing (N4), the no-op client with `invalid_option` for an `endpoint` that is not an
  * absolute `http(s)` URL (N15), the numeric options degraded, a previous client drained and its hooks
  * uninstalled first; then the `uncaughtExceptionMonitor` / `unhandledRejection` hooks of §4.6 installed unless
- * `installGlobalHandlers: false`.
+ * `installGlobalHandlers: false`. `serverName` (spec §6.2): a non-empty string, else `os.hostname()`, with
+ * `invalid_option` for a non-string value.
  */
-export function init(options?: NodeInitOptions): void {
+export function initNode(options: NodeInitOptions | undefined, entry: string): void {
   try {
     const given = withServerEnvDefaults<NodeInitOptions>(options !== null && typeof options === 'object' ? options : {});
-    const client = initCore(given, 'node', planServer(given));
+    const rawServerName = given.serverName;
+    const serverNameOption = typeof rawServerName === 'string' ? rawServerName : undefined;
+    const client = initCore(given, 'node', planServer(given), entry, () => nodeAutoContexts(serverNameOption));
+    if (rawServerName !== undefined && typeof rawServerName !== 'string') {
+      reportError(client, 'invalid_option', `serverName ${String(rawServerName)} is not a string; using os.hostname()`, { option: 'serverName' });
+    }
     if (!client.noop && client.options.installGlobalHandlers) installNodeHandlers(client);
   } catch {
     // `init` never throws (contract §4.2); an internal failure leaves whatever was installed.
   }
+}
+
+export function init(options?: NodeInitOptions): void {
+  initNode(options, 'node');
 }

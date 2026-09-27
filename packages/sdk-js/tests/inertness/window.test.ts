@@ -42,7 +42,9 @@ describe('D7 (jsdom): the browser entry with a window present', () => {
 
     mod.init({ tunnel: '/api/sentinel' });
     expect(winAdd.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(['error', 'unhandledrejection', 'pagehide']));
-    expect(docAdd.mock.calls.map((c) => c[0])).toEqual(['visibilitychange']);
+    // 'click' is the click breadcrumb integration's listener on document (spec §5.6), installed alongside
+    // the hide listener's 'visibilitychange'.
+    expect(docAdd.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(['visibilitychange', 'click']));
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(procOn).not.toHaveBeenCalled();
     await mod.close(10);

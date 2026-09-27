@@ -8,12 +8,19 @@
 // page and Next evaluates this graph wherever it bundles it — nothing here touches `window`, `process`, timers
 // or `fetch` until `init`.
 
+import { initBrowser } from '../browser.js';
+import type { BrowserInitOptions } from '../core/types.js';
 import type { InstrumentationOnRequestError } from './request-error.js';
 
 export * from '../browser.js';
 export { captureRouterTransitionStart, onRouterTransitionStart } from './router.js';
 export type { NavigationType } from './router.js';
 export type { InstrumentationOnRequestError, RequestErrorContext, RequestErrorRequest } from './request-error.js';
+
+/** Shadows the star export's `init` (an explicit export wins, spec §3.3): `sdk.name` is `sentinel.javascript.nextjs`. */
+export function init(options?: BrowserInitOptions): void {
+  initBrowser(options, 'nextjs');
+}
 
 /** The client build's `captureRequestError`: a no-op with Next's signature (contract §4.7). Never throws. */
 export const captureRequestError: InstrumentationOnRequestError = function captureRequestError(): void {

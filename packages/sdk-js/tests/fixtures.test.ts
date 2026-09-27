@@ -6,17 +6,22 @@
 // Deterministic output: `crypto.randomUUID` and the clock are stubbed so a re-run leaves `git status` clean.
 // Shuffle-safe: every test starts from a deleted `globalThis` slot.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureException, captureMessage } from '../src/core/capture.js';
 import { MAX_COMPONENT_STACK_BYTES, MAX_MESSAGE_BYTES, MAX_METADATA_BYTES } from '../src/core/event.js';
+import { NATS_PUBLISH_BUDGET, protoSizeEstimate } from '../src/core/proto-size.js';
+import { addBreadcrumb, setContext, setTag, setTenant, setUser } from '../src/core/scope.js';
 import { metadataWireBytes } from '../src/core/serialize.js';
-import type { CoreOptions, SentinelEvent } from '../src/core/types.js';
+import type { CoreOptions, Runtime, SentinelEvent } from '../src/core/types.js';
+import { commit } from './helpers/commit.js';
 import { resetPipeline, setup, TURBOPACK_CHUNK } from './helpers/pipeline.js';
 
-const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FIXTURES = join(HERE, 'fixtures');
+const ESTIMATES_DIR = join(HERE, 'fixture-estimates', 'golden');
 const NEVER_TOP_LEVEL = ['source', 'project_key', 'project_id', 'fingerprint_override'];
 
 let uuidCounter = 0;
@@ -33,17 +38,15 @@ afterEach(() => {
 });
 
 /** Capture through a fresh client and return the one event it produced, written to tests/fixtures/<name>.json. */
-function emit(name: string, run: () => void, options: CoreOptions = {}): SentinelEvent {
-  const p = setup(options);
+function emit(name: string, run: () => void, options: CoreOptions = {}, runtime: Runtime = 'browser'): SentinelEvent {
+  const p = setup(options, runtime);
   run();
   const events = p.events();
   expect(events, `${name}: exactly one event`).toHaveLength(1);
   const event = events[0] as SentinelEvent;
   for (const key of NEVER_TOP_LEVEL) expect(event, `${name}: no top-level ${key}`).not.toHaveProperty(key);
-  mkdirSync(FIXTURES, { recursive: true });
-  const path = join(FIXTURES, `${name}.json`);
-  const content = JSON.stringify(event, null, 2) + '\n';
-  if (!existsSync(path) || readFileSync(path, 'utf8') !== content) writeFileSync(path, content);
+  commit(join(FIXTURES, `${name}.json`), event);
+  commit(join(ESTIMATES_DIR, `${name}.json`), { protoSizeEstimate: protoSizeEstimate(event as unknown as Record<string, unknown>) });
   return event;
 }
 
@@ -89,7 +92,7 @@ describe('§11 fixtures: generated from the pipeline and committed for the Go te
 
   it('fixture: a captureMessage', () => {
     const event = emit('capture-message', () => captureMessage('cache miss storm', { level: 'warning' }));
-    expect(event).toMatchObject({ error_class: 'Message', stacktrace: [], metadata: { level: 'warning' } });
+    expect(event).toMatchObject({ error_class: 'Message', stacktrace: [], level: 'warning' });
   });
 
   it('fixture: a 20 000-char message cut on a code-point boundary', () => {
@@ -172,7 +175,7 @@ describe('§11 fixtures: generated from the pipeline and committed for the Go te
           author: 'me',
           nested: { api_key: 'k', safe: 'kept' },
           items: [{ password: 'in-array' }],
-          user_id: 'usr_1',
+          request_id: 'req_1',
         },
       }),
     );
@@ -181,7 +184,7 @@ describe('§11 fixtures: generated from the pipeline and committed for the Go te
       author: '[FILTERED]',
       nested: { api_key: '[FILTERED]', safe: 'kept' },
       items: [{ password: 'in-array' }],
-      user_id: 'usr_1',
+      request_id: 'req_1',
     });
   });
 
@@ -194,15 +197,143 @@ describe('§11 fixtures: generated from the pipeline and committed for the Go te
   it("fixture: the near-the-cap metadata — under 65 536 by JSON.stringify's count, over it by the validator's; html removed", () => {
     const html = ('<' + 'p'.repeat(24)).repeat(2000) + '\u2028';
     const pad = 'y'.repeat(14 * 1024 + 1000);
-    const preShrink = { html, pad, user_id: 'usr_1', runtime: 'browser' };
+    const preShrink = { html, pad, request_id: 'req_1', runtime: 'browser' };
     const naive = Buffer.byteLength(JSON.stringify(preShrink));
     const goRule = metadataWireBytes(JSON.stringify(preShrink));
     expect(naive).toBeLessThan(MAX_METADATA_BYTES);
     expect(goRule).toBeGreaterThan(MAX_METADATA_BYTES);
-    const event = emit('metadata-near-the-cap', () => captureException(withStack('near the cap', [`    at render (${PAGE_CHUNK}:6:6)`]), { metadata: { html, pad, user_id: 'usr_1' } }));
+    const event = emit('metadata-near-the-cap', () => captureException(withStack('near the cap', [`    at render (${PAGE_CHUNK}:6:6)`]), { metadata: { html, pad, request_id: 'req_1' } }));
     expect(event.metadata.html).toBeUndefined();
     expect(event.metadata.truncated_keys).toEqual(['html']);
     expect(metadataWireBytes(JSON.stringify(event.metadata))).toBeLessThanOrEqual(MAX_METADATA_BYTES);
+  });
+
+  it('fixture: rich typed context (node runtime, no {{auto}}) — every typed field in its place, metadata carries none of it', () => {
+    const event = emit(
+      'v2-rich-context',
+      () => {
+        setUser({ id: 'usr_1', username: 'ada', email: 'ada@example.com' });
+        setTenant('org_a');
+        setTag('feature', 'chats');
+        setContext('ok', { a: 1 });
+        addBreadcrumb({ message: 'clicked save', category: 'ui.click' });
+        captureException(withStack('rich context', [`    at render (${PAGE_CHUNK}:7:7)`]));
+      },
+      {},
+      'node',
+    );
+    expect(event.user).toEqual({ id: 'usr_1', username: 'ada', email: 'ada@example.com' });
+    expect(event.tags).toEqual({ feature: 'chats', tenant_id: 'org_a' });
+    expect(event.contexts).toEqual({ ok: { a: 1 } });
+    expect(event.breadcrumbs).toHaveLength(1);
+    expect(event.level).toBe('error');
+    expect(event.sdk).toEqual({ name: 'sentinel.javascript.node', version: expect.any(String) });
+    expect(event.metadata).not.toHaveProperty('user_id');
+    expect(event.metadata).not.toHaveProperty('tenant_id');
+    expect(event.metadata).not.toHaveProperty('feature');
+  });
+
+  it('fixture: a hostile beforeSend cannot make the ingestor 400 the event (spec §3.8, node runtime)', () => {
+    const event = emit(
+      'v2-hostile-before-send',
+      () => {
+        setContext('ok', { a: 1 });
+        addBreadcrumb({ message: 'one' });
+        captureException(withStack('hostile', [`    at render (${PAGE_CHUNK}:8:8)`]));
+      },
+      {
+        beforeSend: (built) =>
+          ({
+            ...built,
+            logger: 5,
+            dist: {},
+            source: [],
+            exception: 'x',
+            project_key: 7,
+            fingerprint_override: 'yes',
+            LEVEL: 7,
+            Tags: 'x',
+            environment: 42,
+            release_version: {},
+            fingerprint: 'f'.repeat(65),
+            trace_id: 5,
+            trace_flags: -1,
+            stacktrace: built.stacktrace.map((f, i) => (i === 0 ? { ...f, line: 1e12 } : f)),
+            contexts: { ...built.contexts, when: new Date(), url: new URL('https://h/p'), arr: { toJSON: () => [1] } },
+            breadcrumbs: (built.breadcrumbs ?? []).map((b, i) => (i === 0 ? { ...b, data: new URL('https://h/p') } : b)),
+            request: { headers: { a: 1 } },
+            toJSON: () => ({ hacked: true }),
+          }) as unknown as SentinelEvent,
+      },
+      'node',
+    );
+    expect(event).not.toHaveProperty('logger');
+    expect(event).not.toHaveProperty('dist');
+    expect(event).not.toHaveProperty('source');
+    expect(event).not.toHaveProperty('exception');
+    expect(event).not.toHaveProperty('project_key');
+    expect(event).not.toHaveProperty('fingerprint_override');
+    expect(event).not.toHaveProperty('LEVEL');
+    expect(event).not.toHaveProperty('Tags');
+    expect(event.environment).not.toBe(42);
+    expect(event).not.toHaveProperty('release_version');
+    expect(event).not.toHaveProperty('fingerprint');
+    expect(event).not.toHaveProperty('trace_id');
+    expect(event).not.toHaveProperty('trace_flags');
+    expect(event.stacktrace[0]?.line).toBeUndefined();
+    expect(event.contexts).toEqual({ ok: { a: 1 } });
+    expect(event.breadcrumbs?.[0]?.data).toBeUndefined();
+    expect(event.request).toBeUndefined();
+  });
+
+  it('fixture: every map-shaped field maxed out with tiny content — the +8-per-entry map overhead (spec §11.2, C9, round-8 finding sdkjs-rc-spec-estimate-vs-proto-not-gated-r8)', () => {
+    const headers: Record<string, string> = {};
+    const env: Record<string, string> = {};
+    for (let i = 0; i < 64; i++) {
+      headers[`h${i}`] = 'x'.repeat(150);
+      env[`e${i}`] = 'x'.repeat(150);
+    }
+    const event = emit(
+      'v2-estimate-numbers',
+      () => {
+        for (let i = 0; i < 50; i++) setTag(`k${i}`, 'x'.repeat(190));
+        captureException(withStack('map entries', [`    at compute (${PAGE_CHUNK}:9:9)`]), { request: { headers, env } });
+      },
+      {},
+      'node',
+    );
+    expect(Object.keys(event.tags ?? {}).length).toBeGreaterThanOrEqual(50);
+    expect(Object.keys(event.request?.headers ?? {}).length).toBeGreaterThan(0);
+    expect(Object.keys(event.request?.env ?? {}).length).toBeGreaterThan(0);
+  });
+
+  it('fixture: 40 multi-byte tags — utf8Bytes over the skeleton and the +8-per-entry map overhead (spec §11.2, C9, round-8 finding sdkjs-rc-spec-estimate-vs-proto-not-gated-r8)', () => {
+    const event = emit(
+      'v2-estimate-strings',
+      () => {
+        for (let i = 0; i < 40; i++) setTag(`t${String(i).padStart(2, '0')}`, '日本語🎉'.repeat(3));
+        captureException(withStack('multi-byte tags', [`    at render (${PAGE_CHUNK}:10:10)`]));
+      },
+      {},
+      'node',
+    );
+    expect(Object.keys(event.tags ?? {}).length).toBeGreaterThanOrEqual(40);
+  });
+
+  it("fixture: the NATS publish shed's own worked example, post-shed and near the budget (spec §4.6 round 7's case, §11.2, C9)", () => {
+    const event = emit(
+      'v2-publish-bound',
+      () => {
+        for (let i = 0; i < 32; i++) addBreadcrumb({ message: `${i}`, data: { a: Array(2030).fill(0) } });
+        captureException(withStack('publish bound', [`    at fetchAll (${PAGE_CHUNK}:11:11)`]), { metadata: { a: Array(32_700).fill(0) } });
+      },
+      { maxBreadcrumbs: 100 },
+      'node',
+    );
+    const estimate = protoSizeEstimate(event as unknown as Record<string, unknown>);
+    expect(estimate).toBeLessThanOrEqual(NATS_PUBLISH_BUDGET);
+    expect(event.metadata.truncated).toContain('breadcrumbs');
+    expect((event.breadcrumbs?.length ?? 0)).toBeLessThan(32);
   });
 
   it('the committed set: ≥ 13 files, each a parseable event with no top-level source / project_key / project_id / fingerprint_override', () => {

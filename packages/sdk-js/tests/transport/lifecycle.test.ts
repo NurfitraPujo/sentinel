@@ -257,7 +257,7 @@ describe('B23: close()', () => {
     captureMessage('after re-init');
     await advance(1000);
     await s.waitFor(2);
-    expect(s.requests[1]?.events[0]?.metadata.user_id).toBe('usr_1');
+    expect(s.requests[1]?.events[0]?.user?.id).toBe('usr_1');
   });
 
   it('B23: close counts pending beforeSend hooks and their events never enqueue into a client', async () => {

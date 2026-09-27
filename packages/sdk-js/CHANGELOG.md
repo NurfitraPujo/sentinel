@@ -4,10 +4,72 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
-### Unreleased — the tunnel writes the browser's IP (ships with the next tag, planned v0.2.0)
+## v0.2.0 — Typed `level` / `sdk` / `user` / `tags` / `contexts` / `request` / `breadcrumbs`; identity and tags leave `metadata`
 
-Not tagged by this change (`sentinel-event-enrichment` contract decision 5); it reaches `web` with
-`sentinel-sdk-js-rich-context/TASK-05` (0.2.0) and `TASK-06`.
+#### Behaviour change
+
+- **`tags`, `user_id`, `tenant_id` and `level` leave `metadata`.** They now live in their own typed
+  wire fields: `setTag` / `setTags` / `setTenant` write `tags` (a per-event copy of the scope's map,
+  capped at 50 keys — see below); `setUser` and a per-call `ctx.user` write `user` (`id`, `username`,
+  `email`, `ip_address`, replace semantics); `level` is a top-level field, `'fatal' | 'error' |
+  'warning' | 'info' | 'debug'`, defaulting to `'error'` for `captureException` and `'info'` for
+  `captureMessage` (which now also takes a level string as its second argument). A per-call
+  `ctx.metadata.user_id` / `tenant_id` / `level` is dropped with a debug line — use `ctx.user` /
+  `ctx.tags` / `ctx.level` instead. **0.1.x apps keep working**: the server accepts both the old
+  metadata-carried shape and the new typed one from every SDK version at once.
+- **New scope APIs and options.** `setContext(name, value | null)` writes `contexts`, merged under
+  each runtime's automatic contexts (below), app-set fields winning field by field.
+  `setExtra` / `setExtras` (Sentry's names) write arbitrary `metadata` keys. `addBreadcrumb(crumb,
+  hint?)` and the automatic browser integrations (below) write `breadcrumbs`. New options:
+  `maxBreadcrumbs` (0-100, default 100), `beforeBreadcrumb`, `breadcrumbs` (the automatic
+  integrations' switch), `autoIpAddress` (browser only, default `true`), `serverName` (node only).
+- **Automatic contexts and request, per runtime.** The browser sends `request.url` / `query_string`
+  / a `User-Agent` header (filtered, see below) and `contexts.culture` / `.device`; node sends
+  `contexts.runtime` / `.os` and `server_name`; the edge sends `contexts.runtime` only. **Neither
+  runtime ever sends `contexts.browser` or `contexts.os` directly** — the ingestor derives both from
+  the browser's `User-Agent` header itself, which is the one place that parsing already lives, so the
+  SDK does not duplicate it (D2).
+- **Automatic browser breadcrumbs**: console, `fetch`, `XMLHttpRequest`, `history.pushState` /
+  `replaceState` / `popstate`, and clicks — each independently switchable through the `breadcrumbs`
+  option, each on by default.
+- **The URL privacy filter.** Every URL the SDK records — breadcrumb `data.url` / `.from` / `.to`,
+  `request.url` / `.query_string`, every `stacktrace[].file`, and the event `message` — has a
+  sensitive query value replaced with the literal `[Filtered]` (distinct from metadata's `[FILTERED]`,
+  which is Go-side PII scrubbing parity). A key is sensitive when it contains `password`, `passwd`,
+  `pass`, `token`, `bearer`, `secret`, `authorization`, `auth`, `credit_card`, `card_number`, `cvv`,
+  `ssn`, `social_security`, `api_key` or `apikey` as a substring, or when one of its `-`/`_`/`.`/`[`/`]`-
+  delimited segments is exactly `code`, `state`, `key`, `signature`, `sig`, `jwt`, `otp` or
+  `credential`. Userinfo (`user:pass@host`) is always removed. See *URL privacy* below for what is
+  deliberately **not** filtered.
+- **The tunnel forwards seven more typed fields**: `level`, `sdk`, `user`, `tags`, `contexts`,
+  `request`, `breadcrumbs` join the exact-key allow-list `ITEM_KEYS` already forwards.
+- **New `metadata.truncated` values** `breadcrumbs`, `contexts` and `tags`, alongside the existing
+  ones, recorded whenever the SDK itself removes one of those fields to fit a bound (see the next
+  three points).
+- **The NATS publish bound.** Every event is now estimated against the ingestor's own protobuf
+  encoding (not just its JSON size) before it is queued, because a `Struct` value can cost up to 5.5×
+  its JSON size on the wire. Over a 1,000,000-byte estimate (which assumes the ingestor's own
+  enrichment adds at most ~48 KB after the SDK), breadcrumbs are shed oldest first, then contexts
+  (custom names before the automatic ones, largest first), then non-exempt metadata keys — in that
+  order, each shed only as far as needed. In the browser this runs after an existing keepalive trim
+  (breadcrumbs shed to fit a 60 KiB single-event body, then, as a last resort for the tunnel's 256 KiB
+  cap, `contexts` and every tag but `tenant_id`).
+- **The metadata shrink's new end.** The server's own 18 exempt keys (`user_id`, `userId`, `user`,
+  `tenant_id`, `tenantId`, `organization_id`, `trace_id`, `traceId`, `trace-id`, `span_id`, `spanId`,
+  `span-id`, `request_id`, `requestId`, `request-id`, `release_version`, `truncated`,
+  `truncated_keys`) replace the SDK's own exempt list; `route` is no longer exempt, because the server
+  never protected it either. Once every non-exempt key is gone, the exempt keys are now removed too
+  (largest first) instead of dropping the event — **the shrink never drops an event any more**, and
+  `metadata_too_large` is no longer emitted (the code stays in `SentinelSdkErrorCode` so an
+  exhaustive `switch` still compiles). `truncated_keys` is written in the server's own capped shape:
+  its first 50 removed-key names, each cut to 128 bytes, then one `"+N more"` entry for the rest.
+- **The SDK's own 50-tag cap.** An event's effective tag count (the scope's, merged with a per-call
+  `ctx.tags`) over 50 keeps `tenant_id` and the 49 lexically smallest other keys — mirroring what the
+  server would keep, so its own cut is a no-op on what the SDK sends.
+- **The SDK's own contexts and request-map bounds**, applied before every send so the server's own
+  cut never removes anything: `contexts` to 32 names / 64 KiB (custom names removed before the six
+  automatic ones, largest first, a size tie to the lexically smallest name); `request.headers` /
+  `.env` to 64 entries, values cut to 4096 / 1024 code points.
 
 #### Changed
 

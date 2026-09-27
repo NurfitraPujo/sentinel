@@ -1,0 +1,48 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "platform": "javascript",
+  "environment": "production",
+  "error_class": "Error",
+  "message": "rich context",
+  "stacktrace": [
+    {
+      "file": "https://app/_next/static/chunks/app/page-9b0d4e.js",
+      "line": 7,
+      "column": 7,
+      "function": "render",
+      "in_app": true
+    }
+  ],
+  "metadata": {
+    "runtime": "node"
+  },
+  "timestamp": "2026-09-16T12:00:00.000Z",
+  "level": "error",
+  "sdk": {
+    "name": "sentinel.javascript.node",
+    "version": "0.2.0"
+  },
+  "user": {
+    "id": "usr_1",
+    "email": "ada@example.com",
+    "username": "ada"
+  },
+  "tags": {
+    "tenant_id": "org_a",
+    "feature": "chats"
+  },
+  "contexts": {
+    "ok": {
+      "a": 1
+    }
+  },
+  "breadcrumbs": [
+    {
+      "timestamp": "2026-09-16T12:00:00.000Z",
+      "type": "default",
+      "category": "ui.click",
+      "message": "clicked save",
+      "level": "info"
+    }
+  ]
+}

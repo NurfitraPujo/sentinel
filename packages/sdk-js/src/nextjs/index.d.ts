@@ -7,23 +7,45 @@
 // `stale-deploy.ts` and any component compile in every bundle, and `import { init } from
 // '@sentinel/sdk-js/nextjs'` is a type error (flows B18): an init file imports its own fixed subpath.
 
-export { captureException, captureMessage, close, flush, getClient, SentinelSdkError, setTag, setTenant, setUser, SDK_NAME } from '../core/index.js';
+export {
+  addBreadcrumb,
+  captureException,
+  captureMessage,
+  close,
+  flush,
+  getClient,
+  SentinelSdkError,
+  setContext,
+  setExtra,
+  setExtras,
+  setTag,
+  setTags,
+  setTenant,
+  setUser,
+  SDK_NAME,
+} from '../core/index.js';
 export type {
+  BeforeBreadcrumb,
   BeforeSend,
   BeforeSendHint,
+  Breadcrumb,
+  BreadcrumbHint,
   CaptureContext,
   CoreOptions,
   InitOptions,
   Level,
+  RequestInfo,
   ResolvedCoreOptions,
   ResolvedOptions,
   ResolvedTransportOptions,
   Runtime,
+  SdkInfo,
   SentinelClient,
   SentinelEvent,
   SentinelSdkErrorCode,
   StackFrame,
   TransportOptions,
+  User,
 } from '../core/index.js';
 export type { InstrumentationOnRequestError, RequestErrorContext, RequestErrorRequest } from './request-error.js';
 export type { NavigationType } from './router.js';

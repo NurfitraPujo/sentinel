@@ -7,8 +7,9 @@ import type { JsonValue } from './serialize.js';
 
 export const FILTERED = '[FILTERED]';
 
-// packages/sdk-go/pii.go: defaultPIIKeys, in its order.
-const PII_KEYS = [
+// packages/sdk-go/pii.go: defaultPIIKeys, in its order. Also the substring half of the URL filter's key
+// test (spec §5.1 rule 3).
+export const PII_KEYS = [
   'password',
   'passwd',
   'pass',

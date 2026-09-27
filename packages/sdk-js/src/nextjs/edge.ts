@@ -9,6 +9,7 @@
 // Import-time inertness (contract §4.7, §11; D7): nothing here touches `process`, timers or `fetch` until `init`.
 
 import { sendPromise } from '../core/client.js';
+import { initEdge } from '../edge.js';
 import type { EdgeInitOptions } from '../core/types.js';
 import { captureRequestErrorEvent, type InstrumentationOnRequestError, type RequestErrorContext, type RequestErrorRequest } from './request-error.js';
 
@@ -16,6 +17,11 @@ export * from '../edge.js';
 export { captureRouterTransitionStart, onRouterTransitionStart } from './router.js';
 export type { NavigationType } from './router.js';
 export type { InstrumentationOnRequestError, RequestErrorContext, RequestErrorRequest };
+
+/** Shadows the star export's `init` (spec §3.3): `sdk.name` is `sentinel.javascript.nextjs`. */
+export function init(options?: EdgeInitOptions): void {
+  initEdge(options, 'nextjs');
+}
 
 /**
  * Next's `onRequestError` on the edge (contract §4.7): captures `error` with the request / route metadata and

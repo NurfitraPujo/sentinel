@@ -312,11 +312,11 @@ describe('T10: the body taxonomy, complete (step 6)', () => {
   });
 
   it('T10: normaliseBody keeps every ErrorPayload key the ingestor decodes and nothing else', () => {
-    const full = { event_id: 'e', platform: 'p', environment: 'env', message: 'm', error_class: 'c', trace_id: 't', span_id: 's', stacktrace: [], metadata: {}, timestamp: 'ts', trace_flags: 1, release_version: 'r', fingerprint: 'f', fingerprint_override: false, project_key: 'pk', project_id: 'pid', extra: 1 };
+    const full = { event_id: 'e', platform: 'p', environment: 'env', message: 'm', error_class: 'c', trace_id: 't', span_id: 's', stacktrace: [], metadata: {}, timestamp: 'ts', trace_flags: 1, release_version: 'r', fingerprint: 'f', fingerprint_override: false, level: 'error', sdk: {}, user: {}, tags: {}, contexts: {}, request: {}, breadcrumbs: [], project_key: 'pk', project_id: 'pid', extra: 1 };
     const out = normaliseBody(JSON.stringify(full), 50);
     expect(out.ok).toBe(true);
     if (out.ok) {
-      expect(Object.keys(out.items[0] ?? {}).sort()).toEqual(['environment', 'error_class', 'event_id', 'fingerprint', 'fingerprint_override', 'message', 'metadata', 'platform', 'release_version', 'span_id', 'stacktrace', 'timestamp', 'trace_flags', 'trace_id']);
+      expect(Object.keys(out.items[0] ?? {}).sort()).toEqual(['breadcrumbs', 'contexts', 'environment', 'error_class', 'event_id', 'fingerprint', 'fingerprint_override', 'level', 'message', 'metadata', 'platform', 'release_version', 'request', 'sdk', 'span_id', 'stacktrace', 'tags', 'timestamp', 'trace_flags', 'trace_id', 'user']);
       expect(out.items[0]?.platform).toBe('javascript');
     }
   });
@@ -789,11 +789,11 @@ describe('TASK-06: applyClientIp rebuilds user from the exact-key allow-list (sp
     expect(run(['x'], IP)).toEqual({ ...base, user: ['x'] });
   });
 
-  it('B4: with no IP a plain-object user is rebuilt with no ip_address in any spelling; B5: no user stays absent', () => {
+  it('B4: with no IP a plain-object user is rebuilt with no ip_address in any spelling, and deleted entirely when empty; B5: no user stays absent', () => {
     expect(run({ ip_address: '6.6.6.6', id: 'u1' }, null)).toEqual({ ...base, user: { id: 'u1' } });
-    expect(run({ Ip_Address: '6.6.6.6' }, null)).toEqual({ ...base, user: {} });
-    expect(run({ 'ip_addreſſ': '6.6.6.6' }, null)).toEqual({ ...base, user: {} });
-    expect(run({ IP_ADDRESS: '6.6.6.6', GEO: {} }, null)).toEqual({ ...base, user: {} });
+    expect(run({ Ip_Address: '6.6.6.6' }, null)).toEqual(base);
+    expect(run({ 'ip_addreſſ': '6.6.6.6' }, null)).toEqual(base);
+    expect(run({ IP_ADDRESS: '6.6.6.6', GEO: {} }, null)).toEqual(base);
     expect(run(undefined, null)).toEqual(base);
     expect(run(null, null)).toEqual({ ...base, user: null });
   });
@@ -801,7 +801,8 @@ describe('TASK-06: applyClientIp rebuilds user from the exact-key allow-list (sp
 
 describe('TASK-06: through the route — overwrite, the top-level filter, clientKey (spec §4.5)', () => {
   it('an inbound user.ip_address is never forwarded: with a derivable IP the item carries the derived one; with none, no user at all', async () => {
-    // ITEM_KEYS removes `user` today (T10), so the item arrives at applyClientIp with none (B1 / B5).
+    // ITEM_KEYS admits `user` (spec §7.1); applyClientIp rebuilds it from USER_KEYS only, so the inbound
+    // ip_address never survives, and B4 deletes the empty rebuild when no IP was derived.
     expect((await forwardedItems(IP, {}, [{ ...ITEM, user: { ip_address: '6.6.6.6' } }]))[0]?.user).toEqual({ ip_address: IP });
     expect((await forwardedItems(null, {}, [{ ...ITEM, user: { ip_address: '6.6.6.6' } }]))[0]).not.toHaveProperty('user');
   });
@@ -828,6 +829,64 @@ describe('TASK-06: through the route — overwrite, the top-level filter, client
         })
       )[0],
     ).not.toHaveProperty('user');
+  });
+});
+
+describe('C1: ITEM_KEYS admits the typed fields (spec §7.1, §7.2)', () => {
+  const V2_EXTRAS = {
+    level: 'warning',
+    sdk: { name: 'sentinel.javascript.browser', version: '0.2.0' },
+    tags: { tenant_id: 't1', plan: 'pro' },
+    contexts: { app: { version: '1.0' } },
+    request: { url: 'https://app.example/x' },
+    breadcrumbs: [{ type: 'default', category: 'ui.click', timestamp: '2026-09-16T00:00:00.000Z' }],
+  };
+
+  it('each of the six non-user typed keys survives a forward unchanged, deep-equal', async () => {
+    const items = await forwardedItems(null, {}, [{ ...ITEM, ...V2_EXTRAS }]);
+    const item = items[0] as unknown as typeof V2_EXTRAS;
+    expect(item.level).toEqual(V2_EXTRAS.level);
+    expect(item.sdk).toEqual(V2_EXTRAS.sdk);
+    expect(item.tags).toEqual(V2_EXTRAS.tags);
+    expect(item.contexts).toEqual(V2_EXTRAS.contexts);
+    expect(item.request).toEqual(V2_EXTRAS.request);
+    expect(item.breadcrumbs).toEqual(V2_EXTRAS.breadcrumbs);
+  });
+
+  it('not-admitted keys never reach the forward: transaction, server_name, exception, logger, dist, source, project_key, project_id, received_at', async () => {
+    const notAdmitted = {
+      transaction: 'x',
+      server_name: 'x',
+      exception: 'x',
+      logger: 'x',
+      dist: 'x',
+      source: 'x',
+      project_key: 'pk',
+      project_id: 'pid',
+      received_at: 'x',
+    };
+    const items = await forwardedItems(null, {}, [{ ...ITEM, ...notAdmitted }]);
+    for (const key of Object.keys(notAdmitted)) expect(items[0]).not.toHaveProperty(key);
+  });
+
+  it('case-folded spellings of the new keys are dropped: USER, Tags, Breadcrumbs, uſer', async () => {
+    const items = await forwardedItems(null, {}, [
+      { ...ITEM, USER: { id: 'x' }, Tags: { a: 'b' }, Breadcrumbs: [{ type: 'x' }], 'uſer': { id: 'y' } },
+    ]);
+    expect(items[0]).not.toHaveProperty('USER');
+    expect(items[0]).not.toHaveProperty('Tags');
+    expect(items[0]).not.toHaveProperty('Breadcrumbs');
+    expect(items[0]).not.toHaveProperty('uſer');
+    expect(items[0]).not.toHaveProperty('user');
+    expect(items[0]).not.toHaveProperty('tags');
+    expect(items[0]).not.toHaveProperty('breadcrumbs');
+  });
+
+  it('a v2 item’s user with {{auto}}, IP_ADDRESS, geo and an extra key forwards as exactly { id, username, email, ip_address: <derived> }', async () => {
+    const items = await forwardedItems(IP, {}, [
+      { ...ITEM, user: { id: 'u1', username: 'name', email: 'a@b.c', ip_address: '{{auto}}', IP_ADDRESS: '6.6.6.6', geo: { country_code: 'XX' }, extra: 'z' } },
+    ]);
+    expect(items[0]?.user).toEqual({ id: 'u1', username: 'name', email: 'a@b.c', ip_address: IP });
   });
 });
 

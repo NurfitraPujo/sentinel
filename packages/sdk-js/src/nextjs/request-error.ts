@@ -14,7 +14,21 @@
 // missing key) still captures the error with whatever could be read.
 
 import { capture } from '../core/capture.js';
-import type { CaptureContext } from '../core/types.js';
+import { isSensitiveKey } from '../core/pii.js';
+import { filterQuery, filterUrl } from '../core/url.js';
+import type { CaptureContext, RequestInfo } from '../core/types.js';
+
+function codePoints(s: string): string[] {
+  return Array.from(s);
+}
+
+function cutCodePoints(s: string, max: number): string {
+  const cps = codePoints(s);
+  return cps.length > max ? cps.slice(0, max).join('') : s;
+}
+
+/** Names dropped outright, lower-cased (contract §4.3) — never even reach `isSensitiveKey`. */
+const DROPPED_HEADER_NAMES: ReadonlySet<string> = new Set(['authorization', 'cookie', 'set-cookie', 'proxy-authorization', 'x-api-key']);
 
 /** `RequestErrorContext` — next/dist/server/instrumentation/types.d.ts at 15.5.21, verbatim. */
 export type RequestErrorContext = {
@@ -62,6 +76,57 @@ function traceparentOf(headers: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/** One header value as a string: an array is joined with `, `; `undefined` is skipped (spec §6.4). */
+function headerValueOf(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.filter((v): v is string => typeof v === 'string').join(', ');
+  return undefined;
+}
+
+/**
+ * `errorRequest.headers` → `request.headers` (spec §6.4): the five credential names dropped outright; a
+ * PII-sensitive name kept with `[Filtered]`; every other value holding `?` or `#` filtered whole through
+ * `filterUrl` (D6 — a `referer`, `next-url` or a proxy's forwarded-path header). §3.10's `boundStringMap`
+ * (entries, key length, value cut) is applied generically to every event's `request.headers` at `build`.
+ */
+function requestHeadersOf(headers: unknown): Record<string, string> | undefined {
+  if (headers === null || typeof headers !== 'object') return undefined;
+  let keys: string[];
+  try {
+    keys = Object.keys(headers as Record<string, unknown>);
+  } catch {
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const name of keys) {
+    const lower = name.toLowerCase();
+    if (DROPPED_HEADER_NAMES.has(lower)) continue;
+    const raw = read(headers, name);
+    const value = headerValueOf(raw);
+    if (value === undefined) continue;
+    if (isSensitiveKey(name)) {
+      out[name] = '[Filtered]';
+    } else if (value.includes('?') || value.includes('#')) {
+      out[name] = filterUrl(value);
+    } else {
+      out[name] = value;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** `errorRequest.path` split into its `request.url` (up to `?`/`#`) and `request.query_string` (spec §6.4). */
+function requestFromPath(path: string): { url: string; queryString?: string } {
+  const hashIndex = path.indexOf('#');
+  const noFragment = hashIndex === -1 ? path : path.slice(0, hashIndex);
+  const qIndex = noFragment.indexOf('?');
+  if (qIndex === -1) return { url: cutCodePoints(filterUrl(noFragment), 2048) };
+  const url = cutCodePoints(filterUrl(noFragment.slice(0, qIndex)), 2048);
+  const rawQuery = noFragment.slice(qIndex + 1);
+  const queryString = rawQuery === '' ? undefined : cutCodePoints(filterQuery(rawQuery), 4096);
+  return queryString === undefined || queryString === '' ? { url } : { url, queryString };
+}
+
 /**
  * Build the capture context for `onRequestError`'s three arguments and capture `error`. Returns the `event_id`
  * (the edge build waits on its send). Never throws.
@@ -77,15 +142,28 @@ export function captureRequestErrorEvent(error: unknown, errorRequest: unknown, 
     const routeType = read(errorContext, 'routeType');
     const renderSource = read(errorContext, 'renderSource');
     const revalidateReason = read(errorContext, 'revalidateReason');
-    if (method !== undefined) metadata.http_method = method;
-    if (path !== undefined) metadata.http_url = path;
     if (routePath !== undefined) metadata.route = routePath;
     if (routerKind !== undefined) metadata.router_kind = routerKind;
     if (routeType !== undefined) metadata.route_type = routeType;
     if (renderSource !== undefined) metadata.render_source = renderSource;
     if (revalidateReason !== undefined) metadata.revalidate_reason = revalidateReason;
     ctx.metadata = metadata;
-    const traceparent = traceparentOf(read(errorRequest, 'headers'));
+
+    const request: RequestInfo = {};
+    if (typeof method === 'string') request.method = cutCodePoints(method, 16);
+    if (typeof path === 'string') {
+      const { url, queryString } = requestFromPath(path);
+      request.url = url;
+      if (queryString !== undefined) request.query_string = queryString;
+    }
+    const headersIn = read(errorRequest, 'headers');
+    const headers = requestHeadersOf(headersIn);
+    if (headers !== undefined) request.headers = headers;
+    if (Object.keys(request).length > 0) ctx.request = request;
+
+    if (typeof routePath === 'string') ctx.transaction = cutCodePoints(routePath, 200);
+
+    const traceparent = traceparentOf(headersIn);
     if (traceparent !== undefined) ctx.traceparent = traceparent;
   } catch {
     // Whatever could not be read is left out; the error itself is still captured.

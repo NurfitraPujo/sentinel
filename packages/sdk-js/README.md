@@ -528,27 +528,151 @@ in one tick go out in one `POST`, a lone capture is its own one-element batch (`
 ignored there) — so a runtime that stops the isolate at the response still gets the event. No
 global handlers exist to install on the edge; `captureRequestError` is the path.
 
+## Scope: user, tags, contexts, extras (0.2.0)
+
+```ts
+import { setUser, setTags, setTenant, setContext, setExtra } from '@sentinel/sdk-js/browser'; // or /node, /edge
+
+setUser({ id: 'usr_1', email: 'ada@example.com' }); // replaces the scope user; null clears it
+setTags({ feature: 'checkout' });
+setTenant('org_42'); // → tags.tenant_id — the processor's affected-tenant read
+setContext('device', { model: 'Pixel 8' }); // merged under automatic contexts, field by field
+setExtra('order_id', 'ord_123'); // → metadata, same as today
+```
+
+A per-call `ctx.user` / `ctx.tags` replaces / merges over the scope for one event only — the
+`captureRequestError` workaround this README used to describe as `metadata: { user_id }` is now
+`captureException(err, { user: { id }, tags: { tenant_id } })`. `tags` over 50 keys keeps
+`tenant_id` and the 49 lexically smallest others; the rest are dropped with a debug line and
+`metadata.truncated` gains `'tags'`.
+
+## Breadcrumbs (0.2.0)
+
+```ts
+import { addBreadcrumb } from '@sentinel/sdk-js/browser';
+
+addBreadcrumb({ category: 'auth', message: 'logged in', level: 'info' });
+```
+
+A ring buffer, oldest first, capacity `maxBreadcrumbs` (0-100, default 100 — `0` disables it and
+installs no automatic integration). `beforeBreadcrumb(crumb, hint) => crumb | null` runs
+synchronously on every crumb, manual and automatic, before it enters the buffer; returning `null`
+drops it, returning anything but a plain object drops it too, and a throw drops it silently (no
+`onError` — this is where an app removes what it does not want recorded, and failing open would
+record exactly that). In the browser, five integrations record automatically, each switchable:
+
+```ts
+init({
+  tunnel: '/api/sentinel',
+  breadcrumbs: { console: true, fetch: true, xhr: true, navigation: true, click: false },
+  // or breadcrumbs: false to disable every one of them
+});
+```
+
+- **console** — `debug` / `info` / `log` / `warn` / `error` / `assert` / `trace`, up to 10 arguments
+  rendered and filtered (see *URL privacy*), the SDK's own `[@sentinel/sdk-js]` lines excluded.
+- **fetch** — method, filtered URL, status and duration on settle; never reads headers or bodies;
+  never records a request to the SDK's own tunnel.
+- **xhr** — the same shape, from `open` / `send` / `loadend`.
+- **navigation** — `history.pushState` / `replaceState` and `popstate`; `from` / `to`, filtered,
+  relative when same-origin.
+- **click** — one passive, capture-phase listener; a CSS-like selector (tag, `#id`, `.class`, up to
+  5 ancestors, 80 characters) — never a value, name, `aria-*` or `data-*` attribute, so an input's
+  value cannot reach Sentinel through this integration.
+
+## URL privacy (0.2.0)
+
+Every URL the SDK records — breadcrumb `data.url` / `.from` / `.to`, `request.url` /
+`.query_string`, every `stacktrace[].file`, and the event `message` — has a sensitive query value
+replaced with `[Filtered]`. A key is sensitive when it **contains** (case-insensitively) `password`,
+`passwd`, `pass`, `token`, `bearer`, `secret`, `authorization`, `auth`, `credit_card`,
+`card_number`, `cvv`, `ssn`, `social_security`, `api_key` or `apikey`, or when one of its
+`-`/`_`/`.`/`[`/`]`-delimited segments is **exactly** `code`, `state`, `key`, `signature`, `sig`,
+`jwt`, `otp` or `credential` (whole-segment, so `zipcode` and `monkey` are untouched). A query is
+split on both `&` and `;`. A value that is itself a URL (a `next` / `redirect` / `return_to` /
+`callbackUrl`-style parameter) is filtered recursively, up to 3 levels deep. Userinfo
+(`user:pass@host`) is always removed, everywhere, with no key test at all.
+
+**Not filtered** — deliberate residuals, listed so you know what to avoid logging yourself:
+
+- A **keyless** query part (`/verify?t0k`) — filtering every bare token would rewrite ordinary
+  URLs like `?print` or `?v2`.
+- A **scheme-less, base-less** nested value with no `?` (`/login?next=reset_token%3DX` — `next`'s
+  decoded value has no `?` and no `#`, so it is not recognised as a nested URL).
+- A bare **fragment** in free text with nothing recognised as a base before it (`hash is
+  #access_token=X`).
+- `location.search` and `location.hash` themselves are never read by anything other than the
+  browser's own automatic `request.query_string` (which is filtered) — an app that logs
+  `location.hash` directly bypasses the filter entirely.
+- More than **3** levels of nesting, or more than 3 steps of percent-decoding.
+- A URL written into free text **unencoded**, past the point the match ends at whitespace
+  (`GET /api/search?q=John Doe&token=abc` — the match's query is `q=John`, and `Doe&token=abc` sits
+  outside it, unfiltered — encode the value, or use `addBreadcrumb` / `setContext` for structured
+  data instead of building it into a log line).
+
+## Automatic contexts, per runtime (0.2.0)
+
+| Runtime | Sends |
+|---|---|
+| Browser | `request.url` / `.query_string` / a `User-Agent` header (filtered, cut to the server's bounds); `contexts.culture` (locale, timezone); `contexts.device` (screen size, pixel ratio, memory, CPU count) where the browser exposes them |
+| Node | `contexts.runtime` (`node`, `process.version`); `contexts.os` (name, kernel version); `server_name` (the `serverName` option, else `os.hostname()`) |
+| Edge | `contexts.runtime` (`edge`, or Next's own `EdgeRuntime` global when it names itself) — no version, no `os`, no `server_name` |
+
+**Neither runtime ever sends `contexts.browser` or `contexts.os` directly.** The ingestor derives
+both from the browser's own `User-Agent` header — that parsing already lives there, so the SDK does
+not duplicate it. Automatic contexts are merged **under** whatever `setContext` sets, field by
+field: an app-set field always wins, a field only the automatic context has is kept as sent. The
+SDK also applies the server's own `contexts` bound itself (32 names, 64 KiB total, custom names
+before the six automatic ones, largest first) before every send, so the server's own cut is a
+no-op on what the SDK sends, and marks `metadata.truncated` with `'contexts'` when it removes one.
+
+## Size limits (0.2.0)
+
+Two size rules run in `enqueue`, after `beforeSend`, before every event is queued:
+
+- **The browser keepalive trim.** An event over 60 KiB (the `keepalive`-eligible body limit) has its
+  breadcrumbs shed oldest first until it fits, or none are left; as a last resort, if it is still
+  over the tunnel's 256 KiB body cap, `contexts` and then every tag but `tenant_id` are dropped too.
+- **The NATS publish bound**, on every runtime: the ingestor publishes each event to NATS as
+  protobuf, where a JSON number can cost up to 5.5× its JSON size. The SDK estimates that cost
+  before queuing and, over roughly 1,000,000 bytes, sheds breadcrumbs, then contexts, then
+  non-essential metadata keys — in that order, only as far as needed to fit.
+
+Both mark `metadata.truncated` with what they removed, so a truncated event is always distinguishable
+from one that genuinely had nothing to trim.
+
+## `autoIpAddress` (browser only, default `true`)
+
+- Behind the Sentinel tunnel, the SDK's own value never reaches the ingestor: the tunnel rebuilds
+  `user` without any `ip_address` and writes the browser's derived IP itself. A browser cannot
+  choose, and cannot suppress, its stored IP this way.
+- A browser event that reaches the ingestor through **another** same-origin proxy is filled from
+  that proxy's own connection only because of `"{{auto}}"` — which stores **the proxy's egress IP**,
+  not the browser's. Without it, the ingestor leaves the field empty.
+- An app behind its own such proxy should set `autoIpAddress: false` unless that proxy's address is
+  one it wants attributed to its users.
+
 ## What is not implemented
 
-- **Breadcrumbs** — the wire has no field; `max_breadcrumbs` is not an option.
 - **Tracing** — `tracesSampleRate` is accepted and ignored; trace ids come only from a
   `traceparent` string you pass (`ctx.traceparent`, or the request header in `captureRequestError`).
 - **Per-request server scope** — `setUser` on the server leaks to the next request on the same
-  worker; pass `metadata: { user_id }` on the capture call instead (`captureRequestError` never
-  calls `setUser`).
+  worker; pass `user: { id }` / `tags: { tenant_id }` on the capture call instead
+  (`captureRequestError` never calls `setUser`).
 - `withSentinelErrorBoundary` — Next's `error.tsx` / `global-error.tsx` call the boundary helper
   above.
 - Index maps with `url` sections — skipped with a `warn`; the route rejects them.
 
 ## Bundle size
 
-**`sdk_js_client_entry_gzip_bytes` = 11 198** — the first real measurement, taken by `pnpm size`
-at `365863c` on node 22 and re-measured unchanged at `735345f`, the head this README was written from: **gzip of the raw
-`dist/nextjs/client.js` as built (32 043 bytes minified — the file the `browser` condition of
-`./nextjs` resolves to, everything it statically imports bundled in), at `zlib`'s default
-compression level**. Not a tree-shaken consumer bundle, not a `next build` chunk, not level 9.
-`pnpm size` is **report-only in v0.1**: it prints the number and exits `0`; **the threshold is a
-decision taken on this number before the tag, never a CI value edited in place.**
+**`sdk_js_client_entry_gzip_bytes` = 21 251** — re-measured for 0.2.0 (`pnpm size`) at `08b16af`,
+the head this README was written from, up from 11 198 at 0.1.2: **gzip of the raw
+`dist/nextjs/client.js` as built (65 369 bytes minified — the file the `browser` condition of
+`./nextjs` resolves to, everything it statically imports bundled in, now including the URL filter
+and the five automatic breadcrumb integrations), at `zlib`'s default compression level**. Not a
+tree-shaken consumer bundle, not a `next build` chunk, not level 9. `pnpm size` is **report-only**:
+it prints the number and exits `0`; **the threshold is a decision taken on this number before the
+tag, never a CI value edited in place.**
 
 ## Local bench
 

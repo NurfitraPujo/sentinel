@@ -11,19 +11,23 @@
 //
 // Each route fixture: { name, inbound: { headers, body }, forwarded: { path, headers, body }, expect: { client_ip,
 // user_agent } }, bodies as the exact strings sent. tunnel-user-rebuild.json carries the exported applyClientIp's
-// real output instead, because ITEM_KEYS removes `user` before it runs on the route today (T10).
+// real output instead — it is a table of applyClientIp inputs and outputs, not a forward (spec §7.3).
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureException } from '../src/core/capture.js';
+import { protoSizeEstimate } from '../src/core/proto-size.js';
+import { addBreadcrumb, setContext, setTag, setTenant, setUser } from '../src/core/scope.js';
 import type { SentinelEvent } from '../src/core/types.js';
 import { applyClientIp, createSentinelRouteHandler } from '../src/nextjs/route.js';
+import { commit } from './helpers/commit.js';
 import { resetPipeline, setup } from './helpers/pipeline.js';
 import { request, stubUpstream, type Upstream } from './route/helpers.js';
 
-const DIR = join(dirname(fileURLToPath(import.meta.url)), 'tunnel-fixtures');
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DIR = join(HERE, 'tunnel-fixtures');
+const ESTIMATES_DIR = join(HERE, 'fixture-estimates', 'tunnel');
 const FIXTURE_KEY = 'sk_tunnel_fixture_key';
 const FIXTURE_ENDPOINT = 'http://ingestor.fixture:8080/ingest';
 const CHROME_WINDOWS_UA =
@@ -61,20 +65,6 @@ function browserEvent(idTag: number, message: string): SentinelEvent {
   expect(events).toHaveLength(1);
   resetPipeline();
   return events[0] as SentinelEvent;
-}
-
-/** Write (locally) or compare (under CI) one fixture file. */
-function commit(file: string, value: unknown): void {
-  const path = join(DIR, file);
-  const content = JSON.stringify(value, null, 2) + '\n';
-  const committed = existsSync(path) ? readFileSync(path, 'utf8') : undefined;
-  if (process.env.CI) {
-    expect(committed, `tests/tunnel-fixtures/${file} is missing — run the sdk-js suite locally and commit it`).toBeDefined();
-    expect(content, `tests/tunnel-fixtures/${file} drifted from the route's real output — regenerate and commit it`).toBe(committed);
-    return;
-  }
-  mkdirSync(DIR, { recursive: true });
-  if (committed !== content) writeFileSync(path, content);
 }
 
 interface RouteCase {
@@ -129,14 +119,80 @@ describe('tunnel fixtures: the route’s real forwards, committed for the Go sid
       }
       expect(call.body).not.toContain('6.6.6.6');
 
-      commit(`${c.name}.json`, {
+      commit(join(DIR, `${c.name}.json`), {
         name: c.name,
         inbound: { headers: inboundHeaders, body: inboundBody },
         forwarded: { path: new URL(call.url).pathname, headers: call.headers, body: call.body },
         expect: { client_ip: c.clientIp, user_agent: CHROME_WINDOWS_UA },
       });
+
+      // The estimate against every item the ingestor would receive, after applyClientIp (spec §7.3): one
+      // sidecar per route fixture, excluded for tunnel-user-rebuild (a table, not a forward, §13 F2).
+      commit(join(ESTIMATES_DIR, `${c.name}.json`), { protoSizeEstimate: items.map((item) => protoSizeEstimate(item)) });
     });
   }
+});
+
+describe('tunnel fixtures: a v2 rich-context event, the typed fields the tunnel must forward (spec §7.3, C8)', () => {
+  it('fixture: tunnel-v2-event', async () => {
+    const name = 'tunnel-v2-event';
+    const clientIp = '203.0.113.77';
+    let n = 0;
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(
+      () => `00000000-0000-4000-8006-${String(++n).padStart(12, '0')}` as `${string}-${string}-${string}-${string}-${string}`,
+    );
+    const p = setup({}, 'browser');
+    setUser({ id: 'usr_1', username: 'ada', email: 'ada@example.com' });
+    setTenant('org_a');
+    setTag('feature', 'chats');
+    setContext('ok', { a: 1 });
+    addBreadcrumb({ message: 'clicked save', category: 'ui.click' });
+    const err = new Error(`tunnel fixture ${name}`);
+    err.name = 'TypeError';
+    err.stack = [`TypeError: tunnel fixture ${name}`, '    at render (https://app/_next/static/chunks/app/page-9b0d4e.js:12:34)'].join('\n');
+    captureException(err, {
+      level: 'warning',
+      request: { method: 'POST', url: 'https://app-staging.daya.ai/checkout', query_string: 'step=2', headers: { 'x-request-id': 'req_v2' } },
+    });
+    const events = p.events();
+    expect(events).toHaveLength(1);
+    const event = events[0] as unknown as Record<string, unknown>;
+    resetPipeline();
+    expect((event.metadata as Record<string, unknown>).runtime).toBe('browser');
+
+    const inboundBody = JSON.stringify([event]);
+    const inboundHeaders: Record<string, string> = {
+      host: 'app-staging.daya.ai',
+      origin: 'https://app-staging.daya.ai',
+      'sec-fetch-site': 'same-origin',
+      'content-type': 'application/json',
+      'user-agent': CHROME_WINDOWS_UA,
+      'x-forwarded-for': clientIp,
+    };
+
+    upstream = stubUpstream();
+    const { POST } = createSentinelRouteHandler();
+    const res = await POST(request({ url: 'https://app-staging.daya.ai/api/sentinel', headers: inboundHeaders, body: inboundBody }));
+    expect(res.status).toBe(202);
+    expect(upstream.calls).toHaveLength(1);
+    const call = upstream.calls[0];
+    if (call === undefined) throw new Error('no forward');
+
+    expect(call.headers).not.toHaveProperty('x-forwarded-for');
+    expect(call.headers['x-sentinel-derive-ip']).toBe('off');
+    expect(call.headers['user-agent']).toBe(CHROME_WINDOWS_UA);
+    const items = call.items as Record<string, unknown>[];
+    for (const item of items) expect(item.user).toMatchObject({ ip_address: clientIp, id: 'usr_1', username: 'ada', email: 'ada@example.com' });
+    expect(call.body).not.toContain('6.6.6.6');
+
+    commit(join(DIR, `${name}.json`), {
+      name,
+      inbound: { headers: inboundHeaders, body: inboundBody },
+      forwarded: { path: new URL(call.url).pathname, headers: call.headers, body: call.body },
+      expect: { client_ip: clientIp, user_agent: CHROME_WINDOWS_UA },
+    });
+    commit(join(ESTIMATES_DIR, `${name}.json`), { protoSizeEstimate: items.map((item) => protoSizeEstimate(item)) });
+  });
 });
 
 describe('tunnel fixtures: applyClientIp’s real output (tunnel-user-rebuild.json, spec §4.5)', () => {
@@ -160,6 +216,6 @@ describe('tunnel fixtures: applyClientIp’s real output (tunnel-user-rebuild.js
       expect(output).not.toContain('Fake');
       return { name: c.name, ip: c.ip, input, output };
     });
-    commit('tunnel-user-rebuild.json', { name: 'tunnel-user-rebuild', cases: out });
+    commit(join(DIR, 'tunnel-user-rebuild.json'), { name: 'tunnel-user-rebuild', cases: out });
   });
 });

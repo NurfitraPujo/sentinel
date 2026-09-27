@@ -175,14 +175,14 @@ describe('B3: nothing throws — the four unserialisable inputs are kept with ma
     expect(event?.metadata.truncated_keys).toEqual(['items.0.socket']);
   });
 
-  it('B3: a removed top-level key subsumes its substituted sub-paths — a 70 KiB cyclic req beside user_id → ["req"]', () => {
+  it('B3: a removed top-level key subsumes its substituted sub-paths — a 70 KiB cyclic req beside request_id → ["req"]', () => {
     const req: Record<string, unknown> = { body: 'x'.repeat(70 * 1024) };
     req.socket = req;
     const p = setup();
-    captureException(new Error('x'), { metadata: { req, user_id: 'usr_1' } });
+    captureException(new Error('x'), { metadata: { req, request_id: 'req_1' } });
     const [event] = p.events();
     expect(event?.metadata.req).toBeUndefined();
-    expect(event?.metadata.user_id).toBe('usr_1');
+    expect(event?.metadata.request_id).toBe('req_1');
     expect(event?.metadata.truncated_keys).toEqual(['req']);
   });
 

@@ -138,7 +138,7 @@ describe('B22 (handler half): a second init', () => {
     throwPrimitive('boom');
     const events = queued();
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ error_class: 'Error', message: 'boom', metadata: { user_id: 'usr_1', feature: 'chats', source: 'window.onerror' } });
+    expect(events[0]).toMatchObject({ error_class: 'Error', message: 'boom', user: { id: 'usr_1' }, tags: { feature: 'chats' }, metadata: { source: 'window.onerror' } });
     await expect(flush(2000)).resolves.toBe(true);
     expect(f.posts).toHaveLength(1);
     expect(f.posts[0]?.events).toHaveLength(1);
@@ -174,7 +174,7 @@ describe('B22 (handler half): a second init', () => {
     await expect(core.flush(2000)).resolves.toBe(true);
     expect(f.posts).toHaveLength(1);
     expect(f.posts[0]?.url).toBe('http://localhost:3000/api/sentinel');
-    expect(f.posts[0]?.events.map((e) => [e.event_id, e.metadata.user_id])).toEqual([[id, 'usr_2']]);
+    expect(f.posts[0]?.events.map((e) => [e.event_id, e.user?.id])).toEqual([[id, 'usr_2']]);
     expect(r.errors).toEqual([]);
     await browser.close(100);
     expect(core.getClient()).toBeUndefined();
@@ -236,7 +236,7 @@ describe('B23 (handler half): capture before init / after close, and close itsel
     expect(getInternalClient()?.transport?.stats()).toMatchObject({ queued: 0, inFlight: 0 });
     expect(log.live().size).toBe(2);
     throwPrimitive('after re-init');
-    expect(queued().map((e) => e.metadata.user_id)).toEqual(['usr_1']);
+    expect(queued().map((e) => e.user?.id)).toEqual(['usr_1']);
 
     const client = getClient();
     expect(client).toBeDefined();

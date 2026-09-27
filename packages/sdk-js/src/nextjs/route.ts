@@ -89,6 +89,11 @@ export const UPSTREAM_RETRY_AFTER_SECONDS = 5;
  * `validation.ErrorPayload`'s JSON keys (apps/ingestor-go/validation/validator.go) — what an item may carry —
  * minus `project_key` / `project_id`, which the route deletes: tenant scope derives from the key, never from
  * the body (step 6). Any other key is dropped; the SDK never sends one, so this is for foreign posters.
+ *
+ * `level sdk user tags contexts request breadcrumbs` (spec §7.1) are the typed fields a browser event now
+ * carries. Not admitted: `transaction` / `server_name` (the browser never sends them), `exception` / `logger` /
+ * `dist` / `source` (no producer in this feature), `project_key` / `project_id` (deleted above), `received_at`
+ * and anything else.
  */
 export const ITEM_KEYS: ReadonlySet<string> = new Set([
   'event_id',
@@ -105,6 +110,13 @@ export const ITEM_KEYS: ReadonlySet<string> = new Set([
   'release_version',
   'fingerprint',
   'fingerprint_override',
+  'level',
+  'sdk',
+  'user',
+  'tags',
+  'contexts',
+  'request',
+  'breadcrumbs',
 ]);
 
 export type RouteErrorCode =
@@ -322,7 +334,8 @@ function defaultClientKey(clientIp: string | null): BucketKey {
  * `geo` is always dropped. Per item:
  *   B1 ip, no/null user → `{ ip_address: ip }`     B2 ip, object → rebuilt + `ip_address: ip`
  *   B3 user not a plain object → left as it is (the ingestor rejects the batch)
- *   B4 no ip, object → rebuilt without any IP      B5 no ip, no/null user → unchanged
+ *   B4 no ip, object → rebuilt without any IP, and deleted entirely when the rebuild has no key (an empty
+ *      `user: {}` is never forwarded, spec §7.1)      B5 no ip, no/null user → unchanged
  */
 export function applyClientIp(items: Record<string, unknown>[], ip: string | null): void {
   for (const item of items) {
@@ -337,8 +350,14 @@ export function applyClientIp(items: Record<string, unknown>[], ip: string | nul
       const value = Object.prototype.hasOwnProperty.call(user, name) ? user[name] : undefined;
       if (typeof value === 'string') rebuilt[name] = value;
     }
-    if (ip !== null) rebuilt.ip_address = ip;
-    item.user = rebuilt;
+    if (ip !== null) {
+      rebuilt.ip_address = ip;
+      item.user = rebuilt;
+    } else if (Object.keys(rebuilt).length > 0) {
+      item.user = rebuilt;
+    } else {
+      delete item.user;
+    }
   }
 }
 

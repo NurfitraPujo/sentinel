@@ -188,6 +188,8 @@ tasks:
     # exact 10.34.5 CI's sdk-js-node job uses (pnpm 11 rewrites packages/sdk-js/pnpm-lock.yaml); bump both
     # together, tests/unit/pnpm_pin_test.go holds them equal. The two git lines fail on tunnel-fixture drift
     # the sdk-js suite wrote locally, including a new untracked fixture `git diff` cannot see (spec §4.5).
+    # Widened for the golden corpus and both fixtures' estimate sidecars (spec §7.3): the golden corpus was
+    # not under this gate before, and a stale or drifted protoSizeEstimate is exactly what R2 guards against.
     test-unit:
         desc: Run unit tests (Go tests/unit, ingestor packages, dashboard and sdk-js vitest suites)
         cmds:
@@ -198,8 +200,8 @@ tasks:
             - pnpm --dir apps/dashboard-web test
             - npx -y pnpm@10.34.5 --dir packages/sdk-js install --frozen-lockfile
             - npx -y pnpm@10.34.5 --dir packages/sdk-js test
-            - git diff --exit-code -- packages/sdk-js/tests/tunnel-fixtures
-            - test -z "$(git ls-files --others --exclude-standard -- packages/sdk-js/tests/tunnel-fixtures)"
+            - git diff --exit-code -- packages/sdk-js/tests/tunnel-fixtures packages/sdk-js/tests/fixture-estimates packages/sdk-js/tests/fixtures
+            - test -z "$(git ls-files --others --exclude-standard -- packages/sdk-js/tests/tunnel-fixtures packages/sdk-js/tests/fixture-estimates packages/sdk-js/tests/fixtures)"
 
     # sentinel-event-schema-v2 §9.1 (rulings 3 and 4): FORCE_TESTCONTAINERS=1 so the suite never falls
     # back to the compose stack's SHARED dev database when something answers localhost:8080/health

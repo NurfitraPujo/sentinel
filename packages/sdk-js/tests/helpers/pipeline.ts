@@ -5,7 +5,7 @@
 import { vi } from 'vitest';
 import { initCore } from '../../src/core/init.js';
 import { clearSlot, getInternalClient } from '../../src/core/state.js';
-import type { CoreOptions, Runtime, SentinelEvent, SentinelSdkError } from '../../src/core/types.js';
+import type { AutoContexts, InitOptions, Runtime, SentinelEvent, SentinelSdkError } from '../../src/core/types.js';
 
 export const SLOT = Symbol.for('@sentinel/sdk-js');
 
@@ -43,7 +43,11 @@ export interface Pipeline {
 }
 
 /** Install a client for `runtime` with `options` plus `debug: true` and an `onError` recorder. */
-export function setup(options: CoreOptions = {}, runtime: Runtime = 'browser'): Pipeline {
+export function setup(
+  options: InitOptions & { autoIpAddress?: boolean } = {},
+  runtime: Runtime = 'browser',
+  autoContexts?: () => AutoContexts,
+): Pipeline {
   const errors: SentinelSdkError[] = [];
   const debugLines: string[] = [];
   vi.spyOn(console, 'debug').mockImplementation((line: unknown) => {
@@ -60,6 +64,9 @@ export function setup(options: CoreOptions = {}, runtime: Runtime = 'browser'): 
       },
     },
     runtime,
+    undefined,
+    undefined,
+    autoContexts,
   );
   return {
     events: () => (getInternalClient()?.queue ?? []).map((json) => JSON.parse(json) as SentinelEvent),

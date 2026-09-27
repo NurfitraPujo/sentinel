@@ -6,7 +6,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureException, captureMessage } from '../../src/core/capture.js';
-import { MAX_COMPONENT_STACK_BYTES, MAX_METADATA_BYTES } from '../../src/core/event.js';
+import { MAX_COMPONENT_STACK_BYTES, MAX_MESSAGE_BYTES, MAX_METADATA_BYTES } from '../../src/core/event.js';
 import { getClient } from '../../src/core/init.js';
 import { setTag, setTenant, setUser } from '../../src/core/scope.js';
 import { metadataWireBytes } from '../../src/core/serialize.js';
@@ -80,16 +80,46 @@ describe('B11: the 64 KiB shrink', () => {
     expect(metadataWireBytes(JSON.stringify(event?.metadata))).toBeLessThanOrEqual(MAX_METADATA_BYTES);
   });
 
-  it('B11: { a: 30 KiB, user_id, b: 30 KiB, c: 30 KiB, route } with setTenant — a removed first (tie by insertion), exempt keys never', () => {
+  it('a caller-supplied CaptureContext.request is filtered exactly like an automatic one — no raw cookie/authorization or reset_token query', () => {
     const p = setup();
-    setTenant('org_a');
+    captureException(new Error('x'), {
+      request: {
+        url: '/reset',
+        query_string: 'reset_token=X',
+        headers: { Cookie: 'sid=1', Authorization: 'Bearer x', 'x-csrf-token': 'tok', referer: 'https://h/r?reset_token=Y' },
+      },
+    });
+    const [event] = p.events();
+    expect(event?.request?.url).toBe('/reset');
+    expect(event?.request?.query_string).toBe('reset_token=[Filtered]');
+    expect(event?.request?.headers?.referer).not.toContain('Y');
+    expect(event?.request?.headers?.referer).toContain('[Filtered]');
+    expect(event?.request?.headers).not.toHaveProperty('Cookie');
+    expect(event?.request?.headers).not.toHaveProperty('Authorization');
+    expect(event?.request?.headers?.['x-csrf-token']).toBe('[Filtered]');
+    const serialized = JSON.stringify(event);
+    expect(serialized).not.toContain('sid=1');
+    expect(serialized).not.toContain('Bearer x');
+    expect(serialized).not.toContain('reset_token=X');
+  });
+
+  it('CaptureContext.contexts only accepts the react shape — a per-call custom context name is a type error and, forced through, is silently dropped (spec §2, §3.9)', () => {
+    const p = setup();
+    // @ts-expect-error CaptureContext.contexts is { react?: { componentStack } }, not an arbitrary context map.
+    captureException(new Error('x'), { contexts: { order: { id: 1 } } });
+    const [event] = p.events();
+    expect(event?.contexts).toBeUndefined();
+  });
+
+  it('B11: { a: 30 KiB, request_id, b: 30 KiB, c: 30 KiB, route } — a removed first (tie by insertion), exempt keys never', () => {
+    const p = setup();
     const big = 'x'.repeat(30 * 1024);
-    captureException(new Error('x'), { metadata: { a: big, user_id: 'usr_1', b: big, c: big, route: '/x' } });
+    captureException(new Error('x'), { metadata: { a: big, request_id: 'req_1', b: big, c: big, route: '/x' } });
     const [event] = p.events();
     // 90 KiB → remove `a` (largest; `a` before `c` on the tie) → 60 KiB + overhead fits: nothing else removed.
     expect(event?.metadata.truncated_keys).toEqual(['a']);
-    expect(Object.keys(event?.metadata ?? {})).toEqual(['tenant_id', 'user_id', 'b', 'c', 'route', 'runtime', 'truncated_keys']);
-    expect(event?.metadata).toMatchObject({ user_id: 'usr_1', tenant_id: 'org_a', route: '/x', runtime: 'browser' });
+    expect(Object.keys(event?.metadata ?? {})).toEqual(['request_id', 'b', 'c', 'route', 'runtime', 'truncated_keys']);
+    expect(event?.metadata).toMatchObject({ request_id: 'req_1', route: '/x', runtime: 'browser' });
     expect(metadataWireBytes(JSON.stringify(event?.metadata))).toBeLessThanOrEqual(MAX_METADATA_BYTES);
   });
 
@@ -101,12 +131,16 @@ describe('B11: the 64 KiB shrink', () => {
     expect(p.events()[0]?.metadata.a).toBe(big);
   });
 
-  it('B11: { route: 70 KiB } alone → the event is dropped with onError metadata_too_large, captureException still returns an id', () => {
+  it('B11: { route: 70 KiB } alone → never dropped (spec §3.7): route removed, truncated_keys: [route], small kept, no onError', () => {
     const p = setup();
     const id = captureException(new Error('x'), { metadata: { route: '/'.repeat(70 * 1024), small: 'kept?' } });
     expect(id).toMatch(UUID);
-    expect(p.events()).toHaveLength(0);
-    expect(p.errors.map((e) => [e.code, e.count])).toEqual([['metadata_too_large', 1]]);
+    const [event] = p.events();
+    expect(event?.metadata.route).toBeUndefined();
+    expect(event?.metadata.small).toBe('kept?');
+    expect(event?.metadata.truncated_keys).toEqual(['route']);
+    expect(metadataWireBytes(JSON.stringify(event?.metadata))).toBeLessThanOrEqual(MAX_METADATA_BYTES);
+    expect(p.errors).toEqual([]);
   });
 
   it("B11: the validator's ruler — html with 2 000 '<' and a U+2028 is under 65 536 naively and over it by the Go count → html removed", () => {
@@ -128,102 +162,63 @@ describe('B11: the 64 KiB shrink', () => {
 });
 
 describe('B12: scope, setTag rules, the per-call ctx.metadata table and the runtime coercion', () => {
-  it('B12: all six captures of the row', () => {
-    const p = setup();
-    // First: user, tenant, a tag; password and author filtered (substring rule, D8).
+  it('B12: user and tags land in their typed fields, never in metadata (spec §3.7); password/author still filtered (D8)', () => {
+    const p = setup({}, 'node');
     setUser({ id: 'usr_1' });
     setTenant('org_a');
     setTag('feature', 'chats');
     captureException(new Error('1'), { metadata: { password: 'hunter2', author: 'me', passenger: 'p' } });
-    // Second: null deletes; the three reserved names are dropped with a debug line each, no onError.
-    setTag('feature', null);
-    setTag('user_id', 'usr_9');
-    setTag('userId', '');
-    setTag('runtime', 'x');
-    captureException(new Error('2'));
-    // Third: '' to the identity writers ≡ null.
-    setUser({ id: '' });
-    setTenant('');
-    captureException(new Error('3'));
-    // Fourth: a finite number / a boolean coerced with String(v).
-    setUser({ id: 123 as unknown as string });
-    setTenant(true as unknown as string);
-    captureException(new Error('4'));
-    // Fifth: an object ≡ '' → deleted.
-    setUser({ id: {} as unknown as string });
-    captureException(new Error('5'));
-    // Sixth: decision 38's per-call table with usr_1 / org_a back in scope.
-    setUser({ id: 'usr_1' });
-    setTenant('org_a');
-    captureException(new Error('6'), {
-      metadata: { runtime: 'x', source: 'y', level: 'info', truncated: ['z'], user_id: 'usr_7', tenant_id: '', userId: 'alias', password: 'p' },
-    });
 
-    const [e1, e2, e3, e4, e5, e6] = p.events();
+    const [e1] = p.events();
+    expect(e1?.user).toEqual({ id: 'usr_1' });
+    expect(e1?.tags).toEqual({ feature: 'chats', tenant_id: 'org_a' });
     expect(e1?.metadata).toEqual({
-      feature: 'chats',
-      user_id: 'usr_1',
-      tenant_id: 'org_a',
       password: '[FILTERED]',
       author: '[FILTERED]',
       passenger: '[FILTERED]',
-      runtime: 'browser',
+      runtime: 'node',
     });
-    expect(e2?.metadata).toEqual({ user_id: 'usr_1', tenant_id: 'org_a', runtime: 'browser' });
-    expect(e3?.metadata).toEqual({ runtime: 'browser' });
-    expect(e4?.metadata).toEqual({ user_id: '123', tenant_id: 'true', runtime: 'browser' });
-    expect(e5?.metadata).toEqual({ tenant_id: 'true', runtime: 'browser' });
-    expect(e6?.metadata).toEqual({ user_id: 'usr_7', userId: 'alias', password: '[FILTERED]', runtime: 'browser' });
     expect(p.errors).toEqual([]);
-    const reserved = p.debugLines.filter((l) => l.includes("setTag('user_id')") || l.includes("setTag('userId')") || l.includes("setTag('runtime')"));
-    expect(reserved).toHaveLength(3);
-    const owned = p.debugLines.filter((l) => /ctx\.metadata\.(runtime|source|level|truncated) dropped/.test(l));
-    expect(owned).toHaveLength(4);
-    expect(p.debugLines.some((l) => l.includes('ctx.metadata.tenant_id deleted'))).toBe(true);
   });
 
-  it('B12: the spread order — tags, then user_id / tenant_id, then ctx.metadata, then the SDK keys', () => {
-    const p = setup();
-    setTag('zeta', 'z');
-    setTag('alpha', 'a');
+  it('B12: decision 38 per-call ctx.metadata table — SDK-owned keys and identity keys dropped, everything else kept', () => {
+    // node's debug goes to stderr, not console.debug (report.ts) — browser (with autoIpAddress off) keeps it
+    // observable through the console.debug spy the pipeline helper installs.
+    const p = setup({ autoIpAddress: false });
+    captureException(new Error('2'), {
+      metadata: { runtime: 'x', source: 'y', level: 'info', truncated: ['z'], truncated_keys: ['z'], user_id: 'usr_7', tenant_id: 'org_z', request_id: 'req_1' },
+    });
+    expect(p.events()[0]?.metadata).toEqual({ request_id: 'req_1', runtime: 'browser' });
+    expect(p.events()[0]?.user).toBeUndefined();
+    expect(p.events()[0]?.tags).toBeUndefined();
+    const owned = p.debugLines.filter((l) => /ctx\.metadata\.(runtime|source|level|truncated|truncated_keys) dropped/.test(l));
+    expect(owned).toHaveLength(5);
+    const identity = p.debugLines.filter((l) => /ctx\.metadata\.(user_id|tenant_id) dropped: use ctx\.user \/ ctx\.tags/.test(l));
+    expect(identity).toHaveLength(2);
+  });
+
+  it('B12: per-call ctx.user replaces the scope user for one event only; ctx.tags merges over the scope tags', () => {
+    // node: no autoIpAddress, so `user` is exactly what setUser / ctx.user gave.
+    const p = setup({}, 'node');
     setUser({ id: 'usr_1' });
-    captureMessage('m', { metadata: { extra: 1 }, level: 'info' });
-    expect(Object.keys(p.events()[0]?.metadata ?? {})).toEqual(['zeta', 'alpha', 'user_id', 'extra', 'runtime', 'level']);
-  });
-
-  it('B12: every reserved tag name is dropped; setTag(key, "") keeps the empty string; a per-call user_id: null deletes', () => {
-    const p = setup();
-    for (const name of ['user_id', 'userId', 'user', 'tenant_id', 'tenantId', 'organization_id', 'runtime', 'level', 'truncated', 'truncated_keys']) {
-      setTag(name, 'v');
-    }
-    setTag('empty', '');
-    setUser({ id: 'usr_1' });
-    captureException(new Error('x'), { metadata: { user_id: null as unknown as string } });
-    expect(p.events()[0]?.metadata).toEqual({ empty: '', runtime: 'browser' });
-    expect(p.debugLines.filter((l) => l.includes('is reserved'))).toHaveLength(10);
-  });
-
-  it('B12: the coercion table — NaN, Infinity, an array, a symbol, a bigint, a function, undefined all delete', () => {
-    const p = setup();
-    const unusable: unknown[] = [NaN, Infinity, -Infinity, [], Symbol('s'), 10n, () => 1, undefined, null];
-    for (const v of unusable) {
-      setUser({ id: 'usr_1' });
-      setUser({ id: v as string });
-      captureException(new Error(String(v)));
-    }
-    expect(p.events().every((e) => e.metadata.user_id === undefined)).toBe(true);
-    setTenant(0 as unknown as string);
-    setTenant(false as unknown as string);
-    captureException(new Error('last'));
-    expect(p.events().at(-1)?.metadata.tenant_id).toBe('false');
+    setTag('feature', 'chats');
+    captureException(new Error('a'), { user: { id: 'usr_override' }, tags: { region: 'eu', feature: null } });
+    captureException(new Error('b'));
+    const [e1, e2] = p.events();
+    expect(e1?.user).toEqual({ id: 'usr_override' });
+    expect(e1?.tags).toEqual({ region: 'eu' });
+    expect(e2?.user).toEqual({ id: 'usr_1' });
+    expect(e2?.tags).toEqual({ feature: 'chats' });
   });
 
   it('B12: scope calls made before the first init are kept and stamp the first event after it', () => {
     setUser({ id: 'usr_early' });
     setTag('feature', 'chats');
-    const p = setup();
+    const p = setup({}, 'node');
     captureException(new Error('x'));
-    expect(p.events()[0]?.metadata).toEqual({ feature: 'chats', user_id: 'usr_early', runtime: 'browser' });
+    expect(p.events()[0]?.user).toEqual({ id: 'usr_early' });
+    expect(p.events()[0]?.tags).toEqual({ feature: 'chats' });
+    expect(p.events()[0]?.metadata).toEqual({ runtime: 'node' });
   });
 });
 
@@ -325,23 +320,36 @@ describe('N11: environment normalisation', () => {
 });
 
 describe("N12: captureMessage's shape", () => {
-  it('N12: level warning → error_class Message, message as given, metadata.level warning, stacktrace []', () => {
+  it('N12: level warning → error_class Message, message as given, top-level level warning, stacktrace []', () => {
     const p = setup();
     captureMessage('cache miss storm', { level: 'warning' });
-    expect(p.events()[0]).toMatchObject({ error_class: 'Message', message: 'cache miss storm', stacktrace: [], metadata: { level: 'warning', runtime: 'browser' } });
+    expect(p.events()[0]).toMatchObject({ error_class: 'Message', message: 'cache miss storm', stacktrace: [], level: 'warning', metadata: { runtime: 'browser' } });
   });
 
-  it("N12: captureMessage('plain') has no metadata.level", () => {
+  it("N12: a string second argument is the level (D5) — captureMessage('x', 'debug')", () => {
+    const p = setup();
+    captureMessage('x', 'debug');
+    expect(p.events()[0]?.level).toBe('debug');
+  });
+
+  it("N12: captureMessage('plain') defaults to level info (Sentry's default, D5)", () => {
     const p = setup();
     captureMessage('plain');
+    expect(p.events()[0]?.level).toBe('info');
     expect(p.events()[0]?.metadata).toEqual({ runtime: 'browser' });
   });
 
-  it('N12: captureException ignores level (debug notes it)', () => {
+  it('N12: captureException honours an explicit ctx.level (spec §3.2 — the 0.1.x ignore is removed)', () => {
     const p = setup();
     captureException(new Error('x'), { level: 'info' });
+    expect(p.events()[0]?.level).toBe('info');
     expect(p.events()[0]?.metadata).toEqual({ runtime: 'browser' });
-    expect(p.debugLines.some((l) => l.includes('ctx.level is ignored'))).toBe(true);
+  });
+
+  it('N12: captureException with no level defaults to error', () => {
+    const p = setup();
+    captureException(new Error('x'));
+    expect(p.events()[0]?.level).toBe('error');
   });
 
   it('N12: beforeSend receives hint.originalException = the message string for captureMessage, the value for captureException', () => {
@@ -400,9 +408,26 @@ describe('the event shape and the pinned invariants', () => {
       expect(event?.platform).toBe('javascript');
       expect(event?.metadata.runtime).toBe(runtime);
       expect(new Date(event?.timestamp ?? '').toISOString()).toBe(event?.timestamp);
-      expect(Object.keys(event ?? {}).sort()).toEqual(
-        ['event_id', 'platform', 'environment', 'release_version', 'error_class', 'message', 'stacktrace', 'metadata', 'timestamp', 'fingerprint', 'trace_id', 'span_id', 'trace_flags'].sort(),
-      );
+      const expectedKeys = [
+        'event_id',
+        'platform',
+        'environment',
+        'release_version',
+        'error_class',
+        'message',
+        'stacktrace',
+        'metadata',
+        'timestamp',
+        'fingerprint',
+        'trace_id',
+        'span_id',
+        'trace_flags',
+        'level',
+        'sdk',
+      ];
+      // autoIpAddress (spec §3.4) defaults on and adds a user only on the browser runtime.
+      if (runtime === 'browser') expectedKeys.push('user');
+      expect(Object.keys(event ?? {}).sort()).toEqual(expectedKeys.sort());
     }
   });
 
@@ -474,6 +499,22 @@ describe('the event shape and the pinned invariants', () => {
     expect(p.errors.map((e) => [e.code, e.cause])).toEqual([['before_send_threw', boom]]);
   });
 
+  it('a beforeSend result whose own property access throws (not the hook itself) is not lost silently — before_send_threw, sent unmodified', () => {
+    const boom = new Error('getter broke');
+    const p = setup({
+      beforeSend: (event) =>
+        ({
+          ...event,
+          get user(): never {
+            throw boom;
+          },
+        }) as unknown as typeof event,
+    });
+    captureException(new Error('original'));
+    expect(p.events().map((e) => e.message)).toEqual(['original']);
+    expect(p.errors.map((e) => [e.code, e.cause])).toEqual([['before_send_threw', boom]]);
+  });
+
   it('a hook returning a new object with event_id deleted / platform node / metadata.token / runtime x / source custom → re-stamped, re-scrubbed, source kept', () => {
     const p = setup({
       beforeSend: (event) => ({
@@ -501,5 +542,109 @@ describe('the event shape and the pinned invariants', () => {
       expect(p.errors).toEqual([]);
       expect(p.debugLines.some((l) => l.includes('dropped'))).toBe(true);
     }
+  });
+});
+
+describe('§11.2 TASK-01/02: a hostile beforeSend result is re-checked, not trusted', () => {
+  it('A3: user is rebuilt from the returned object — an unknown key dropped, id coerced, not smuggled through verbatim', () => {
+    const p = setup({
+      beforeSend: (event) => ({ ...event, user: { id: 123, unknown_key: 'x', email: 'a@b.c' } }) as unknown as typeof event,
+    });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(event?.user).toEqual({ id: '123', email: 'a@b.c' });
+  });
+
+  it('A4: tags are re-validated and re-capped at 50 — a hook returning 61 tags (z00..z60) keeps only 50, with the tags marker', () => {
+    const tags: Record<string, string> = {};
+    for (let i = 0; i <= 60; i++) tags[`z${String(i).padStart(2, '0')}`] = String(i);
+    const p = setup({ beforeSend: (event) => ({ ...event, tags }) as unknown as typeof event });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(Object.keys(event?.tags ?? {})).toHaveLength(50);
+    expect(event?.metadata.truncated).toContain('tags');
+  });
+
+  it('A5: hook breadcrumbs over 100 are cut to the LAST 100, not the first', () => {
+    const breadcrumbs = Array.from({ length: 150 }, (_, i) => ({ timestamp: new Date().toISOString(), type: 'default', message: `m${i}`, level: 'info' }));
+    const p = setup({ beforeSend: (event) => ({ ...event, breadcrumbs }) as unknown as typeof event });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(event?.breadcrumbs).toHaveLength(100);
+    expect(event?.breadcrumbs?.[0]?.message).toBe('m50');
+    expect(event?.breadcrumbs?.[99]?.message).toBe('m149');
+  });
+
+  it('A6: sdk is re-stamped from the pre-hook value — a hook-supplied name/version is discarded', () => {
+    const p = setup({ beforeSend: (event) => ({ ...event, sdk: { name: 'evil.sdk', version: '0.0.0-evil' } }) });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(event?.sdk).toEqual({ name: 'sentinel.javascript.browser', version: expect.any(String) });
+    expect(event?.sdk?.name).not.toBe('evil.sdk');
+  });
+
+  it('H1: applyServerBounds runs again after the hook — a 65-code-point context key and one with U+0000 are removed', () => {
+    const longKey = 'k'.repeat(65);
+    const p = setup({
+      beforeSend: (event) => ({ ...event, contexts: { [longKey]: { a: 1 }, 'bad\u0000name': { b: 2 }, ok: { c: 3 } } }) as unknown as typeof event,
+    });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(event?.contexts).toEqual({ ok: { c: 3 } });
+  });
+
+  it('H2/M9: boundRequestStrings runs again after the hook — a request.url over 2048 code points is cut back down', () => {
+    const hugeUrl = '/' + 'a'.repeat(3000);
+    const p = setup({ beforeSend: (event) => ({ ...event, request: { url: hugeUrl } }) as unknown as typeof event });
+    captureException(new Error('x'));
+    const [event] = p.events();
+    expect(Array.from(event?.request?.url ?? '').length).toBeLessThanOrEqual(2048);
+  });
+
+  it('spec §4.4: the 131 072-byte breadcrumb total is applied to the REBUILT breadcrumbs in afterHook, not just at build', () => {
+    const breadcrumbs = Array.from({ length: 100 }, (_, i) => ({ timestamp: new Date().toISOString(), type: 'default', message: 'm'.repeat(4000), level: 'info' as const }));
+    const p = setup({ beforeSend: (event) => ({ ...event, breadcrumbs }) as unknown as typeof event }, 'node');
+    captureException(new Error('x'));
+    const [event] = p.events();
+    // 100 crumbs of ~4000 chars is ~411 KB of Go-ruler bytes, far over the 131 072 total — must be trimmed.
+    expect(event?.breadcrumbs?.length ?? 0).toBeLessThan(100);
+  });
+});
+
+describe('the URL privacy filter runs on every capture path (spec §5.1)', () => {
+  it('captureException: the error message is filtered', () => {
+    const p = setup();
+    captureException(new Error('failed at /reset-password?reset_token=X'));
+    expect(p.events()[0]?.message).toBe('failed at /reset-password?reset_token=[Filtered]');
+  });
+
+  it('captureMessage: a message with a fragment is filtered (the fragment dropped)', () => {
+    const p = setup();
+    captureMessage('see https://h/q?token=t#frag');
+    expect(p.events()[0]?.message).toBe('see https://h/q?token=[Filtered]');
+  });
+
+  it('a message of exactly MAX_MESSAGE_BYTES ending in a token is filtered, then cut, with the truncated marker', () => {
+    const p = setup();
+    const message = 'x'.repeat(MAX_MESSAGE_BYTES - 11) + ' /r?token=X';
+    expect(Buffer.byteLength(message)).toBe(MAX_MESSAGE_BYTES);
+    captureException(new Error(message));
+    const [event] = p.events();
+    expect(Buffer.byteLength(event?.message ?? '')).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    expect(event?.metadata.truncated).toContain('message');
+  });
+
+  it('a beforeSend that sets message is not filtered again — the app owns what it writes', () => {
+    const p = setup({ beforeSend: (event) => ({ ...event, message: '/r?token=t' }) });
+    captureException(new Error('x'));
+    expect(p.events()[0]?.message).toBe('/r?token=t');
+  });
+
+  it('stacktrace[].file is filtered, then cut (spec §5.1)', () => {
+    const p = setup();
+    const err = new Error('boom');
+    err.stack = 'Error: boom\n    at f (https://app/reset-password?reset_token=X:1:2)';
+    captureException(err);
+    expect(p.events()[0]?.stacktrace[0]?.file).toBe('https://app/reset-password?reset_token=[Filtered]');
   });
 });

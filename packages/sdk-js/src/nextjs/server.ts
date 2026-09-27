@@ -11,7 +11,7 @@
 import { debug } from '../core/report.js';
 import { getInternalClient } from '../core/state.js';
 import { readEnv } from '../core/options.js';
-import { init as initNode } from '../node.js';
+import { initNode } from '../node.js';
 import type { NodeInitOptions } from '../core/types.js';
 import { captureRequestErrorEvent, type InstrumentationOnRequestError, type RequestErrorContext, type RequestErrorRequest } from './request-error.js';
 
@@ -23,7 +23,7 @@ export type { InstrumentationOnRequestError, RequestErrorContext, RequestErrorRe
 
 /** The node `init` (contract §4.2, §4.6) — `NEXT_RUNTIME` noted in `debug` output only. */
 export function init(options?: NodeInitOptions): void {
-  initNode(options);
+  initNode(options, 'nextjs');
   try {
     const client = getInternalClient();
     if (client !== undefined) debug(client, `nextjs/server init (NEXT_RUNTIME=${readEnv('NEXT_RUNTIME') ?? '(unset)'})`);

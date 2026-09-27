@@ -51,10 +51,10 @@ export function installNodeHandlers(client: InternalClient): void {
     return;
   }
   const onMonitor = (err: unknown): void => {
-    capture({ kind: 'exception', value: err, ctx: undefined, source: 'uncaughtException', syncHookOnly: true });
+    capture({ kind: 'exception', value: err, ctx: { level: 'fatal' }, source: 'uncaughtException', syncHookOnly: true });
   };
   const onRejection = (reason: unknown): void => {
-    capture({ kind: 'exception', value: reason, ctx: undefined, source: 'unhandledRejection', syncHookOnly: true });
+    capture({ kind: 'exception', value: reason, ctx: { level: 'error' }, source: 'unhandledRejection', syncHookOnly: true });
     if (proc.listenerCount('unhandledRejection') === 1) {
       // The sole listener: re-raise so the default `throw` mode crashes exactly as it would have. The header of
       // node's crash output names this line; everything from the first `Error:` line down is the reason's own.
