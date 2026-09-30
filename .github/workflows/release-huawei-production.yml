@@ -207,10 +207,11 @@ jobs:
     # pre-staged, exactly like cdc-pipeline 2.11m.
     if: ${{ !endsWith(github.ref_name, '-staging') }}
     needs: [gate-production]
-    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
+    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@8418659eb2d57ed605a35f74c96fe14d5b6482ec # main as of 2026-09-27, workflow#312 source_position
     with:
       runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
       app_name: "sentinel-tuju-production"
+      source_position: "1"
       argocd_url: "argocd.tuju.ai"
       argocd_username_aws_ssm_parameter_store_path: "/infra/tuju-production/argocd/ARGOCD_USERNAME"
       argocd_password_aws_ssm_parameter_store_path: "/infra/tuju-production/argocd/ARGOCD_PASSWORD"
