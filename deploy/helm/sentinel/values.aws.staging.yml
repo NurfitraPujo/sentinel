@@ -149,6 +149,10 @@ config:
     manualIssueRetentionDays: "365"
   ingestor:
     ratelimitStrictMode: "true"
+    # sentinel-sentry-compat-ingest (contract D15): empty = fail closed -- the relay's X-Forwarded-For and
+    # X-Sentinel-Relay-* headers are ignored. core-sentinel-mobile-relay sets this at its rollout, by the
+    # RUNBOOK entry "Sentry-compatible ingest: trusting core's relay". Narrowest CIDR only.
+    sentryCompatTrustedProxyCidrs: []
 
 # Live: run the db-migrate Job (a wave-1 `Sync` hook) so the restored schema is
 # reconciled with the app's expectations. The database is populated, so unlike

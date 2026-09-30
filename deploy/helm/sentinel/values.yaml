@@ -158,10 +158,20 @@ config:
     # TRUSTED_PROXY_CIDRS (sentinel-event-enrichment spec §3.3) -- a YAML list of CIDR prefixes (a bare
     # address is a single-address prefix), rendered comma-joined as plain env on the ingestor container
     # only (templates/ingestor.yaml), never in the shared ConfigMap. X-Forwarded-For is believed only
-    # through proxies in these ranges. Empty = trust nothing: the caller is the connection's peer, and
+    # through proxies in these ranges. This list NEVER grants relay identity: the Sentry-compatible routes
+    # believe X-Sentinel-Relay-* headers only from sentryCompatTrustedProxyCidrs (below). Empty = trust nothing: the caller is the connection's peer, and
     # a derived caller IP is stored only if it is public. An unparseable or IPv4-mapped entry makes
     # the ingestor exit 1 at startup.
     trustedProxyCidrs: []
+    # SENTRY_COMPAT_TRUSTED_PROXY_CIDRS (sentinel-sentry-compat-ingest spec §3.6) -- CIDR prefixes whose
+    # X-Sentinel-Relay-* identity headers the Sentry-compatible routes (/api/{project_id}/envelope/, /store/)
+    # believe -- this list ALONE grants relay identity -- and whose X-Forwarded-For they believe on top of
+    # trustedProxyCidrs: the immediate peer core's mobile relay (core-sentinel-mobile-relay) connects from. Every host inside it can assert any app user and
+    # tenant: narrowest CIDR only (RUNBOOK "Sentry-compatible ingest: trusting core's relay"). /ingest and
+    # /ingest/batch never read this list. Same syntax and start-up check as trustedProxyCidrs. Empty (the
+    # default, contract D15) = fail closed: every relay header is ignored, whatever trustedProxyCidrs holds; the
+    # compat routes' X-Forwarded-For handling is then exactly /ingest's.
+    sentryCompatTrustedProxyCidrs: []
   processor:
     # sentinel-sourcemaps §12: the symbolication knobs (decisions 9, 11, 27, 37, 38). Rendered as
     # plain env on the processor container (templates/processor.yaml), never in the ConfigMap the

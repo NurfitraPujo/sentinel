@@ -634,3 +634,125 @@ New SDK implementations MUST be placed in dedicated subdirectories under `packag
 - `packages/sdk-go/` — Official Go SDK
 - [`packages/sdk-js/`](../packages/sdk-js/README.md) — Official JavaScript/TypeScript SDK (`@sentinel/sdk-js`, **exists**): browser, node and edge entries, the Next.js adapter, the tunnel route, the `sentinel-sourcemaps` CLI and the `withSentinelConfig` build wrapper
 - `packages/sdk-python/` — Official Python SDK
+
+
+---
+
+## 10. Sentry-compatible ingest
+
+The ingestor also accepts Sentry SDK envelopes, so a Sentry client (or core's mobile relay, which forwards
+sentry_flutter's envelopes) can report into a Sentinel project without a Sentinel SDK
+(`sentinel-sentry-compat-ingest`). The routes are **private**: nothing exposes them to a phone or a browser. Every event
+takes the same write path as `/ingest` (bounds, enrichment, protovalidate, one JetStream publish); `/ingest` and
+`/ingest/batch` are unchanged.
+
+### 10.1 Routes
+
+| Route | Body |
+|---|---|
+| `POST /api/{project_id}/envelope/` and `POST /api/{project_id}/envelope` | a Sentry envelope |
+| `POST /api/{project_id}/store/` and `POST /api/{project_id}/store` | one Sentry event JSON |
+
+`{project_id}` is the derived Sentry project id of §10.3, never a UUID. Any other method is `405` with `Allow: POST` (no CORS,
+no `OPTIONS`); `/api/1/envelope/anything` is `404`.
+
+### 10.2 Authentication and status codes
+
+The key is read from the **first present** of: the `X-Sentry-Auth` header (`Sentry sentry_version=7, sentry_key=<key>`, the
+`Sentry` word and the parameter names case-insensitive, one pair of quotes removed, the first non-empty `sentry_key` wins),
+the `sentry_key` query parameter, the `X-API-Key` header. A present but unusable source is an error, never a fall-through. The
+envelope header's `dsn` is never read as a key. Only a **project-scoped** key with scope `ingest` is accepted (an org-wide,
+`admin`, `read`, `agent` or `report` key is `403`), and the path's project id must equal the one derived from the key's project.
+
+| Status | Meaning |
+|---|---|
+| `200` | `{"id": "<effective event id>"}`, or `{}` when no event item was accepted |
+| `400` | malformed envelope, corrupt compressed body, a payload that is not a JSON object, a validation failure |
+| `401` | no key, `Invalid X-Sentry-Auth header`, or an unknown, revoked or expired key |
+| `403` | scope, org-wide key, or a path project id that does not match the key's project |
+| `413` | a body or event over a limit of §10.4, or an event still over the publish budget of §10.5 |
+| `415` | a `Content-Encoding` other than identity, `gzip` (`x-gzip`) or `deflate` |
+| `429` | rate limited: `Retry-After: 60` and `X-Sentry-Rate-Limits: 60::organization` (all categories, organization scope) |
+| `500` | a publish failure |
+
+### 10.3 The derived project id
+
+The Sentry project id is derived, never stored: the decimal value of the first 13 hex digits of the project UUID, dashes
+removed (52 bits, so every JavaScript runtime holds it exactly). Project settings in the dashboard show it, with a copy button.
+Two rows of `tests/fixtures/sentry/project-id-vectors.json`, which the Go and TypeScript implementations both read:
+
+| UUID | Sentry project id |
+|---|---|
+| `0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6` | `27690631804612` |
+| `ffffffff-ffff-ffff-ffff-ffffffffffff` | `4503599627370495` |
+
+### 10.4 Bodies and limits
+
+`Content-Encoding` identity, `gzip`/`x-gzip`, and `deflate` (zlib or raw, told apart by RFC 1950's header check). The body is read
+through a counting reader, so a decompression bomb stops at the cap whatever its ratio.
+
+| Limit | Value | Over it |
+|---|---|---|
+| request body as sent | 5 MiB (5242880 bytes) | `413` |
+| body after decoding | 20 MiB (20971520 bytes) | `413` |
+| one event item (`/store/`: the body) | 1 MiB (1048576 bytes) | envelope: the item is dropped and counted, the rest is processed; `/store/`: `413` |
+| items per envelope | 100 | `413` on the 101st |
+| the envelope header line and each item header line | 64 KiB (65536 bytes) | `400` |
+
+Items are `length`- or newline-framed (both, mixed, are accepted; a missing trailing newline and `\r\n` are tolerated). The whole
+envelope is read before any event is ingested, so every `4xx` precedes every publish. Only `event` items are ingested;
+`transaction`, `span`, `session`, `sessions`, `client_report`, `replay_event`, `replay_recording`, `replay_video`, `attachment`,
+`profile`, `profile_chunk`, `check_in`, `log`, `statsd`, `feedback`, `user_report` and anything unknown are read past and never an
+error. The first event that fails answers the request; a re-send is idempotent because the processor stores one occurrence per
+`(project_id, event_id)`.
+
+### 10.5 The publish budget
+
+A compat event whose marshaled proto exceeds **1,000,000** bytes (NATS's `max_payload` less headers, the budget `sdk-go` and
+`sdk-js` already use) is shed in a fixed order until it fits: breadcrumbs (oldest first), non-exempt `extra` keys (largest
+first), non-well-known contexts (largest first), exception values other than the titled (last) one, then every frame's context
+lines. The grouping inputs (top-level frames, `error_class`, `message`, `platform`, `environment`, `release_version`, `user`,
+`tags`, `request`) are never shed. Each removal is recorded in `metadata.server_truncated` and `metadata.server_truncated_keys`,
+and the ingestor logs `event=ingest.event_shed`. What still does not fit, or what NATS refuses, is `413`, never `500`.
+
+### 10.6 Trusting core's relay
+
+`SENTRY_COMPAT_TRUSTED_PROXY_CIDRS` (chart value `config.ingestor.sentryCompatTrustedProxyCidrs`) lists the prefixes the
+Sentry-compatible routes believe `X-Forwarded-For` and the relay identity headers from, on top of `TRUSTED_PROXY_CIDRS`. It is
+empty everywhere by default (fail closed) and `/ingest` never reads it. From a peer in the list, the phone's address (the first
+untrusted `X-Forwarded-For` entry, when public) fills a `{{auto}}` `user.ip_address`.
+
+The relay states who the app user was with `X-Sentinel-Relay-Auth: user|anonymous` and, for `user`, `X-Sentinel-Relay-User-Id`
+and `X-Sentinel-Relay-Tenant-Id`. They are honoured only from a peer in the trusted list and ignored from any other:
+
+| Assertion | Effect on the event |
+|---|---|
+| none, or a peer that is not trusted | nothing applied; the body's user and tags stay as sent |
+| `user` | `user.id` = the user id header, `tags.tenant_id` = the tenant id header (each when sent), `tags.relay_auth` = `user` |
+| `anonymous` | `user.id` cleared, `tags.tenant_id` and the metadata fallbacks (`user_id`, `userId`, `user`, `tenant_id`, `tenantId`, `organization_id`) removed, `tags.relay_auth` = `anonymous` |
+
+A `relay_auth` tag in the event body is **never** kept, so its presence on a stored event means the relay asserted it.
+
+### 10.7 Mapping (condensed)
+
+| Sentry | Sentinel v2 | Rule |
+|---|---|---|
+| `event_id` | `event_id` | verbatim; the envelope header's when absent |
+| `timestamp` | `timestamp` | number (seconds), RFC 3339, or zone-less ISO (UTC); unusable → receipt time |
+| `platform` | `platform` | `[a-z0-9]+` else `other`; `other` + a `sentry.dart*` SDK → `dart` |
+| `level` | `level` | lower-cased; `log` → `info` |
+| `environment` | `environment` | lower-cased; invalid or absent → `production` |
+| `release`, `dist` | `release_version`, `dist` | `release` cut to 100 code points |
+| `exception.values`, `message`, `logentry` | `exception`, `error_class`, `message` | the **last** value titles the event: `error_class` = its `type`, else the first line of its `value`, else the message, else `UnknownError` |
+| `stacktrace.frames` | `stacktrace` (and each value's) | **reversed** to crash-first; `file` = `abs_path` else `filename` (cut to 512 bytes), `function` cut to 255 bytes, `in_app` only when sent `true` with a file; a `threads` frame list is the fallback |
+| `breadcrumbs`, `tags`, `contexts`, `user`, `sdk`, `request` | the same-named v2 fields | `{values: [...]}` or arrays, tag pairs or objects, one loss per bad entry |
+| `extra` | `metadata` | verbatim |
+| `fingerprint` | `fingerprint` | `{{ default }}` anywhere → server-computed; otherwise the first 32 hex of SHA-256 of the elements joined by newlines |
+| everything else | dropped | `modules`, `debug_meta`, `spans`, `culprit`, ... |
+
+U+0000 is removed from every string and key. `source` is `sentry-compat`. Nothing is symbolicated.
+
+### 10.8 Metric
+
+`sentinel_compat_items_total{type,outcome}` counts every envelope item once. `type` is one of the 17 known item types or
+`unknown`; `outcome` is `accepted`, `discarded`, `too_large`, `rejected`, `failed` or `skipped`.

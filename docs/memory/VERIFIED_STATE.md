@@ -166,6 +166,39 @@ current picture of module boundaries.
 
 ## Resolved
 
+### `sentinel-sentry-compat-ingest` — Sentry-compatible envelope/store routes, Sentry key auth, bounded decoder, Sentry → v2 mapper, Dart grouping, relay trust, Sentry project id (VERIFIED locally 2026-09-29, branch `NurfitraPujo/sentinel-sentry-compat-ingest-implementing.sentinel`)
+
+What runs, and what proved it (`GOFLAGS=-p=3`, `GOMEMLIMIT=3GiB`, `prlimit --as=10GiB` on every `go test`, one heavy command at a time):
+
+| Gate | Command | Result |
+|---|---|---|
+| go-root | `env GOWORK=off go build ./... && env GOWORK=off go vet ./...` | exit 0 |
+| Unit suite | `env GOWORK=off go test ./tests/unit/... -count=1 -json` | **1460 passed, 0 failed, 0 skipped** (baseline at `2812b23`: 1311 / 0 / 0) |
+| Named proofs | `-run 'SentryCompat\|SentryProjectID\|ParseSentryAuth\|SentryEnvelope\|SentryDecode\|SentryStore\|SentryDart\|SentryFixtures\|RelayIdentity\|RelayAuth\|RelayUntrusted\|RelayHeaders\|IngestAuthUnchanged\|IngestRateLimitHasNoSentryHeader\|IngestResolverIgnoresCompatList\|IngestHasNoPublishBudget\|HelmSentryCompat\|HelmTrustedProxy' -v` | 56 top-level tests, 149 with subtests, 0 failed, 0 skipped |
+| Ingestor packages | `go test ./apps/ingestor-go/... -count=1` | `ok` for root, `auth`, `mapping`, `middleware`, `service`, `validation` (not in CI, T16) |
+| Chart | `helm lint deploy/helm/sentinel`; `helm template` over the four overlays; `-run TestHelm` | lint 0 failed; `SENTRY_COMPAT_TRUSTED_PROXY_CIDRS` renders `""` in every overlay; every `TestHelm*` passes |
+| Dashboard | `pnpm build && pnpm check && pnpm test && pnpm test --sequence.shuffle` | build ok; 2154 files, 0 errors, 0 warnings; 201 files passed / 31 skipped, 2488 passed / 250 skipped, shuffled the same (baseline: 2151 files; 199 / 31, 2466 / 250) |
+| Plane gate | `task test-unit` (with a `go` shim applying the memory limit) | exit 0: Go unit, ingestor packages, `sdk-go -race`, dashboard vitest, sdk-js 40 files / 703 passed, tunnel fixtures clean |
+
+What is true now, each held red-first (the production change reverted after the proof went red):
+- `POST /api/{project_id}/envelope/` and `/store/` (each with and without the trailing slash) are mounted on the default
+  mux from `main()` behind `otelhttp → observeMiddleware → sentrycompat.Chain` (`clientip` over `compatResolver` →
+  `SentryMiddleware` → the Sentry rate limiter); the mux answers every other method `405`.
+- Only a project-scoped `ingest` key whose derived id equals the path id is accepted; the derivation is one vector file
+  read by Go (`auth.SentryProjectID`) and TypeScript (`sentryProjectId`).
+- A frame list is reversed crash-first by the mapper, so two errors reached through one entry point are two issues and
+  one error from two devices is one; the processor is unchanged.
+- A compat event over the 1,000,000-byte publish budget is shed in a fixed order, else `413`, never `500`; `/ingest`
+  runs exactly today's statements (`IngestAt` passes no budget).
+- `SENTRY_COMPAT_TRUSTED_PROXY_CIDRS` ships **empty everywhere** (D15). While it is empty every relay header is ignored
+  and no `X-Forwarded-For` is believed on the compat routes. Tag keys are NUL-stripped before `relay_auth` is removed
+  (finding `d14-nul-tag-key`).
+
+Not verified here: `TestU40_SentryCompatEnvelopeDedupsAndGroups` needs the compose stack (its Postgres is on 5432,
+which another lane owns); it runs in CI's `e2e` job on `workflow_dispatch`. The staging envelope of spec §10.3 is the
+orchestrator's release step. No relay traffic has been sent by core yet, so the trusted-peer paths are proven in
+`tests/unit`, not against a real relay.
+
 ### `sentinel-issue-tag-facets` — tag rollup, backfill, retention, tag panel, `key:value` search; the proofs cannot skip (VERIFIED 2026-09-25, branch `NurfitraPujo/sentinel-issue-tag-facets-implementing.sentinel`)
 
 What runs, and what proved it (plan §4, `GOFLAGS=-p=2`, vitest capped at 2 workers):

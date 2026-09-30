@@ -82,7 +82,27 @@ func NewRateLimiter(client *libredis.Client) *RateLimiter {
 	}
 }
 
+const (
+	// RetryAfterSeconds is the Retry-After both chains send on a 429: the sliding window's length.
+	RetryAfterSeconds = 60
+	// SentryRateLimitsValue is X-Sentry-Rate-Limits on a compat 429: all categories (empty list), organization scope.
+	SentryRateLimitsValue = "60::organization"
+)
+
+// Middleware is the rate limiter for /ingest and /ingest/batch.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
+	return rl.limit(next, func(http.Header) {})
+}
+
+// SentryMiddleware is Middleware for the Sentry-compatible routes: the same per-key sliding window, the same
+// RATELIMIT_STRICT_MODE behaviour, and on a 429 also X-Sentry-Rate-Limits.
+func (rl *RateLimiter) SentryMiddleware(next http.Handler) http.Handler {
+	return rl.limit(next, func(h http.Header) { h.Set("X-Sentry-Rate-Limits", SentryRateLimitsValue) })
+}
+
+// limit is the shared core. onLimited runs after the X-RateLimit-* and Retry-After headers are set and before the
+// 429 is written.
+func (rl *RateLimiter) limit(next http.Handler, onLimited func(http.Header)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read via auth's typed accessors. These used to be bare string keys
 		// (r.Context().Value("api_key_hash")); when auth switched to a private ctxKey type, the
@@ -152,7 +172,8 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		if allowed == 0 {
 			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Retry-After", strconv.Itoa(RetryAfterSeconds))
+			onLimited(w.Header())
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}

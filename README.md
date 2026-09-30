@@ -282,4 +282,6 @@ pre-v0.2.0 client, move your secret into `APIKey`.
 - [docs/agents/SENTINEL_AGENT_GUIDE.md](docs/agents/SENTINEL_AGENT_GUIDE.md) — how a registered agent
   discovers, claims, and works Sentinel issues via the API.
 - [packages/db-migrations/README.md](packages/db-migrations/README.md) — migration recovery procedures.
+- [docs/sdk-specification.md §10](docs/sdk-specification.md) — the Sentry-compatible ingest routes (`/api/{project_id}/envelope/`,
+  `/store/`): auth, limits, publish budget, relay trust and the Sentry → v2 mapping.
 - `CLAUDE.md` — repo conventions for AI coding agents (also useful background for humans).

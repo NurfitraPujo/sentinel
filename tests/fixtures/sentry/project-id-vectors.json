@@ -1,0 +1,13 @@
+{
+  "valid": [
+    {"uuid": "00000000-0000-0000-0000-000000000000", "sentry_project_id": "0"},
+    {"uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff", "sentry_project_id": "4503599627370495"},
+    {"uuid": "FFFFFFFF-FFFF-4FFF-BFFF-FFFFFFFFFFFF", "sentry_project_id": "4503599627370484"},
+    {"uuid": "0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6", "sentry_project_id": "27690631804612"},
+    {"uuid": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "sentry_project_id": "2192316254601812"},
+    {"uuid": "00000000-0001-4000-8000-000000000000", "sentry_project_id": "20"},
+    {"uuid": "a3bb189e8bf938889912ace4e6543002",     "sentry_project_id": "2880383476088723"}
+  ],
+  "invalid": ["", "not-a-uuid", "0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f", "0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6a",
+              "0192f3a4_5b6c_4d7e_8f90_a1b2c3d4e5f6", "g192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6", " 0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6"]
+}

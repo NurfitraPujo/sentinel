@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -118,6 +119,11 @@ var metadataExemptKeys = map[string]bool{
 	"request_id": true, "requestId": true, "request-id": true,
 	"release_version": true, "truncated": true, "truncated_keys": true,
 }
+
+// IsMetadataExemptKey reports whether k is a metadata key the processor routes on. The bounds step's shrink
+// removes such a key only after everything else; a caller that sheds metadata itself (the Sentry-compatible
+// routes' publish-budget shedder) must exempt the same keys, so both read this one list.
+func IsMetadataExemptKey(k string) bool { return metadataExemptKeys[k] }
 
 // wellKnownContexts are removed last when contexts is over its bound.
 var wellKnownContexts = map[string]bool{
@@ -765,4 +771,60 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+var overflowEntryRe = regexp.MustCompile(`^\+(\d+) more$`)
+
+// MarkServerTruncated records a removal made AFTER the bounds step (the publish-budget shedder, spec §4.7): it
+// adds field to metadata.server_truncated (vocabulary order, no duplicates) and appends keys to
+// metadata.server_truncated_keys under the bounds step's own cap (MaxServerTruncatedKeys entries of at most
+// MaxServerTruncatedKeyBytes, then one "+N more", whose N is read back from an existing list). It never removes a
+// key from either marker.
+func MarkServerTruncated(p *ErrorPayload, field string, keys ...string) {
+	if p.Metadata == nil {
+		p.Metadata = map[string]interface{}{}
+	}
+	have := map[string]bool{field: true}
+	for _, f := range markerStrings(p.Metadata[MetadataKeyServerTruncated]) {
+		have[f] = true
+	}
+	fields := []interface{}{}
+	for _, f := range obs.TruncatedFieldVocabulary() {
+		if have[f] {
+			fields = append(fields, f)
+		}
+	}
+	p.Metadata[MetadataKeyServerTruncated] = fields
+	if len(keys) == 0 {
+		return
+	}
+	var rk removedKeys
+	existing := markerStrings(p.Metadata[MetadataKeyServerTruncatedKeys])
+	for i, e := range existing {
+		if m := overflowEntryRe.FindStringSubmatch(e); m != nil && i == len(existing)-1 {
+			rk.overflow, _ = strconv.Atoi(m[1])
+			continue
+		}
+		rk.add(e)
+	}
+	for _, k := range keys {
+		rk.add(strings.ReplaceAll(k, "\x00", ""))
+	}
+	p.Metadata[MetadataKeyServerTruncatedKeys] = rk.value()
+}
+
+// markerStrings reads a marker value back: the bounds step writes []interface{} of strings.
+func markerStrings(v interface{}) []string {
+	var out []string
+	switch t := v.(type) {
+	case []interface{}:
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+	case []string:
+		out = append(out, t...)
+	}
+	return out
 }

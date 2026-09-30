@@ -105,6 +105,26 @@ func NewAPIKeyAuthenticator(db *pgxpool.Pool, redis *libredis.Client, sub *nats.
 	return auth
 }
 
+// resolveKey hashes apiKey and looks it up (a.lookup: Redis cache, then Postgres). The hash is returned for
+// WithIdentity and the rate limiter.
+func (a *APIKeyAuthenticator) resolveKey(ctx context.Context, apiKey string) (*APIKeyData, string, error) {
+	hash := sha256.Sum256([]byte(apiKey))
+	hashStr := hex.EncodeToString(hash[:])
+	data, err := a.lookup(ctx, hashStr)
+	if err != nil {
+		return nil, hashStr, err
+	}
+	return data, hashStr, nil
+}
+
+// NewAPIKeyAuthenticatorWithLookup builds an authenticator over an injected lookup, with no database, Redis or
+// invalidation subscriber. For tests: tests/unit is outside package auth and cannot set the unexported field.
+// Middleware's organization-wide X-Project-Key branch would dereference a nil pool on such an authenticator, so
+// tests through Middleware must use project-scoped keys only; SentryMiddleware never touches the pool.
+func NewAPIKeyAuthenticatorWithLookup(lookup func(ctx context.Context, hashStr string) (*APIKeyData, error)) *APIKeyAuthenticator {
+	return &APIKeyAuthenticator{lookup: lookup}
+}
+
 // Middleware authenticates X-API-Key and admits only the scopes on `allowed`.
 //
 // `allowed` is a required parameter and not a package-level default on purpose: every mount site
@@ -117,10 +137,7 @@ func (a *APIKeyAuthenticator) Middleware(allowed ScopeSet, next http.Handler) ht
 			return
 		}
 
-		hash := sha256.Sum256([]byte(apiKey))
-		hashStr := hex.EncodeToString(hash[:])
-
-		data, err := a.lookup(r.Context(), hashStr)
+		data, hashStr, err := a.resolveKey(r.Context(), apiKey)
 		if err != nil {
 			http.Error(w, "Invalid API key", http.StatusUnauthorized)
 			return

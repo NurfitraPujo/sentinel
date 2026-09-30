@@ -30,6 +30,12 @@ const maxHops = 32
 // IPv6 one, is an error whose text main logs verbatim before exiting 1: a typo in a trust boundary must
 // never become silent.
 func ParseTrusted(s string) ([]netip.Prefix, error) {
+	return parseTrustedList("TRUSTED_PROXY_CIDRS", s)
+}
+
+// parseTrustedList is ParseTrusted for a list read from the environment variable envName, whose name prefixes
+// every error so a typo in one list never exits naming another.
+func parseTrustedList(envName, s string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, raw := range strings.Split(s, ",") {
 		entry := strings.TrimSpace(raw)
@@ -40,13 +46,13 @@ func ParseTrusted(s string) ([]netip.Prefix, error) {
 		if strings.Contains(entry, "/") {
 			parsed, err := netip.ParsePrefix(entry)
 			if err != nil {
-				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: %q is not a CIDR or IP address", entry)
+				return nil, fmt.Errorf("%s: %q is not a CIDR or IP address", envName, entry)
 			}
 			p = parsed
 		} else {
 			a, err := netip.ParseAddr(entry)
 			if err != nil {
-				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: %q is not a CIDR or IP address", entry)
+				return nil, fmt.Errorf("%s: %q is not a CIDR or IP address", envName, entry)
 			}
 			a = a.WithZone("")
 			p = netip.PrefixFrom(a, a.BitLen())
@@ -54,7 +60,7 @@ func ParseTrusted(s string) ([]netip.Prefix, error) {
 		// netip.Prefix.Contains never matches an IPv4 address against an IPv6 prefix, and every address
 		// is unmapped before the check, so a mapped entry would trust nothing, in silence (§3.3).
 		if p.Addr().Is4In6() {
-			return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: %q is an IPv4-mapped IPv6 prefix; write it in IPv4 form", entry)
+			return nil, fmt.Errorf("%s: %q is an IPv4-mapped IPv6 prefix; write it in IPv4 form", envName, entry)
 		}
 		out = append(out, p.Masked())
 	}
@@ -64,12 +70,52 @@ func ParseTrusted(s string) ([]netip.Prefix, error) {
 // Resolver applies the trusted-proxy walk (spec §3.4) and the public-caller rule (§3.5).
 type Resolver struct {
 	trusted []netip.Prefix
+	// peerOnly, when peerScoped, is the prefix list PeerTrusted tests instead of trusted. The compat resolver
+	// walks X-Forwarded-For over the union of both lists but believes the relay identity headers (which
+	// PeerTrusted gates) only from SENTRY_COMPAT_TRUSTED_PROXY_CIDRS: the global list never grants identity.
+	peerOnly   []netip.Prefix
+	peerScoped bool
 }
 
 // NewResolver returns a Resolver over the given trusted prefixes (ParseTrusted's output). An empty list
 // trusts nothing: the caller is always the connection's peer, which must still be public.
 func NewResolver(trusted []netip.Prefix) *Resolver {
 	return &Resolver{trusted: append([]netip.Prefix(nil), trusted...)}
+}
+
+// Resolvers parses TRUSTED_PROXY_CIDRS (globalSpec) and SENTRY_COMPAT_TRUSTED_PROXY_CIDRS (compatSpec) and returns
+// the two resolvers main.go uses: ingest over the global prefixes ALONE (for /ingest and /ingest/batch, exactly
+// today's resolver), compat over the global prefixes plus the compat ones for the X-Forwarded-For walk, whose
+// PeerTrusted (the relay identity headers' gate) is the compat prefixes ALONE. Either spec invalid is an error that
+// names the variable it came from, which main.go treats exactly as today's invalid TRUSTED_PROXY_CIDRS: log
+// clientip.config_invalid and exit 1.
+func Resolvers(globalSpec, compatSpec string) (ingest, compat *Resolver, err error) {
+	global, err := parseTrustedList("TRUSTED_PROXY_CIDRS", globalSpec)
+	if err != nil {
+		return nil, nil, err
+	}
+	extra, err := parseTrustedList("SENTRY_COMPAT_TRUSTED_PROXY_CIDRS", compatSpec)
+	if err != nil {
+		return nil, nil, err
+	}
+	union := append(append([]netip.Prefix(nil), global...), extra...)
+	compat = NewResolver(union)
+	compat.peerOnly, compat.peerScoped = append([]netip.Prefix(nil), extra...), true
+	return NewResolver(global), compat, nil
+}
+
+// PeerTrusted reports whether the connection's immediate peer (RemoteAddr) is inside one of the resolver's
+// trusted prefixes (for the compat resolver: inside the compat-only prefixes, see Resolvers). An address inside a
+// header never counts.
+func (r *Resolver) PeerTrusted(req *http.Request) bool {
+	peer, ok := parseHop(req.RemoteAddr)
+	if !ok {
+		return false
+	}
+	if r.peerScoped {
+		return containsAddr(r.peerOnly, peer)
+	}
+	return r.isTrusted(peer)
 }
 
 // Trusted returns the configured prefixes, for the startup log line.
@@ -118,8 +164,10 @@ func (r *Resolver) Resolve(req *http.Request) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-func (r *Resolver) isTrusted(a netip.Addr) bool {
-	for _, p := range r.trusted {
+func (r *Resolver) isTrusted(a netip.Addr) bool { return containsAddr(r.trusted, a) }
+
+func containsAddr(prefixes []netip.Prefix, a netip.Addr) bool {
+	for _, p := range prefixes {
 		if p.Contains(a) {
 			return true
 		}
@@ -189,6 +237,10 @@ type Info struct {
 	ClientIP    netip.Addr
 	HasClientIP bool
 	UserAgent   string
+	// PeerTrusted is Resolver.PeerTrusted for this request. Enrichment does not read it; the Sentry-compatible
+	// routes read it to decide whether the relay's identity headers are believed (spec §3.7.2). On the compat
+	// resolver it is true only for SENTRY_COMPAT_TRUSTED_PROXY_CIDRS peers, never for TRUSTED_PROXY_CIDRS alone.
+	PeerTrusted bool
 }
 
 // requestInfoKey is private so no other package can read or forge the value by a string literal.
@@ -211,7 +263,7 @@ func RequestInfoFromContext(ctx context.Context) (Info, bool) {
 func Middleware(r *Resolver, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ip, ok := r.Resolve(req)
-		info := Info{ClientIP: ip, HasClientIP: ok, UserAgent: req.UserAgent()}
+		info := Info{ClientIP: ip, HasClientIP: ok, UserAgent: req.UserAgent(), PeerTrusted: r.PeerTrusted(req)}
 		next.ServeHTTP(w, req.WithContext(WithRequestInfo(req.Context(), info)))
 	})
 }

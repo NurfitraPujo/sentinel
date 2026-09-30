@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/geoip"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/geoip/refresh"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/sentrycompat"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/service"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
@@ -75,17 +77,25 @@ func main() {
 	// listens. An unparseable or IPv4-mapped entry is fatal, as a bad S3_FORCE_PATH_STYLE is for the
 	// processor: a typo in a trust boundary must not become silent, and a rollout with a bad value never
 	// becomes ready. Unset or empty trusts nothing (both Huawei overlays, contract decision 11).
-	trustedProxies, err := clientip.ParseTrusted(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	//
+	// sentinel-sentry-compat-ingest spec §3.6.1: the same parse also reads SENTRY_COMPAT_TRUSTED_PROXY_CIDRS
+	// (empty by default, contract D15). clientResolver, over TRUSTED_PROXY_CIDRS alone, serves /ingest and
+	// /ingest/batch exactly as before; compatResolver, over both lists, serves only the Sentry-compatible
+	// routes. An invalid entry in either is fatal and names the variable it came from.
+	clientResolver, compatResolver, err := clientip.Resolvers(os.Getenv("TRUSTED_PROXY_CIDRS"), os.Getenv("SENTRY_COMPAT_TRUSTED_PROXY_CIDRS"))
 	if err != nil {
 		logger.Error(err.Error(), slog.String(obs.LogKeyEvent, "clientip.config_invalid"))
 		os.Exit(1)
 	}
-	trustedStrs := make([]string, len(trustedProxies))
-	for i, p := range trustedProxies {
-		trustedStrs[i] = p.String()
+	cidrStrings := func(prefixes []netip.Prefix) []string {
+		out := make([]string, len(prefixes))
+		for i, p := range prefixes {
+			out[i] = p.String()
+		}
+		return out
 	}
-	logger.Info("trusted proxy ranges", slog.Any("trusted_proxy_cidrs", trustedStrs))
-	clientResolver := clientip.NewResolver(trustedProxies)
+	logger.Info("trusted proxy ranges", slog.Any("trusted_proxy_cidrs", cidrStrings(clientResolver.Trusted())))
+	logger.Info("sentry-compat trusted proxy ranges", slog.Any("sentry_compat_trusted_proxy_cidrs", cidrStrings(compatResolver.Trusted())))
 
 	// obs.Bootstrap wires OpenTelemetry traces+metrics (OTLP/HTTP exporter, Prometheus scrape
 	// endpoint) and registers them as the process-wide otel globals. Degradation is load-bearing here,
@@ -287,6 +297,31 @@ func main() {
 	// service.IngestService.Ingest (the NATS publish) becomes a child of.
 	http.Handle("/ingest", otelhttp.NewHandler(ingestChain, "POST /ingest"))
 	http.Handle("/ingest/batch", otelhttp.NewHandler(batchChain, "POST /ingest/batch"))
+
+	// sentinel-sentry-compat-ingest spec §3.1: the Sentry-compatible routes, behind the same otelhttp ->
+	// observe wrap with FIXED operation names (the path carries the project id, which must never become a span
+	// name or a label). compatResolver, not clientResolver, feeds them; the chain itself is
+	// sentrycompat.Chain so tests/unit proves what it composes.
+	compatItems, err := sentrycompat.NewItemRecorder(meter)
+	if err != nil {
+		logger.ErrorContext(ctx, "obs: failed to create sentry-compat item counter; items will not be recorded as a metric",
+			slog.String("error", err.Error()))
+	}
+	compat := sentrycompat.Config{
+		Ingest: ingestService,
+		Scope: func(ctx context.Context, p *validation.ErrorPayload) error {
+			return applyAuthenticatedScope(ctx, db, p)
+		},
+		Logger:     logger,
+		RecordItem: compatItems,
+	}
+	envelopeChain := observeMiddleware(ingestRequestCounter,
+		sentrycompat.Chain(compatResolver, authenticator, rateLimiter, sentrycompat.NewEnvelopeHandler(compat)))
+	storeChain := observeMiddleware(ingestRequestCounter,
+		sentrycompat.Chain(compatResolver, authenticator, rateLimiter, sentrycompat.NewStoreHandler(compat)))
+	sentrycompat.Mount(http.DefaultServeMux,
+		otelhttp.NewHandler(envelopeChain, "POST /api/{project_id}/envelope/"),
+		otelhttp.NewHandler(storeChain, "POST /api/{project_id}/store/"))
 	http.HandleFunc("/health", handleHealth(db))
 	if providers != nil {
 		// Never auth'd or rate-limited (deliverable #2) — mounted directly, outside both middlewares.

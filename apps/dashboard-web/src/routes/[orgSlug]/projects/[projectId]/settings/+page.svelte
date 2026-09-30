@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { AGENT_REPO_PROVIDERS } from '$lib/constants/agent-repo';
+	import { sentryProjectId } from '$lib/sentry-project-id';
 
 	interface AgentSettings {
 		fixEnabled: boolean;
@@ -104,6 +105,32 @@
 		setTimeout(() => {
 			if (toastMessage === message) toastMessage = null;
 		}, 5000);
+	}
+
+	// sentinel-sentry-compat-ingest spec §8.1: the numeric Sentry project id, derived in the browser from the
+	// project UUID the load already returns (it is not secret, and the load function is unchanged). It cannot
+	// throw for a database UUID; a malformed one shows a dash rather than breaking the page.
+	let sentryId = $derived.by(() => {
+		try {
+			return sentryProjectId(data.projectId);
+		} catch {
+			return null;
+		}
+	});
+	let copiedSentryId = $state(false);
+
+	// Same clipboard pattern as the keys page: a failed write is a toast, never a silent no-op.
+	async function copySentryProjectId() {
+		if (!sentryId) return;
+		try {
+			await navigator.clipboard.writeText(sentryId);
+			copiedSentryId = true;
+			setTimeout(() => {
+				copiedSentryId = false;
+			}, 4000);
+		} catch {
+			showToast('Failed to copy to clipboard');
+		}
 	}
 
 	async function saveAgentSettings() {
@@ -474,6 +501,25 @@
 			<button type="button" onclick={() => (toastMessage = null)}>✕</button>
 		</div>
 	{/if}
+
+	<section class="sentry-sdk" id="sentry-sdk">
+		<h2>Sentry SDK</h2>
+		<p class="subtitle">
+			The numeric project id the Sentry-compatible ingest routes expect for this project
+			(<code>/api/&lt;id&gt;/envelope/</code>). Core's mobile relay is configured with it.
+		</p>
+		<div class="field-row">
+			<span id="sentry-project-id-label">Sentry project id</span>
+			<div class="sentry-id-row">
+				<code class="sentry-id" data-testid="sentry-project-id" aria-labelledby="sentry-project-id-label">{sentryId ?? '—'}</code>
+				{#if sentryId}
+					<button type="button" class="sentry-id-copy" onclick={copySentryProjectId}>
+						{copiedSentryId ? '✓ Copied' : 'Copy'}
+					</button>
+				{/if}
+			</div>
+		</div>
+	</section>
 
 	{#if data.canManageAgents}
 		<section class="agent-automation">
@@ -908,6 +954,7 @@
 	}
 
 	.agent-automation,
+	.sentry-sdk,
 	.environments,
 	.environment-access {
 		border: 1px solid var(--border-color);
@@ -1091,7 +1138,8 @@
 		padding: 0.125rem 0;
 	}
 
-	.agent-automation h2 {
+	.agent-automation h2,
+	.sentry-sdk h2 {
 		margin: 0;
 		font-size: 1rem;
 		font-weight: 700;
@@ -1103,6 +1151,29 @@
 		font-weight: 700;
 		border-top: 1px dashed var(--border-color);
 		padding-top: 0.75rem;
+	}
+
+	.sentry-id-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.sentry-id {
+		font-family: var(--font-mono, ui-monospace, monospace);
+		font-size: 0.9rem;
+		font-weight: 700;
+		user-select: all;
+	}
+
+	.sentry-id-copy {
+		background: none;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		color: inherit;
+		cursor: pointer;
+		font-size: 0.75rem;
+		padding: 0.125rem 0.5rem;
 	}
 
 	.subtitle {

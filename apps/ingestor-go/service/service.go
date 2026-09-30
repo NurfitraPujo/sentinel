@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/enrich"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/mapping"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
+	sentinelv1 "github.com/NurfitraPujo/sentinel/gen/sentinel/v1"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"google.golang.org/protobuf/proto"
@@ -251,6 +253,38 @@ func (s *IngestService) Ingest(ctx context.Context, payload *validation.ErrorPay
 // the body was decoded and auth/scope passed, and shared by every item of a batch. The handlers read
 // it once and pass it here; tests pass a fixed instant so R1-R4 are deterministic.
 func (s *IngestService) IngestAt(ctx context.Context, payload *validation.ErrorPayload, receivedAt time.Time) error {
+	return s.ingestAt(ctx, payload, receivedAt, 0, nil)
+}
+
+// MaxPublishBytes is the largest message a budgeted caller publishes: NATS's default max_payload (1,048,576) less
+// 48,576 bytes for headers and framing -- the budget sdk-go (publishcost.go maxPublishBytes) and sdk-js
+// (proto-size.ts NATS_PUBLISH_BUDGET) already hold to.
+const MaxPublishBytes = 1_000_000
+
+// MaxShedRounds caps how many times IngestAtWithin sheds and re-marshals one event.
+const MaxShedRounds = 4
+
+// ErrEventTooLarge: the marshaled event is still over the caller's budget when the Shedder has nothing left to
+// remove or MaxShedRounds is spent.
+var ErrEventTooLarge = errors.New("event too large to publish")
+
+// Shedder removes content from a payload that has been through the bounds step, in a fixed order, aiming to shrink
+// its proto by at least over bytes. ev is p as MapPayloadToEvent mapped it, for measuring. It reports whether it
+// removed anything.
+type Shedder func(p *validation.ErrorPayload, ev *sentinelv1.ErrorEvent, over int) bool
+
+// IngestAtWithin is IngestAt for a caller that must publish under budget bytes (the sentry-compat routes, sentinel-
+// sentry-compat-ingest D13). An event whose marshaled proto is over budget is handed to shed, which removes content
+// in its own fixed order; the event is then re-mapped, re-validated and re-marshaled, at most MaxShedRounds times.
+// What still does not fit is ErrEventTooLarge, never a publish. IngestAt itself passes no budget, so /ingest and
+// /ingest/batch measure nothing and shed nothing.
+func (s *IngestService) IngestAtWithin(ctx context.Context, payload *validation.ErrorPayload, receivedAt time.Time,
+	budget int, shed Shedder) error {
+	return s.ingestAt(ctx, payload, receivedAt, budget, shed)
+}
+
+func (s *IngestService) ingestAt(ctx context.Context, payload *validation.ErrorPayload, receivedAt time.Time,
+	budget int, shed Shedder) error {
 	// D-a: resolve the effective event_id BEFORE mapping/validate/publish, and stamp it back onto the
 	// payload so callers (handleIngest/handleBatchIngest) can echo the effective id in the HTTP
 	// response without this method's signature changing - main.go reads payload.EventID after this
@@ -308,6 +342,34 @@ func (s *IngestService) IngestAt(ctx context.Context, payload *validation.ErrorP
 	data, err := proto.Marshal(event)
 	if err != nil {
 		return err
+	}
+
+	// D13 (compat callers only; budget 0 skips all of this): shed toward the publish budget in the shedder's
+	// order. The bounds step is not re-run -- shedding only removes values, so everything it guaranteed still
+	// holds -- and the protovalidate re-check is there to prove it (a failure would be a 400, never a publish).
+	shedRounds := 0
+	sizeBefore := len(data)
+	for round := 0; budget > 0 && len(data) > budget; round++ {
+		if shed == nil || round == MaxShedRounds || !shed(payload, event, len(data)-budget) {
+			return fmt.Errorf("%w: %d bytes, budget %d", ErrEventTooLarge, len(data), budget)
+		}
+		shedRounds++
+		event = mapping.MapPayloadToEvent(payload)
+		if err := s.validator.Validate(event); err != nil {
+			return fmt.Errorf("validation failed: %w", err)
+		}
+		if data, err = proto.Marshal(event); err != nil {
+			return err
+		}
+	}
+	if shedRounds > 0 {
+		slog.Default().WarnContext(ctx, "ingest: event published with parts removed to fit the publish budget",
+			slog.String(obs.LogKeyEvent, "ingest.event_shed"),
+			slog.String("project_key", payload.ProjectKey),
+			slog.String("event_id", payload.EventID),
+			slog.Int("bytes_before", sizeBefore),
+			slog.Int("bytes_after", len(data)),
+			slog.Int("rounds", shedRounds))
 	}
 
 	return s.publish(ctx, data)

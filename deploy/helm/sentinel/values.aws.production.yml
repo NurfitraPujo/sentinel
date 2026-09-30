@@ -129,6 +129,10 @@ config:
     manualIssueRetentionDays: "365"
   ingestor:
     ratelimitStrictMode: "true"
+    # sentinel-sentry-compat-ingest (contract D15): empty = fail closed -- the relay's X-Forwarded-For and
+    # X-Sentinel-Relay-* headers are ignored. core-sentinel-mobile-relay sets this at its rollout, by the
+    # RUNBOOK entry "Sentry-compatible ingest: trusting core's relay". Narrowest CIDR only.
+    sentryCompatTrustedProxyCidrs: []
 
 # Dormant: no DB migration Job until the cutover window. `sentinel-production`
 # is seeded by DMS; Goose runs must wait for CCE write-freeze.
