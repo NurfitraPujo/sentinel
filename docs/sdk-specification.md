@@ -717,17 +717,23 @@ and the ingestor logs `event=ingest.event_shed`. What still does not fit, or wha
 
 ### 10.6 Trusting core's relay
 
-`SENTRY_COMPAT_TRUSTED_PROXY_CIDRS` (chart value `config.ingestor.sentryCompatTrustedProxyCidrs`) lists the prefixes the
-Sentry-compatible routes believe `X-Forwarded-For` and the relay identity headers from, on top of `TRUSTED_PROXY_CIDRS`. It is
-empty everywhere by default (fail closed) and `/ingest` never reads it. From a peer in the list, the phone's address (the first
-untrusted `X-Forwarded-For` entry, when public) fills a `{{auto}}` `user.ip_address`.
+Core's mobile relay is identified by a credential, not an address: a project API key of scope **`relay`**. Only that scope makes
+the Sentry-compatible routes believe the relay identity headers and a relayed client IP, from any peer. A `relay` key is
+project-scoped only, is accepted on `/api/{project_id}/envelope/` and `/store/` (with the same project-id check as an `ingest`
+key), and is refused with `403` on `/ingest` and `/ingest/batch`.
+
+For a `relay` key the phone's address is the **rightmost** `X-Forwarded-For` entry (the one core's relay sets), used only when it
+parses and is public; otherwise no client IP is recorded (a request carrying `X-Sentinel-Derive-IP` also gets none, as in "Server-side enrichment"). For any other key the client IP is resolved as before from
+`TRUSTED_PROXY_CIDRS` and `SENTRY_COMPAT_TRUSTED_PROXY_CIDRS` (chart values `config.ingestor.trustedProxyCidrs` and
+`config.ingestor.sentryCompatTrustedProxyCidrs`, empty everywhere by default); that list no longer grants relay identity.
 
 The relay states who the app user was with `X-Sentinel-Relay-Auth: user|anonymous` and, for `user`, `X-Sentinel-Relay-User-Id`
-and `X-Sentinel-Relay-Tenant-Id`. They are honoured only from a peer in the trusted list and ignored from any other:
+and `X-Sentinel-Relay-Tenant-Id`. They are honoured only with a `relay` key and ignored with any other (one
+`event=sentrycompat.relay_headers_ignored reason=not_relay_key` line records the key's scope):
 
 | Assertion | Effect on the event |
 |---|---|
-| none, or a peer that is not trusted | nothing applied; the body's user and tags stay as sent |
+| none, or a key that is not a `relay` key | nothing applied; the body's user and tags stay as sent |
 | `user` | `user.id` = the user id header, `tags.tenant_id` = the tenant id header (each when sent), `tags.relay_auth` = `user` |
 | `anonymous` | `user.id` cleared, `tags.tenant_id` and the metadata fallbacks (`user_id`, `userId`, `user`, `tenant_id`, `tenantId`, `organization_id`) removed, `tags.relay_auth` = `anonymous` |
 

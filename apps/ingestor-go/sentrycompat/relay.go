@@ -2,19 +2,18 @@ package sentrycompat
 
 import (
 	"log/slog"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
 
-	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/clientip"
+	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/validation"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 )
 
 // The relay identity headers (spec §3.7, contract §4.7 D12): core's mobile relay tells the ingestor who the app
-// user was, and the ingestor believes it only when the connection's immediate peer is inside a trusted-proxy
-// prefix (the compat resolver's list, shipped empty, D15). Nothing outside this package reads them.
+// user was, and the ingestor believes it only when the request authenticated with a `relay` key (sentinel-relay-key-trust;
+// this replaced the trusted-peer network test of D12/D15). Nothing outside this package reads them.
 const (
 	HeaderRelayAuth     = "X-Sentinel-Relay-Auth"
 	HeaderRelayUserID   = "X-Sentinel-Relay-User-Id"
@@ -45,24 +44,21 @@ func headerValue(r *http.Request, name string) string {
 	return strings.TrimSpace(stripNULs(r.Header.Get(name)))
 }
 
-// RelayIdentityFromRequest returns the zero RelayIdentity unless clientip.RequestInfoFromContext(r.Context()) has
-// PeerTrusted; then it reads the three headers (spec §3.7.3). logger is Config.Logger.
+// RelayIdentityFromRequest returns the zero RelayIdentity unless the authenticated key's scope is auth.ScopeRelay
+// (sentinel-relay-key-trust §4.2, K1); then it reads the three headers (spec §3.7.3), whatever the peer. From any
+// other key they are ignored and, when one was sent, one line records the key's scope. logger is Config.Logger.
 func RelayIdentityFromRequest(r *http.Request, logger *slog.Logger) RelayIdentity {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	info, _ := clientip.RequestInfoFromContext(r.Context())
-	if !info.PeerTrusted {
-		if len(r.Header.Values(HeaderRelayAuth)) > 0 {
-			// How an operator observes the relay's immediate peer before setting the trusted list (RUNBOOK):
-			// the peer address only, never a header value, a forwarded address or a key.
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				host = r.RemoteAddr
-			}
-			logger.InfoContext(r.Context(), "relay identity headers ignored: the peer is not a trusted proxy",
-				slog.String(obs.LogKeyEvent, "sentrycompat.relay_peer_untrusted"),
-				slog.String("peer", host))
+	scope, _ := auth.ScopeFromContext(r.Context())
+	if scope != auth.ScopeRelay {
+		if len(r.Header.Values(HeaderRelayAuth))+len(r.Header.Values(HeaderRelayUserID))+len(r.Header.Values(HeaderRelayTenantID)) > 0 {
+			// The key's scope only: never a header value, a forwarded address, a peer or a key.
+			logger.InfoContext(r.Context(), "relay identity headers ignored: the key is not a relay key",
+				slog.String(obs.LogKeyEvent, "sentrycompat.relay_headers_ignored"),
+				slog.String("reason", "not_relay_key"),
+				slog.String("scope", scope))
 		}
 		return RelayIdentity{}
 	}
@@ -79,7 +75,7 @@ func RelayIdentityFromRequest(r *http.Request, logger *slog.Logger) RelayIdentit
 	case "":
 		return RelayIdentity{}
 	}
-	// A trusted relay sending anything else is misconfigured, but refusing the envelope would lose the event.
+	// A relay key sending anything else is misconfigured, but refusing the envelope would lose the event.
 	logger.WarnContext(r.Context(), "relay identity header has an invalid value; nothing applied",
 		slog.String(obs.LogKeyEvent, "sentrycompat.relay_auth_invalid"))
 	return RelayIdentity{}

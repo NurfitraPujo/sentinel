@@ -28,11 +28,20 @@
 	
 	const dispatch = createEventDispatcher();
 	
-	const availableScopes = [
+	const baseScopes = [
 		{ id: 'ingest', label: 'Ingest (Ingest metrics & logs)', desc: 'Allows submitting telemetry events' },
 		{ id: 'read', label: 'Read (Query telemetry data)', desc: 'Allows querying dashboards & logs' },
 		{ id: 'admin', label: 'Admin (Full privileges)', desc: 'Full administrative access' }
 	];
+	// sentinel-relay-key-trust §4.3: a relay key can state a verified user, tenant and client IP, and is
+	// project-scoped only. The project-scoped page is the one that passes allowOrgWide={false}, so that is the
+	// only place it is offered; the API refuses it for an org-wide key regardless of what a client sends.
+	const relayScope = {
+		id: 'relay',
+		label: 'Relay',
+		desc: "For core's mobile relay only: this key can state a verified user, tenant and client IP. Keep it in core's secrets."
+	};
+	$: availableScopes = allowOrgWide ? baseScopes : [...baseScopes, relayScope];
 
 	function handleSubmit() {
 		if (!name.trim()) return;

@@ -232,9 +232,10 @@ func TestTagFacetsMigration_BoundedLockWait(t *testing.T) {
 // is a bounded-wait DO block like Up's blocks C/T1/TR, not a plain statement that queues behind a reader
 // indefinitely.
 func TestTagFacetsMigration_DownBoundedLockWait(t *testing.T) {
-	_, _, prev := tagFacetsMigrationFile(t)
-	env := tagFacetsDB(t, tagFacetsOpts{UpTo: prev})
-	env.migrateRest()
+	// Up to and including the tag-facets migration, so the single down step below is its Down
+	// whatever migrations are added after it.
+	_, version, _ := tagFacetsMigrationFile(t)
+	env := tagFacetsDB(t, tagFacetsOpts{UpTo: version})
 	ctx := context.Background()
 	opts := dbmigrations.MigrationOptions{TableName: tagFacetsLedger, Directory: tagFacetsMigrationsDir}
 

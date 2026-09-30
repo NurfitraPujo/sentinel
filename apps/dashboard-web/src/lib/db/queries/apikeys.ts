@@ -88,7 +88,7 @@ export async function createApiKey(
 		organizationId: string;
 		projectId?: string | null;
 		name: string;
-		scope: 'ingest' | 'read' | 'admin' | 'agent';
+		scope: 'ingest' | 'read' | 'admin' | 'agent' | 'relay';
 		rateLimitRpm?: number;
 		// M5 §7: set only for scope='agent'. Agent keys are always org-scoped (projectId stays
 		// null regardless of what the caller passes) — an agent works across every project in

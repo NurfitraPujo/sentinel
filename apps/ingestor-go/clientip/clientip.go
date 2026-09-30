@@ -164,6 +164,22 @@ func (r *Resolver) Resolve(req *http.Request) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
+// RelayedClientIP is the caller address a relay-scoped key asserts: the rightmost X-Forwarded-For entry, which is
+// the one core's relay sets (sentinel-relay-key-trust K3). It is used only if it parses and is public; nothing
+// else is consulted, no network is trusted, and a request carrying DeriveIPHeader gets none (as in Resolve). The
+// caller must have authenticated a relay key: this function does not check.
+func RelayedClientIP(req *http.Request) (netip.Addr, bool) {
+	if len(req.Header.Values(DeriveIPHeader)) > 0 {
+		return netip.Addr{}, false
+	}
+	entries := strings.Split(strings.Join(req.Header.Values("X-Forwarded-For"), ","), ",")
+	hop, ok := parseHop(strings.Trim(entries[len(entries)-1], " \t"))
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return publicOnly(hop)
+}
+
 func (r *Resolver) isTrusted(a netip.Addr) bool { return containsAddr(r.trusted, a) }
 
 func containsAddr(prefixes []netip.Prefix, a netip.Addr) bool {
@@ -237,9 +253,8 @@ type Info struct {
 	ClientIP    netip.Addr
 	HasClientIP bool
 	UserAgent   string
-	// PeerTrusted is Resolver.PeerTrusted for this request. Enrichment does not read it; the Sentry-compatible
-	// routes read it to decide whether the relay's identity headers are believed (spec §3.7.2). On the compat
-	// resolver it is true only for SENTRY_COMPAT_TRUSTED_PROXY_CIDRS peers, never for TRUSTED_PROXY_CIDRS alone.
+	// PeerTrusted is Resolver.PeerTrusted for this request. Nothing reads it to grant relay identity any more: that
+	// is decided by the authenticated key's scope (sentinel-relay-key-trust §4.2). It stays as an observation.
 	PeerTrusted bool
 }
 

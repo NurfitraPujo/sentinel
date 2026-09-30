@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/auth"
 	"github.com/NurfitraPujo/sentinel/apps/ingestor-go/middleware"
 )
@@ -260,4 +263,48 @@ func TestIngestAuthUnchanged(t *testing.T) {
 	if calls != before {
 		t.Error("handler ran for a Sentry-presented key on /ingest")
 	}
+}
+
+// sentinel-relay-key-trust §4.1 / K2: a `relay` key is stored, works on the Sentry-compatible routes only, is
+// project-scoped only, and /ingest refuses it.
+func TestRelayKeyScope(t *testing.T) {
+	pid := "0192f3a4-5b6c-4d7e-8f90-a1b2c3d4e5f6"
+	pathID, err := auth.SentryProjectID(pid)
+	require.NoError(t, err)
+	a := auth.NewAPIKeyAuthenticatorWithLookup(scLookup(map[string]*auth.APIKeyData{
+		scHash("k-relay"):     {ProjectID: &pid, OrganizationID: "org", Scope: "relay", ProjectName: "proj"},
+		scHash("k-ingest"):    {ProjectID: &pid, OrganizationID: "org", Scope: "ingest", ProjectName: "proj"},
+		scHash("k-relay-org"): {OrganizationID: "org", Scope: "relay"},
+	}))
+
+	// /ingest and /ingest/batch keep {ingest, admin}: a relay key is 403 and the handler never runs.
+	assert.Equal(t, auth.ScopeSet{"ingest", "admin"}, auth.ScopesIngest)
+	calls := 0
+	h := a.Middleware(auth.ScopesIngest, okHandler(&calls))
+	r := httptest.NewRequest(http.MethodPost, "/ingest", nil)
+	r.Header.Set("X-API-Key", "k-relay")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Zero(t, calls)
+
+	// The compat routes accept it, with the D2 path check unchanged, and record the scope on the context.
+	var gotScope string
+	mux := scMountedAuth(t, a, func(ctx context.Context) { gotScope, _ = auth.ScopeFromContext(ctx) })
+	do := func(path, key string) int {
+		rr := httptest.NewRequest(http.MethodPost, path, nil)
+		rr.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+key)
+		ww := httptest.NewRecorder()
+		mux.ServeHTTP(ww, rr)
+		return ww.Code
+	}
+	for _, route := range []string{"envelope", "store"} {
+		gotScope = ""
+		assert.Equal(t, http.StatusNoContent, do("/api/"+pathID+"/"+route+"/", "k-relay"), route)
+		assert.Equal(t, "relay", gotScope, route)
+		assert.Equal(t, http.StatusForbidden, do("/api/1/"+route+"/", "k-relay"), route+": another project's id")
+		assert.Equal(t, http.StatusForbidden, do("/api/"+pathID+"/"+route+"/", "k-relay-org"), route+": an org-wide relay key")
+	}
+	assert.Equal(t, http.StatusNoContent, do("/api/"+pathID+"/envelope/", "k-ingest"))
+	assert.Equal(t, "ingest", gotScope, "an ingest key's scope is not relay")
 }

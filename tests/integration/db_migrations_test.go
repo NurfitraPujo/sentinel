@@ -460,7 +460,9 @@ func TestOncallWeekdayCheckReplayOverIsoRow(t *testing.T) {
 	require.Equal(t, 7, weekday(), "seed did not land as written")
 
 	// REPLAY. This is the statement that used to abort with "is violated by some row".
-	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "up", opts),
+	// Up to 1724200000, not the whole directory: goose down is one step, and the step below must be
+	// 1724200000's no matter which migrations are added after it.
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, 1724200000, opts),
 		"replaying the directory under a second ledger must not re-narrow the weekday CHECK onto a live ISO row")
 	assert.Equal(t, 7, weekday(), "the replay must leave the ISO row untouched")
 	assert.True(t, rejectsZero(), "after the replay the live CHECK must still be ISO 1-7, not the widened union")
@@ -472,7 +474,7 @@ func TestOncallWeekdayCheckReplayOverIsoRow(t *testing.T) {
 		"down over an ISO row must not violate the outgoing 1-7 CHECK")
 	assert.Equal(t, 0, weekday(), "down must re-encode ISO Sunday back to 0")
 
-	require.NoError(t, dbmigrations.RunMigrations(ctx, db, "up", opts),
+	require.NoError(t, dbmigrations.BaselineVersion(ctx, db, 1724200000, opts),
 		"up again must re-encode 0 back to ISO 7")
 	assert.Equal(t, 7, weekday())
 	assert.True(t, rejectsZero(), "the replayed up must reinstate the ISO 1-7 CHECK")

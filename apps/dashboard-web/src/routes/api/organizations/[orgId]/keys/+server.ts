@@ -5,7 +5,7 @@ import { getAgentById } from '$lib/db/queries/agents';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership, resolveProjectInOrg } from './_shared';
 
-const VALID_SCOPES = ['ingest', 'read', 'admin', 'agent'] as const;
+const VALID_SCOPES = ['ingest', 'read', 'admin', 'agent', 'relay'] as const;
 
 export const GET: RequestHandler = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -109,6 +109,13 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			}
 			projectId = resolved;
 		}
+	}
+
+	// sentinel-relay-key-trust §4.1/§4.3: a `relay` key can state a verified user, tenant and client IP to the
+	// ingestor, so it is project-scoped only. An org-wide request (no project named) is refused whatever the
+	// client sends; the ingestor refuses an org-wide key on its compat routes as well.
+	if (scope === 'relay' && projectId === null) {
+		throw error(400, 'A relay key must be scoped to a project');
 	}
 
 	// N9 (docs/plans/AGENT_WORKER_PLAN.md, C6/C13): optional key lifetime. Applies to every scope

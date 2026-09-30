@@ -46,6 +46,7 @@ const (
 	scReadKey  = "sent_live_" + "0000000000000000000000000000000000000000000000000000000000000004"
 	scAgentKey = "sent_agent_" + "000000000000000000000000000000000000000000000000000000000000005"
 	scRepKey   = "sent_live_" + "0000000000000000000000000000000000000000000000000000000000000006"
+	scRelayKey = "sent_live_" + "0000000000000000000000000000000000000000000000000000000000000007"
 	scPathID   = "27690631804612" // sentryProjectId(scProjectUUID)
 )
 
@@ -65,6 +66,7 @@ func scAuthenticator() *auth.APIKeyAuthenticator {
 		scSum(scReadKey):  proj("read"),
 		scSum(scAgentKey): proj("agent"),
 		scSum(scRepKey):   proj("report"),
+		scSum(scRelayKey): proj("relay"),
 		scSum(scOrgKey):   {OrganizationID: "org-1", Scope: "ingest", RateLimitRPM: 100000},
 	}))
 }

@@ -14,6 +14,7 @@ const (
 	ctxKeyAPIKeyHash
 	ctxKeyOrganizationID
 	ctxKeyOrgWide
+	ctxKeyScope
 )
 
 // WithIdentity stores the identity resolved from the presented API key.
@@ -73,4 +74,16 @@ func APIKeyHashFromContext(ctx context.Context) (string, bool) {
 func RateLimitRPMFromContext(ctx context.Context) (int, bool) {
 	v, ok := ctx.Value(ctxKeyRateLimitRPM).(int)
 	return v, ok
+}
+
+// WithScope records the authenticated key's scope. Only the Sentry-compatible chain sets it: the relay identity
+// headers are honoured if and only if it is ScopeRelay.
+func WithScope(ctx context.Context, scope string) context.Context {
+	return context.WithValue(ctx, ctxKeyScope, scope)
+}
+
+// ScopeFromContext returns the authenticated key's scope, and false when none was recorded.
+func ScopeFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(ctxKeyScope).(string)
+	return v, ok && v != ""
 }

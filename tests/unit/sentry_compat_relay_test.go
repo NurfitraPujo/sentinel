@@ -105,7 +105,19 @@ func scRelayEventBody(t *testing.T, mut func(m map[string]any)) []byte {
 	return scJSON(t, m)
 }
 
+// send presents the RELAY key (sentinel-relay-key-trust): the only credential that makes relay headers count.
 func (h *scRelayHarness) send(peer string, hdr map[string]string, body []byte) (*sentinelv1.ErrorEvent, *httptest.ResponseRecorder) {
+	h.t.Helper()
+	return h.sendKey(scRelayKey, peer, hdr, body)
+}
+
+// sendIngest presents an ordinary ingest key.
+func (h *scRelayHarness) sendIngest(peer string, hdr map[string]string, body []byte) (*sentinelv1.ErrorEvent, *httptest.ResponseRecorder) {
+	h.t.Helper()
+	return h.sendKey(scKey, peer, hdr, body)
+}
+
+func (h *scRelayHarness) sendKey(key, peer string, hdr map[string]string, body []byte) (*sentinelv1.ErrorEvent, *httptest.ResponseRecorder) {
 	h.t.Helper()
 	h.pub.published = nil
 	if body == nil {
@@ -114,7 +126,7 @@ func (h *scRelayHarness) send(peer string, hdr map[string]string, body []byte) (
 	r := httptest.NewRequest(http.MethodPost, "/api/"+scPathID+"/envelope/", bytes.NewReader(scEnvelope(map[string]any{}, scEvent(body))))
 	r.SetPathValue("project_id", scPathID)
 	r.RemoteAddr = peer
-	r.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+scKey)
+	r.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+key)
 	r.Header.Set("X-Forwarded-For", "203.0.113.9")
 	for k, v := range hdr {
 		r.Header.Set(k, v)
@@ -145,7 +157,7 @@ func scStable(e *sentinelv1.ErrorEvent) *sentinelv1.ErrorEvent {
 }
 
 // P7.1
-func TestRelayIdentityUserFromTrustedPeer(t *testing.T) {
+func TestRelayIdentityUserWithRelayKey(t *testing.T) {
 	h := scNewRelayHarness(t)
 	base, _ := h.send(scTrustedPeer, nil, nil)
 	got, _ := h.send(scTrustedPeer, scUserHdr, nil)
@@ -167,7 +179,7 @@ func TestRelayIdentityUserFromTrustedPeer(t *testing.T) {
 }
 
 // P7.2
-func TestRelayIdentityAnonymousFromTrustedPeer(t *testing.T) {
+func TestRelayIdentityAnonymousWithRelayKey(t *testing.T) {
 	h := scNewRelayHarness(t)
 	body := scRelayEventBody(t, func(m map[string]any) {
 		m["tags"].(map[string]any)["tenant_id"] = "app-tenant"
@@ -205,28 +217,34 @@ func TestRelayIdentityAnonymousFromTrustedPeer(t *testing.T) {
 	assert.Empty(t, a.AffectedTenantID)
 }
 
-// P7.3
-func TestRelayIdentityIgnoredFromUntrustedPeer(t *testing.T) {
+// P7.3 (sentinel-relay-key-trust §4.2): an ingest key's relay headers change nothing, from ANY peer, including one
+// inside the compat trusted list, and an address inside X-Forwarded-For does not change that.
+func TestRelayIdentityIgnoredWithIngestKey(t *testing.T) {
 	h := scNewRelayHarness(t)
-	without, _ := h.send(scUntrustedPeer, nil, nil)
-	with, _ := h.send(scUntrustedPeer, scUserHdr, nil)
-	assert.True(t, proto.Equal(scStable(without), scStable(with)), "an untrusted peer's relay headers change nothing")
-	assert.NotContains(t, with.Tags, "relay_auth")
-	assert.NotContains(t, with.Tags, "tenant_id")
-	assert.Equal(t, "user-00000001", with.User.Id)
-
-	// A trusted ADDRESS inside X-Forwarded-For does not make the request trusted.
+	for _, peer := range []string{scUntrustedPeer, scTrustedPeer} {
+		without, _ := h.sendIngest(peer, nil, nil)
+		with, _ := h.sendIngest(peer, scUserHdr, nil)
+		assert.True(t, proto.Equal(scStable(without), scStable(with)), peer+": an ingest key's relay headers change nothing")
+		assert.NotContains(t, with.Tags, "relay_auth", peer)
+		assert.NotContains(t, with.Tags, "tenant_id", peer)
+		assert.Equal(t, "user-00000001", with.User.Id, peer)
+	}
 	hdr := scRelayHdr("user", "X-Sentinel-Relay-User-Id", "core-user-42", "X-Sentinel-Relay-Tenant-Id", "company-7", "X-Forwarded-For", "10.20.3.4")
-	viaXFF, _ := h.send(scUntrustedPeer, hdr, nil)
+	viaXFF, _ := h.sendIngest(scUntrustedPeer, hdr, nil)
 	assert.NotContains(t, viaXFF.Tags, "relay_auth")
 	assert.Equal(t, "user-00000001", viaXFF.User.Id)
+
+	// The converse: the same headers from the same untrusted peer ARE honoured with a relay key.
+	viaKey, _ := h.send(scUntrustedPeer, scUserHdr, nil)
+	assert.Equal(t, "core-user-42", viaKey.User.Id)
+	assert.Equal(t, "user", viaKey.Tags["relay_auth"])
 }
 
 // P7.4
 func TestRelayIdentityInvalidAuthValue(t *testing.T) {
 	h := scNewRelayHarness(t)
 	ids := []string{"X-Sentinel-Relay-User-Id", "core-user-42", "X-Sentinel-Relay-Tenant-Id", "company-7"}
-	got, _ := h.send(scTrustedPeer, scRelayHdr("USER ", ids...), nil)
+	got, _ := h.send(scUntrustedPeer, scRelayHdr("USER ", ids...), nil)
 	assert.Equal(t, "user", got.Tags["relay_auth"], "trimmed and case-insensitive")
 	assert.Equal(t, "core-user-42", got.User.Id)
 	for _, v := range []string{"admin", ""} {
@@ -300,7 +318,7 @@ func TestRelayIdentityOnStore(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/api/"+scPathID+"/store/", bytes.NewReader(scRelayEventBody(t, nil)))
 	r.SetPathValue("project_id", scPathID)
 	r.RemoteAddr = scTrustedPeer
-	r.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+scKey)
+	r.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+scRelayKey)
 	r.Header.Set("X-Forwarded-For", "203.0.113.9")
 	for k, v := range scUserHdr {
 		r.Header.Set(k, v)
@@ -367,12 +385,14 @@ func TestRelayAuthTagFromBodyAlwaysRemoved(t *testing.T) {
 	}
 	for name, mut := range forms {
 		body := scRelayEventBody(t, mut)
-		got, _ := h.send(scUntrustedPeer, nil, body)
-		assert.NotContains(t, got.Tags, "relay_auth", name+": untrusted, no relay headers")
+		got, _ := h.sendIngest(scUntrustedPeer, nil, body)
+		assert.NotContains(t, got.Tags, "relay_auth", name+": ingest key, no relay headers")
+		got, _ = h.sendIngest(scTrustedPeer, scRelayHdr("anonymous"), body)
+		assert.NotContains(t, got.Tags, "relay_auth", name+": ingest key ignores the header, body tag dropped")
 		got, _ = h.send(scTrustedPeer, nil, body)
-		assert.NotContains(t, got.Tags, "relay_auth", name+": trusted, Auth absent")
+		assert.NotContains(t, got.Tags, "relay_auth", name+": relay key, Auth absent")
 		got, _ = h.send(scTrustedPeer, scRelayHdr("admin"), body)
-		assert.NotContains(t, got.Tags, "relay_auth", name+": trusted, Auth invalid")
+		assert.NotContains(t, got.Tags, "relay_auth", name+": relay key, Auth invalid")
 		got, _ = h.send(scTrustedPeer, scRelayHdr("anonymous"), body)
 		assert.Equal(t, "anonymous", got.Tags["relay_auth"], name+": the header's value, not the body's")
 	}
@@ -387,32 +407,33 @@ func scTagPairs(m map[string]any) []any {
 }
 
 // P7.10 (D14, D1)
-func TestRelayUntrustedPeerKeepsBodyIdentity(t *testing.T) {
+func TestRelayIngestKeyKeepsBodyIdentity(t *testing.T) {
 	h := scNewRelayHarness(t)
 	body := scRelayEventBody(t, func(m map[string]any) {
 		m["tags"].(map[string]any)["tenant_id"] = "app-tenant"
 		m["tags"].(map[string]any)["relay_auth"] = "user"
 		m["extra"] = map[string]any{"user_id": "body-extra-user"}
 	})
-	got, _ := h.send(scUntrustedPeer, scUserHdr, body)
+	got, _ := h.sendIngest(scTrustedPeer, scUserHdr, body)
 	assert.Equal(t, "user-00000001", got.User.Id)
 	assert.Equal(t, "app-tenant", got.Tags["tenant_id"])
 	assert.Equal(t, "body-extra-user", got.Metadata.AsMap()["user_id"])
 	assert.NotContains(t, got.Tags, "relay_auth")
 }
 
-// P7.11
-func TestRelayUntrustedPeerLogged(t *testing.T) {
+// P7.11: the ignored-headers line for a non-relay key.
+func TestRelayHeadersIgnoredLogged(t *testing.T) {
 	h := scNewRelayHarness(t)
-	forbidden := []string{"user", "core-user-42", "company-7", "203.0.113.9", scKey}
-	h.send(scUntrustedPeer, scUserHdr, nil)
-	recs := h.logs.byEvent("sentrycompat.relay_peer_untrusted")
+	forbidden := []string{"user", "core-user-42", "company-7", "203.0.113.9", "198.51.100.20", scKey, scRelayKey}
+	h.sendIngest(scUntrustedPeer, scUserHdr, nil)
+	recs := h.logs.byEvent("sentrycompat.relay_headers_ignored")
 	require.Len(t, recs, 1)
 	assert.Equal(t, slog.LevelInfo, recs[0].Level)
 	seen := map[string]string{}
 	recs[0].Attrs(func(a slog.Attr) bool { seen[a.Key] = a.Value.String(); return true })
-	assert.Equal(t, "198.51.100.20", seen["peer"])
-	assert.Len(t, seen, 2, "the event name and the peer, nothing else")
+	assert.Equal(t, "not_relay_key", seen["reason"])
+	assert.Equal(t, "ingest", seen["scope"])
+	assert.Len(t, seen, 3, "the event name, the reason and the key's scope, nothing else")
 	for k, v := range seen {
 		for _, f := range forbidden {
 			assert.NotEqual(t, f, v, "attribute %s carries a header value", k)
@@ -420,39 +441,86 @@ func TestRelayUntrustedPeerLogged(t *testing.T) {
 		}
 	}
 	assert.False(t, strings.Contains(recs[0].Message, "core-user-42") || strings.Contains(recs[0].Message, "203.0.113.9"))
+	assert.Empty(t, h.logs.byEvent("sentrycompat.relay_peer_untrusted"), "the network-based line is gone")
 
-	before := len(h.logs.byEvent("sentrycompat.relay_peer_untrusted"))
-	h.send(scUntrustedPeer, nil, nil) // no X-Sentinel-Relay-Auth: no record
-	h.send(scTrustedPeer, scUserHdr, nil)
-	assert.Len(t, h.logs.byEvent("sentrycompat.relay_peer_untrusted"), before, "not for a request without the header, not for a trusted peer")
+	before := len(h.logs.byEvent("sentrycompat.relay_headers_ignored"))
+	h.sendIngest(scUntrustedPeer, nil, nil) // no relay headers: no record
+	h.send(scTrustedPeer, scUserHdr, nil)   // a relay key: honoured, no record
+	assert.Len(t, h.logs.byEvent("sentrycompat.relay_headers_ignored"), before, "not for a request without the headers, not for a relay key")
+
+	// Contract 4.2: once per request that carries ANY relay header. Each header alone, with an ingest key, logs once.
+	for _, name := range []string{"X-Sentinel-Relay-User-Id", "X-Sentinel-Relay-Tenant-Id", "X-Sentinel-Relay-Auth"} {
+		h := scNewRelayHarness(t)
+		h.sendIngest(scUntrustedPeer, map[string]string{name: "x"}, nil)
+		assert.Len(t, h.logs.byEvent("sentrycompat.relay_headers_ignored"), 1, "only %s was sent", name)
+	}
 }
 
-// finding rev1-relay-trust-global-list-undocumented (D12): a peer inside TRUSTED_PROXY_CIDRS ONLY has its
-// X-Forwarded-For believed on the compat routes and its X-Sentinel-Relay-* headers ignored.
+// finding rev1-relay-trust-global-list-undocumented (D12), restated: a peer inside TRUSTED_PROXY_CIDRS ONLY has its
+// X-Forwarded-For believed on the compat routes for a non-relay key, and no network membership grants relay identity.
 func TestRelayIdentityIgnoredFromGlobalListPeer(t *testing.T) {
 	const globalPeer = "10.30.3.4:5555"
 	h := scNewRelayHarnessLists(t, "10.30.0.0/16", "10.20.0.0/16")
-	base, _ := h.send(globalPeer, nil, nil)
-	got, _ := h.send(globalPeer, scUserHdr, nil)
-	assert.Equal(t, "203.0.113.9", got.User.IpAddress, "the global list still makes X-Forwarded-For believed")
+	base, _ := h.sendIngest(globalPeer, nil, nil)
+	got, _ := h.sendIngest(globalPeer, scUserHdr, nil)
+	assert.Equal(t, "203.0.113.9", got.User.IpAddress, "the global list still makes X-Forwarded-For believed for an ingest key")
 	assert.Equal(t, base.User.Id, got.User.Id, "the relay's user id is not applied")
 	assert.NotContains(t, got.Tags, "relay_auth")
 	assert.NotContains(t, got.Tags, "tenant_id")
 	assert.True(t, proto.Equal(scStable(base), scStable(got)), "headers from a global-list peer change nothing")
 
-	anon, _ := h.send(globalPeer, scRelayHdr("anonymous"), nil)
+	anon, _ := h.sendIngest(globalPeer, scRelayHdr("anonymous"), nil)
 	assert.Equal(t, base.User.Id, anon.User.Id, "anonymous stripping is not applied either")
 	assert.NotContains(t, anon.Tags, "relay_auth")
 
-	// The compat-list peer, on the very same chain, is believed.
-	trusted, _ := h.send(scTrustedPeer, scUserHdr, nil)
-	assert.Equal(t, "core-user-42", trusted.User.Id)
-	assert.Equal(t, "user", trusted.Tags["relay_auth"])
+	// A compat-list peer with an INGEST key is not believed either: the network no longer grants identity.
+	inList, _ := h.sendIngest(scTrustedPeer, scUserHdr, nil)
+	assert.Equal(t, base.User.Id, inList.User.Id)
+	assert.NotContains(t, inList.Tags, "relay_auth")
 
-	// A peer in both lists is believed too: the compat list is what counts.
-	both := scNewRelayHarnessLists(t, "10.20.0.0/16", "10.20.0.0/16")
-	got, _ = both.send(scTrustedPeer, scUserHdr, nil)
-	assert.Equal(t, "core-user-42", got.User.Id)
+	// A relay key is believed from a peer in NO list, with no list configured at all.
+	empty := scNewRelayHarnessLists(t, "", "")
+	relayed, _ := empty.send(scUntrustedPeer, scUserHdr, nil)
+	assert.Equal(t, "core-user-42", relayed.User.Id)
+	assert.Equal(t, "user", relayed.Tags["relay_auth"])
+}
+
+// sentinel-relay-key-trust K3: for a relay key the client IP is the rightmost X-Forwarded-For entry when it is public,
+// and none otherwise; for any other key the union resolver decides, unchanged.
+func TestRelayClientIPIsRightmostPublicXFF(t *testing.T) {
+	h := scNewRelayHarnessLists(t, "", "")
+	xff := func(v string) map[string]string { return map[string]string{"X-Forwarded-For": v} }
+
+	got, _ := h.send(scUntrustedPeer, xff("198.51.100.77, 203.0.113.9"), nil)
+	assert.Equal(t, "203.0.113.9", got.User.IpAddress, "the rightmost entry, not the leftmost (the phone's own claim)")
+
+	// A relay key from a private peer (core's node) still gets the phone's address, with an empty trusted list.
+	got, _ = h.send("10.200.32.66:4000", xff("203.0.113.9"), nil)
+	assert.Equal(t, "203.0.113.9", got.User.IpAddress)
+
+	// Rightmost private, or unparseable, or absent: no client IP, even though a public entry sits to its left.
+	for _, v := range []string{"203.0.113.9, 10.1.2.3", "203.0.113.9, not-an-ip", "203.0.113.9, ", "127.0.0.1"} {
+		got, _ = h.send(scUntrustedPeer, xff(v), nil)
+		assert.Empty(t, got.User.IpAddress, v)
+	}
+	// Multiple header lines: the last line's last entry is the rightmost.
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	r.Header.Add("X-Forwarded-For", "198.51.100.1")
+	r.Header.Add("X-Forwarded-For", "203.0.113.9")
+	ip, ok := clientip.RelayedClientIP(r)
+	require.True(t, ok)
+	assert.Equal(t, "203.0.113.9", ip.String())
+
+	// The X-Sentinel-Derive-IP opt-out (as in Resolve): a request carrying it gets no client IP, whatever its XFF.
+	optOut := httptest.NewRequest(http.MethodPost, "/", nil)
+	optOut.Header.Set("X-Forwarded-For", "203.0.113.9")
+	optOut.Header.Set(clientip.DeriveIPHeader, "0")
+	_, ok = clientip.RelayedClientIP(optOut)
+	assert.False(t, ok, "the derive-IP opt-out wins over a public rightmost entry")
+
+	// An ingest key from a peer inside neither list: the peer itself (198.51.100.20), XFF not read.
+	got, _ = h.sendIngest(scUntrustedPeer, xff("203.0.113.9"), nil)
+	assert.Equal(t, "198.51.100.20", got.User.IpAddress, "a non-relay key keeps the union resolver: XFF is not believed from an untrusted peer")
 }
 
 // Same at the resolver: PeerTrusted on the compat resolver follows the compat list alone, the walk the union.

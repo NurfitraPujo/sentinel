@@ -12,8 +12,13 @@ var (
 	ErrSentryAuthMalformed = errors.New("Invalid X-Sentry-Auth header")
 )
 
-// ScopesSentryCompat guards the Sentry-compatible routes: project-scoped ingest keys only (contract D1).
-var ScopesSentryCompat = ScopeSet{"ingest"}
+// ScopeRelay is the key scope only core's mobile relay holds. It is the sole credential that makes the ingestor
+// believe the relay identity headers and a relayed client IP (sentinel-relay-key-trust §4.1, K1).
+const ScopeRelay = "relay"
+
+// ScopesSentryCompat guards the Sentry-compatible routes: project-scoped ingest and relay keys only (contract D1;
+// sentinel-relay-key-trust K2). ScopesIngest deliberately does not list relay, so /ingest refuses a relay key.
+var ScopesSentryCompat = ScopeSet{"ingest", ScopeRelay}
 
 // SentryKey returns the API key a Sentry-compatible request presents. The FIRST source that is present is the ONLY
 // source consulted; a present-but-unusable source is an error, never a fall-through.
@@ -123,6 +128,7 @@ func (a *APIKeyAuthenticator) SentryMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := WithIdentity(r.Context(), data.ProjectName, *data.ProjectID, data.OrganizationID, hash, data.RateLimitRPM, false)
+		ctx = WithScope(ctx, data.Scope)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

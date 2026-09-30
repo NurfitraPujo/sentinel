@@ -1030,40 +1030,28 @@ The ingestor serves `POST /api/{project_id}/envelope/` and `/store/` for core's 
 
 ### Sentry-compatible ingest: trusting core's relay (sentinel-sentry-compat-ingest)
 
-`config.ingestor.sentryCompatTrustedProxyCidrs` (env `SENTRY_COMPAT_TRUSTED_PROXY_CIDRS`) ships **empty** in `values.yaml` and in
-every overlay: with it empty every relay header is ignored, whatever `config.ingestor.trustedProxyCidrs` holds, and the compat routes' `X-Forwarded-For` handling is exactly `/ingest`'s. This list **alone** grants relay identity; `trustedProxyCidrs` never does (it only widens the `X-Forwarded-For` walk on these routes). Setting
-it belongs to `core-sentinel-mobile-relay`'s rollout, by the steps below. This entry names no value.
+Since sentinel-relay-key-trust, core's mobile relay is trusted by **key**, not by network. A project API key with scope **`relay`** is the only thing that makes the
+compat routes honour the `X-Sentinel-Relay-*` identity headers and a relayed client IP, from any peer, on any network.
+`config.ingestor.sentryCompatTrustedProxyCidrs` (env `SENTRY_COMPAT_TRUSTED_PROXY_CIDRS`) ships **empty** in `values.yaml` and in every
+overlay, **stays empty**, and no longer affects relay identity; it only widens the `X-Forwarded-For` walk for callers that are not a relay
+(as `trustedProxyCidrs` does), and this entry names no value. Give it the narrowest CIDR that covers a trusted proxy, if you ever set it.
 
-**Order of the rollout:** `core-sentinel-mobile-relay` sets this list (step 4) and passes the check (step 5) **before** it enables
-core's anonymous relay route. While the list is empty every relayed request is untrusted, so D14's anonymous stripping does not
-apply yet.
+**Order of the rollout:** the `relay` key is created or converted, and core presents it (step 2), **before** core enables its anonymous
+relay route. Until then D14's anonymous stripping does not apply, because the relay's headers are ignored.
 
-1. **What the value is.** The CIDR of the **immediate peer** the ingestor pod sees on the relay's connections: the address in the
-   connection's `RemoteAddr`, never an address inside `X-Forwarded-For`. That one address decides whether `X-Forwarded-For` is read
-   (here or in `trustedProxyCidrs`) and, when it is inside **this list**, whether the `X-Sentinel-Relay-*` identity headers are honoured, so **every host inside the CIDR can assert any app
-   user and tenant**. Use the narrowest CIDR that covers the relay's peer addresses (a single-address prefix per address where
-   the addresses are stable), never a VPC, a subnet "to be safe", or the ingestor's own range.
-2. **How to observe it.** With the list still empty, send one relayed event. Every compat request that carries
-   `X-Sentinel-Relay-Auth` from an untrusted peer is logged by the ingestor at Info as
-   `event=sentrycompat.relay_peer_untrusted peer=<ip>` (the peer address only, never a header value). The `peer` values seen for
-   the relay's traffic are the candidates.
-3. **Which topology produced it**, and what that means:
-   - **Direct to the ingestor's Service** (core's consumer in the same cluster calls the chart's `<fullname>-ingestor` ClusterIP
-     Service, `templates/ingestor.yaml`): the peer is the consumer **pod's** address. Pod addresses move on every reschedule, so
-     the narrowest stable value is the range core's consumer pods are scheduled from (its node group's pod range); prefer a
-     dedicated one. This is the topology to choose: only core's pods are trusted.
-   - **Through an internal load balancer** (for example `api-sentinel.staging.tuju.ai`): the peer is the load balancer's private
-     address, and **every caller of that load balancer becomes a trusted relay**: it can set `X-Sentinel-Relay-*` and
-     `X-Forwarded-For` at will. Do not trust a shared load balancer; route the consumer to the Service directly instead. If there
-     is no alternative, the load balancer must append the caller's address to `X-Forwarded-For`, core's range must be listed as
-     well (the walk skips only trusted hops), and the operator records that every caller of that load balancer is trusted.
-   - **Across clusters or VPCs through NAT**: the peer is the NAT gateway's egress address; list exactly those addresses, and note
-     that everything else egressing through the same NAT is trusted too.
-4. **Set it** in that environment's overlay (`values.aws.staging.yml`, `values.aws.production.yml`), which already carries an
-   explicit empty `sentryCompatTrustedProxyCidrs: []` to edit, in the same change as the relay's rollout, and roll the ingestor.
+1. **Create the key.** In the dashboard, on the **project** keys page, create a key with scope **Relay** (never offered for org-wide
+   keys; the API refuses it). Keep it in core's secrets: a holder can state any verified user, tenant and client IP. A relay key is
+   refused on `/ingest` and `/ingest/batch` with `403`. To convert an existing project `ingest` key in place, run one recorded
+   `UPDATE project_api_keys SET scope='relay' WHERE id IN (...)`, then invalidate the cache (NATS `api_key.invalidated`, or wait out the
+   60 s TTL); nothing is resealed.
+2. **Core presents it** as `X-Sentry-Auth`, as it does today; only the key's scope changes.
+3. **How to observe it.** A compat request that carries any `X-Sentinel-Relay-*` header with a key that is **not** a `relay` key is
+   logged by the ingestor at Info as `event=sentrycompat.relay_headers_ignored reason=not_relay_key scope=<scope>` (the key's scope
+   only, never a header value, a forwarded address or a key). Seeing it for core's traffic means core is still using an `ingest` key.
+4. **Client IP.** For a `relay` key the phone's address is the rightmost `X-Forwarded-For` entry, when it is public; otherwise none is
+   recorded. A request that carries `X-Sentinel-Derive-IP` (any value, the SDK's privacy opt-out) gets no client IP, relay or not. For any other key the union resolver applies as before.
 5. **Check it** (two-sided): one relayed event whose occurrence has `event_user.ip_address` equal to the test phone's public
-   address (not empty, not core's) and `tags.relay_auth` set; and one request to the same route from another in-network host
-   carrying `X-Sentinel-Relay-Auth: user` whose occurrence has **no** `relay_auth` tag.
+   address (not empty, not core's) and `tags.relay_auth` set; and the same headers sent straight to the ingestor with an `ingest`
+   key, whose occurrence has **no** `relay_auth` tag.
 
-A wrong value fails one of two ways: too narrow drops the phone's address and the relay's identity (the fail-closed state this
-change ships); too wide lets another in-network caller forge both.
+A leaked `relay` key lets its holder forge attribution: revoke it in the dashboard (instant via `api_key.invalidated`) and issue another.

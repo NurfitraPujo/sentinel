@@ -157,6 +157,46 @@ describe('organization API key routes', () => {
 			);
 		});
 
+		// sentinel-relay-key-trust §4.3
+		it('400s for a relay key without a project (org-wide), even if the client sends the sentinel', async () => {
+			for (const extra of [{}, { targetProject: 'All Projects [Org-Wide]' }]) {
+				dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+				const request = new Request('http://x', { method: 'POST', body: JSON.stringify({ name: 'k', scope: 'relay', ...extra }) });
+				await expect(
+					POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+				).rejects.toMatchObject({ status: 400 });
+			}
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
+		it('201s for a project-scoped relay key', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([{ id: 'proj-1' }]));
+			apikeyQueries.createApiKey.mockResolvedValueOnce({ apiKey: { id: 'key-new' }, secretToken: 'sent_live_relay' });
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'core relay', scope: 'relay', projectId: 'proj-1' }),
+			});
+			const res = await POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any);
+			expect(res.status).toBe(201);
+			expect(apikeyQueries.createApiKey).toHaveBeenCalledWith(
+				'user-1',
+				expect.objectContaining({ scope: 'relay', projectId: 'proj-1' })
+			);
+		});
+
+		it.each(['support', 'viewer'])('403s for an org %s minting a relay key, and never creates it', async (role) => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow(role)]));
+			const request = new Request('http://x', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'core relay', scope: 'relay', projectId: 'proj-1' }),
+			});
+			await expect(
+				POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 403 });
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
+
 		it('403s for org support (read-only, cannot manage keys)', async () => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('support')]));
 			const request = new Request('http://x', { method: 'POST', body: JSON.stringify({ name: 'k' }) });

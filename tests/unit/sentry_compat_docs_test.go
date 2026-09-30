@@ -59,7 +59,7 @@ func TestSentryCompatDocumented(t *testing.T) {
 
 	rb := scRead(t, "deploy", "helm", "sentinel", "RUNBOOK.md")
 	for _, want := range []string{
-		"sentinel_compat_items_total", "ingest.event_shed", "sentryCompatTrustedProxyCidrs", "sentrycompat.relay_peer_untrusted", "narrowest",
+		"sentinel_compat_items_total", "ingest.event_shed", "sentryCompatTrustedProxyCidrs", "sentrycompat.relay_headers_ignored", "narrowest",
 	} {
 		assert.Containsf(t, rb, want, "RUNBOOK.md must mention %q", want)
 	}
@@ -97,7 +97,7 @@ func TestSentryCompatNamesPinned(t *testing.T) {
 	assert.Equal(t, "project_id", sentrycompat.PathValueProjectID)
 	assert.Equal(t, "60::organization", middleware.SentryRateLimitsValue)
 	assert.Equal(t, 60, middleware.RetryAfterSeconds)
-	assert.Equal(t, auth.ScopeSet{"ingest"}, auth.ScopesSentryCompat)
+	assert.Equal(t, auth.ScopeSet{"ingest", "relay"}, auth.ScopesSentryCompat)
 	assert.Equal(t, "X-Sentinel-Relay-Auth", sentrycompat.HeaderRelayAuth)
 	assert.Equal(t, "X-Sentinel-Relay-User-Id", sentrycompat.HeaderRelayUserID)
 	assert.Equal(t, "X-Sentinel-Relay-Tenant-Id", sentrycompat.HeaderRelayTenantID)
