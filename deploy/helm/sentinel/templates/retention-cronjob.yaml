@@ -36,6 +36,15 @@ spec:
           serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
           securityContext:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.affinity }}
+          affinity: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
             - name: retention-cron
               image: "{{ .Values.retentionCron.image.repository }}:{{ .Values.retentionCron.image.tag }}"

@@ -102,6 +102,42 @@ stream_exists() {
   nats stream info "$1" --server "$NATS_URL" -j >/dev/null 2>&1
 }
 
+# consumer_exists STREAM CONSUMER - true (exit 0) if the consumer is already
+# present on the stream. Mirrors stream_exists above: `nats consumer add`
+# against an existing consumer exits non-zero, which under `set -e` fails the
+# whole init Job on every re-run after the first (the AWS NATS cutover owns
+# the streams/consumers out-of-band, so re-runs are the normal case, not the
+# exception).
+consumer_exists() {
+  nats consumer info "$1" "$2" --server "$NATS_URL" -j >/dev/null 2>&1
+}
+
+# create_consumer_if_missing STREAM CONSUMER - `nats consumer add` with the
+# chart's standard pull/explicit-ack shape, skipped when the consumer exists.
+#
+# Contract (deliberately asymmetric with streams): streams CONVERGE in place
+# via `nats stream edit`, but consumers are create-if-missing ONLY — an
+# existing consumer keeps its current config and is never edited. If the
+# desired consumer shape ever changes (deliver policy, ack, filter), apply it
+# manually with `nats consumer edit`, or delete the consumer and re-run this
+# script. (Underscore-prefixed vars: `local` is not POSIX — nats-box /bin/sh
+# is busybox ash — so functions namespace their vars with a leading `_`.)
+create_consumer_if_missing() {
+  _stream="$1"
+  _consumer="$2"
+  if consumer_exists "$_stream" "$_consumer"; then
+    echo "Consumer $_consumer on stream $_stream exists - skipping..."
+  else
+    echo "Creating consumer $_consumer..."
+    nats consumer add "$_stream" "$_consumer" \
+      --server "$NATS_URL" \
+      --pull \
+      --deliver=all \
+      --ack=explicit \
+      --defaults
+  fi
+}
+
 # create_or_update_stream NAME SUBJECT DISCARD MAX_AGE MAX_BYTES
 #
 # `nats stream add` against a stream that ALREADY EXISTS with a different config does not update it - it
@@ -115,66 +151,48 @@ stream_exists() {
 # when the requested config already matches - so this function, and the whole script, is safe to run on
 # every `compose up`.
 create_or_update_stream() {
-  name="$1"
-  subject="$2"
-  discard="$3"
-  max_age="$4"
-  max_bytes="$5"
+  _name="$1"
+  _subject="$2"
+  _discard="$3"
+  _max_age="$4"
+  _max_bytes="$5"
 
-  if stream_exists "$name"; then
-    echo "Stream $name exists - applying limits (discard=$discard max-age=$max_age max-bytes=$max_bytes)..."
-    nats stream edit "$name" \
+  if stream_exists "$_name"; then
+    echo "Stream $_name exists - applying limits (discard=$_discard max-age=$_max_age max-bytes=$_max_bytes)..."
+    nats stream edit "$_name" \
       --server "$NATS_URL" \
-      --discard="$discard" \
-      --max-age="$max_age" \
-      --max-bytes="$max_bytes" \
+      --discard="$_discard" \
+      --max-age="$_max_age" \
+      --max-bytes="$_max_bytes" \
       -f
   else
-    echo "Creating stream $name..."
-    nats stream add "$name" \
+    echo "Creating stream $_name..."
+    nats stream add "$_name" \
       --server "$NATS_URL" \
-      --subjects="$subject" \
+      --subjects="$_subject" \
       --retention=limits \
       --max-msgs=-1 \
-      --max-bytes="$max_bytes" \
-      --max-age="$max_age" \
+      --max-bytes="$_max_bytes" \
+      --max-age="$_max_age" \
       --storage=file \
       --replicas=1 \
-      --discard="$discard" \
+      --discard="$_discard" \
       --defaults
   fi
 }
 
 create_or_update_stream "$STREAM_NAME" "$SUBJECT" "$STREAM_DISCARD" "$STREAM_MAX_AGE" "$STREAM_MAX_BYTES"
 
-echo "Creating consumer $CONSUMER_NAME..."
-nats consumer add "$STREAM_NAME" "$CONSUMER_NAME" \
-  --server "$NATS_URL" \
-  --pull \
-  --deliver=all \
-  --ack=explicit \
-  --defaults
+create_consumer_if_missing "$STREAM_NAME" "$CONSUMER_NAME"
 
 create_or_update_stream "$DLQ_STREAM_NAME" "$DLQ_SUBJECT" "$DLQ_DISCARD" "$DLQ_MAX_AGE" "$DLQ_MAX_BYTES"
 
 create_or_update_stream "$API_KEYS_STREAM_NAME" "$API_KEYS_SUBJECT" "new" "0s" "$CONTROL_PLANE_MAX_BYTES"
 
-echo "Creating consumer $API_KEYS_CONSUMER_NAME..."
-nats consumer add "$API_KEYS_STREAM_NAME" "$API_KEYS_CONSUMER_NAME" \
-  --server "$NATS_URL" \
-  --pull \
-  --deliver=all \
-  --ack=explicit \
-  --defaults
+create_consumer_if_missing "$API_KEYS_STREAM_NAME" "$API_KEYS_CONSUMER_NAME"
 
 create_or_update_stream "$ALERT_CONFIG_STREAM_NAME" "$ALERT_CONFIG_SUBJECT" "new" "0s" "$CONTROL_PLANE_MAX_BYTES"
 
-echo "Creating consumer $ALERT_CONFIG_CONSUMER_NAME..."
-nats consumer add "$ALERT_CONFIG_STREAM_NAME" "$ALERT_CONFIG_CONSUMER_NAME" \
-  --server "$NATS_URL" \
-  --pull \
-  --deliver=all \
-  --ack=explicit \
-  --defaults
+create_consumer_if_missing "$ALERT_CONFIG_STREAM_NAME" "$ALERT_CONFIG_CONSUMER_NAME"
 
 echo "NATS JetStream initialization complete."

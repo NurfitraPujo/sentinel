@@ -30,11 +30,14 @@
 #
 # What is deliberately still off, and why:
 #   init.nats.enabled=false — the streams and consumers already exist from the
-#     NATS cutover, and scripts/nats-init.sh is NOT idempotent for consumers:
-#     it calls `nats consumer add` with no existence guard under `set -e`, so an
-#     existing `processor-consumer` makes the Job exit non-zero. It is a wave-1
-#     `Sync` hook, so that failure would block the whole deploy. Verified live:
-#     `nats consumer ls ERROR_EVENTS` -> processor-consumer (2026-09-21).
+#     NATS cutover, so there is nothing for the init Job to do. scripts/
+#     nats-init.sh IS idempotent since 2026-10-01 (consumer_exists() +
+#     create_consumer_if_missing() guard all three `nats consumer add` calls,
+#     mirroring the stream_exists() guard), so re-enabling it is safe — it just
+#     converges streams in place and skips existing consumers. Left off because
+#     a no-op wave-1 `Sync` hook still costs a Job run on every sync for zero
+#     effect. Verified live: `nats consumer ls ERROR_EVENTS` ->
+#     processor-consumer (2026-09-21).
 #   dlqDrainer.enabled=false — its jobTemplate hardcodes replicas: 1 and its
 #     cursor lives on a PVC; enabling it needs a StorageClass decision first.
 #   autoscaling.enabled=false / podDisruptionBudget.enabled=false — one replica
@@ -102,8 +105,13 @@ images:
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# EKSNodeGroupType selects the x86-64 spot pool (verified live on both
+# clusters); kubernetes.io/arch+os are kubelet-guaranteed belt-and-braces so a
+# drifted custom label can never reschedule amd64-only images onto Graviton.
 nodeSelector:
   EKSNodeGroupType: medium-size-x86-64-spot
+  kubernetes.io/arch: amd64
+  kubernetes.io/os: linux
 affinity: {}
 tolerations: []
 
@@ -224,8 +232,9 @@ dependencies:
     enabled: false
 
 # init.nats stays OFF even though we are live: the §5 NATS cutover already
-# restored the streams AND their consumers, and scripts/nats-init.sh would fail
-# on `nats consumer add` for the existing processor-consumer. See the header.
+# restored the streams AND their consumers. scripts/nats-init.sh has been
+# idempotent since 2026-10-01 (consumer_exists guard), so enabling it would be
+# safe but pointless — see the header.
 init:
   nats:
     enabled: false

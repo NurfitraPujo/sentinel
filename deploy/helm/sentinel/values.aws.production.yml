@@ -24,11 +24,11 @@
 #   replicaCount=0. Re-enable at cutover.
 #
 # Pre-flight before first sync:
-#   1. Create the 5 sentinel-* ECR repos (infra terraform/live/shared/ecr).
+#   1. Create the 6 sentinel-* ECR repos (infra terraform/live/shared/ecr).
 #   2. Seed /tuju/production/sentinel/shared/* (done 2026-09-26, 10/10).
-#   3. Push sentinel images to ECR and pin the tags below (none exist yet;
-#      replicas 0 means nothing pulls, but a scale-up before the push would
-#      ImagePullBackOff).
+#   3. Push sentinel images to ECR and pin the tags below (done — v0.2.43
+#      verified in all six repos; replicas 0 means nothing pulls, but an
+#      unpinned tag would ImagePullBackOff on scale-up).
 #   4. Start the production cache (tuju-cache-production is stopped; Redis auth
 #      must answer PONG before scale-up).
 
@@ -61,31 +61,41 @@ externalSecrets:
 
 # -----------------------------------------------------------------------------
 # First-party images (ECR, tuju prod account 576329195570, ap-southeast-1).
-# tags are pinned by CI at deploy time; empty => Chart.AppVersion. Nothing is
-# pulled while replicas are 0, so an absent tag is inert until cutover.
+# Tags are pinned declaratively (not only via CI `argocd app set` parameters)
+# so a fresh sync or an Application recreate can never fall back to
+# Chart.AppVersion (0.1.0, in no registry) and wedge the app in
+# ImagePullBackOff. Pinned to v0.2.43 — the newest production tag verified
+# present in all six ECR repos and already carried as the live ArgoCD
+# parameters, so this pin introduces zero diff. Nothing is pulled while
+# replicas are 0, so the pin is inert until cutover.
 # -----------------------------------------------------------------------------
 images:
   ingestor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-ingestor
-    tag: ""
+    tag: "v0.2.43"
   processor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-processor
-    tag: ""
+    tag: "v0.2.43"
   dashboard:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dashboard
-    tag: ""
+    tag: "v0.2.43"
   migrate:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-db-migrate
-    tag: ""
+    tag: "v0.2.43"
   dlqDrainer:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dlq-drainer
-    tag: ""
+    tag: "v0.2.43"
 
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# EKSNodeGroupType selects the x86-64 spot pool (verified live on both
+# clusters); kubernetes.io/arch+os are kubelet-guaranteed belt-and-braces so a
+# drifted custom label can never reschedule amd64-only images onto Graviton.
 nodeSelector:
   EKSNodeGroupType: medium-size-x86-64-spot
+  kubernetes.io/arch: amd64
+  kubernetes.io/os: linux
 affinity: {}
 tolerations: []
 
@@ -203,12 +213,19 @@ dependencies:
     enabled: false
 
 # Dormant: the §5 NATS cutover owns JetStream stream creation. Enable at cutover.
+# Tag pinned to v0.2.43 (verified in ECR, matches live ArgoCD parameters) for
+# the same ImagePullBackOff reason as images.* above.
 init:
   nats:
     enabled: false
     image: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
-    tag: ""
+    tag: "v0.2.43"
   minio:
+    # AWS: object storage is external (Huawei OBS during the migration window,
+    # S3 after) — minio-init must NEVER be enabled here. It has no ECR image
+    # override, so enabling it would render ghcr.io/nurfitrapujo/sentinel/
+    # minio-init:0.1.0 (a registry with no imagePullSecrets on EKS, a tag that
+    # exists nowhere, and a likely amd64-only image).
     enabled: false
 
 # Legacy combined ingress renders nothing on AWS.
