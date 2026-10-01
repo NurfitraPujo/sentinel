@@ -317,6 +317,37 @@ and every derived value is bounded exactly as a sent one (enrichment runs before
   - `X-Project-Key: <project_name>` — optional; for organization-wide keys, selects the target project. **Takes precedence over the body's `project_key`**, so the server resolves tenancy without reading the body.
 - **Expected Status**: `HTTP 202 Accepted` (`{"status": "accepted", "event_id": "<effective event id>", "timestamp": "<effective timestamp, RFC 3339 with nanoseconds, UTC>"}`) — both keys are the values the server **used**, which differ from what was sent when the server generated the `event_id` or replaced the `timestamp` (§3).
 
+### Trace propagation (the JS SDK, from 0.3.0)
+
+`trace_id` / `span_id` / `trace_flags` (§3) can come from a W3C `traceparent` the caller passes in a capture
+context. The browser entry (`@sentinel/sdk-js/browser`, and the Next.js client) also **starts a trace itself**:
+
+- **Page trace.** One trace id (32 hex) and one page span id (16 hex) per page load, renewed on each navigation to
+  a **new pathname** (`pushState`, `replaceState`, `popstate`; a query- or hash-only change keeps the trace). A
+  captured browser event with no explicit `traceparent` carries that trace id, the page span id and
+  `trace_flags: 1`. An explicit `ctx.traceparent` always wins. Server runtimes (node, edge, Next server) are unchanged.
+- **Propagation.** `fetch` and `XMLHttpRequest` requests whose URL matches `tracePropagationTargets` get
+  `traceparent: 00-<page trace>-<fresh 16-hex span per request>-01`. A `traceparent` the caller (or another SDK)
+  already set, in any header case, is never overwritten. `tracestate`, `baggage` and `sentry-trace` are never
+  written. The SDK's own tunnel request is never decorated. It works whether another SDK wrapped `fetch`/XHR
+  before or after `init`, and is independent of the `breadcrumbs` switches.
+- **`tracePropagationTargets: Array<string | RegExp>`** — default (omitted): **the page's own origin only**
+  (relative URLs, which resolve against `document.baseURI`, and `location.origin`). When given it REPLACES the
+  default. A **string** is either `/path` (on the page's origin) or an absolute `http(s)` URL; it matches when the
+  request's **origin equals the target's exactly** and the request path equals the target's path or lies under it,
+  **segment-aware** (`'/api'` matches `/api` and `/api/x`, not `/apiary`; `'https://api.example.com'` does not
+  match `https://api.example.com.evil.com/`). A **RegExp** is tested against the absolute URL. `[]` propagates
+  nowhere. A non-array falls back to the default; an entry that is not a RegExp, a `/path` or an absolute
+  `http(s)` URL (e.g. `'api/'`) is ignored — each reports `invalid_option`.
+- **An absent `traceparent`.** `undefined`, `null` and `''` count as absent (so `traceparent: headers.get('traceparent')`
+  works) and the page trace applies; a non-empty but malformed value is the caller's word and yields **no** trace.
+- **Fetch details.** A `Request` input is sent as a clone carrying the header (its method, body, credentials,
+  referrer and policy are preserved); `init.headers`, when present, replaces the Request's headers (Fetch), so only
+  those are checked for a caller's `traceparent`. An `init` that is not a plain object is left untouched.
+
+Why same origin by default: a `traceparent` on a cross-origin request triggers a CORS preflight and leaks the page's
+trace id to a third party.
+
 ---
 
 ## 5. Security & PII Sanitization Rules

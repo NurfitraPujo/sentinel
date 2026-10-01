@@ -4,6 +4,21 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+## v0.3.0 — Browser trace propagation (`tracePropagationTargets`)
+
+- **The browser SDK starts a trace and sends it.** One trace id per page load, renewed on each navigation to a
+  new **pathname** (a query- or hash-only `pushState`/`replaceState` keeps the trace); every captured browser event without an explicit `traceparent` now carries it as
+  `trace_id` / `span_id` / `trace_flags: 1`, so a browser error and the server error the same API call caused
+  share one trace id in Sentinel. `fetch` and `XMLHttpRequest` requests to matching URLs get
+  `traceparent: 00-<trace>-<fresh span>-01`; an existing `traceparent` is never overwritten, and
+  `tracestate`, `baggage` and `sentry-trace` are never added.
+- **New `init` option `tracePropagationTargets: Array<string | RegExp>`** (browser and `./nextjs/client`).
+  **Default: the page's own origin only** — a behaviour change for same-origin requests, which now carry a
+  `traceparent` header; cross-origin requests are untouched unless you list them. String targets match the request's origin exactly, then the path
+  segment-aware (`'/api'` is not `/apiary`); a `ctx.traceparent` of `undefined`/`null`/`''` counts as absent.
+  Details in `docs/sdk-specification.md` *Trace propagation* and the README. `tracePropagationTargets: []` turns it off.
+- Server runtimes (node, edge, Next server) and the wire format are unchanged.
+
 ## v0.2.0 — Typed `level` / `sdk` / `user` / `tags` / `contexts` / `request` / `breadcrumbs`; identity and tags leave `metadata`
 
 #### Behaviour change

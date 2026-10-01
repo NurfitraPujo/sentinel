@@ -266,6 +266,12 @@ export type BrowserInitOptions = CoreOptions &
     autoIpAddress?: boolean;
     /** `false` disables every automatic integration; an object switches them individually (spec §5). */
     breadcrumbs?: boolean | BreadcrumbSwitches;
+    /**
+     * Browser only (spec *Trace propagation*): where fetch/XHR get a `traceparent` header. Default (omitted): the page's own origin.
+     * A string matches by prefix of the absolute URL (`'/api'` = same-origin `/api…`), a RegExp is tested against it;
+     * the option replaces the default, `[]` sends nowhere.
+     */
+    tracePropagationTargets?: Array<string | RegExp>;
   };
 export type NodeInitOptions = CoreOptions &
   Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'> &

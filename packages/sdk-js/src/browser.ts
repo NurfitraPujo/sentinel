@@ -7,6 +7,8 @@
 
 import { browserAutoContexts } from './browser/contexts.js';
 import { installBrowserIntegrations } from './browser/integrations/index.js';
+import { installPropagation } from './browser/propagation.js';
+import { installPageTrace } from './browser/trace.js';
 import { installBrowserHandlers } from './core/handlers/browser.js';
 import { initCore } from './core/init.js';
 import { planBrowser } from './core/options.js';
@@ -28,7 +30,16 @@ export function initBrowser(options: BrowserInitOptions | undefined, entry: stri
     const plan = planBrowser(given);
     const client = initCore(given, 'browser', plan, entry, browserAutoContexts);
     if (!client.noop && client.options.installGlobalHandlers) installBrowserHandlers(client);
-    if (!client.noop) client.teardown.push(installBrowserIntegrations(client, given.breadcrumbs, plan.target?.url));
+    if (!client.noop) {
+      // Propagation goes in FIRST (innermost), the breadcrumb wrappers over it, and the teardown runs outermost
+      // first — each uninstall then finds its own wrapper on top and restores cleanly (shared.ts wrapMethod).
+      // Tracing is independent of `breadcrumbs`: `false` there does not stop the `traceparent` (spec §5.6).
+      const uninstallTrace = installPageTrace(client);
+      const uninstallPropagation = installPropagation(client, given.tracePropagationTargets, plan.target?.url);
+      client.teardown.push(installBrowserIntegrations(client, given.breadcrumbs, plan.target?.url));
+      client.teardown.push(uninstallPropagation);
+      client.teardown.push(uninstallTrace);
+    }
   } catch {
     // `init` never throws (contract §4.2); an internal failure leaves whatever was installed.
   }

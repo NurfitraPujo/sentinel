@@ -16,6 +16,12 @@ export const SLOT_KEY: unique symbol = Symbol.for(SDK_NAME);
  * target (`endpoint` / `tunnel`) resolved — a client without one keeps the serialised events in a plain queue —
  * and the teardown hooks `close` runs.
  */
+/** The browser page's current trace (spec *Trace propagation*): the trace id and the span id a captured event carries. */
+export interface PageTrace {
+  trace_id: string;
+  span_id: string;
+}
+
 export interface InternalClient {
   readonly options: ResolvedOptions;
   readonly runtime: Runtime;
@@ -45,6 +51,8 @@ export interface InternalClient {
    * (handlers/browser.ts, handlers/node.ts). Each is called once and may not throw outward.
    */
   readonly teardown: Array<() => void>;
+  /** Browser only: set by `installPageTrace`, renewed per navigation; `undefined` on the server runtimes. */
+  pageTrace?: PageTrace | undefined;
 }
 
 export interface Scope {

@@ -27,7 +27,7 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "ip_address": "",
@@ -35,7 +35,7 @@
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8010-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild dup-exact-and-upper\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8010-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild dup-exact-and-upper\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
     },
     {
       "name": "dup-both-set",
@@ -63,7 +63,7 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "ip_address": "6.6.6.6",
@@ -71,7 +71,7 @@
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8011-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild dup-both-set\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8011-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild dup-both-set\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
     },
     {
       "name": "mixed-case",
@@ -99,14 +99,14 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "Ip_Address": "6.6.6.6"
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8012-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild mixed-case\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8012-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild mixed-case\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
     },
     {
       "name": "long-s",
@@ -134,14 +134,14 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "ip_addreſſ": "6.6.6.6"
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8013-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild long-s\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8013-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild long-s\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"},\"user\":{\"ip_address\":\"81.2.69.142\"}}]"
     },
     {
       "name": "browser-geo",
@@ -169,7 +169,7 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "id": "u1",
@@ -184,7 +184,7 @@
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8014-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild browser-geo\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"},\"user\":{\"id\":\"u1\",\"ip_address\":\"81.2.69.142\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8014-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild browser-geo\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"},\"user\":{\"id\":\"u1\",\"ip_address\":\"81.2.69.142\"}}]"
     },
     {
       "name": "no-ip-folded",
@@ -212,7 +212,7 @@
           "level": "error",
           "sdk": {
             "name": "sentinel.javascript.browser",
-            "version": "0.2.0"
+            "version": "0.3.0"
           },
           "user": {
             "Ip_Address": "6.6.6.6",
@@ -222,7 +222,7 @@
           }
         }
       ],
-      "output": "[{\"event_id\":\"00000000-0000-4000-8015-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild no-ip-folded\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.2.0\"}}]"
+      "output": "[{\"event_id\":\"00000000-0000-4000-8015-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel rebuild no-ip-folded\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"error\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.0\"}}]"
     }
   ]
 }

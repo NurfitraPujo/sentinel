@@ -654,8 +654,9 @@ from one that genuinely had nothing to trim.
 
 ## What is not implemented
 
-- **Tracing** — `tracesSampleRate` is accepted and ignored; trace ids come only from a
-  `traceparent` string you pass (`ctx.traceparent`, or the request header in `captureRequestError`).
+- **Tracing** — `tracesSampleRate` is accepted and ignored; there are no spans or transactions. Trace
+  ids come from a `traceparent` string you pass (`ctx.traceparent`, or the request header in
+  `captureRequestError`) or, in the browser, from the page trace (see *Trace propagation*).
 - **Per-request server scope** — `setUser` on the server leaks to the next request on the same
   worker; pass `user: { id }` / `tags: { tenant_id }` on the capture call instead
   (`captureRequestError` never calls `setUser`).
@@ -664,6 +665,9 @@ from one that genuinely had nothing to trim.
 - Index maps with `url` sections — skipped with a `warn`; the route rejects them.
 
 ## Bundle size
+
+**0.3.0: `sdk_js_client_entry_gzip_bytes` = 22 829** (`pnpm size`; 21 457 on the same machine at the 0.2.0 head, +1 372 for page trace and
+fetch/XHR propagation). The 0.2.0 paragraph below is kept as measured at its own head.
 
 **`sdk_js_client_entry_gzip_bytes` = 21 251** — re-measured for 0.2.0 (`pnpm size`) at `08b16af`,
 the head this README was written from, up from 11 198 at 0.1.2: **gzip of the raw
@@ -778,3 +782,38 @@ document.querySelector('#save')?.addEventListener('click', () => {
   }
 });
 ```
+
+## Trace propagation (0.3.0)
+
+The browser entry (and `./nextjs/client`) starts one trace per page load and renews it on each
+navigation to a new pathname (`pushState`, `replaceState`, `popstate`; a query- or hash-only change
+keeps it). Every captured browser event without an explicit `ctx.traceparent` carries that trace id,
+and `fetch` / `XMLHttpRequest` requests to a target get `traceparent: 00-<trace>-<fresh span>-01`, so
+a browser error and the server error the same API call caused share one `trace_id` in Sentinel
+(`/search?trace_id=`). It is independent of `breadcrumbs`, never overwrites a `traceparent` you (or
+another SDK) set, never writes `tracestate`, `baggage` or `sentry-trace`, and never touches the
+tunnel request. Server runtimes are unchanged.
+
+```ts
+init({
+  tunnel: '/api/sentinel',
+  // Default (omit): the page's own origin only. Giving the option REPLACES the default.
+  tracePropagationTargets: ['/api', 'https://api.example.com/', /^https:\/\/[a-z]+\.example\.com\//],
+});
+```
+
+- A **string** is `/path` (on the page's origin) or an absolute `http(s)` URL. It matches when the
+  request's **origin equals the target's exactly** and the request path equals the target's path or is under
+  it, segment-aware: `'/api'` matches `/api` and `/api/x` but not `/apiary`, and `'https://api.example.com'`
+  never matches `https://api.example.com.evil.com/`. Relative URLs resolve against `document.baseURI`.
+- A **RegExp** is tested against the absolute URL.
+- `[]` sends nowhere. A non-array, or an entry that is none of those (`'api/'`, say), reports
+  `invalid_option` and is ignored.
+- A `ctx.traceparent` of `undefined`, `null` or `''` counts as absent, so
+  `captureException(e, { traceparent: headers.get('traceparent') })` falls back to the page trace; a
+  non-empty but malformed value yields no trace.
+- List only origins you control and whose CORS config allows a `traceparent` request header: a
+  cross-origin `traceparent` triggers a preflight, and the trace id is visible to the receiver.
+- **Redirects:** a same-origin request that redirects to another origin (a presigned S3/OBS URL, say)
+  carries the `traceparent` along and may fail a CORS preflight unless that bucket allows the header.
+- **SSE:** `EventSource` cannot carry request headers, so it gets no `traceparent`.

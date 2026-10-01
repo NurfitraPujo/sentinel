@@ -652,7 +652,11 @@ function build(client: InternalClient, input: CaptureInput, eventId: string): vo
   if (opts.release !== '') event.release_version = opts.release;
   const fingerprint = readFingerprint(client, ctx?.fingerprint);
   if (fingerprint !== undefined) event.fingerprint = fingerprint;
-  const trace = parseTraceparent(ctx?.traceparent);
+  // A non-empty traceparent (even a malformed one) is the caller's word; only a capture with none — undefined,
+  // null (`headers.get('traceparent')`) or '' — gets the browser page's trace (spec *Trace propagation*).
+  const tp = ctx?.traceparent as unknown;
+  const absent = tp === undefined || tp === null || tp === '';
+  const trace = absent && client.pageTrace !== undefined ? { ...client.pageTrace, trace_flags: 1 } : parseTraceparent(tp);
   if (trace !== undefined) {
     event.trace_id = trace.trace_id;
     event.span_id = trace.span_id;
