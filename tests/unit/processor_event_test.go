@@ -784,3 +784,23 @@ func TestPrepare_AffectedIDPrecedence(t *testing.T) {
 		assert.Equal(t, "typed-tenant", got.AffectedTenantID)
 	})
 }
+
+// sentinel-relay-auth-tag-redacted BUG-01: the server-set relay_auth tag survives the masker, but only
+// for the two literals the ingestor writes.
+func TestPrepare_RelayAuthTag(t *testing.T) {
+	tagsAfter := func(tags map[string]string) map[string]string {
+		e := &event.ErrorEvent{Tags: tags}
+		e.Prepare(masker.NewMasker())
+		return e.Tags
+	}
+	for _, v := range []string{"user", "anonymous"} {
+		assert.Equal(t, map[string]string{"relay_auth": v, "region": "eu"},
+			tagsAfter(map[string]string{"relay_auth": v, "region": "eu"}), v)
+	}
+	for _, v := range []string{"Bearer abc123", "user2", "USER", "token=abc", ""} {
+		assert.Equal(t, "***REDACTED***", tagsAfter(map[string]string{"relay_auth": v})["relay_auth"], "value %q", v)
+	}
+	assert.Equal(t, "***REDACTED***", tagsAfter(map[string]string{"Relay_Auth": "user"})["Relay_Auth"], "key is case-sensitive")
+	got := tagsAfter(map[string]string{"relay_auth": "user", "x_auth_token": "user", "authorization": "anonymous"})
+	assert.Equal(t, map[string]string{"relay_auth": "user", "x_auth_token": "***REDACTED***", "authorization": "***REDACTED***"}, got)
+}

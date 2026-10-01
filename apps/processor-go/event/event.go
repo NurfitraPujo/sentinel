@@ -246,7 +246,7 @@ func (e *ErrorEvent) Prepare(masker *masker.Masker) {
 	e.maskV2(masker)
 	// TASK-08 (amended decision 4): tag values are masked like metadata — a sensitive key's value is
 	// replaced, every other value goes through MaskString (PAN included). After readAffectedIDs.
-	e.Tags = maskStringMap(masker, e.Tags)
+	e.Tags = maskTags(masker, e.Tags)
 }
 
 // readAffectedIDs is sentinel-event-schema-v2 §6.3 (OQ-3) over sentinel-affected-users §4.3: the
@@ -302,6 +302,35 @@ func (e *ErrorEvent) maskV2(m *masker.Masker) {
 			e.Exception.Values[i].Value = m.MaskString(e.Exception.Values[i].Value)
 		}
 	}
+}
+
+// tagRelayAuth mirrors sentrycompat.TagRelayAuth (apps/ingestor-go/sentrycompat/relay.go); a local
+// const because processor-go does not import ingestor-go.
+const tagRelayAuth = "relay_auth"
+
+// maskTags is maskStringMap for ErrorEvent.Tags with ONE exemption (sentinel-relay-auth-tag-redacted
+// BUG-01): the server-set relay_auth tag. isSensitiveKey matches by substring and "auth" is a
+// sensitive key, so every relayed event stored relay_auth="***REDACTED***" and authenticated could not
+// be told from anonymous. Only the exact key with the exact value "user" or "anonymous" is kept: the
+// native ingest path does not strip a client-supplied tags.relay_auth, so any other value may be a
+// secret and is still redacted. The masker's key rules are deliberately untouched.
+func maskTags(m *masker.Masker, in map[string]string) map[string]string {
+	v, ok := in[tagRelayAuth]
+	keep := ok && (v == "user" || v == "anonymous")
+	if keep {
+		rest := make(map[string]string, len(in))
+		for k, val := range in {
+			if k != tagRelayAuth {
+				rest[k] = val
+			}
+		}
+		in = rest
+	}
+	out := maskStringMap(m, in)
+	if keep {
+		out[tagRelayAuth] = v
+	}
+	return out
 }
 
 // maskStringMap runs MaskMap over a string->string map and back. Every value stays a string: a
