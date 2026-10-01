@@ -2,6 +2,7 @@
 	import '../app.css';
 	import type { LayoutData } from './$types';
 	import NotificationBell from '$lib/components/notifications/NotificationBell.svelte';
+	import OrganizationSwitcher from '$lib/components/orgs/OrganizationSwitcher.svelte';
 	import { onNavigate } from '$app/navigation';
 	import { updated } from '$app/state';
 
@@ -29,6 +30,12 @@
 					<span class="logo-icon">⚡</span>
 					<span class="logo-text">SENTINEL</span>
 				</a>
+				{#if data.session && data.organizations && data.organizations.length > 0}
+					<OrganizationSwitcher
+						activeOrg={data.activeOrg}
+						organizations={data.organizations}
+					/>
+				{/if}
 			</div>
 			<nav class="nav-menu">
 				<a href="/" class="nav-link active">Dashboard</a>
@@ -99,6 +106,7 @@
 	.brand {
 		display: flex;
 		align-items: center;
+		gap: 1rem;
 	}
 
 	.logo {
