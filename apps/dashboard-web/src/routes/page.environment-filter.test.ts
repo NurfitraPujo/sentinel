@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { screen } from '@testing-library/svelte';
+import { render } from './page-fixtures';
 import Page from './+page.svelte';
 import type { PageData } from './$types';
 
@@ -82,13 +83,13 @@ describe('/ environment filter (contract §4.4, flows L3 and L6)', () => {
 		const fromProject = render(Page, {
 			data: pageData({
 				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
-				filters: { status: 'open', project: 'proj-1', environment: 'production' },
+				filters: { status: 'unresolved', project: 'proj-1', environment: 'production' },
 				pagination: { page: 2, limit: 20, total: 60, totalPages: 3 },
 			}) as unknown as PageData,
 		});
 
 		const allProjects = screen.getByRole('link', { name: 'All Projects' });
-		expect(allProjects.getAttribute('href')).toBe('?status=open&project=all');
+		expect(allProjects.getAttribute('href')).toBe('?status=unresolved&project=all');
 		fromProject.unmount();
 
 		// Already on `project=all` with the parameter still in the query string: the anchor is the

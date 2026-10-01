@@ -22,7 +22,7 @@ const listProjectsMock = vi.fn();
 // for a set of ids against a real Postgres is issue-queries.trend.integration.test.ts's boundary;
 // this file owns WHICH ids it is asked about, and that it is never asked about none.
 const trendForIssuesMock = vi.fn();
-const getClaimantFacetCountsMock = vi.fn();
+const getIssueFacetsMock = vi.fn();
 const listOrgUsersMock = vi.fn();
 const listOrgAgentsMock = vi.fn();
 
@@ -65,7 +65,7 @@ vi.mock('$lib/server/queries/issue-queries', () => ({
 		countIssues: countIssuesMock,
 		listProjects: listProjectsMock,
 		trendForIssues: trendForIssuesMock,
-		getClaimantFacetCounts: getClaimantFacetCountsMock,
+		getIssueFacets: getIssueFacetsMock,
 		listOrgUsers: listOrgUsersMock,
 		listOrgAgents: listOrgAgentsMock,
 	},
@@ -91,6 +91,24 @@ function registryRow(name: string, extra: Record<string, unknown> = {}) {
 	};
 }
 
+function emptyFacets(claim: Record<string, unknown> = {}) {
+	return {
+		status: { all: 0, unresolved: 0, resolved: 0, ignored: 0 },
+		age: { all: 0, new24h: 0 },
+		environment: { all: 0, byEnvironment: {} },
+		project: { all: 0, byProject: {} },
+		claim: {
+			total: 0,
+			unclaimed: 0,
+			claimedMe: 0,
+			claimedAgent: 0,
+			byClaimant: {},
+			claimantTypes: {},
+			...claim,
+		},
+	};
+}
+
 async function loadWith(query: string) {
 	return (await load({
 		url: new URL(`http://x/${query}`),
@@ -111,14 +129,7 @@ beforeEach(() => {
 	listIssuesMock.mockResolvedValue([]);
 	countIssuesMock.mockResolvedValue(0);
 	trendForIssuesMock.mockResolvedValue(new Map());
-	getClaimantFacetCountsMock.mockResolvedValue({
-		total: 0,
-		unclaimed: 0,
-		claimedMe: 0,
-		claimedAgent: 0,
-		byClaimant: {},
-		claimantTypes: {},
-	});
+	getIssueFacetsMock.mockResolvedValue(emptyFacets());
 	listOrgUsersMock.mockResolvedValue([]);
 	listOrgAgentsMock.mockResolvedValue([]);
 	listProjectsMock.mockResolvedValue([
@@ -332,7 +343,7 @@ describe('GET / page load — new filter, regression fields and trend24h (sentin
 			message: 'boom',
 			errorClass: 'TypeError',
 			environment: 'production',
-			status: 'open',
+			status: 'unresolved',
 			firstSeen: new Date('2026-09-13T09:00:00Z'),
 			lastSeen: new Date('2026-09-13T13:00:00Z'),
 			count: 7,
@@ -510,15 +521,17 @@ describe('GET / page load — claimant facets and organization users', () => {
 		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ claim: 'claimed-me' });
 	});
 
-	it('returns claimantFacets and maps orgUsers and usersById with human-readable attributes', async () => {
-		getClaimantFacetCountsMock.mockResolvedValueOnce({
-			total: 5,
-			unclaimed: 2,
-			claimedMe: 1,
-			claimedAgent: 1,
-			byClaimant: { 'user-1': 1, 'agent-1': 1, 'unclaimed': 2 },
-			claimantTypes: { 'agent-1': 'agent', 'user-1': 'user' },
-		});
+	it('returns facets and maps orgUsers and usersById with human-readable attributes', async () => {
+		getIssueFacetsMock.mockResolvedValueOnce(
+			emptyFacets({
+				total: 5,
+				unclaimed: 2,
+				claimedMe: 1,
+				claimedAgent: 1,
+				byClaimant: { 'user-1': 1, 'agent-1': 1, 'unclaimed': 2 },
+				claimantTypes: { 'agent-1': 'agent', 'user-1': 'user' },
+			})
+		);
 		listOrgUsersMock.mockResolvedValueOnce([
 			{ id: 'user-2', name: 'Alice Smith', email: 'alice@example.com' },
 			{ id: 'user-3', name: null, email: 'bob@example.com' },
@@ -529,7 +542,7 @@ describe('GET / page load — claimant facets and organization users', () => {
 		getUserMock.mockResolvedValueOnce({ id: 'user-1', email: 'me@example.com', name: 'Current User' });
 
 		const data = await loadWith('');
-		expect(data.claimantFacets).toEqual({
+		expect(data.facets.claim).toEqual({
 			total: 5,
 			unclaimed: 2,
 			claimedMe: 1,
@@ -553,12 +566,12 @@ describe('GET / page load — claimant facets and organization users', () => {
 });
 
 describe('GET / page load — search query q', () => {
-	it('passes q search filter through to listIssues, countIssues, and claimantFacets, and echoes in filters.q', async () => {
+	it('passes q search filter through to listIssues, countIssues and the facet reader, and echoes in filters.q', async () => {
 		const data = await loadWith('?q=timeout');
 		expect(data.filters.q).toBe('timeout');
 		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
 		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
-		expect(getClaimantFacetCountsMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
+		expect(getIssueFacetsMock.mock.calls[0][0]).toMatchObject({ q: 'timeout' });
 	});
 
 	it('trims q search query and handles empty string as undefined in query calls', async () => {
@@ -566,6 +579,124 @@ describe('GET / page load — search query q', () => {
 		expect(data.filters.q).toBe('');
 		expect(listIssuesMock.mock.calls[0][0].q).toBeUndefined();
 		expect(countIssuesMock.mock.calls[0][0].q).toBeUndefined();
-		expect(getClaimantFacetCountsMock.mock.calls[0][0].q).toBeUndefined();
+		expect(getIssueFacetsMock.mock.calls[0][0].q).toBeUndefined();
+	});
+});
+
+/**
+ * fix-sentinel-issues-dashboard — the loader half of D1–D4 (acceptance rows 1, 3, 4, 6). What the
+ * QUERIES do with these filters is `issue-queries.facets.integration.test.ts`'s claim, against a
+ * real Postgres; this file owns the parse, the coercion, the echo, the clamp and that every
+ * statement gets the same filters.
+ */
+describe('GET / page load — status, server filters, page clamp (fix-sentinel-issues-dashboard)', () => {
+	it('returns the facet reader\'s counts untouched and calls it once, with the guards and the one instant', async () => {
+		const facets = emptyFacets();
+		facets.status = { all: 1234, unresolved: 1000, resolved: 200, ignored: 34 };
+		getIssueFacetsMock.mockResolvedValueOnce(facets);
+		countIssuesMock.mockResolvedValue(1234);
+
+		const data = await loadWith('?page=2&limit=50');
+
+		expect(data.facets).toBe(facets);
+		expect(getIssueFacetsMock).toHaveBeenCalledTimes(1);
+		const [filters, now] = getIssueFacetsMock.mock.calls[0];
+		expect(filters.projectIds).toEqual([PROJECT_A, PROJECT_B]);
+		expect(filters.environmentScopes).toBeInstanceOf(Map);
+		expect(now).toBeInstanceOf(Date);
+		// The count the footer reads and the facet reader read the SAME filters.
+		expect(countIssuesMock.mock.calls[0][0]).toEqual(filters);
+	});
+
+	it('coerces status=open to unresolved for the queries and the echo (row 3)', async () => {
+		const data = await loadWith('?status=open');
+		expect(data.filters.status).toBe('unresolved');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ status: 'unresolved' });
+		expect(countIssuesMock.mock.calls[0][0]).toMatchObject({ status: 'unresolved' });
+		expect(getIssueFacetsMock.mock.calls[0][0]).toMatchObject({ status: 'unresolved' });
+	});
+
+	it.each(['banana', '', 'OPEN'])('coerces status=%j to all (row 3)', async (value) => {
+		const data = await loadWith(`?status=${value}`);
+		expect(data.filters.status).toBe('all');
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject({ status: 'all' });
+	});
+
+	it.each(['unresolved', 'resolved', 'ignored'])('passes status=%s through', async (status) => {
+		const data = await loadWith(`?status=${status}`);
+		expect(data.filters.status).toBe(status);
+	});
+
+	it('passes volume, seen and the custom range to the list, the count and the facets alike (row 4)', async () => {
+		const data = await loadWith('?volume=high&seen=7d');
+		for (const filters of [
+			listIssuesMock.mock.calls[0][0],
+			countIssuesMock.mock.calls[0][0],
+			getIssueFacetsMock.mock.calls[0][0],
+		]) {
+			expect(filters.volume).toBe('high');
+			expect(filters.seenAfter).toBeInstanceOf(Date);
+			expect(filters.seenBefore).toBeUndefined();
+		}
+		const now: Date = getIssueFacetsMock.mock.calls[0][1];
+		// seen=7d is last_seen >= (the loader's instant) - 7 days.
+		expect(now.getTime() - getIssueFacetsMock.mock.calls[0][0].seenAfter.getTime()).toBe(
+			7 * 24 * 60 * 60 * 1000
+		);
+		expect(data.filters).toMatchObject({ volume: 'high', seen: '7d', seen_from: '', seen_to: '' });
+	});
+
+	it('applies a custom range as seenAfter/seenBefore and echoes it as ISO', async () => {
+		const data = await loadWith(
+			'?seen_from=2026-09-01T00:00:00.000Z&seen_to=2026-09-02T00:00:00.000Z'
+		);
+		expect(listIssuesMock.mock.calls[0][0].seenAfter).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+		expect(listIssuesMock.mock.calls[0][0].seenBefore).toEqual(new Date('2026-09-02T00:00:00.000Z'));
+		expect(countIssuesMock.mock.calls[0][0].seenBefore).toEqual(new Date('2026-09-02T00:00:00.000Z'));
+		expect(data.filters).toMatchObject({
+			seen: 'all',
+			seen_from: '2026-09-01T00:00:00.000Z',
+			seen_to: '2026-09-02T00:00:00.000Z',
+		});
+	});
+
+	it('accepts a half-open range, and ignores an unparsable bound instead of failing', async () => {
+		const data = await loadWith('?seen_from=nonsense&seen_to=2026-09-02T00:00:00.000Z');
+		expect(listIssuesMock.mock.calls[0][0].seenAfter).toBeUndefined();
+		expect(listIssuesMock.mock.calls[0][0].seenBefore).toEqual(new Date('2026-09-02T00:00:00.000Z'));
+		expect(data.filters.seen_from).toBe('');
+	});
+
+	it('lets a preset win over a custom range, and echoes only the preset', async () => {
+		const data = await loadWith('?seen=24h&seen_from=2026-09-01T00:00:00.000Z');
+		expect(data.filters).toMatchObject({ seen: '24h', seen_from: '', seen_to: '' });
+		expect(listIssuesMock.mock.calls[0][0].seenBefore).toBeUndefined();
+	});
+
+	it('coerces unknown volume and seen to all, with no predicate', async () => {
+		const data = await loadWith('?volume=banana&seen=banana');
+		expect(data.filters).toMatchObject({ volume: 'all', seen: 'all' });
+		expect(listIssuesMock.mock.calls[0][0].seenAfter).toBeUndefined();
+	});
+
+	it.each(['0', '-3', 'abc', '', '1.5x'])('page=%j renders page 1 (row 6)', async (page) => {
+		countIssuesMock.mockResolvedValue(100);
+		const data = await loadWith(`?page=${page}`);
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 20);
+		expect(data.pagination.page).toBe(1);
+	});
+
+	it('clamps a page past the end to the last page, after the count (row 6)', async () => {
+		countIssuesMock.mockResolvedValue(45);
+		const data = await loadWith('?page=999');
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 3, 20);
+		expect(data.pagination).toMatchObject({ page: 3, total: 45, totalPages: 3 });
+	});
+
+	it('renders page 1 of nothing when there are no matches and the page is past the end', async () => {
+		countIssuesMock.mockResolvedValue(0);
+		const data = await loadWith('?page=999');
+		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 20);
+		expect(data.pagination).toMatchObject({ page: 1, total: 0, totalPages: 0 });
 	});
 });

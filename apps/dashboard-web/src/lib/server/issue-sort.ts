@@ -63,3 +63,77 @@ export function firstSeenLowerBound(filter: IssueNewFilter, now: Date): Date | u
 			return undefined;
 	}
 }
+
+/**
+ * fix-sentinel-issues-dashboard D2 — the `status` vocabulary, as `issues.check_status` allows it:
+ * `unresolved | resolved | ignored`. The page used to link `?status=open`, a value no row has ever
+ * carried. `open` is kept as an ALIAS (old bookmarks, the `/issues?status=open` redirect) and
+ * coerced to `unresolved`; anything else unknown is `all`. The coerced value is what the queries
+ * see and what `filters.status` echoes, like `sort` and `new`.
+ */
+export const ISSUE_STATUSES = ['all', 'unresolved', 'resolved', 'ignored'] as const;
+
+export type IssueStatus = (typeof ISSUE_STATUSES)[number];
+
+export function coerceIssueStatus(value: string | null | undefined): IssueStatus {
+	if (value === 'open') return 'unresolved';
+	return (ISSUE_STATUSES as readonly string[]).includes(value ?? '')
+		? (value as IssueStatus)
+		: 'all';
+}
+
+/**
+ * D3 — `volume=high` is `issues.count >= HIGH_VOLUME_THRESHOLD`. Coerced like `new`: unknown is
+ * `all` (no predicate).
+ */
+export const ISSUE_VOLUMES = ['all', 'high'] as const;
+
+export type IssueVolume = (typeof ISSUE_VOLUMES)[number];
+
+export const HIGH_VOLUME_THRESHOLD = 100;
+
+export function coerceIssueVolume(value: string | null | undefined): IssueVolume {
+	return (ISSUE_VOLUMES as readonly string[]).includes(value ?? '')
+		? (value as IssueVolume)
+		: 'all';
+}
+
+/**
+ * D3 — the `seen` window on `last_seen`: `seen=1h|24h|7d|14d|30d` is `last_seen >= now − window`
+ * against the loader's ONE instant. Unknown is `all` (no predicate).
+ */
+export const ISSUE_SEEN_WINDOWS = ['all', '1h', '24h', '7d', '14d', '30d'] as const;
+
+export type IssueSeenWindow = (typeof ISSUE_SEEN_WINDOWS)[number];
+
+export function coerceIssueSeen(value: string | null | undefined): IssueSeenWindow {
+	return (ISSUE_SEEN_WINDOWS as readonly string[]).includes(value ?? '')
+		? (value as IssueSeenWindow)
+		: 'all';
+}
+
+const SEEN_WINDOW_MS: Record<Exclude<IssueSeenWindow, 'all'>, number> = {
+	'1h': 60 * 60 * 1000,
+	'24h': 24 * 60 * 60 * 1000,
+	'7d': 7 * 24 * 60 * 60 * 1000,
+	'14d': 14 * 24 * 60 * 60 * 1000,
+	'30d': 30 * 24 * 60 * 60 * 1000,
+};
+
+/** The `last_seen` lower bound a coerced `seen` stands for, against ONE instant; `all` is none. */
+export function seenLowerBound(seen: IssueSeenWindow, now: Date): Date | undefined {
+	return seen === 'all' ? undefined : new Date(now.getTime() - SEEN_WINDOW_MS[seen]);
+}
+
+/** `seen_from` / `seen_to`: an unparsable value is ignored (undefined), never a 500. */
+export function parseSeenInstant(value: string | null | undefined): Date | undefined {
+	if (!value) return undefined;
+	const d = new Date(value);
+	return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
+/** `page` is an integer >= 1: NaN, zero and negatives are page 1 (D4). */
+export function coercePage(value: string | null | undefined): number {
+	const n = parseInt(value ?? '1', 10);
+	return Number.isFinite(n) && n >= 1 ? n : 1;
+}

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { screen } from '@testing-library/svelte';
+import { render } from './page-fixtures';
 import Page from './+page.svelte';
 import type { PageData } from './$types';
 
@@ -21,7 +22,7 @@ function issue(overrides: Record<string, unknown> = {}) {
 		lastSeen: '2026-09-12T10:00:00.000Z',
 		projectName: 'Checkout API',
 		environment: 'production',
-		status: 'open',
+		status: 'unresolved',
 		affectedUserCount: 1234,
 		affectedTenantCount: 3,
 		// sentinel-issue-trend §4.1 — the projection and the per-card series the template now reads
@@ -183,7 +184,7 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 			data: pageData({
 				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
 				filters: {
-					status: 'open',
+					status: 'unresolved',
 					project: 'proj-1',
 					environment: 'production',
 					sort: 'affected_users',
@@ -195,24 +196,24 @@ describe('/ sort control (contract §4.1, flows L2–L7, decision 17)', () => {
 
 		// L4 — paging.
 		expect(screen.getByRole('link', { name: 'Next' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=affected_users&page=3'
+			'?status=unresolved&project=proj-1&environment=production&sort=affected_users&page=3'
 		);
 		expect(screen.getByRole('link', { name: 'Previous' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=affected_users'
+			'?status=unresolved&project=proj-1&environment=production&sort=affected_users'
 		);
 		// L5 — status and environment.
 		expect(screen.getByRole('link', { name: 'Resolved' }).getAttribute('href')).toBe(
 			'?status=resolved&project=proj-1&environment=production&sort=affected_users'
 		);
 		expect(screen.getByRole('link', { name: 'Production' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=affected_users'
+			'?status=unresolved&project=proj-1&environment=production&sort=affected_users'
 		);
 		// L6, decision 17 — a project change keeps the sort; only `environment` resets.
 		expect(screen.getByRole('link', { name: 'Billing' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-2&sort=affected_users'
+			'?status=unresolved&project=proj-2&sort=affected_users'
 		);
 		expect(screen.getByRole('link', { name: 'All Projects' }).getAttribute('href')).toBe(
-			'?status=open&project=all&sort=affected_users'
+			'?status=unresolved&project=all&sort=affected_users'
 		);
 	});
 

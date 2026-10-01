@@ -2,7 +2,7 @@ import { db } from "$lib/server/db";
 import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers, agents } from "$lib/db/schema";
 import { eq, ne, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
-import { coerceIssueSort } from "$lib/server/issue-sort";
+import { coerceIssueSort, firstSeenLowerBound, HIGH_VOLUME_THRESHOLD } from "$lib/server/issue-sort";
 import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
 import type { TagFacetRow } from "$lib/tag-facets";
 
@@ -60,6 +60,16 @@ export interface IssueFilters {
      */
     firstSeenAfter?: Date;
     /**
+     * fix-sentinel-issues-dashboard D3 — `volume=high`: `count >= HIGH_VOLUME_THRESHOLD`. Coerced by
+     * the loader (`coerceIssueVolume`); a real predicate in the shared builder, so the list, the
+     * total and every facet group narrow with it.
+     */
+    volume?: string;
+    /** D3 — `last_seen >= seenAfter` (`seen=` preset or `seen_from`). Same shared builder. */
+    seenAfter?: Date;
+    /** D3 — `last_seen <= seenBefore` (`seen_to`). */
+    seenBefore?: Date;
+    /**
      * Claimant filter: 'all' | 'unclaimed' | 'claimed-me' | 'claimed-agent' | specific claimant string (user ID or email).
      */
     claim?: string;
@@ -71,6 +81,27 @@ export interface IssueFilters {
      * Search query across error_class, fingerprint (ILIKE) and message (FTS vector).
      */
     q?: string;
+}
+
+/**
+ * The FILTERS a facet group may drop from its own count (§4.1: "every active filter except X").
+ * Deliberately a closed list of filter names: the two GUARDS (`projectIds`, `environmentScopes`) are
+ * not on it, so no caller can express "drop the guard".
+ */
+export type IssueFilterName = "status" | "new" | "environment" | "project" | "claim";
+
+/**
+ * fix-sentinel-issues-dashboard §4.1 — every sidebar count, over ALL issues the caller may see
+ * under the other active filters, never the page.
+ */
+export interface IssueFacets {
+    status: { all: number; unresolved: number; resolved: number; ignored: number };
+    age: { all: number; new24h: number };
+    /** `byEnvironment` is empty unless a project is selected; keys are `issues.environment`. */
+    environment: { all: number; byEnvironment: Record<string, number> };
+    /** Keyed by project id. */
+    project: { all: number; byProject: Record<string, number> };
+    claim: ClaimantFacetCounts;
 }
 
 export interface ClaimantFacetCounts {
@@ -135,14 +166,14 @@ function inAuthorisedProjects(column: typeof issues.projectId | typeof projects.
  * the same leak in a smaller font, and the two drifting apart is exactly how that happens. One
  * builder makes the count agree with the list by construction.
  */
-function buildIssueConditions(filters: IssueFilters): SQL[] {
+function buildIssueConditions(filters: IssueFilters, omit: ReadonlySet<IssueFilterName> = new Set()): SQL[] {
     const conditions: SQL[] = [];
 
-    if (filters.status && filters.status !== "all") {
+    if (!omit.has("status") && filters.status && filters.status !== "all") {
         conditions.push(eq(issues.status, filters.status));
     }
 
-    if (filters.projectId && filters.projectId !== "all") {
+    if (!omit.has("project") && filters.projectId && filters.projectId !== "all") {
         // ANDed with the tenancy predicate below, never instead of it: `eq(projectId, selected)`
         // alone does not check that the caller may reach the selected project, so `?project=<a
         // foreign uuid>` would read another organization's issues.
@@ -151,7 +182,7 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
 
     conditions.push(inAuthorisedProjects(issues.projectId, filters.projectIds ?? []));
 
-    if (filters.environment && filters.environment !== "all") {
+    if (!omit.has("environment") && filters.environment && filters.environment !== "all") {
         conditions.push(eq(issues.environment, filters.environment));
     }
 
@@ -163,11 +194,23 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
     // sentinel-issue-trend §4.1 (decision 6): `new=24h`, ANDed inside the guards above — one more
     // condition on the same query, never a read path around them. Here rather than in `listIssues`
     // so the count narrows with the list by construction.
-    if (filters.firstSeenAfter) {
+    if (!omit.has("new") && filters.firstSeenAfter) {
         conditions.push(gte(issues.firstSeen, filters.firstSeenAfter));
     }
 
-    if (filters.claim && filters.claim !== "all") {
+    // D3: volume and the `last_seen` window. Not omittable by any facet group: no group counts
+    // "except volume" or "except seen", so the counts always agree with the list on them.
+    if (filters.volume === "high") {
+        conditions.push(gte(issues.count, HIGH_VOLUME_THRESHOLD));
+    }
+    if (filters.seenAfter) {
+        conditions.push(gte(issues.lastSeen, filters.seenAfter));
+    }
+    if (filters.seenBefore) {
+        conditions.push(lte(issues.lastSeen, filters.seenBefore));
+    }
+
+    if (!omit.has("claim") && filters.claim && filters.claim !== "all") {
         if (filters.claim === "unclaimed") {
             conditions.push(isNull(issues.assignedTo));
         } else if (filters.claim === "claimed-me") {
@@ -178,16 +221,18 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
         } else if (filters.claim === "claimed-agent") {
             conditions.push(and(isNotNull(issues.assignedTo), eq(issues.assigneeType, "agent"))!);
         } else {
-            // Specific claimant identifier (user ID, agent ID, or email)
+            // Specific claimant: the EXACT `assigned_to` value (user id, agent id, or a legacy email).
             conditions.push(eq(issues.assignedTo, filters.claim));
         }
     }
 
     if (filters.q && filters.q.trim()) {
         const rawQ = filters.q.trim();
-        const term = `%${rawQ}%`;
+        // D6: `%`, `_` and `\` are escaped so a search for `100%` matches the literal. The FTS arm
+        // takes the raw term and is unchanged.
+        const term = `%${rawQ.replace(/[\\%_]/g, "\\$&")}%`;
         conditions.push(
-            sql`(${issues.errorClass} ILIKE ${term} OR ${issues.fingerprint} ILIKE ${term} OR to_tsvector('english', ${issues.message}) @@ plainto_tsquery('english', ${rawQ}))`
+            sql`(${issues.errorClass} ILIKE ${term} ESCAPE '\\' OR ${issues.fingerprint} ILIKE ${term} ESCAPE '\\' OR to_tsvector('english', ${issues.message}) @@ plainto_tsquery('english', ${rawQ}))`
         );
     }
 
@@ -206,8 +251,8 @@ function buildIssueConditions(filters: IssueFilters): SQL[] {
  * and `idx_issues_project_affected_users` (1724600000, BUG-01) under `project_id` alone — the
  * `environment=all` form, which a btree keyed on `environment` second cannot order without a Sort.
  *
- * `last_seen` is `last_seen DESC` and nothing else — unchanged, deliberately: the default must be
- * exactly today's order, ties included.
+ * `last_seen` is `last_seen DESC NULLS LAST, id DESC` (fix-sentinel-issues-dashboard D5): it used to
+ * have no unique final key. The leading order is today's.
  *
  * sentinel-issue-trend §4.1 (decision 5) adds two, both ending in the unique key:
  *
@@ -229,7 +274,9 @@ function issueOrder(sort: string | undefined): SQL[] {
         case "first_seen":
             return [sql`${issues.firstSeen} DESC NULLS LAST`, desc(issues.id)];
         case "last_seen":
-            return [desc(issues.lastSeen)];
+            // D5: a unique final key, or an offset page can repeat or skip rows. NULLS LAST spelled
+            // out for the same reason as `first_seen` below.
+            return [sql`${issues.lastSeen} DESC NULLS LAST`, desc(issues.id)];
     }
 }
 
@@ -394,8 +441,8 @@ export const issueQueries = {
      * Aggregates claimant counts across all matching issues in the database under active project/environment guards.
      * Evaluated WITHOUT applying `filters.claim`, so the sidebar shows true facet totals across all issues.
      */
-    async getClaimantFacetCounts(filters: Omit<IssueFilters, 'claim'>, currentUserId?: string): Promise<ClaimantFacetCounts> {
-        const conditions = buildIssueConditions(filters);
+    async getClaimantFacetCounts(filters: IssueFilters, currentUserId?: string): Promise<ClaimantFacetCounts> {
+        const conditions = buildIssueConditions(filters, new Set<IssueFilterName>(["claim"]));
 
         // Overall summary counts
         const [summaryRow] = await db
@@ -436,6 +483,81 @@ export const issueQueries = {
             claimedAgent: Number(summaryRow?.claimedAgent ?? 0),
             byClaimant,
             claimantTypes,
+        };
+    },
+
+    /**
+     * fix-sentinel-issues-dashboard §4.1 (D1) — every sidebar count, from the database.
+     *
+     * Each group is the list's own condition set minus the ONE filter the group switches
+     * (`buildIssueConditions`' `omit`), so a count never reflects the page, the page size or the
+     * group's own selection — and never loses a guard: `omit` can name filters only, and the project
+     * and environment guards are applied by the builder on every call. A fixed handful of statements
+     * run in parallel, independent of page size and of the number of issues.
+     *
+     * `now` is the loader's ONE instant, so the `24h` age count agrees with `new=24h` on the list.
+     */
+    async getIssueFacets(filters: IssueFilters, now: Date, currentUserId?: string): Promise<IssueFacets> {
+        const where = (...omit: IssueFilterName[]) => and(...buildIssueConditions(filters, new Set(omit)));
+        const n = (value: unknown) => Number(value ?? 0);
+        const count = sql<number>`cast(count(*) as integer)`;
+        const newBound = firstSeenLowerBound("24h", now)!;
+        const environmentSelected = Boolean(filters.projectId && filters.projectId !== "all");
+
+        const [statusRows, [ageRow], environmentRows, projectRows, claim] = await Promise.all([
+            db.select({ status: issues.status, count }).from(issues).where(where("status")).groupBy(issues.status),
+            db
+                .select({
+                    all: count,
+                    new24h: sql<number>`cast(count(*) filter (where ${gte(issues.firstSeen, newBound)}) as integer)`,
+                })
+                .from(issues)
+                .where(where("new")),
+            environmentSelected
+                ? db
+                      .select({ environment: issues.environment, count })
+                      .from(issues)
+                      .where(where("environment"))
+                      .groupBy(issues.environment)
+                : Promise.resolve([] as { environment: string; count: number }[]),
+            // A project change drops `environment` (it is per project), so this group does too.
+            db
+                .select({ projectId: issues.projectId, count })
+                .from(issues)
+                .where(where("project", "environment"))
+                .groupBy(issues.projectId),
+            issueQueries.getClaimantFacetCounts(filters, currentUserId),
+        ]);
+
+        const status = { all: 0, unresolved: 0, resolved: 0, ignored: 0 };
+        for (const row of statusRows) {
+            const c = n(row.count);
+            status.all += c;
+            if (row.status === "unresolved" || row.status === "resolved" || row.status === "ignored") {
+                status[row.status] = c;
+            }
+        }
+
+        const byEnvironment: Record<string, number> = {};
+        let environmentAll = 0;
+        for (const row of environmentRows) {
+            byEnvironment[row.environment] = n(row.count);
+            environmentAll += n(row.count);
+        }
+
+        const byProject: Record<string, number> = {};
+        let projectAll = 0;
+        for (const row of projectRows) {
+            byProject[row.projectId] = n(row.count);
+            projectAll += n(row.count);
+        }
+
+        return {
+            status,
+            age: { all: n(ageRow?.all), new24h: n(ageRow?.new24h) },
+            environment: { all: environmentAll, byEnvironment },
+            project: { all: projectAll, byProject },
+            claim,
         };
     },
 
@@ -568,8 +690,7 @@ export const issueQueries = {
                 name: projects.name,
             })
             .from(projects)
-            .where(inAuthorisedProjects(projects.id, projectIds))
-            .limit(100);
+            .where(inAuthorisedProjects(projects.id, projectIds));
     },
 
     async getProjectById(id: string) {

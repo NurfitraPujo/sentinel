@@ -107,6 +107,10 @@
 		new?: IssueNewValue;
 		claim?: string;
 		q?: string;
+		volume?: string;
+		seen?: string;
+		seen_from?: string;
+		seen_to?: string;
 		page?: number;
 		limit?: number;
 	}) {
@@ -122,6 +126,14 @@
 		const claim = params.claim ?? data.filters.claim ?? 'all';
 		const searchQueryParam = params.q !== undefined ? params.q : (data.filters.q ?? '');
 		const limit = params.limit ?? data.pagination.limit;
+		// fix-sentinel-issues-dashboard D3: `volume`, `seen` and the custom range are server filters
+		// like `new` — carried across every anchor, omitted at their default, and (because `page` is
+		// only set by the pagination anchors) reset to page 1 when changed. A preset wins over a
+		// custom range, so the range is only emitted beside `seen=all`.
+		const volume = params.volume ?? data.filters.volume;
+		const seen = params.seen ?? data.filters.seen;
+		const seenFrom = params.seen_from ?? data.filters.seen_from;
+		const seenTo = params.seen_to ?? data.filters.seen_to;
 
 		const q = new URLSearchParams();
 		q.set('status', status);
@@ -130,6 +142,10 @@
 		if (sort && sort !== 'last_seen') q.set('sort', sort);
 		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
 		if (claim && claim !== 'all') q.set('claim', claim);
+		if (volume && volume !== 'all') q.set('volume', volume);
+		if (seen && seen !== 'all') q.set('seen', seen);
+		if (seen === 'all' && seenFrom) q.set('seen_from', seenFrom);
+		if (seen === 'all' && seenTo) q.set('seen_to', seenTo);
 		if (searchQueryParam && searchQueryParam.trim()) q.set('q', searchQueryParam.trim());
 		if (limit && limit !== 20) q.set('limit', String(limit));
 		if (params.page && params.page > 1) q.set('page', String(params.page));
@@ -160,6 +176,14 @@
 		{ value: '24h', label: 'New in the last 24 hours' },
 	];
 
+	// D2: the status group is the vocabulary `issues.check_status` allows; counts are `data.facets.status`.
+	const statusOptions = [
+		{ value: 'all', label: 'All' },
+		{ value: 'unresolved', label: 'Unresolved' },
+		{ value: 'resolved', label: 'Resolved' },
+		{ value: 'ignored', label: 'Ignored' },
+	] as const;
+
 	let searchQuery = $state(untrack(() => data.filters.q ?? ''));
 	$effect(() => {
 		searchQuery = data.filters.q ?? '';
@@ -170,44 +194,105 @@
 		goto(targetHref, { keepFocus: true, noScroll: true });
 	}
 
-	let quickChip = $state<'all' | 'production' | 'staging' | 'unhandled' | 'has-trace' | 'high-volume'>('all');
+	// Compact/Expanded is a view, not a filter, so it stays client-side.
 	let displayMode = $state<'expanded' | 'compact'>('expanded');
 
-	// Immersive Date Range Selector state
+	// Date range (D3). Every value here is DERIVED from `data.filters` — the server applies the
+	// filter, the URL carries it, and the trigger's label reads the echo so a reload shows it. The
+	// only local state is the popover's open flag and the two custom inputs' draft values.
+	const seenPresets: { key: '1h' | '24h' | '7d' | '14d' | '30d'; label: string; button: string }[] = [
+		{ key: '1h', label: 'Last 1 Hour', button: '1 Hour' },
+		{ key: '24h', label: 'Last 24 Hours', button: '24 Hours' },
+		{ key: '7d', label: 'Last 7 Days', button: '7 Days' },
+		{ key: '14d', label: 'Last 14 Days', button: '14 Days' },
+		{ key: '30d', label: 'Last 30 Days', button: '30 Days' },
+	];
+
+	// An ISO instant -> the value a `datetime-local` input takes (local time, minute precision).
+	function toLocalInput(iso: string): string {
+		if (!iso) return '';
+		const d = new Date(iso);
+		if (Number.isNaN(d.getTime())) return '';
+		const pad = (n: number) => String(n).padStart(2, '0');
+		return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+	}
+
 	let dateModalOpen = $state(false);
-	let selectedDatePreset = $state<'1h' | '24h' | '7d' | '14d' | '30d' | 'custom' | null>(null);
-	let selectedDateLabel = $state('Date Range');
-	let customDateStart = $state('');
-	let customDateEnd = $state('');
+	let customDateStart = $state(untrack(() => toLocalInput(data.filters.seen_from)));
+	let customDateEnd = $state(untrack(() => toLocalInput(data.filters.seen_to)));
+	$effect(() => {
+		customDateStart = toLocalInput(data.filters.seen_from);
+		customDateEnd = toLocalInput(data.filters.seen_to);
+	});
+
+	let dateRangeActive = $derived(
+		data.filters.seen !== 'all' || Boolean(data.filters.seen_from || data.filters.seen_to)
+	);
+	let selectedDateLabel = $derived.by(() => {
+		const preset = seenPresets.find((p) => p.key === data.filters.seen);
+		if (preset) return preset.label;
+		if (data.filters.seen_from || data.filters.seen_to) {
+			const s = data.filters.seen_from ? toLocalInput(data.filters.seen_from).replace('T', ' ') : 'Any';
+			const e = data.filters.seen_to ? toLocalInput(data.filters.seen_to).replace('T', ' ') : 'Now';
+			return `${s} → ${e}`;
+		}
+		return 'Date Range';
+	});
 
 	function toggleDateModal() {
 		dateModalOpen = !dateModalOpen;
 	}
 
-	function setDatePreset(key: '1h' | '24h' | '7d' | '14d' | '30d' | 'custom', label: string) {
-		selectedDatePreset = key;
-		selectedDateLabel = label;
-		if (key !== 'custom') {
-			dateModalOpen = false;
-		}
-	}
-
-	function applyCustomDateRange() {
-		if (customDateStart || customDateEnd) {
-			const s = customDateStart ? customDateStart.replace('T', ' ') : 'Any';
-			const e = customDateEnd ? customDateEnd.replace('T', ' ') : 'Now';
-			selectedDateLabel = `${s} → ${e}`;
-		} else {
-			selectedDateLabel = 'Custom Range';
-		}
-		selectedDatePreset = 'custom';
+	// *Cancel* closes WITHOUT navigating and drops the draft.
+	function cancelDateModal() {
+		customDateStart = toLocalInput(data.filters.seen_from);
+		customDateEnd = toLocalInput(data.filters.seen_to);
 		dateModalOpen = false;
 	}
 
-	// Facet Filter State (Claim & Triage, Platform)
-	// Supports 'all', 'unclaimed', 'claimed-me', 'claimed-agent', or a specific claimant identifier string
-	let claimFilter = $derived(data.filters.claim ?? 'all');
-	let platformFilter = $state<string>('all');
+	function pickDatePreset(key: string) {
+		dateModalOpen = false;
+		goto(href({ seen: key, seen_from: '', seen_to: '' }));
+	}
+
+	function clearDateRange() {
+		dateModalOpen = false;
+		goto(href({ seen: 'all', seen_from: '', seen_to: '' }));
+	}
+
+	function applyCustomDateRange() {
+		const from = customDateStart ? new Date(customDateStart) : null;
+		const to = customDateEnd ? new Date(customDateEnd) : null;
+		const iso = (d: Date | null) => (d && !Number.isNaN(d.getTime()) ? d.toISOString() : '');
+		dateModalOpen = false;
+		goto(href({ seen: 'all', seen_from: iso(from), seen_to: iso(to) }));
+	}
+
+	// "Reset all filters": keeps `project`, `sort` and `limit`, drops every other filter.
+	let anyFilterActive = $derived(
+		data.filters.status !== 'all' ||
+			data.filters.environment !== 'all' ||
+			data.filters.new !== 'all' ||
+			data.filters.claim !== 'all' ||
+			Boolean(data.filters.q) ||
+			data.filters.volume !== 'all' ||
+			dateRangeActive
+	);
+	let resetHref = $derived(
+		href({
+			status: 'all',
+			environment: 'all',
+			new: 'all',
+			claim: 'all',
+			q: '',
+			volume: 'all',
+			seen: 'all',
+			seen_from: '',
+			seen_to: '',
+		})
+	);
+
+	// Claim facet: 'all', 'unclaimed', 'claimed-me', 'claimed-agent', or the exact `assigned_to` value.
 
 	// True database claimant detection helper
 	function getIssueClaimInfo(issue: (typeof data.issues)[number]) {
@@ -218,9 +303,9 @@
 			return { type: 'unclaimed' as const, label: 'Unclaimed', assignee: null, assigneeType: null };
 		}
 
-		const isMe =
-			Boolean(data.currentUser) &&
-			(assignedTo === data.currentUser?.id || assignedTo === data.currentUser?.email);
+		// D7: the SAME rule as the server's `claimed-me`: a user-typed claim whose `assigned_to` is
+		// the current user's id. An email is not the user.
+		const isMe = assigneeType === 'user' && Boolean(data.currentUser) && assignedTo === data.currentUser?.id;
 
 		if (assigneeType === 'agent') {
 			const agentName = data.agentsById?.[assignedTo]?.name || assignedTo;
@@ -243,18 +328,6 @@
 		};
 	}
 
-	// Platform detection helper
-	function getIssuePlatform(issue: (typeof data.issues)[number]): { id: string; label: string } {
-		const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
-		if (text.includes('panic') || text.includes('goroutine') || text.includes('nil pointer') || text.includes('timeout')) {
-			return { id: 'go', label: 'Go (linux/amd64)' };
-		}
-		if (text.includes('syntaxerror') || text.includes('typeerror') || text.includes('unmarshal') || text.includes('node')) {
-			return { id: 'node', label: 'Node.js / TypeScript' };
-		}
-		return { id: 'browser', label: 'Browser (JS)' };
-	}
-
 	// Derived distinct claimants and counts from all issues in database across organization
 	let distinctClaimants = $derived.by(() => {
 		const list: Array<{ id: string; label: string; count: number; isAgent: boolean }> = [];
@@ -263,8 +336,9 @@
 		// 1. All users in the organizations (shows 0 if no claimed issues)
 		if (data.orgUsers && data.orgUsers.length > 0) {
 			for (const u of data.orgUsers) {
-				const count = (data.claimantFacets?.byClaimant?.[u.id] ?? 0) +
-					(u.email ? (data.claimantFacets?.byClaimant?.[u.email] ?? 0) : 0);
+				// D7: counted by the EXACT `assigned_to` value — the user's id only. A legacy row
+				// keyed by the user's email is its own row below, and filters by that exact value.
+				const count = data.facets.claim.byClaimant[u.id] ?? 0;
 				list.push({
 					id: u.id,
 					label: u.name || u.email,
@@ -272,14 +346,13 @@
 					isAgent: false,
 				});
 				addedIds.add(u.id);
-				if (u.email) addedIds.add(u.email);
 			}
 		}
 
 		// 2. All agents in the organizations (shows 0 if no claimed issues)
 		if (data.orgAgents && data.orgAgents.length > 0) {
 			for (const a of data.orgAgents) {
-				const count = data.claimantFacets?.byClaimant?.[a.id] ?? 0;
+				const count = data.facets.claim.byClaimant[a.id] ?? 0;
 				list.push({
 					id: a.id,
 					label: a.name,
@@ -291,10 +364,10 @@
 		}
 
 		// 3. Any additional claimants in database (e.g. claimants not in orgUsers/orgAgents list)
-		if (data.claimantFacets?.byClaimant) {
-			for (const [assigneeId, count] of Object.entries(data.claimantFacets.byClaimant)) {
+		{
+			for (const [assigneeId, count] of Object.entries(data.facets.claim.byClaimant)) {
 				if (!addedIds.has(assigneeId)) {
-					const isAgent = data.claimantFacets.claimantTypes?.[assigneeId] === 'agent';
+					const isAgent = data.facets.claim.claimantTypes[assigneeId] === 'agent';
 					const matchedUser = data.usersById?.[assigneeId];
 					const matchedAgent = data.agentsById?.[assigneeId];
 					const label = isAgent
@@ -313,134 +386,6 @@
 
 		return list.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 	});
-
-	// Derived counts for sidebar facets
-	let facetCounts = $derived.by(() => {
-		const all = data.issues;
-		const openCount = all.filter((i) => i.status === 'open').length;
-		const resolvedCount = all.filter((i) => i.status === 'resolved').length;
-		const ignoredCount = all.filter((i) => i.status === 'ignored').length;
-		const unresolvedCount = all.filter((i) => i.status !== 'resolved').length;
-
-		const now = Date.now();
-		const dayAgo = now - 24 * 60 * 60 * 1000;
-		const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
-
-		const new24hCount = all.filter((i) => i.firstSeen && new Date(i.firstSeen).getTime() >= dayAgo).length;
-		const regressedCount = all.filter((i) => i.regressionStatus === 'regressed').length;
-		const olderCount = all.filter((i) => i.firstSeen && new Date(i.firstSeen).getTime() < weekAgo).length;
-
-		const prodCount = all.filter((i) => i.environment === 'production').length;
-		const stagingCount = all.filter((i) => i.environment === 'staging').length;
-		const devCount = all.filter((i) => i.environment === 'development').length;
-
-		let unclaimedCount = 0;
-		let claimedMeCount = 0;
-		let claimedAgentCount = 0;
-
-		let goCount = 0;
-		let nodeCount = 0;
-		let browserCount = 0;
-
-		for (const iss of all) {
-			const claim = getIssueClaimInfo(iss);
-			if (claim.type === 'unclaimed') unclaimedCount++;
-			if (claim.type === 'claimed-me') claimedMeCount++;
-			if (claim.type === 'claimed-agent') claimedAgentCount++;
-
-			const plat = getIssuePlatform(iss);
-			if (plat.id === 'go') goCount++;
-			else if (plat.id === 'node') nodeCount++;
-			else browserCount++;
-		}
-
-		return {
-			unresolved: unresolvedCount,
-			open: openCount,
-			resolved: resolvedCount,
-			ignored: ignoredCount,
-			total: all.length,
-			new24h: new24hCount,
-			regressed: regressedCount,
-			older: olderCount,
-			production: prodCount,
-			staging: stagingCount,
-			development: devCount,
-			go: goCount,
-			node: nodeCount,
-			browser: browserCount,
-			unclaimed: unclaimedCount,
-			claimedMe: claimedMeCount,
-			claimedAgent: claimedAgentCount,
-		};
-	});
-
-	let filteredIssues = $derived.by(() => {
-		return data.issues.filter((issue) => {
-			if (quickChip === 'production' && issue.environment !== 'production') return false;
-			if (quickChip === 'staging' && issue.environment !== 'staging') return false;
-			if (quickChip === 'unhandled') {
-				const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
-				if (!text.includes('panic') && !text.includes('syntaxerror') && !text.includes('fatal')) return false;
-			}
-			if (quickChip === 'has-trace') {
-				const text = `${issue.errorClass} ${issue.message}`.toLowerCase();
-				if (text.includes('closed') || text.includes('unclaimed')) return false;
-			}
-			if (quickChip === 'high-volume' && Number(issue.count) < 50) return false;
-
-			// Date preset / custom range client-side narrowing
-			if (selectedDatePreset && selectedDatePreset !== 'custom') {
-				const now = Date.now();
-				const targetTimestamp = issue.lastSeen ? new Date(issue.lastSeen).getTime() : 0;
-				if (!targetTimestamp) return false;
-
-				let windowMs = 0;
-				if (selectedDatePreset === '1h') windowMs = 60 * 60 * 1000;
-				else if (selectedDatePreset === '24h') windowMs = 24 * 60 * 60 * 1000;
-				else if (selectedDatePreset === '7d') windowMs = 7 * 24 * 60 * 60 * 1000;
-				else if (selectedDatePreset === '14d') windowMs = 14 * 24 * 60 * 60 * 1000;
-				else if (selectedDatePreset === '30d') windowMs = 30 * 24 * 60 * 60 * 1000;
-
-				if (windowMs > 0 && now - targetTimestamp > windowMs) {
-					return false;
-				}
-			} else if (selectedDatePreset === 'custom') {
-				const targetTimestamp = issue.lastSeen ? new Date(issue.lastSeen).getTime() : 0;
-				if (!targetTimestamp) return false;
-
-				if (customDateStart) {
-					const startMs = new Date(customDateStart).getTime();
-					if (!isNaN(startMs) && targetTimestamp < startMs) return false;
-				}
-				if (customDateEnd) {
-					const endMs = new Date(customDateEnd).getTime();
-					if (!isNaN(endMs) && targetTimestamp > endMs) return false;
-				}
-			}
-
-			// Claimer facet
-			const claim = getIssueClaimInfo(issue);
-			if (claimFilter === 'unclaimed') {
-				if (claim.type !== 'unclaimed') return false;
-			} else if (claimFilter === 'claimed-me') {
-				if (claim.type !== 'claimed-me') return false;
-			} else if (claimFilter === 'claimed-agent') {
-				if (claim.type !== 'claimed-agent') return false;
-			} else if (claimFilter !== 'all') {
-				// Specific claimant filter (matches real assignedTo identifier)
-				if (claim.assignee !== claimFilter) return false;
-			}
-
-			// Platform facet
-			if (platformFilter !== 'all') {
-				const plat = getIssuePlatform(issue);
-				if (plat.id !== platformFilter) return false;
-			}
-
-			return true;
-		});
-	});
 </script>
 
 <!-- Decision 16's zero shape, stated once: the dash replaces the number only, on its own span. -->
@@ -452,15 +397,19 @@
 		<ul>
 			<li>
 				<a href={href({ project: 'all' })}
+				   aria-label="All Projects"
 				   class:active={data.filters.project === 'all'}>
 					<span>All Projects</span>
+					<strong class="count-badge">{data.facets.project.all}</strong>
 				</a>
 			</li>
 			{#each data.projects as project}
 				<li>
 					<a href={href({ project: project.id })}
+				   aria-label={project.name}
 					   class:active={data.filters.project === project.id}>
 						<span>{project.name}</span>
+						<strong class="count-badge">{data.facets.project.byProject[project.id] ?? 0}</strong>
 					</a>
 				</li>
 			{/each}
@@ -468,38 +417,16 @@
 
 		<h2>Status</h2>
 		<ul>
-			<li>
-				<a href={href({ status: 'all' })}
-				   aria-label="All"
-				   class:active={data.filters.status === 'all'}>
-					<span>All</span>
-					<strong class="count-badge">{facetCounts.total}</strong>
-				</a>
-			</li>
-			<li>
-				<a href={href({ status: 'open' })}
-				   aria-label="Open"
-				   class:active={data.filters.status === 'open'}>
-					<span>Open</span>
-					<strong class="count-badge">{facetCounts.open}</strong>
-				</a>
-			</li>
-			<li>
-				<a href={href({ status: 'resolved' })}
-				   aria-label="Resolved"
-				   class:active={data.filters.status === 'resolved'}>
-					<span>Resolved</span>
-					<strong class="count-badge">{facetCounts.resolved}</strong>
-				</a>
-			</li>
-			<li>
-				<a href={href({ status: 'ignored' })}
-				   aria-label="Ignored"
-				   class:active={data.filters.status === 'ignored'}>
-					<span>Ignored</span>
-					<strong class="count-badge">{facetCounts.ignored}</strong>
-				</a>
-			</li>
+			{#each statusOptions as option (option.value)}
+				<li>
+					<a href={href({ status: option.value })}
+					   aria-label={option.label}
+					   class:active={data.filters.status === option.value}>
+						<span>{option.label}</span>
+						<strong class="count-badge">{data.facets.status[option.value]}</strong>
+					</a>
+				</li>
+			{/each}
 		</ul>
 
 		<!--
@@ -518,10 +445,8 @@
 					   class:active={data.filters.new === option.value}
 					   data-testid="new-{option.value}">
 						<span>{option.label}</span>
+						<strong class="count-badge">{option.value === '24h' ? data.facets.age.new24h : data.facets.age.all}</strong>
 					</a>
-					{#if option.value === '24h'}
-						<strong class="count-badge">{facetCounts.new24h}</strong>
-					{/if}
 				</li>
 			{/each}
 		</ul>
@@ -559,6 +484,7 @@
 						   aria-label="All Environments"
 						   class:active={data.filters.environment === 'all'}>
 							<span>All Environments</span>
+							<strong class="count-badge">{data.facets.environment.all}</strong>
 						</a>
 					</li>
 					{#each environments as environment (environment.name)}
@@ -567,11 +493,7 @@
 							   aria-label={environment.displayName}
 							   class:active={data.filters.environment === environment.name}>
 								<span>{environment.displayName}</span>
-								{#if environment.name === 'production'}
-									<strong class="count-badge">{facetCounts.production}</strong>
-								{:else if environment.name === 'staging'}
-									<strong class="count-badge">{facetCounts.staging}</strong>
-								{/if}
+								<strong class="count-badge">{data.facets.environment.byEnvironment[environment.name] ?? 0}</strong>
 							</a>
 						</li>
 					{/each}
@@ -593,54 +515,6 @@
 			{/if}
 		{/if}
 
-		<!-- Platform / Runtime Facet -->
-		<h2>Platform</h2>
-		<ul class="facet-list">
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={platformFilter === 'all'}
-					onclick={() => (platformFilter = 'all')}
-				>
-					<span>All Runtimes</span>
-				</button>
-			</li>
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={platformFilter === 'go'}
-					onclick={() => (platformFilter = 'go')}
-				>
-					<span>Go (linux/amd64)</span>
-					<strong class="count-badge">{facetCounts.go}</strong>
-				</button>
-			</li>
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={platformFilter === 'node'}
-					onclick={() => (platformFilter = 'node')}
-				>
-					<span>Node.js / TypeScript</span>
-					<strong class="count-badge">{facetCounts.node}</strong>
-				</button>
-			</li>
-			<li>
-				<button
-					type="button"
-					class="facet-btn"
-					class:active={platformFilter === 'browser'}
-					onclick={() => (platformFilter = 'browser')}
-				>
-					<span>Browser (JS)</span>
-					<strong class="count-badge">{facetCounts.browser}</strong>
-				</button>
-			</li>
-		</ul>
-
 		<!-- Claim & Triage Status Facet -->
 		<h2>Claim & Triage Status</h2>
 		<ul class="facet-list">
@@ -651,7 +525,7 @@
 					class:active={data.filters.claim === 'all'}
 				>
 					<span>All Issues</span>
-					<strong class="count-badge">{data.claimantFacets?.total ?? facetCounts.total}</strong>
+					<strong class="count-badge">{data.facets.claim.total}</strong>
 				</a>
 			</li>
 			<li>
@@ -661,7 +535,7 @@
 					class:active={data.filters.claim === 'unclaimed'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-open">⚪</span> Unclaimed</span>
-					<strong class="count-badge">{data.claimantFacets?.unclaimed ?? facetCounts.unclaimed}</strong>
+					<strong class="count-badge">{data.facets.claim.unclaimed}</strong>
 				</a>
 			</li>
 			<li>
@@ -671,7 +545,7 @@
 					class:active={data.filters.claim === 'claimed-me'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-primary">🔵</span> Claimed by Me</span>
-					<strong class="count-badge">{data.claimantFacets?.claimedMe ?? facetCounts.claimedMe}</strong>
+					<strong class="count-badge">{data.facets.claim.claimedMe}</strong>
 				</a>
 			</li>
 			<li>
@@ -681,7 +555,7 @@
 					class:active={data.filters.claim === 'claimed-agent'}
 				>
 					<span class="facet-label-with-icon"><span class="icon-agent">🤖</span> Claimed by Agent</span>
-					<strong class="count-badge">{data.claimantFacets?.claimedAgent ?? facetCounts.claimedAgent}</strong>
+					<strong class="count-badge">{data.facets.claim.claimedAgent}</strong>
 				</a>
 			</li>
 		</ul>
@@ -768,57 +642,24 @@
 				<div class="quick-chips-and-date-row">
 					<div class="quick-chips-row">
 						<span class="quick-filter-label">Quick Filters:</span>
-						<button
-							type="button"
+						<a
+							href={href({ volume: 'all' })}
 							class="chip-btn"
-							class:active={quickChip === 'all'}
-							onclick={() => (quickChip = 'all')}
+							class:active={data.filters.volume === 'all'}
 						>
 							All
-						</button>
-						<button
-							type="button"
+						</a>
+						<a
+							href={href({ volume: 'high' })}
 							class="chip-btn"
-							class:active={quickChip === 'unhandled'}
-							onclick={() => (quickChip = 'unhandled')}
+							class:active={data.filters.volume === 'high'}
+							data-testid="volume-high"
 						>
-							Unhandled Only
-						</button>
-						<button
-							type="button"
-							class="chip-btn"
-							class:active={quickChip === 'production'}
-							onclick={() => (quickChip = 'production')}
-						>
-							production
-						</button>
-						<button
-							type="button"
-							class="chip-btn"
-							class:active={quickChip === 'staging'}
-							onclick={() => (quickChip = 'staging')}
-						>
-							staging
-						</button>
-						<button
-							type="button"
-							class="chip-btn"
-							class:active={quickChip === 'has-trace'}
-							onclick={() => (quickChip = 'has-trace')}
-						>
-							Has Trace ID
-						</button>
-						<button
-							type="button"
-							class="chip-btn"
-							class:active={quickChip === 'high-volume'}
-							onclick={() => (quickChip = 'high-volume')}
-						>
-							&gt; 100 Events
-						</button>
+							100+ events
+						</a>
 					</div>
 
-					<!-- Immersive Date Range Selector Trigger & Popover -->
+					<!-- Date range: a server filter on `last_seen` (`seen`, `seen_from`, `seen_to`). -->
 					<div class="date-picker-wrapper">
 						<button
 							type="button"
@@ -835,18 +676,15 @@
 							<div class="date-picker-popover" role="dialog" aria-modal="true" tabindex="-1">
 								<div class="popover-header">
 									<strong class="popover-title">Select Date & Time Range</strong>
-									<button type="button" class="btn-popover-close" onclick={toggleDateModal}>✕</button>
+									<button type="button" class="btn-popover-close" onclick={cancelDateModal}>✕</button>
 								</div>
 
 								<div class="presets-section">
 									<span class="presets-label">Presets</span>
 									<div class="presets-grid">
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === '1h'} onclick={() => setDatePreset('1h', 'Last 1 Hour')}>1 Hour</button>
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === '24h'} onclick={() => setDatePreset('24h', 'Last 24 Hours')}>24 Hours</button>
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === '7d'} onclick={() => setDatePreset('7d', 'Last 7 Days')}>7 Days</button>
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === '14d'} onclick={() => setDatePreset('14d', 'Last 14 Days')}>14 Days</button>
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === '30d'} onclick={() => setDatePreset('30d', 'Last 30 Days')}>30 Days</button>
-										<button type="button" class="btn-preset" class:active={selectedDatePreset === 'custom'} onclick={() => setDatePreset('custom', 'Custom')}>Custom</button>
+										{#each seenPresets as preset (preset.key)}
+											<button type="button" class="btn-preset" class:active={data.filters.seen === preset.key} onclick={() => pickDatePreset(preset.key)}>{preset.button}</button>
+										{/each}
 									</div>
 								</div>
 
@@ -872,7 +710,10 @@
 								</div>
 
 								<div class="popover-actions">
-									<button type="button" class="btn-cancel" onclick={toggleDateModal}>Cancel</button>
+									{#if dateRangeActive}
+										<button type="button" class="btn-cancel" onclick={clearDateRange}>Clear</button>
+									{/if}
+									<button type="button" class="btn-cancel" onclick={cancelDateModal}>Cancel</button>
 									<button type="button" class="btn-apply" onclick={applyCustomDateRange}>Apply Range</button>
 								</div>
 							</div>
@@ -881,35 +722,17 @@
 				</div>
 
 				<div class="sub-filter-status-row">
-					<span class="filter-count-readout">Showing {filteredIssues.length} matching issue{filteredIssues.length === 1 ? '' : 's'}</span>
-					{#if searchQuery || data.filters.q || quickChip !== 'all' || claimFilter !== 'all' || platformFilter !== 'all' || selectedDatePreset !== null}
-						<button
-							type="button"
-							class="btn-reset-filters"
-							onclick={() => {
-								searchQuery = '';
-								quickChip = 'all';
-								platformFilter = 'all';
-								selectedDatePreset = null;
-								selectedDateLabel = 'Date Range';
-								customDateStart = '';
-								customDateEnd = '';
-								if (data.filters.q) {
-									handleSearchCommit('');
-								}
-							}}
-						>
-							Reset all filters
-						</button>
+					<span class="filter-count-readout">Showing {data.pagination.total.toLocaleString()} matching issue{data.pagination.total === 1 ? '' : 's'}</span>
+					{#if anyFilterActive}
+						<a class="btn-reset-filters" href={resetHref} data-testid="reset-filters">Reset all filters</a>
 					{/if}
 				</div>
 			</div>
 		</div>
 
 		<div class="issue-grid" class:compact={displayMode === 'compact'}>
-			{#each filteredIssues as issue}
+			{#each data.issues as issue}
 				{@const claimInfo = getIssueClaimInfo(issue)}
-				{@const platInfo = getIssuePlatform(issue)}
 				<a href="/issues/{issue.id}" class="issue-card" class:compact={displayMode === 'compact'}>
 					<div class="card-header">
 						<span class="error-class">{issue.errorClass}</span>
@@ -981,7 +804,7 @@
 						<span class="last-seen">Last seen: {formatDate(issue.lastSeen)}</span>
 					</div>
 					<div class="meta">
-						<span class="project">{issue.projectName} • {platInfo.label}</span>
+						<span class="project">{issue.projectName}</span>
 						<!--
 							Flow `L8`. `issues.environment` is a column on the row the loader already
 							selects — no extra query, no aggregate — and the chip is on every row whether
@@ -989,8 +812,7 @@
 							see which environment each issue is in.
 						-->
 						<span class="environment-chip" data-testid="issue-environment">{issue.environment}</span>
-						<span class="status {issue.status}">{issue.status}</span>
-					</div>
+						</div>
 				</a>
 			{:else}
 				<!--
@@ -1306,31 +1128,6 @@
 		background: none;
 	}
 
-	.status {
-		padding: 0.125rem 0.5rem;
-		border-radius: var(--radius-sm);
-		font-family: var(--font-mono);
-		font-size: 0.6875rem;
-		text-transform: uppercase;
-		font-weight: 600;
-		letter-spacing: 0.05em;
-	}
-
-	.status.open {
-		background: var(--status-open-bg);
-		color: var(--status-open-text);
-	}
-
-	.status.resolved {
-		background: var(--status-resolved-bg);
-		color: var(--status-resolved-text);
-	}
-
-	.status.ignored {
-		background: var(--status-ignored-bg);
-		color: var(--status-ignored-text);
-	}
-
 	.pagination {
 		display: flex;
 		flex-wrap: wrap;
@@ -1514,6 +1311,7 @@
 
 	.chip-btn {
 		padding: 0.25rem 0.75rem;
+		text-decoration: none;
 		border-radius: var(--radius-full);
 		font-size: 0.75rem;
 		font-weight: 500;
@@ -1918,7 +1716,7 @@
 		letter-spacing: 0.05em;
 	}
 
-	.badge-pill.status-pill.open {
+	.badge-pill.status-pill.unresolved {
 		background: var(--status-open-bg);
 		color: var(--status-open-text);
 		border: 1px solid var(--status-open-border);

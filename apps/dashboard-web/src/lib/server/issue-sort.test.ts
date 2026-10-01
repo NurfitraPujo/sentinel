@@ -74,3 +74,34 @@ describe('coerceIssueNewFilter (decision 6)', () => {
 		expect(firstSeenLowerBound('all', now)).toBeUndefined();
 	});
 });
+
+describe('fix-sentinel-issues-dashboard coercions', () => {
+	it('status: open is an alias of unresolved; unknown is all', async () => {
+		const { coerceIssueStatus } = await import('./issue-sort');
+		expect(coerceIssueStatus('open')).toBe('unresolved');
+		for (const v of ['all', 'unresolved', 'resolved', 'ignored'] as const) {
+			expect(coerceIssueStatus(v)).toBe(v);
+		}
+		for (const v of ['banana', '', null, undefined, 'OPEN']) expect(coerceIssueStatus(v)).toBe('all');
+	});
+
+	it('volume and seen: unknown is all; the seen bound is now minus the window', async () => {
+		const { coerceIssueVolume, coerceIssueSeen, seenLowerBound } = await import('./issue-sort');
+		expect(coerceIssueVolume('high')).toBe('high');
+		expect(coerceIssueVolume('banana')).toBe('all');
+		expect(coerceIssueSeen('14d')).toBe('14d');
+		expect(coerceIssueSeen('2d')).toBe('all');
+		const now = new Date('2026-10-01T00:00:00Z');
+		expect(seenLowerBound('1h', now)).toEqual(new Date('2026-09-30T23:00:00Z'));
+		expect(seenLowerBound('30d', now)).toEqual(new Date('2026-09-01T00:00:00Z'));
+		expect(seenLowerBound('all', now)).toBeUndefined();
+	});
+
+	it('parseSeenInstant ignores the unparsable; coercePage floors at 1', async () => {
+		const { parseSeenInstant, coercePage } = await import('./issue-sort');
+		expect(parseSeenInstant('nonsense')).toBeUndefined();
+		expect(parseSeenInstant('')).toBeUndefined();
+		expect(parseSeenInstant('2026-09-01T00:00:00Z')).toEqual(new Date('2026-09-01T00:00:00Z'));
+		expect([coercePage('0'), coercePage('-2'), coercePage('abc'), coercePage(null), coercePage('7')]).toEqual([1, 1, 1, 1, 7]);
+	});
+});

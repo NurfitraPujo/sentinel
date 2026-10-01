@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { screen } from '@testing-library/svelte';
+import { render, EMPTY_FACETS } from './page-fixtures';
 import Page from './+page.svelte';
 import type { PageData } from './$types';
 
@@ -36,7 +37,7 @@ function issue(overrides: Record<string, unknown> = {}) {
 		lastSeen: '2026-09-12T10:00:00.000Z',
 		projectName: 'Checkout API',
 		environment: 'production',
-		status: 'open',
+		status: 'unresolved',
 		affectedUserCount: 1234,
 		affectedTenantCount: 3,
 		regressionStatus: 'none',
@@ -202,8 +203,8 @@ describe('/ sort group gains Occurrences and First seen (contract §4.1, flows L
 describe('/ the new filter anchors and href() (contract §4.1, flows L4–L7, decision 6)', () => {
 	it('renders new-all and new-24h, the active class from filters.new, 24h carried and all omitted', () => {
 		const all = render(Page, { data: pageData() as unknown as PageData });
-		expect(text(screen.getByTestId('new-all'))).toBe('All');
-		expect(text(screen.getByTestId('new-24h'))).toBe('New in the last 24 hours');
+		expect(text(screen.getByTestId('new-all'))).toBe('All 0');
+		expect(text(screen.getByTestId('new-24h'))).toBe('New in the last 24 hours 0');
 		expect(screen.getByTestId('new-all').classList.contains('active')).toBe(true);
 		expect(screen.getByTestId('new-24h').classList.contains('active')).toBe(false);
 		expect(screen.getByTestId('new-24h').getAttribute('href')).toBe(
@@ -231,17 +232,17 @@ describe('/ the new filter anchors and href() (contract §4.1, flows L4–L7, de
 		render(Page, {
 			data: pageData({
 				environments: [{ id: 'env-1', name: 'production', displayName: 'Production' }],
-				filters: filters({ status: 'open', environment: 'production', sort: 'count', new: '24h' }),
+				filters: filters({ status: 'unresolved', environment: 'production', sort: 'count', new: '24h' }),
 				pagination: { page: 2, limit: 20, total: 60, totalPages: 3 },
 			}) as unknown as PageData,
 		});
 
 		// Paging.
 		expect(screen.getByRole('link', { name: 'Next' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=count&new=24h&page=3'
+			'?status=unresolved&project=proj-1&environment=production&sort=count&new=24h&page=3'
 		);
 		expect(screen.getByRole('link', { name: 'Previous' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=count&new=24h'
+			'?status=unresolved&project=proj-1&environment=production&sort=count&new=24h'
 		);
 		// Status.
 		expect(screen.getByRole('link', { name: 'Resolved' }).getAttribute('href')).toBe(
@@ -249,22 +250,22 @@ describe('/ the new filter anchors and href() (contract §4.1, flows L4–L7, de
 		);
 		// Sort.
 		expect(screen.getByTestId('sort-first_seen').getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=first_seen&new=24h'
+			'?status=unresolved&project=proj-1&environment=production&sort=first_seen&new=24h'
 		);
 		// Environment.
 		expect(screen.getByRole('link', { name: 'Production' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=count&new=24h'
+			'?status=unresolved&project=proj-1&environment=production&sort=count&new=24h'
 		);
 		// Project — `new` survives; only `environment` resets.
 		expect(screen.getByRole('link', { name: 'Billing' }).getAttribute('href')).toBe(
-			'?status=open&project=proj-2&sort=count&new=24h'
+			'?status=unresolved&project=proj-2&sort=count&new=24h'
 		);
 		expect(screen.getByRole('link', { name: 'All Projects' }).getAttribute('href')).toBe(
-			'?status=open&project=all&sort=count&new=24h'
+			'?status=unresolved&project=all&sort=count&new=24h'
 		);
 		// The `new` anchors themselves: the other value, and no `page` — a filter change starts at 1.
 		expect(screen.getByTestId('new-all').getAttribute('href')).toBe(
-			'?status=open&project=proj-1&environment=production&sort=count'
+			'?status=unresolved&project=proj-1&environment=production&sort=count'
 		);
 		expect(screen.getByTestId('new-24h').getAttribute('href')).not.toContain('page=');
 	});
@@ -401,7 +402,9 @@ describe('/ everything else on the card is unchanged (flow L11)', () => {
 		);
 		expect(text(document.querySelector('.last-seen'))).toMatch(/^Last seen: /);
 		expect(text(screen.getByTestId('issue-environment'))).toBe('production');
-		expect(text(document.querySelector('.meta .status'))).toBe('open');
+		// D2/D9: the status is shown ONCE, in the header pill, and it is the real value.
+		expect(text(document.querySelector('.status-pill'))).toBe('UNRESOLVED');
+		expect(document.querySelector('.meta .status')).toBeNull();
 	});
 });
 
@@ -415,7 +418,19 @@ describe('/ true claimant detection and dynamic claimers', () => {
 		expect(text(document.querySelector('.claim-badge'))).toBe('Unclaimed');
 	});
 
-	it('renders Claimed by Me when assignedTo matches currentUser email or id', () => {
+	it('renders Claimed by Me when a user claim\'s assignedTo is the current user id — the server\'s rule (D7)', () => {
+		render(Page, {
+			data: {
+				...pageData({
+					issues: [issue({ assignedTo: 'usr-1', assigneeType: 'user' })],
+				}),
+				currentUser: { id: 'usr-1', email: 'fitrapujo@gmail.com' },
+			} as unknown as PageData,
+		});
+		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed by Me');
+	});
+
+	it('does NOT render Claimed by Me for a legacy claim keyed by the user email — the server would not match it (D7)', () => {
 		render(Page, {
 			data: {
 				...pageData({
@@ -424,7 +439,7 @@ describe('/ true claimant detection and dynamic claimers', () => {
 				currentUser: { id: 'usr-1', email: 'fitrapujo@gmail.com' },
 			} as unknown as PageData,
 		});
-		expect(text(document.querySelector('.claim-badge'))).toBe('Claimed by Me');
+		expect(text(document.querySelector('.claim-badge'))).not.toBe('Claimed by Me');
 	});
 
 	it('renders Claimed: <assignee> when assigned to another user', () => {
@@ -472,14 +487,14 @@ describe('/ true claimant detection and dynamic claimers', () => {
 				agentsById: {
 					'agent-uuid-456': { id: 'agent-uuid-456', name: 'AutoFix Agent' },
 				},
-				claimantFacets: {
+				facets: { ...EMPTY_FACETS, claim: {
 					total: 1,
 					unclaimed: 0,
 					claimedMe: 0,
 					claimedAgent: 1,
 					byClaimant: { 'agent-uuid-456': 1 },
 					claimantTypes: { 'agent-uuid-456': 'agent' },
-				},
+				} },
 			} as unknown as PageData,
 		});
 		expect(text(document.querySelector('.claim-badge'))).toBe('🤖 AutoFix Agent');
@@ -496,14 +511,14 @@ describe('/ true claimant detection and dynamic claimers', () => {
 		render(Page, {
 			data: {
 				...pageData({ issues: [] }),
-				claimantFacets: {
+				facets: { ...EMPTY_FACETS, claim: {
 					total: 4,
 					unclaimed: 1,
 					claimedMe: 1,
 					claimedAgent: 1,
 					byClaimant: { 'user-1': 1, 'agent-x': 1 },
 					claimantTypes: { 'agent-x': 'agent' },
-				},
+				} },
 				orgUsers: [
 					{ id: 'user-1', name: 'Bob Builder', email: 'bob@build.com' },
 					{ id: 'user-2', name: 'Charlie', email: 'charlie@build.com' },

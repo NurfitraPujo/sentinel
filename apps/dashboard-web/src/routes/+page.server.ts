@@ -5,7 +5,17 @@ import { getUser } from '$lib/server/auth';
 import { getAccessibleProjects } from '$lib/server/issue-access';
 import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
 import { listProjectEnvironments, toEnvironmentApiShape } from '$lib/db/queries/environments';
-import { coerceIssueNewFilter, coerceIssueSort, firstSeenLowerBound } from '$lib/server/issue-sort';
+import {
+	coerceIssueNewFilter,
+	coerceIssueSeen,
+	coerceIssueSort,
+	coerceIssueStatus,
+	coerceIssueVolume,
+	coercePage,
+	firstSeenLowerBound,
+	parseSeenInstant,
+	seenLowerBound,
+} from '$lib/server/issue-sort';
 import { getRetentionDays } from '$lib/server/retention-window';
 import { listTrendWindow, TREND_HOURLY_SLOTS } from '$lib/server/trend-window';
 
@@ -41,12 +51,15 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	// unrestricted, never denied.
 	const environmentScopes = await resolveEnvironmentScopes(user.id);
 
-	const statusFilter = url.searchParams.get('status') ?? 'all';
+	// D2: coerced like `sort` and `new` — `open` is an alias of `unresolved`, anything unknown is
+	// `all`, and the COERCED value is what the queries see and what `filters.status` echoes.
+	const statusFilter = coerceIssueStatus(url.searchParams.get('status'));
 	const projectIdFilter = url.searchParams.get('project') ?? 'all';
 	const environmentFilter = url.searchParams.get('environment') ?? 'all';
 	const claimFilter = url.searchParams.get('claim') ?? 'all';
 	const searchQuery = url.searchParams.get('q')?.trim() || '';
-	const page = parseInt(url.searchParams.get('page') ?? '1', 10);
+	// D4: an integer >= 1; clamped to the last page once the total is known (below).
+	const requestedPage = coercePage(url.searchParams.get('page'));
 	const ALLOWED_LIMITS = [20, 50, 100] as const;
 	const parsedLimit = parseInt(url.searchParams.get('limit') ?? '20', 10);
 	const limit = ALLOWED_LIMITS.includes(parsedLimit as any) ? parsedLimit : 20;
@@ -78,6 +91,15 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const newFilter = coerceIssueNewFilter(url.searchParams.get('new'));
 	const firstSeenAfter = firstSeenLowerBound(newFilter, now);
 
+	// D3: `volume`, `seen` and the custom range are server filters like `new`. A preset wins over a
+	// custom range; an unparsable `seen_from` / `seen_to` is ignored, never a 500. The echo is the
+	// effective value, so the page's trigger label and `href()` agree with what the query did.
+	const volume = coerceIssueVolume(url.searchParams.get('volume'));
+	const seen = coerceIssueSeen(url.searchParams.get('seen'));
+	const seenFrom = seen === 'all' ? parseSeenInstant(url.searchParams.get('seen_from')) : undefined;
+	const seenTo = seen === 'all' ? parseSeenInstant(url.searchParams.get('seen_to')) : undefined;
+	const seenAfter = seen === 'all' ? seenFrom : seenLowerBound(seen, now);
+
 	const baseFilters = {
 		status: statusFilter,
 		projectId: projectIdFilter,
@@ -86,6 +108,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		environmentScopes,
 		// The SAME `Date` to both queries (below), never recomputed per call.
 		firstSeenAfter,
+		volume,
+		seenAfter,
+		seenBefore: seenTo,
 		q: searchQuery || undefined,
 	};
 
@@ -97,17 +122,25 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 
 	const orgIds = Array.from(new Set(accessibleProjects.map((p) => p.organizationId).filter(Boolean)));
 
-	const [results, userProjects, total, claimantFacets, orgUsersList, orgAgentsList] = await Promise.all([
-		// `sort` goes to the list ONLY. It changes the `ORDER BY` of the guarded query and nothing
-		// about its `WHERE` — `buildIssueConditions` never reads it — and `countIssues` takes the
-		// filters WITHOUT it: `pagination.total` does not change with the order.
-		issueQueries.listIssues({ ...filters, sort }, page, limit),
+	const [userProjects, total, facets, orgUsersList, orgAgentsList] = await Promise.all([
 		issueQueries.listProjects(authorizedProjectIds),
 		issueQueries.countIssues(filters),
-		issueQueries.getClaimantFacetCounts(baseFilters, user.id),
+		// §4.1: every sidebar number, from the database, through the same guarded condition builder.
+		// `filters` carries `claim`; the reader drops each group's OWN filter itself.
+		issueQueries.getIssueFacets(filters, now, user.id),
 		issueQueries.listOrgUsers(orgIds),
 		issueQueries.listOrgAgents(orgIds),
 	]);
+
+	// D4: a page past the end clamps to the last page (1 when there are none) — never a 500, never
+	// an empty page 7 under a total that has matches.
+	const totalPages = Math.ceil(total / limit);
+	const page = totalPages === 0 ? 1 : Math.min(requestedPage, totalPages);
+
+	// `sort` goes to the list ONLY. It changes the `ORDER BY` of the guarded query and nothing
+	// about its `WHERE` — `buildIssueConditions` never reads it — and `countIssues` takes the
+	// filters WITHOUT it: `pagination.total` does not change with the order.
+	const results = await issueQueries.listIssues({ ...filters, sort }, page, limit);
 
 	// De-duplicate and map orgAgents
 	const agentsById: Record<string, { id: string; name: string }> = {};
@@ -187,7 +220,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		issues: issuesWithProject,
 		projects: userProjects,
 		environments,
-		claimantFacets,
+		facets,
 		usersById,
 		orgUsers,
 		agentsById,
@@ -210,6 +243,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			new: newFilter,
 			claim: claimFilter,
 			q: searchQuery,
+			volume,
+			seen,
+			// ISO strings (or '') — the page derives the date trigger's label from the echo.
+			seen_from: seenFrom?.toISOString() ?? '',
+			seen_to: seenTo?.toISOString() ?? '',
 		},
 		// §4.1, decision 21 — top level, beside `filters`. The window every count label carries
 		// ("in the last N days"); a template cannot read `$env/dynamic/private`, and the number has
@@ -219,7 +257,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			page,
 			limit,
 			total,
-			totalPages: Math.ceil(total / limit),
+			totalPages,
 		},
 	};
 };
