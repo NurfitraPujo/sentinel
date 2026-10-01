@@ -26,6 +26,7 @@ if (GOOGLE_WORKSPACE_CLIENT_ID && GOOGLE_WORKSPACE_CLIENT_SECRET) {
 		Google({
 			clientId: GOOGLE_WORKSPACE_CLIENT_ID,
 			clientSecret: GOOGLE_WORKSPACE_CLIENT_SECRET,
+			allowDangerousEmailAccountLinking: true,
 		})
 	);
 }
@@ -35,6 +36,7 @@ if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
 		GitHub({
 			clientId: GITHUB_CLIENT_ID,
 			clientSecret: GITHUB_CLIENT_SECRET,
+			allowDangerousEmailAccountLinking: true,
 		})
 	);
 }

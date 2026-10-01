@@ -22,7 +22,11 @@
 
 		{#if error || errorParam}
 			<div class="alert error">
-				<span>Authentication error: {error || errorParam}</span>
+				{#if error === 'OAuthAccountNotLinked'}
+					<span>An account with this email address already exists. Please sign in with your original method or link your account.</span>
+				{:else}
+					<span>Authentication error: {error || errorParam}</span>
+				{/if}
 			</div>
 		{/if}
 
