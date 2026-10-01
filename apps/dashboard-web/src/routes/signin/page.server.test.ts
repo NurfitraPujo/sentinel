@@ -98,6 +98,14 @@ describe('/signin actions', () => {
 		expect(sent.get('providerId')).toBe('google');
 	});
 
+	it('exposes a github action that drives signIn with providerId=github', async () => {
+		await actions.github(makeEvent({}));
+
+		const [authEvent] = signInMock.mock.calls[0];
+		const sent = await authEvent.request.formData();
+		expect(sent.get('providerId')).toBe('github');
+	});
+
 	it('load reports the sent flag off the query string', async () => {
 		const sent: any = await load({ url: new URL('https://sentinel.test/signin?sent=1') } as any);
 		const fresh: any = await load({ url: new URL('https://sentinel.test/signin') } as any);

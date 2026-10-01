@@ -58,6 +58,8 @@ externalSecrets:
     SETTINGS_ENCRYPTION_KEY: "/tuju/production/sentinel/shared/SETTINGS_ENCRYPTION_KEY"
     S3_ACCESS_KEY: "/tuju/production/sentinel/shared/S3_ACCESS_KEY"
     S3_SECRET_KEY: "/tuju/production/sentinel/shared/S3_SECRET_KEY"
+    GITHUB_CLIENT_ID: "/tuju/production/sentinel/shared/GITHUB_CLIENT_ID"
+    GITHUB_CLIENT_SECRET: "/tuju/production/sentinel/shared/GITHUB_CLIENT_SECRET"
 
 # -----------------------------------------------------------------------------
 # First-party images (ECR, tuju prod account 576329195570, ap-southeast-1).

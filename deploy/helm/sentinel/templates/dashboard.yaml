@@ -111,6 +111,14 @@ spec:
             - name: GOOGLE_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_SECRET } }
             {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "GITHUB_CLIENT_ID") }}
+            - name: GITHUB_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GITHUB_CLIENT_ID } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "GITHUB_CLIENT_SECRET") }}
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GITHUB_CLIENT_SECRET } }
+            {{- end }}
             - name: EMAIL_SERVER
               valueFrom: { secretKeyRef: { name: {{ $secret }}, key: EMAIL_SERVER } }
             # sentinel-sourcemaps §12: adapter-node's request-body cap and POST /api/sourcemaps's

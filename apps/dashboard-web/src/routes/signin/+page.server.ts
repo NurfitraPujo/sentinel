@@ -42,6 +42,8 @@ function authEventFor(event: RequestEvent, fields: Record<string, string>): Requ
 export const load: PageServerLoad = async ({ url }) => {
 	return {
 		emailConfigured: !!env.EMAIL_SERVER,
+		githubConfigured: !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET),
+		googleConfigured: !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
 		// Auth.js redirects here after it has accepted the address and dispatched the mail; see
 		// `pages.verifyRequest` in auth-config.ts.
 		linkSent: url.searchParams.get('sent') === '1',
@@ -54,6 +56,10 @@ export const actions: Actions = {
 	// as the magic link.
 	google: async (event) => {
 		await signIn(authEventFor(event, { providerId: 'google', redirectTo: '/' }));
+	},
+
+	github: async (event) => {
+		await signIn(authEventFor(event, { providerId: 'github', redirectTo: '/' }));
 	},
 
 	magiclink: async (event) => {

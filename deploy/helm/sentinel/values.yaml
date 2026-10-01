@@ -69,6 +69,8 @@ secrets:
     CRON_SECRET: "change-me-cron-secret"
     GOOGLE_CLIENT_ID: ""
     GOOGLE_CLIENT_SECRET: ""
+    GITHUB_CLIENT_ID: ""
+    GITHUB_CLIENT_SECRET: ""
     # SMTP DSN for invitation / magic-link email. Without it, invitations cannot be delivered
     # (a deliberate consequence of design decision D06). e.g. smtp://user:pass@smtp.host:587
     EMAIL_SERVER: ""

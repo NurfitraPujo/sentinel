@@ -1,5 +1,6 @@
 import { SvelteKitAuth } from '@auth/sveltekit';
 import Google from '@auth/core/providers/google';
+import GitHub from '@auth/core/providers/github';
 import Email from '@auth/core/providers/email';
 import { env } from '$env/dynamic/private';
 import { CQRSAdapter } from './auth-adapter';
@@ -7,6 +8,8 @@ import { getUserProjectRoles } from './queries/project-members';
 
 const GOOGLE_WORKSPACE_CLIENT_ID = env.GOOGLE_CLIENT_ID;
 const GOOGLE_WORKSPACE_CLIENT_SECRET = env.GOOGLE_CLIENT_SECRET;
+const GITHUB_CLIENT_ID = env.GITHUB_CLIENT_ID;
+const GITHUB_CLIENT_SECRET = env.GITHUB_CLIENT_SECRET;
 // P3-4: env-driven, empty (unset) means allow all — a hardcoded literal made "no restriction"
 // inexpressible, permanently rejecting every Google account in any deployment that didn't happen to
 // use 'company.com'.
@@ -23,6 +26,15 @@ if (GOOGLE_WORKSPACE_CLIENT_ID && GOOGLE_WORKSPACE_CLIENT_SECRET) {
 		Google({
 			clientId: GOOGLE_WORKSPACE_CLIENT_ID,
 			clientSecret: GOOGLE_WORKSPACE_CLIENT_SECRET,
+		})
+	);
+}
+
+if (GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET) {
+	providers.push(
+		GitHub({
+			clientId: GITHUB_CLIENT_ID,
+			clientSecret: GITHUB_CLIENT_SECRET,
 		})
 	);
 }
@@ -57,7 +69,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 	providers,
 	callbacks: {
 		async signIn({ user, account }) {
-			if (account?.provider === 'google') {
+			if (account?.provider === 'google' || account?.provider === 'github') {
 				const email = user?.email;
 				if (!email) {
 					return false;

@@ -333,6 +333,8 @@ services:
             AUTH_TRUST_HOST: "true"
             GOOGLE_CLIENT_ID: ""
             GOOGLE_CLIENT_SECRET: ""
+            GITHUB_CLIENT_ID: ""
+            GITHUB_CLIENT_SECRET: ""
             EMAIL_SERVER: smtp://debug
             EMAIL_FROM: noreply@sentinel.local
             SETTINGS_ENCRYPTION_KEY: default-long-and-secure-key-32-chars

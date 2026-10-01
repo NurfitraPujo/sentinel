@@ -1,8 +1,11 @@
-# Fully qualified + pinned, matching Dockerfile.nats-init's rationale: podman resolves no
-# unqualified short names unless registries.conf defines unqualified-search-registries, and an
-# unpinned tag means behavior can change on any prune+pull.
-# Uses quay.io mirror to avoid Docker Hub unauthenticated rate-limiting / pull access scope failures.
-FROM quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+# Fully qualified + pinned base image. MinIO removed public access to quay.io/minio/mc,
+# and docker.io/minio/mc is restricted/rate-limited. We use alpine:3.19 and install
+# the official statically compiled mc binary from minio/mc GitHub releases.
+FROM docker.io/library/alpine:3.19
+RUN apk add --no-cache curl ca-certificates && \
+    curl -fsSL -o /usr/local/bin/mc https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z && \
+    chmod +x /usr/local/bin/mc
 COPY minio-init.sh /scripts/minio-init.sh
 RUN chmod +x /scripts/minio-init.sh
 ENTRYPOINT ["/bin/sh", "/scripts/minio-init.sh"]
+
