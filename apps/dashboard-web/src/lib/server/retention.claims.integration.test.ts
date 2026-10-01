@@ -225,6 +225,38 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 		expect(issueRow.assigned_to).toBe(userId);
 	});
 
+	it('never touches an agent claim on resolved or ignored issues, however old', async () => {
+		const { reapStaleClaims } = await import('./retention');
+
+		const agentId = 'agent-resolved-claim-' + suffix;
+		const resolvedIssueId = await seedIssue({
+			fingerprint: 'resolved-issue-' + suffix,
+			assigneeType: 'agent',
+			assignedTo: agentId,
+			status: 'resolved',
+			claimedAt: hoursAgo(1000),
+		});
+		const ignoredIssueId = await seedIssue({
+			fingerprint: 'ignored-issue-' + suffix,
+			assigneeType: 'agent',
+			assignedTo: agentId,
+			status: 'ignored',
+			claimedAt: hoursAgo(1000),
+		});
+
+		await reapStaleClaims(24);
+
+		const [resolvedRow] = await sql`select assigned_to, assignee_type, claimed_at from issues where id = ${resolvedIssueId}`;
+		expect(resolvedRow.assigned_to).toBe(agentId);
+		expect(resolvedRow.assignee_type).toBe('agent');
+		expect(resolvedRow.claimed_at).not.toBeNull();
+
+		const [ignoredRow] = await sql`select assigned_to, assignee_type, claimed_at from issues where id = ${ignoredIssueId}`;
+		expect(ignoredRow.assigned_to).toBe(agentId);
+		expect(ignoredRow.assignee_type).toBe('agent');
+		expect(ignoredRow.claimed_at).not.toBeNull();
+	});
+
 	it('A04: an occurrence-less unresolved or claimed issue survives cleanupRetainedData at any age', async () => {
 		const { cleanupRetainedData } = await import('./retention');
 

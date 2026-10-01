@@ -1049,12 +1049,13 @@ export interface ReapStaleClaimsResult {
 
 /**
  * A03: force-releases agent claims an unattended loop abandoned. Only claims with
- * assigneeType='agent' are eligible -- human claims are never auto-released. A claim is
- * stale-eligible when `claimedAt` is either NULL (pre-migration claim, or somehow never set) or
- * older than `staleHours` (default 24, env CLAIM_STALE_HOURS). Even a stale-eligible claim is
- * still protected if the claimant has written an issue_activity row on that issue within the
- * same window -- an agent making visible progress should not be reaped just because it claimed a
- * while ago.
+ * assigneeType='agent' on unresolved issues are eligible -- resolved/ignored issues retain
+ * their claimant as an immutable historical record, and human claims are never auto-released.
+ * A claim is stale-eligible when `claimedAt` is either NULL (pre-migration claim, or somehow
+ * never set) or older than `staleHours` (default 24, env CLAIM_STALE_HOURS). Even a stale-eligible
+ * claim is still protected if the claimant has written an issue_activity row on that issue within
+ * the same window -- an agent making visible progress should not be reaped just because it claimed
+ * a while ago.
  *
  * Per-candidate: read (select stale-eligible issues) -> check recent activity -> conditional
  * UPDATE re-scoped to the same claimant, so a claim that changed hands between the select and the
@@ -1074,6 +1075,7 @@ export async function reapStaleClaims(staleHours: number = 24, exec: Exec = db):
 			.where(
 				and(
 					eq(issues.assigneeType, 'agent'),
+					eq(issues.status, 'unresolved'),
 					sql`${issues.assignedTo} IS NOT NULL`,
 					or(isNull(issues.claimedAt), lt(issues.claimedAt, cutoff))
 				)
@@ -1105,7 +1107,8 @@ export async function reapStaleClaims(staleHours: number = 24, exec: Exec = db):
 					and(
 						eq(issues.id, candidate.id),
 						eq(issues.assignedTo, candidate.assignedTo),
-						eq(issues.assigneeType, 'agent')
+						eq(issues.assigneeType, 'agent'),
+						eq(issues.status, 'unresolved')
 					)
 				)
 				.returning({ id: issues.id });
