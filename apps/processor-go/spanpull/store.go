@@ -20,7 +20,7 @@ var ErrNotFound = errors.New("trace not found in the trace store")
 // maxResponseBytes bounds one trace-store response so a huge trace cannot exhaust the processor's memory.
 const maxResponseBytes = 32 << 20
 
-// ErrTooLarge is a response over maxResponseBytes: not retried (the next fetch returns the same body), counted
+// ErrTooLarge is a response over maxResponseBytes, or the store's own "trace exceeds max size" refusal: not retried (the next fetch returns the same body), counted
 // `too_large`, and the stage is finished.
 var ErrTooLarge = errors.New("trace store response over the size bound")
 
@@ -47,6 +47,40 @@ func NewTraceStore(cfg Config, client *http.Client) (TraceStore, error) {
 	}
 }
 
+const (
+	errBodyBytes   = 4 << 10
+	tooLargeMarker = "trace exceeds max size"
+)
+
+// dropControls removes NUL and the other control characters: Postgres text rejects NUL, and the rest have no place
+// in a one-line log field.
+func dropControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func controlsToSpace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// excerpt is b as one line of at most 200 characters.
+func excerpt(b []byte) string {
+	s := strings.Join(strings.Fields(controlsToSpace(strings.ToValidUTF8(string(b), "?"))), " ")
+	if r := []rune(s); len(r) > 200 {
+		s = string(r[:200])
+	}
+	return s
+}
+
 // getJSON GETs path under base and returns the body, ErrNotFound for a 404. The context carries the 5 s budget.
 func getJSON(ctx context.Context, client *http.Client, base, path string) ([]byte, error) {
 	if _, err := url.Parse(base); err != nil {
@@ -67,7 +101,15 @@ func getJSON(ctx context.Context, client *http.Client, base, path string) ([]byt
 		return nil, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
+		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyBytes))
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16)) //nolint:errcheck
+		// Tempo refuses a trace over its max size with HTTP 500: the trace only grows, so this is final, not a failure.
+		if strings.Contains(string(prefix), tooLargeMarker) {
+			return nil, ErrTooLarge
+		}
+		if ex := excerpt(prefix); ex != "" {
+			return nil, fmt.Errorf("trace store answered HTTP %d: %s", resp.StatusCode, ex)
+		}
 		return nil, fmt.Errorf("trace store answered HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))

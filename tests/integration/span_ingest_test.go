@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -550,10 +552,7 @@ func TestSpanPull_AnOversizedTraceResponseIsNotRetried(t *testing.T) {
 	n, err := h.worker.RunOnce(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
-	var stage, attempts int
-	require.NoError(t, h.pool.QueryRow(ctx, `SELECT stage, attempts FROM span_pull_queue WHERE org_id = $1 AND trace_id = $2`, h.tenant.OrgID, pullTrace).Scan(&stage, &attempts))
-	assert.Equal(t, 1, stage, "m3: finished, not retried")
-	assert.Zero(t, attempts)
+	assert.Equal(t, 2, jobStage(t, h), "m3: finished (a trace only grows, so no second stage), not retried")
 	assert.EqualValues(t, 1, h.stub.requests.Load())
 }
 
@@ -623,4 +622,198 @@ func TestSpanIngest_AProjectlessMobileBatchIsNotStored(t *testing.T) {
 	raw, _ := json.Marshal(b)
 	require.NoError(t, (&spans.Consumer{Store: store}).Handle(context.Background(), raw))
 	assert.Zero(t, countRows(t, pool, `SELECT count(*) FROM spans WHERE org_id = $1`, tenant.OrgID), "m5: invisible forever, so not stored")
+}
+
+// ---- sentinel-span-ingest BUG-01: SPAN_PULL_SCOPES is checked against the database ---------------------------
+
+func gatedConfig(t *testing.T, url string, pairs ...string) spanpull.Config {
+	t.Helper()
+	env := map[string]string{"SPAN_PULL_SCOPES": strings.Join(pairs, ","), "TRACE_STORE_KIND": "tempo", "TRACE_STORE_URL": url}
+	cfg, err := spanpull.ParseConfig(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err)
+	return cfg
+}
+
+func TestSpanPull_ScopesAreValidatedAgainstTheProjectsTable(t *testing.T) {
+	pool := spanPool(t)
+	ctx := context.Background()
+	a, b, c := seedSpanTenant(t, pool, "scope-a"), seedSpanTenant(t, pool, "scope-b"), seedSpanTenant(t, pool, "scope-c")
+	ghost := uuid.New().String()
+	stub := newStubTraceStore(t)
+	stub.body.Store("")
+	cfg := gatedConfig(t, stub.srv.URL,
+		a.OrgID+":"+a.ProjectID, // valid
+		b.OrgID+":"+a.ProjectID, // b mapped to a's core project: refused
+		c.OrgID+":"+ghost,       // unknown project: refused
+	)
+	queue := spanpull.NewQueue(pool, cfg)
+	svc := service.NewProcessorService(pool)
+	svc.SetSpanPull(queue)
+	h := &pullHarness{pool: pool, svc: svc}
+
+	// Before validation nothing is enqueued, not even for the valid org.
+	h.errorIn(t, a, pullTrace)
+	assert.Zero(t, h.queueRows(t, a.OrgID), "no enqueue before validation has succeeded")
+
+	accepted, refused, err := cfg.ValidateAgainstDB(ctx, pool)
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+	assert.Equal(t, 2, refused)
+
+	h.errorIn(t, a, pullTrace)
+	h.errorIn(t, b, pullTrace)
+	h.errorIn(t, c, pullTrace)
+	assert.Equal(t, 1, h.queueRows(t, a.OrgID), "the valid scope is kept")
+	assert.Zero(t, h.queueRows(t, b.OrgID), "a project of another organization is refused")
+	assert.Zero(t, h.queueRows(t, c.OrgID), "an unknown project is refused")
+	assert.Equal(t, a.ProjectID, cfg.ScopeProject(a.OrgID))
+	assert.False(t, cfg.Allowed(b.OrgID))
+}
+
+// ---- sentinel-span-ingest BUG-02: Tempo's "trace too large" is final; 404 is not a warning -------------------
+
+const tooLargeBody = "trace exceeds max size (max bytes: 5000000)"
+
+func jobStage(t *testing.T, h *pullHarness) int {
+	return countRows(t, h.pool, `SELECT stage FROM span_pull_queue WHERE org_id = $1 AND trace_id = $2`, h.tenant.OrgID, pullTrace)
+}
+
+func captureLogs(t *testing.T) *strings.Builder {
+	var buf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestSpanPull_TooLargeAtStageOneFinishesTheJobWithoutRetryOrWarning(t *testing.T) {
+	h := newPullHarness(t, spanpull.KindTempo)
+	logs := captureLogs(t)
+	h.stub.status.Store(500)
+	h.stub.body.Store(tooLargeBody)
+	h.errorIn(t, h.tenant, pullTrace)
+	*h.clock = time.Now().Add(3 * time.Minute)
+
+	_, err := h.worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, h.stub.requests.Load(), "one fetch, no retry")
+	assert.Equal(t, 2, jobStage(t, h), "finished: the second stage is skipped, the trace only grows")
+	assert.NotContains(t, logs.String(), "level=WARN")
+	assert.Equal(t, 1, strings.Count(logs.String(), "too large"), "one line for the stage")
+
+	*h.clock = h.clock.Add(time.Hour)
+	_, err = h.worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, h.stub.requests.Load(), "nothing more is fetched")
+}
+
+func TestSpanPull_NotFoundAdvancesAndFinishesWithoutWarning(t *testing.T) {
+	h := newPullHarness(t, spanpull.KindTempo)
+	logs := captureLogs(t)
+	h.stub.status.Store(404)
+	h.stub.body.Store("trace not found")
+	h.errorIn(t, h.tenant, pullTrace)
+	*h.clock = time.Now().Add(3 * time.Minute)
+
+	_, err := h.worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, jobStage(t, h), "404 at stage 0 advances to the second fetch")
+	assert.EqualValues(t, 1, h.stub.requests.Load())
+
+	*h.clock = time.Now().Add(11 * time.Minute)
+	_, err = h.worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, jobStage(t, h), "404 at the last stage finishes the job")
+	assert.EqualValues(t, 2, h.stub.requests.Load())
+	assert.NotContains(t, logs.String(), "level=WARN")
+}
+
+func TestSpanPull_AnotherServerErrorIsStillRetried(t *testing.T) {
+	h := newPullHarness(t, spanpull.KindTempo)
+	logs := captureLogs(t)
+	h.stub.status.Store(500)
+	h.stub.body.Store("ingester unavailable")
+	h.errorIn(t, h.tenant, pullTrace)
+	*h.clock = time.Now().Add(3 * time.Minute)
+
+	_, err := h.worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, jobStage(t, h), "still stage 0: it will be retried")
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "HTTP 500: ingester unavailable")
+}
+
+// ---- repair round 1 ----------------------------------------------------------------------------------------
+
+// A job that comes due while the pod restarts (scopes not validated yet) is left alone, then fetched once the
+// validation has succeeded: it must not be finished as "delisted".
+func TestSpanPull_JobsDueBeforeValidationAreUntouchedThenFetched(t *testing.T) {
+	pool := spanPool(t)
+	ctx := context.Background()
+	tenant := seedSpanTenant(t, pool, "restart")
+	stub := newStubTraceStore(t)
+	start := time.Now().Add(-time.Minute)
+	stub.body.Store(otlpBody(start, 2))
+	now := time.Now()
+	clock := func() time.Time { return now }
+	cfg := gatedConfig(t, stub.srv.URL, tenant.OrgID+":"+tenant.ProjectID)
+	queue := spanpull.NewQueue(pool, cfg).WithClock(clock)
+	store, err := spanpull.NewTraceStore(cfg, stub.srv.Client())
+	require.NoError(t, err)
+	worker := &spanpull.Worker{Queue: queue, Spans: spans.NewStore(pool).WithClock(clock), Traces: store, Cfg: cfg, Now: clock}
+	_, err = spans.NewStore(pool).EnsurePartitions(ctx)
+	require.NoError(t, err)
+
+	// The job was queued by an earlier process that had validated.
+	_, err = pool.Exec(ctx, `INSERT INTO span_pull_queue (org_id, trace_id, stage, next_fetch_at, trigger_project_id)
+		VALUES ($1::uuid, $2, 0, $3, $4::uuid)`, tenant.OrgID, pullTrace, now.Add(2*time.Minute), tenant.ProjectID)
+	require.NoError(t, err)
+	now = now.Add(3 * time.Minute)
+	snapshot := func() string {
+		var s string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT stage||'|'||attempts||'|'||next_fetch_at::text FROM span_pull_queue WHERE org_id = $1 AND trace_id = $2`,
+			tenant.OrgID, pullTrace).Scan(&s))
+		return s
+	}
+	before := snapshot()
+
+	n, err := worker.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, n, "nothing is claimed before validation")
+	assert.Equal(t, before, snapshot(), "stage, attempts and next_fetch_at are unchanged")
+	assert.Zero(t, stub.requests.Load())
+
+	_, _, err = cfg.ValidateAgainstDB(ctx, pool)
+	require.NoError(t, err)
+	n, err = worker.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.EqualValues(t, 1, stub.requests.Load())
+	assert.Equal(t, 2, countRows(t, pool, `SELECT count(*) FROM spans WHERE org_id = $1 AND source = 'pulled'`, tenant.OrgID))
+}
+
+func TestSpanPull_AMultibyteErrorBodyStillRecordsTheFailure(t *testing.T) {
+	for name, body := range map[string]string{
+		"multibyte": strings.Repeat("错", 300),
+		"invalid":   "bad \xff\xfe bytes",
+		"nul":       "proxy error \x00\x01 binary",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newPullHarness(t, spanpull.KindTempo)
+			h.stub.status.Store(502)
+			h.stub.body.Store(body)
+			h.errorIn(t, h.tenant, pullTrace)
+			*h.clock = time.Now().Add(3 * time.Minute)
+			_, err := h.worker.RunOnce(context.Background())
+			require.NoError(t, err)
+			var last string
+			var retryAt time.Time
+			require.NoError(t, h.pool.QueryRow(context.Background(), `SELECT last_error, next_fetch_at FROM span_pull_queue WHERE org_id = $1 AND trace_id = $2`,
+				h.tenant.OrgID, pullTrace).Scan(&last, &retryAt), "last_error was recorded")
+			assert.True(t, utf8.ValidString(last))
+			assert.LessOrEqual(t, len(last), 500)
+			assert.Contains(t, last, "HTTP 502")
+			assert.True(t, retryAt.After(h.clock.Add(30*time.Second)), "the retry delay was applied")
+		})
+	}
 }

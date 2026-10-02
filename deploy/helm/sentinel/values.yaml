@@ -633,6 +633,9 @@ dependencies:
 #            who can reach that core project and whose environment grant on it permits the span's environment,
 #            whichever project's error queued the trace. storeKind is tempo (Huawei) or jaeger (AWS VictoriaTraces);
 #            storeUrl is the base URL, no trailing path.
+#            At processor start every entry is checked against the database: the project must exist and belong to
+#            the organization it is listed under, otherwise that entry is dropped with an ERROR log. An organization
+#            listed twice is refused entirely (ERROR). Until the check has succeeded nothing is enqueued or pulled.
 # -----------------------------------------------------------------------------
 spans:
   enabled: false

@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -99,6 +102,11 @@ func TestSpanPullConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, cfg.Enabled())
 	assert.Equal(t, "http://t:3100", cfg.URL)
+	assert.False(t, cfg.Allowed(org), "BUG-01: nothing is allowed until the scopes have been validated against the database")
+	assert.Empty(t, cfg.ScopeProject(org))
+	_, refused, err := cfg.ValidateAgainstDB(context.Background(), fakeProjects{core: org})
+	require.NoError(t, err)
+	assert.Zero(t, refused)
 	assert.True(t, cfg.Allowed(org))
 	assert.True(t, cfg.Allowed(strings.ToUpper(org)))
 	assert.Equal(t, core, cfg.ScopeProject(org), "the mapped core project governs the org's pulled spans")
@@ -243,4 +251,119 @@ func TestSpanPullJaegerAdapter(t *testing.T) {
 	assert.Equal(t, "error", child.Status, "an error=true tag is an error")
 	assert.Equal(t, "core-db", child.ServiceName)
 	assert.Equal(t, "unset", by["1212121212121212"].Status)
+}
+
+// fakeProjects answers the validation query from a project id -> organization id map; a missing id is no row.
+type fakeProjects map[string]string
+
+type fakeRow struct {
+	org string
+	err error
+}
+
+func (r fakeRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	*(dest[0].(**string)) = &r.org
+	return nil
+}
+
+func (f fakeProjects) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	if org, ok := f[args[0].(string)]; ok {
+		return fakeRow{org: org}
+	}
+	return fakeRow{err: pgx.ErrNoRows}
+}
+
+type brokenDB struct{}
+
+func (brokenDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	return fakeRow{err: errors.New("connection refused")}
+}
+
+func TestSpanPullConfig_DuplicateOrgIsRefusedAndOthersKept(t *testing.T) {
+	a, b := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	p1, p2, p3 := "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"
+	env := map[string]string{"SPAN_PULL_SCOPES": a + ":" + p1 + "," + b + ":" + p3 + "," + a + ":" + p2, "TRACE_STORE_KIND": "tempo", "TRACE_STORE_URL": "http://t"}
+	cfg, err := spanpull.ParseConfig(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err, "a duplicate must not stop the process: it also ingests errors")
+	assert.NotContains(t, cfg.Scopes, a, "the duplicated org gets no entry, not the last value")
+	assert.Equal(t, p3, cfg.Scopes[b])
+	assert.Equal(t, 1, cfg.Duplicated)
+
+	_, _, err = cfg.ValidateAgainstDB(context.Background(), fakeProjects{p1: a, p2: a, p3: b})
+	require.NoError(t, err)
+	assert.False(t, cfg.Allowed(a))
+	assert.True(t, cfg.Allowed(b))
+}
+
+func TestSpanPullConfig_ValidationDropsForeignAndUnknownProjects(t *testing.T) {
+	a, b, c := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "66666666-6666-4666-8666-666666666666"
+	pa, pb, ghost := "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"
+	env := map[string]string{"SPAN_PULL_SCOPES": a + ":" + pa + "," + b + ":" + pa + "," + c + ":" + ghost, "TRACE_STORE_KIND": "tempo", "TRACE_STORE_URL": "http://t"}
+	cfg, err := spanpull.ParseConfig(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err)
+
+	_, _, err = cfg.ValidateAgainstDB(context.Background(), brokenDB{})
+	require.Error(t, err)
+	assert.False(t, cfg.Allowed(a), "a failed validation leaves everything refused")
+
+	accepted, refused, err := cfg.ValidateAgainstDB(context.Background(), fakeProjects{pa: a, pb: b})
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+	assert.Equal(t, 2, refused)
+	assert.True(t, cfg.Allowed(a))
+	assert.False(t, cfg.Allowed(b), "b is mapped to a's project")
+	assert.False(t, cfg.Allowed(c), "unknown project")
+}
+
+func TestSpanPullConfig_ValidatedOnlyAfterTheGateIsPublished(t *testing.T) {
+	a, pa := "11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"
+	env := map[string]string{"SPAN_PULL_SCOPES": a + ":" + pa, "TRACE_STORE_KIND": "tempo", "TRACE_STORE_URL": "http://t"}
+	cfg, err := spanpull.ParseConfig(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	require.NoError(t, err)
+	assert.False(t, cfg.Validated())
+	_, _, _ = cfg.ValidateAgainstDB(context.Background(), brokenDB{})
+	assert.False(t, cfg.Validated(), "a failed validation publishes nothing")
+	_, _, err = cfg.ValidateAgainstDB(context.Background(), fakeProjects{})
+	require.NoError(t, err)
+	assert.True(t, cfg.Validated(), "published, even if every entry was refused")
+	assert.False(t, cfg.Allowed(a))
+}
+
+func TestSpanPullErrorExcerptIsValidUTF8(t *testing.T) {
+	srv := tempoServer(t, 502, "bad \xff\xfe bytes", nil)
+	defer srv.Close()
+	st, _ := spanpull.NewTraceStore(spanpull.Config{Kind: spanpull.KindTempo, URL: srv.URL}, srv.Client())
+	_, err := st.Fetch(context.Background(), spanTrace)
+	require.Error(t, err)
+	assert.True(t, utf8.ValidString(err.Error()))
+
+	nul := tempoServer(t, 502, "proxy error \x00\x01 binary\nline2", nil)
+	defer nul.Close()
+	st, _ = spanpull.NewTraceStore(spanpull.Config{Kind: spanpull.KindTempo, URL: nul.URL}, nul.Client())
+	_, err = st.Fetch(context.Background(), spanTrace)
+	require.Error(t, err)
+	assert.Equal(t, "trace store answered HTTP 502: proxy error binary line2", err.Error()[:len("trace store answered HTTP 502: proxy error binary line2")])
+	assert.NotContains(t, err.Error(), "\x00")
+	assert.NotContains(t, err.Error(), "\n")
+}
+
+func TestSpanPullTempoTooLargeIsFinalAndOtherErrorsCarryTheBody(t *testing.T) {
+	big := tempoServer(t, 500, "trace exceeds max size (max bytes: 5000000)\n", nil)
+	defer big.Close()
+	st, _ := spanpull.NewTraceStore(spanpull.Config{Kind: spanpull.KindTempo, URL: big.URL}, big.Client())
+	_, err := st.Fetch(context.Background(), spanTrace)
+	assert.ErrorIs(t, err, spanpull.ErrTooLarge)
+
+	other := tempoServer(t, 500, "boom\n"+strings.Repeat("y", 500), nil)
+	defer other.Close()
+	st, _ = spanpull.NewTraceStore(spanpull.Config{Kind: spanpull.KindTempo, URL: other.URL}, other.Client())
+	_, err = st.Fetch(context.Background(), spanTrace)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, spanpull.ErrTooLarge)
+	assert.Contains(t, err.Error(), "HTTP 500: boom yyy")
+	assert.NotContains(t, err.Error(), "\n")
+	assert.Less(t, len(err.Error()), 260, "the body excerpt is at most 200 characters")
 }

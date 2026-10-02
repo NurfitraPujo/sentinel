@@ -432,6 +432,8 @@ func startSpans(ctx context.Context, db *pgxpool.Pool, proc *service.ProcessorSe
 		if err != nil {
 			log.Fatalf("Invalid span pull configuration: %v", err)
 		}
+		// Nothing is enqueued or pulled until every scope has been checked against the projects table.
+		go pullCfg.RunValidation(ctx, db, 15*time.Second)
 		queue := spanpull.NewQueue(db, pullCfg)
 		proc.SetSpanPull(queue)
 		go (&spanpull.Worker{Queue: queue, Spans: spanStore, Traces: traces, Cfg: pullCfg}).Run(ctx)

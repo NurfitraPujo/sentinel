@@ -58,6 +58,11 @@ func (w *Worker) Run(ctx context.Context) {
 
 // RunOnce claims one batch of due jobs and processes them in order. It returns how many it claimed.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
+	// Before the scopes are validated every organization looks "not allowed"; claiming now would burn attempts and
+	// the delisted branch would finish valid jobs (a restart window). Leave the queue untouched until the gate is up.
+	if !w.Cfg.Validated() {
+		return 0, nil
+	}
 	jobs, err := w.Queue.Claim(ctx, claimBatch)
 	if err != nil {
 		return 0, err
@@ -72,7 +77,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 }
 
 func (w *Worker) process(ctx context.Context, j Job) {
-	// The allow-list is checked again here: the row may predate a configuration change, and trace ids are
+	// The allow-list (published, so an org absent from it is truly delisted) is checked again here: the row may predate a configuration change, and trace ids are
 	// client-asserted, so the guard must hold at the moment of the copy, not only at the enqueue.
 	if !w.Cfg.Allowed(j.OrgID) {
 		slog.WarnContext(ctx, "span pull: organization no longer allow-listed; dropping the job")
@@ -97,12 +102,17 @@ func (w *Worker) process(ctx context.Context, j Job) {
 	outcome := "ok"
 	switch {
 	case errors.Is(err, ErrNotFound):
+		// Not flushed yet is normal at the first stage (the second one tries again), so this is not a warning.
 		fetched, err, outcome = nil, nil, "not_found"
+		slog.DebugContext(ctx, "span pull: trace not found", slog.Int("stage", j.Stage))
 	case errors.Is(err, ErrTooLarge):
-		// The response is over the read bound: retrying fetches the same oversized body, so the stage is finished.
+		// Over the read bound or refused by the store as too big: a trace only grows, so neither a retry nor the
+		// second stage can succeed; the job is finished.
 		count(ctx, fetchesCtr, "too_large")
-		slog.WarnContext(ctx, "span pull: trace response over the size bound; not retrying", slog.Int("stage", j.Stage))
-		w.advance(ctx, j)
+		slog.InfoContext(ctx, "span pull: trace too large for the trace store; finishing the job", slog.Int("stage", j.Stage))
+		if err := w.Queue.Finish(ctx, j); err != nil {
+			slog.WarnContext(ctx, "span pull: finish failed", slog.String("error", err.Error()))
+		}
 		return
 	case err != nil:
 		w.fail(ctx, j, err)

@@ -20,6 +20,12 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
     for pulled spans (trace ids are client-asserted: only an org that is a key is ever enqueued, checked at enqueue
     AND again by the worker) and what governs who may see them. Never widen it to "all orgs", never derive it from
     a request body.
+  - `SPAN_PULL_SCOPES` is validated against `projects` at processor start (sentinel-span-ingest BUG-01): the
+    project must exist and its `organization_id` must equal the key, else that entry is dropped with an ERROR; an
+    org listed twice is refused entirely. Until validation succeeds (retried every 15 s on a DB error) `Allowed` is
+    false everywhere, so nothing is enqueued or pulled. Tempo's HTTP 500 `trace exceeds max size` is `ErrTooLarge`
+    (BUG-02): counted `too_large`, logged INFO, and the job is finished (no stage 2, no retry); 404 is `not_found`
+    at DEBUG, never WARN.
   - D8 for PULLED spans (core's data, no project of their own): governed by the org's configured CORE project
     (`spans.scope_project_id`, stamped at pull time from the map): the viewer must reach that project AND its
     environment grant must permit the span's environment. NOT the project of the error that queued the trace (a

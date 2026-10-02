@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,7 +18,7 @@ import (
 )
 
 const (
-	MetricEnqueued = "sentinel_span_pull_enqueued_total" // outcome: queued | duplicate | not_allowed | no_org | error
+	MetricEnqueued = "sentinel_span_pull_enqueued_total" // outcome: queued | duplicate | not_allowed | not_validated | no_org | error
 	MetricFetches  = "sentinel_span_pull_fetches_total"  // outcome: ok | not_found | too_large | error | gave_up
 )
 
@@ -58,6 +60,10 @@ func (q *Queue) WithClock(now func() time.Time) *Queue { q.now = now; return q }
 // ingest"). The caller invokes it after the occurrence is committed.
 func (q *Queue) MaybeEnqueue(ctx context.Context, projectID, traceID string) {
 	if q == nil || !q.cfg.Enabled() || !spanwire.ValidTraceID(traceID) || projectID == "" {
+		return
+	}
+	if !q.cfg.Validated() {
+		count(ctx, enqueuedCtr, "not_validated")
 		return
 	}
 	var org *string
@@ -151,10 +157,7 @@ func (q *Queue) Advance(ctx context.Context, j Job) (bool, error) {
 // Fail records a failed fetch: the attempt was already counted at claim, so this only sets the retry time and the
 // error. It is conditional on the claimed stage like Advance.
 func (q *Queue) Fail(ctx context.Context, j Job, cause error) error {
-	msg := cause.Error()
-	if len(msg) > 500 {
-		msg = msg[:500]
-	}
+	msg := truncUTF8(dropControls(strings.ToValidUTF8(cause.Error(), "?")), 500)
 	_, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET last_error = $4, next_fetch_at = $5
 		WHERE org_id = $1::uuid AND trace_id = $2 AND stage = $3`, j.OrgID, j.TraceID, j.Stage, msg, q.now().Add(RetryDelay))
 	return err
@@ -164,4 +167,15 @@ func (q *Queue) Fail(ctx context.Context, j Job, cause error) error {
 func (q *Queue) Finish(ctx context.Context, j Job) error {
 	_, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET stage = 2 WHERE org_id = $1::uuid AND trace_id = $2`, j.OrgID, j.TraceID)
 	return err
+}
+
+// truncUTF8 cuts s to at most n bytes without splitting a rune (Postgres rejects a split one).
+func truncUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
