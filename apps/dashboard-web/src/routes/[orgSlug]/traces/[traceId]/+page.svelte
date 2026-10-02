@@ -1,10 +1,11 @@
 <script lang="ts">
 	// sentinel-cross-repo-trace-view TASK-01 (contract D3/D4): every error occurrence sharing one
-	// trace id across the org's projects, oldest first. Error occurrences only — a span/transaction
-	// view is sentinel-span-ingest's, not this page's.
+	// trace id across the org's projects, oldest first, under a span waterfall (sentinel-span-ingest D6)
+	// that pins each error to its span.
 	import { goto } from '$app/navigation';
 	import type { PageData } from './$types';
 	import { levelTone } from '$lib/components/issues/occurrence-display';
+	import SpanWaterfall from '$lib/components/traces/SpanWaterfall.svelte';
 
 	let { data }: { data: PageData } = $props();
 
@@ -62,6 +63,17 @@
 
 <div class="container" data-testid="trace-page">
 	<h1>Trace <code data-testid="trace-id">{data.traceId}</code></h1>
+
+	<!-- D6: above the occurrence list; the row list and its paging are unchanged. Errors pinned are the rows
+	     loaded so far, so "Load more" pins the next page's errors too. -->
+	{#if data.spans.length > 0 || rows.length > 0}
+		<SpanWaterfall
+			spans={data.spans}
+			errors={rows}
+			truncated={data.spansTruncated}
+			retentionDays={data.spanRetentionDays}
+		/>
+	{/if}
 
 	{#if rows.length === 0}
 		<!-- D2: one message for "never existed", "another org's" and "hidden by an environment grant". -->

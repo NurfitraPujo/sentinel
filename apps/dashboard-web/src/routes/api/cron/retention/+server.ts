@@ -5,6 +5,7 @@ import {
 	reapStaleClaims,
 	reapExpiredIdempotencyKeys,
 	reapExpiredReportIdempotencyKeys,
+	maintainSpans,
 } from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
 import { reapAllOrphanAttachments } from '$lib/server/attachment-reaper';
@@ -103,6 +104,13 @@ export const POST: RequestHandler = async ({ request }) => {
 		run = openRetentionRun(client as never, { deadlineMs: RETENTION_ROUTE_DEADLINE_MS, isLost: () => lost });
 		const routeStart = performance.now();
 
+		// sentinel-span-ingest D1: create the day partitions spans are written into and drop the ones past the 14-day
+		// window. It runs FIRST, before the occurrence sweep and the reapers, so a throw or a deadline in any of them
+		// cannot stop partition upkeep (a missing partition drops spans; a missed drop grows the table). It has its own
+		// try/catch inside maintainSpans (a failure is logged and reported in the result, never fatal to the run) and
+		// it is held to a 3 s lock / 30 s statement cap (SPAN_MAINT_CAPS) so a reader on `spans` cannot spend the run.
+		const spanMaintenance = await maintainSpans(run.db, undefined, run);
+
 		const result = await cleanupRetainedData(retentionDays, manualRetentionDays, tombstoneRetentionDays, run);
 
 		// D42: sweep expired pending invitations across every organization. The per-org reaper only
@@ -136,6 +144,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			releasedClaims: claimReap.releasedClaims,
 			reapedIdempotencyKeys,
 			reapedReportIdempotencyKeys,
+			spanMaintenance,
 			deletedOccurrences: result.deletedOccurrences,
 			// sentinel-affected-users §4.5 (flow R3): side rows deleted, NOT issues touched.
 			deletedAffectedUsers: result.deletedAffectedUsers,
@@ -170,6 +179,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				releasedClaims: claimReap.releasedClaims,
 				reapedIdempotencyKeys,
 				reapedReportIdempotencyKeys,
+				spanMaintenance,
 				deletedOccurrences: result.deletedOccurrences,
 				deletedAffectedUsers: result.deletedAffectedUsers,
 				deletedAffectedTenants: result.deletedAffectedTenants,

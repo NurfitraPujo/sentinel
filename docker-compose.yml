@@ -171,6 +171,8 @@ services:
             POSTGRES_PASSWORD: changeme
             POSTGRES_DB: sentinel
             NATS_URL: nats://nats:4222
+            # sentinel-span-ingest D2: SPANS stream (created by nats-init) + `spans` table. Dev default ON.
+            SPAN_INGEST_ENABLED: "true"
             REDIS_ADDR: redis:6379
             REDIS_PASSWORD: ""
             REDIS_DB: 0
@@ -213,6 +215,8 @@ services:
             POSTGRES_PASSWORD: changeme
             POSTGRES_DB: sentinel
             NATS_URL: nats://nats:4222
+            # sentinel-span-ingest D2: SPANS stream (created by nats-init) + `spans` table. Dev default ON.
+            SPAN_INGEST_ENABLED: "true"
             # W0 (docs/plans/OBSERVABILITY_PLAN.md): in-cluster address, never the host-mapped port
             # above. If jaeger is down, obs.Bootstrap degrades to one warning log and the processor
             # stays fully functional — this is not a hard dependency (see the jaeger service's comment).

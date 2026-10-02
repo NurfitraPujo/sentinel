@@ -619,6 +619,28 @@ dependencies:
       requests: { cpu: 100m, memory: 256Mi }
       limits: { cpu: "1", memory: 1Gi }
 
+# -----------------------------------------------------------------------------
+# sentinel-span-ingest: spans for the trace page's waterfall. Ships OFF.
+#   enabled  SPAN_INGEST_ENABLED on the ingestor and the processor: the ingestor publishes the spans of a Sentry-
+#            compatible `transaction` item to the SPANS stream (scripts/nats-init.sh creates it) and the processor
+#            writes them to the day-partitioned `spans` table. Off, a transaction item is discarded as before.
+#   pull     D3: when an error with a canonical trace id is stored in an organization that is a key of `scopes`, the
+#            processor fetches that trace's spans from core's trace store 2 and 10 minutes later. All three of
+#            scopes, storeKind and storeUrl must be set; empty = off.
+#            scopes is a comma-separated list of `<org_uuid>:<core_project_uuid>`. The organization is THE guard
+#            (trace ids are client-asserted, so an organization not listed can never cause core's trace to be copied
+#            into it), and the project is what GOVERNS the pulled spans: they are core's data, shown only to a viewer
+#            who can reach that core project and whose environment grant on it permits the span's environment,
+#            whichever project's error queued the trace. storeKind is tempo (Huawei) or jaeger (AWS VictoriaTraces);
+#            storeUrl is the base URL, no trailing path.
+# -----------------------------------------------------------------------------
+spans:
+  enabled: false
+  pull:
+    scopes: ""
+    storeKind: ""
+    storeUrl: ""
+
 # Optional: run the NATS/MinIO one-shot init steps as Jobs (create the JetStream streams /
 # the attachments bucket). Disable if your managed deps are pre-provisioned.
 init:

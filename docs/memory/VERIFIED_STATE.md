@@ -1548,6 +1548,24 @@ what **B7** exists to prevent. Activity now derives from the UPDATE's `RETURNING
 returned count is what actually changed. A batch cap (500, matching the ingestor's `maxBatchSize`)
 bounds lock duration and the DoS shape. Both guards observed failing before acceptance.
 
+## sentinel-span-ingest — VERIFIED 2026-10-02 (branch `NurfitraPujo/sentinel-span-ingest-implementing.sentinel`, pre-merge)
+
+Spans for the trace waterfall (contract prd `sentinel-span-ingest` D1-D9). Run against a throwaway
+`postgres:15-alpine` (never the shared dev DB); each guard mutation-tested (the line removed, the test went red).
+
+| What | Command | Result |
+|---|---|---|
+| Migration: partitions create/drop, 14-day retention, dedupe key, replay down/up | `cd packages/db-migrations && MIGRATIONS_TEST_DB_URL=<disposable> MIGRATIONS_TEST_REQUIRED=1 GOWORK=off go test . -run Spans` | pass; red when `spans_drop_expired`'s bound is changed |
+| Whole migration chain still replays across goose ledgers | `FORCE_TESTCONTAINERS=1 go test ./tests/integration/ -run Migration` | pass |
+| Transaction parser, handler, adapters, masker/cap, window, config | `go test ./tests/unit/...` | pass (1,479 test funcs/subtests) |
+| Ingest -> rows, pull queue, both stores, late spans, allow-list, failure isolation | `FORCE_TESTCONTAINERS=1 go test ./tests/integration/ -run 'SpanIngest\|SpanPull'` | 6 tests pass |
+| Waterfall query guards + retention cron step | `cd apps/dashboard-web && DATABASE_URL=<disposable> SPAN_WATERFALL_INTEGRATION_REQUIRED=1 pnpm vitest run src/lib/server/span-waterfall.integration.test.ts` | 9 pass |
+| Dashboard gates | `pnpm check && pnpm build && pnpm test --sequence.shuffle` | 0 errors / build ok / 12 failures, ALL identical on a clean `21d9fc5` checkout against the same DB (integration files needing `SENTINEL_ENCRYPTION_KEY` etc.) |
+
+Not verified here: a real Tempo / VictoriaTraces (adapters are proven against stubs shaped from the documented
+formats), a real mobile transaction, `helm template` on AWS values (parked), production. `spans.pull.scopes`
+in `values-huawei-production.yml` maps the `tuju` org to its `core` project only.
+
 ## Known-broken, STILL OPEN
 
 Each entry below was independently re-read against current code this pass (not assumed unchanged from

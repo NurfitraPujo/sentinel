@@ -14,6 +14,8 @@ import {
 	traceRowColumns,
 	type TraceScope,
 } from '$lib/server/queries/trace-queries';
+import { listTraceSpans } from '$lib/server/queries/span-queries';
+import { SPAN_RETENTION_DAYS } from '$lib/spans/waterfall';
 
 // sentinel-cross-repo-trace-view TASK-01 (contract D1–D4). Lives under `[orgSlug]` so `orgHandle`'s
 // membership check applies and `reservedRoutes` is untouched.
@@ -51,9 +53,10 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	}
 
 	const accessible = await getAccessibleProjects(session.user.id, currentOrg.id);
+	const environmentScopes = await resolveEnvironmentScopes(session.user.id);
 	const scope: TraceScope = {
 		projectIds: accessible.map((p) => p.id),
-		environmentScopes: await resolveEnvironmentScopes(session.user.id),
+		environmentScopes,
 	};
 
 	let page;
@@ -70,10 +73,13 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		if (err instanceof Error && err.message === 'invalid cursor') throw error(404, 'Trace not found');
 		throw err;
 	}
-	const [total, spanned, projectCount] = await Promise.all([
+	// sentinel-span-ingest D6/D8: the waterfall's spans under the same org/project/environment guards. A trace
+	// with no spans (never pulled, older than 14 days, or none visible) leaves the list below unchanged.
+	const [total, spanned, projectCount, traceSpans] = await Promise.all([
 		countTraceOccurrences(traceId, scope),
 		listTraceProjects(traceId, scope),
 		countTraceProjects(traceId, scope),
+		listTraceSpans(traceId, { orgId: currentOrg.id, projects: accessible, environmentScopes }),
 	]);
 	const { rows, nextCursor } = page;
 
@@ -88,5 +94,8 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// The true distinct count: `projects` is capped at 50 names.
 		projectCount,
 		retentionDays: getRetentionDays(),
+		spans: traceSpans.spans,
+		spansTruncated: traceSpans.truncated,
+		spanRetentionDays: SPAN_RETENTION_DAYS,
 	};
 };

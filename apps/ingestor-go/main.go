@@ -28,6 +28,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/redis"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/spanwire"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ua-parser/uap-go/uaparser"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -307,8 +308,37 @@ func main() {
 		logger.ErrorContext(ctx, "obs: failed to create sentry-compat item counter; items will not be recorded as a metric",
 			slog.String("error", err.Error()))
 	}
+	// sentinel-span-ingest D2: transaction items go to the SPANS stream. Off unless SPAN_INGEST_ENABLED=true, because
+	// the stream is created by scripts/nats-init.sh and a publish to a stream that does not exist would fail every
+	// transaction envelope; with it off a transaction item is discarded and counted exactly as before.
+	var spanPublish func(ctx context.Context, msg []byte) error
+	if getEnv("SPAN_INGEST_ENABLED", "false") == "true" {
+		spanPublisher, spanErr := nats.NewPublisher(ctx, nats.PublisherConfig{
+			URL:     getEnv("NATS_URL", "nats://localhost:4222"),
+			Subject: spanwire.Subject,
+			Timeout: 5 * time.Second,
+		})
+		if spanErr != nil {
+			logger.ErrorContext(ctx, fmt.Sprintf("Failed to create SPANS publisher: %v", spanErr), slog.Any("error", spanErr))
+			os.Exit(1)
+		}
+		defer spanPublisher.Close()
+		spanPublish = spanPublisher.Publish
+	}
+	compatSpans, err := sentrycompat.NewSpanRecorder(meter)
+	if err != nil {
+		logger.ErrorContext(ctx, "obs: failed to create sentry-compat span counter; spans will not be recorded as a metric",
+			slog.String("error", err.Error()))
+	}
 	compat := sentrycompat.Config{
 		Ingest: ingestService,
+		Spans:  spanPublish,
+		Identity: func(ctx context.Context) (string, string, bool) {
+			orgID, ok := auth.OrganizationIDFromContext(ctx)
+			projectID, _ := auth.ProjectIDFromContext(ctx)
+			return orgID, projectID, ok
+		},
+		RecordSpans: compatSpans,
 		Scope: func(ctx context.Context, p *validation.ErrorPayload) error {
 			return applyAuthenticatedScope(ctx, db, p)
 		},

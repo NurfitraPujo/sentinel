@@ -14,12 +14,17 @@ const (
 
 	// outcomes (label obs.LabelOutcome = "outcome")
 	OutcomeAccepted  = "accepted"  // an event item IngestAt published
-	OutcomeDiscarded = "discarded" // a non-event item, read past
+	OutcomeStored    = "stored"    // a transaction item whose spans were published to SPANS (sentinel-span-ingest D2)
+	OutcomeDiscarded = "discarded" // a non-event item, read past (a transaction too, while span ingest is off)
 	OutcomeTooLarge  = "too_large" // an event item over MaxEventItemBytes (envelope) or a store body over it, or a
 	// mapped event over the publish budget after shedding / refused by NATS (§4.7, D13)
 	OutcomeRejected = "rejected" // not a JSON object, refused by Config.Scope, or an IngestAt validation failure
 	OutcomeFailed   = "failed"   // any other IngestAt error (publish, marshal)
 	OutcomeSkipped  = "skipped"  // a kept event item after the one that stopped the envelope (§4.2 step 6)
+)
+
+const (
+	MetricSpans = "sentinel_compat_spans_total" // spans by outcome: stored | truncated | invalid
 )
 
 // ItemTypes is the bounded set of item types the metric labels by; anything else is "unknown" (V6).
@@ -57,5 +62,18 @@ func NewItemRecorder(meter metric.Meter) (func(ctx context.Context, itemType, ou
 		c.Add(ctx, 1, metric.WithAttributes(
 			attribute.String(LabelType, ItemTypeLabel(itemType)),
 			attribute.String(obs.LabelOutcome, outcome)))
+	}, nil
+}
+
+// NewSpanRecorder creates the Int64Counter MetricSpans and returns the function Config.RecordSpans takes.
+func NewSpanRecorder(meter metric.Meter) (func(ctx context.Context, outcome string, n int), error) {
+	c, err := meter.Int64Counter(MetricSpans,
+		metric.WithDescription("Spans from Sentry-compatible transaction items by outcome"),
+		metric.WithUnit("{span}"))
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, outcome string, n int) {
+		c.Add(ctx, int64(n), metric.WithAttributes(attribute.String(obs.LabelOutcome, outcome)))
 	}, nil
 }

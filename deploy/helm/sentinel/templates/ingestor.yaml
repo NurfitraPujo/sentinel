@@ -63,6 +63,9 @@ spec:
             # sentinel-event-enrichment spec §3.3: always rendered; empty = trust no forwarding header.
             - name: TRUSTED_PROXY_CIDRS
               value: {{ join "," .Values.config.ingestor.trustedProxyCidrs | quote }}
+            # sentinel-span-ingest D2: transaction items -> the SPANS stream. Off = discarded and counted, as before.
+            - name: SPAN_INGEST_ENABLED
+              value: {{ .Values.spans.enabled | quote }}
             # sentinel-sentry-compat-ingest spec §3.6: compat routes only; empty = no extra trust.
             - name: SENTRY_COMPAT_TRUSTED_PROXY_CIDRS
               value: {{ join "," .Values.config.ingestor.sentryCompatTrustedProxyCidrs | quote }}

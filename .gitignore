@@ -37,3 +37,6 @@ node_modules
 
 .worktrees
 worktrees
+
+# compiled service binaries (go build -o bin/...) must never be committed
+apps/*/bin/

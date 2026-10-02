@@ -1023,3 +1023,44 @@ export const issueEscalations = pgTable('issue_escalations', {
 	uniqIssueHop: uniqueIndex('issue_escalations_issue_hop_unique').on(table.issueId, table.hop),
 	idxDue: index('idx_issue_escalations_due').on(table.ackDeadlineAt),
 }));
+
+// sentinel-span-ingest D1 (1725600000_add_spans.sql): spans for the trace waterfall, PARTITIONED BY DAY on
+// start_ts (the processor writes; the dashboard only reads, and the retention cron creates and drops day
+// partitions through spans_ensure_partitions / spans_drop_expired). Hand-maintained mirror like every table
+// here — the migration is the source of truth. org_id carries no FK and project_id is nullable: a span pulled
+// from core's trace store belongs to an organization, never to a Sentinel project.
+export const spans = pgTable('spans', {
+	orgId: uuid('org_id').notNull(),
+	projectId: uuid('project_id'),
+	environment: text('environment').notNull().default(''),
+	source: text('source').notNull(),
+	serviceName: text('service_name').notNull().default(''),
+	traceId: text('trace_id').notNull(),
+	spanId: text('span_id').notNull(),
+	parentSpanId: text('parent_span_id').notNull().default(''),
+	name: text('name').notNull().default(''),
+	op: text('op').notNull().default(''),
+	kind: text('kind').notNull().default(''),
+	startTs: timestamp('start_ts', { withTimezone: true }).notNull(),
+	durationUs: bigint('duration_us', { mode: 'number' }).notNull().default(0),
+	status: text('status').notNull().default(''),
+	attributes: jsonb('attributes').notNull().default({}),
+	// D8: the configured CORE project that governs a PULLED span (SPAN_PULL_SCOPES). NULL for mobile spans.
+	scopeProjectId: uuid('scope_project_id'),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.orgId, table.traceId, table.spanId, table.startTs] }),
+}));
+
+// D3: the durable pull queue, one row per (organization, trace); rows age out with the 14-day span window.
+export const spanPullQueue = pgTable('span_pull_queue', {
+	orgId: uuid('org_id').notNull(),
+	traceId: text('trace_id').notNull(),
+	stage: smallint('stage').notNull().default(0),
+	attempts: integer('attempts').notNull().default(0),
+	nextFetchAt: timestamp('next_fetch_at', { withTimezone: true }).notNull(),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	lastError: text('last_error').notNull().default(''),
+	triggerProjectId: uuid('trigger_project_id'),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.orgId, table.traceId] }),
+}));

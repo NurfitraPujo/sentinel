@@ -228,6 +228,18 @@ dependencies:
   minio:
     enabled: false
 
+# sentinel-span-ingest (contract D2/D3). Span ingest is on; the core-trace pull reads Tempo (shared by staging and
+# production, no auth). scopes maps the `tuju` organization - the organization that owns core's errors - to its `core`
+# project: the organization is the pull guard, and the project governs who may see the pulled spans (they are core's
+# data: SQL text and query parameters). The other organization on this database, `test`
+# (7ad17ddf-2ae1-47e8-b745-c5973965ac55), must NOT be listed.
+spans:
+  enabled: true
+  pull:
+    scopes: "98867bbe-5594-471e-a5c0-16b39d6afabc:7d95eb6d-6551-4096-a8b2-ef8944dfefcf"
+    storeKind: tempo
+    storeUrl: http://tempo.tempo-production.svc:3100
+
 init:
   nats:
     enabled: true

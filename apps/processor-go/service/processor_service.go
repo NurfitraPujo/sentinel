@@ -15,6 +15,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/spanpull"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
@@ -49,7 +50,14 @@ type ProcessorService struct {
 	// that constructs NewProcessorService(pool) without wiring the stage gets.
 	symbolicator *symbolicate.Service
 	symPlatforms []string
+
+	// spanPull queues a stored occurrence's trace for a pull of core's spans (sentinel-span-ingest D3). nil — the
+	// default, and what every test that does not wire it gets — means the feature is off.
+	spanPull *spanpull.Queue
 }
+
+// SetSpanPull wires the span-pull queue; main.go calls it once, before Subscribe, when SPAN_PULL_* is configured.
+func (s *ProcessorService) SetSpanPull(q *spanpull.Queue) { s.spanPull = q }
 
 func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
 	svc := &ProcessorService{
@@ -445,6 +453,11 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		ActorID:      "processor-go",
 		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
 	})
+
+	// sentinel-span-ingest D3: queue the occurrence's trace for a pull of core's spans. Best-effort like the audit rows
+	// above: MaybeEnqueue returns nothing, logs and counts its own failures, and runs only for a delivery that wrote
+	// an occurrence, so a redelivery never enqueues twice. The organization allow-list is checked inside it.
+	s.spanPull.MaybeEnqueue(ctx, issue.ProjectID, occ.TraceID)
 
 	// sentinel-releases-snooze §4.3 "After commit" (decisions 15, 41): the `next` rewrite, only when
 	// step 4c's RETURNING inserted was true — this delivery is the FIRST sighting of (project, R), so

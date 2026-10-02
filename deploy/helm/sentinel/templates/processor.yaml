@@ -97,6 +97,16 @@ spec:
               value: {{ .Values.config.processor.symbolicateDeadline | quote }}
             - name: SOURCEMAP_MAX_PARSE_BYTES
               value: {{ .Values.config.processor.sourcemapMaxParseBytes | quote }}
+            # sentinel-span-ingest D2/D3: the SPANS consumer and the core-trace pull (values.yaml `spans:`). A
+            # malformed SPAN_PULL value stops the process at start; empty = that half is off.
+            - name: SPAN_INGEST_ENABLED
+              value: {{ .Values.spans.enabled | quote }}
+            - name: SPAN_PULL_SCOPES
+              value: {{ .Values.spans.pull.scopes | quote }}
+            - name: TRACE_STORE_KIND
+              value: {{ .Values.spans.pull.storeKind | quote }}
+            - name: TRACE_STORE_URL
+              value: {{ .Values.spans.pull.storeUrl | quote }}
             # Go runtime soft memory limit, below resources.limits.memory (decision 35) so the
             # collector runs before the kernel's OOM killer does; see processor.gomemlimit in
             # values.yaml for the arithmetic that derives it.

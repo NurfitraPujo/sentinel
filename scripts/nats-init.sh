@@ -76,6 +76,27 @@ DLQ_DISCARD="old"
 DLQ_MAX_AGE="30d"
 DLQ_MAX_BYTES="1GiB"
 
+# --- SPANS / SPANS_DLQ -------------------------------------------------------
+#
+# sentinel-span-ingest D2: the ingestor publishes the spans of a Sentry-compatible `transaction` item here and the
+# processor's `processor-spans` consumer writes them to Postgres. Bounded like every other stream on this shared store
+# (the P0 incident above): 2GiB / 24h / discard-new, messages < 1 MiB (the ingestor encodes to 900,000 bytes).
+#   volume check   ~1.5k mobile transactions/day x ~4 spans x ~1 KiB = ~6 MiB/day: 2GiB is ~300x headroom, kept
+#                  generous because a Postgres outage that outlasts the consumer's redelivery window backs the stream up.
+#   store budget   Sentinel's worst case on the shared 50Gi store was 11.1 GiB (ERROR_EVENTS block); this adds
+#                  2GiB + 256MiB = 13.4 GiB, ~27%. Re-derive before raising.
+# discard=new: refuse a publish (the client's outbox retries) rather than silently drop spans nobody has stored.
+# SPANS_DLQ is where the consumer parks a message that kept failing; discard=old so it can always accept one, 7d / 256MiB
+# because a span is a view over an error, not evidence worth the 30 days ERROR_EVENTS_DLQ keeps. Creating it here means
+# ensureDLQStream's lazy, UNBOUNDED creation never runs.
+SPANS_STREAM_NAME="SPANS"
+SPANS_SUBJECT="spans"
+SPANS_CONSUMER_NAME="processor-spans"
+SPANS_MAX_AGE="${SPANS_MAX_AGE:-24h}"
+SPANS_MAX_BYTES="${SPANS_MAX_BYTES:-2GiB}"
+SPANS_DLQ_STREAM_NAME="SPANS_DLQ"
+SPANS_DLQ_SUBJECT="spans.dlq"
+
 # --- Control-plane streams ---------------------------------------------------
 #
 # ALERT_CONFIG and API_KEYS are small, low-frequency invalidation/change-notification streams (13 and 25
@@ -186,6 +207,12 @@ create_or_update_stream "$STREAM_NAME" "$SUBJECT" "$STREAM_DISCARD" "$STREAM_MAX
 create_consumer_if_missing "$STREAM_NAME" "$CONSUMER_NAME"
 
 create_or_update_stream "$DLQ_STREAM_NAME" "$DLQ_SUBJECT" "$DLQ_DISCARD" "$DLQ_MAX_AGE" "$DLQ_MAX_BYTES"
+
+create_or_update_stream "$SPANS_STREAM_NAME" "$SPANS_SUBJECT" "new" "$SPANS_MAX_AGE" "$SPANS_MAX_BYTES"
+
+create_consumer_if_missing "$SPANS_STREAM_NAME" "$SPANS_CONSUMER_NAME"
+
+create_or_update_stream "$SPANS_DLQ_STREAM_NAME" "$SPANS_DLQ_SUBJECT" "old" "168h" "256MiB"
 
 create_or_update_stream "$API_KEYS_STREAM_NAME" "$API_KEYS_SUBJECT" "new" "0s" "$CONTROL_PLANE_MAX_BYTES"
 

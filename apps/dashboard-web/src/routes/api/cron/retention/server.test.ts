@@ -17,6 +17,7 @@ const retention = {
 	reapStaleClaims: vi.fn(),
 	reapExpiredIdempotencyKeys: vi.fn(),
 	reapExpiredReportIdempotencyKeys: vi.fn(),
+	maintainSpans: vi.fn(),
 };
 vi.mock('$lib/server/retention', () => retention);
 vi.mock('$lib/db/queries/organizations', () => ({ reapAllExpiredInvitations: vi.fn(async () => 0) }));
@@ -113,6 +114,7 @@ beforeEach(() => {
 	retention.reapStaleClaims.mockResolvedValue({ releasedClaims: 0 });
 	retention.reapExpiredIdempotencyKeys.mockResolvedValue(0);
 	retention.reapExpiredReportIdempotencyKeys.mockResolvedValue(0);
+	retention.maintainSpans.mockResolvedValue({ createdPartitions: 0, droppedPartitions: 0, reapedPullQueue: 0, failed: false });
 });
 
 describe('POST /api/cron/retention — retentionDays comes from the shared helper (decision 21)', () => {
@@ -141,6 +143,8 @@ describe('POST /api/cron/retention — retentionDays comes from the shared helpe
 			retention.reapStaleClaims.mock.calls[0][1],
 			retention.reapExpiredIdempotencyKeys.mock.calls[0][0],
 			retention.reapExpiredReportIdempotencyKeys.mock.calls[0][0],
+			// sentinel-span-ingest D1: span partitions are kept on the same run connection.
+			retention.maintainSpans.mock.calls[0][0],
 		];
 		for (const d of stepDbs) expect(d).toBe(run.db);
 		expect(run.db).toBeDefined();
@@ -353,5 +357,22 @@ describe('POST /api/cron/retention — one run, one connection, one deadline (se
 		expect(runClient.end).toHaveBeenCalledTimes(1);
 		expect(recordRetentionRun).toHaveBeenCalledTimes(1);
 		expect(recordRetentionRun).toHaveBeenCalledWith('connection_lost');
+	});
+});
+
+describe('POST /api/cron/retention — span partition upkeep is independent (sentinel-span-ingest D1, repair m7)', () => {
+	it('runs BEFORE the occurrence sweep, so a throw there cannot stop partition create/drop', async () => {
+		retention.cleanupRetainedData.mockRejectedValueOnce(new Error('sweep blew up'));
+		const response = await POST(cronRequest('s3cret'));
+		expect(response.status).toBe(500);
+		expect(retention.maintainSpans).toHaveBeenCalledTimes(1);
+		expect(retention.maintainSpans.mock.invocationCallOrder[0]).toBeLessThan(retention.cleanupRetainedData.mock.invocationCallOrder[0]);
+	});
+
+	it('a failed maintenance is reported in the result and does not fail the run', async () => {
+		retention.maintainSpans.mockResolvedValueOnce({ createdPartitions: 0, droppedPartitions: 0, reapedPullQueue: 0, failed: true });
+		const response = await POST(cronRequest('s3cret'));
+		expect(response.status).toBe(200);
+		expect((await response.json()).result.spanMaintenance.failed).toBe(true);
 	});
 });

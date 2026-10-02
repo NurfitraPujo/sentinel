@@ -5,6 +5,35 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-10-02 - Span ingest: mobile transactions + pulled core traces feed a trace waterfall
+
+- **Why durable**: spans (14-day retention) live in a DAY-PARTITIONED `spans` table; retention is a
+  `DROP` of whole partitions by `spans_drop_expired`, partitions are made by `spans_ensure_partitions`
+  (both SQL, called by the hourly retention cron AND the processor at start-up/hourly). A span whose
+  `start_ts` is outside yesterday..+2 days has NO partition (no DEFAULT one, on purpose) and is dropped
+  and counted `sentinel_spans_dropped_total{reason="out_of_window"}`. Two sources: compat `transaction`
+  items -> SPANS stream -> `spans` (`source='mobile'`), and core traces PULLED from Tempo / the Jaeger API
+  2 and 10 minutes after an error with a canonical trace id lands in an organization listed in
+  `SPAN_PULL_SCOPES` (`source='pulled'`, no project). Contract: prd `sentinel-span-ingest` D1-D9.
+- **Future mistakes prevented**:
+  - `SPAN_PULL_SCOPES` (`<org uuid>:<core project uuid>,...`; Helm `spans.pull.scopes`) is BOTH the tenancy guard
+    for pulled spans (trace ids are client-asserted: only an org that is a key is ever enqueued, checked at enqueue
+    AND again by the worker) and what governs who may see them. Never widen it to "all orgs", never derive it from
+    a request body.
+  - D8 for PULLED spans (core's data, no project of their own): governed by the org's configured CORE project
+    (`spans.scope_project_id`, stamped at pull time from the map): the viewer must reach that project AND its
+    environment grant must permit the span's environment. NOT the project of the error that queued the trace (a
+    mobile error can queue it first; `span_pull_queue.trigger_project_id` is debugging only) and NOT a union
+    over the projects a viewer reaches (both leaked production spans; repair rounds 1-2).
+  - The spans dedupe key includes `org_id` `(org_id, trace_id, span_id, start_ts)`: another org cannot block a row.
+  - Production `spans.pull.scopes` maps the `tuju` org to its `core` project only; the `test` org must not be listed.
+- **Where to look**: `packages/db-migrations/migrations/1725600000_add_spans.sql`,
+  `apps/ingestor-go/sentrycompat/{transaction,spans}.go`, `apps/processor-go/{spans,spanpull}/`,
+  `apps/dashboard-web/src/lib/{spans/waterfall.ts,server/queries/span-queries.ts}`,
+  `tests/integration/span_ingest_test.go`, `src/lib/server/span-waterfall.integration.test.ts`.
+
+---
+
 ### 2026-08-18 - N10 part 1: per-project agent settings + repo connections (server-side worker policy)
 
 - **Why durable**: FIX authorization for the N8 sentinel-worker is now per-project, server-side,

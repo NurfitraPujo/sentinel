@@ -19,6 +19,8 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/dlqmonitor"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/service"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/spanpull"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/spans"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/tagfacets"
@@ -26,6 +28,7 @@ import (
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/database"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/spanwire"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -202,6 +205,11 @@ func main() {
 	proc := service.NewProcessorService(db)
 	proc.Alerts().StartInvalidationSubscriber(alertConfigSub)
 
+	// sentinel-span-ingest: the SPANS consumer (D2) and the core-trace pull worker (D3). Both are off unless
+	// configured and neither is ever fatal: spans are a view over errors, so a missing stream or an unreachable
+	// trace store is logged and the error pipeline runs on.
+	startSpans(ctx, db, proc)
+
 	// sentinel-sourcemaps §4.4: the symbolication stage, wired before Subscribe so no event is
 	// consumed by a processor that would pass every frame through. The S3 client is built from
 	// S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY (§12 — the same four the dashboard
@@ -352,6 +360,84 @@ func main() {
 // a named constant because symbolicate.AckWait's arithmetic is in terms of it (§12: "BatchSize
 // is 10").
 const processorBatchSize = 10
+
+// startSpans wires sentinel-span-ingest's two processor halves. SPAN_INGEST_ENABLED=true starts the SPANS consumer
+// (D2) and the partition keeper; SPAN_PULL_SCOPES + TRACE_STORE_KIND + TRACE_STORE_URL (all set) start the pull
+// worker and let the processor enqueue traces (D3). A bad SPAN_PULL value is a configuration error and stops the
+// process, like the symbolication knobs: a typo must not silently pull nothing.
+func startSpans(ctx context.Context, db *pgxpool.Pool, proc *service.ProcessorService) {
+	spanStore := spans.NewStore(db)
+	ingestOn := getEnv("SPAN_INGEST_ENABLED", "false") == "true"
+	pullCfg, err := spanpull.ParseConfig(os.LookupEnv)
+	if err != nil {
+		log.Fatalf("Invalid span pull configuration: %v", err)
+	}
+	if !ingestOn && !pullCfg.Enabled() {
+		slog.InfoContext(ctx, "Span ingest and span pull are off")
+		return
+	}
+
+	// The partition window is also kept by the dashboard's hourly retention cron; doing it here too means a stalled
+	// cron cannot leave today without a partition (spans outside the window are dropped, D1).
+	keepPartitions := func() {
+		if n, err := spanStore.EnsurePartitions(ctx); err != nil {
+			slog.WarnContext(ctx, "spans: ensure partitions failed", slog.String("error", err.Error()))
+		} else if n > 0 {
+			slog.InfoContext(ctx, "spans: created day partitions", slog.Int("created", n))
+		}
+	}
+	keepPartitions()
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				keepPartitions()
+			}
+		}
+	}()
+
+	if ingestOn {
+		sub, err := nats.NewSubscriber(ctx, nats.SubscriberConfig{
+			URL:       getEnv("NATS_URL", "nats://localhost:4222"),
+			Stream:    spanwire.Stream,
+			Subject:   spanwire.Subject,
+			Consumer:  "processor-spans",
+			BatchSize: 50,
+			BatchWait: 1 * time.Second,
+			// A database outage redelivers with the subscriber's backoff (~8.5 min window at 7); what still fails is
+			// parked in a bounded SPANS_DLQ (scripts/nats-init.sh), never in the error DLQ whose depth pages an operator.
+			MaxDeliver: 7,
+			DLQSubject: "spans.dlq",
+			DLQStream:  "SPANS_DLQ",
+		})
+		if err != nil {
+			slog.ErrorContext(ctx, "spans: could not connect the SPANS consumer; mobile spans will not be stored", slog.String("error", err.Error()))
+		} else {
+			consumer := &spans.Consumer{Store: spanStore}
+			if err := sub.Subscribe(ctx, func(msgCtx context.Context, data []byte, _ nats.Header) error {
+				return consumer.Handle(msgCtx, data)
+			}); err != nil {
+				slog.ErrorContext(ctx, "spans: could not subscribe to SPANS (is the stream created?); mobile spans will not be stored", slog.String("error", err.Error()))
+				sub.Close()
+			}
+		}
+	}
+
+	if pullCfg.Enabled() {
+		traces, err := spanpull.NewTraceStore(pullCfg, &http.Client{})
+		if err != nil {
+			log.Fatalf("Invalid span pull configuration: %v", err)
+		}
+		queue := spanpull.NewQueue(db, pullCfg)
+		proc.SetSpanPull(queue)
+		go (&spanpull.Worker{Queue: queue, Spans: spanStore, Traces: traces, Cfg: pullCfg}).Run(ctx)
+		slog.InfoContext(ctx, "Span pull enabled", slog.String("store_kind", pullCfg.Kind), slog.Int("orgs", len(pullCfg.Scopes)))
+	}
+}
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

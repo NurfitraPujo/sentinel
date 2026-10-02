@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne, or, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, ne, or, type AnyColumn, type SQL } from 'drizzle-orm';
 import { db } from './db';
 import { issues, projectEnvironmentGrants } from '$lib/db/schema';
 
@@ -187,13 +187,18 @@ export function scopeForProject(
  * condition the call site applies beside this one (§4.4's unconditional `inArray`); conflating the
  * two is how a guard becomes a filter the caller controls.
  */
-export function environmentScopeCondition(scopes: Map<string, string[]>): SQL | undefined {
+export function environmentScopeCondition(
+	scopes: Map<string, string[]>,
+	// The same rule over another table's (project, environment) pair — `spans` composes it for the mobile spans
+	// of the trace waterfall (sentinel-span-ingest D8). Defaults to `issues`, so every existing caller is unchanged.
+	columns: { projectId: AnyColumn; environment: AnyColumn } = issues
+): SQL | undefined {
 	if (scopes.size === 0) {
 		return undefined;
 	}
 
 	const perProject = [...scopes.entries()].map(([projectId, environments]) =>
-		or(ne(issues.projectId, projectId), inArray(issues.environment, environments))
+		or(ne(columns.projectId, projectId), inArray(columns.environment, environments))
 	);
 
 	return and(...perProject);

@@ -41,6 +41,9 @@ function data(over: Record<string, unknown> = {}) {
 		projects: [{ id: 'p2', name: 'core' }, { id: 'p1', name: 'web' }],
 		projectCount: 2,
 		retentionDays: 30,
+		spans: [],
+		spansTruncated: false,
+		spanRetentionDays: 14,
 		...over,
 	} as any;
 }
@@ -71,6 +74,38 @@ describe('the trace page', () => {
 		});
 		expect(getByTestId('trace-empty').textContent).toContain('No errors in this trace');
 		expect(queryAllByTestId('trace-row')).toHaveLength(0);
+	});
+
+	it('draws the span waterfall above the list when the trace has spans, pinning the loaded errors', () => {
+		const span = (spanId: string, over: Record<string, unknown> = {}) => ({
+			spanId,
+			parentSpanId: '',
+			name: `span ${spanId}`,
+			op: 'http.server',
+			kind: 'server',
+			source: 'pulled',
+			serviceName: 'core-api',
+			projectName: null,
+			environment: 'production',
+			startUs: Date.parse('2026-09-25T02:00:00.000Z') * 1000,
+			durationUs: 5_000_000,
+			status: 'ok',
+			attributes: {},
+			...over,
+		});
+		const { getByTestId, getAllByTestId, container } = render(Page, {
+			data: data({ occurrences: [row(1, { spanId: 'b'.repeat(16) })], spans: [span('a'.repeat(16)), span('b'.repeat(16), { parentSpanId: 'a'.repeat(16) })] }),
+		});
+		const wf = getByTestId('waterfall');
+		expect(wf.compareDocumentPosition(getByTestId('trace-summary')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(getAllByTestId('waterfall-row')).toHaveLength(2);
+		expect(getByTestId('waterfall-error').closest('[data-testid="waterfall-row"]')?.getAttribute('data-span-id')).toBe('b'.repeat(16));
+		expect(container.querySelectorAll('[data-testid="trace-row"]')).toHaveLength(1); // the list is unchanged
+	});
+
+	it('has no waterfall for a trace with neither spans nor errors', () => {
+		const { queryByTestId } = render(Page, { data: data({ occurrences: [], total: 0, projects: [] }) });
+		expect(queryByTestId('waterfall')).toBeNull();
 	});
 
 	it('states the retention window, as the issue page does', () => {

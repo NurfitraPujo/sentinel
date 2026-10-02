@@ -237,6 +237,16 @@ dependencies:
 # restored the streams AND their consumers. scripts/nats-init.sh has been
 # idempotent since 2026-10-01 (consumer_exists guard), so enabling it would be
 # safe but pointless — see the header.
+# sentinel-span-ingest: AWS reads VictoriaTraces' Jaeger query API (no auth, reachable from the VPC). Off while this
+# environment is parked (replicas 0, the NATS cutover owns the streams): at cutover create SPANS / SPANS_DLQ /
+# processor-spans exactly as scripts/nats-init.sh does, set enabled, and fill scopes with `<tuju org uuid>:<core project uuid>`.
+spans:
+  enabled: false
+  pull:
+    scopes: ""
+    storeKind: jaeger
+    storeUrl: http://monitoring.internal.tuju.ai:10428
+
 init:
   nats:
     enabled: false

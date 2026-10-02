@@ -244,6 +244,15 @@ dependencies:
   minio:
     enabled: false
 
+# sentinel-span-ingest: Tempo is shared with production; ingest and pull stay off here (mobile staging sends no
+# transactions, and no organization is allow-listed) until someone needs them.
+spans:
+  enabled: false
+  pull:
+    scopes: ""
+    storeKind: tempo
+    storeUrl: http://tempo.tempo-production.svc:3100
+
 init:
   nats:
     # Off while frozen. The streams AND consumers already exist on the CCE

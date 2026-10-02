@@ -31,6 +31,23 @@ type Config struct {
 	Logger        *slog.Logger                                                // nil → slog.Default()
 	RecordItem    func(ctx context.Context, itemType, outcome string)         // nil → no-op (§4.6)
 	PublishBudget int                                                         // 0 → service.MaxPublishBytes (§4.7); tests pass a smaller one
+
+	// Spans is where transaction items go (sentinel-span-ingest D2): it publishes one encoded spanwire message to the
+	// SPANS stream. nil means span ingest is off and a transaction item is discarded and counted as before.
+	Spans func(ctx context.Context, msg []byte) error
+	// Identity returns the authenticated organization and project (the project is "" for an organization-wide key
+	// that named none). Tenancy for spans derives from the credential, never the body (B7); a request without an
+	// organization is rejected.
+	Identity func(ctx context.Context) (orgID, projectID string, ok bool)
+	// RecordSpans counts spans by outcome: stored (published), truncated (past the per-transaction cap) and
+	// invalid (skipped for an unusable id or timestamp). nil → no-op.
+	RecordSpans func(ctx context.Context, outcome string, n int)
+}
+
+func (c Config) recordSpans(ctx context.Context, outcome string, n int) {
+	if c.RecordSpans != nil && n > 0 {
+		c.RecordSpans(ctx, outcome, n)
+	}
 }
 
 func (c Config) logger() *slog.Logger {
@@ -87,9 +104,15 @@ func NewEnvelopeHandler(cfg Config) http.Handler {
 			writeStatus(w, err)
 			return
 		}
-		var events [][]byte
+		var events, transactions [][]byte
 		for _, it := range env.Items {
 			switch {
+			case it.Type == "transaction" && cfg.Spans != nil:
+				if it.Oversized {
+					cfg.record(r.Context(), it.Type, OutcomeTooLarge)
+				} else {
+					transactions = append(transactions, it.Payload)
+				}
 			case it.Type != "event":
 				cfg.record(r.Context(), it.Type, OutcomeDiscarded)
 			case it.Oversized:
@@ -98,7 +121,19 @@ func NewEnvelopeHandler(cfg Config) http.Handler {
 				events = append(events, it.Payload)
 			}
 		}
-		ingestEvents(w, r, cfg, env.Header, events)
+		firstID, ok := processEvents(w, r, cfg, env.Header, events)
+		if !ok {
+			// An event failed and answered. Transactions of the same envelope are not attempted: the client retries the
+			// whole envelope, and errors drain before spans (sentinel-span-ingest D5).
+			for range transactions {
+				cfg.record(r.Context(), "transaction", OutcomeSkipped)
+			}
+			return
+		}
+		if !processTransactions(w, r, cfg, transactions) {
+			return
+		}
+		writeOK(w, firstID)
 	})
 }
 
@@ -120,7 +155,9 @@ func NewStoreHandler(cfg Config) http.Handler {
 			writeStatus(w, err)
 			return
 		}
-		ingestEvents(w, r, cfg, EnvelopeHeader{}, [][]byte{payload})
+		if firstID, ok := processEvents(w, r, cfg, EnvelopeHeader{}, [][]byte{payload}); ok {
+			writeOK(w, firstID)
+		}
 	})
 }
 
@@ -129,16 +166,16 @@ func writeStatus(w http.ResponseWriter, err error) {
 	http.Error(w, msg, code)
 }
 
-// ingestEvents is steps 5-7 of §4.2, shared by both handlers: map, scope and ingest each kept event in order; the
-// first failure answers and stops the envelope, and every kept event after it is counted skipped.
-func ingestEvents(w http.ResponseWriter, r *http.Request, cfg Config, header EnvelopeHeader, payloads [][]byte) {
+// processEvents is steps 5-7 of §4.2, shared by both handlers: map, scope and ingest each kept event in order; the
+// first failure answers and stops the envelope (ok = false, the response is written), and every kept event after it
+// is counted skipped. On success it writes nothing: the caller finishes the response with writeOK.
+func processEvents(w http.ResponseWriter, r *http.Request, cfg Config, header EnvelopeHeader, payloads [][]byte) (firstID string, ok bool) {
 	ctx := enrich.WithBudget(r.Context(), enrich.NewBudget())
 	receivedAt := time.Now().UTC()
 	logger := cfg.logger()
 	// Resolved once per request (spec §3.7.3); the untrusted-peer log line, when it applies, is written here once.
 	relay := RelayIdentityFromRequest(r, logger)
 
-	firstID := ""
 	for i, raw := range payloads {
 		fail := func(outcome string, code int, msg string) {
 			cfg.record(ctx, "event", outcome)
@@ -151,13 +188,13 @@ func ingestEvents(w http.ResponseWriter, r *http.Request, cfg Config, header Env
 		p, err := MapEvent(raw, header)
 		if err != nil {
 			fail(OutcomeRejected, http.StatusBadRequest, "invalid event payload")
-			return
+			return "", false
 		}
 		relay.Apply(p)
 		if cfg.Scope != nil {
 			if err := cfg.Scope(ctx, p); err != nil {
 				fail(OutcomeRejected, http.StatusForbidden, err.Error())
-				return
+				return "", false
 			}
 		}
 		if err := cfg.Ingest.IngestAtWithin(ctx, p, receivedAt, cfg.budget(), Shed); err != nil {
@@ -173,7 +210,7 @@ func ingestEvents(w http.ResponseWriter, r *http.Request, cfg Config, header Env
 				logger.ErrorContext(ctx, fmt.Sprintf("Failed to ingest error: %v", err), slog.Any("error", err), slog.String("project_key", p.ProjectKey))
 				fail(OutcomeFailed, http.StatusInternalServerError, "Failed to ingest event")
 			}
-			return
+			return "", false
 		}
 		cfg.record(ctx, "event", OutcomeAccepted)
 		if firstID == "" {
@@ -181,6 +218,10 @@ func ingestEvents(w http.ResponseWriter, r *http.Request, cfg Config, header Env
 		}
 	}
 
+	return firstID, true
+}
+
+func writeOK(w http.ResponseWriter, firstID string) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := map[string]string{}
 	if firstID != "" {

@@ -287,6 +287,9 @@ jobs:
       # proof that the trace page / related-errors count / agent read scope to ONE organization, honour environment
       # grants, and page by keyset without skipping rows. Self-skips without a database; this makes that a hard failure.
       TRACE_VIEW_INTEGRATION_REQUIRED: "1"
+      # sentinel-span-ingest's span-waterfall.integration.test.ts: the real-Postgres proof of the waterfall query's
+      # org/project/environment guards and of the span retention step. Self-skips without a database; hard failure here.
+      SPAN_WATERFALL_INTEGRATION_REQUIRED: "1"
       # Master key for the same test's real AES-GCM round-trip (base64 of 32 bytes, CI-only value).
       SENTINEL_ENCRYPTION_KEY: "ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE="
       DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel

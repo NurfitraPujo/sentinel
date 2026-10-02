@@ -60,7 +60,10 @@ func TestSentryEnvelopeFixturesParse(t *testing.T) {
 	require.Len(t, env.Items, 3)
 	assert.Equal(t, []string{"event", "transaction", "client_report"}, []string{env.Items[0].Type, env.Items[1].Type, env.Items[2].Type})
 	assert.Equal(t, string(scCompact(t, scReadFixture(t, "flutter-typeerror-unhandled.json"))), string(env.Items[0].Payload))
-	assert.Nil(t, env.Items[1].Payload, "a non-event payload is read past, not kept")
+	// sentinel-span-ingest D2: a transaction item is kept like an event so its spans can be parsed; every other type
+	// (the client_report below) is still read past unread.
+	assert.NotEmpty(t, env.Items[1].Payload, "a transaction payload is kept")
+	assert.Nil(t, env.Items[2].Payload, "a non-event, non-transaction payload is read past, not kept")
 
 	env = scReadEnv(t, scReadFixture(t, "envelopes/nextjs-10.envelope"))
 	assert.Equal(t, "44444444444444448444444444444444", env.Header.EventID)

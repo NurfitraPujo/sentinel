@@ -27,8 +27,8 @@ type EnvelopeHeader struct {
 // Item is one envelope item as the reader returns it.
 type Item struct {
 	Type      string // the item header's "type", verbatim
-	Payload   []byte // set only for a kept event item
-	Oversized bool   // an event item over MaxEventItemBytes: read past, not kept
+	Payload   []byte // set only for a kept event or transaction item
+	Oversized bool   // an event or transaction item over MaxEventItemBytes: read past, not kept
 }
 
 type Envelope struct {
@@ -82,7 +82,9 @@ func ReadEnvelope(r io.Reader) (*Envelope, error) {
 			return nil, err
 		}
 		it := Item{Type: typ}
-		isEvent := typ == "event"
+		// A transaction item is kept like an event (sentinel-span-ingest D2) under the same 1 MiB per-item bound;
+		// every other type is read past unread.
+		isEvent := typ == "event" || typ == "transaction"
 
 		if eof {
 			// The header line ended at EOF: a length item has no payload; a newline item has an empty one.

@@ -22,9 +22,11 @@ import { AGENT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/agent-idempotency'
 import { REPORT_IDEMPOTENCY_RETENTION_DAYS } from '$lib/server/report-idempotency';
 import { deleteObject, isStorageConfigured } from '$lib/server/storage';
 import { log } from '$lib/server/observability/log';
+import { SPAN_RETENTION_DAYS } from '$lib/spans/waterfall';
 import { recordReleaseNextRewriteFailure } from '$lib/server/metrics';
 import {
 	openRetentionRun,
+	isConnectionLossError,
 	RetentionConnectionLost,
 	RetentionDeadlineError,
 	type RetentionRun,
@@ -1013,6 +1015,77 @@ export async function reapExpiredIdempotencyKeys(
 		.returning({ id: agentIdempotencyKeys.id });
 
 	return deleted.length;
+}
+
+/**
+ * sentinel-span-ingest D1: the span table's retention. Spans are DAY-PARTITIONED on `start_ts`, so keeping
+ * them 14 days is a DROP of whole expired partitions (instant, no dead tuples, no row-by-row DELETE on a table
+ * that takes ~47M core spans a day at the source) and keeping the table writable is creating the day partitions
+ * the processor and the ingest path insert into: yesterday through two days ahead.
+ *
+ * It lives in THIS job — the existing hourly retention cron — because that is the only scheduled job the chart
+ * already runs, with its own advisory lock and deadline, and a second cron for one SELECT would be a new thing
+ * to keep alive. Both functions are SQL (spans_ensure_partitions / spans_drop_expired in
+ * 1725600000_add_spans.sql) so this and the processor, which also ensures partitions at start-up and hourly,
+ * cannot disagree on naming or bounds. The pull queue's rows age out on the same 14-day window: a row is the
+ * dedupe for its trace, and past the window the trace's spans are gone anyway.
+ *
+ * Isolated from the rest of the run: a failure here (the migration not applied yet during a rollout, a lock
+ * wait on a partition) is logged and reported in the result and NEVER fails the occurrence retention beside it.
+ */
+export interface SpanMaintenanceResult {
+	createdPartitions: number;
+	droppedPartitions: number;
+	reapedPullQueue: number;
+	failed: boolean;
+}
+
+/**
+ * The bounds on span maintenance's own statements. It runs FIRST in the run, so without them it would inherit the
+ * run's whole remaining deadline as its lock and statement timeout: a long reader holding `spans` made
+ * spans_drop_expired (ACCESS EXCLUSIVE on the table) wait ~11 s while every span insert queued behind it, and could
+ * exhaust the run and starve the occurrence sweep. 3 s of lock wait and 30 s of statement time are generous for
+ * catalog-sized DDL; past either, the step is abandoned, logged and metered, and the run goes on (the next hourly
+ * run tries again).
+ */
+export const SPAN_MAINT_CAPS = { lockMs: 3_000, statementMs: 30_000 } as const;
+
+export async function maintainSpans(
+	exec: Exec = db,
+	keepDays: number = SPAN_RETENTION_DAYS,
+	// The run whose connection `exec` is, when there is one: its caps are tightened for these statements only and
+	// returned to the run's own bound afterwards, whatever happens in between.
+	run?: Pick<RetentionRun, 'setCaps'>,
+	caps: { lockMs: number; statementMs: number } = SPAN_MAINT_CAPS
+): Promise<SpanMaintenanceResult> {
+	run?.setCaps(caps);
+	try {
+		const created = await exec.execute<{ n: number }>(sql`SELECT spans_ensure_partitions(1, 2) AS n`);
+		const dropped = await exec.execute<{ n: number }>(sql`SELECT spans_drop_expired(${keepDays}::int) AS n`);
+		const cutoff = new Date(Date.now() - keepDays * 24 * 60 * 60 * 1000);
+		// A count, not every reaped row: a busy week queues many thousands of traces.
+		const reaped = await exec.execute<{ n: number }>(
+			sql`WITH d AS (DELETE FROM span_pull_queue WHERE created_at < ${cutoff.toISOString()}::timestamptz RETURNING 1) SELECT count(*)::int AS n FROM d`
+		);
+		return {
+			createdPartitions: Number(created[0]?.n ?? 0),
+			droppedPartitions: Number(dropped[0]?.n ?? 0),
+			reapedPullQueue: Number(reaped[0]?.n ?? 0),
+			failed: false,
+		};
+	} catch (error) {
+		// A lost connection is the run's to handle (its later steps would fail on it anyway); everything else —
+		// including a lock or statement timeout from the caps above — is this step's failure alone.
+		if (isConnectionLossError(error)) throw error;
+		const code = (error as { code?: unknown } | null)?.code;
+		log.error('retention.span_maintenance_failed', {
+			error,
+			timedOut: code === '55P03' || code === '57014',
+		});
+		return { createdPartitions: 0, droppedPartitions: 0, reapedPullQueue: 0, failed: true };
+	} finally {
+		run?.setCaps(null);
+	}
 }
 
 /**
