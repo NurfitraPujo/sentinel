@@ -23,7 +23,7 @@
   "level": "error",
   "sdk": {
     "name": "sentinel.javascript.browser",
-    "version": "0.3.0"
+    "version": "0.3.1"
   },
   "user": {
     "ip_address": "{{auto}}"

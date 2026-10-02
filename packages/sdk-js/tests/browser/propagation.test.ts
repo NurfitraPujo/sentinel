@@ -342,7 +342,6 @@ describe('through a real Request', () => {
     const r = new Request(`${location.origin}/api/x`, { method: 'POST', body: 'b' });
     await fetch(r);
     expect(r.headers.has('traceparent')).toBe(false);
-    expect(r.bodyUsed).toBe(false);
   });
 
   it('an init that is not a plain object (a Request as init) goes out untouched — method and body intact', async () => {
@@ -451,5 +450,43 @@ describe('<base href>', () => {
     expect(sent[0]?.headers.traceparent).toBeUndefined();
     await fetch(`${location.origin}/b`);
     expect(sent[1]?.headers.traceparent).toMatch(TP);
+  });
+});
+
+// sentinel-sdkjs-request-clone-unread BUG-01: adding traceparent must consume the caller's Request body exactly as a
+// plain fetch(req) would, not leave it unread behind a clone.
+describe('a Request with a body is consumed, not cloned', () => {
+  beforeEach(() => {
+    sent = [];
+    installRealRequestFetch();
+  });
+
+  it('bodyUsed is true after the SDK fetch, and a second fetch rejects', async () => {
+    init({ tunnel: '/api/sentinel' });
+    const r = new Request(`${location.origin}/api/x`, { method: 'POST', body: 'b' });
+    await fetch(r);
+    expect(sent[0]?.body).toBe('b');
+    expect(sent[0]?.headers.traceparent).toMatch(TP);
+    expect(r.bodyUsed).toBe(true);
+    await expect(fetch(r)).rejects.toThrow(TypeError);
+  });
+
+  it('a streaming body is sent with traceparent and the original stream is not left unread', async () => {
+    init({ tunnel: '/api/sentinel' });
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('streamed'));
+        c.close();
+      },
+    });
+    const r = new Request(`${location.origin}/api/up`, { method: 'POST', body: stream, duplex: 'half' } as RequestInit);
+    await fetch(r);
+    expect(sent[0]?.body).toBe('streamed');
+    expect(sent[0]?.headers.traceparent).toMatch(TP);
+    expect(r.bodyUsed).toBe(true);
+    // Read to the end by the sent request (a tee'd, abandoned original would still be locked by the tee):
+    // the stream is free again and has nothing left in it.
+    expect(r.body?.locked).toBe(false);
+    expect((await r.body?.getReader().read())?.done).toBe(true);
   });
 });

@@ -4,6 +4,16 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+## v0.3.1 — Fix: `traceparent` no longer leaves the caller's Request body unread
+
+### Fixed
+
+- **Adding `traceparent` to a same-origin `fetch(request)` no longer sends `request.clone()`** when the Request has a
+  body. The clone left the caller's original unread, so `request.bodyUsed` stayed `false` (a second `fetch(request)`
+  succeeded where it throws without the SDK) and a streaming (`duplex: 'half'`) upload was buffered by the tee. The
+  outgoing request is now built from the original, which transfers and consumes its body exactly as a plain
+  `fetch(request)` does; method, credentials, referrer and referrerPolicy are kept. Body-less Requests are unchanged.
+
 ## v0.3.0 — Browser trace propagation (`tracePropagationTargets`)
 
 - **The browser SDK starts a trace and sends it.** One trace id per page load, renewed on each navigation to a

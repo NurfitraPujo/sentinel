@@ -2,4 +2,4 @@
 // as `dist` and `tests/package.test.ts` can assert it equals `package.json`'s `version` directly. Bump both
 // together — C11 does, at the release commit.
 
-export const SDK_VERSION = '0.3.0';
+export const SDK_VERSION = '0.3.1';

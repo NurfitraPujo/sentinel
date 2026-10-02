@@ -154,8 +154,19 @@ function installFetch(client: InternalClient, targets: PropagationTarget[] | und
                 } else {
                   // A Request with no init.headers: a non-empty init would reset its referrer and referrerPolicy
                   // (Fetch spec), so send a clone carrying the header instead — everything else is preserved.
-                  const copy = request.clone();
-                  copy.headers.set('traceparent', value);
+                  // sentinel-sdkjs-request-clone-unread BUG-01: a Request WITH a body is not cloned. clone() tees the
+                  // stream and the caller's original is never read, so `bodyUsed` stays false (a second fetch(req)
+                  // succeeds where the platform throws) and a streaming upload is buffered. Constructing from the
+                  // Request transfers its body and disturbs the source, exactly as a plain fetch(req) would.
+                  // referrer/referrerPolicy are passed explicitly because a non-empty init resets them (Fetch spec).
+                  const rq = request as unknown as Request;
+                  const headers = new Headers(rq.headers);
+                  headers.set('traceparent', value);
+                  const copy =
+                    rq.body === null
+                      ? rq.clone()
+                      : new Request(rq, { headers, referrer: rq.referrer, referrerPolicy: rq.referrerPolicy, duplex: 'half' } as RequestInit);
+                  if (rq.body === null) copy.headers.set('traceparent', value);
                   callArgs = [copy, ...args.slice(1)];
                 }
               }

@@ -666,7 +666,7 @@ from one that genuinely had nothing to trim.
 
 ## Bundle size
 
-**0.3.0: `sdk_js_client_entry_gzip_bytes` = 22 829** (`pnpm size`; 21 457 on the same machine at the 0.2.0 head, +1 372 for page trace and
+**0.3.1: `sdk_js_client_entry_gzip_bytes` = 22 898** (22 829 at 0.3.0; `pnpm size`; 21 457 on the same machine at the 0.2.0 head, +1 372 for page trace and
 fetch/XHR propagation). The 0.2.0 paragraph below is kept as measured at its own head.
 
 **`sdk_js_client_entry_gzip_bytes` = 21 251** — re-measured for 0.2.0 (`pnpm size`) at `08b16af`,
