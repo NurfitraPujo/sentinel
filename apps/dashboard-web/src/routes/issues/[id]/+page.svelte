@@ -1075,6 +1075,18 @@
 		border: 1px solid var(--border-color);
 	}
 
+	.trace-info a,
+	.meta-item a[data-testid='view-trace'] {
+		color: var(--color-primary);
+		text-decoration: none;
+	}
+
+	.trace-info a:hover,
+	.meta-item a[data-testid='view-trace']:hover {
+		color: var(--color-primary-hover);
+		text-decoration: underline;
+	}
+
 	.trace-info {
 		display: flex;
 		gap: 1rem;

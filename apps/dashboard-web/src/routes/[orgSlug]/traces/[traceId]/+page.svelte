@@ -4,6 +4,7 @@
 	// view is sentinel-span-ingest's, not this page's.
 	import { goto } from '$app/navigation';
 	import type { PageData } from './$types';
+	import { levelTone } from '$lib/components/issues/occurrence-display';
 
 	let { data }: { data: PageData } = $props();
 
@@ -86,7 +87,7 @@
 						{/if}
 						<span class="badge project" data-testid="trace-project">{r.projectName}</span>
 						<span class="badge env">{r.environment}</span>
-						{#if r.level}<span class="badge level level-{r.level}">{r.level}</span>{/if}
+						{#if r.level}<span class="badge level level-{r.level} {levelTone(r.level)}">{r.level}</span>{/if}
 					</div>
 					<div class="trace-row-body">
 						<a
@@ -126,14 +127,24 @@
 	.container { max-width: 1000px; margin: 0 auto; padding: 1.5rem; }
 	h1 { font-size: 1.25rem; }
 	code { word-break: break-all; }
+	.trace-summary { color: var(--text-secondary); }
+	.empty { color: var(--text-muted); }
 	.trace-list { list-style: none; padding: 0; margin: 1rem 0; }
-	.trace-row { border: 1px solid var(--border, #ddd); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.5rem; }
+	.trace-row { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.75rem; margin-bottom: 0.5rem; }
 	.trace-row-head { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; font-size: 0.85rem; }
 	.trace-row-body { margin-top: 0.4rem; }
+	.trace-row-body a { color: var(--color-primary); text-decoration: none; }
+	.trace-row-body a:hover { color: var(--color-primary-hover); text-decoration: underline; }
 	.trace-row-body .message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; max-width: 100%; vertical-align: bottom; }
-	.trace-row-meta { margin-top: 0.3rem; font-size: 0.8rem; opacity: 0.7; display: flex; gap: 0.75rem; }
-	.badge { padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--badge-bg, #eee); font-size: 0.75rem; }
-	.skew { font-size: 0.75rem; opacity: 0.7; }
-	.retention-note { font-size: 0.8rem; opacity: 0.7; }
+	.trace-row-meta { margin-top: 0.3rem; font-size: 0.8rem; color: var(--text-muted); display: flex; gap: 0.75rem; }
+	.timestamp { font-family: var(--font-mono); color: var(--text-muted); }
+	.badge { padding: 0.125rem 0.375rem; border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 0.6875rem; background: var(--bg-root); color: var(--text-muted); border: 1px solid var(--border-color); }
+	/* Level badges reuse the issue page's tones (occurrence-display levelTone), same variables as OccurrenceHeader. */
+	.badge.tone-critical { color: var(--severity-critical-text); background: var(--severity-critical-bg); border-color: var(--severity-critical-border); }
+	.badge.tone-warning { color: var(--status-open-text); background: var(--status-open-bg); border-color: var(--status-open-border); }
+	.badge.tone-info { color: var(--color-primary); background: var(--color-primary-subtle); border-color: var(--border-color); }
+	.badge.tone-debug { color: var(--status-ignored-text); background: var(--status-ignored-bg); border-color: var(--status-ignored-border); }
+	.skew { font-size: 0.75rem; color: var(--text-muted); }
+	.retention-note { font-size: 0.8rem; color: var(--text-muted); }
 	.load-more { margin: 0.5rem 0 1rem; }
 </style>
