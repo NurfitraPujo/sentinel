@@ -158,12 +158,14 @@ const getAgentReportDetail = vi.fn();
 const getLatestAgentOccurrence = vi.fn();
 const listAgentOccurrences = vi.fn();
 const listAgentProjects = vi.fn();
+const listAgentTraceOccurrences = vi.fn();
 vi.mock('$lib/db/queries/agent-reads', () => ({
 	getAgentIssueDetail,
 	getAgentReportDetail,
 	getLatestAgentOccurrence,
 	listAgentOccurrences,
 	listAgentProjects,
+	listAgentTraceOccurrences,
 }));
 
 const listOrgActivity = vi.fn();
@@ -180,6 +182,7 @@ vi.mock('$lib/server/upload-core', () => ({ handleAttachmentUpload, checkDeclare
 const issuesListRoute = await import('../../../routes/api/agent/issues/+server');
 const issueDetailRoute = await import('../../../routes/api/agent/issues/[issueId]/+server');
 const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId]/occurrences/+server');
+const traceRoute = await import('../../../routes/api/agent/traces/[traceId]/+server');
 const claimRoute = await import('../../../routes/api/agent/issues/[issueId]/claim/+server');
 const claimNextRoute = await import('../../../routes/api/agent/issues/claim-next/+server');
 const statusRoute = await import('../../../routes/api/agent/issues/[issueId]/status/+server');
@@ -311,6 +314,89 @@ describe('GET /api/agent/issues/{issueId}/occurrences', () => {
 				makeEvent('http://localhost/api/agent/issues/issue-1/occurrences?limit=0', { issueId: 'issue-1' })
 			)
 		).rejects.toMatchObject({ status: 400 });
+	});
+});
+
+describe('GET /api/agent/traces/{traceId}', () => {
+	const TRACE_ID = 'a'.repeat(32);
+	const TRACE_OCCURRENCE = {
+		id: 'occ-trace',
+		environment: 'production',
+		platform: 'go',
+		releaseVersion: null,
+		stacktrace: [],
+		metadata: {},
+		traceId: TRACE_ID,
+		createdAt: new Date('2026-09-01T00:00:00Z').toISOString(),
+		level: 'error',
+		message: 'boom',
+		errorClass: 'Error',
+		logger: null,
+		serverName: null,
+		transaction: null,
+		dist: null,
+		source: null,
+		traceFlags: null,
+		receivedAt: null,
+		sdk: null,
+		user: null,
+		tags: null,
+		contexts: null,
+		request: null,
+		breadcrumbs: null,
+		exception: null,
+		projectId: 'project-1',
+		projectName: 'core',
+		issueId: 'issue-1',
+		spanId: 'b'.repeat(16),
+	};
+	// makeEvent only knows `issueId` params; this route's param is `traceId`.
+	const call = (query = '', traceId = TRACE_ID) => {
+		const u = new URL(`http://localhost/api/agent/traces/${traceId}${query}`);
+		return traceRoute.GET({ params: { traceId }, request: new Request(u), url: u } as any);
+	};
+
+	it('200: matches TraceResponseSchema, and scopes by the KEY\'s organization', async () => {
+		authenticateAgentRequest.mockResolvedValue(CTX);
+		listAgentTraceOccurrences.mockResolvedValue({ occurrences: [TRACE_OCCURRENCE], nextCursor: 'abc' });
+		const res = await call('?limit=5&environment=production');
+		expect(res.status).toBe(200);
+		const body = S.TraceResponseSchema.parse(await res.json());
+		expect(body.nextCursor).toBe('abc');
+		expect(listAgentTraceOccurrences).toHaveBeenCalledWith({
+			organizationId: 'org-1',
+			traceId: TRACE_ID,
+			environment: 'production',
+			limit: 5,
+			cursor: undefined,
+		});
+	});
+
+	it('200: omits nextCursor on the last page', async () => {
+		listAgentTraceOccurrences.mockResolvedValue({ occurrences: [] });
+		const res = await call();
+		expect(S.TraceResponseSchema.parse(await res.json())).toEqual({ occurrences: [] });
+	});
+
+	it('the schema is strict: an unlisted occurrence field fails', () => {
+		expect(S.AgentTraceOccurrenceSchema.safeParse({ ...TRACE_OCCURRENCE, extra: 1 }).success).toBe(false);
+		expect(S.AgentTraceOccurrenceSchema.safeParse({ ...TRACE_OCCURRENCE, projectId: undefined }).success).toBe(false);
+	});
+
+	it('404: a malformed trace id never reaches the query', async () => {
+		listAgentTraceOccurrences.mockClear();
+		await expect(call('', 'not-a-trace')).rejects.toMatchObject({ status: 404 });
+		expect(listAgentTraceOccurrences).not.toHaveBeenCalled();
+	});
+
+	it('400: limit above 200 or below 1', async () => {
+		await expect(call('?limit=201')).rejects.toMatchObject({ status: 400 });
+		await expect(call('?limit=0')).rejects.toMatchObject({ status: 400 });
+	});
+
+	it('400: a cursor the query layer rejects', async () => {
+		listAgentTraceOccurrences.mockRejectedValue(new Error('invalid cursor'));
+		await expect(call('?cursor=garbage')).rejects.toMatchObject({ status: 400 });
 	});
 });
 

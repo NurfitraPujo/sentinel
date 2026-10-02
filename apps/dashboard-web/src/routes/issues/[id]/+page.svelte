@@ -10,6 +10,7 @@
 	import ExceptionChain from '$lib/components/issues/ExceptionChain.svelte';
 	import BreadcrumbTimeline from '$lib/components/issues/BreadcrumbTimeline.svelte';
 	import ContextCards from '$lib/components/issues/ContextCards.svelte';
+	import { isCanonicalTraceId } from '$lib/trace-id';
 	import {
 		displayedFrame,
 		formatStackFrame,
@@ -18,6 +19,16 @@
 	} from '$lib/components/issues/occurrence-display';
 
 	let { data } = $props();
+
+	// sentinel-cross-repo-trace-view D5: `/{org}/traces/{id}` for a stored trace id, or null when the
+	// loader had no org slug (an older loader build, or no occurrence with a trace) or the STORED id is not
+	// canonical 32-hex lower-case (ingest stores it raw; the trace page matches the canonical form only) — a link to a page that can only answer 404 is worse than plain text.
+	function traceHref(traceId: string | null | undefined): string | null {
+		return isCanonicalTraceId(traceId) && data.traceOrgSlug
+			? `/${data.traceOrgSlug}/traces/${traceId}`
+			: null;
+	}
+	const latestTraceHref = $derived(traceHref(data.occurrences?.[0]?.traceId));
 
 	// SvelteSet ensures .add() and .delete() trigger Svelte 5 fine-grained reactivity.
 	const expandedMetadata = new SvelteSet<string>();
@@ -544,6 +555,10 @@
 			{#if data.issue.status === 'ignored'}
 				<span class="meta-item" data-testid="issue-ignored"><strong class="meta-label">Ignored:</strong> {ignoredFact}</span>
 			{/if}
+			<!-- sentinel-cross-repo-trace-view D5: the LATEST occurrence's trace, when it has one. -->
+			{#if latestTraceHref}
+				<span class="meta-item"><a href={latestTraceHref} data-testid="view-trace">View trace</a></span>
+			{/if}
 		</div>
 	</div>
 
@@ -621,7 +636,20 @@
 
 				{#if occurrence.traceId}
 					<div class="trace-info">
-						<span class="trace-id">Trace: {occurrence.traceId}</span>
+						<!--
+							sentinel-cross-repo-trace-view D5: v2 cards ONLY — a pre-v2 card's markup is frozen by
+							tests/fixtures/issue-page-pre-v2-cards.golden.html, so its text is the branch that
+							never changes. "N related errors in other projects" is the SELECTED card's, and shows
+							only when N > 0.
+						-->
+						{#if v2 && traceHref(occurrence.traceId)}
+							<span class="trace-id">Trace: <a href={traceHref(occurrence.traceId)} data-testid="trace-link">{occurrence.traceId}</a></span>
+							{#if selected && data.relatedTraceErrors && data.relatedTraceErrors.count > 0}
+								<span class="related-trace-errors" data-testid="related-trace-errors">{data.relatedTraceErrors.capped ? '1,000+' : data.relatedTraceErrors.count.toLocaleString()} related {data.relatedTraceErrors.count === 1 && !data.relatedTraceErrors.capped ? 'error' : 'errors'} in other projects</span>
+							{/if}
+						{:else}
+							<span class="trace-id">Trace: {occurrence.traceId}</span>
+						{/if}
 						{#if occurrence.spanId}
 							<span class="span-id">Span: {occurrence.spanId}</span>
 						{/if}

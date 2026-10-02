@@ -81,6 +81,21 @@ export const agentApiRegistry: RegistryEntry[] = [
 		},
 	},
 	{
+		path: '/api/agent/traces/{traceId}',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/traces/[traceId]/+server.ts',
+		operationId: 'getTrace',
+		summary:
+			"Oldest-first page of every occurrence sharing a trace id across the calling key's organization (32-hex trace id; 404 for a malformed id, 200 with an empty list for one the key's organization has no occurrence of)",
+		request: { querySchema: S.TraceQuerySchema },
+		responses: {
+			'200': S.TraceResponseSchema,
+			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
 		path: '/api/agent/issues/{issueId}/claim',
 		method: 'post',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',

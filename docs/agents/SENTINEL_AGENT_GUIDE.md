@@ -316,6 +316,17 @@ A minimal, working loop:
      `.metadata`, `.traceId`) for the crash detail. Page further back with
      `GET /api/agent/issues/:id/occurrences?limit=&before=` (newest-first, `limit` clamped to
      `[1, 50]`, default 20; `before` is an exclusive ISO-timestamp cursor).
+   - **Follow a trace across projects** — an occurrence's `traceId` is shared by every project that
+     handled the same request (mobile → web → core and its workers). `GET /api/agent/traces/:traceId`
+     returns **every occurrence in that trace across your key's organization**, oldest first by the
+     client's event time (`createdAt`), as `{ "occurrences": [...], "nextCursor": "..." }`. Each
+     occurrence has the usual fields plus `projectId`, `projectName`, `issueId` and `spanId`, so you
+     can open the issue it belongs to. `:traceId` must be 32 hexadecimal characters (anything else is a `404`). A trace your key's
+     organization has no occurrence of — never seen, another organization's, or aged out — is a
+     `200` with `{"occurrences": []}`; the cases are not distinguishable. `?limit=` is `[1, 200]` (default 50); pass the returned `nextCursor` back as
+     `?cursor=` for the next page (absent on the last page; the value is opaque). `?environment=` is a
+     filter. Like every agent read it is organization-scoped, **not** environment-scoped. Occurrences
+     older than the retention window are gone.
    - For `issueType: "user_report"`: `latestOccurrence` is `null`; read `report.bodyMd` (the
      reporter's Markdown description) and `report.severity`.
 4. **Post a triage summary** — `POST /api/agent/issues/:id/comments` with
@@ -630,6 +641,7 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 | `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true] [--since TS] [--sort firstSeen\|lastSeen] [--limit N] [--cursor C]` | `GET /api/agent/issues` |
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` |
+| *(no CLI verb yet)* | `GET /api/agent/traces/:traceId[?limit=&cursor=&environment=]` — see §5 step 3 |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` (409 on conflict) |
 | `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen\|lastSeen]` | `POST /api/agent/issues/claim-next` — pick + claim + full detail in one call; exit 4 when the queue is empty |
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` (own claim only) |

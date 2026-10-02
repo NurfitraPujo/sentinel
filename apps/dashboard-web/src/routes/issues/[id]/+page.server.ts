@@ -13,6 +13,7 @@ import { getRetentionDays } from '$lib/server/retention-window';
 import { detailTrendWindow } from '$lib/server/trend-window';
 import { cleanOccurrenceRow } from '$lib/server/json-safe';
 import { buildTagFacets } from '$lib/tag-facets';
+import { loadTraceLinks } from '$lib/server/trace-links';
 
 // sentinel-occurrence-detail-panels §3.2: the shape of an occurrence id. Tested against the lower-cased
 // parameter, so a malformed value (S4) never reaches a query, where Postgres would answer 22P02 → 500.
@@ -132,6 +133,20 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 			occurrenceDetail = await issueQueries.getOccurrenceDetail(issueId, selectedOccurrenceId);
 		}
 	}
+	// sentinel-cross-repo-trace-view D5 — AFTER both access checks. Only read when some occurrence
+	// carries a trace id (the card links and the header link need the org slug); the related-errors
+	// count is for the SELECTED occurrence alone, never one query per card.
+	const selectedListed = occurrences.find((o) => o.id === selectedOccurrenceId);
+	const selectedTraceId = selectedListed?.traceId ?? occurrenceDetail?.traceId ?? null;
+	const anyTrace = selectedTraceId !== null || occurrences.some((o) => o.traceId);
+	const traceLinks = anyTrace
+		? await loadTraceLinks({
+				userId: session.user.id,
+				organizationId,
+				projectId: issue.projectId,
+				selectedTraceId,
+			})
+		: { orgSlug: null, related: null };
 	// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
 	// `getOccurrencesByIssueId` caps at 100. The heading takes this real `COUNT(*)`; the list below
 	// says it is showing the most recent n.
@@ -159,6 +174,10 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		occurrenceDetail: occurrenceDetail ? cleanOccurrenceRow(occurrenceDetail) : null,
 		occurrenceTotal,
 		environmentDisplayName,
+		// sentinel-cross-repo-trace-view D5: the slug the trace links are built from (null when no
+		// occurrence has a trace) and the selected occurrence's other-project count (null: none to show).
+		traceOrgSlug: traceLinks.orgSlug,
+		relatedTraceErrors: traceLinks.related,
 		relations,
 		// sentinel-issue-trend §4.2 — top level beside `issue`: `{ hourly: TrendPoint[24], daily:
 		// TrendPoint[30] }`, dense, oldest first, the last entry of each the current partial slot.

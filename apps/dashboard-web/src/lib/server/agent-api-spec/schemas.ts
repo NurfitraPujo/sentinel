@@ -316,6 +316,37 @@ export const OccurrencesQuerySchema = z
 export const OccurrencesResponseSchema = z.object({ occurrences: z.array(AgentOccurrenceSchema) }).strict();
 
 // ---------------------------------------------------------------------------
+// GET /api/agent/traces/{traceId} -- agent-reads.ts's `listAgentTraceOccurrences`
+// ---------------------------------------------------------------------------
+
+/**
+ * sentinel-cross-repo-trace-view D6: one occurrence of a trace, i.e. the occurrence shape plus the
+ * four fields that identify WHERE in the org it happened (`projectId`, `projectName`, `issueId`)
+ * and which span (`spanId`). Strict, like every other schema here, so an added or dropped field
+ * fails the contract test.
+ */
+export const AgentTraceOccurrenceSchema = AgentOccurrenceSchema.extend({
+	projectId: z.string(),
+	projectName: z.string(),
+	issueId: z.string(),
+	spanId: z.string().nullable(),
+}).strict();
+
+export const TraceQuerySchema = z
+	.object({
+		limit: z.coerce.number().int().min(1).max(200).optional(),
+		/** Opaque: the `nextCursor` of a previous page. */
+		cursor: z.string().optional(),
+		/** A filter, not a guard: agent keys are org-scoped, not environment-scoped. */
+		environment: z.string().optional(),
+	})
+	.strict();
+
+export const TraceResponseSchema = z
+	.object({ occurrences: z.array(AgentTraceOccurrenceSchema), nextCursor: z.string().optional() })
+	.strict();
+
+// ---------------------------------------------------------------------------
 // POST/DELETE /api/agent/issues/{issueId}/claim -- agent-ops.ts's `issuesClaim`/`issuesClaimRelease`
 // ---------------------------------------------------------------------------
 

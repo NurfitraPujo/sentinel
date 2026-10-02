@@ -8,6 +8,12 @@ import {
 	externalReporters,
 } from '$lib/db/schema';
 import { and, desc, eq, lt } from 'drizzle-orm';
+import {
+	createdAtIso,
+	decodeTraceCursor,
+	listTraceOccurrences,
+	type TraceCursor,
+} from '$lib/server/queries/trace-queries';
 import { getAgentSettingsForProjects, type RepoConnectionRow } from '$lib/db/queries/agent-settings';
 
 /**
@@ -240,6 +246,67 @@ export async function listAgentOccurrences(options: ListAgentOccurrencesOptions)
 		.limit(limit);
 
 	return rows;
+}
+
+/**
+ * sentinel-cross-repo-trace-view D6 -- `GET /api/agent/traces/{traceId}`. The occurrence shape plus
+ * the four fields that let an agent follow a trace ACROSS projects (`projectId`, `projectName`,
+ * `issueId`, `spanId`).
+ */
+export interface AgentTraceOccurrence extends AgentOccurrence {
+	projectId: string;
+	projectName: string;
+	issueId: string;
+	spanId: string | null;
+}
+
+const TRACE_DEFAULT_LIMIT = 50;
+const TRACE_MAX_LIMIT = 200;
+
+/**
+ * Oldest-first page of every occurrence sharing `traceId` across the key's ORGANIZATION. Agent keys
+ * are org-scoped and not environment-scoped by design (docs/ENVIRONMENT_ACCESS.md), so no grant map
+ * is applied; `environment` is a caller-chosen filter, not a guard. The org's project set is read
+ * here from `organizationId` -- sourced from `AgentAuthContext`, never a request value (B7) -- so a
+ * foreign organization's occurrence under the same client-asserted trace id cannot appear.
+ *
+ * `cursor` is the opaque value a previous page returned; a malformed one throws
+ * `Error('invalid cursor')` for the route to map to 400.
+ */
+export async function listAgentTraceOccurrences(options: {
+	organizationId: string;
+	traceId: string;
+	environment?: string;
+	limit?: number;
+	cursor?: string;
+}): Promise<{ occurrences: AgentTraceOccurrence[]; nextCursor?: string }> {
+	const limit = Math.min(Math.max(options.limit ?? TRACE_DEFAULT_LIMIT, 1), TRACE_MAX_LIMIT);
+	const cursor: TraceCursor | undefined = options.cursor ? decodeTraceCursor(options.cursor) : undefined;
+
+	const orgProjects = await db
+		.select({ id: projects.id })
+		.from(projects)
+		.where(eq(projects.organizationId, options.organizationId));
+
+	const { rows, nextCursor } = await listTraceOccurrences({
+		traceId: options.traceId,
+		scope: { projectIds: orgProjects.map((p) => p.id), environment: options.environment },
+		limit,
+		cursor,
+		columns: {
+			...agentOccurrenceColumns,
+			// Rendered by Postgres, so it is right under any session TimeZone (see `createdAtIso`).
+			createdAt: createdAtIso,
+			// The shared trace columns the agent shape adds; `environment`/`traceId`/`createdAt` etc.
+			// already come from `agentOccurrenceColumns` (the occurrence's own columns).
+			issueId: errorOccurrences.issueId,
+			projectId: issues.projectId,
+			projectName: projects.name,
+			spanId: errorOccurrences.spanId,
+		},
+	});
+
+	return { occurrences: rows as unknown as AgentTraceOccurrence[], nextCursor };
 }
 
 export interface AgentProjectRepo {
