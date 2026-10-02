@@ -272,6 +272,13 @@ export type BrowserInitOptions = CoreOptions &
      * the option replaces the default, `[]` sends nowhere.
      */
     tracePropagationTargets?: Array<string | RegExp>;
+    /**
+     * Browser only (spec *Trace propagation*): a page trace older than this is replaced by a new one the next time it is
+     * read (a propagated request or a captured event) — a page left open for hours does not become one trace. Default
+     * 1_800_000 (30 min); `0` or `Infinity` disables age renewal (a pathname change still renews). Negative, NaN or non-number is
+     * rejected (`invalid_option`, default used); a positive value below 60_000 is clamped to 60_000.
+     */
+    pageTraceMaxAgeMs?: number;
   };
 export type NodeInitOptions = CoreOptions &
   Pick<TransportOptions, 'maxBufferSize' | 'batchSize' | 'batchWaitMs' | 'endpoint' | 'apiKey' | 'projectKey'> &

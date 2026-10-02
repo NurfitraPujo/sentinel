@@ -34,7 +34,7 @@ export function initBrowser(options: BrowserInitOptions | undefined, entry: stri
       // Propagation goes in FIRST (innermost), the breadcrumb wrappers over it, and the teardown runs outermost
       // first — each uninstall then finds its own wrapper on top and restores cleanly (shared.ts wrapMethod).
       // Tracing is independent of `breadcrumbs`: `false` there does not stop the `traceparent` (spec §5.6).
-      const uninstallTrace = installPageTrace(client);
+      const uninstallTrace = installPageTrace(client, given.pageTraceMaxAgeMs);
       const uninstallPropagation = installPropagation(client, given.tracePropagationTargets, plan.target?.url);
       client.teardown.push(installBrowserIntegrations(client, given.breadcrumbs, plan.target?.url));
       client.teardown.push(uninstallPropagation);

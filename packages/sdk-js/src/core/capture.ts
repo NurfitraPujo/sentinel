@@ -33,7 +33,7 @@ import {
   MAX_REQUEST_HEADER_VALUE_CODEPOINTS,
   MAX_REQUEST_HEADERS,
 } from './server-bounds.js';
-import { getSlot, type InternalClient, type Scope } from './state.js';
+import { currentPageTrace, getSlot, type InternalClient, type Scope } from './state.js';
 import type { CaptureContext, CaptureSource, Level, RequestInfo, SentinelEvent, StackFrame, User } from './types.js';
 import { SDK_VERSION } from './version.js';
 import { MAX_RELEASE_BYTES } from './init.js';
@@ -656,7 +656,8 @@ function build(client: InternalClient, input: CaptureInput, eventId: string): vo
   // null (`headers.get('traceparent')`) or '' — gets the browser page's trace (spec *Trace propagation*).
   const tp = ctx?.traceparent as unknown;
   const absent = tp === undefined || tp === null || tp === '';
-  const trace = absent && client.pageTrace !== undefined ? { ...client.pageTrace, trace_flags: 1 } : parseTraceparent(tp);
+  const page = absent ? currentPageTrace(client) : undefined;
+  const trace = page !== undefined ? { ...page, trace_flags: 1 } : parseTraceparent(tp);
   if (trace !== undefined) {
     event.trace_id = trace.trace_id;
     event.span_id = trace.span_id;

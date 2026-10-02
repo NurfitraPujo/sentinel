@@ -4,7 +4,7 @@
 // `sentry-trace`; never overwrites a `traceparent` the caller (or another SDK) already set. Independent of the
 // breadcrumb integrations, and every failure degrades to sending the request untouched.
 
-import type { InternalClient } from '../core/state.js';
+import { currentPageTrace, type InternalClient } from '../core/state.js';
 import { reportError } from '../core/report.js';
 import { originAndPath, wrapMethod } from './integrations/shared.js';
 import { newSpanId } from './trace.js';
@@ -101,7 +101,7 @@ export function matchesTarget(url: string, targets: PropagationTarget[] | undefi
 }
 
 function headerValue(client: InternalClient): string | undefined {
-  const t = client.pageTrace;
+  const t = currentPageTrace(client);
   return t === undefined ? undefined : `00-${t.trace_id}-${newSpanId()}-01`;
 }
 

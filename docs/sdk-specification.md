@@ -317,7 +317,7 @@ and every derived value is bounded exactly as a sent one (enrichment runs before
   - `X-Project-Key: <project_name>` — optional; for organization-wide keys, selects the target project. **Takes precedence over the body's `project_key`**, so the server resolves tenancy without reading the body.
 - **Expected Status**: `HTTP 202 Accepted` (`{"status": "accepted", "event_id": "<effective event id>", "timestamp": "<effective timestamp, RFC 3339 with nanoseconds, UTC>"}`) — both keys are the values the server **used**, which differ from what was sent when the server generated the `event_id` or replaced the `timestamp` (§3).
 
-### Trace propagation (the JS SDK, from 0.3.0)
+### Trace propagation (the JS SDK, from 0.3.0; `pageTraceMaxAgeMs` from 0.3.2)
 
 `trace_id` / `span_id` / `trace_flags` (§3) can come from a W3C `traceparent` the caller passes in a capture
 context. The browser entry (`@sentinel/sdk-js/browser`, and the Next.js client) also **starts a trace itself**:
@@ -326,6 +326,11 @@ context. The browser entry (`@sentinel/sdk-js/browser`, and the Next.js client) 
   a **new pathname** (`pushState`, `replaceState`, `popstate`; a query- or hash-only change keeps the trace). A
   captured browser event with no explicit `traceparent` carries that trace id, the page span id and
   `trace_flags: 1`. An explicit `ctx.traceparent` always wins. Server runtimes (node, edge, Next server) are unchanged.
+- **Page-trace age: `pageTraceMaxAgeMs: number`** — default `1_800_000` (30 min). A page trace older than this
+  **when it is read** (by a propagated `fetch`/XHR or by an event being captured) is replaced first, and the new
+  trace is the one used, so one call never sees two ids. Renewal is lazy (no timers) and a pathname renewal resets
+  the age. `0` or `Infinity` disables age renewal. A negative, `NaN` or non-number value reports `invalid_option` and
+  uses the default; a positive value below `60_000` is clamped to `60_000` (reported). A clock that steps backwards (now earlier than the trace's start) renews as well.
 - **Propagation.** `fetch` and `XMLHttpRequest` requests whose URL matches `tracePropagationTargets` get
   `traceparent: 00-<page trace>-<fresh 16-hex span per request>-01`. A `traceparent` the caller (or another SDK)
   already set, in any header case, is never overwritten. `tracestate`, `baggage` and `sentry-trace` are never

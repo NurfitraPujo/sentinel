@@ -666,7 +666,7 @@ from one that genuinely had nothing to trim.
 
 ## Bundle size
 
-**0.3.1: `sdk_js_client_entry_gzip_bytes` = 22 898** (22 829 at 0.3.0; `pnpm size`; 21 457 on the same machine at the 0.2.0 head, +1 372 for page trace and
+**0.3.2: `sdk_js_client_entry_gzip_bytes` = 23 165** (22 898 at 0.3.1, +267 for `pageTraceMaxAgeMs`; 22 829 at 0.3.0; `pnpm size`; 21 457 on the same machine at the 0.2.0 head, +1 372 for page trace and
 fetch/XHR propagation). The 0.2.0 paragraph below is kept as measured at its own head.
 
 **`sdk_js_client_entry_gzip_bytes` = 21 251** — re-measured for 0.2.0 (`pnpm size`) at `08b16af`,
@@ -812,6 +812,11 @@ init({
 - A `ctx.traceparent` of `undefined`, `null` or `''` counts as absent, so
   `captureException(e, { traceparent: headers.get('traceparent') })` falls back to the page trace; a
   non-empty but malformed value yields no trace.
+- **`pageTraceMaxAgeMs`** (default `1_800_000`, 30 min): a page trace older than this is replaced by a new one the
+  next time a propagated request or a captured event reads it — lazily, with no timer — so a page left open for
+  hours is not one trace. `0` or `Infinity` turns age renewal off (a pathname change still renews, and resets the age). A
+  negative, `NaN` or non-number value reports `invalid_option` and uses the default; a positive value below
+  `60_000` is clamped to `60_000`. A wall clock stepped backwards renews the trace too.
 - List only origins you control and whose CORS config allows a `traceparent` request header: a
   cross-origin `traceparent` triggers a preflight, and the trace id is visible to the receiver.
 - **Redirects:** a same-origin request that redirects to another origin (a presigned S3/OBS URL, say)

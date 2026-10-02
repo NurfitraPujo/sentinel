@@ -22,6 +22,15 @@ export interface PageTrace {
   span_id: string;
 }
 
+/**
+ * The one reader of the page trace (every propagated request and every captured event goes through it, so they can
+ * never disagree within a call). Browser only: `installPageTrace` sets `renewPageTrace`, which starts a new trace
+ * first when the current one is older than `pageTraceMaxAgeMs`; elsewhere it is just `client.pageTrace`.
+ */
+export function currentPageTrace(client: InternalClient): PageTrace | undefined {
+  return client.renewPageTrace === undefined ? client.pageTrace : client.renewPageTrace();
+}
+
 export interface InternalClient {
   readonly options: ResolvedOptions;
   readonly runtime: Runtime;
@@ -53,6 +62,8 @@ export interface InternalClient {
   readonly teardown: Array<() => void>;
   /** Browser only: set by `installPageTrace`, renewed per navigation; `undefined` on the server runtimes. */
   pageTrace?: PageTrace | undefined;
+  /** Browser only: set by `installPageTrace`; renews `pageTrace` when older than `pageTraceMaxAgeMs`, returns the current one. */
+  renewPageTrace?: (() => PageTrace | undefined) | undefined;
 }
 
 export interface Scope {

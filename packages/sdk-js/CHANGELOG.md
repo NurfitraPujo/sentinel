@@ -4,6 +4,18 @@ All notable changes to `packages/sdk-js` (`@sentinel/sdk-js`) are documented her
 tag (`packages/sdk-js/vX.Y.Z`). The package is major-zero: a minor bump may change shape, and every
 wire-vocabulary change is named here because the dashboard reads `metadata` as-is.
 
+## v0.3.2 — Fix: a long-lived page no longer stays one trace (`pageTraceMaxAgeMs`)
+
+### Added
+
+- **`pageTraceMaxAgeMs`** (browser; default `1_800_000` = 30 minutes). A page trace older than this is replaced by a
+  new one the next time it is read — by a propagated `fetch`/`XMLHttpRequest` or by a captured event — so a chat page
+  left open for hours no longer puts hours of API calls and errors under one `trace_id` (production, 2026-10-02: one
+  trace spanned ~4.5 h, 131 web errors, 490 core spans). Renewal is lazy at read time (no timer); the request and the
+  event of one call always see the same id. `0` or `Infinity` disables age renewal; a pathname change still renews and resets the
+  age. A negative, `NaN` or non-number value reports `invalid_option` and uses the default; a positive
+  value below `60_000` is clamped to `60_000` (also reported). A wall clock stepped backwards renews the trace too.
+
 ## v0.3.1 — Fix: `traceparent` no longer leaves the caller's Request body unread
 
 ### Fixed
