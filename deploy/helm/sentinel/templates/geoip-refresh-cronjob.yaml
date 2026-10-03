@@ -28,6 +28,17 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: {{ $cron.backoffLimit }}
+      # HOW LONG A FINISHED JOB LINGERS (report-an-issue/BUG-89).
+      #
+      # failedJobsHistoryLimit caps how MANY failed Jobs are kept and says nothing
+      # about how OLD they get, while KubeJobFailed fires on the existence of a
+      # Failed Job with no time bound. This cron's own failures from 2026-10-01
+      # were still firing that alert two and a half days later, with the newest
+      # runs completing in four seconds -- so the alert described a fixed problem.
+      #
+      # A day: long enough to read a failure the next morning, short enough that
+      # the alert resolves itself.
+      ttlSecondsAfterFinished: {{ $cron.ttlSecondsAfterFinished | default 86400 }}
       activeDeadlineSeconds: {{ $cron.activeDeadlineSeconds }}
       template:
         metadata:

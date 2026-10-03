@@ -32,6 +32,11 @@ checks:
     - "dangling-service"
     - "pdb-unhealthy-pod-eviction-policy"
     - "pdb-min-available"
-    - "job-ttl-seconds-after-finished"
     - "unset-cpu-requirements"
     - "unset-memory-requirements"
+
+# NOTE: "job-ttl-seconds-after-finished" used to be in the exclude list above and
+# had never done anything -- it is NOT a kube-linter check. `kube-linter checks
+# list` has nothing matching "ttl", and putting it in `include` fails with
+# `check "job-ttl-seconds-after-finished" not found`. Excluding a check that does
+# not exist excludes nothing (report-an-issue/BUG-89).
