@@ -135,8 +135,15 @@ migrate:
     - ingestor
     - dashboard
 
+# FROZEN since the 2026-10-03 production cutover: AWS EKS serves
+# sentinel-production, so nothing may write to Huawei again. The freeze lives
+# in git (not `kubectl scale`) because the release workflow deploys to BOTH
+# clusters — a production tag would otherwise scale CCE straight back up.
+# Autoscaling is disabled (not minReplicas: 2) because the chart only renders
+# `replicas` when the HPA is off. migrate stays on (idempotent, reconciles
+# schema only). Mirrors the staging freeze (sentinel#59).
 ingestor:
-  replicaCount: 2
+  replicaCount: 0
   containerPort: 8080
   service:
     type: NodePort
@@ -148,7 +155,7 @@ ingestor:
     elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
     tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
@@ -173,13 +180,13 @@ geoip:
     enabled: true
 
 processor:
-  replicaCount: 2
+  replicaCount: 0
   healthPort: 8081
   service:
     type: ClusterIP
     port: 8081
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 2
     maxReplicas: 8
     targetCPUUtilizationPercentage: 70
@@ -194,7 +201,7 @@ processor:
     limits: { cpu: "1", memory: 1Gi }
 
 dashboard:
-  replicaCount: 2
+  replicaCount: 0
   containerPort: 3000
   service:
     type: NodePort
@@ -206,7 +213,7 @@ dashboard:
     elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
     tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 2
     maxReplicas: 6
     targetCPUUtilizationPercentage: 70
@@ -242,7 +249,11 @@ spans:
 
 init:
   nats:
-    enabled: true
+    # Off while frozen: the streams AND consumers already exist on the CCE
+    # cluster, so there is nothing to converge (scripts/nats-init.sh has been
+    # idempotent since #68, but a no-op wave-1 Sync hook still costs a Job run
+    # per sync for zero effect). Same reason it is off on AWS.
+    enabled: false
     image: swr.ap-southeast-3.myhuaweicloud.com/daya-engineering/sentinel-nats-init
     tag: ""
     # ERROR_EVENTS limits on the shared-cluster JetStream store (infra
@@ -263,7 +274,8 @@ ingress:
   enabled: false
 
 retentionCron:
-  enabled: true
+  # Off while frozen — no dashboard to serve and nothing to retain against.
+  enabled: false
   schedule: "0 * * * *"
 
 oncallCron:
@@ -273,7 +285,9 @@ prometheusRule:
   enabled: false
 
 dlqDrainer:
-  enabled: true
+  # Off while frozen — its jobTemplate hardcodes replicas: 1 and it POSTs to
+  # a scaled-to-zero dashboard.
+  enabled: false
   drainerEnabled: "false"
   drainerExecute: "false"
   # CCE has no default StorageClass — Everest CSI csi-disk provisions EVS.

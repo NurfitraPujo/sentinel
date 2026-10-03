@@ -14,19 +14,17 @@
 #   - No imagePullSecrets on EKS (same-account ECR via node instance role).
 #   - Canonical production host: sentinel.tuju.ai (mirrors sentinel.daya.ai).
 #
-# DORMANT bootstrap: replicas 0 + every side-effecting hook OFF until the
-# production cutover window (cloud-migration.todo.md §4.2e). `sentinel-production`
-# is populated out-of-band by DMS (full load DONE, CDC running) — Goose
-# migrations must NOT run before the cutover drains CCE:
-#   migrate.enabled=false (no DB migrations), init.nats.enabled=false (no
-#   JetStream stream creation — the §5 NATS cutover owns the streams),
-#   dlqDrainer/retentionCron/oncallCron=false, autoscaling.enabled=false +
-#   replicaCount=0. Re-enable at cutover.
+# LIVE since the 2026-10-03 production cutover (cloud-migration.todo.md §4.2e):
+# CCE is write-frozen and DMS CDC is stopped, so this file runs the full
+# production shape — migrate.enabled=true, ingestor/processor/dashboard at 2
+# replicas, retentionCron + oncallCron on. init.nats stays OFF (the §5 NATS
+# cutover owns the already-restored streams/consumers) and dlqDrainer stays OFF
+# (needs a StorageClass decision) — see each block.
 #
 # Pre-flight before first sync:
 #   1. Create the 6 sentinel-* ECR repos (infra terraform/live/shared/ecr).
 #   2. Seed /tuju/production/sentinel/shared/* (done 2026-09-26, 10/10).
-#   3. Push sentinel images to ECR and pin the tags below (done — v0.2.43
+#   3. Push sentinel images to ECR and pin the tags below (done — v0.2.54
 #      verified in all six repos; replicas 0 means nothing pulls, but an
 #      unpinned tag would ImagePullBackOff on scale-up).
 #   4. Start the production cache (tuju-cache-production is stopped; Redis auth
@@ -66,27 +64,25 @@ externalSecrets:
 # Tags are pinned declaratively (not only via CI `argocd app set` parameters)
 # so a fresh sync or an Application recreate can never fall back to
 # Chart.AppVersion (0.1.0, in no registry) and wedge the app in
-# ImagePullBackOff. Pinned to v0.2.43 — the newest production tag verified
-# present in all six ECR repos and already carried as the live ArgoCD
-# parameters, so this pin introduces zero diff. Nothing is pulled while
-# replicas are 0, so the pin is inert until cutover.
+# ImagePullBackOff. Pinned to v0.2.54 — the newest production tag verified
+# present in all six ECR repos at cutover time (2026-10-03).
 # -----------------------------------------------------------------------------
 images:
   ingestor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-ingestor
-    tag: "v0.2.43"
+    tag: "v0.2.54"
   processor:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-processor
-    tag: "v0.2.43"
+    tag: "v0.2.54"
   dashboard:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dashboard
-    tag: "v0.2.43"
+    tag: "v0.2.54"
   migrate:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-db-migrate
-    tag: "v0.2.43"
+    tag: "v0.2.54"
   dlqDrainer:
     repository: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dlq-drainer
-    tag: "v0.2.43"
+    tag: "v0.2.54"
 
 imagePullPolicy: IfNotPresent
 imagePullSecrets: []
@@ -98,7 +94,19 @@ nodeSelector:
   EKSNodeGroupType: medium-size-x86-64-spot
   kubernetes.io/arch: amd64
   kubernetes.io/os: linux
-affinity: {}
+# Soft anti-affinity: spread the 2-replica Deployments across nodes when
+# capacity allows, without blocking scheduling on a constrained spot pool.
+# labelSelector matches the chart's common pod labels (app.kubernetes.io/name:
+# sentinel on every workload pod).
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sentinel
 tolerations: []
 
 config:
@@ -146,17 +154,18 @@ config:
     # RUNBOOK entry "Sentry-compatible ingest: trusting core's relay". Narrowest CIDR only.
     sentryCompatTrustedProxyCidrs: []
 
-# Dormant: no DB migration Job until the cutover window. `sentinel-production`
-# is seeded by DMS; Goose runs must wait for CCE write-freeze.
+# LIVE since the 2026-10-03 production cutover: CCE is write-frozen and DMS
+# CDC is stopped, so the wave-1 Sync hook runs Goose migrations against AWS
+# RDS on every sync (idempotent — reconciles schema only).
 migrate:
-  enabled: false
+  enabled: true
   targets:
     - processor
     - ingestor
     - dashboard
 
 ingestor:
-  replicaCount: 0
+  replicaCount: 2
   containerPort: 8080
   service:
     type: ClusterIP
@@ -173,7 +182,7 @@ ingestor:
     limits: { cpu: "1", memory: 512Mi }
 
 processor:
-  replicaCount: 0
+  replicaCount: 2
   healthPort: 8081
   service:
     type: ClusterIP
@@ -187,7 +196,7 @@ processor:
     limits: { cpu: "1", memory: 512Mi }
 
 dashboard:
-  replicaCount: 0
+  replicaCount: 2
   containerPort: 3000
   service:
     type: ClusterIP
@@ -231,7 +240,7 @@ init:
   nats:
     enabled: false
     image: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
-    tag: "v0.2.43"
+    tag: "v0.2.54"
   minio:
     # AWS: object storage is external (Huawei OBS during the migration window,
     # S3 after) — minio-init must NEVER be enabled here. It has no ECR image
@@ -245,10 +254,10 @@ ingress:
   enabled: false
 
 retentionCron:
-  enabled: false
+  enabled: true
 
 oncallCron:
-  enabled: false
+  enabled: true
 
 prometheusRule:
   enabled: false
