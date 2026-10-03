@@ -210,3 +210,45 @@ environment (report-an-issue/BUG-68).
   value: {{ .Values.config.otel.exporterEndpoint | quote }}
 {{- end }}
 {{- end -}}
+
+{{/*
+sentinel.externalSecretsRefreshInterval -- how often ESO re-reads SSM.
+
+MUST NOT BE "0" (report-an-issue/BUG-90). An ExternalSecret with refreshInterval
+"0" syncs ONCE, when it is created, and never again. The comment this replaces
+said "Refresh driven by ArgoCD sync", and that is false: Argo applying a changed
+spec advances metadata.generation without ESO re-reading anything, while the
+Ready condition goes on reporting True/SecretSynced. Read status.refreshTime.
+
+This object is less visibly stale than its siblings only because sentinel is
+redeployed often -- measured 2026-10-03, 6.8h on staging and 17.3h on
+production. Recreation on deploy is not refreshing; it is the one event that
+happens to re-read SSM, so between deploys a rotated or newly added parameter
+never arrives.
+
+The external-secrets.io/force-sync annotation does not help. The only manual
+lever is deleting the owned target Secret, and consumers then need a restart
+because the Secret is read at process start.
+
+Override with global.externalSecretsRefreshInterval for a slower cadence. Note
+what a real interval also means: a parameter DELETED from SSM now disappears
+from the Secret within one interval instead of lingering until a recreate.
+*/}}
+{{- define "sentinel.externalSecretsRefreshInterval" -}}
+{{- $v := "" -}}
+{{- if .Values.global -}}
+{{- /* NO `default` BEFORE THE CHECK. Helm's `default` treats 0 and "0" as empty,
+       so `$v | default ""` would silently turn an explicit 0 into "" and the
+       guard below could never fire -- a check that cannot fail, which is the
+       same shape as the bug it guards. Read it raw, judge it, then default. */ -}}
+{{- $v = .Values.global.externalSecretsRefreshInterval -}}
+{{- end -}}
+{{- if and (ne (toString $v) "<nil>") (ne (toString $v) "") -}}
+{{- if or (eq (toString $v) "0") (eq (toString $v) "0s") -}}
+{{- fail "global.externalSecretsRefreshInterval must not be 0: an ExternalSecret with refreshInterval 0 syncs once at creation and never again (report-an-issue/BUG-90)" -}}
+{{- end -}}
+{{- toString $v -}}
+{{- else -}}
+1h
+{{- end -}}
+{{- end -}}
