@@ -126,36 +126,37 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
-      - name: Generate SWR login password (HMAC-SHA256)
-        id: derive-swr-password
-        env:
-          SWR_REGION: ${{ secrets.SWR_REGION }}
-          SWR_AK: ${{ secrets.SWR_ACCESS_KEY }}
-          SWR_SK: ${{ secrets.SWR_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SWR_REGION:-}" ] || [ -z "${SWR_AK:-}" ] || [ -z "${SWR_SK:-}" ]; then
-            echo "::error::Missing required SWR secret (SWR_REGION/SWR_ACCESS_KEY/SWR_SECRET_KEY). SWR_SECRET_KEY must be RAW SK from credentials.csv, not pre-hashed." >&2
-            exit 1
-          fi
-          if command -v xxd >/dev/null 2>&1; then
-            SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | xxd -p -c 256)
-          else
-            SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | od -An -vtx1 | tr -d ' \t\n\r')
-          fi
-          if [ -z "$SWR_LOGIN_PWD" ]; then
-            echo "::error::Failed to derive SWR login password" >&2
-            exit 1
-          fi
-          echo "::add-mask::$SWR_LOGIN_PWD"
-          echo "swr_login_password=$SWR_LOGIN_PWD" >> "$GITHUB_OUTPUT"
-
-      - name: Login to Huawei SWR
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
-        with:
-          registry: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com
-          username: ${{ secrets.SWR_REGION }}@${{ secrets.SWR_ACCESS_KEY }}
-          password: ${{ steps.derive-swr-password.outputs.swr_login_password }}
+# DISABLED 2026-10-03 (post AWS cutover): Huawei leg off — AWS EKS is the live origin. Restore by uncommenting this block.
+#       - name: Generate SWR login password (HMAC-SHA256)
+#         id: derive-swr-password
+#         env:
+#           SWR_REGION: ${{ secrets.SWR_REGION }}
+#           SWR_AK: ${{ secrets.SWR_ACCESS_KEY }}
+#           SWR_SK: ${{ secrets.SWR_SECRET_KEY }}
+#         run: |
+#           set -euo pipefail
+#           if [ -z "${SWR_REGION:-}" ] || [ -z "${SWR_AK:-}" ] || [ -z "${SWR_SK:-}" ]; then
+#             echo "::error::Missing required SWR secret (SWR_REGION/SWR_ACCESS_KEY/SWR_SECRET_KEY). SWR_SECRET_KEY must be RAW SK from credentials.csv, not pre-hashed." >&2
+#             exit 1
+#           fi
+#           if command -v xxd >/dev/null 2>&1; then
+#             SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | xxd -p -c 256)
+#           else
+#             SWR_LOGIN_PWD=$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | od -An -vtx1 | tr -d ' \t\n\r')
+#           fi
+#           if [ -z "$SWR_LOGIN_PWD" ]; then
+#             echo "::error::Failed to derive SWR login password" >&2
+#             exit 1
+#           fi
+#           echo "::add-mask::$SWR_LOGIN_PWD"
+#           echo "swr_login_password=$SWR_LOGIN_PWD" >> "$GITHUB_OUTPUT"
+#
+#       - name: Login to Huawei SWR
+#         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+#         with:
+#           registry: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com
+#           username: ${{ secrets.SWR_REGION }}@${{ secrets.SWR_ACCESS_KEY }}
+#           password: ${{ steps.derive-swr-password.outputs.swr_login_password }}
 
       - name: Configure AWS credentials for ECR
         uses: aws-actions/configure-aws-credentials@d0834ad3a60a024346910e522a81b0002bd37fea # v4.3.0
@@ -175,12 +176,15 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
-          # Single build (one digest/layer set), pushed to both registries. The
+          # Single build pushed to AWS ECR only. The SWR tag below is disabled
+          # since the 2026-10-03 post-cutover Huawei CI/CD switch-off — AWS EKS
+          # is the live origin, Huawei CCE is frozen at 0 and never synced.
+          # Restore by uncommenting the SWR tag line.
           # ECR repo name is the bare matrix image (sentinel-ingestor, …) which
           # matches the clean repo names created in infra shared/ecr — the
           # reusable build-docker.yml would prefix daya-engineering/ instead.
           tags: |
-            swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
+            # DISABLED 2026-10-03: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
             ${{ steps.login-ecr.outputs.registry }}/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -202,9 +206,9 @@ jobs:
 
   deploy-eks-production:
     name: Deploy Production Environment (AWS EKS)
-    # EKS production stays DORMANT (0 replicas, migrate disabled) until the
-    # cutover window — this job only advances the image tags so the release is
-    # pre-staged, exactly like cdc-pipeline 2.11m.
+    # EKS production is LIVE since the 2026-10-03 cutover — this job rolls the
+    # new tags through the migrate hook into the 2/2 Deployments. The Huawei
+    # CCE leg below it is disabled (frozen at 0, never synced).
     if: ${{ !endsWith(github.ref_name, '-staging') }}
     needs: [gate-production]
     uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@8418659eb2d57ed605a35f74c96fe14d5b6482ec # main as of 2026-09-27, workflow#312 source_position
@@ -226,26 +230,27 @@ jobs:
       wait: true
       wait_timeout: 600
 
-  deploy-production:
-    name: Deploy Production Environment (Huawei CCE)
-    # Serialized AFTER the EKS deploy on purpose — see the staging workflow for
-    # the /tmp/argocd shared-runner race this avoids.
-    if: ${{ !endsWith(github.ref_name, '-staging') }}
-    needs: [gate-production, deploy-eks-production]
-    uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
-    with:
-      runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
-      app_name: "sentinel-production"
-      argocd_url: "argocd.daya.ai"
-      argocd_username_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_USER"
-      argocd_password_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_PASSWORD"
-      parameters: |
-        images.ingestor.tag=${{ inputs.version_tag || github.ref_name }}
-        images.processor.tag=${{ inputs.version_tag || github.ref_name }}
-        images.dashboard.tag=${{ inputs.version_tag || github.ref_name }}
-        images.migrate.tag=${{ inputs.version_tag || github.ref_name }}
-        images.dlqDrainer.tag=${{ inputs.version_tag || github.ref_name }}
-        init.nats.tag=${{ inputs.version_tag || github.ref_name }}
-      sync: true
-      wait: true
-      wait_timeout: 600
+# DISABLED 2026-10-03 (post AWS cutover): Huawei CCE deploy off — CCE is frozen at 0 and never synced. Restore by uncommenting this job.
+#   deploy-production:
+#     name: Deploy Production Environment (Huawei CCE)
+#     # Serialized AFTER the EKS deploy on purpose — see the staging workflow for
+#     # the /tmp/argocd shared-runner race this avoids.
+#     if: ${{ !endsWith(github.ref_name, '-staging') }}
+#     needs: [gate-production, deploy-eks-production]
+#     uses: tuju-ai/workflow/.github/workflows/deploy-argocd-app.yml@e018b36b69eff3903e9f4e2875063afd7d63bba0 # main as of 2026-09-08, PR #128 atomic app set & in-flight sync retry
+#     with:
+#       runner: ${{ vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]' }}
+#       app_name: "sentinel-production"
+#       argocd_url: "argocd.daya.ai"
+#       argocd_username_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_USER"
+#       argocd_password_aws_ssm_parameter_store_path: "/infra/hwc-daya-cce-production/argocd/ARGOCD_PASSWORD"
+#       parameters: |
+#         images.ingestor.tag=${{ inputs.version_tag || github.ref_name }}
+#         images.processor.tag=${{ inputs.version_tag || github.ref_name }}
+#         images.dashboard.tag=${{ inputs.version_tag || github.ref_name }}
+#         images.migrate.tag=${{ inputs.version_tag || github.ref_name }}
+#         images.dlqDrainer.tag=${{ inputs.version_tag || github.ref_name }}
+#         init.nats.tag=${{ inputs.version_tag || github.ref_name }}
+#       sync: true
+#       wait: true
+#       wait_timeout: 600
