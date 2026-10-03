@@ -164,6 +164,46 @@ Shared POSTGRES_* env block (host/port/user/db as literals; password from Secret
       key: POSTGRES_PASSWORD
 {{- end -}}
 
+{{/*
+sentinel.migratePostgresEnv -- the connection the MIGRATION job uses.
+
+Identical to sentinel.postgresEnv unless .Values.migrate.postgres.user is set,
+in which case POSTGRES_USER and POSTGRES_PASSWORD name the owning role instead.
+See the comment on migrate.postgres in values.yaml for why this differs per
+environment (report-an-issue/BUG-68).
+*/}}
+{{- define "sentinel.migratePostgresEnv" -}}
+{{- $m := (.Values.migrate | default dict).postgres | default dict }}
+{{- $user := $m.user | default "" }}
+{{- if not $user }}
+{{- include "sentinel.postgresEnv" . }}
+{{- else }}
+{{- $key := $m.passwordSecretKey | default "" }}
+{{- if not $key }}
+{{- fail "migrate.postgres.passwordSecretKey must name the Secret key holding migrate.postgres.user's password" }}
+{{- end }}
+{{- if eq (include "sentinel.isAws" .) "true" }}
+{{- $ext := (.Values.externalSecrets | default dict).secrets | default dict }}
+{{- if not (hasKey $ext $key) }}
+{{- fail (printf "migrate.postgres.passwordSecretKey %s is not in externalSecrets.secrets, so the Secret would never carry it" $key) }}
+{{- end }}
+{{- end }}
+- name: POSTGRES_HOST
+  value: {{ include "sentinel.postgresHost" . | quote }}
+- name: POSTGRES_PORT
+  value: {{ .Values.config.postgres.port | quote }}
+- name: POSTGRES_USER
+  value: {{ $user | quote }}
+- name: POSTGRES_DB
+  value: {{ .Values.config.postgres.database | quote }}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "sentinel.secretName" . }}
+      key: {{ $key | quote }}
+{{- end }}
+{{- end -}}
+
 {{- define "sentinel.otelEnv" -}}
 {{- if .Values.config.otel.exporterEndpoint }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT

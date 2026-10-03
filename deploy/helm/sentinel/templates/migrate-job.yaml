@@ -49,7 +49,7 @@ spec:
           image: "{{ $img.repository }}:{{ $tag }}"
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           env:
-            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            {{- include "sentinel.migratePostgresEnv" . | nindent 12 }}
             - name: SSLMODE
               value: {{ .Values.config.postgres.sslmode | quote }}
             - name: DB_URL_PROCESSOR

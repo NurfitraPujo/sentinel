@@ -70,6 +70,10 @@ externalSecrets:
   storeName: aws-parameter-store
   secrets:
     POSTGRES_PASSWORD: "/tuju/staging/sentinel/shared/POSTGRES_PASSWORD"
+    # The owning role's password, for the migration job only -- see migrate.postgres.
+    # Lives under /rds/ rather than /sentinel/ because the role is shared across
+    # this RDS instance's databases, not owned by sentinel.
+    MIGRATE_POSTGRES_PASSWORD: "/tuju/staging/rds/tuju-migration-user/password"
     REDIS_PASSWORD: "/tuju/staging/sentinel/shared/REDIS_PASSWORD"
     NATS_URL: "/tuju/staging/sentinel/shared/NATS_URL"
     AUTH_SECRET: "/tuju/staging/sentinel/shared/AUTH_SECRET"
@@ -173,6 +177,22 @@ migrate:
     - processor
     - ingestor
     - dashboard
+  # STAGING'S SCHEMA IS OWNED BY tuju-migration-user, NOT BY THE APP ROLE.
+  #
+  # Measured, not assumed: all 50 tables in public are owned by
+  # tuju-migration-user while the app connects as tuju-sentinel-user, so every
+  # ALTER TABLE in a migration failed with "must be owner of table" and froze
+  # the Argo sync from 2026-09-30 (report-an-issue/BUG-68). Production is the
+  # other way round -- tuju-sentinel-user owns 56 of its 57 tables -- so this
+  # override is staging-only, deliberately.
+  #
+  # Safe for the app: ALTER DEFAULT PRIVILEGES FOR tuju-migration-user already
+  # grants tuju-sentinel-user arwdDxt on new tables, rwU on sequences and X on
+  # functions, so anything the migrations create from here is readable and
+  # writable by the running pods without a further grant.
+  postgres:
+    user: tuju-migration-user
+    passwordSecretKey: MIGRATE_POSTGRES_PASSWORD
 
 ingestor:
   replicaCount: 1

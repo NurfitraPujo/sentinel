@@ -235,6 +235,27 @@ migrate:
     - processor
     - ingestor
     - dashboard
+  # WHO THE MIGRATIONS RUN AS, WHICH IS NOT ALWAYS THE APPLICATION ROLE.
+  #
+  # ALTER TABLE requires OWNERSHIP of the table and no GRANT substitutes for it,
+  # so the migration job must connect as whichever role owns the schema. That is
+  # not the same role in every environment:
+  #
+  #   staging    all 50 public tables are owned by tuju-migration-user, while the
+  #              app connects as tuju-sentinel-user -- so an ALTER fails with
+  #              "must be owner of table" (report-an-issue/BUG-68)
+  #   production tuju-sentinel-user owns its tables, so the app identity IS the
+  #              owner and nothing needs overriding
+  #
+  # Empty means "use the application identity", which keeps production, the
+  # Huawei values and the demo path exactly as they were.
+  postgres:
+    user: ""
+    # Key inside the release Secret holding that role's password. Required when
+    # `user` is set, and on AWS it must also appear in externalSecrets.secrets --
+    # both are enforced at template time, because the alternative is a job that
+    # starts and then cannot authenticate.
+    passwordSecretKey: ""
   backoffLimit: 3
   resources:
     requests: { cpu: 50m, memory: 64Mi }
