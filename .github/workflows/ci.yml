@@ -829,7 +829,6 @@ jobs:
     name: verify-externalsecret-paths
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","tuju-ai-runner"]') }}
     timeout-minutes: 10
-    continue-on-error: ${{ vars.AWS_SSM_READONLY_ROLE_ARN == '' }}
     permissions:
       contents: read
       id-token: write
