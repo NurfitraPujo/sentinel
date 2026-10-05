@@ -48,6 +48,7 @@ const ISSUE = {
 	message: 'boom',
 	environment: 'production',
 	status: 'unresolved',
+	issueType: 'system_error',
 };
 
 const { load } = await import('./+page.server');

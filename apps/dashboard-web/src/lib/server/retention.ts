@@ -681,7 +681,9 @@ async function sweep(
 	// construction (they are reported directly, not ingested), so they are ALWAYS "occurrence-less"
 	// -- gating their deletion on `retentionDays` (default 30) would delete a legitimate,
 	// still-relevant manual issue purely because of its type. `manualCutoff` is a second, longer
-	// cutoff (default 365d) that applies only to them.
+	// cutoff (default 365d) that applies only to them. The issue page's occurrence total mirrors
+	// which issues outlive the bucket cutoff (`occurrenceTotalIsExact`, queries/issue-queries.ts):
+	// change who keeps occurrences or buckets past `cutoffDate` and that rule has to change with it.
 	const manualCutoff = new Date();
 	manualCutoff.setDate(manualCutoff.getDate() - manualRetentionDays);
 

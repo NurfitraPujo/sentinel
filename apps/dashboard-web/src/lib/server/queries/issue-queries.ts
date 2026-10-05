@@ -281,6 +281,24 @@ function issueOrder(sort: string | undefined): SQL[] {
 }
 
 /**
+ * Whether `countOccurrencesByIssueId` must take the exact `COUNT(*)` for an issue of this
+ * `issue_type` instead of the bucket sum. True for exactly the issues retention.ts keeps past the
+ * bucket cutoff: `'user_report'`, the A04 branch whose deletion is gated on `manualRetentionDays`
+ * (`MANUAL_ISSUE_RETENTION_DAYS`, default 365) instead of `retentionDays` (`DATA_RETENTION_DAYS`,
+ * which is also where every `issue_occurrence_buckets` row goes). Anything retained under that longer
+ * constant would be undercounted by buckets swept at the shorter one, so it is counted exactly.
+ *
+ * As retention.ts stands, that undercount cannot happen: the occurrence delete applies the short
+ * `cutoffDate` to every issue type, and manual issues have no `error_occurrences` rows by
+ * construction, so the `COUNT(*)` is an index probe that finds nothing. The rule is kept so that it
+ * stays correct if either changes. A retention change that keeps occurrences of some issue past the
+ * bucket cutoff, or keeps buckets past the occurrence cutoff, has to update this rule too.
+ */
+export function occurrenceTotalIsExact(issueType: string): boolean {
+    return issueType === 'user_report';
+}
+
+/**
  * The `error_occurrences` columns the issue page receives for every listed occurrence: the 12 pre-v2
  * columns (sentinel-event-schema-v2 §8.3) plus the six light v2 header columns
  * (sentinel-occurrence-detail-panels §3.1). The heavy JSONB bodies are not here; they go only to the
@@ -375,17 +393,39 @@ export const issueQueries = {
     },
 
     /**
-     * §4.5a, flow `D2` — the real `COUNT(*)` behind the `Occurrence History` heading.
+     * §4.5a, flow `D2` — the RETAINED occurrence total behind the `Occurrence History` heading: how
+     * many `error_occurrences` rows this issue still has, not `issues.count` (lifetime, already in
+     * the header).
      *
      * `getOccurrencesByIssueId` caps at 100 and the heading rendered `occurrences.length` as though
      * it were a total, which is untrue for any issue with more than a page of occurrences. The
      * heading shows this number and the list below says it is showing the most recent *n*.
+     *
+     * Read as `sum(count)` over the issue's `issue_occurrence_buckets` rows, NOT `COUNT(*)` over
+     * `error_occurrences`. `COUNT(*)` walks every occurrence of the issue on every page view: in
+     * production (2026-10-04, 5.1M occurrences) it took 66.9 s for a 1,788,214-occurrence issue,
+     * 39 s for 347k and 8.4 s for 286k (8.3 s mean in pg_stat_statements), while every other read
+     * on the page took 4–45 ms. The bucket sum returned the same number on those issues in 4–60 ms.
+     * It is the same number because the processor upserts the occurrence's hourly bucket in the
+     * same transaction as the occurrence (`occurrenceBucketUpsertQuery`, processor-go store.go),
+     * and the retention sweep deletes buckets at the same `cutoffDate` as occurrences
+     * (retention.ts). The one hour the cutoff falls inside is dropped up to an hour early, so at
+     * most that hour's occurrences can be missing from the sum.
+     *
+     * `issueType` picks the source — see `occurrenceTotalIsExact`.
      */
-    async countOccurrencesByIssueId(issueId: string) {
+    async countOccurrencesByIssueId(issueId: string, issueType: string) {
+        if (occurrenceTotalIsExact(issueType)) {
+            const [row] = await db
+                .select({ count: sql<number>`cast(count(*) as integer)` })
+                .from(errorOccurrences)
+                .where(eq(errorOccurrences.issueId, issueId));
+            return Number(row?.count ?? 0);
+        }
         const [row] = await db
-            .select({ count: sql<number>`cast(count(*) as integer)` })
-            .from(errorOccurrences)
-            .where(eq(errorOccurrences.issueId, issueId));
+            .select({ count: sql<number>`cast(coalesce(sum(${issueOccurrenceBuckets.count}), 0) as integer)` })
+            .from(issueOccurrenceBuckets)
+            .where(eq(issueOccurrenceBuckets.issueId, issueId));
         return Number(row?.count ?? 0);
     },
 

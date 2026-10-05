@@ -91,6 +91,7 @@ const ISSUE = {
 	message: 'boom',
 	environment: 'production',
 	status: 'unresolved',
+	issueType: 'system_error',
 };
 
 const HOUR = 60 * 60 * 1000;
@@ -196,12 +197,15 @@ describe('/issues/[id] load (§4.5a)', () => {
 	});
 
 	// Flow `D2`: the heading showed `occurrences.length`, a page size capped at 100, as a total.
-	it('returns a real occurrence COUNT(*) beside the capped page of occurrences', async () => {
+	// Which source the total is read from is page.server.occurrence-total.test.ts's; this asserts the
+	// loader hands the reader the issue's type and returns its answer beside the capped page.
+	it('returns the retained occurrence total beside the capped page of occurrences', async () => {
 		getOccurrencesByIssueIdMock.mockResolvedValue(new Array(100).fill({ id: 'occ' }));
 		countOccurrencesByIssueIdMock.mockResolvedValue(1755);
 
 		const result: any = await loadAs('user-1');
 
+		expect(countOccurrencesByIssueIdMock).toHaveBeenCalledWith(ISSUE.id, 'system_error');
 		expect(result.occurrences).toHaveLength(100);
 		expect(result.occurrenceTotal).toBe(1755);
 	});

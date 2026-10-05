@@ -83,17 +83,41 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		canWrite = false;
 	}
 
-	const project = await issueQueries.getProjectById(issue.projectId);
-	// sentinel-issue-trend §4.2, decision 11 — AFTER both access checks above, keyed on the same
-	// `issueId` the loader has just been allowed to read (§2). One PK range query over the 30 UTC
-	// calendar days ending today, bounded at both ends, densified by the reader into `hourly` (24)
-	// and `daily` (30). The window is taken from one instant so the two headings agree on "now".
+	// The reads below depend on nothing but the issue row and the caller, so they run concurrently,
+	// all of them AFTER both access checks above (their errors and order are unchanged). The trend
+	// window is taken from one instant so the two headings agree on "now".
 	const { windowStart, windowEnd } = detailTrendWindow(new Date());
-	const trend = await issueQueries.trendForIssue(issueId, windowStart, windowEnd);
-	// sentinel-issue-tag-facets §7.1 — AFTER both access checks, ONE read of the issue_tag_values rollup
-	// (every row belongs to this issue, whose environment the checks above already passed).
-	const tagFacets = buildTagFacets(await issueQueries.getTagFacets(issueId));
-	const occurrences = await issueQueries.getOccurrencesByIssueId(issueId);
+	const [
+		project,
+		trend,
+		tagFacets,
+		occurrences,
+		occurrenceTotal,
+		environmentDisplayName,
+		relations,
+	] = await Promise.all([
+		issueQueries.getProjectById(issue.projectId),
+		// sentinel-issue-trend §4.2, decision 11 — AFTER both access checks above, keyed on the same
+		// `issueId` the loader has just been allowed to read (§2). One PK range query over the 30 UTC
+		// calendar days ending today, bounded at both ends, densified by the reader into `hourly` (24)
+		// and `daily` (30).
+		issueQueries.trendForIssue(issueId, windowStart, windowEnd),
+		// sentinel-issue-tag-facets §7.1 — AFTER both access checks, ONE read of the issue_tag_values rollup
+		// (every row belongs to this issue, whose environment the checks above already passed).
+		issueQueries.getTagFacets(issueId).then(buildTagFacets),
+		issueQueries.getOccurrencesByIssueId(issueId),
+		// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
+		// `getOccurrencesByIssueId` caps at 100. The heading takes this retained total (the hourly bucket
+		// sum, or an exact count for the issue types `occurrenceTotalIsExact` names, decided from the row
+		// already read); the list below says it is showing the most recent n.
+		issueQueries.countOccurrencesByIssueId(issueId, issue.issueType),
+		// §4.5a: the registry's display name, falling back to the raw name. Decisions 8+9 make the
+		// fallback the normal path for a new environment, not an error case.
+		resolveEnvironmentDisplayName(issue.projectId, issue.environment),
+		// §2.2, decision 37: the relations panel is guarded on the RELATED issue too, per project — an
+		// out-of-scope relation comes back as a redacted placeholder rather than being dropped or 404'd.
+		resolveEnvironmentScopes(session.user.id).then((scopes) => getIssueRelations(issueId, scopes)),
+	]);
 	// sentinel-occurrence-detail-panels §3.2: the selected occurrence, read AFTER both access checks
 	// above, so their errors and order are unchanged. `url?.` is binding: a loader test that builds its
 	// event without a `url` (page.server.test.ts's loadAs) must reach S1, not throw. The heavy JSONB
@@ -147,22 +171,6 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 				selectedTraceId,
 			})
 		: { orgSlug: null, related: null };
-	// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
-	// `getOccurrencesByIssueId` caps at 100. The heading takes this real `COUNT(*)`; the list below
-	// says it is showing the most recent n.
-	const occurrenceTotal = await issueQueries.countOccurrencesByIssueId(issueId);
-	// §4.5a: the registry's display name, falling back to the raw name. Decisions 8+9 make the
-	// fallback the normal path for a new environment, not an error case.
-	const environmentDisplayName = await resolveEnvironmentDisplayName(
-		issue.projectId,
-		issue.environment
-	);
-	// §2.2, decision 37: the relations panel is guarded on the RELATED issue too, per project — an
-	// out-of-scope relation comes back as a redacted placeholder rather than being dropped or 404'd.
-	const relations = await getIssueRelations(
-		issueId,
-		await resolveEnvironmentScopes(session.user.id)
-	);
 
 	return {
 		issue,

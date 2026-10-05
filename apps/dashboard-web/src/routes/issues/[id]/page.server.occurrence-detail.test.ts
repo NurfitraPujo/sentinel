@@ -52,6 +52,7 @@ const ISSUE = {
 	message: 'boom',
 	environment: 'production',
 	status: 'unresolved',
+	issueType: 'system_error',
 };
 
 const FIRST = 'aaaaaaaa-0000-4000-8000-000000000001';
