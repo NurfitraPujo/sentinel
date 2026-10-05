@@ -740,9 +740,23 @@ async function sweep(
 	// that meaning even after its occurrences are gone. `last_seen` would also default to the
 	// creation time for a brand-new issue, but conceptually it tracks the most recent occurrence,
 	// which is the wrong signal to gate deletion of a row precisely because it has none.
-	const noOccurrencesCondition = sql`${issues.id} NOT IN (
-		SELECT DISTINCT ${errorOccurrences.issueId}
-		FROM ${errorOccurrences}
+	//
+	// BUG-03 (sentinel-issue-page-slow-count): a correlated NOT EXISTS, never `NOT IN (SELECT DISTINCT
+	// issue_id FROM error_occurrences)`. The NOT IN form materialises every occurrence's issue_id -- a
+	// full index-only scan of idx_error_occurrences_issue_id -- once for the candidate SELECT and again
+	// for the DELETE. On production (5.1M occurrence rows / 11 GB) that took ~86 s of the route's 170 s
+	// deadline and from 2026-10-05 failed every hourly run with a statement timeout. NOT EXISTS is
+	// evaluated per issue that passes the cheap predicates (issue_type, first_seen past the cutoff):
+	// one probe of idx_error_occurrences_issue_id each. Because it sits inside the OR of the two
+	// orphan conditions Postgres runs it as a correlated SubPlan, not an anti-join, so the cost grows
+	// with the number of aged issues, never with the number of occurrences (single-branch form on
+	// production: 0.07 ms; the OR shape on 400k issues / 4M occurrences in PG16: ~0.66 s). Same
+	// semantics too: error_occurrences.issue_id is NOT NULL, so NOT IN's NULL trap never applied.
+	// `${issues.id}` renders table-qualified, so it correlates to the OUTER issues row in both the
+	// SELECT and the DELETE (proved by retention.claims.integration.test.ts).
+	const noOccurrencesCondition = sql`NOT EXISTS (
+		SELECT 1 FROM ${errorOccurrences}
+		WHERE ${errorOccurrences.issueId} = ${issues.id}
 	)`;
 
 	// System-error (ingested) issues: unchanged behavior, gated on the short `retentionDays` cutoff.

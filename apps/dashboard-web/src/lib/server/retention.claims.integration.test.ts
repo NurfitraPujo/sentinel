@@ -89,6 +89,7 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 		if (!sql) return;
 		try {
 			await sql`delete from issue_activity where issue_id in (select id from issues where project_id = ${projectId})`;
+			await sql`delete from error_occurrences where issue_id in (select id from issues where project_id = ${projectId})`;
 			await sql`delete from manual_issue_reports where issue_id in (select id from issues where project_id = ${projectId})`;
 			await sql`delete from issues where project_id = ${projectId}`;
 			await sql`delete from projects where id = ${projectId}`;
@@ -305,5 +306,29 @@ describe.skipIf(!dbReachable)('reapStaleClaims + A04 manual retention (integrati
 
 		const oldSurvives = await sql`select id from issues where id = ${oldId}`;
 		expect(oldSurvives).toHaveLength(0);
+	});
+	it('BUG-03: the NOT EXISTS orphan rule deletes only an old issue with no occurrences', async () => {
+		const { cleanupRetainedData } = await import('./retention');
+
+		// The condition correlates on the OUTER issues.id in both the candidate SELECT and the DELETE;
+		// a mis-correlated subquery would delete all three of these or none of them.
+		const oldOrphanId = await seedIssue({ fingerprint: 'orphan-old-' + suffix, firstSeen: daysAgo(40) });
+		const oldWithOccurrenceId = await seedIssue({
+			fingerprint: 'orphan-old-occ-' + suffix,
+			firstSeen: daysAgo(40),
+		});
+		const newOrphanId = await seedIssue({ fingerprint: 'orphan-new-' + suffix, firstSeen: daysAgo(1) });
+		// A recent occurrence, so the occurrence-age step (30d) leaves it in place.
+		await sql`
+			insert into error_occurrences (issue_id, project_id, environment, platform, created_at)
+			values (${oldWithOccurrenceId}, ${projectId}, 'production', 'javascript', ${new Date()})
+		`;
+
+		await cleanupRetainedData(30, 365);
+
+		const survivors = await sql`
+			select id from issues where id in (${oldOrphanId}, ${oldWithOccurrenceId}, ${newOrphanId})
+		`;
+		expect(survivors.map((r) => r.id).sort()).toEqual([newOrphanId, oldWithOccurrenceId].sort());
 	});
 });
