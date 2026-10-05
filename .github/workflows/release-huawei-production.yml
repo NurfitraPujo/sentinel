@@ -183,8 +183,11 @@ jobs:
           # ECR repo name is the bare matrix image (sentinel-ingestor, …) which
           # matches the clean repo names created in infra shared/ecr — the
           # reusable build-docker.yml would prefix daya-engineering/ instead.
+          # The SWR tag lives HERE, outside the block below: inside `tags: |` a `#` line is not a
+          # YAML comment but literal text, which buildx rejected as an invalid tag (every release
+          # from #82 until this fix failed at image build). To restore, add it back as a block line:
+          #   swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
           tags: |
-            # DISABLED 2026-10-03: swr.${{ secrets.SWR_REGION }}.myhuaweicloud.com/daya-engineering/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
             ${{ steps.login-ecr.outputs.registry }}/${{ matrix.image }}:${{ inputs.version_tag || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
