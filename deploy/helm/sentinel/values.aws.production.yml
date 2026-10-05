@@ -226,13 +226,15 @@ dependencies:
 # Dormant: the §5 NATS cutover owns JetStream stream creation. Enable at cutover.
 # Tag pinned to v0.2.43 (verified in ECR, matches live ArgoCD parameters) for
 # the same ImagePullBackOff reason as images.* above.
-# sentinel-span-ingest: AWS reads VictoriaTraces' Jaeger query API (no auth, reachable from the VPC). Off while this
-# environment is parked (replicas 0, the NATS cutover owns the streams): at cutover create SPANS / SPANS_DLQ /
-# processor-spans exactly as scripts/nats-init.sh does, set enabled, and fill scopes with `<tuju org uuid>:<core project uuid>`.
+# sentinel-span-ingest: AWS reads VictoriaTraces' Jaeger query API (no auth, reachable from the VPC; core exports
+# its traces to monitoring.internal.tuju.ai:4317, VictoriaTraces serves them at :10428/select/jaeger/api). Enabled
+# 2026-10-05 (sentinel-aws-error-reporting/TASK-01): the cutover left this off, so no span was stored after
+# 2026-10-03 01:59 UTC. SPANS / SPANS_DLQ / processor-spans already exist on the EKS NATS. Scope: the Tuju
+# organization pulls through its core project (`<org uuid>:<core project uuid>`), as on Huawei.
 spans:
-  enabled: false
+  enabled: true
   pull:
-    scopes: ""
+    scopes: "98867bbe-5594-471e-a5c0-16b39d6afabc:7d95eb6d-6551-4096-a8b2-ef8944dfefcf"
     storeKind: jaeger
     storeUrl: http://monitoring.internal.tuju.ai:10428
 
