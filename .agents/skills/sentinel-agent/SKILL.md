@@ -1,89 +1,96 @@
 ---
 name: sentinel-agent
 description: >
-  Triage Sentinel issues as a registered agent via /api/agent/*: discover work from the events
-  feed, claim/release, read issue detail (stacktraces or user reports), comment/progress/question,
-  set status, link relations, batch mutations, and verify inbound webhooks. Use whenever the task
-  is to act as an AI agent operating ON a Sentinel instance (not on Sentinel's own codebase).
+  Triage Sentinel issues as a registered agent through the `sentinel` CLI (/api/agent/*): find work,
+  claim/release, read issue detail (stacktraces or user reports), comment/progress/question, set
+  status, link relations, batch mutations. Use whenever the task is to act as an AI agent operating
+  ON a Sentinel instance (not on Sentinel's own codebase), from any repository.
 ---
 
 # Sentinel Agent
 
-Provider-neutral instructions for triaging Sentinel issues through its agent API. This file is the
-canonical skill definition; `.claude/skills/sentinel-agent/SKILL.md` is a thin Claude-specific shim
-that points back here.
+Instructions for triaging Sentinel issues with the `sentinel` command-line client. This skill is
+installed globally by `sentinel agent install`, so it is available in every repository; it does not
+assume you are inside the Sentinel codebase. Do **not** use it for changes to Sentinel's own source.
 
-**Full reference:** `docs/agents/SENTINEL_AGENT_GUIDE.md` (this repo) — read it before writing any
-non-trivial triage logic. This file is a condensed pointer, not a replacement.
+**Full reference:** run `sentinel guide` — it prints the complete agent guide (endpoints, schemas,
+batch semantics, webhooks, curl appendix). Read it before writing non-trivial triage logic. This
+file is the condensed version.
 
-## When to use this skill
-
-- You have (or are being asked to obtain) a Sentinel agent Bearer key (`sent_agent_...`) and need
-  to list, inspect, claim, comment on, or resolve issues.
-- You are building or debugging a webhook receiver for Sentinel's outbound event push.
-- You are writing a triage bot / autonomous loop against `/api/agent/*`.
-
-Do **not** use this skill for changes to Sentinel's own source code — that's the repo's normal
-`AGENTS.md` / `CLAUDE.md` guidance, a different concern entirely.
-
-## Environment setup
+## 1. Check setup first
 
 ```bash
-export SENTINEL_URL=https://sentinel.example.com
-export SENTINEL_AGENT_KEY=sent_agent_...   # never log or print this
+sentinel whoami      # profile in use, server URL, key prefix, "auth: ok" + agent name / organization
+sentinel config      # which profile, and where url and key each come from (flag / env pair / profile)
+sentinel profile list
 ```
 
-Every request needs `Authorization: Bearer $SENTINEL_AGENT_KEY`. A 401 covers unknown/revoked/
-expired/wrong-scope keys and disabled agents indistinguishably by design — see the guide §2.
+**Read the `profile:` and `url:` lines of `sentinel whoami` before acting** — the human may have several
+Sentinels (e.g. `production` and `staging`) and mutating the wrong one is the failure to avoid. When the
+human names an environment ("triage staging"), pass it explicitly: `sentinel --profile staging issues list`
+(global flag, before the subcommand). Do not change the current profile with `sentinel profile use` unless
+asked.
 
-## Core CLI commands
+**Never `export SENTINEL_URL`** (or `SENTINEL_AGENT_KEY`) and never write them into scripts or shell rc
+files: env credentials override the profile file and a stale value silently points the CLI at the wrong
+Sentinel. Use `--profile` instead.
 
-Prefer the `sentinel` CLI (`tools/sentinel-cli`) over raw curl when scripting:
+If `sentinel` is not found or `whoami` fails (exit 3 = bad/expired key, exit 1 = unreachable, "no server
+URL / agent key configured", "unknown profile"), **stop and tell the human** to run:
+
+```bash
+sentinel login --url https://<their-sentinel-host> [--profile <name>]   # prompts for the key (hidden), verifies, saves
+```
+
+Never ask the human to paste a key into the chat, never print or log the key, and never write it into a
+repository. Agent keys (`sent_agent_...`) are minted by an org admin on the dashboard's Agents settings page.
+
+## 2. Commands
 
 ```
 sentinel issues list [--type T] [--claimed true|false] [--project ID] [--waiting true]
 sentinel issues get <issueId>
-sentinel claim <issueId>            # 409 = owned by someone else, back off
+sentinel claim <issueId>            # 409 / exit 5 = owned by someone else, back off
 sentinel claim-next [--type T] [--project ID] [--environment E] [--source S]   # pick+claim+get in one call; exit 4 = queue empty
 sentinel release <issueId>          # releases only your own claim
 sentinel comment <issueId> --body <md>
-sentinel comment edit <issueId> <commentId> --body <md>      # own comment only, 403 otherwise
-sentinel comment delete <issueId> <commentId>                # own comment only, 403 otherwise
 sentinel progress <issueId> --body <md>       # in-app only, no email
 sentinel question <issueId> --body <md> --waiting-on <reporter|team>
+sentinel comments <issueId> [--after <ts>]    # poll for replies to a question
 sentinel status <issueId> <unresolved|resolved|ignored> [--resolved-in VERSION]
 sentinel severity <issueId> <low|medium|high|critical>       # user_report issues only
 sentinel link <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>
-sentinel events --follow [--type T]           # NDJSON stream, ~2s lag guard
+sentinel events --follow [--type T]           # NDJSON stream
 sentinel batch -f ops.json                    # up to 20 mutations, one round trip
 ```
 
-Exit codes: `0` ok, `2` usage, `3` auth, `4` not found, `5` conflict, `6` validation. Full command
-table and config resolution order: guide §11.
+Exit codes: `0` ok, `1` network/5xx, `2` usage, `3` auth, `4` not found, `5` conflict,
+`6` validation. On a non-zero exit the server's message is on stderr.
 
-## Triage recipe (condensed)
+## 3. Triage recipe
 
-1. **Discover** — poll `sentinel events --follow` (or `issues list --claimed false`).
-2. **Claim** — `sentinel claim <id>`; on conflict (exit 5), skip and move on.
-3. **Read** — `sentinel issues get <id>`: `system_error` → `latestOccurrence.stacktrace`;
+1. **Discover** — `sentinel claim-next` (atomic pick + claim + detail) or `sentinel issues list
+   --claimed false`.
+2. **Read** — `sentinel issues get <id>`: `system_error` → `latestOccurrence.stacktrace`;
    `user_report` → `report.bodyMd` / `report.severity`.
-   Steps 1–3 collapse into `sentinel claim-next [filters]` when you just want the next unclaimed
-   unresolved issue: it is atomic across agents (no 409 to handle), prints the same detail shape
-   as `issues get`, and exits 4 when nothing is left.
-4. **Act** — post a triage `comment`; if blocked, `question` (sets `waiting_on`, forces an email;
-   ANY user reply clears it — poll `comments` or `events --type question_answered` to notice) and
-   `release`; otherwise `status resolved` (or `ignored`) then `release`.
+3. **Act** — post a triage `comment` with your findings; if blocked on information, `question`
+   (sets `waiting_on` and emails; ANY user reply clears it) and `release`; otherwise
+   `status resolved` (or `ignored`) and `release`.
 
-Batch (`sentinel batch`) folds several of these into one call but has **no cross-op transaction** —
-partial completion is normal; check every result, not just the HTTP status (guide §9).
+`sentinel batch` folds several mutations into one call but has **no cross-op transaction** — partial
+completion is normal; check every result, not just the HTTP status.
 
-## Webhooks
+## 4. Claim etiquette
 
-Verify `X-Sentinel-Signature: t=<unix>,v1=<hex>` = `hex(HMAC-SHA256(secret, "<t>." + raw_body))`.
-Worked example and Node/Python receivers: guide §10, `docs/agents/examples/webhook-receiver.md`.
+- Claims are attributed to the engineer's agent (the key you are using). Other agents and humans see
+  "claimed by <agent>" — only claim what you will actually work on right now.
+- On exit 5 (conflict), skip the issue; never fight over it.
+- `release` anything you stop working on, including when you hit an error. Don't leave stale claims.
+- Don't change status of issues you have not claimed. Prefer `comment`/`progress` over silent changes
+  so the human can follow what you did and why.
+- You can only edit or delete your own comments.
 
-## More
+## 5. Webhooks
 
-- Raw curl for every endpoint: guide §14.
-- OpenAPI (informative): `docs/agents/openapi.agent.yaml`.
-- Runnable examples: `docs/agents/examples/`.
+Inbound events carry `X-Sentinel-Signature: t=<unix>,v1=<hex>` = `hex(HMAC-SHA256(secret, "<t>." +
+raw_body))`. Worked receivers: `sentinel guide` §10.

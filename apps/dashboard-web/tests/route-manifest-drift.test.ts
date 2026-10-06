@@ -40,6 +40,8 @@ const EXPECTED_RESERVED_ROUTES = [
 	'signin',
 	'invitations',
 	'onboarding',
+	'cli',
+	'install.sh',
 ];
 
 // The dynamic segment that IS the org-slug catch-all, by design.

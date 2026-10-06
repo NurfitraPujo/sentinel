@@ -110,6 +110,11 @@ config:
   dashboard:
     # Public URL of the dashboard (Auth.js AUTH_URL). MUST be the externally-visible https URL.
     authUrl: "https://sentinel.example.com"
+    # Name of the `sentinel` CLI config profile this deployment installs/logs in as (rendered as
+    # SENTINEL_CLI_PROFILE). install.sh and the Agents page then print
+    # `sentinel login --url <origin> --profile <name>`, so an engineer using several Sentinels ends up with
+    # one named profile per environment. Empty = no --profile in the printed commands.
+    cliProfile: ""
     authTrustHost: "true"
     emailFrom: "noreply@sentinel.example.com"
     dataRetentionDays: "30"

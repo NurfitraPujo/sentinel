@@ -184,11 +184,14 @@ jobs:
         run: go test ./... -count=1
 
   # ---------------------------------------------------------------------------------------------------------
-  # sentinel-cli: independent module (tools/sentinel-cli), N4 (AI-agent-native plan). Zero dependencies on
+  # sentinel-cli: independent module (tools/sentinel), N4 (AI-agent-native plan). Zero dependencies on
   # any other module in this repo and zero external deps (stdlib only), so it is not in go.work and, like
   # go-migrations/go-sdk above, must run with GOWORK=off or the repo-root go.work (found by walking up) would
   # pull it into the workspace build instead of testing it standalone as the independently `go install`-able
   # module it is meant to be.
+  # The job id/name stays `sentinel-cli` ON PURPOSE even though the module dir/binary is now `sentinel`: the
+  # workflow registry gates merges on the GitHub check named `sentinel-cli`; renaming it would silently break
+  # that gate.
   # ---------------------------------------------------------------------------------------------------------
   sentinel-cli:
     name: sentinel-cli
@@ -197,13 +200,17 @@ jobs:
       GOWORK: "off"
     defaults:
       run:
-        working-directory: tools/sentinel-cli
+        working-directory: tools/sentinel
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: tools/sentinel-cli/go.mod
+          go-version-file: tools/sentinel/go.mod
+
+      - name: embedded copies in sync (skill + guide)
+        working-directory: .
+        run: sh scripts/sync-cli-embeds.sh --check
 
       - name: go build
         run: go build ./...

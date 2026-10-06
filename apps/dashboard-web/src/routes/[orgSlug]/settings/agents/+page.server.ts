@@ -1,5 +1,6 @@
 import { error } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
+import { cliProfileName } from '$lib/server/cli-dist';
 
 // Manual Issues M5 §7/§9: mirrors settings/keys/+page.server.ts's shape -- authenticate BEFORE
 // any lookup that would reveal whether an organization exists (D39), then delegate the actual
@@ -39,5 +40,7 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 		orgSlug,
 		agents: agents || [],
 		projects,
+		// Profile name the printed `sentinel login` command should carry (helm config.dashboard.cliProfile).
+		cliProfile: cliProfileName(),
 	};
 };

@@ -111,6 +111,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("User-Agent", userAgent())
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -152,6 +153,7 @@ func (c *Client) UploadFile(ctx context.Context, path, filePath string, fileRead
 		return nil, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
 	resp, err := c.HTTP.Do(req)

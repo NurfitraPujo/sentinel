@@ -711,6 +711,9 @@ export const SelfResponseSchema = z
 		agentId: z.string(),
 		name: z.string(),
 		organizationId: z.string(),
+		// Suggested `sentinel` CLI profile name for this deployment (SENTINEL_CLI_PROFILE); present only
+		// when the operator configured one. `sentinel login` uses it to name the profile on a fresh machine.
+		cliProfile: z.string().optional(),
 		key: z
 			.object({
 				id: z.string(),

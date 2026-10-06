@@ -172,6 +172,10 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
+          # Only apps/dashboard-web/Dockerfile consumes this (stamps the served `sentinel` CLI's version with the
+          # release tag); the other images' Dockerfiles ignore it (buildx emits a harmless 'not consumed' warning).
+          build-args: |
+            SENTINEL_VERSION=${{ inputs.version_tag || github.ref_name }}
           push: true
           # Single build pushed to AWS ECR only. The SWR tag below is disabled
           # since the 2026-10-03 post-cutover Huawei CI/CD switch-off — AWS EKS

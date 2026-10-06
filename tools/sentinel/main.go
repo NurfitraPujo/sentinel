@@ -6,23 +6,28 @@
 //
 // It is a standalone Go module (see go.mod) with zero dependencies beyond the standard library
 // and zero imports from any other module in this repository, deliberately: this is meant to be
-// `go install`-able on its own, by an agent that has never cloned the Sentinel monorepo.
+// `go install`-able on its own
+// (go install github.com/tuju-ai/sentinel/tools/sentinel@latest, or the dashboard's /install.sh), by an agent that has never cloned the Sentinel monorepo.
 //
 // # Configuration
 //
-// The server URL and agent key are resolved in this order, highest priority first:
+// The server URL and agent key come from ONE place — never mixed across sources (a stale SENTINEL_URL
+// in a shell once got paired with another environment's key). Highest priority first:
 //
-//  1. -url / -key command-line flags
-//  2. SENTINEL_URL / SENTINEL_AGENT_KEY environment variables
-//  3. $XDG_CONFIG_HOME/sentinel/config.json (or ~/.config/sentinel/config.json):
-//     {"url": "https://sentinel.example.com", "agent_key": "sk_..."}
+//  1. -url / -key command-line flags (per field)
+//  2. an explicit profile: --profile P, or SENTINEL_PROFILE (beats env credentials, like the AWS CLI)
+//  3. the env PAIR SENTINEL_URL + SENTINEL_AGENT_KEY (SENTINEL_URL alone is ignored with a warning)
+//  4. a profile from $XDG_CONFIG_HOME/sentinel/config.json (or ~/.config/sentinel/config.json), written by
+//     `sentinel login`: {"current_profile": "production", "profiles": {"production": {"url": "...",
+//     "agent_key": "sent_agent_..."}}}; the profile is current_profile, else "default". The old flat
+//     {"url", "agent_key"} file still loads, as profile "default".
 //
 // The key is never logged or printed; see keyPrefix in config.go for the only derived form this
 // program will ever emit.
 //
 // # Usage
 //
-//	sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]
+//	sentinel [--profile P] [-url URL] [-key KEY] [-format json|table] <command> [args...]
 //
 //	sentinel issues list [--type user_report|system_error] [--claimed true|false] [--project ID] [--waiting true]
 //	sentinel issues get <issueId>
@@ -45,6 +50,12 @@
 //	sentinel members add <email> [--role <role>]
 //	sentinel members remove <memberId>
 //	sentinel whoami
+//	sentinel version | --version
+//	sentinel login [--url U] [--key-stdin]
+//	sentinel config
+//	sentinel profile list | use <name> | remove <name>
+//	sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]
+//	sentinel guide
 //	sentinel key rotate
 //	sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me] [--follow] [--interval SEC]
 //	sentinel batch -f ops.json [--stop-on-error=false]
@@ -60,6 +71,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -76,19 +88,25 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr *os.File) int {
+func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("sentinel", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	urlFlag := fs.String("url", "", "Sentinel server base URL (overrides SENTINEL_URL and the config file)")
 	keyFlag := fs.String("key", "", "Sentinel agent key (overrides SENTINEL_AGENT_KEY and the config file)")
+	profileFlag := fs.String("profile", "", "config profile to use (overrides SENTINEL_PROFILE and current_profile)")
+	showVersion := fs.Bool("version", false, "print the version and exit")
 	format := fs.String("format", "json", `output format: "json" (default) or "table" (list-shaped commands only)`)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]")
-		fmt.Fprintln(stderr, "commands: issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
+		fmt.Fprintln(stderr, "commands: login, profile, config, version, guide, agent, issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
 	}
 
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
+	}
+	if *showVersion {
+		fmt.Fprintln(stdout, buildVersion())
+		return ExitOK
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
@@ -97,6 +115,28 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 
 	name, cmdArgs := rest[0], rest[1:]
+
+	gflags := cfgFlags{URL: *urlFlag, Key: *keyFlag, Profile: *profileFlag}
+
+	// Commands that must work BEFORE a url/key is configured (or that never touch the server).
+	switch name {
+	case "version":
+		fmt.Fprintln(stdout, buildVersion())
+		return ExitOK
+	case "guide":
+		return cmdGuide(stdout)
+	case "agent":
+		return cmdAgent(cmdArgs, stdout, stderr)
+	case "profile":
+		return cmdProfile(cmdArgs, stdout, stderr)
+	case "config":
+		return cmdConfig(gflags, stdout, stderr)
+	case "login":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return cmdLogin(ctx, cmdArgs, gflags, stdLoginIO(stdout, stderr))
+	}
+
 	fn, ok := commands[name]
 	if !ok {
 		fmt.Fprintf(stderr, "unknown command %q\n", name)
@@ -104,7 +144,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		return ExitUsage
 	}
 
-	cfg, err := resolveConfig(*urlFlag, *keyFlag, func(msg string) { fmt.Fprintln(stderr, msg) })
+	cfg, err := resolveConfig(gflags, func(msg string) { fmt.Fprintln(stderr, msg) })
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return ExitUsage
@@ -115,6 +155,7 @@ func run(args []string, stdout, stderr *os.File) int {
 
 	e := &env{
 		client: NewClient(cfg.URL, cfg.Key),
+		cfg:    cfg,
 		format: *format,
 		stdout: stdout,
 		stderr: stderr,

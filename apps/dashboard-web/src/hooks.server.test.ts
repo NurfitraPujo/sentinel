@@ -89,6 +89,18 @@ describe('orgHandle reservedRoutes (D01)', () => {
 		expect(response).toBeInstanceOf(Response);
 	});
 
+	it.each(['/cli/download/linux/amd64', '/cli/checksums.txt', '/install.sh'])(
+		'CLI distribution path %s is not parsed as an org slug for a signed-in user',
+		async (pathname) => {
+			const resolve = vi.fn().mockResolvedValue(new Response('ok'));
+			const event = makeEvent(pathname, true);
+
+			await orgHandle({ event, resolve });
+
+			expect(resolve).toHaveBeenCalledWith(event);
+		}
+	);
+
 	it('still 403s an authenticated request to an unknown top-level path treated as an org slug', async () => {
 		const resolve = vi.fn().mockResolvedValue(new Response('ok'));
 		const event = makeEvent('/some-nonexistent-org-slug', true);

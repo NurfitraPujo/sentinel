@@ -47,7 +47,7 @@
 	}
 
 	interface Props {
-		data: { orgId: string; orgSlug: string; agents: AgentRow[]; projects: { id: string; name: string }[] };
+		data: { orgId: string; orgSlug: string; agents: AgentRow[]; projects: { id: string; name: string }[]; cliProfile?: string };
 	}
 
 	let { data }: Props = $props();
@@ -88,6 +88,27 @@
 	let newCredAppPassword = $state('');
 	let savingCredential = $state(false);
 	let replacingCredentialId = $state<string | null>(null);
+
+	// Setup snippet shown under a freshly minted key. Uses the origin the admin is looking at (the page's
+	// own origin) and deliberately does NOT embed the key: `sentinel login` prompts for it with echo off.
+	// Only rendered after a client-side action, so `window` is always defined when this is read.
+	const cliOrigin = $derived(typeof window === 'undefined' ? '' : window.location.origin);
+	const cliSetupSnippet = $derived(
+		[
+			`curl -fsSL ${cliOrigin}/install.sh | sh`,
+			`sentinel login --url ${cliOrigin}${data.cliProfile ? ` --profile ${data.cliProfile}` : ''}   # paste the key when prompted`,
+			`sentinel agent install`,
+		].join('\n')
+	);
+
+	async function copyCliSnippet() {
+		try {
+			await navigator.clipboard.writeText(cliSetupSnippet);
+			showToast('Setup commands copied', 'success');
+		} catch {
+			showToast('Could not copy — select the commands and copy manually');
+		}
+	}
 
 	function showToast(message: string, type: 'error' | 'success' = 'error') {
 		toastMessage = message;
@@ -486,6 +507,11 @@
 				<button type="button" onclick={() => (newlyIssuedToken = null)}>✕</button>
 			</div>
 			<code class="secret-token">{newlyIssuedToken}</code>
+			<div class="secret-tray-head cli-setup-head">
+				<strong>Set up the sentinel CLI on your machine (the key is not included — paste it when prompted)</strong>
+				<button type="button" onclick={copyCliSnippet}>Copy</button>
+			</div>
+			<pre class="secret-token cli-setup" data-testid="cli-setup-snippet">{cliSetupSnippet}</pre>
 		</div>
 	{/if}
 
@@ -823,6 +849,15 @@
 		padding: 0.5rem;
 		background: var(--bg-root);
 		border-radius: var(--radius-sm);
+	}
+
+	.cli-setup-head {
+		margin-top: 0.75rem;
+	}
+
+	.cli-setup {
+		margin: 0;
+		white-space: pre-wrap;
 	}
 
 	.create-agent {

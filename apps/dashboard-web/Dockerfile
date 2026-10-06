@@ -19,6 +19,26 @@ COPY apps/dashboard-web/ ./
 # Build
 RUN pnpm build
 
+# Stage 1b: the `sentinel` CLI, cross-compiled for the four platforms the dashboard's /install.sh serves
+# (see apps/dashboard-web/src/lib/server/cli-dist.ts). Independent of the SvelteKit stage, so BuildKit
+# builds them in parallel and a dashboard-only change never rebuilds the CLI. tools/sentinel is a
+# stdlib-only module (no dependency download step); it is built with GOWORK=off exactly like CI's
+# `sentinel-cli` job. Only the version build-arg is declared AFTER the source COPY, so it is the one
+# thing that invalidates the compile layer — a retag rebuilds this stage, nothing else.
+FROM docker.io/library/golang:1.25-alpine AS cli
+
+WORKDIR /src
+COPY tools/sentinel/ ./
+ARG SENTINEL_VERSION=dev
+RUN set -eu; mkdir -p /out; \
+    for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do \
+      os=${target%/*}; arch=${target#*/}; \
+      GOWORK=off CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+        go build -trimpath -ldflags "-s -w -X main.version=${SENTINEL_VERSION}" \
+        -o "/out/sentinel-$os-$arch" . ; \
+    done; \
+    cd /out && sha256sum sentinel-* > checksums.txt && cat checksums.txt
+
 # Stage 2: Production
 FROM docker.io/library/node:20-alpine
 
@@ -33,6 +53,10 @@ WORKDIR /app
 COPY --from=builder /app/build ./build
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
+
+# Prebuilt CLI binaries + sha256 checksums, served unauthenticated by /install.sh, /cli/download/<os>/<arch>
+# and /cli/checksums.txt (SENTINEL_CLI_DIR defaults to ./cli relative to WORKDIR).
+COPY --from=cli /out ./cli
 
 # OTel bootstrap (docs/plans/OBSERVABILITY_PLAN.md D-f). Deliberately NOT part of the SvelteKit/Vite
 # build (see the file's own header comment) — copied in directly, unbundled, and loaded via `node

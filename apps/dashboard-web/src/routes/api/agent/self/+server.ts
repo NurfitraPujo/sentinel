@@ -1,11 +1,12 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
+import { cliProfileName } from '$lib/server/cli-dist';
 
 /**
  * R1a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f): closes the "no dedicated identity
  * endpoint" gap `sentinel whoami` used to work around by probing GET /api/agent/issues and
- * reporting only reachability (tools/sentinel-cli/commands.go's old `cmdWhoami`). Returns exactly
+ * reporting only reachability (tools/sentinel/commands.go's old `cmdWhoami`). Returns exactly
  * what `authenticateAgentRequest` already resolved for THIS request -- no second query, no
  * `lastUsedAt` (project_api_keys tracks no such column; adding one is out of scope for this
  * phase, see the plan's R1 note).
@@ -16,7 +17,12 @@ import { authenticateAgentRequest } from '$lib/server/agent-auth';
 export const GET: RequestHandler = async ({ request }) => {
 	const ctx = await authenticateAgentRequest(request);
 
+	// Suggested CLI profile name for this deployment (SENTINEL_CLI_PROFILE), so `sentinel login` on a fresh
+	// machine names the profile after the environment. Omitted when unset.
+	const cliProfile = cliProfileName();
+
 	return json({
+		...(cliProfile ? { cliProfile } : {}),
 		agentId: ctx.agentId,
 		name: ctx.agentName,
 		organizationId: ctx.organizationId,

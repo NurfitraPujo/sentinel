@@ -16,6 +16,7 @@ import (
 // buffers and swap in an httptest.Server's client.
 type env struct {
 	client *Client
+	cfg    Resolved // where url/key came from; never printed with the key
 	format string
 	stdout io.Writer
 	stderr io.Writer
@@ -702,8 +703,12 @@ func cmdMembers(ctx context.Context, e *env, args []string) int {
 // existing scripts checking `$?` keep working; only the printed output gained real identity
 // fields.
 func cmdWhoami(ctx context.Context, e *env, args []string) int {
-	fmt.Fprintf(e.stdout, "url: %s\n", e.client.BaseURL)
-	fmt.Fprintf(e.stdout, "key: %s\n", keyPrefix(e.client.Key))
+	if e.cfg.URLSource != "" {
+		writeConfigSummary(e.stdout, e.cfg)
+	} else {
+		fmt.Fprintf(e.stdout, "url: %s\n", e.client.BaseURL)
+	}
+	fmt.Fprintf(e.stdout, "key prefix: %s\n", displayPrefix(e.cfg.KeyPrefix, e.client.Key))
 
 	res, err := e.client.Do(ctx, "GET", "/api/agent/self", nil, nil)
 	if err != nil {
@@ -855,7 +860,7 @@ func cursorStatePath() (string, error) {
 }
 
 func cursorKey(baseURL, key string) string {
-	return baseURL + "|" + keyPrefix(key)
+	return baseURL + "|" + stateKeyTag(key)
 }
 
 func loadCursorState(path string) (*cursorState, error) {

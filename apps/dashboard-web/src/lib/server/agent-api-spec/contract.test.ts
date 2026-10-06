@@ -185,6 +185,7 @@ const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId
 const traceRoute = await import('../../../routes/api/agent/traces/[traceId]/+server');
 const claimRoute = await import('../../../routes/api/agent/issues/[issueId]/claim/+server');
 const claimNextRoute = await import('../../../routes/api/agent/issues/claim-next/+server');
+const selfRoute = await import('../../../routes/api/agent/self/+server');
 const statusRoute = await import('../../../routes/api/agent/issues/[issueId]/status/+server');
 const commentsRoute = await import('../../../routes/api/agent/issues/[issueId]/comments/+server');
 const questionsRoute = await import('../../../routes/api/agent/issues/[issueId]/questions/+server');
@@ -276,6 +277,29 @@ describe('GET /api/agent/issues', () => {
 		const res = await issuesListRoute.GET(makeEvent('http://localhost/api/agent/issues?type=bogus'));
 		expect(res.status).toBe(400);
 		expect(S.ErrorFieldErrorSchema.parse(await res.json())).toBeTruthy();
+	});
+});
+
+describe('GET /api/agent/self', () => {
+	const selfCtx = { ...CTX, keyId: 'key-1', keyPrefix: 'sent_agent_ab12', keyCreatedAt: new Date(), keyExpiresAt: null };
+
+	it('200: matches SelfResponseSchema without a configured CLI profile', async () => {
+		vi.stubEnv('SENTINEL_CLI_PROFILE', '');
+		authenticateAgentRequest.mockResolvedValue(selfCtx);
+		const res = await selfRoute.GET(makeEvent('http://localhost/api/agent/self'));
+		expect(res.status).toBe(200);
+		expect(S.SelfResponseSchema.parse(await res.json())).toBeTruthy();
+		vi.unstubAllEnvs();
+	});
+
+	it('200: matches SelfResponseSchema WITH cliProfile (deployments that set SENTINEL_CLI_PROFILE)', async () => {
+		vi.stubEnv('SENTINEL_CLI_PROFILE', 'production');
+		authenticateAgentRequest.mockResolvedValue(selfCtx);
+		const res = await selfRoute.GET(makeEvent('http://localhost/api/agent/self'));
+		const body = await res.json();
+		expect(body.cliProfile).toBe('production');
+		expect(S.SelfResponseSchema.parse(body)).toBeTruthy();
+		vi.unstubAllEnvs();
 	});
 });
 

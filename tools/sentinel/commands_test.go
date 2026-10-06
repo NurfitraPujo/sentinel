@@ -404,7 +404,7 @@ func TestConfigPrecedence(t *testing.T) {
 	// File alone.
 	t.Setenv("SENTINEL_URL", "")
 	t.Setenv("SENTINEL_AGENT_KEY", "")
-	cfg, err := resolveConfig("", "", func(string) {})
+	cfg, err := resolveConfig(cfgFlags{}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestConfigPrecedence(t *testing.T) {
 	// Env overrides file.
 	t.Setenv("SENTINEL_URL", "https://env.example")
 	t.Setenv("SENTINEL_AGENT_KEY", "env_key")
-	cfg, err = resolveConfig("", "", func(string) {})
+	cfg, err = resolveConfig(cfgFlags{}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +424,7 @@ func TestConfigPrecedence(t *testing.T) {
 	}
 
 	// Flags override everything.
-	cfg, err = resolveConfig("https://flag.example", "flag_key", func(string) {})
+	cfg, err = resolveConfig(cfgFlags{URL: "https://flag.example", Key: "flag_key"}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +447,7 @@ func TestConfigFile_WorldReadableWarns(t *testing.T) {
 	}
 
 	var warned string
-	_, err := resolveConfig("", "", func(msg string) { warned = msg })
+	_, err := resolveConfig(cfgFlags{}, func(msg string) { warned = msg })
 	if err != nil {
 		t.Fatal(err)
 	}

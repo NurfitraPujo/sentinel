@@ -10,7 +10,7 @@ identity against a running Sentinel instance.
 
 Everything in this guide is verified against the route handlers under
 `apps/dashboard-web/src/routes/api/agent/**`, `$lib/server/agent-ops.ts`, `$lib/server/agent-events.ts`,
-`apps/processor-go/webhooks/dispatcher.go`, and `tools/sentinel-cli/`. Where this guide and any other
+`apps/processor-go/webhooks/dispatcher.go`, and `tools/sentinel/`. Where this guide and any other
 document disagree, trust this guide or the source files it cites.
 
 `docs/agents/openapi.agent.yaml` is a machine-readable OpenAPI 3.1 companion to this guide. As of N6
@@ -625,16 +625,32 @@ webhook was down for a while.
 
 A zero-dependency Go CLI wrapping `/api/agent/*`, built for scripting triage loops.
 
-**Install:**
+**Install** (the binary is named `sentinel`; the version is the deployed dashboard's release tag):
 ```bash
-go install github.com/NurfitraPujo/sentinel/tools/sentinel-cli@latest
-# or, from a checkout:
-cd tools/sentinel-cli && go build -o sentinel .
+curl -fsSL https://<your-sentinel-host>/install.sh | sh   # served by the dashboard, sha256-verified, no sudo
+sentinel login --url https://<your-sentinel-host>         # prompts for the agent key (hidden), verifies, saves config
+sentinel agent install                                    # installs the sentinel-agent skill for Claude Code / Codex / agy
 ```
+Developers can instead `go install github.com/tuju-ai/sentinel/tools/sentinel@latest` (private repo — needs
+`GOPRIVATE=github.com/tuju-ai` and `git config --global url."git@github.com:".insteadOf "https://github.com/"`)
+or `cd tools/sentinel && go build -o sentinel .` from a checkout. `sentinel version` prints the version.
 
-**Config** (highest priority first): `-url`/`-key` flags → `SENTINEL_URL`/`SENTINEL_AGENT_KEY` env
-vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/sentinel/config.json`,
-`{"url": "...", "agent_key": "sent_agent_..."}`, should be `chmod 600`). The key is never logged.
+**Config — profiles.** `config.json` (`$XDG_CONFIG_HOME/sentinel/`, else `~/.config/sentinel/`, `0600`, written by
+`sentinel login`) holds named profiles: `{"current_profile": "production", "profiles": {"production": {"url":
+"...", "agent_key": "sent_agent_..."}, "staging": {...}}}` (the old flat `{"url","agent_key"}` file loads as
+profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_PROFILE` > `current_profile` >
+`default`; an unknown profile exits 2. URL and key are never mixed across sources:
+
+| Situation | URL / key used |
+|---|---|
+| `-url` / `-key` flags | the flag, per field |
+| `--profile` / `SENTINEL_PROFILE` | that profile (beats env credentials) |
+| `SENTINEL_AGENT_KEY` set, no explicit profile | the pair `SENTINEL_URL` + `SENTINEL_AGENT_KEY` (key without URL = exit 2) |
+| `SENTINEL_URL` set without `SENTINEL_AGENT_KEY` | ignored, with a warning naming the profile used |
+| otherwise | `current_profile`, else `default` |
+
+`sentinel whoami` / `sentinel config` show the profile and where url and key came from (never the key);
+`sentinel profile list|use|remove` manage profiles. The key is never logged.
 
 | Command | HTTP call |
 |---|---|
@@ -656,6 +672,11 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 | `sentinel link <issueId> <targetIssueId> --type <linked_to\|caused_by\|duplicate_of>` | `POST /api/agent/issues/:id/relations` |
 | `sentinel unlink <issueId> <targetIssueId> --type <...>` | `DELETE /api/agent/issues/:id/relations` |
 | `sentinel projects` | `GET /api/agent/projects` |
+| `sentinel login [--profile P] [--url U] [--key-stdin] [--use] [--yes]` | verifies via `GET /api/agent/self`, then writes profile P to the config file (`0600`); never prints the key |
+| `sentinel profile list` / `use <name>` / `remove <name>` | *(local)* manage profiles |
+| `sentinel config` | *(local)* profile in use + where url / key come from; the key itself is never shown |
+| `sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]` | *(local)* installs the embedded sentinel-agent skill globally for each agent tool |
+| `sentinel version`, `sentinel guide` | *(local)* version; prints this guide |
 | `sentinel whoami` | `GET /api/agent/self` — real identity as of N7f (R1a), see below |
 | `sentinel key rotate` | `POST /api/agent/key/rotate` — new secret printed to stdout ONCE (N7f, R1b) |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` (one page) |
@@ -664,13 +685,13 @@ vars → `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/senti
 | `sentinel upload <file> --issue <id> [--comment <text>]` | upload + comment-with-attachment in one call (N7f, A15) |
 | `sentinel upload <issueId> <file>` | deprecated two-positional form — plain upload, `issueId` ignored, warns (see below) |
 
-Global flags (`-url`, `-key`, `-format json|table`) go before the subcommand. `-format table`
+Global flags (`--profile`, `-url`, `-key`, `-format json|table`) go before the subcommand. `-format table`
 renders list-shaped responses as a column table.
 
 **Exit codes:** `0` ok · `1` network/5xx · `2` usage error (no request made) · `3` auth failure
 (401/403) · `4` not found (404) · `5` conflict (409) · `6` validation error (400/422).
 
-**Known CLI/server mismatches** (server wins in every case — see `tools/sentinel-cli/README.md`
+**Known CLI/server mismatches** (server wins in every case — see `tools/sentinel/README.md`
 for the full explanation):
 - `comment --parent <id>` is accepted and sent, but the server-side comment op ignores it — there
   is no threading support in the agent comment path today.
@@ -840,6 +861,17 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### `sentinel` CLI distribution (sentinel-cli-install)
+
+- **No `/api/agent/*` wire change.** The CLI module moved `tools/sentinel-cli` → `tools/sentinel`
+  (module `github.com/tuju-ai/sentinel/tools/sentinel`), so the binary is `sentinel`, not `sentinel-cli`.
+- **New unauthenticated dashboard routes:** `GET /install.sh`, `GET /cli/download/<os>/<arch>`
+  (`linux|darwin` × `amd64|arm64`), `GET /cli/checksums.txt`. The binaries carry the dashboard's release tag.
+- **New CLI commands:** `version`/`--version`, `login`, `config`, `profile`, `agent install`, `guide`; config is now
+  named **profiles** (`--profile` / `SENTINEL_PROFILE`), and a lone `SENTINEL_URL` no longer overrides the file.
+  `GET /api/agent/self` additively returns `cliProfile` (the deployment's suggested profile name) when configured. The HTTP
+  `User-Agent` is now `sentinel/<version>` (it was Go's default; the server does not key on it).
 
 ### `POST /api/agent/issues/claim-next` (sentinel-agent-claim-next-issue)
 

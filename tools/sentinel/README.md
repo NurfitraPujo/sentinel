@@ -1,4 +1,4 @@
-# sentinel-cli
+# sentinel
 
 A provider-agnostic command-line client for Sentinel's agent API (`/api/agent/*`). It is a
 standalone Go module — zero dependencies beyond the standard library, zero imports from any other
@@ -8,34 +8,103 @@ tail the org's activity feed, and batch several mutations into one HTTP round tr
 
 ## Install
 
-```bash
-go install github.com/NurfitraPujo/sentinel/tools/sentinel-cli@latest
-```
-
-Or from a checkout:
+**Engineers** — one command, from your Sentinel dashboard (no Go toolchain, no repo access, no sudo):
 
 ```bash
-cd tools/sentinel-cli && go build -o sentinel .
+curl -fsSL https://<your-sentinel-host>/install.sh | sh
+sentinel login --url https://<your-sentinel-host>   # paste your agent key when prompted (hidden)
+sentinel agent install                              # give Claude Code / Codex / agy the sentinel-agent skill
 ```
 
-## Configuration
+`install.sh` downloads the binary from the same server, verifies its sha256, and installs it atomically
+to `${SENTINEL_INSTALL_DIR:-$HOME/.local/bin}/sentinel` (it warns if that is not on your `PATH`, and warns
+about — never removes — an old `sentinel-cli`). `sentinel version` prints the dashboard release tag it was
+built with. Re-run the one-liner to upgrade. Agent keys are minted by an org owner/admin on the dashboard's
+*Settings → Agents* page, which also shows these three commands next to a new key.
 
-Resolved in this order, highest priority first:
+**Developers** — build from source:
 
-1. `-url` / `-key` command-line flags
-2. `SENTINEL_URL` / `SENTINEL_AGENT_KEY` environment variables
-3. `$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/sentinel/config.json`):
+```bash
+# the repo is private: tell Go not to use the public proxy, and fetch over SSH
+go env -w GOPRIVATE=github.com/tuju-ai
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+go install github.com/tuju-ai/sentinel/tools/sentinel@latest   # installs a binary named `sentinel`
+```
 
-   ```json
-   {
-     "url": "https://sentinel.example.com",
-     "agent_key": "sk_..."
-   }
-   ```
+or from a checkout: `cd tools/sentinel && GOWORK=off go build -o sentinel .` (add
+`-ldflags "-X main.version=v1.2.3"` to stamp a version; otherwise it reports the module version / VCS
+revision, or `dev`).
 
-The key is never logged or printed. `sentinel whoami` prints only its first 8 characters. The
-config file should be `chmod 600` — the CLI warns to stderr (without ever printing the key itself)
-if it finds the file group- or world-readable.
+### Local setup commands
+
+| Command | What it does |
+|---|---|
+| `sentinel login` | see *Configuration: profiles*; prompts for the URL and the key (echo off), verifies with `GET /api/agent/self` **before** saving, prints agent name / org id / key prefix only. Without a TTY, pass `--key-stdin` and pipe the key. |
+| `sentinel config` | the profile in use + where the URL (value) and key (source only) come from |
+| `sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]` | writes the embedded `sentinel-agent` skill to each tool's **global** skill dir (no flag = every tool whose home dir exists) |
+| `sentinel guide` | prints the full agent guide (embedded copy of `docs/agents/SENTINEL_AGENT_GUIDE.md`) |
+| `sentinel version` / `--version` | prints the version |
+
+Skill locations: Claude Code `~/.claude/skills/sentinel-agent/SKILL.md`; agy
+`~/.gemini/config/skills/sentinel-agent/SKILL.md`; Codex `~/.agents/skills/sentinel-agent/SKILL.md`.
+Each file carries an `<!-- installed by sentinel <version>; do not edit -->` marker: re-running updates it in
+place, a file *without* the marker is never overwritten unless `--force`, and `--uninstall` removes only
+marked files.
+
+### Embedded files (maintainers)
+
+`go:embed` cannot reach outside this directory, so `assets/GUIDE.md` and `.agents/skills/sentinel-agent/SKILL.md`
+are generated copies — canonical sources are `docs/agents/SENTINEL_AGENT_GUIDE.md` and `assets/SKILL.md`. After
+editing either, run `scripts/sync-cli-embeds.sh`; CI (`sentinel-cli` job) runs it with `--check` and fails on drift.
+
+## Configuration: profiles
+
+`$XDG_CONFIG_HOME/sentinel/config.json` (falls back to `~/.config/sentinel/config.json`), written `0600` by
+`sentinel login`, holds **named profiles**, like the AWS CLI:
+
+```json
+{
+  "current_profile": "production",
+  "profiles": {
+    "production": { "url": "https://sentinel.example.com",         "agent_key": "sent_agent_..." },
+    "staging":    { "url": "https://sentinel.staging.example.com", "agent_key": "sent_agent_..." }
+  }
+}
+```
+
+The older flat `{"url", "agent_key"}` file still loads, as a profile named `default`; the first write migrates
+it. Profile names match `[a-z0-9][a-z0-9_-]{0,31}`.
+
+**Which profile:** `--profile P` (global flag, before the subcommand) > `SENTINEL_PROFILE` > `current_profile`
+> `default`. An unknown profile exits 2 and lists the ones that exist.
+
+**Where url and key come from** — never from two different sources (a stale `SENTINEL_URL` in a shell used to
+be silently paired with the file's key for a *different* Sentinel):
+
+| Situation | URL / key used |
+|---|---|
+| `-url` / `-key` flags | the flag, per field (flags always win) |
+| `--profile` or `SENTINEL_PROFILE` given | that profile — an explicit profile beats env credentials |
+| `SENTINEL_AGENT_KEY` set (no explicit profile) | the pair `SENTINEL_URL` + `SENTINEL_AGENT_KEY`; `SENTINEL_AGENT_KEY` without `SENTINEL_URL` is an error (exit 2) |
+| `SENTINEL_URL` set **without** `SENTINEL_AGENT_KEY` | **ignored**, with a warning naming the profile actually used |
+| none of the above | `current_profile`, else `default` |
+
+`sentinel whoami` and `sentinel config` print the profile in use and where url and key each came from —
+never the key. `sentinel login` warns about env variables that would shadow what it saves.
+
+| Command | |
+|---|---|
+| `sentinel login [--profile P] [--url U] [--key-stdin] [--use] [--yes]` | verify, then write/update profile P (default: the selected profile; on a fresh machine the server's suggested name, else `default`). First profile becomes current; `--use` forces it. Replacing an existing profile's URL asks first (`--yes` to skip; required without a TTY). |
+| `sentinel profile list` | name, URL, `*` marks current, key prefix only |
+| `sentinel profile use <name>` / `remove <name>` | switch current / delete a profile |
+
+A deployment can suggest a profile name (helm `config.dashboard.cliProfile` → `SENTINEL_CLI_PROFILE`; set to
+`production` / `staging` in the AWS values): `install.sh` and the Agents page then print
+`sentinel login --url <origin> --profile <name>`, so installing from both leaves you with two named profiles —
+switch with `sentinel --profile staging …` or `SENTINEL_PROFILE=staging`.
+
+The key is never logged or printed. The CLI warns to stderr (without printing the key) if the config file is
+group- or world-readable.
 
 ## Commands
 

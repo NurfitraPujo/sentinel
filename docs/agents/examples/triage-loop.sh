@@ -1,7 +1,7 @@
 #!/bin/sh
 # triage-loop.sh -- a minimal, defensive triage loop for the sentinel CLI.
 #
-# Requires: sentinel CLI on PATH (tools/sentinel-cli), jq.
+# Requires: sentinel CLI on PATH (tools/sentinel), jq.
 # Requires env: SENTINEL_URL, SENTINEL_AGENT_KEY (see docs/agents/SENTINEL_AGENT_GUIDE.md §11).
 #
 # What it does, per new issue.created-ish event seen on the org activity feed:

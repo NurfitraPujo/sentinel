@@ -29,6 +29,7 @@ data:
   INGESTOR_HEALTH_URL: {{ .Values.config.dashboard.ingestorHealthUrl | default (printf "http://%s-ingestor:%v" (include "sentinel.fullname" .) .Values.ingestor.service.port) | quote }}
   AUTH_URL: {{ .Values.config.dashboard.authUrl | quote }}
   AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
+  SENTINEL_CLI_PROFILE: {{ .Values.config.dashboard.cliProfile | default "" | quote }}
   EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}
   DATA_RETENTION_DAYS: {{ .Values.config.dashboard.dataRetentionDays | quote }}
   # sentinel-user-report-issue §8's config knobs. Non-secret, so they belong here and not in the

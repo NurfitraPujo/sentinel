@@ -150,6 +150,7 @@ config:
     exporterEndpoint: ""
   dashboard:
     authUrl: "https://sentinel.staging.tuju.ai"
+    cliProfile: "staging"
     authTrustHost: "true"
     # Kept on daya.ai for now (verified SES identity); rebrand at cutover.
     emailFrom: "noreply@daya.ai"

@@ -3543,6 +3543,8 @@ paths:
                     type: string
                   organizationId:
                     type: string
+                  cliProfile:
+                    type: string
                   key:
                     type: object
                     properties:

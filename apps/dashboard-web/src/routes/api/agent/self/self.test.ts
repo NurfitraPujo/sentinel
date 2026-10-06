@@ -71,4 +71,15 @@ describe('GET /api/agent/self', () => {
 		expect(body.key.expiresAt).toBeNull();
 		expect(body.key.createdAt).toBeNull();
 	});
+
+	it('includes cliProfile only when SENTINEL_CLI_PROFILE is set (fresh-machine login suggestion)', async () => {
+		authenticateAgentRequest.mockResolvedValue({ agentId: 'a', organizationId: 'o', agentName: 'n', keyId: 'k', keyPrefix: 'p', keyCreatedAt: null, keyExpiresAt: null });
+		vi.stubEnv('SENTINEL_CLI_PROFILE', 'production');
+		const withProfile = await (await GET(makeEvent())).json();
+		expect(withProfile.cliProfile).toBe('production');
+		vi.stubEnv('SENTINEL_CLI_PROFILE', '');
+		const without = await (await GET(makeEvent())).json();
+		expect('cliProfile' in without).toBe(false);
+		vi.unstubAllEnvs();
+	});
 });
