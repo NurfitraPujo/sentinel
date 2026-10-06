@@ -657,6 +657,10 @@ dependencies:
 #            At processor start every entry is checked against the database: the project must exist and belong to
 #            the organization it is listed under, otherwise that entry is dropped with an ERROR log. An organization
 #            listed twice is refused entirely (ERROR). Until the check has succeeded nothing is enqueued or pulled.
+#            issueWindow (SPAN_PULL_ISSUE_WINDOW, a Go duration): at most ONE pull is queued per issue per window, so
+#            a noisy error whose every occurrence carries its own trace queues one pull, not one per occurrence
+#            (2026-10-06: 1,806 pulls, 1.34M spans in one hour from one issue). "0" turns the throttle off; a
+#            negative or malformed value stops the processor at start.
 # -----------------------------------------------------------------------------
 spans:
   enabled: false
@@ -664,6 +668,7 @@ spans:
     scopes: ""
     storeKind: ""
     storeUrl: ""
+    issueWindow: "10m"
 
 # Optional: run the NATS/MinIO one-shot init steps as Jobs (create the JetStream streams /
 # the attachments bucket). Disable if your managed deps are pre-provisioned.

@@ -455,9 +455,10 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 	})
 
 	// sentinel-span-ingest D3: queue the occurrence's trace for a pull of core's spans. Best-effort like the audit rows
-	// above: MaybeEnqueue returns nothing, logs and counts its own failures, and runs only for a delivery that wrote
-	// an occurrence, so a redelivery never enqueues twice. The organization allow-list is checked inside it.
-	s.spanPull.MaybeEnqueue(ctx, issue.ProjectID, occ.TraceID)
+	// above: MaybeEnqueue returns no error, logs and counts its own failures, and runs only for a delivery that wrote
+	// an occurrence, so a redelivery never enqueues twice. The organization allow-list and the per-issue window
+	// (SPAN_PULL_ISSUE_WINDOW: one pull per issue per window) are checked inside it.
+	s.spanPull.MaybeEnqueue(ctx, issue.ProjectID, issue.ID, occ.TraceID)
 
 	// sentinel-releases-snooze §4.3 "After commit" (decisions 15, 41): the `next` rewrite, only when
 	// step 4c's RETURNING inserted was true — this delivery is the FIRST sighting of (project, R), so

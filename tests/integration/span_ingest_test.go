@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -816,4 +817,104 @@ func TestSpanPull_AMultibyteErrorBodyStillRecordsTheFailure(t *testing.T) {
 			assert.True(t, retryAt.After(h.clock.Add(30*time.Second)), "the retry delay was applied")
 		})
 	}
+}
+
+// sentinel-aws-error-reporting TASK-02: at most one pull per issue per SPAN_PULL_ISSUE_WINDOW. On 2026-10-06 one noisy
+// error, every occurrence carrying its own trace, queued 1,806 pulls in an hour; the (org_id, trace_id) dedupe above
+// does nothing for that.
+
+// withIssueWindow points the harness's processor at a queue with the throttle on (a Config literal has window 0).
+func (h *pullHarness) withIssueWindow(window time.Duration) *spanpull.Queue {
+	cfg := spanpull.Config{Scopes: map[string]string{h.tenant.OrgID: h.tenant.ProjectID}, Kind: spanpull.KindTempo, URL: h.stub.srv.URL, IssueWindow: window}
+	q := spanpull.NewQueue(h.pool, cfg).WithClock(func() time.Time { return *h.clock })
+	h.svc.SetSpanPull(q)
+	return q
+}
+
+// errorOf processes one occurrence of the issue keyed by fingerprint (a client fingerprint groups verbatim).
+func (h *pullHarness) errorOf(t *testing.T, tenant spanTenant, fingerprint, traceID string) {
+	t.Helper()
+	ev := buildValidProtoEvent(tenant.ProjectName)
+	ev.TraceId = traceID
+	ev.EventId = uuid.New().String()
+	ev.Fingerprint = fingerprint
+	data, err := proto.Marshal(ev)
+	require.NoError(t, err)
+	require.NoError(t, h.svc.ProcessEvent(context.Background(), data), "error ingest must succeed")
+}
+
+func traceN(n int) string { return fmt.Sprintf("%032x", 0xa000+n) }
+
+func TestSpanPull_IssueWindowQueuesOnePullPerIssue(t *testing.T) {
+	h := newPullHarness(t, spanpull.KindTempo)
+	h.withIssueWindow(10 * time.Minute)
+	queued := func() int {
+		return countRows(t, h.pool, `SELECT count(*) FROM span_pull_queue WHERE org_id = $1`, h.tenant.OrgID)
+	}
+	noisy, other := "fp-noisy-"+uuid.New().String(), "fp-other-"+uuid.New().String()
+	start := *h.clock
+
+	// Five occurrences of one issue, each with its own trace, inside the window: one pull.
+	for i := 1; i <= 5; i++ {
+		h.errorOf(t, h.tenant, noisy, traceN(i))
+	}
+	assert.Equal(t, 1, queued(), "one issue queues one pull per window, whatever its traces")
+	assert.Equal(t, 1, countRows(t, h.pool, `SELECT count(*) FROM span_pull_queue WHERE org_id = $1 AND trace_id = $2`, h.tenant.OrgID, traceN(1)),
+		"the pull queued is the first occurrence's trace")
+
+	// Another issue is independent.
+	h.errorOf(t, h.tenant, other, traceN(20))
+	assert.Equal(t, 2, queued())
+
+	// Inside the window: still throttled. At the window's end: one more pull, then throttled again.
+	*h.clock = start.Add(10*time.Minute - time.Second)
+	h.errorOf(t, h.tenant, noisy, traceN(6))
+	assert.Equal(t, 2, queued())
+	*h.clock = start.Add(10 * time.Minute)
+	h.errorOf(t, h.tenant, noisy, traceN(7))
+	h.errorOf(t, h.tenant, noisy, traceN(8))
+	assert.Equal(t, 3, queued())
+
+	// The window row is the issue's, and goes with it.
+	var issueID string
+	require.NoError(t, h.pool.QueryRow(context.Background(), `SELECT id::text FROM issues WHERE project_id = $1 AND fingerprint = $2`, h.tenant.ProjectID, noisy).Scan(&issueID))
+	assert.Equal(t, 1, countRows(t, h.pool, `SELECT count(*) FROM span_pull_issue_window WHERE issue_id = $1`, issueID))
+}
+
+func TestSpanPull_IssueWindowIsAtomicAcrossReplicas(t *testing.T) {
+	h := newPullHarness(t, spanpull.KindTempo)
+	ctx := context.Background()
+	// Two queues on separate pools stand in for two processor pods; both share the database and nothing else.
+	cfg := spanpull.Config{Scopes: map[string]string{h.tenant.OrgID: h.tenant.ProjectID}, Kind: spanpull.KindTempo, URL: h.stub.srv.URL, IssueWindow: 10 * time.Minute}
+	clock := func() time.Time { return *h.clock }
+	pods := []*spanpull.Queue{h.withIssueWindow(10 * time.Minute), spanpull.NewQueue(spanPool(t), cfg).WithClock(clock)}
+
+	// The issue exists, with no window row yet (an occurrence without a trace is not a pull candidate).
+	fp := "fp-race-" + uuid.New().String()
+	h.errorOf(t, h.tenant, fp, "")
+	var issueID string
+	require.NoError(t, h.pool.QueryRow(ctx, `SELECT id::text FROM issues WHERE project_id = $1 AND fingerprint = $2`, h.tenant.ProjectID, fp).Scan(&issueID))
+	require.Zero(t, countRows(t, h.pool, `SELECT count(*) FROM span_pull_issue_window WHERE issue_id = $1`, issueID))
+
+	const n = 24
+	outcomes := make([]string, n)
+	gate := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-gate
+			outcomes[i] = pods[i%2].MaybeEnqueue(ctx, h.tenant.ProjectID, issueID, traceN(100+i))
+		}(i)
+	}
+	close(gate)
+	wg.Wait()
+
+	tally := map[string]int{}
+	for _, o := range outcomes {
+		tally[o]++
+	}
+	assert.Equal(t, map[string]int{"queued": 1, "throttled": n - 1}, tally, "exactly one of %d concurrent occurrences of one issue queues a pull", n)
+	assert.Equal(t, 1, countRows(t, h.pool, `SELECT count(*) FROM span_pull_queue WHERE org_id = $1`, h.tenant.OrgID))
 }

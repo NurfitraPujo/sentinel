@@ -103,6 +103,9 @@ spec:
               value: {{ .Values.spans.enabled | quote }}
             - name: SPAN_PULL_SCOPES
               value: {{ .Values.spans.pull.scopes | quote }}
+            # At most one pull per issue per window; "0" = no throttle.
+            - name: SPAN_PULL_ISSUE_WINDOW
+              value: {{ .Values.spans.pull.issueWindow | quote }}
             - name: TRACE_STORE_KIND
               value: {{ .Values.spans.pull.storeKind | quote }}
             - name: TRACE_STORE_URL

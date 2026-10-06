@@ -1566,6 +1566,21 @@ Not verified here: a real Tempo / VictoriaTraces (adapters are proven against st
 formats), a real mobile transaction, `helm template` on AWS values (parked), production. `spans.pull.scopes`
 in `values-huawei-production.yml` maps the `tuju` org to its `core` project only.
 
+## Span pull per-issue window (sentinel-aws-error-reporting TASK-02) — VERIFIED 2026-10-06 (branch `NurfitraPujo/spt-sentinel`, pre-merge)
+
+Production 2026-10-06 01:00 UTC: one noisy error (~100/min, each occurrence its own trace) queued 1,806 pulls =
+1.34M spans in an hour, because `span_pull_queue` dedupes only by `(org_id, trace_id)`. Now at most ONE pull is
+queued per issue per `SPAN_PULL_ISSUE_WINDOW` (default `10m`, `0` = off; Helm `spans.pull.issueWindow`), decided
+and recorded by one upsert on `span_pull_issue_window` (migration `1725700000`), counted `outcome="throttled"`.
+Run against a throwaway `postgres:16` (never the shared dev DB).
+
+| What | Command | Result |
+|---|---|---|
+| Migration: FK cascade, the window statement, replay over the existing table, down/up | `cd packages/db-migrations && MIGRATIONS_TEST_DB_URL=<disposable> MIGRATIONS_TEST_REQUIRED=1 GOWORK=off go test . -run SpanPullIssueWindow` | pass |
+| Replay on three ledgers (`DELETE` the version row, `up -target={processor,dashboard,ingestor}`) | `go run ./cmd/migrate up` | each re-ran `1725700000` over the existing table, OK |
+| Order of checks, window arithmetic, window 0, error path, config parsing | `go test ./tests/unit/ -run 'SpanPullIssueWindow\|SpanPullConfig_IssueWindow'` | pass; red with the throttle removed |
+| Processor -> one pull per issue per window; 24 concurrent callers on two pools -> exactly 1 queued | `go test ./tests/integration/ -run SpanPull_IssueWindow` (TestMain pointed at the disposable DB) | pass 20/20; red with the throttle removed (5 occurrences -> 5 pulls, 24 -> 24) and with a non-atomic SELECT-then-upsert (24 -> 6) |
+
 ## Known-broken, STILL OPEN
 
 Each entry below was independently re-read against current code this pass (not assumed unchanged from

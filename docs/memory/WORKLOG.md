@@ -33,7 +33,14 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
     over the projects a viewer reaches (both leaked production spans; repair rounds 1-2).
   - The spans dedupe key includes `org_id` `(org_id, trace_id, span_id, start_ts)`: another org cannot block a row.
   - Production `spans.pull.scopes` maps the `tuju` org to its `core` project only; the `test` org must not be listed.
-- **Where to look**: `packages/db-migrations/migrations/1725600000_add_spans.sql`,
+  - (2026-10-06, sentinel-aws-error-reporting TASK-02) The pull queue dedupes by TRACE, which does nothing for a
+    noisy error whose every occurrence has its own trace: one issue queued 1,806 pulls (1.34M spans, ~1.2 GB) in
+    an hour. `SPAN_PULL_ISSUE_WINDOW` (Helm `spans.pull.issueWindow`, default `10m`, `0` = off) allows ONE pull per
+    issue per window via one atomic upsert on `span_pull_issue_window` (never a write to the hot `issues` row);
+    order is allow-list, then window, then queue insert. The window row is spent even if the queue insert is a
+    trace duplicate or errors (at most one window of pulls lost for that issue). Rows cascade with their issue and
+    are not reaped otherwise (one per erroring issue).
+- **Where to look**: `packages/db-migrations/migrations/1725600000_add_spans.sql`, `1725700000_add_span_pull_issue_window.sql`,
   `apps/ingestor-go/sentrycompat/{transaction,spans}.go`, `apps/processor-go/{spans,spanpull}/`,
   `apps/dashboard-web/src/lib/{spans/waterfall.ts,server/queries/span-queries.ts}`,
   `tests/integration/span_ingest_test.go`, `src/lib/server/span-waterfall.integration.test.ts`.

@@ -437,7 +437,8 @@ func startSpans(ctx context.Context, db *pgxpool.Pool, proc *service.ProcessorSe
 		queue := spanpull.NewQueue(db, pullCfg)
 		proc.SetSpanPull(queue)
 		go (&spanpull.Worker{Queue: queue, Spans: spanStore, Traces: traces, Cfg: pullCfg}).Run(ctx)
-		slog.InfoContext(ctx, "Span pull enabled", slog.String("store_kind", pullCfg.Kind), slog.Int("orgs", len(pullCfg.Scopes)))
+		slog.InfoContext(ctx, "Span pull enabled", slog.String("store_kind", pullCfg.Kind), slog.Int("orgs", len(pullCfg.Scopes)),
+			slog.String("issue_window", pullCfg.IssueWindow.String()))
 	}
 }
 

@@ -1,6 +1,8 @@
 // Package spanpull is sentinel-span-ingest D3: when an error occurrence with a canonical trace id is stored in an
 // allow-listed organization, the trace is queued and a worker fetches its spans from core's trace store (Tempo on
-// Huawei, VictoriaTraces on AWS) twice — 2 and 10 minutes after the first error — into the spans table.
+// Huawei, VictoriaTraces on AWS) twice — 2 and 10 minutes after the first error — into the spans table. At most one
+// trace is queued per issue per SPAN_PULL_ISSUE_WINDOW (span_pull_issue_window), so a noisy error does not queue a
+// pull for every occurrence.
 package spanpull
 
 import (
@@ -30,6 +32,8 @@ const (
 	RetryDelay          = 1 * time.Minute
 	// ClaimLease is how long a claimed row is invisible to other workers; a crashed worker's row is due again after it.
 	ClaimLease = 2 * time.Minute
+	// DefaultIssueWindow is SPAN_PULL_ISSUE_WINDOW when it is unset: at most one pull is queued per issue per window.
+	DefaultIssueWindow = 10 * time.Minute
 )
 
 // Config is the knobs of D3. The feature is OFF unless a scope map, TRACE_STORE_KIND and TRACE_STORE_URL are all set.
@@ -42,6 +46,10 @@ type Config struct {
 	Scopes map[string]string
 	Kind   string // TRACE_STORE_KIND: tempo | jaeger
 	URL    string // TRACE_STORE_URL
+	// IssueWindow is SPAN_PULL_ISSUE_WINDOW: at most one pull is queued per issue per window, so one noisy error whose
+	// every occurrence carries its own trace cannot queue a pull per occurrence. 0 turns the throttle off (every
+	// allow-listed trace is queued); ParseConfig defaults it to DefaultIssueWindow, while a Config literal (tests) has 0.
+	IssueWindow time.Duration
 
 	// Duplicated counts the organizations refused because SPAN_PULL_SCOPES named them more than once.
 	Duplicated int
@@ -56,7 +64,8 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 // ParseConfig reads the variables through lookup (os.LookupEnv in main, a map in tests). Unset or empty
 // SPAN_PULL_SCOPES or TRACE_STORE_URL → (Config{}, nil): the feature is off. A value that is set but wrong is an
 // error, so a typo stops the process instead of silently pulling nothing. SPAN_PULL_SCOPES is a comma-separated list
-// of `<org_uuid>:<core_project_uuid>`.
+// of `<org_uuid>:<core_project_uuid>`. SPAN_PULL_ISSUE_WINDOW is a Go duration (unset or empty → DefaultIssueWindow,
+// 0 → no throttle); a negative or unparsable value is an error.
 func ParseConfig(lookup func(string) (string, bool)) (Config, error) {
 	get := func(k string) string {
 		v, _ := lookup(k)
@@ -69,7 +78,15 @@ func ParseConfig(lookup func(string) (string, bool)) (Config, error) {
 	if kind != KindTempo && kind != KindJaeger {
 		return Config{}, fmt.Errorf("TRACE_STORE_KIND must be %q or %q, got %q", KindTempo, KindJaeger, kind)
 	}
-	cfg := Config{Scopes: map[string]string{}, Kind: kind, URL: url, gate: new(atomic.Pointer[map[string]string])}
+	window := DefaultIssueWindow
+	if raw := get("SPAN_PULL_ISSUE_WINDOW"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return Config{}, fmt.Errorf("SPAN_PULL_ISSUE_WINDOW must be a non-negative Go duration (e.g. 10m; 0 disables the throttle), got %q", raw)
+		}
+		window = d
+	}
+	cfg := Config{Scopes: map[string]string{}, Kind: kind, URL: url, IssueWindow: window, gate: new(atomic.Pointer[map[string]string])}
 	seen := map[string]bool{}
 	dup := map[string]bool{}
 	for _, pair := range strings.Split(scopes, ",") {

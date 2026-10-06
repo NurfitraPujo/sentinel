@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	MetricEnqueued = "sentinel_span_pull_enqueued_total" // outcome: queued | duplicate | not_allowed | not_validated | no_org | error
+	MetricEnqueued = "sentinel_span_pull_enqueued_total" // outcome: queued | duplicate | throttled | not_allowed | not_validated | no_org | error
 	MetricFetches  = "sentinel_span_pull_fetches_total"  // outcome: ok | not_found | too_large | error | gave_up
 )
 
@@ -39,47 +39,69 @@ func count(ctx context.Context, c metric.Int64Counter, outcome string) {
 	}
 }
 
+// DB is the slice of a pgx pool the queue uses (*pgxpool.Pool in main; a fake in unit tests).
+type DB interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Queue is the Postgres side of D3: the enqueue the processor calls after an occurrence is stored, and the claim the
 // worker takes.
 type Queue struct {
-	db  *pgxpool.Pool
+	db  DB
 	cfg Config
 	now func() time.Time
 }
 
-func NewQueue(db *pgxpool.Pool, cfg Config) *Queue {
+func NewQueue(db DB, cfg Config) *Queue {
 	return &Queue{db: db, cfg: cfg, now: time.Now}
 }
 
-// WithClock replaces the clock the due times are computed from (tests).
+// WithClock replaces the clock the due times and the issue window are computed from (tests).
 func (q *Queue) WithClock(now func() time.Time) *Queue { q.now = now; return q }
 
-// MaybeEnqueue queues traceID for a pull when the feature is on, traceID is canonical and projectID belongs to an
-// allow-listed organization. It NEVER returns an error and never blocks error ingest on anything slower than two
-// primary-key reads: every failure is logged and counted (D3: "a fetch failure ... never blocks or fails error
-// ingest"). The caller invokes it after the occurrence is committed.
-func (q *Queue) MaybeEnqueue(ctx context.Context, projectID, traceID string) {
+// MaybeEnqueue queues traceID for a pull when the feature is on, traceID is canonical, projectID belongs to an
+// allow-listed organization and issueID has not queued a pull within Config.IssueWindow. It NEVER returns an error and
+// never blocks error ingest on anything slower than three primary-key statements: every failure is logged and counted
+// (D3: "a fetch failure ... never blocks or fails error ingest"). It returns the MetricEnqueued outcome it counted, ""
+// when the occurrence was not a candidate at all; the processor ignores it. The caller invokes it after the occurrence
+// is committed.
+func (q *Queue) MaybeEnqueue(ctx context.Context, projectID, issueID, traceID string) string {
 	if q == nil || !q.cfg.Enabled() || !spanwire.ValidTraceID(traceID) || projectID == "" {
-		return
+		return ""
 	}
+	outcome := q.enqueue(ctx, projectID, issueID, traceID)
+	count(ctx, enqueuedCtr, outcome)
+	return outcome
+}
+
+func (q *Queue) enqueue(ctx context.Context, projectID, issueID, traceID string) string {
 	if !q.cfg.Validated() {
-		count(ctx, enqueuedCtr, "not_validated")
-		return
+		return "not_validated"
 	}
 	var org *string
 	err := q.db.QueryRow(ctx, `SELECT organization_id::text FROM projects WHERE id = $1::uuid`, projectID).Scan(&org)
 	if err != nil || org == nil {
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			slog.WarnContext(ctx, "span pull: organization lookup failed", slog.String("error", err.Error()))
-			count(ctx, enqueuedCtr, "error")
-			return
+			return "error"
 		}
-		count(ctx, enqueuedCtr, "no_org")
-		return
+		return "no_org"
 	}
 	if !q.cfg.Allowed(*org) {
-		count(ctx, enqueuedCtr, "not_allowed")
-		return
+		return "not_allowed"
+	}
+	// The throttle comes after the allow-list, so an organization that is not allow-listed never writes a window row.
+	if q.cfg.IssueWindow > 0 && issueID != "" {
+		allowed, err := q.claimIssueWindow(ctx, issueID)
+		if err != nil {
+			slog.WarnContext(ctx, "span pull: issue window check failed", slog.String("error", err.Error()))
+			return "error"
+		}
+		if !allowed {
+			return "throttled"
+		}
 	}
 	// trigger_project_id is the FIRST error's project, kept for debugging only (ON CONFLICT DO NOTHING never rewrites
 	// it). It scopes nothing: pulled spans are governed by the configured core project (Config.Scopes), so which
@@ -90,12 +112,35 @@ func (q *Queue) MaybeEnqueue(ctx context.Context, projectID, traceID string) {
 	switch {
 	case err != nil:
 		slog.WarnContext(ctx, "span pull: enqueue failed", slog.String("error", err.Error()))
-		count(ctx, enqueuedCtr, "error")
+		return "error"
 	case tag.RowsAffected() == 0:
-		count(ctx, enqueuedCtr, "duplicate")
+		return "duplicate"
 	default:
-		count(ctx, enqueuedCtr, "queued")
+		return "queued"
 	}
+}
+
+// claimIssueWindow is the per-issue throttle: one statement that both decides and records, so two processor replicas
+// handling occurrences of the same issue at the same moment cannot both pass it. The first occurrence inserts the row;
+// a later one rewrites last_enqueued_at only when the window has elapsed, and the row comes back only when this call
+// inserted or rewrote it. Concurrent callers serialize on the row, and ON CONFLICT DO UPDATE evaluates its WHERE
+// against the latest committed version, so exactly one of them gets it back.
+//
+// The row is recorded BEFORE the queue insert, outside any transaction. When that insert then finds the trace already
+// queued (ON CONFLICT, outcome duplicate) the window is still spent, which is fine: that trace is being pulled. When it
+// errors, the issue queues nothing until the window elapses; that costs at most one window of pulls for one issue,
+// and the database is failing anyway.
+func (q *Queue) claimIssueWindow(ctx context.Context, issueID string) (bool, error) {
+	now := q.now()
+	var got string
+	err := q.db.QueryRow(ctx, `INSERT INTO span_pull_issue_window (issue_id, last_enqueued_at) VALUES ($1::uuid, $2)
+		ON CONFLICT (issue_id) DO UPDATE SET last_enqueued_at = EXCLUDED.last_enqueued_at
+		 WHERE span_pull_issue_window.last_enqueued_at <= $3
+		RETURNING issue_id::text`, issueID, now, now.Add(-q.cfg.IssueWindow)).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Job is one claimed queue row.
