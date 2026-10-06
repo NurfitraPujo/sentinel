@@ -14,6 +14,15 @@ import { detailTrendWindow } from '$lib/server/trend-window';
 import { cleanOccurrenceRow } from '$lib/server/json-safe';
 import { buildTagFacets } from '$lib/tag-facets';
 import { loadTraceLinks } from '$lib/server/trace-links';
+import { resolveViewerSpanScope } from '$lib/server/span-scope';
+import { SPANS_SCAN_BOUND, statusByOccurrence, walkOccurrencesWithSpans } from '$lib/server/issue-spans';
+import { canReachSpanPullCore, isSpanPullEnabled } from '$lib/server/span-pull';
+import { log } from '$lib/server/observability/log';
+import type { SpansStatus } from '$lib/spans/status';
+
+// sentinel-occurrence-spans TASK-01: the occurrence list's "with spans only" toggle, `?spans=1`.
+const WITH_SPANS_PARAM = 'spans';
+const OCCURRENCE_PAGE = 100;
 
 // sentinel-occurrence-detail-panels §3.2: the shape of an occurrence id. Tested against the lower-cased
 // parameter, so a malformed value (S4) never reaches a query, where Postgres would answer 22P02 → 500.
@@ -87,11 +96,12 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 	// all of them AFTER both access checks above (their errors and order are unchanged). The trend
 	// window is taken from one instant so the two headings agree on "now".
 	const { windowStart, windowEnd } = detailTrendWindow(new Date());
+	const withSpansOnly = url?.searchParams.get(WITH_SPANS_PARAM) === '1';
 	const [
 		project,
 		trend,
 		tagFacets,
-		occurrences,
+		listedOccurrences,
 		occurrenceTotal,
 		environmentDisplayName,
 		relations,
@@ -105,7 +115,8 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// sentinel-issue-tag-facets §7.1 — AFTER both access checks, ONE read of the issue_tag_values rollup
 		// (every row belongs to this issue, whose environment the checks above already passed).
 		issueQueries.getTagFacets(issueId).then(buildTagFacets),
-		issueQueries.getOccurrencesByIssueId(issueId),
+		// With the spans filter on, the list is built below from the bounded walk instead.
+		withSpansOnly ? Promise.resolve([]) : issueQueries.getOccurrencesByIssueId(issueId),
 		// Flow `D2`: `Occurrence History ({occurrences.length})` presented a page size as a total —
 		// `getOccurrencesByIssueId` caps at 100. The heading takes this retained total (the hourly bucket
 		// sum, or an exact count for the issue types `occurrenceTotalIsExact` names, decided from the row
@@ -118,6 +129,39 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// out-of-scope relation comes back as a redacted placeholder rather than being dropped or 404'd.
 		resolveEnvironmentScopes(session.user.id).then((scopes) => getIssueRelations(issueId, scopes)),
 	]);
+	// sentinel-occurrence-spans TASK-01 — which occurrences have spans the viewer may open. AFTER both access checks, through
+	// the waterfall's own guard (span-queries). A failure here degrades the badges, never the page.
+	let occurrences = listedOccurrences;
+	let spansStatus: Record<string, SpansStatus> = {};
+	let spansFilter: { active: boolean; scanned: number; bound: number; exhausted: boolean } | null = null;
+	let latestSpansTrace: { occurrenceId: string; traceId: string } | null = null;
+	// Whether the buttons are offered: the org is allow-listed AND the viewer can reach its core (scope) project, which
+	// governs pulled spans. Without both there is nothing to badge and nothing to pull, so nothing is computed.
+	let spanPullEnabled = false;
+	try {
+		if (isSpanPullEnabled(organizationId)) {
+			const spanScope = await resolveViewerSpanScope(session.user.id, organizationId);
+			spanPullEnabled = !!spanScope && canReachSpanPullCore(spanScope);
+			if (spanScope && spanPullEnabled && withSpansOnly) {
+				// Only here does the bounded walk run (up to SPANS_SCAN_BOUND occurrences); the default page never does.
+				const walk = await walkOccurrencesWithSpans({ issueId, scope: spanScope, want: OCCURRENCE_PAGE });
+				occurrences = await issueQueries.getOccurrencesByIds(issueId, walk.ids);
+				spansStatus = Object.fromEntries(walk.ids.map((id) => [id, 'available' as const]));
+				spansFilter = { active: true, scanned: walk.scanned, bound: SPANS_SCAN_BOUND, exhausted: walk.exhausted };
+				const first = occurrences[0];
+				if (first?.traceId) latestSpansTrace = { occurrenceId: first.id, traceId: walk.traceIds.get(first.id) ?? first.traceId };
+			} else if (spanScope && spanPullEnabled) {
+				// The default page: ONE status statement for the (<= 100) occurrences it already lists, nothing more.
+				spansFilter = { active: false, scanned: 0, bound: SPANS_SCAN_BOUND, exhausted: false };
+				spansStatus = await statusByOccurrence(occurrences, spanScope);
+				const firstWith = occurrences.find((o) => spansStatus[o.id] === 'available');
+				if (firstWith?.traceId) latestSpansTrace = { occurrenceId: firstWith.id, traceId: firstWith.traceId };
+			}
+		}
+	} catch (err) {
+		log.error('issue_page.spans_status_failed', { issueId, error: err });
+	}
+
 	// sentinel-occurrence-detail-panels §3.2: the selected occurrence, read AFTER both access checks
 	// above, so their errors and order are unchanged. `url?.` is binding: a loader test that builds its
 	// event without a `url` (page.server.test.ts's loadAs) must reach S1, not throw. The heavy JSONB
@@ -185,6 +229,13 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// sentinel-cross-repo-trace-view D5: the slug the trace links are built from (null when no
 		// occurrence has a trace) and the selected occurrence's other-project count (null: none to show).
 		traceOrgSlug: traceLinks.orgSlug,
+		// sentinel-occurrence-spans: the organization (the pull endpoint's scope), whether on-demand pull is offered for
+		// it, each listed occurrence's spans status, the issue-level link target, and the "with spans only" state.
+		organizationId,
+		spanPullEnabled,
+		spansStatus,
+		latestSpansTrace,
+		spansFilter,
 		relatedTraceErrors: traceLinks.related,
 		relations,
 		// sentinel-issue-trend §4.2 — top level beside `issue`: `{ hourly: TrendPoint[24], daily:

@@ -19,7 +19,26 @@ import (
 
 const (
 	MetricEnqueued = "sentinel_span_pull_enqueued_total" // outcome: queued | duplicate | throttled | not_allowed | not_validated | no_org | error
-	MetricFetches  = "sentinel_span_pull_fetches_total"  // outcome: ok | not_found | too_large | error | gave_up
+	// MetricFetches counts trace-store fetches. outcome: ok | not_found | too_large | error | gave_up. trigger: auto (queued
+	// by MaybeEnqueue) | on_demand (a person or agent asked, via the dashboard or the agent API); an on-demand row is
+	// processed exactly like an automatic one, the label is the only difference.
+	MetricFetches = "sentinel_span_pull_fetches_total"
+)
+
+// Terminal outcomes the worker records on the queue row (span_pull_queue.outcome, 1725800000), so a reader can tell a
+// finished pull that found nothing from one that has not run. "" means nothing has finished since the row was queued or
+// re-armed.
+const (
+	OutcomeStored     = "stored"      // spans were written
+	OutcomeNotFound   = "not_found"   // the trace store has no such trace (or an empty one)
+	OutcomeTooLarge   = "too_large"   // over the read bound or refused by the store
+	OutcomeNotAllowed = "not_allowed" // the organization left the allow-list
+	OutcomeGaveUp     = "gave_up"     // retries exhausted
+)
+
+const (
+	TriggerAuto     = "auto"
+	TriggerOnDemand = "on_demand"
 )
 
 var (
@@ -33,10 +52,18 @@ func init() {
 	fetchesCtr, _ = meter.Int64Counter(MetricFetches, metric.WithDescription("Trace-store fetches by outcome"))
 }
 
-func count(ctx context.Context, c metric.Int64Counter, outcome string) {
+func count(ctx context.Context, c metric.Int64Counter, outcome string, extra ...attribute.KeyValue) {
 	if c != nil {
-		c.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+		c.Add(ctx, 1, metric.WithAttributes(append([]attribute.KeyValue{attribute.String("outcome", outcome)}, extra...)...))
 	}
+}
+
+// Trigger is the MetricFetches label value for this job.
+func (j Job) Trigger() string {
+	if j.OnDemand {
+		return TriggerOnDemand
+	}
+	return TriggerAuto
 }
 
 // DB is the slice of a pgx pool the queue uses (*pgxpool.Pool in main; a fake in unit tests).
@@ -149,6 +176,9 @@ type Job struct {
 	TraceID          string
 	TriggerProjectID string // debugging only
 	Stage            int
+	// OnDemand is set when the row's last (re)arm came from a person or agent (span_pull_queue.on_demand). The worker
+	// treats it like any other row; it only labels the metrics.
+	OnDemand bool
 	// Attempts is this job's attempt number AT THIS STAGE, counted when it was claimed: 1 on the first try. A worker
 	// that crashes mid-fetch still spent the attempt, so a poison job cannot retry every lease forever.
 	Attempts int
@@ -166,7 +196,7 @@ func (q *Queue) Claim(ctx context.Context, limit int) ([]Job, error) {
 			 ORDER BY next_fetch_at LIMIT $2 FOR UPDATE SKIP LOCKED)
 		UPDATE span_pull_queue q SET next_fetch_at = $3, attempts = q.attempts + 1
 		  FROM due WHERE q.org_id = due.org_id AND q.trace_id = due.trace_id
-		RETURNING q.org_id::text, q.trace_id, coalesce(q.trigger_project_id::text, ''), q.stage, q.attempts, q.created_at`,
+		RETURNING q.org_id::text, q.trace_id, coalesce(q.trigger_project_id::text, ''), q.stage, q.attempts, q.created_at, q.on_demand`,
 		q.now(), limit, q.now().Add(ClaimLease))
 	if err != nil {
 		return nil, err
@@ -176,7 +206,7 @@ func (q *Queue) Claim(ctx context.Context, limit int) ([]Job, error) {
 	for rows.Next() {
 		var j Job
 		var stage int16
-		if err := rows.Scan(&j.OrgID, &j.TraceID, &j.TriggerProjectID, &stage, &j.Attempts, &j.Created); err != nil {
+		if err := rows.Scan(&j.OrgID, &j.TraceID, &j.TriggerProjectID, &stage, &j.Attempts, &j.Created, &j.OnDemand); err != nil {
 			return nil, err
 		}
 		j.Stage = int(stage)
@@ -189,13 +219,17 @@ func (q *Queue) Claim(ctx context.Context, limit int) ([]Job, error) {
 // error, never sooner than now), stage 1 -> 2 (done). It is conditional on the stage the job was CLAIMED at, so a
 // worker whose lease expired and whose job was re-claimed and finished by another cannot advance it a second time
 // (skipping the 10-minute fetch, or tripping the stage CHECK). It reports whether this call advanced the row.
-func (q *Queue) Advance(ctx context.Context, j Job) (bool, error) {
+func (q *Queue) Advance(ctx context.Context, j Job) (bool, error) { return q.AdvanceWith(ctx, j, "") }
+
+// AdvanceWith is Advance that also records what the fetch ended in (an Outcome* constant) on the row, so the row of a
+// finished (stage 2) job says why it holds no spans.
+func (q *Queue) AdvanceWith(ctx context.Context, j Job, outcome string) (bool, error) {
 	next := j.Created.Add(SecondFetchDelay)
 	if now := q.now(); next.Before(now) {
 		next = now
 	}
-	tag, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET stage = stage + 1, attempts = 0, last_error = '', next_fetch_at = $4
-		WHERE org_id = $1::uuid AND trace_id = $2 AND stage = $3`, j.OrgID, j.TraceID, j.Stage, next)
+	tag, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET stage = stage + 1, attempts = 0, last_error = '', next_fetch_at = $4, outcome = $5
+		WHERE org_id = $1::uuid AND trace_id = $2 AND stage = $3`, j.OrgID, j.TraceID, j.Stage, next, outcome)
 	return tag.RowsAffected() > 0, err
 }
 
@@ -208,9 +242,13 @@ func (q *Queue) Fail(ctx context.Context, j Job, cause error) error {
 	return err
 }
 
-// Finish marks a job done without fetching (its organization left the allow-list).
-func (q *Queue) Finish(ctx context.Context, j Job) error {
-	_, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET stage = 2 WHERE org_id = $1::uuid AND trace_id = $2`, j.OrgID, j.TraceID)
+// Finish marks a job done without a successful fetch.
+func (q *Queue) Finish(ctx context.Context, j Job) error { return q.FinishWith(ctx, j, "") }
+
+// FinishWith is Finish that records why the job ended (OutcomeNotAllowed: its organization left the allow-list;
+// OutcomeTooLarge: the trace cannot be pulled).
+func (q *Queue) FinishWith(ctx context.Context, j Job, outcome string) error {
+	_, err := q.db.Exec(ctx, `UPDATE span_pull_queue SET stage = 2, outcome = $3 WHERE org_id = $1::uuid AND trace_id = $2`, j.OrgID, j.TraceID, outcome)
 	return err
 }
 

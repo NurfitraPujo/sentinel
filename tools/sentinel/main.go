@@ -31,7 +31,8 @@
 //
 //	sentinel issues list [--type user_report|system_error] [--claimed true|false] [--project ID] [--waiting true]
 //	sentinel issues get <issueId>
-//	sentinel issues occurrences <issueId> [--limit N] [--before TS]
+//	sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]
+//	sentinel spans pull <traceId|occurrenceId> [--wait] [--timeout 3m]
 //	sentinel claim <issueId>
 //	sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen|lastSeen]
 //	sentinel release <issueId>
@@ -64,7 +65,8 @@
 //
 // Exit codes: 0 ok, 1 network/server error, 2 usage error, 3 auth failure (401/403), 4 not found
 // (404), 5 conflict (409), 6 validation error (400/422). On any non-zero exit the server's error
-// message (when there was a server response) is printed to stderr.
+// message (when there was a server response) is printed to stderr. `spans pull --wait` exits 4 when the pull
+// finishes with no spans and 1 when it times out.
 package main
 
 import (

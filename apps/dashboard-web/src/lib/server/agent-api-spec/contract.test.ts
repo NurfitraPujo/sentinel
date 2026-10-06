@@ -159,6 +159,8 @@ const getLatestAgentOccurrence = vi.fn();
 const listAgentOccurrences = vi.fn();
 const listAgentProjects = vi.fn();
 const listAgentTraceOccurrences = vi.fn();
+const getAgentOccurrencesByIds = vi.fn();
+const getAgentOccurrenceInOrg = vi.fn();
 vi.mock('$lib/db/queries/agent-reads', () => ({
 	getAgentIssueDetail,
 	getAgentReportDetail,
@@ -166,7 +168,26 @@ vi.mock('$lib/db/queries/agent-reads', () => ({
 	listAgentOccurrences,
 	listAgentProjects,
 	listAgentTraceOccurrences,
+	getAgentOccurrencesByIds,
+	getAgentOccurrenceInOrg,
 }));
+
+// sentinel-occurrence-spans: the span guard, the bounded walk and the pull service are mocked; their own tests are
+// span-status.integration.test.ts, issue-spans.test.ts and span-pull.integration.test.ts.
+const getSpansStatuses = vi.fn();
+const getSpansState = vi.fn();
+vi.mock('$lib/server/queries/span-queries', () => ({ getSpansStatuses, getSpansState }));
+const resolveAgentSpanScope = vi.fn();
+vi.mock('$lib/server/span-scope', () => ({ resolveAgentSpanScope }));
+const walkOccurrencesWithSpans = vi.fn();
+vi.mock('$lib/server/issue-spans', () => ({ walkOccurrencesWithSpans }));
+const requestSpanPull = vi.fn();
+class SpanPullError extends Error {
+	constructor(public code: string, message: string, public retryAfterSeconds?: number) {
+		super(message);
+	}
+}
+vi.mock('$lib/server/span-pull', () => ({ requestSpanPull, SpanPullError }));
 
 const listOrgActivity = vi.fn();
 vi.mock('$lib/db/queries/events', () => ({ listOrgActivity }));
@@ -183,6 +204,8 @@ const issuesListRoute = await import('../../../routes/api/agent/issues/+server')
 const issueDetailRoute = await import('../../../routes/api/agent/issues/[issueId]/+server');
 const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId]/occurrences/+server');
 const traceRoute = await import('../../../routes/api/agent/traces/[traceId]/+server');
+const pullRoute = await import('../../../routes/api/agent/traces/[traceId]/pull/+server');
+const occurrenceRoute = await import('../../../routes/api/agent/occurrences/[occurrenceId]/+server');
 const claimRoute = await import('../../../routes/api/agent/issues/[issueId]/claim/+server');
 const claimNextRoute = await import('../../../routes/api/agent/issues/claim-next/+server');
 const selfRoute = await import('../../../routes/api/agent/self/+server');
@@ -217,6 +240,9 @@ beforeEach(() => {
 	resolveAgentIssueScope.mockResolvedValue(ISSUE_SCOPE);
 	sendIssueNotificationEmails.mockResolvedValue(undefined);
 	validateResolvedInVersion.mockImplementation((v: unknown) => v ?? null);
+	resolveAgentSpanScope.mockResolvedValue({ orgId: 'org-1', projects: [{ id: 'project-1' }], environmentScopes: new Map() });
+	getSpansStatuses.mockImplementation(async (ids: Array<string | null>) => new Map(ids.filter(Boolean).map((i) => [i, 'none'])));
+	getSpansState.mockResolvedValue({ status: 'none', reason: 'not_pulled' });
 });
 
 describe('GET /api/agent/issues', () => {
@@ -373,6 +399,8 @@ describe('GET /api/agent/traces/{traceId}', () => {
 		projectName: 'core',
 		issueId: 'issue-1',
 		spanId: 'b'.repeat(16),
+		spansStatus: 'none',
+		hasSpans: false,
 	};
 	// makeEvent only knows `issueId` params; this route's param is `traceId`.
 	const call = (query = '', traceId = TRACE_ID) => {
@@ -382,11 +410,17 @@ describe('GET /api/agent/traces/{traceId}', () => {
 
 	it('200: matches TraceResponseSchema, and scopes by the KEY\'s organization', async () => {
 		authenticateAgentRequest.mockResolvedValue(CTX);
-		listAgentTraceOccurrences.mockResolvedValue({ occurrences: [TRACE_OCCURRENCE], nextCursor: 'abc' });
+		const { spansStatus: _s, hasSpans: _h, ...stored } = TRACE_OCCURRENCE;
+		listAgentTraceOccurrences.mockResolvedValue({ occurrences: [stored], nextCursor: 'abc' });
+		getSpansStatuses.mockResolvedValue(new Map([[TRACE_ID, 'available']]));
+		getSpansState.mockResolvedValue({ status: 'available', reason: null });
 		const res = await call('?limit=5&environment=production');
 		expect(res.status).toBe(200);
 		const body = S.TraceResponseSchema.parse(await res.json());
 		expect(body.nextCursor).toBe('abc');
+		expect(body.spans).toEqual({ status: 'available', reason: null });
+		expect(body.occurrences[0]).toMatchObject({ spansStatus: 'available', hasSpans: true });
+		expect(getSpansState).toHaveBeenCalledWith(TRACE_ID, expect.objectContaining({ orgId: 'org-1' }));
 		expect(listAgentTraceOccurrences).toHaveBeenCalledWith({
 			organizationId: 'org-1',
 			traceId: TRACE_ID,
@@ -399,7 +433,7 @@ describe('GET /api/agent/traces/{traceId}', () => {
 	it('200: omits nextCursor on the last page', async () => {
 		listAgentTraceOccurrences.mockResolvedValue({ occurrences: [] });
 		const res = await call();
-		expect(S.TraceResponseSchema.parse(await res.json())).toEqual({ occurrences: [] });
+		expect(S.TraceResponseSchema.parse(await res.json())).toEqual({ occurrences: [], spans: { status: 'none', reason: 'not_pulled' } });
 	});
 
 	it('the schema is strict: an unlisted occurrence field fails', () => {
@@ -421,6 +455,134 @@ describe('GET /api/agent/traces/{traceId}', () => {
 	it('400: a cursor the query layer rejects', async () => {
 		listAgentTraceOccurrences.mockRejectedValue(new Error('invalid cursor'));
 		await expect(call('?cursor=garbage')).rejects.toMatchObject({ status: 400 });
+	});
+});
+
+describe('GET /api/agent/issues/{issueId}/occurrences spans fields (sentinel-occurrence-spans)', () => {
+	const OCC = (id: string, traceId: string | null) => ({
+		id, environment: 'production', platform: 'go', releaseVersion: null, stacktrace: [], metadata: {}, traceId,
+		createdAt: new Date('2026-09-01T00:00:00Z'), level: 'error', message: 'boom', errorClass: 'Error', logger: null,
+		serverName: null, transaction: null, dist: null, source: null, traceFlags: null, receivedAt: null, sdk: null,
+		user: null, tags: null, contexts: null, request: null, breadcrumbs: null, exception: null,
+	});
+	const T1 = 'a'.repeat(32);
+	const T2 = 'b'.repeat(32);
+
+	it('200: every occurrence carries spansStatus (null without a trace id) and hasSpans', async () => {
+		listAgentOccurrences.mockResolvedValue([OCC('o1', T1), OCC('o2', T2), OCC('o3', null)]);
+		getSpansStatuses.mockResolvedValue(new Map([[T1, 'available'], [T2, 'pending']]));
+		const res = await occurrencesRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/occurrences', { issueId: 'issue-1' }));
+		const body = S.OccurrencesResponseSchema.parse(await res.json());
+		expect(body.occurrences.map((o) => [o.spansStatus, o.hasSpans])).toEqual([['available', true], ['pending', false], [null, false]]);
+		expect(body).not.toHaveProperty('spansScan');
+	});
+
+	it('hasSpans=true: only occurrences with spans, the scan summary and the continuation cursor', async () => {
+		walkOccurrencesWithSpans.mockResolvedValue({
+			ids: ['o1'], traceIds: new Map([['o1', T1]]), scanned: 2000, exhausted: false, continueBefore: new Date('2026-08-01T00:00:00Z'),
+		});
+		getAgentOccurrencesByIds.mockResolvedValue([OCC('o1', T1)]);
+		const res = await occurrencesRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/occurrences?hasSpans=true&limit=5', { issueId: 'issue-1' }));
+		const body = S.OccurrencesResponseSchema.parse(await res.json());
+		expect(body.occurrences).toHaveLength(1);
+		expect(body.occurrences[0]).toMatchObject({ spansStatus: 'available', hasSpans: true });
+		expect(body.spansScan).toEqual({ scanned: 2000, exhausted: false });
+		expect(body.nextBefore).toBe('2026-08-01T00:00:00.000Z');
+		expect(walkOccurrencesWithSpans).toHaveBeenCalledWith(expect.objectContaining({ issueId: 'issue-1', want: 5, before: undefined }));
+		expect(getAgentOccurrencesByIds).toHaveBeenCalledWith('issue-1', ['o1']);
+		expect(listAgentOccurrences).not.toHaveBeenCalled();
+	});
+
+	it('400: hasSpans must be true or false', async () => {
+		await expect(
+			occurrencesRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/occurrences?hasSpans=maybe', { issueId: 'issue-1' }))
+		).rejects.toMatchObject({ status: 400 });
+	});
+
+	it('the schema is strict about the new fields', () => {
+		expect(S.AgentOccurrenceWithSpansSchema.safeParse({ ...OCC('o1', T1), spansStatus: 'available' }).success).toBe(false);
+		expect(S.AgentOccurrenceWithSpansSchema.safeParse({ ...OCC('o1', T1), spansStatus: 'bogus', hasSpans: false }).success).toBe(false);
+	});
+});
+
+describe('GET /api/agent/occurrences/{occurrenceId}', () => {
+	const ID = '11111111-2222-4333-8444-555555555555';
+	const call = (id = ID) => {
+		const u = new URL(`http://localhost/api/agent/occurrences/${id}`);
+		return occurrenceRoute.GET({ params: { occurrenceId: id }, request: new Request(u), url: u } as any);
+	};
+	const OCC = {
+		id: ID, environment: 'production', platform: 'go', releaseVersion: null, stacktrace: [], metadata: {}, traceId: 'a'.repeat(32),
+		createdAt: '2026-09-01T00:00:00.000Z', level: 'error', message: 'boom', errorClass: 'Error', logger: null, serverName: null,
+		transaction: null, dist: null, source: null, traceFlags: null, receivedAt: null, sdk: null, user: null, tags: null,
+		contexts: null, request: null, breadcrumbs: null, exception: null, projectId: 'project-1', projectName: 'core',
+		issueId: 'issue-1', spanId: null,
+	};
+
+	it('200: matches OccurrenceResponseSchema, scoped by the key\'s organization', async () => {
+		getAgentOccurrenceInOrg.mockResolvedValue(OCC);
+		getSpansStatuses.mockResolvedValue(new Map([['a'.repeat(32), 'pending']]));
+		const res = await call();
+		const body = S.OccurrenceResponseSchema.parse(await res.json());
+		expect(body.occurrence).toMatchObject({ id: ID, spansStatus: 'pending', hasSpans: false });
+		expect(getAgentOccurrenceInOrg).toHaveBeenCalledWith('org-1', ID);
+	});
+
+	it('404: malformed id never reaches the query; another organization\'s occurrence is not found', async () => {
+		await expect(call('nope')).rejects.toMatchObject({ status: 404 });
+		expect(getAgentOccurrenceInOrg).not.toHaveBeenCalled();
+		getAgentOccurrenceInOrg.mockResolvedValue(null);
+		await expect(call()).rejects.toMatchObject({ status: 404 });
+	});
+});
+
+describe('POST /api/agent/traces/{traceId}/pull', () => {
+	const TRACE = 'a'.repeat(32);
+	const call = (traceId = TRACE) => {
+		const u = new URL(`http://localhost/api/agent/traces/${traceId}/pull`);
+		return pullRoute.POST({ params: { traceId }, request: new Request(u, { method: 'POST' }), url: u } as any);
+	};
+
+	it('200: matches PullSpansResponseSchema, requests as the agent, and audits an accepted request', async () => {
+		requestSpanPull.mockResolvedValue({ status: 'pending', reason: null, action: 'queued', requestId: 'req-1' });
+		const res = await call();
+		expect(res.status).toBe(200);
+		expect(S.PullSpansResponseSchema.parse(await res.json())).toEqual({ status: 'pending', reason: null, action: 'queued', requestId: 'req-1' });
+		expect(requestSpanPull).toHaveBeenCalledWith(
+			expect.objectContaining({ traceId: TRACE, requester: { kind: 'agent', id: 'agent-1' }, scope: expect.objectContaining({ orgId: 'org-1' }) })
+		);
+		expect(writeAgentAuditLog).toHaveBeenCalledWith(CTX, 'span_pull.request', 'span_pull', 'req-1', { traceId: TRACE, action: 'queued' });
+	});
+
+	it('200 and no audit row when nothing was written (already available / already pending)', async () => {
+		requestSpanPull.mockResolvedValue({ status: 'available', reason: null, action: 'none', requestId: null });
+		const res = await call();
+		expect(S.PullSpansResponseSchema.parse(await res.json()).action).toBe('none');
+		expect(writeAgentAuditLog).not.toHaveBeenCalled();
+	});
+
+	it('404 for a malformed id (no pull), 404 when the service says not found, 403 when not allow-listed', async () => {
+		await expect(call('nope')).rejects.toMatchObject({ status: 404 });
+		expect(requestSpanPull).not.toHaveBeenCalled();
+		requestSpanPull.mockRejectedValueOnce(new SpanPullError('not_found', 'Trace not found'));
+		await expect(call()).rejects.toMatchObject({ status: 404 });
+		requestSpanPull.mockRejectedValueOnce(new SpanPullError('not_allowed', 'Span pull is not enabled for this organization'));
+		await expect(call()).rejects.toMatchObject({ status: 403 });
+	});
+
+	it('429 with Retry-After when the organization is over its hourly limit', async () => {
+		requestSpanPull.mockRejectedValue(new SpanPullError('rate_limited', 'slow down', 120));
+		const res = await call();
+		expect(res.status).toBe(429);
+		expect(res.headers.get('retry-after')).toBe('120');
+		expect(S.MessageErrorSchema.parse(await res.json())).toBeTruthy();
+		expect(writeAgentAuditLog).not.toHaveBeenCalled();
+	});
+
+	it('401 without a valid key: nothing is requested', async () => {
+		authenticateAgentRequest.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }));
+		await expect(call()).rejects.toMatchObject({ status: 401 });
+		expect(requestSpanPull).not.toHaveBeenCalled();
 	});
 });
 

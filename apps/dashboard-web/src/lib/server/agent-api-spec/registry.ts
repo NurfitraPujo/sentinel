@@ -71,7 +71,8 @@ export const agentApiRegistry: RegistryEntry[] = [
 		method: 'get',
 		routeFile: 'src/routes/api/agent/issues/[issueId]/occurrences/+server.ts',
 		operationId: 'listIssueOccurrences',
-		summary: 'Newest-first page of occurrences (system_error issues)',
+		summary:
+			'Newest-first page of occurrences (system_error issues), each with spansStatus/hasSpans; hasSpans=true keeps only occurrences with spans (a walk bounded to the newest 2,000 occurrences; before=<nextBefore> continues it)',
 		request: { querySchema: S.OccurrencesQuerySchema },
 		responses: {
 			'200': S.OccurrencesResponseSchema,
@@ -91,6 +92,34 @@ export const agentApiRegistry: RegistryEntry[] = [
 		responses: {
 			'200': S.TraceResponseSchema,
 			'400': S.MessageErrorSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/traces/{traceId}/pull',
+		method: 'post',
+		routeFile: 'src/routes/api/agent/traces/[traceId]/pull/+server.ts',
+		operationId: 'pullTraceSpans',
+		summary:
+			"Pull a trace's spans from the trace store NOW (idempotent; no body). Only for organizations allow-listed for span pull (403 otherwise), at most SPAN_PULL_ON_DEMAND_LIMIT (default 30) accepted requests per organization per hour (429 + Retry-After). Returns the trace's spans state; poll GET /api/agent/traces/{traceId} (`spans`) until it is `available`, or `none` with a reason",
+		responses: {
+			'200': S.PullSpansResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'403': S.MessageErrorSchema,
+			'404': S.MessageErrorSchema,
+			'429': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/occurrences/{occurrenceId}',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/occurrences/[occurrenceId]/+server.ts',
+		operationId: 'getOccurrence',
+		summary:
+			"One occurrence of the calling key's organization, with its trace id and spans status (404 for a malformed id or one of another organization)",
+		responses: {
+			'200': S.OccurrenceResponseSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
 		},

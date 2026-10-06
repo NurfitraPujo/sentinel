@@ -3,7 +3,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // N1c (agent read endpoints). GET /api/agent/issues/[issueId]/occurrences -- paging + clamp.
 
 const listAgentOccurrences = vi.fn();
-vi.mock('$lib/db/queries/agent-reads', () => ({ listAgentOccurrences }));
+const getAgentOccurrencesByIds = vi.fn();
+vi.mock('$lib/db/queries/agent-reads', () => ({ listAgentOccurrences, getAgentOccurrencesByIds }));
+
+// sentinel-occurrence-spans: the span guard and the walk have their own tests.
+const getSpansStatuses = vi.fn();
+vi.mock('$lib/server/queries/span-queries', () => ({ getSpansStatuses }));
+vi.mock('$lib/server/span-scope', () => ({
+	resolveAgentSpanScope: async (orgId: string) => ({ orgId, projects: [], environmentScopes: new Map() }),
+}));
+const walkOccurrencesWithSpans = vi.fn();
+vi.mock('$lib/server/issue-spans', () => ({ walkOccurrencesWithSpans }));
 
 const authenticateAgentRequest = vi.fn();
 const resolveAgentIssueScope = vi.fn();
@@ -42,6 +52,7 @@ beforeEach(() => {
 		waitingOn: null,
 	});
 	listAgentOccurrences.mockResolvedValue([]);
+	getSpansStatuses.mockResolvedValue(new Map());
 });
 
 describe('GET /api/agent/issues/[issueId]/occurrences', () => {
@@ -84,6 +95,28 @@ describe('GET /api/agent/issues/[issueId]/occurrences', () => {
 		const res = await GET(makeEvent());
 		expect(res.status).toBe(200);
 		const body = await res.json();
-		expect(body.occurrences).toEqual([{ id: 'occ-1' }, { id: 'occ-2' }]);
+		expect(body.occurrences).toEqual([
+			{ id: 'occ-1', spansStatus: null, hasSpans: false },
+			{ id: 'occ-2', spansStatus: null, hasSpans: false },
+		]);
+	});
+
+	// sentinel-occurrence-spans TASK-01: the filter is the helper's walk, scoped by the key's organization.
+	it('hasSpans=true walks with the KEY\'s organization and the page size, and pages with before', async () => {
+		walkOccurrencesWithSpans.mockResolvedValue({ ids: [], traceIds: new Map(), scanned: 12, exhausted: true, continueBefore: null });
+		getAgentOccurrencesByIds.mockResolvedValue([]);
+		const res = await GET(makeEvent('?hasSpans=true&limit=7&before=2026-01-01T00:00:00.000Z'));
+		const body = await res.json();
+		expect(walkOccurrencesWithSpans).toHaveBeenCalledWith(
+			expect.objectContaining({ issueId: 'issue-1', want: 7, before: new Date('2026-01-01T00:00:00.000Z'), scope: expect.objectContaining({ orgId: 'org-1' }) })
+		);
+		expect(body).toEqual({ occurrences: [], spansScan: { scanned: 12, exhausted: true } });
+		expect(listAgentOccurrences).not.toHaveBeenCalled();
+	});
+
+	it('hasSpans=false is the plain list', async () => {
+		await GET(makeEvent('?hasSpans=false'));
+		expect(walkOccurrencesWithSpans).not.toHaveBeenCalled();
+		expect(listAgentOccurrences).toHaveBeenCalled();
 	});
 });

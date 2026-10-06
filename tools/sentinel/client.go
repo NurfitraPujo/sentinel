@@ -62,8 +62,9 @@ func NewClient(baseURL, key string) *Client {
 // Result is what every Client method returns: the raw HTTP status and body. Commands decide how
 // to interpret/print it; Client never does.
 type Result struct {
-	Status int
-	Body   json.RawMessage
+	Status     int
+	Body       json.RawMessage
+	RetryAfter string // the Retry-After response header, when the server sent one (429)
 }
 
 // errorMessage attempts to pull a human-readable message out of a non-2xx JSON error body. The
@@ -127,7 +128,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	return &Result{Status: resp.StatusCode, Body: data}, nil
+	return &Result{Status: resp.StatusCode, Body: data, RetryAfter: resp.Header.Get("Retry-After")}, nil
 }
 
 // UploadFile performs a multipart/form-data POST with the given file under form field "file"

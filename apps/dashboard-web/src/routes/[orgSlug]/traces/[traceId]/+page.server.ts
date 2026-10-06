@@ -14,7 +14,8 @@ import {
 	traceRowColumns,
 	type TraceScope,
 } from '$lib/server/queries/trace-queries';
-import { listTraceSpans } from '$lib/server/queries/span-queries';
+import { getSpansState, listTraceSpans } from '$lib/server/queries/span-queries';
+import { canReachSpanPullCore } from '$lib/server/span-pull';
 import { SPAN_RETENTION_DAYS } from '$lib/spans/waterfall';
 
 // sentinel-cross-repo-trace-view TASK-01 (contract D1–D4). Lives under `[orgSlug]` so `orgHandle`'s
@@ -82,6 +83,15 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		listTraceSpans(traceId, { orgId: currentOrg.id, projects: accessible, environmentScopes }),
 	]);
 	const { rows, nextCursor } = page;
+	// sentinel-occurrence-spans TASK-01/02: a trace with no visible spans says WHY (never pulled / pending / not found in the
+	// trace store ...) instead of an empty waterfall, and offers the pull. Only for a trace with a visible error (D2: the empty
+	// page must not vary by cause, and the state of a trace the viewer cannot see is not theirs to learn).
+	const spansState =
+		traceSpans.spans.length > 0
+			? { status: 'available' as const, reason: null }
+			: rows.length > 0
+				? await getSpansState(traceId, { orgId: currentOrg.id, projects: accessible, environmentScopes })
+				: { status: 'none' as const, reason: null };
 
 	return {
 		orgSlug: currentOrg.slug,
@@ -94,6 +104,9 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		// The true distinct count: `projects` is capped at 50 names.
 		projectCount,
 		retentionDays: getRetentionDays(),
+		organizationId: currentOrg.id,
+		spansState,
+		spanPullEnabled: canReachSpanPullCore({ orgId: currentOrg.id, projects: accessible, environmentScopes }),
 		spans: traceSpans.spans,
 		spansTruncated: traceSpans.truncated,
 		spanRetentionDays: SPAN_RETENTION_DAYS,

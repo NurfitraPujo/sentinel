@@ -1175,7 +1175,7 @@ paths:
   /api/agent/issues/{issueId}/occurrences:
     get:
       operationId: listIssueOccurrences
-      summary: Newest-first page of occurrences (system_error issues)
+      summary: Newest-first page of occurrences (system_error issues), each with spansStatus/hasSpans; hasSpans=true keeps only occurrences with spans (a walk bounded to the newest 2,000 occurrences; before=<nextBefore> continues it)
       parameters:
         - name: issueId
           in: path
@@ -1197,6 +1197,14 @@ paths:
               - type: string
                 format: date-time
               - type: string
+        - name: hasSpans
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
       responses:
         "200":
           description: OK
@@ -1391,6 +1399,16 @@ paths:
                           required:
                             - values
                           additionalProperties: true
+                        spansStatus:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - available
+                            - pending
+                            - none
+                        hasSpans:
+                          type: boolean
                       required:
                         - id
                         - environment
@@ -1417,7 +1435,22 @@ paths:
                         - request
                         - breadcrumbs
                         - exception
+                        - spansStatus
+                        - hasSpans
                       additionalProperties: false
+                  spansScan:
+                    type: object
+                    properties:
+                      scanned:
+                        type: integer
+                      exhausted:
+                        type: boolean
+                    required:
+                      - scanned
+                      - exhausted
+                    additionalProperties: false
+                  nextBefore:
+                    type: string
                 required:
                   - occurrences
                 additionalProperties: false
@@ -1683,6 +1716,16 @@ paths:
                           type:
                             - string
                             - "null"
+                        spansStatus:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - available
+                            - pending
+                            - none
+                        hasSpans:
+                          type: boolean
                       required:
                         - id
                         - environment
@@ -1713,11 +1756,38 @@ paths:
                         - projectName
                         - issueId
                         - spanId
+                        - spansStatus
+                        - hasSpans
                       additionalProperties: false
                   nextCursor:
                     type: string
+                  spans:
+                    type: object
+                    properties:
+                      status:
+                        type: string
+                        enum:
+                          - available
+                          - pending
+                          - none
+                      reason:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - not_pulled
+                          - not_found
+                          - too_large
+                          - failed
+                          - not_allowed
+                          - not_visible
+                    required:
+                      - status
+                      - reason
+                    additionalProperties: false
                 required:
                   - occurrences
+                  - spans
                 additionalProperties: false
         "400":
           description: Bad request
@@ -1730,6 +1800,377 @@ paths:
                     type: string
                 required:
                   - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/traces/{traceId}/pull:
+    post:
+      operationId: pullTraceSpans
+      summary: Pull a trace's spans from the trace store NOW (idempotent; no body). Only for organizations allow-listed for span pull (403 otherwise), at most SPAN_PULL_ON_DEMAND_LIMIT (default 30) accepted requests per organization per hour (429 + Retry-After). Returns the trace's spans state; poll GET /api/agent/traces/{traceId} (`spans`) until it is `available`, or `none` with a reason
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - available
+                      - pending
+                      - none
+                  reason:
+                    type:
+                      - string
+                      - "null"
+                    enum:
+                      - not_pulled
+                      - not_found
+                      - too_large
+                      - failed
+                      - not_allowed
+                      - not_visible
+                  action:
+                    type: string
+                    enum:
+                      - none
+                      - queued
+                      - pulled_forward
+                      - rearmed
+                      - already_pending
+                  requestId:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - status
+                  - reason
+                  - action
+                  - requestId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "429":
+          description: "429"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/occurrences/{occurrenceId}:
+    get:
+      operationId: getOccurrence
+      summary: One occurrence of the calling key's organization, with its trace id and spans status (404 for a malformed id or one of another organization)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  occurrence:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      environment:
+                        type: string
+                      platform:
+                        type: string
+                      releaseVersion:
+                        type:
+                          - string
+                          - "null"
+                      stacktrace: {}
+                      metadata: {}
+                      traceId:
+                        type:
+                          - string
+                          - "null"
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
+                      projectId:
+                        type: string
+                      projectName:
+                        type: string
+                      issueId:
+                        type: string
+                      spanId:
+                        type:
+                          - string
+                          - "null"
+                      spansStatus:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - available
+                          - pending
+                          - none
+                      hasSpans:
+                        type: boolean
+                    required:
+                      - id
+                      - environment
+                      - platform
+                      - releaseVersion
+                      - stacktrace
+                      - metadata
+                      - traceId
+                      - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
+                      - projectId
+                      - projectName
+                      - issueId
+                      - spanId
+                      - spansStatus
+                      - hasSpans
+                    additionalProperties: false
+                required:
+                  - occurrence
                 additionalProperties: false
         "401":
           description: Unauthorized

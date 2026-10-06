@@ -1083,6 +1083,8 @@ export async function maintainSpans(
 		const reaped = await exec.execute<{ n: number }>(
 			sql`WITH d AS (DELETE FROM span_pull_queue WHERE created_at < ${cutoff.toISOString()}::timestamptz RETURNING 1) SELECT count(*)::int AS n FROM d`
 		);
+		// sentinel-occurrence-spans TASK-02: the on-demand request ledger (audit + rate limit) ages out with the same window.
+		await exec.execute(sql`DELETE FROM span_pull_requests WHERE requested_at < ${cutoff.toISOString()}::timestamptz`);
 		return {
 			createdPartitions: Number(created[0]?.n ?? 0),
 			droppedPartitions: Number(dropped[0]?.n ?? 0),

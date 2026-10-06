@@ -1061,6 +1061,25 @@ export const spanPullQueue = pgTable('span_pull_queue', {
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 	lastError: text('last_error').notNull().default(''),
 	triggerProjectId: uuid('trigger_project_id'),
+	// sentinel-occurrence-spans TASK-02 (1725800000_add_span_pull_on_demand.sql): the last (re)arm came from a person or
+	// agent, who, when, and what the worker's last fetch ended in ('' | stored | not_found | too_large | not_allowed | gave_up).
+	onDemand: boolean('on_demand').notNull().default(false),
+	requestedBy: text('requested_by').notNull().default(''),
+	requestedByKind: text('requested_by_kind').notNull().default(''),
+	requestedAt: timestamp('requested_at', { withTimezone: true }),
+	outcome: text('outcome').notNull().default(''),
 }, (table) => ({
 	pk: primaryKey({ columns: [table.orgId, table.traceId] }),
 }));
+
+// sentinel-occurrence-spans TASK-02: one row per ACCEPTED on-demand pull request — the audit trail (who asked for which
+// trace, when) and the per-organization rate-limit ledger (count of the last hour, under an advisory lock).
+export const spanPullRequests = pgTable('span_pull_requests', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	orgId: uuid('org_id').notNull(),
+	traceId: text('trace_id').notNull(),
+	action: text('action').notNull(),
+	requestedBy: text('requested_by').notNull(),
+	requestedByKind: text('requested_by_kind').notNull(),
+	requestedAt: timestamp('requested_at', { withTimezone: true }).notNull().defaultNow(),
+});

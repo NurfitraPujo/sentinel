@@ -133,6 +133,16 @@ spec:
               value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRequest | quote }}
             - name: SOURCEMAP_MAX_FILES_PER_RELEASE
               value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRelease | quote }}
+            # sentinel-occurrence-spans TASK-02: the "Pull spans" button and POST /api/agent/traces/{id}/pull. The dashboard needs
+            # the SAME allow-list the processor reads (values.yaml `spans.pull`), and only when the processor can actually fetch:
+            # without scopes AND a trace store the variable is not rendered, so no button is offered for pulls that could never
+            # run. The processor's worker re-checks the allow-list at fetch time and stays the backstop.
+            {{- if and .Values.spans.pull.scopes .Values.spans.pull.storeKind .Values.spans.pull.storeUrl }}
+            - name: SPAN_PULL_SCOPES
+              value: {{ .Values.spans.pull.scopes | quote }}
+            {{- end }}
+            - name: SPAN_PULL_ON_DEMAND_LIMIT
+              value: {{ .Values.spans.pull.onDemandLimitPerHour | quote }}
           livenessProbe:
             httpGet: { path: {{ .Values.dashboard.livenessPath }}, port: http }
             initialDelaySeconds: 15

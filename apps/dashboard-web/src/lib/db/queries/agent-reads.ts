@@ -7,7 +7,7 @@ import {
 	externalIssueReports,
 	externalReporters,
 } from '$lib/db/schema';
-import { and, desc, eq, lt } from 'drizzle-orm';
+import { and, desc, eq, inArray, lt } from 'drizzle-orm';
 import {
 	createdAtIso,
 	decodeTraceCursor,
@@ -248,6 +248,16 @@ export async function listAgentOccurrences(options: ListAgentOccurrencesOptions)
 	return rows;
 }
 
+/** sentinel-occurrence-spans: specific occurrences of ONE issue (`issueId` is the guard), newest first. */
+export async function getAgentOccurrencesByIds(issueId: string, ids: string[]): Promise<AgentOccurrence[]> {
+	if (ids.length === 0) return [];
+	return await db
+		.select(agentOccurrenceColumns)
+		.from(errorOccurrences)
+		.where(and(eq(errorOccurrences.issueId, issueId), inArray(errorOccurrences.id, ids)))
+		.orderBy(desc(errorOccurrences.createdAt));
+}
+
 /**
  * sentinel-cross-repo-trace-view D6 -- `GET /api/agent/traces/{traceId}`. The occurrence shape plus
  * the four fields that let an agent follow a trace ACROSS projects (`projectId`, `projectName`,
@@ -307,6 +317,28 @@ export async function listAgentTraceOccurrences(options: {
 	});
 
 	return { occurrences: rows as unknown as AgentTraceOccurrence[], nextCursor };
+}
+
+/**
+ * sentinel-occurrence-spans: ONE occurrence of the key's organization, in the trace-occurrence shape (so the CLI can go from
+ * an occurrence id to its trace). `organizationId` comes from `AgentAuthContext` (B7); an occurrence of another organization
+ * is simply not found.
+ */
+export async function getAgentOccurrenceInOrg(organizationId: string, occurrenceId: string): Promise<AgentTraceOccurrence | null> {
+	const [row] = await db
+		.select({
+			...agentOccurrenceColumns,
+			createdAt: createdAtIso,
+			issueId: errorOccurrences.issueId,
+			projectId: issues.projectId,
+			projectName: projects.name,
+			spanId: errorOccurrences.spanId,
+		})
+		.from(errorOccurrences)
+		.innerJoin(issues, eq(issues.id, errorOccurrences.issueId))
+		.innerJoin(projects, eq(projects.id, issues.projectId))
+		.where(and(eq(errorOccurrences.id, occurrenceId), eq(projects.organizationId, organizationId)));
+	return (row as unknown as AgentTraceOccurrence | undefined) ?? null;
 }
 
 export interface AgentProjectRepo {

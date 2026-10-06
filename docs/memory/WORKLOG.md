@@ -5,6 +5,32 @@ This is not a changelog. Do not record routine releases, version bumps, or imple
 
 ---
 
+### 2026-10-06 - Occurrence spans: show which traces have spans; pull one on demand
+
+- **Why durable**: since the per-issue pull throttle (1725700000) only ~3-4% of traced occurrences ever have spans, so most
+  trace links opened an empty waterfall. The issue page now badges each occurrence (spans / spans pending / no spans), links
+  the issue to its latest occurrence WITH spans, and offers "with spans only" (`?spans=1`); the trace page says why a trace
+  has none. Anyone can then pull ONE trace now: dashboard button -> `POST /api/spans/pull`, agent -> `POST
+  /api/agent/traces/{id}/pull`, CLI `sentinel spans pull`. Migration 1725800000 adds `span_pull_queue.{on_demand,requested_by,
+  requested_by_kind,requested_at,outcome}` and the `span_pull_requests` ledger.
+- **Future mistakes prevented**:
+  - "Has spans" is ONE guard: `span-queries.ts` `spanVisibility`, shared by the waterfall and `getSpansStatuses` (a single
+    correlated EXISTS per trace, one statement per page). Do not write a second spelling of it; a badge that advertises a span the
+    waterfall hides is a tenancy leak.
+  - "Occurrences with spans" is a BOUNDED WALK (`issue-spans.ts`: newest 2,000 occurrences off `(issue_id, created_at DESC)`,
+    statuses 200 at a time), never a join with the 9 GB `spans` table. Anything older is not found and the UI/API say so
+    (`spansScan`, `nextBefore`).
+  - An on-demand row starts at stage 1 (ONE fetch, due at max(now, first error + 2 min)): the automatic path's second fetch at +10 min
+    exists for traces still being written, and would leave the button `pending` for ten minutes. It never touches
+    `span_pull_issue_window`. Existing rows: pending+unclaimed (`attempts = 0`) is pulled forward, in flight is left alone, stage 2
+    with no visible spans is re-armed. The hourly limit (`SPAN_PULL_ON_DEMAND_LIMIT`, default 30/org) counts only requests that wrote
+    a queue row, under `pg_advisory_xact_lock`, and a refused request is rolled back by THROWING (a `return` inside the transaction
+    would commit it - D18).
+  - The worker records `outcome` (stored / not_found / too_large / not_allowed / gave_up) so "finished with nothing" is
+    distinguishable from "not pulled yet"; `sentinel_span_pull_fetches_total` gained `trigger=auto|on_demand`.
+  - The dashboard reads the same `SPAN_PULL_SCOPES` as the processor (helm renders it only when scopes, storeKind and storeUrl are
+    all set); the worker's allow-list re-check stays the backstop.
+
 ### 2026-10-02 - Span ingest: mobile transactions + pulled core traces feed a trace waterfall
 
 - **Why durable**: spans (14-day retention) live in a DAY-PARTITIONED `spans` table; retention is a

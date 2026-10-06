@@ -112,7 +112,8 @@ group- or world-readable.
 |---|---|---|
 | `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true]` | `GET /api/agent/issues` | |
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` | full detail: issue, report, latest occurrence, relations |
-| `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` | newest-first page |
+| `sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]` | `GET /api/agent/issues/:id/occurrences` | newest-first page; rows carry `spansStatus`; `--with-spans` sends `hasSpans=true` |
+| `sentinel spans pull <traceId\|occurrenceId> [--wait] [--timeout 3m]` | `POST /api/agent/traces/:id/pull` | pull a trace's spans now; `--wait` polls to available (exit 0) / finished with none (exit 4) / timeout (exit 1) |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` | 409 on conflict |
 | `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen\|lastSeen]` | `POST /api/agent/issues/claim-next` | atomically picks + claims the next unclaimed unresolved issue and prints its full detail (same shape as `issues get`); exit 4 when the queue is empty, never 409 |
 | `sentinel release <issueId>` | `DELETE /api/agent/issues/:id/claim` | releases only YOUR OWN claim |

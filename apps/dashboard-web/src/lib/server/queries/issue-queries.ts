@@ -366,6 +366,39 @@ export const issueQueries = {
     },
 
     /**
+     * sentinel-occurrence-spans TASK-01: the (id, trace id) of an issue's NEWEST `bound` occurrences, newest first, from
+     * `offset`; `traceId` is null for an occurrence recorded without one. The bound is on rows VISITED (the LIMIT is the whole
+     * query), so an issue whose occurrences mostly carry no trace still costs `bound` index entries, and fewer than `bound`
+     * rows back means the issue has nothing older. It walks `(issue_id, created_at DESC)` and reads two narrow columns,
+     * never the JSONB bodies.
+     */
+    async scanOccurrenceTraces(
+        issueId: string,
+        bound: number,
+        opts: { offset?: number; before?: Date } = {}
+    ): Promise<Array<{ id: string; traceId: string | null; createdAt: Date | null }>> {
+        const conditions = [eq(errorOccurrences.issueId, issueId)];
+        if (opts.before) conditions.push(sql`${errorOccurrences.createdAt} < ${opts.before.toISOString()}::timestamptz`);
+        return await db
+            .select({ id: errorOccurrences.id, traceId: errorOccurrences.traceId, createdAt: errorOccurrences.createdAt })
+            .from(errorOccurrences)
+            .where(and(...conditions))
+            .orderBy(desc(errorOccurrences.createdAt))
+            .limit(bound)
+            .offset(opts.offset ?? 0);
+    },
+
+    /** The list columns of specific occurrences OF THIS ISSUE, newest first (the "with spans only" list). */
+    async getOccurrencesByIds(issueId: string, ids: string[]) {
+        if (ids.length === 0) return [];
+        return await db
+            .select(issuePageOccurrenceColumns)
+            .from(errorOccurrences)
+            .where(and(eq(errorOccurrences.issueId, issueId), inArray(errorOccurrences.id, ids)))
+            .orderBy(desc(errorOccurrences.createdAt));
+    },
+
+    /**
      * sentinel-occurrence-detail-panels §3.1: the selected occurrence's whole renderable row, or null.
      * BOTH predicates are required: the issueId one is what stops an occurrence id from being read
      * through another issue's page.

@@ -3,12 +3,16 @@ import type { RequestEvent } from '@sveltejs/kit';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
 import { listAgentTraceOccurrences } from '$lib/db/queries/agent-reads';
 import { parseTraceId } from '$lib/server/queries/trace-queries';
+import { getSpansState } from '$lib/server/queries/span-queries';
+import { annotateSpans } from '$lib/server/agent-spans';
+import { resolveAgentSpanScope } from '$lib/server/span-scope';
 
 // sentinel-cross-repo-trace-view TASK-03 (contract D6). GET /api/agent/traces/{traceId}
 // ?limit=&cursor=&environment= -- oldest-first page of every occurrence sharing the trace id across
 // the KEY'S ORGANIZATION (agent reads are org-scoped by design, not environment-scoped). `limit`
 // is [1, 200] (default 50); `cursor` is the opaque `nextCursor` of a previous page; `environment`
-// is a filter. A malformed trace id is a 404 without a query (D1); an unseen, foreign or hidden one is a
+// is a filter. sentinel-occurrence-spans: `spans` is the trace's spans state ({status, reason}) and every occurrence carries
+// `spansStatus`/`hasSpans`; this is also the status poll of POST /api/agent/traces/{traceId}/pull. A malformed trace id is a 404 without a query (D1); an unseen, foreign or hidden one is a
 // 200 with an empty list, so the three are indistinguishable. Read-only, so unaudited like the other agent reads.
 export const GET = async (event: RequestEvent): Promise<Response> => {
 	const ctx = await authenticateAgentRequest(event.request);
@@ -39,7 +43,9 @@ export const GET = async (event: RequestEvent): Promise<Response> => {
 			limit,
 			cursor,
 		});
-		return json(nextCursor ? { occurrences, nextCursor } : { occurrences });
+		const scope = await resolveAgentSpanScope(ctx.organizationId);
+		const spans = await getSpansState(traceId, scope);
+		return json({ occurrences: await annotateSpans(occurrences, scope), ...(nextCursor ? { nextCursor } : {}), spans });
 	} catch (err) {
 		if (err instanceof Error && err.message === 'invalid cursor') {
 			throw error(400, 'cursor is invalid');

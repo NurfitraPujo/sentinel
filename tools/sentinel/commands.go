@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 )
 
 // env is everything a command needs to run: the resolved client, output format, and the streams
@@ -47,6 +49,7 @@ var commands = map[string]cmdFunc{
 	"batch":      cmdBatch,
 	"upload":     cmdUpload,
 	"key":        cmdKey,
+	"spans":      cmdSpans,
 }
 
 // reorderArgs moves every "-flag value" (or "-flag=value", or a bare boolean "-flag") pair to the
@@ -93,6 +96,16 @@ func (e *env) respond(res *Result, listKey string) int {
 	}
 	fmt.Fprintf(e.stderr, "error: server returned %d: %s\n", res.Status, errorMessage(res.Body))
 	return code
+}
+
+// httpFailure prints a non-2xx Result like respond does (plus Retry-After when the server sent one) and returns its exit code.
+func (e *env) httpFailure(res *Result) int {
+	msg := errorMessage(res.Body)
+	if res.RetryAfter != "" {
+		msg += " (retry after " + res.RetryAfter + "s)"
+	}
+	fmt.Fprintf(e.stderr, "error: server returned %d: %s\n", res.Status, msg)
+	return exitCodeForStatus(res.Status)
 }
 
 func (e *env) networkErr(err error) int {
@@ -187,15 +200,15 @@ func cmdIssuesGet(ctx context.Context, e *env, args []string) int {
 func cmdIssuesOccurrences(ctx context.Context, e *env, args []string) int {
 	fs := flag.NewFlagSet("issues occurrences", flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
-	args = reorderArgs(args, nil)
 	limit := fs.String("limit", "", "max rows (server clamps to [1,50], default 20)")
 	before := fs.String("before", "", "ISO timestamp cursor: only occurrences before this time")
-	if err := fs.Parse(args); err != nil {
+	withSpans := fs.Bool("with-spans", false, "only occurrences whose trace has spans (bounded to the issue's newest 2,000 occurrences)")
+	if err := fs.Parse(reorderArgs(args, map[string]bool{"with-spans": true})); err != nil {
 		return ExitUsage
 	}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		return usageErr(e, "usage: sentinel issues occurrences <issueId> [--limit N] [--before TS]")
+		return usageErr(e, "usage: sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]")
 	}
 
 	q := url.Values{}
@@ -205,12 +218,25 @@ func cmdIssuesOccurrences(ctx context.Context, e *env, args []string) int {
 	if *before != "" {
 		q.Set("before", *before)
 	}
+	if *withSpans {
+		q.Set("hasSpans", "true")
+	}
 
 	res, err := e.client.Do(ctx, "GET", "/api/agent/issues/"+url.PathEscape(rest[0])+"/occurrences", q, nil)
 	if err != nil {
 		return e.networkErr(err)
 	}
-	return e.respond(res, "occurrences")
+	code := e.respond(res, "occurrences")
+	if code == ExitOK && *withSpans {
+		// The walk is bounded, so say where to continue (the table format drops non-list fields).
+		var parsed struct {
+			NextBefore string `json:"nextBefore"`
+		}
+		if json.Unmarshal(res.Body, &parsed) == nil && parsed.NextBefore != "" {
+			fmt.Fprintf(e.stderr, "more occurrences with spans may exist: rerun with --before %s\n", parsed.NextBefore)
+		}
+	}
+	return code
 }
 
 // --- claim / release ----------------------------------------------------------------------------
@@ -1136,4 +1162,138 @@ func (s *stringList) String() string {
 func (s *stringList) Set(v string) error {
 	*s = append(*s, v)
 	return nil
+}
+
+// --- spans ----------------------------------------------------------------------------------------
+
+// spansPollInterval is how often `spans pull --wait` re-reads the trace's spans state (a var so tests can shrink it).
+var spansPollInterval = 5 * time.Second
+
+var (
+	traceIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	uuidRe    = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
+
+// cmdSpans dispatches `spans pull`.
+func cmdSpans(ctx context.Context, e *env, args []string) int {
+	if len(args) == 0 || args[0] != "pull" {
+		return usageErr(e, "usage: sentinel spans pull <traceId|occurrenceId> [--wait] [--timeout 3m]")
+	}
+	return cmdSpansPull(ctx, e, args[1:])
+}
+
+type spansState struct {
+	Status string  `json:"status"`
+	Reason *string `json:"reason"`
+}
+
+func (s spansState) String() string {
+	if s.Reason != nil && *s.Reason != "" {
+		return s.Status + " (" + *s.Reason + ")"
+	}
+	return s.Status
+}
+
+// cmdSpansPull asks the server to pull a trace's spans from the trace store now (POST /api/agent/traces/{id}/pull). The
+// argument is a 32-hex trace id, or an occurrence UUID resolved through GET /api/agent/occurrences/{id}.
+//
+// Exit codes (the CLI's table): 0 when the spans are available -- or, without --wait, when the pull is queued/pending;
+// 4 (not found) when --wait sees the pull finish with no spans (`none`: not found in the trace store, too large, ...) or
+// the server answers 404; 3 for 403/401 (organization not allow-listed, bad key); 1 for a --wait timeout and for 429
+// (rate limited; Retry-After is printed); 2 usage.
+func cmdSpansPull(ctx context.Context, e *env, args []string) int {
+	fs := flag.NewFlagSet("spans pull", flag.ContinueOnError)
+	fs.SetOutput(e.stderr)
+	wait := fs.Bool("wait", false, "poll until the spans are available, the pull finishes with none, or --timeout")
+	timeout := fs.Duration("timeout", 3*time.Minute, "how long --wait polls")
+	if err := fs.Parse(reorderArgs(args, map[string]bool{"wait": true})); err != nil {
+		return ExitUsage
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return usageErr(e, "usage: sentinel spans pull <traceId|occurrenceId> [--wait] [--timeout 3m]")
+	}
+
+	arg := strings.ToLower(rest[0])
+	traceID := arg
+	switch {
+	case traceIDRe.MatchString(arg):
+	case uuidRe.MatchString(arg):
+		res, err := e.client.Do(ctx, "GET", "/api/agent/occurrences/"+arg, nil, nil)
+		if err != nil {
+			return e.networkErr(err)
+		}
+		if exitCodeForStatus(res.Status) != ExitOK {
+			return e.httpFailure(res)
+		}
+		var parsed struct {
+			Occurrence struct {
+				TraceID *string `json:"traceId"`
+			} `json:"occurrence"`
+		}
+		if err := json.Unmarshal(res.Body, &parsed); err != nil {
+			fmt.Fprintln(e.stderr, "error decoding occurrence response:", err)
+			return ExitNetwork
+		}
+		if parsed.Occurrence.TraceID == nil || !traceIDRe.MatchString(*parsed.Occurrence.TraceID) {
+			fmt.Fprintf(e.stderr, "error: occurrence %s has no canonical trace id, so it has no spans to pull\n", arg)
+			return ExitValidation
+		}
+		traceID = *parsed.Occurrence.TraceID
+	default:
+		return usageErr(e, "%q is neither a 32-hex trace id nor an occurrence UUID", rest[0])
+	}
+
+	res, err := e.client.Do(ctx, "POST", "/api/agent/traces/"+traceID+"/pull", nil, nil)
+	if err != nil {
+		return e.networkErr(err)
+	}
+	if exitCodeForStatus(res.Status) != ExitOK {
+		return e.httpFailure(res)
+	}
+	if !*wait {
+		return e.respond(res, "")
+	}
+
+	var state spansState
+	if err := json.Unmarshal(res.Body, &state); err != nil {
+		fmt.Fprintln(e.stderr, "error decoding pull response:", err)
+		return ExitNetwork
+	}
+	deadline := time.Now().Add(*timeout)
+	for {
+		switch state.Status {
+		case "available":
+			fmt.Fprintf(e.stdout, "spans available for trace %s\n", traceID)
+			return ExitOK
+		case "none":
+			fmt.Fprintf(e.stderr, "error: no spans for trace %s: %s\n", traceID, state)
+			return ExitNotFound
+		}
+		if !time.Now().Add(spansPollInterval).Before(deadline) {
+			fmt.Fprintf(e.stderr, "error: timed out after %s waiting for the spans of trace %s (still %s)\n", *timeout, traceID, state.Status)
+			return ExitNetwork
+		}
+		select {
+		case <-ctx.Done():
+			return e.networkErr(ctx.Err())
+		case <-time.After(spansPollInterval):
+		}
+		q := url.Values{"limit": {"1"}}
+		pr, err := e.client.Do(ctx, "GET", "/api/agent/traces/"+traceID, q, nil)
+		if err != nil {
+			return e.networkErr(err)
+		}
+		if exitCodeForStatus(pr.Status) != ExitOK {
+			return e.httpFailure(pr)
+		}
+		var polled struct {
+			Spans spansState `json:"spans"`
+		}
+		if err := json.Unmarshal(pr.Body, &polled); err != nil {
+			fmt.Fprintln(e.stderr, "error decoding trace response:", err)
+			return ExitNetwork
+		}
+		state = polled.Spans
+	}
 }

@@ -666,6 +666,12 @@ dependencies:
 #            a noisy error whose every occurrence carries its own trace queues one pull, not one per occurrence
 #            (2026-10-06: 1,806 pulls, 1.34M spans in one hour from one issue). "0" turns the throttle off; a
 #            negative or malformed value stops the processor at start.
+#            onDemandLimitPerHour (SPAN_PULL_ON_DEMAND_LIMIT on the DASHBOARD): the "Pull spans" button and POST
+#            /api/agent/traces/{id}/pull queue ONE immediate fetch of one trace (never touching the per-issue window above).
+#            This is the most accepted on-demand requests per organization per rolling hour, counted in the database
+#            (span_pull_requests) so it holds across dashboard replicas; over it the API answers 429 with Retry-After.
+#            The dashboard also gets SPAN_PULL_SCOPES (the allow-list above) but only when scopes, storeKind and storeUrl are
+#            ALL set; otherwise no button is offered. A request for an organization outside the list is refused (403).
 # -----------------------------------------------------------------------------
 spans:
   enabled: false
@@ -674,6 +680,7 @@ spans:
     storeKind: ""
     storeUrl: ""
     issueWindow: "10m"
+    onDemandLimitPerHour: "30"
 
 # Optional: run the NATS/MinIO one-shot init steps as Jobs (create the JetStream streams /
 # the attachments bucket). Disable if your managed deps are pre-provisioned.

@@ -306,14 +306,38 @@ export const ClaimNextBodySchema = z
 // GET /api/agent/issues/{issueId}/occurrences
 // ---------------------------------------------------------------------------
 
+// sentinel-occurrence-spans TASK-01: whether a trace's spans can be shown. `available`: at least one span the key's
+// organization holds; `pending`: a pull of the trace is queued or running; `none`: nothing, and `reason` says why.
+export const SpansStatusSchema = z.enum(['available', 'pending', 'none']);
+export const SpansReasonSchema = z.enum(['not_pulled', 'not_found', 'too_large', 'failed', 'not_allowed', 'not_visible']);
+export const SpansStateSchema = z.object({ status: SpansStatusSchema, reason: SpansReasonSchema.nullable() }).strict();
+
+const spansFields = {
+	// null: the occurrence has no canonical (32-hex) trace id, so there is no trace to have spans.
+	spansStatus: SpansStatusSchema.nullable(),
+	hasSpans: z.boolean(),
+};
+
+export const AgentOccurrenceWithSpansSchema = AgentOccurrenceSchema.extend(spansFields).strict();
+
 export const OccurrencesQuerySchema = z
 	.object({
 		limit: z.coerce.number().int().min(1).max(50).optional(),
 		before: z.string().datetime({ offset: true }).or(z.string()).optional(),
+		// `true`: only occurrences with spans, found by walking the issue's newest 2,000 occurrences (`before` continues
+		// the walk); the response then carries `spansScan` and, when older occurrences may remain, `nextBefore`.
+		hasSpans: z.enum(['true', 'false']).optional(),
 	})
 	.strict();
 
-export const OccurrencesResponseSchema = z.object({ occurrences: z.array(AgentOccurrenceSchema) }).strict();
+export const OccurrencesResponseSchema = z
+	.object({
+		occurrences: z.array(AgentOccurrenceWithSpansSchema),
+		// hasSpans=true only: what the bounded walk looked at, and where to continue (`before=<nextBefore>`).
+		spansScan: z.object({ scanned: z.number().int(), exhausted: z.boolean() }).strict().optional(),
+		nextBefore: z.string().optional(),
+	})
+	.strict();
 
 // ---------------------------------------------------------------------------
 // GET /api/agent/traces/{traceId} -- agent-reads.ts's `listAgentTraceOccurrences`
@@ -330,6 +354,7 @@ export const AgentTraceOccurrenceSchema = AgentOccurrenceSchema.extend({
 	projectName: z.string(),
 	issueId: z.string(),
 	spanId: z.string().nullable(),
+	...spansFields,
 }).strict();
 
 export const TraceQuerySchema = z
@@ -343,7 +368,37 @@ export const TraceQuerySchema = z
 	.strict();
 
 export const TraceResponseSchema = z
-	.object({ occurrences: z.array(AgentTraceOccurrenceSchema), nextCursor: z.string().optional() })
+	.object({
+		occurrences: z.array(AgentTraceOccurrenceSchema),
+		nextCursor: z.string().optional(),
+		// sentinel-occurrence-spans: the trace's spans state (also the status poll of POST .../pull).
+		spans: SpansStateSchema,
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
+// GET /api/agent/occurrences/{occurrenceId} -- one occurrence of the key's organization (resolves an occurrence id to its trace)
+// ---------------------------------------------------------------------------
+
+export const OccurrenceResponseSchema = z.object({ occurrence: AgentTraceOccurrenceSchema }).strict();
+
+// ---------------------------------------------------------------------------
+// POST /api/agent/traces/{traceId}/pull -- sentinel-occurrence-spans TASK-02
+// ---------------------------------------------------------------------------
+
+/**
+ * `action` is what THIS call did to the pull queue: `none` (spans already available), `queued` (new), `pulled_forward`
+ * (an automatic pull moved up), `rearmed` (a finished pull with no visible spans, run once more), `already_pending`
+ * (nothing to change). The call is idempotent: repeating it changes nothing while the pull is pending. `requestId` is the
+ * audit record of an accepted request (null when nothing was written).
+ */
+export const PullSpansResponseSchema = z
+	.object({
+		status: SpansStatusSchema,
+		reason: SpansReasonSchema.nullable(),
+		action: z.enum(['none', 'queued', 'pulled_forward', 'rearmed', 'already_pending']),
+		requestId: z.string().nullable(),
+	})
 	.strict();
 
 // ---------------------------------------------------------------------------

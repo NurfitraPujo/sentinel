@@ -656,7 +656,8 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 |---|---|
 | `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true] [--since TS] [--sort firstSeen\|lastSeen] [--limit N] [--cursor C]` | `GET /api/agent/issues` |
 | `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` |
-| `sentinel issues occurrences <issueId> [--limit N] [--before TS]` | `GET /api/agent/issues/:id/occurrences` |
+| `sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]` | `GET /api/agent/issues/:id/occurrences[?hasSpans=true]` — each row carries `spansStatus`/`hasSpans`; see §11a |
+| `sentinel spans pull <traceId\|occurrenceId> [--wait] [--timeout 3m]` | `POST /api/agent/traces/:traceId/pull` (an occurrence UUID is first resolved with `GET /api/agent/occurrences/:id`); `--wait` polls `GET /api/agent/traces/:traceId` (`spans`) — see §11a |
 | *(no CLI verb yet)* | `GET /api/agent/traces/:traceId[?limit=&cursor=&environment=]` — see §5 step 3 |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` (409 on conflict) |
 | `sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen\|lastSeen]` | `POST /api/agent/issues/claim-next` — pick + claim + full detail in one call; exit 4 when the queue is empty |
@@ -701,6 +702,25 @@ for the full explanation):
   does not take an `issueId` at all; this form does a plain upload with no issue association. Use
   `upload <file> --issue <id> [--comment <text>]` instead, which chains the follow-up
   `comment --attachment <id>` call for you.
+
+## 11a. Spans: which occurrences have them, and pulling a trace on demand
+
+Only a small share of traced occurrences have spans: the automatic pull is throttled to one trace per issue per window.
+
+- **Status.** Every occurrence from `GET /api/agent/issues/:id/occurrences` and `GET /api/agent/traces/:traceId` carries
+  `spansStatus` — `available` (spans you can open exist), `pending` (a pull is queued or running) or `none` — and
+  `hasSpans` (`spansStatus == "available"`). `spansStatus` is `null` when the occurrence has no canonical 32-hex trace id.
+  `GET /api/agent/traces/:traceId` also returns `spans: {status, reason}`; for `none`, `reason` is `not_pulled`,
+  `not_found` (the trace store has no such trace), `too_large`, `failed`, `not_allowed` or `not_visible`.
+- **Filter.** `?hasSpans=true` (CLI `--with-spans`) keeps only occurrences with spans. It walks the issue's newest 2,000
+  occurrences, so the response adds `spansScan: {scanned, exhausted}` and, when older ones may remain, `nextBefore`
+  (pass it back as `before`).
+- **Pull now.** `POST /api/agent/traces/:traceId/pull` (CLI `sentinel spans pull <traceId|occurrenceId> [--wait]`) asks the
+  server to fetch the trace's spans immediately. Idempotent; returns `{status, reason, action, requestId}`. It works only
+  for organizations allow-listed for span pull (`403` otherwise), needs an occurrence of that trace in your organization
+  (`404`), and is limited per organization (default 30 accepted pulls per hour; `429` + `Retry-After`). That budget is **shared by every person and every agent of the organization**, so one busy agent can use up what the dashboard users would have. A trace already marked too large is returned as such and costs nothing. `--wait` polls every
+  5 s up to `--timeout` (default 3m): exit `0` when available, `4` when the pull finished with no spans (the reason is
+  printed), `1` on timeout.
 
 ## 12. Runnable examples
 

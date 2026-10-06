@@ -50,6 +50,8 @@ repository. Agent keys (`sent_agent_...`) are minted by an org admin on the dash
 ```
 sentinel issues list [--type T] [--claimed true|false] [--project ID] [--waiting true]
 sentinel issues get <issueId>
+sentinel issues occurrences <issueId> [--with-spans]   # spansStatus per row; --with-spans = only occurrences with spans
+sentinel spans pull <traceId|occurrenceId> [--wait]    # pull a trace's spans now; --wait: exit 0 available, 4 none, 1 timeout
 sentinel claim <issueId>            # 409 / exit 5 = owned by someone else, back off
 sentinel claim-next [--type T] [--project ID] [--environment E] [--source S]   # pick+claim+get in one call; exit 4 = queue empty
 sentinel release <issueId>          # releases only your own claim
@@ -66,6 +68,10 @@ sentinel batch -f ops.json                    # up to 20 mutations, one round tr
 
 Exit codes: `0` ok, `1` network/5xx, `2` usage, `3` auth, `4` not found, `5` conflict,
 `6` validation. On a non-zero exit the server's message is on stderr.
+
+Spans: an occurrence's `spansStatus` is `available` | `pending` | `none` (null: no trace id). Few traces are pulled
+automatically; `spans pull` fetches one on demand (idempotent; only for organizations allow-listed for span pull —
+else 403/exit 3; ~30 accepted pulls per org per hour — shared by people AND agents — then 429/exit 1 with a Retry-After).
 
 ## 3. Triage recipe
 

@@ -10,6 +10,7 @@
 	import ExceptionChain from '$lib/components/issues/ExceptionChain.svelte';
 	import BreadcrumbTimeline from '$lib/components/issues/BreadcrumbTimeline.svelte';
 	import ContextCards from '$lib/components/issues/ContextCards.svelte';
+	import SpanPullControl from '$lib/components/traces/SpanPullControl.svelte';
 	import { isCanonicalTraceId } from '$lib/trace-id';
 	import {
 		displayedFrame,
@@ -28,7 +29,16 @@
 			? `/${data.traceOrgSlug}/traces/${traceId}`
 			: null;
 	}
-	const latestTraceHref = $derived(traceHref(data.occurrences?.[0]?.traceId));
+	// sentinel-occurrence-spans TASK-01: the issue-level link goes to the latest occurrence WITH spans (the loader's
+	// `latestSpansTrace`); with none, it falls back to the latest traced occurrence and says so. A loader that sends no
+	// spans data at all keeps the previous behaviour (the newest occurrence's trace, unlabelled).
+	const latestSpansHref = $derived(traceHref(data.latestSpansTrace?.traceId));
+	const latestTraceHref = $derived(
+		latestSpansHref ?? traceHref(data.occurrences?.find((o: { traceId: string | null }) => isCanonicalTraceId(o.traceId))?.traceId)
+	);
+	const latestTraceHasNoSpans = $derived(!latestSpansHref && !!data.spansFilter && !!latestTraceHref);
+	// One spelling of the status for a card; undefined = no canonical trace id (nothing to badge).
+	const spansOf = (occurrenceId: string) => data.spansStatus?.[occurrenceId] as 'available' | 'pending' | 'none' | undefined;
 
 	// SvelteSet ensures .add() and .delete() trigger Svelte 5 fine-grained reactivity.
 	const expandedMetadata = new SvelteSet<string>();
@@ -557,7 +567,9 @@
 			{/if}
 			<!-- sentinel-cross-repo-trace-view D5: the LATEST occurrence's trace, when it has one. -->
 			{#if latestTraceHref}
-				<span class="meta-item"><a href={latestTraceHref} data-testid="view-trace">View trace</a></span>
+				<span class="meta-item"><a href={latestTraceHref} data-testid="view-trace">View trace</a>{#if latestTraceHasNoSpans}
+						<span class="no-spans-note" data-testid="view-trace-no-spans"> (no spans pulled yet)</span>{#if data.spansFilter && !data.spansFilter.active}
+						<a href="?spans=1" data-testid="find-spans-occurrence">find an occurrence with spans</a>{/if}{/if}</span>
 			{/if}
 		</div>
 	</div>
@@ -644,6 +656,15 @@
 						-->
 						{#if v2 && traceHref(occurrence.traceId)}
 							<span class="trace-id">Trace: <a href={traceHref(occurrence.traceId)} data-testid="trace-link">{occurrence.traceId}</a></span>
+							{#if spansOf(occurrence.id) && data.organizationId}
+								<SpanPullControl
+									organizationId={data.organizationId}
+									traceId={occurrence.traceId!}
+									status={spansOf(occurrence.id)!}
+									reason={spansOf(occurrence.id) === 'none' ? 'not_pulled' : null}
+									enabled={!!data.spanPullEnabled}
+								/>
+							{/if}
 							{#if selected && data.relatedTraceErrors && data.relatedTraceErrors.count > 0}
 								<span class="related-trace-errors" data-testid="related-trace-errors">{data.relatedTraceErrors.capped ? '1,000+' : data.relatedTraceErrors.count.toLocaleString()} related {data.relatedTraceErrors.count === 1 && !data.relatedTraceErrors.capped ? 'error' : 'errors'} in other projects</span>
 							{/if}
@@ -733,10 +754,25 @@
 			are actually listed, so the two numbers can differ on screen without either one lying.
 		-->
 		<h2 class="section-title">Occurrence History ({Number(data.occurrenceTotal ?? data.occurrences.length).toLocaleString()})</h2>
-		{#if (data.occurrenceTotal ?? data.occurrences.length) > data.occurrences.length}
+		{#if data.spansFilter}
+			<!-- sentinel-occurrence-spans TASK-01: a plain link, so the filter is a URL (shareable, back-button safe). -->
+			<p class="spans-filter" data-testid="spans-filter">
+				{#if data.spansFilter.active}
+					<a href="?" data-sveltekit-noscroll data-testid="spans-filter-off">Show all occurrences</a>
+					— only occurrences with spans, found among the newest {data.spansFilter.scanned.toLocaleString()}{#if !data.spansFilter.exhausted}
+						(the search stops at {data.spansFilter.bound.toLocaleString()}){/if}.
+				{:else}
+					<a href="?spans=1" data-sveltekit-noscroll data-testid="spans-filter-on">With spans only</a>
+				{/if}
+			</p>
+		{/if}
+		{#if !data.spansFilter?.active && (data.occurrenceTotal ?? data.occurrences.length) > data.occurrences.length}
 			<p class="occurrence-window">
 				Showing the {data.occurrences.length.toLocaleString()} most recent.
 			</p>
+		{/if}
+		{#if data.spansFilter?.active && data.occurrences.length === 0}
+			<p class="occurrence-window" data-testid="spans-filter-empty">No occurrences with spans among the newest {data.spansFilter.scanned.toLocaleString()}.</p>
 		{/if}
 
 		{#if selectedOutsideWindow}

@@ -1,6 +1,8 @@
 import { db } from '$lib/server/db';
-import { projects, spans } from '$lib/db/schema';
+import { projects, spans, spanPullQueue } from '$lib/db/schema';
 import { and, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
+import { isCanonicalTraceId } from '$lib/trace-id';
+import type { SpansReason, SpansState, SpansStatus } from '$lib/spans/status';
 import { environmentScopeCondition, scopeForProject } from '$lib/server/environment-access';
 import { SPAN_RENDER_CAP, type WaterfallSpan } from '$lib/spans/waterfall';
 
@@ -33,7 +35,12 @@ export interface SpanScope {
 	environmentScopes: Map<string, string[]>;
 }
 
-function spanConditions(traceId: string, scope: SpanScope): SQL {
+/**
+ * The tenancy and environment half of the guard, WITHOUT the trace id: org, then (mobile | pulled) under the viewer's
+ * projects and grants. `spanConditions` adds the trace id for the waterfall; the status helpers below add a correlated
+ * one. There is one spelling of the guard, so "has spans" can never advertise a span the waterfall would not show.
+ */
+export function spanVisibility(scope: SpanScope): SQL {
 	const projectIds = scope.projects.map((p) => p.id);
 	const mobile: SQL[] = [
 		eq(spans.source, 'mobile'),
@@ -53,7 +60,84 @@ function spanConditions(traceId: string, scope: SpanScope): SQL {
 	});
 	if (pulledGuard) pulled.push(pulledGuard);
 
-	return and(eq(spans.traceId, traceId), eq(spans.orgId, scope.orgId), or(and(...mobile), and(...pulled)))!;
+	return and(eq(spans.orgId, scope.orgId), or(and(...mobile), and(...pulled)))!;
+}
+
+function spanConditions(traceId: string, scope: SpanScope): SQL {
+	return and(eq(spans.traceId, traceId), spanVisibility(scope))!;
+}
+
+/** The most trace ids one status call takes: a page of occurrences is 100-200. Beyond it the caller batches. */
+export const SPANS_STATUS_MAX_TRACES = 500;
+
+/**
+ * sentinel-occurrence-spans TASK-01 — `available | pending | none` for a SET of traces of ONE organization, in ONE
+ * statement however many traces there are.
+ *
+ *   SELECT t.trace_id,
+ *          EXISTS (SELECT 1 FROM spans WHERE org_id = $org AND trace_id = t.trace_id AND <the waterfall's guard>),
+ *          EXISTS (SELECT 1 FROM span_pull_queue WHERE org_id = $org AND trace_id = t.trace_id AND stage < 2)
+ *     FROM unnest(ARRAY[...]) AS t(trace_id)
+ *
+ * The EXISTS is a correlated probe per trace, so Postgres stops at the first visible span instead of reading all of a
+ * 7,000-span trace, and each probe is an index lookup on (org_id, trace_id, ...) — the primary key's leading columns — on
+ * EVERY partition of `spans` (the PK holds the partition key start_ts last, and nothing here bounds start_ts, so no
+ * partition is pruned: ~15 partitions x N traces probes). span-status.integration.test.ts EXPLAINs it. A trace id that is
+ * not canonical 32-hex is `none` without a probe (the trace page cannot show it either).
+ *
+ * `pending` only matters when `available` is false, and `available` wins.
+ */
+export async function getSpansStatuses(traceIds: Array<string | null | undefined>, scope: SpanScope): Promise<Map<string, SpansStatus>> {
+	const ids = [...new Set(traceIds.filter((id): id is string => isCanonicalTraceId(id)))];
+	const out = new Map<string, SpansStatus>(ids.map((id) => [id, 'none']));
+	if (ids.length === 0) return out;
+	if (ids.length > SPANS_STATUS_MAX_TRACES) {
+		for (let i = 0; i < ids.length; i += SPANS_STATUS_MAX_TRACES) {
+			for (const [id, status] of await getSpansStatuses(ids.slice(i, i + SPANS_STATUS_MAX_TRACES), scope)) out.set(id, status);
+		}
+		return out;
+	}
+	const rows = await db.execute<{ trace_id: string; available: boolean; pending: boolean }>(statusQuery(ids, scope));
+	for (const r of rows) out.set(r.trace_id, r.available ? 'available' : r.pending ? 'pending' : 'none');
+	return out;
+}
+
+/** Exported so the integration test can EXPLAIN exactly the statement the helper runs. */
+export function statusQuery(ids: string[], scope: SpanScope): SQL {
+	const list = sql.join(ids.map((id) => sql`${id}`), sql`, `);
+	return sql`SELECT t.trace_id AS trace_id,
+		EXISTS (SELECT 1 FROM ${spans} WHERE ${spans.traceId} = t.trace_id AND ${spanVisibility(scope)}) AS available,
+		EXISTS (SELECT 1 FROM ${spanPullQueue} WHERE ${spanPullQueue.orgId} = ${scope.orgId} AND ${spanPullQueue.traceId} = t.trace_id AND ${spanPullQueue.stage} < 2) AS pending
+		FROM unnest(ARRAY[${list}]::text[]) AS t(trace_id)`;
+}
+
+/** What the queue row of a finished pull says about why there are no (visible) spans. */
+export function reasonFromQueueRow(row: { stage: number; outcome: string } | null): SpansReason {
+	if (!row) return 'not_pulled';
+	switch (row.outcome) {
+		case 'stored':
+			return 'not_visible';
+		case 'too_large':
+			return 'too_large';
+		case 'not_allowed':
+			return 'not_allowed';
+		case 'gave_up':
+			return 'failed';
+		// 'not_found', and a row finished before the outcome column existed (outcome ''): it ended without spans.
+		default:
+			return 'not_found';
+	}
+}
+
+/** One trace's state with the reason a `none` is a `none` (the trace page and the pull endpoints). */
+export async function getSpansState(traceId: string, scope: SpanScope): Promise<SpansState> {
+	const status = (await getSpansStatuses([traceId], scope)).get(traceId) ?? 'none';
+	if (status !== 'none') return { status, reason: null };
+	const [row] = await db
+		.select({ stage: spanPullQueue.stage, outcome: spanPullQueue.outcome })
+		.from(spanPullQueue)
+		.where(and(eq(spanPullQueue.orgId, scope.orgId), eq(spanPullQueue.traceId, traceId)));
+	return { status, reason: reasonFromQueueRow(row ?? null) };
 }
 
 /**

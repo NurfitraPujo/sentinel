@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/spans"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/spanwire"
 )
@@ -77,11 +79,12 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 }
 
 func (w *Worker) process(ctx context.Context, j Job) {
+	trigger := attribute.String("trigger", j.Trigger())
 	// The allow-list (published, so an org absent from it is truly delisted) is checked again here: the row may predate a configuration change, and trace ids are
 	// client-asserted, so the guard must hold at the moment of the copy, not only at the enqueue.
 	if !w.Cfg.Allowed(j.OrgID) {
 		slog.WarnContext(ctx, "span pull: organization no longer allow-listed; dropping the job")
-		if err := w.Queue.Finish(ctx, j); err != nil {
+		if err := w.Queue.FinishWith(ctx, j, OutcomeNotAllowed); err != nil {
 			slog.WarnContext(ctx, "span pull: finish failed", slog.String("error", err.Error()))
 		}
 		return
@@ -90,9 +93,9 @@ func (w *Worker) process(ctx context.Context, j Job) {
 	// The attempt was counted when the job was claimed. Past the bound this stage is given up on, so a job that keeps
 	// failing or keeps crashing its worker moves on instead of retrying every lease forever.
 	if j.Attempts > MaxAttemptsPerStage {
-		count(ctx, fetchesCtr, "gave_up")
+		count(ctx, fetchesCtr, "gave_up", trigger)
 		slog.WarnContext(ctx, "span pull: giving up on a stage after repeated attempts", slog.Int("stage", j.Stage), slog.Int("attempts", j.Attempts-1))
-		w.advance(ctx, j)
+		w.advance(ctx, j, OutcomeGaveUp)
 		return
 	}
 
@@ -108,9 +111,9 @@ func (w *Worker) process(ctx context.Context, j Job) {
 	case errors.Is(err, ErrTooLarge):
 		// Over the read bound or refused by the store as too big: a trace only grows, so neither a retry nor the
 		// second stage can succeed; the job is finished.
-		count(ctx, fetchesCtr, "too_large")
+		count(ctx, fetchesCtr, "too_large", trigger)
 		slog.InfoContext(ctx, "span pull: trace too large for the trace store; finishing the job", slog.Int("stage", j.Stage))
-		if err := w.Queue.Finish(ctx, j); err != nil {
+		if err := w.Queue.FinishWith(ctx, j, OutcomeTooLarge); err != nil {
 			slog.WarnContext(ctx, "span pull: finish failed", slog.String("error", err.Error()))
 		}
 		return
@@ -139,12 +142,17 @@ func (w *Worker) process(ctx context.Context, j Job) {
 		return
 	}
 	spans.RecordStored(ctx, spanwire.SourcePulled, n)
-	count(ctx, fetchesCtr, outcome)
-	w.advance(ctx, j)
+	count(ctx, fetchesCtr, outcome, trigger)
+	// "stored" only when this fetch produced spans; a found-but-empty trace and a not-found one both end as not_found.
+	final := OutcomeNotFound
+	if len(rows) > 0 {
+		final = OutcomeStored
+	}
+	w.advance(ctx, j, final)
 }
 
-func (w *Worker) advance(ctx context.Context, j Job) {
-	if _, err := w.Queue.Advance(ctx, j); err != nil {
+func (w *Worker) advance(ctx context.Context, j Job, outcome string) {
+	if _, err := w.Queue.AdvanceWith(ctx, j, outcome); err != nil {
 		slog.WarnContext(ctx, "span pull: advance failed", slog.String("error", err.Error()))
 	}
 }
@@ -153,7 +161,7 @@ func (w *Worker) fail(ctx context.Context, j Job, cause error) {
 	if err := w.Queue.Fail(ctx, j, cause); err != nil {
 		slog.WarnContext(ctx, "span pull: could not record a failed fetch", slog.String("error", err.Error()))
 	}
-	count(ctx, fetchesCtr, "error")
+	count(ctx, fetchesCtr, "error", attribute.String("trigger", j.Trigger()))
 	slog.WarnContext(ctx, "span pull: fetch failed", slog.Int("stage", j.Stage), slog.Int("attempt", j.Attempts),
 		slog.String("error", cause.Error()))
 }

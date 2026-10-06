@@ -297,6 +297,10 @@ jobs:
       # sentinel-span-ingest's span-waterfall.integration.test.ts: the real-Postgres proof of the waterfall query's
       # org/project/environment guards and of the span retention step. Self-skips without a database; hard failure here.
       SPAN_WATERFALL_INTEGRATION_REQUIRED: "1"
+      # sentinel-occurrence-spans' span-pull.integration.test.ts: the real-Postgres proof of the spans status helper (the
+      # waterfall's guard, EXPLAIN on every partition) and of the on-demand pull (queue states, allow-list, hourly limit under
+      # concurrent requests). Self-skips without a database (or without migration 1725800000); hard failure here.
+      SPAN_PULL_INTEGRATION_REQUIRED: "1"
       # Master key for the same test's real AES-GCM round-trip (base64 of 32 bytes, CI-only value).
       SENTINEL_ENCRYPTION_KEY: "ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE="
       DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel

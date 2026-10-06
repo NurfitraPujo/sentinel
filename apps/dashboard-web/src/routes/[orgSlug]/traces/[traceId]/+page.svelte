@@ -6,6 +6,7 @@
 	import type { PageData } from './$types';
 	import { levelTone } from '$lib/components/issues/occurrence-display';
 	import SpanWaterfall from '$lib/components/traces/SpanWaterfall.svelte';
+	import SpanPullControl from '$lib/components/traces/SpanPullControl.svelte';
 
 	let { data }: { data: PageData } = $props();
 
@@ -66,7 +67,17 @@
 
 	<!-- D6: above the occurrence list; the row list and its paging are unchanged. Errors pinned are the rows
 	     loaded so far, so "Load more" pins the next page's errors too. -->
-	{#if data.spans.length > 0 || rows.length > 0}
+	{#if data.spans.length === 0 && rows.length > 0 && data.spansState && data.spansState.status !== 'available'}
+		<!-- sentinel-occurrence-spans: no spans to draw — say why, and offer the pull instead of an empty waterfall. -->
+		<SpanPullControl
+			variant="panel"
+			organizationId={data.organizationId}
+			traceId={data.traceId}
+			status={data.spansState.status}
+			reason={data.spansState.reason}
+			enabled={!!data.spanPullEnabled}
+		/>
+	{:else if data.spans.length > 0 || rows.length > 0}
 		<SpanWaterfall
 			spans={data.spans}
 			errors={rows}

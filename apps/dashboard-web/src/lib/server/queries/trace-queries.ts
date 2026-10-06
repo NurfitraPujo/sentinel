@@ -238,6 +238,21 @@ export async function countTraceOccurrences(
 	return { total: Math.min(n, TRACE_COUNT_CAP), capped: n > TRACE_COUNT_CAP };
 }
 
+/**
+ * sentinel-occurrence-spans TASK-02: when the EARLIEST occurrence of the trace the scope can see was recorded, or
+ * `null` when it can see none. One bounded index read through the same guard as the page, so "may this viewer ask
+ * for this trace's spans" and "may this viewer see an error of this trace" cannot disagree. The trace store needs
+ * a couple of minutes to flush a trace, which is what the pull's first fetch time is derived from.
+ */
+export async function earliestTraceOccurrenceAt(traceId: string, scope: TraceScope): Promise<Date | null> {
+	const [row] = await db
+		.select({ epoch: sql<number | null>`extract(epoch from min(${errorOccurrences.createdAt}))::float8` })
+		.from(errorOccurrences)
+		.innerJoin(issues, eq(issues.id, errorOccurrences.issueId))
+		.where(and(...traceConditions(traceId, scope)));
+	return row?.epoch == null ? null : new Date(Number(row.epoch) * 1000);
+}
+
 /** D3's header: the projects the (guarded) trace spans, by name. */
 export async function listTraceProjects(
 	traceId: string,

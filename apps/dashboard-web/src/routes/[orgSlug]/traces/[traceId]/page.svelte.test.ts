@@ -41,6 +41,8 @@ function data(over: Record<string, unknown> = {}) {
 		projects: [{ id: 'p2', name: 'core' }, { id: 'p1', name: 'web' }],
 		projectCount: 2,
 		retentionDays: 30,
+		organizationId: '11111111-1111-4111-8111-111111111111',
+		spanPullEnabled: true,
 		spans: [],
 		spansTruncated: false,
 		spanRetentionDays: 14,
@@ -154,5 +156,51 @@ describe('the trace page', () => {
 			expect.stringContaining('boom 1'),
 			expect.stringContaining('boom 2'),
 		]);
+	});
+});
+
+// sentinel-occurrence-spans TASK-01/02: a trace with no spans says WHY instead of drawing an empty waterfall, and offers the pull.
+describe('a trace with no spans', () => {
+	const state = (status: string, reason: string | null) => ({ spansState: { status, reason } });
+
+	it.each([
+		['not_pulled', /have not been pulled yet/],
+		['not_found', /trace store has no spans/],
+		['too_large', /too large/],
+	])('says why (%s), with the pull button, and draws no waterfall', (reason, text) => {
+		const { getByTestId, queryByTestId } = render(Page, { data: data(state('none', reason)) });
+		expect(getByTestId('spans-empty-reason').textContent).toMatch(text as RegExp);
+		expect(getByTestId('pull-spans')).toBeTruthy();
+		expect(queryByTestId('waterfall')).toBeNull();
+		expect(queryByTestId('waterfall-empty')).toBeNull();
+	});
+
+	it('says the pull is under way while it is pending, without a button', () => {
+		const { getByTestId, queryByTestId } = render(Page, { data: data(state('pending', null)) });
+		expect(getByTestId('spans-empty-reason').textContent).toMatch(/being pulled/);
+		expect(queryByTestId('pull-spans')).toBeNull();
+	});
+
+	it('offers no button when span pull is not enabled for the organization, but still says why', () => {
+		const { getByTestId, queryByTestId } = render(Page, { data: data({ ...state('none', 'not_pulled'), spanPullEnabled: false }) });
+		expect(getByTestId('spans-empty-reason')).toBeTruthy();
+		expect(queryByTestId('pull-spans')).toBeNull();
+	});
+
+	it('draws the waterfall, not the panel, when the trace has spans', () => {
+		const { queryByTestId } = render(Page, {
+			data: data({
+				...state('available', null),
+				spans: [{ spanId: 'a'.repeat(16), parentSpanId: '', name: 'root', op: '', kind: '', source: 'pulled', serviceName: 'core', projectName: null, environment: 'production', startUs: 0, durationUs: 10, status: 'ok', attributes: {} }],
+			}),
+		});
+		expect(queryByTestId('waterfall')).not.toBeNull();
+		expect(queryByTestId('spans-empty-reason')).toBeNull();
+	});
+
+	it('says nothing about spans when the viewer can see no error of the trace (D2: one empty page whatever the cause)', () => {
+		const { queryByTestId, getByTestId } = render(Page, { data: data({ occurrences: [], total: 0, projects: [], projectCount: 0, ...state('none', null) }) });
+		expect(getByTestId('trace-empty')).toBeTruthy();
+		expect(queryByTestId('spans-empty-reason')).toBeNull();
 	});
 });
