@@ -46,7 +46,7 @@ vi.mock('$lib/db/schema', () => ({
 const environment = { dev: false, browser: false, building: false, version: 'test' };
 vi.mock('$app/environment', () => environment);
 
-const { orgHandle, csrfHandle, frameGuardHandle } = await import('./hooks.server');
+const { orgHandle, csrfHandle, frameGuardHandle, unmatchedApiHandle } = await import('./hooks.server');
 
 function makeEvent(pathname: string, authenticated: boolean) {
 	return {
@@ -263,5 +263,46 @@ describe('frameGuardHandle', () => {
 		const res = await run(pathname);
 		expect(res.headers.get('content-security-policy')).toBeNull();
 		expect(res.headers.get('x-frame-options')).toBeNull();
+	});
+});
+
+// sentinel-issue-activity TASK-01: a uuid path parameter carries the `uuid` matcher, so `/api/agent/issues/--help` matches
+// no route (`event.route.id === null`). unmatchedApiHandle answers that with SvelteKit's `{ message }` 404 as JSON, before
+// any session/org read -- and leaves every routed request, and every non-API path, to the rest of the chain.
+describe('unmatchedApiHandle', () => {
+	const call = async (pathname: string, routeId: string | null) => {
+		const resolve = vi.fn(async () => new Response('routed'));
+		const event: any = { url: new URL(`http://localhost${pathname}`), route: { id: routeId } };
+		const response = await unmatchedApiHandle({ event, resolve });
+		return { response, resolve };
+	};
+
+	beforeEach(() => {
+		dbMock.select.mockClear();
+	});
+
+	it.each(['/api/agent/issues/--help', '/api/issues/42a26f64-/activity', '/api/no-such-thing', '/api'])(
+		'%s, matching no route, is a JSON 404 without resolving or reading the database',
+		async (pathname) => {
+			const { response, resolve } = await call(pathname, null);
+			expect(response.status).toBe(404);
+			expect(response.headers.get('content-type')).toContain('application/json');
+			expect(await response.json()).toEqual({ message: 'Not found' });
+			expect(resolve).not.toHaveBeenCalled();
+			expect(dbMock.select).not.toHaveBeenCalled();
+		}
+	);
+
+	it('passes a routed API request through', async () => {
+		const { response, resolve } = await call('/api/agent/issues/42a26f64-1b2c-4d5e-8f90-123456789012', '/api/agent/issues/[issueId=uuid]');
+		expect(resolve).toHaveBeenCalledTimes(1);
+		expect(await response.text()).toBe('routed');
+	});
+
+	it('leaves an unmatched PAGE path to SvelteKit (its not-found page), and does not treat /apiary as /api', async () => {
+		for (const pathname of ['/issues/42a26f64-', '/apiary']) {
+			const { resolve } = await call(pathname, null);
+			expect(resolve).toHaveBeenCalledTimes(1);
+		}
 	});
 });

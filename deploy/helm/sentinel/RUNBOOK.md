@@ -724,7 +724,7 @@ out.** `Down` drops `uq_error_occurrences_project_event` (concurrently) and then
   `getOccurrencesByIssueId` (`apps/dashboard-web/src/lib/server/queries/issue-queries.ts:200`)
   is a bare `db.select().from(errorOccurrences)`, which Drizzle expands to every
   column the mirror declares — including `project_id` — so after `Down` every
-  `/issues/[id]` page load (`routes/issues/[id]/+page.server.ts:86`) fails with
+  `/issues/[id]` page load (`routes/issues/[id=uuid]/+page.server.ts:86`) fails with
   **`42703` `column "project_id" does not exist`** until the dashboard image is
   rolled back or the file is re-applied.
 

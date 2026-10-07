@@ -40,7 +40,7 @@ const dynamicEnv: Record<string, string | undefined> = {};
 vi.mock('$env/dynamic/private', () => ({ env: dynamicEnv }));
 
 const { POST: SWEEP } = await import('./cron/oncall-escalation/+server');
-const { POST: ACK } = await import('./issues/[issueId]/escalation/ack/+server');
+const { POST: ACK } = await import('./issues/[issueId=uuid]/escalation/ack/+server');
 
 const ISSUE = '33333333-3333-4333-8333-333333333333';
 const ASSIGNEE = 'usr_on_call';

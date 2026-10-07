@@ -24,7 +24,8 @@ interface DiscoveredRoute {
 
 function toOpenApiPath(relativeDir: string): string {
 	const segments = relativeDir.split(path.sep).filter(Boolean);
-	const mapped = segments.map((seg) => (seg.startsWith('[') && seg.endsWith(']') ? `{${seg.slice(1, -1)}}` : seg));
+	// `[issueId=uuid]` is the `issueId` parameter with a matcher (src/params/uuid.ts); the matcher is not part of the path.
+	const mapped = segments.map((seg) => (seg.startsWith('[') && seg.endsWith(']') ? `{${seg.slice(1, -1).split('=')[0]}}` : seg));
 	return `/api/agent${mapped.length > 0 ? '/' + mapped.join('/') : ''}`;
 }
 

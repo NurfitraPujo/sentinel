@@ -31,6 +31,7 @@ type cmdFunc func(ctx context.Context, e *env, args []string) int
 // commands is the dispatch table used by both main() and tests.
 var commands = map[string]cmdFunc{
 	"issues":     cmdIssues,
+	"issue":      cmdIssues, // alias: `sentinel issue show|activity <id>` reads naturally for one issue
 	"claim":      cmdClaim,
 	"claim-next": cmdClaimNext,
 	"release":    cmdRelease,
@@ -120,21 +121,23 @@ func usageErr(e *env, format string, args ...interface{}) int {
 
 // --- issues -----------------------------------------------------------------------------------
 
-// cmdIssues dispatches `issues list|get|occurrences`.
+// cmdIssues dispatches `issues list|get|show|occurrences|activity` (also reachable as `issue ...`).
 func cmdIssues(ctx context.Context, e *env, args []string) int {
 	if len(args) == 0 {
-		return usageErr(e, "usage: sentinel issues <list|get|occurrences> ...")
+		return usageErr(e, "usage: sentinel issues <list|get|show|occurrences|activity> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "list":
 		return cmdIssuesList(ctx, e, rest)
-	case "get":
+	case "get", "show":
 		return cmdIssuesGet(ctx, e, rest)
 	case "occurrences":
 		return cmdIssuesOccurrences(ctx, e, rest)
+	case "activity":
+		return cmdIssueActivity(ctx, e, rest)
 	default:
-		return usageErr(e, "unknown issues subcommand %q: want list, get, or occurrences", sub)
+		return usageErr(e, "unknown issues subcommand %q: want list, get (show), occurrences, or activity", sub)
 	}
 }
 
@@ -190,6 +193,9 @@ func cmdIssuesGet(ctx context.Context, e *env, args []string) int {
 	if len(args) != 1 {
 		return usageErr(e, "usage: sentinel issues get <issueId>")
 	}
+	if code, ok := e.checkIDs("issue id", args[0]); !ok {
+		return code
+	}
 	res, err := e.client.Do(ctx, "GET", "/api/agent/issues/"+url.PathEscape(args[0]), nil, nil)
 	if err != nil {
 		return e.networkErr(err)
@@ -209,6 +215,9 @@ func cmdIssuesOccurrences(ctx context.Context, e *env, args []string) int {
 	rest := fs.Args()
 	if len(rest) != 1 {
 		return usageErr(e, "usage: sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]")
+	}
+	if code, ok := e.checkIDs("issue id", rest[0]); !ok {
+		return code
 	}
 
 	q := url.Values{}
@@ -244,6 +253,9 @@ func cmdIssuesOccurrences(ctx context.Context, e *env, args []string) int {
 func cmdClaim(ctx context.Context, e *env, args []string) int {
 	if len(args) != 1 {
 		return usageErr(e, "usage: sentinel claim <issueId>")
+	}
+	if code, ok := e.checkIDs("issue id", args[0]); !ok {
+		return code
 	}
 	res, err := e.client.Do(ctx, "POST", "/api/agent/issues/"+url.PathEscape(args[0])+"/claim", nil, map[string]interface{}{})
 	if err != nil {
@@ -301,6 +313,9 @@ func cmdRelease(ctx context.Context, e *env, args []string) int {
 	if len(args) != 1 {
 		return usageErr(e, "usage: sentinel release <issueId>")
 	}
+	if code, ok := e.checkIDs("issue id", args[0]); !ok {
+		return code
+	}
 	res, err := e.client.Do(ctx, "DELETE", "/api/agent/issues/"+url.PathEscape(args[0])+"/claim", nil, map[string]interface{}{})
 	if err != nil {
 		return e.networkErr(err)
@@ -325,6 +340,9 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 		return usageErr(e, "usage: sentinel status <issueId> <unresolved|resolved|ignored> [--resolved-in VERSION]")
 	}
 	issueID, status := rest[0], rest[1]
+	if code, ok := e.checkIDs("issue id", issueID); !ok {
+		return code
+	}
 	if !validStatuses[status] {
 		return usageErr(e, "status must be one of: unresolved, resolved, ignored")
 	}
@@ -381,6 +399,19 @@ func cmdCommentPost(ctx context.Context, e *env, args []string) int {
 	if len(rest) != 1 {
 		return usageErr(e, "usage: sentinel comment <issueId> --body <md> [--parent <commentId>] [--attachment <id> ...]")
 	}
+	if code, ok := e.checkIDs("issue id", rest[0]); !ok {
+		return code
+	}
+	if *parent != "" {
+		if code, ok := e.checkIDs("comment id", *parent); !ok {
+			return code
+		}
+	}
+	for _, a := range attachments {
+		if code, ok := e.checkIDs("attachment id", a); !ok {
+			return code
+		}
+	}
 	if *body == "" {
 		return usageErr(e, "--body is required")
 	}
@@ -411,6 +442,9 @@ func cmdComments(ctx context.Context, e *env, args []string) int {
 	rest := fs.Args()
 	if len(rest) != 1 {
 		return usageErr(e, "usage: sentinel comments <issueId> [--after <ts>]")
+	}
+	if code, ok := e.checkIDs("issue id", rest[0]); !ok {
+		return code
 	}
 
 	q := url.Values{}
@@ -446,6 +480,9 @@ func cmdCommentEdit(ctx context.Context, e *env, args []string) int {
 	}
 
 	issueID, commentID := rest[0], rest[1]
+	if code, ok := e.checkIDs("issue id", issueID, "comment id", commentID); !ok {
+		return code
+	}
 	reqBody := map[string]interface{}{"body_md": *body}
 	res, err := e.client.Do(
 		ctx, "PATCH",
@@ -471,6 +508,9 @@ func cmdCommentDelete(ctx context.Context, e *env, args []string) int {
 	}
 
 	issueID, commentID := rest[0], rest[1]
+	if code, ok := e.checkIDs("issue id", issueID, "comment id", commentID); !ok {
+		return code
+	}
 	res, err := e.client.Do(
 		ctx, "DELETE",
 		"/api/agent/issues/"+url.PathEscape(issueID)+"/comments/"+url.PathEscape(commentID),
@@ -500,6 +540,9 @@ func cmdSeverity(ctx context.Context, e *env, args []string) int {
 		return usageErr(e, "usage: sentinel severity <issueId> <low|medium|high|critical>")
 	}
 	issueID, severity := rest[0], rest[1]
+	if code, ok := e.checkIDs("issue id", issueID); !ok {
+		return code
+	}
 	if !validSeverities[severity] {
 		return usageErr(e, "severity must be one of: low, medium, high, critical")
 	}
@@ -530,6 +573,9 @@ func cmdQuestion(ctx context.Context, e *env, args []string) int {
 	if len(rest) != 1 {
 		return usageErr(e, "usage: sentinel question <issueId> --body <md> --waiting-on <reporter|team>")
 	}
+	if code, ok := e.checkIDs("issue id", rest[0]); !ok {
+		return code
+	}
 	if *body == "" {
 		return usageErr(e, "--body is required")
 	}
@@ -558,6 +604,9 @@ func cmdProgress(ctx context.Context, e *env, args []string) int {
 	rest := fs.Args()
 	if len(rest) != 1 {
 		return usageErr(e, "usage: sentinel progress <issueId> --body <md>")
+	}
+	if code, ok := e.checkIDs("issue id", rest[0]); !ok {
+		return code
 	}
 	if *body == "" {
 		return usageErr(e, "--body is required")
@@ -590,6 +639,9 @@ func cmdLink(ctx context.Context, e *env, args []string) int {
 	if len(rest) != 2 {
 		return usageErr(e, "usage: sentinel link <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>")
 	}
+	if code, ok := e.checkIDs("issue id", rest[0], "target issue id", rest[1]); !ok {
+		return code
+	}
 	if !validRelationTypes[*relType] {
 		return usageErr(e, "--type must be one of: linked_to, caused_by, duplicate_of")
 	}
@@ -618,6 +670,9 @@ func cmdUnlink(ctx context.Context, e *env, args []string) int {
 	rest := fs.Args()
 	if len(rest) != 2 {
 		return usageErr(e, "usage: sentinel unlink <issueId> <targetIssueId> --type <linked_to|caused_by|duplicate_of>")
+	}
+	if code, ok := e.checkIDs("issue id", rest[0], "target issue id", rest[1]); !ok {
+		return code
 	}
 	if !validRelationTypes[*relType] {
 		return usageErr(e, "--type must be one of: linked_to, caused_by, duplicate_of")
@@ -711,6 +766,9 @@ func cmdMembers(ctx context.Context, e *env, args []string) int {
 		pos := fs.Args()
 		if len(pos) != 1 {
 			return usageErr(e, "usage: sentinel members remove <memberId>")
+		}
+		if code, ok := e.checkNotFlag("member id", pos[0]); !ok {
+			return code
 		}
 		res, err := e.client.Do(ctx, "DELETE", "/api/agent/members/"+url.PathEscape(pos[0]), nil, nil)
 		if err != nil {
@@ -1137,6 +1195,9 @@ func cmdUpload(ctx context.Context, e *env, args []string) int {
 		}
 		filePath = rest[0]
 		issueID = *issueFlag
+		if code, ok := e.checkIDs("issue id", issueID); !ok {
+			return code
+		}
 	case len(rest) == 2:
 		// Old two-positional form, kept for backward compatibility. The first positional used to
 		// be silently discarded (the server route has no issueId param); it still is here — this
@@ -1213,10 +1274,8 @@ func (s *stringList) Set(v string) error {
 // spansPollInterval is how often `spans pull --wait` re-reads the trace's spans state (a var so tests can shrink it).
 var spansPollInterval = 5 * time.Second
 
-var (
-	traceIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
-	uuidRe    = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-)
+// The occurrence-id form is ids.go's uuidRE (the argument is lower-cased first).
+var traceIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // cmdSpans dispatches `spans pull`.
 func cmdSpans(ctx context.Context, e *env, args []string) int {
@@ -1262,7 +1321,7 @@ func cmdSpansPull(ctx context.Context, e *env, args []string) int {
 	traceID := arg
 	switch {
 	case traceIDRe.MatchString(arg):
-	case uuidRe.MatchString(arg):
+	case uuidRE.MatchString(arg):
 		res, err := e.client.Do(ctx, "GET", "/api/agent/occurrences/"+arg, nil, nil)
 		if err != nil {
 			return e.networkErr(err)

@@ -5,7 +5,7 @@ import { projects } from '$lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 import { hasPermission } from '$lib/rbac';
 import { createProject } from '$lib/db/queries/organizations';
-import { requireOrgMembership } from '../../api/organizations/[orgId]/keys/_shared';
+import { requireOrgMembership } from '../../api/organizations/[orgId=uuid]/keys/_shared';
 import type { PageServerLoad, Actions } from './$types';
 
 // Projects had no index either, so a project's own settings and API-key pages

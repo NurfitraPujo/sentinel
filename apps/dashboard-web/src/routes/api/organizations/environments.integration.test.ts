@@ -131,16 +131,16 @@ describe.skipIf(!dbReachable)('environment routes (integration, real Postgres)',
 	});
 
 	async function importRegistry() {
-		return await import('./[orgId]/projects/[projectId]/environments/+server');
+		return await import('./[orgId=uuid]/projects/[projectId=uuid]/environments/+server');
 	}
 	async function importEnvPatch() {
-		return await import('./[orgId]/projects/[projectId]/environments/[envId]/+server');
+		return await import('./[orgId=uuid]/projects/[projectId=uuid]/environments/[envId=uuid]/+server');
 	}
 	async function importGrants() {
-		return await import('./[orgId]/projects/[projectId]/environment-grants/+server');
+		return await import('./[orgId=uuid]/projects/[projectId=uuid]/environment-grants/+server');
 	}
 	async function importGrantUser() {
-		return await import('./[orgId]/projects/[projectId]/environment-grants/[userId]/+server');
+		return await import('./[orgId=uuid]/projects/[projectId=uuid]/environment-grants/[userId]/+server');
 	}
 
 	async function declare(
@@ -550,7 +550,7 @@ describe.skipIf(!dbReachable)('environment routes (integration, real Postgres)',
 	// --------------------------------------------------- §4.3a and the org project list (dec. 31)
 
 	it('GET /api/organizations/{orgId}/projects: the caller\'s union, {id,name} only, sorted by name', async () => {
-		const { GET } = await import('./[orgId]/projects/+server');
+		const { GET } = await import('./[orgId=uuid]/projects/+server');
 		const body = await (await GET({ params: { orgId }, locals: locals(adminId) } as never)).json();
 
 		const ids = body.projects.map((p: { id: string }) => p.id);

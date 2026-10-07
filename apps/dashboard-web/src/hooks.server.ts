@@ -1,4 +1,5 @@
 import type { Handle } from '@sveltejs/kit';
+import { json } from '@sveltejs/kit';
 import { sequence } from '@sveltejs/kit/hooks';
 import { handle as authHandle } from '$lib/server/auth-config';
 import { db } from '$lib/server/db';
@@ -87,6 +88,19 @@ const requestContextHandle: Handle = async ({ event, resolve }) => {
 			throw err;
 		}
 	});
+};
+
+// sentinel-issue-activity TASK-01: an /api/** path that matches NO route answers a JSON 404 here, before the session and
+// org lookups below. This is where a malformed id lands: every uuid path parameter carries the `uuid` matcher
+// (src/params/uuid.ts), so `/api/agent/issues/--help` or `/api/issues/42a26f64-` matches no route instead of reaching a
+// handler whose query Postgres would reject with 22P02 (a 500). Without this, SvelteKit renders its HTML error page for
+// an unmatched path -- through the root layout -- which is the wrong body for an API client and costs the auth/org reads.
+// The body is SvelteKit's own `error(404, ...)` shape, `{ message }`, so a client sees the same thing as any other 404.
+export const unmatchedApiHandle: Handle = async ({ event, resolve }) => {
+	if (event.route.id === null && (event.url.pathname === '/api' || event.url.pathname.startsWith('/api/'))) {
+		return json({ message: 'Not found' }, { status: 404 });
+	}
+	return resolve(event);
 };
 
 // Exported (not just used internally) so route-level tests can drive it directly against a fake
@@ -224,4 +238,4 @@ export const frameGuardHandle: Handle = async ({ event, resolve }) => {
 	return response;
 };
 
-export const handle = sequence(frameGuardHandle, requestContextHandle, csrfHandle, authHandle, orgHandle);
+export const handle = sequence(frameGuardHandle, requestContextHandle, unmatchedApiHandle, csrfHandle, authHandle, orgHandle);

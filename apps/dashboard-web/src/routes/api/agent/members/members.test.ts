@@ -171,7 +171,8 @@ describe('POST /api/agent/members', () => {
 
 describe('DELETE /api/agent/members/[id]', () => {
 	it('404s when member does not exist', async () => {
-		dbMock.then.mockImplementationOnce((resolve: any) => resolve([])); // byId
+		// 'nonexistent' is not UUID-shaped, so it is only looked up as a user id: one query, never the uuid `id` column
+		// (which Postgres would refuse with 22P02 -> 500; sentinel-issue-activity TASK-01).
 		dbMock.then.mockImplementationOnce((resolve: any) => resolve([])); // byUserId
 
 		await expect(
@@ -190,8 +191,8 @@ describe('DELETE /api/agent/members/[id]', () => {
 
 		await expect(
 			DELETE({
-				params: { id: 'm1' },
-				request: new Request('http://localhost/api/agent/members/m1', { method: 'DELETE' }),
+				params: { id: '00000000-0000-4000-8000-0000000000a1' },
+				request: new Request('http://localhost/api/agent/members/00000000-0000-4000-8000-0000000000a1', { method: 'DELETE' }),
 			} as any)
 		).rejects.toMatchObject({ status: 400 });
 	});
@@ -209,8 +210,8 @@ describe('DELETE /api/agent/members/[id]', () => {
 		dbMock.then.mockImplementationOnce((resolve: any) => resolve([]));
 
 		const res = await DELETE({
-			params: { id: 'm2' },
-			request: new Request('http://localhost/api/agent/members/m2', { method: 'DELETE' }),
+			params: { id: '00000000-0000-4000-8000-0000000000a2' },
+			request: new Request('http://localhost/api/agent/members/00000000-0000-4000-8000-0000000000a2', { method: 'DELETE' }),
 		} as any);
 
 		expect(res.status).toBe(200);

@@ -71,9 +71,9 @@ function assertNoKeyHash(value: unknown, path = 'body') {
 	}
 }
 
-const { GET, POST } = await import('./[orgId]/keys/+server');
-const { DELETE } = await import('./[orgId]/keys/[keyId]/+server');
-const { POST: ROTATE } = await import('./[orgId]/keys/[keyId]/rotate/+server');
+const { GET, POST } = await import('./[orgId=uuid]/keys/+server');
+const { DELETE } = await import('./[orgId=uuid]/keys/[keyId=uuid]/+server');
+const { POST: ROTATE } = await import('./[orgId=uuid]/keys/[keyId=uuid]/rotate/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

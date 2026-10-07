@@ -305,6 +305,10 @@ jobs:
       # and of the personal-key authorization matrix over every /api/agent route (personal-keys.integration.test.ts).
       # Self-skips without a database (or before migration 1725900000); hard failure here.
       CLI_LOGIN_INTEGRATION_REQUIRED: "1"
+      # sentinel-issue-activity: issue-activity.integration.test.ts, the real-Postgres proof of the issue activity history
+      # (keyset paging, the occurrence_burst collapse across pages, actor names, EXPLAIN on the index, the session route's
+      # access parity with the issue page, and the issue page's unchanged default statement count). Hard failure here.
+      ISSUE_ACTIVITY_INTEGRATION_REQUIRED: "1"
       # Master key for the same test's real AES-GCM round-trip (base64 of 32 bytes, CI-only value).
       SENTINEL_ENCRYPTION_KEY: "ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE="
       DATABASE_URL: postgres://sentinel:changeme@localhost:5432/sentinel

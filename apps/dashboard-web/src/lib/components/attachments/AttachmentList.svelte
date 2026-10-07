@@ -2,7 +2,7 @@
 	// Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4/§10): read-only attachments section
 	// for the report detail page. Images render inline as thumbnails via the authorized download
 	// URL (/api/attachments/<id> -- GET already enforces read access to the parent issue, see
-	// routes/api/attachments/[id]/+server.ts); every other content type renders as a download link
+	// routes/api/attachments/[id=uuid]/+server.ts); every other content type renders as a download link
 	// showing filename + human size. Purely presentational -- no fetch of its own, the list comes
 	// from the page's server load (listIssueAttachments).
 	export interface AttachmentSummary {

@@ -238,6 +238,37 @@ polling:
 - `hasMore: true` means keep paging with the same filters and the new `cursor` before you go back
   to sleep/poll-interval — there's more backlog waiting right now.
 
+## 3a. One issue's history: `GET /api/agent/issues/:id/activity`
+
+The events feed is org-wide and moves forward. To read **one issue's** history — who claimed it, status changes,
+comments, progress notes, regressions, occurrence bursts — page backwards through it:
+
+```
+GET /api/agent/issues/:id/activity?limit=<n>&before=<nextCursor>
+```
+
+- Newest first. `limit` is entries per page, clamped to `[1, 200]`, default `50`; a non-integer is `400`.
+- `before` is the previous page's `nextCursor` (opaque; anything else is `400`). The response is
+  `{ "entries": [...], "nextCursor": "..." | null, "hasMore": bool }`.
+- Each entry has the events feed's item fields (`seq`, `eventType`, `actorType`, `actorId`, `oldValue`, `newValue`,
+  `createdAt`) plus `id`, `actor: {type, id, name, personal}` — a user's name (else email), an org agent's name,
+  `"<owner name> (CLI)"` for a personal CLI agent, a label for a system actor; `name` is `null` only for a deleted
+  user/agent — and, by type, `comment: {id, excerpt, deleted}` (`commented`, `question_asked`; a 280-character
+  excerpt), `assignee` (`assigned`) or `burst`.
+- **Bursts are collapsed.** The processor writes at most one `occurrence_burst` row per issue per
+  `OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS`, and on a noisy issue they are most of the history. A run of consecutive
+  burst rows (nothing else between them) is **one** entry with `burst: {rows, firstAt, lastAt, occurrencesFrom,
+  occurrencesTo}` (the issue's total occurrence count at the run's oldest and newest row). A run is never split
+  across pages: `limit` counts entries, and the cursor moves past the whole run.
+- Authorized exactly like `GET /api/agent/issues/:id`: another organization's issue — or, for a personal key, one
+  outside the owner's projects/environment grants — is `404`. A `linked` entry whose target the personal key cannot
+  see is redacted as on the events feed (`targetIssueId: null, targetRedacted: true`).
+
+CLI: `sentinel issue activity <issueId> [--limit N] [--before CURSOR] [--all] [--json]` (a table by default).
+
+**Malformed ids.** Every `:id` in an `/api/agent/*` path (and every dashboard/API path id) must be a UUID; anything
+else — `--help`, a truncated `42a26f64-` — matches no route and is a `404` `{"message":"Not found"}`, never a `500`.
+
 ## 4. Claims are advisory — always check `claimedBy`
 
 **Claiming is NOT enforcement.** It is a signal, checked by nothing except the claim endpoints
@@ -687,7 +718,8 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 | Command | HTTP call |
 |---|---|
 | `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true] [--since TS] [--sort firstSeen\|lastSeen] [--limit N] [--cursor C]` | `GET /api/agent/issues` |
-| `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` |
+| `sentinel issues get <issueId>` (also `sentinel issue show <issueId>`) | `GET /api/agent/issues/:id` |
+| `sentinel issue activity <issueId> [--limit N] [--before CURSOR] [--all] [--json]` | `GET /api/agent/issues/:id/activity` — the issue's history as a table (WHEN, WHO, WHAT, DETAIL; a burst run is one line); `--all` follows every page; `--json` prints the response (merged with `--all`); see §3a |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]` | `GET /api/agent/issues/:id/occurrences[?hasSpans=true]` — each row carries `spansStatus`/`hasSpans`; see §11a |
 | `sentinel spans pull <traceId\|occurrenceId> [--wait] [--timeout 3m]` | `POST /api/agent/traces/:traceId/pull` (an occurrence UUID is first resolved with `GET /api/agent/occurrences/:id`); `--wait` polls `GET /api/agent/traces/:traceId` (`spans`) — see §11a |
 | *(no CLI verb yet)* | `GET /api/agent/traces/:traceId[?limit=&cursor=&environment=]` — see §5 step 3 |
@@ -712,6 +744,7 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 | `sentinel config` | *(local)* profile in use + where url / key come from; the key itself is never shown |
 | `sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]` | *(local)* installs the embedded sentinel-agent skill globally for each agent tool |
 | `sentinel version`, `sentinel guide` | *(local)* version; prints this guide |
+| `sentinel help [command]`, `sentinel <command> --help` | *(local)* a command's usage; `-h`/`--help` anywhere prints it and runs nothing |
 | `sentinel whoami` | `GET /api/agent/self` — real identity as of N7f (R1a), see below |
 | `sentinel key rotate` | `POST /api/agent/key/rotate` — new secret printed to stdout ONCE (N7f, R1b) |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` (one page) |
@@ -721,9 +754,13 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 | `sentinel upload <issueId> <file>` | deprecated two-positional form — plain upload, `issueId` ignored, warns (see below) |
 
 Global flags (`--profile`, `-url`, `-key`, `-format json|table`) go before the subcommand. `-format table`
-renders list-shaped responses as a column table.
+renders list-shaped responses as a column table. `issues` and `issue` are the same command.
 
-**Exit codes:** `0` ok · `1` network/5xx · `2` usage error (no request made) · `3` auth failure
+**Ids are checked before any request.** Every issue, comment, attachment and target id argument must be a UUID
+(either case); anything else — a flag in the id's place, a truncated id — is a usage error (exit `2`, nothing sent),
+with a message naming the argument. `members remove` also accepts a user id, so it only refuses a flag-looking value.
+
+**Exit codes:** `0` ok (including `--help`) · `1` network/5xx · `2` usage error, including an invalid id (no request made) · `3` auth failure
 (401/403) · `4` not found (404) · `5` conflict (409) · `6` validation error (400/422).
 
 **Known CLI/server mismatches** (server wins in every case — see `tools/sentinel/README.md`
@@ -860,6 +897,9 @@ curl -s "$SENTINEL_URL/api/agent/issues/$ISSUE_ID" -H "$AUTH"
 # Occurrences (paged, newest-first)
 curl -s "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/occurrences?limit=20" -H "$AUTH"
 
+# The issue's activity history (newest first, bursts collapsed; pass nextCursor back as before=)
+curl -s "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/activity?limit=50" -H "$AUTH"
+
 # Claim / release
 curl -s -X POST "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/claim" -H "$AUTH"
 curl -s -X DELETE "$SENTINEL_URL/api/agent/issues/$ISSUE_ID/claim" -H "$AUTH"
@@ -921,6 +961,19 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### Issue activity history and malformed ids (sentinel-issue-activity)
+
+- **New `GET /api/agent/issues/:id/activity?limit=&before=`** (§3a): one issue's history, newest first, keyset-paged
+  by an opaque `nextCursor`, runs of consecutive `occurrence_burst` rows collapsed into one entry with `burst`, actors
+  resolved to names. Authorized like `GET /api/agent/issues/:id` (personal keys scoped to the owner, `404` out of
+  scope). Not available as a `/api/agent/batch` op (batch ops are mutations).
+- **Malformed ids are `404`, never `500`:** a path id that is not a UUID (`/api/agent/issues/--help`,
+  `/api/agent/issues/42a26f64-`) matches no route and answers `404 {"message":"Not found"}` without authenticating.
+  Every well-formed request is unchanged.
+- **CLI:** new `sentinel issue activity`; `issue` is an alias of `issues` and `show` of `get`; `-h`/`--help` and
+  `sentinel help [command]` print usage and exit `0` (a command without flags used to send `--help` as the issue id);
+  every id argument is validated as a UUID before any request (exit `2`).
 
 ### Personal keys and browser login (sentinel-cli-browser-login)
 

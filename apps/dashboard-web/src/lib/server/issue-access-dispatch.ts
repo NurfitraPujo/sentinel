@@ -9,8 +9,8 @@ import { resolveEnvironmentScope } from './environment-access';
 /**
  * R17 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): the single per-issue-type access dispatch,
  * extracted from three call sites that had each grown their own copy --
- * routes/api/attachments/[id]/+server.ts's GET (read-only), comment-access.ts's read/write
- * pair, and R4's local `requireClaimAccess` in routes/api/issues/[issueId]/claim/+server.ts.
+ * routes/api/attachments/[id=uuid]/+server.ts's GET (read-only), comment-access.ts's read/write
+ * pair, and R4's local `requireClaimAccess` in routes/api/issues/[issueId=uuid]/claim/+server.ts.
  * `user_report` issues go through `requireReportAccessForIssue` (§9's viewer carve-out);
  * `system_error` issues go through the existing `requireIssueAccess` (D10/D17), with the org role
  * additionally resolved so callers that need it (delete-others-comments, force-release) don't

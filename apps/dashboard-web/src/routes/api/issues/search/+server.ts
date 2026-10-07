@@ -104,7 +104,7 @@ export const GET: RequestHandler = async ({ url, locals }) => {
 	// filter below returned `[]` for everybody, so the new predicate above would be unobservable —
 	// including to any test written at this boundary, and a guard nobody can see fire is not a guard.
 	// **Only this call site.** `getAccessibleProjectIds`'s other caller,
-	// `routes/api/organizations/[orgId]/reports/+server.ts`, is left exactly as it is: a `viewer`
+	// `routes/api/organizations/[orgId=uuid]/reports/+server.ts`, is left exactly as it is: a `viewer`
 	// sees zero reports today and still does, and changing that is an access decision nobody took
 	// (contract §12 *Known limits* 8).
 	const accessibleProjectIds = new Set(

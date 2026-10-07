@@ -2,7 +2,7 @@
 //
 // This mirrors the CHECK constraint in
 // packages/db-migrations/migrations/1721900000_add_issue_lifecycle_and_relations.sql:72 and the
-// VALID_RELATION_TYPES constant that src/routes/api/issues/[issueId]/relations/+server.ts
+// VALID_RELATION_TYPES constant that src/routes/api/issues/[issueId=uuid]/relations/+server.ts
 // validates incoming writes against. Both the query layer (src/lib/db/queries/issues.ts) and any
 // UI component that renders a relationType must import RelationType from here rather than
 // re-declaring the union, so the three call sites cannot drift out of sync again.

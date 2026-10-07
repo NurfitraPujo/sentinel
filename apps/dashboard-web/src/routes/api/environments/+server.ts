@@ -1,7 +1,7 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { resolveEnvironmentUnion } from '$lib/server/environment-union';
-import { requireOrgMembership } from '../organizations/[orgId]/keys/_shared';
+import { requireOrgMembership } from '../organizations/[orgId=uuid]/keys/_shared';
 
 // GET /api/environments — sentinel-project-environments §4.3a, the cross-project union.
 //

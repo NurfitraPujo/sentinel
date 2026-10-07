@@ -9,7 +9,7 @@ vi.mock('$lib/db/schema', () => ({
 }));
 
 const shared = { requireOrgMembership: vi.fn() };
-vi.mock('../../api/organizations/[orgId]/keys/_shared', () => shared);
+vi.mock('../../api/organizations/[orgId=uuid]/keys/_shared', () => shared);
 
 const queries = { createProject: vi.fn() };
 vi.mock('$lib/db/queries/organizations', () => queries);

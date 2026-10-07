@@ -57,7 +57,7 @@ vi.mock('$lib/db/queries/issues', () => issueQueries);
 const issueAccess = { requireIssueAccess: vi.fn() };
 vi.mock('$lib/server/issue-access', () => issueAccess);
 
-const { POST, DELETE } = await import('./[issueId]/relations/+server');
+const { POST, DELETE } = await import('./[issueId=uuid]/relations/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

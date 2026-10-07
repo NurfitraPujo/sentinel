@@ -139,6 +139,7 @@ const ROUTE_TABLE = [
 	'/api/agent/issues GET',
 	'/api/agent/issues/claim-next POST',
 	'/api/agent/issues/{issueId} GET',
+	'/api/agent/issues/{issueId}/activity GET',
 	'/api/agent/issues/{issueId}/claim POST',
 	'/api/agent/issues/{issueId}/claim DELETE',
 	'/api/agent/issues/{issueId}/comments GET',
@@ -172,8 +173,9 @@ async function call(
 	opts: { key: string; params?: Record<string, string>; body?: unknown; query?: string; form?: FormData }
 ): Promise<{ status: number; body: any }> {
 	if (!ROUTE_TABLE.includes(`${routePath} ${method}`)) throw new Error(`not in ROUTE_TABLE: ${routePath} ${method}`);
+	// `{issueId}` is the directory `[issueId]` or, with a param matcher, `[issueId=uuid]` (src/params/uuid.ts).
 	const dir = routePath.replace(/^\/api\/agent/, '').replace(/\{(\w+)\}/g, '[$1]');
-	const loader = ROUTE_MODULES[`.${dir}/+server.ts`];
+	const loader = Object.entries(ROUTE_MODULES).find(([k]) => k.replace(/\[(\w+)=\w+\]/g, '[$1]') === `.${dir}/+server.ts`)?.[1];
 	if (!loader) throw new Error(`no route module for ${routePath}`);
 	const mod = (await loader()) as Record<string, Handler>;
 	const handler = mod[method];
@@ -362,12 +364,36 @@ describe.skipIf(!dbReady)('personal agent keys: authorization matrix (integratio
 			}
 		});
 
+		it("GET /issues/{id}/activity redacts a linked entry's target the owner cannot see, like the events feed", async () => {
+			const r = await call('/api/agent/issues/{issueId}/activity', 'GET', { key: keys[p], params: { issueId: issue.webProd } });
+			if (!VISIBLE[p].includes('webProd')) {
+				expect(r.status).toBe(404);
+				return;
+			}
+			expect(r.status).toBe(200);
+			// The two seeded `related` links (earlier personas' relation tests add `linked_to` ones to this issue).
+			const linked = r.body.entries.filter(
+				(e: { eventType: string; newValue: { relationType?: string } }) => e.eventType === 'linked' && e.newValue.relationType === 'related'
+			);
+			expect(linked).toHaveLength(2);
+			for (const k of ['coreProd', 'webStaging'] as const) {
+				const expected = VISIBLE[p].includes(k)
+					? { targetIssueId: issue[k], relationType: 'related' }
+					: { targetIssueId: null, targetRedacted: true, relationType: 'related' };
+				expect(linked.map((e: { newValue: unknown }) => e.newValue)).toContainEqual(expected);
+				if (!VISIBLE[p].includes(k)) expect(JSON.stringify(linked)).not.toContain(issue[k]);
+			}
+			// The actor is the owner's NAME, never the raw user id.
+			expect(linked[0].actor).toEqual({ type: 'user', id: users.owner, name: 'CBL owner', personal: false });
+		});
+
 		it.each([...ORG_A_ISSUES, 'foreign'] as IssueKey[])('single-issue reads of %s: 200 visible, 404 otherwise', async (k) => {
 			const params = { issueId: issue[k] };
 			const want = k === 'foreign' ? 404 : expectFor(p, k, 200);
 			expect((await call('/api/agent/issues/{issueId}', 'GET', { key: keys[p], params })).status).toBe(want);
 			expect((await call('/api/agent/issues/{issueId}/comments', 'GET', { key: keys[p], params })).status).toBe(want);
 			expect((await call('/api/agent/issues/{issueId}/occurrences', 'GET', { key: keys[p], params })).status).toBe(want);
+			expect((await call('/api/agent/issues/{issueId}/activity', 'GET', { key: keys[p], params })).status).toBe(want);
 			const o = await call('/api/agent/occurrences/{occurrenceId}', 'GET', { key: keys[p], params: { occurrenceId: occ[k] } });
 			expect(o.status).toBe(want);
 		});
@@ -556,7 +582,7 @@ describe.skipIf(!dbReady)('personal agent keys: authorization matrix (integratio
 		it('removing a member through the dashboard revokes their keys for good: re-adding them does not revive one', async () => {
 			const key = keys.removed;
 			expect((await call('/api/agent/self', 'GET', { key })).status).toBe(200);
-			const { DELETE } = await import('../organizations/[orgId]/members/[memberId]/+server');
+			const { DELETE } = await import('../organizations/[orgId=uuid]/members/[memberId]/+server');
 			const res = await (DELETE as any)({
 				params: { orgId: orgA, memberId: users.removed },
 				locals: { auth: async () => ({ user: { id: users.owner } }) },
@@ -576,7 +602,7 @@ describe.skipIf(!dbReady)('personal agent keys: authorization matrix (integratio
 			const key = await deviceLogin(users.support, orgA, 'agents-page');
 			const self = await call('/api/agent/self', 'GET', { key });
 			const keyId = self.body.key.id as string;
-			const { DELETE } = await import('../organizations/[orgId]/cli-keys/[keyId]/+server');
+			const { DELETE } = await import('../organizations/[orgId=uuid]/cli-keys/[keyId=uuid]/+server');
 			const as = (userId: string, orgId = orgA) =>
 				(DELETE as any)({ params: { orgId, keyId }, locals: { auth: async () => ({ user: { id: userId } }) } }).then(
 					(r: Response) => r.status,
@@ -666,7 +692,7 @@ describe.skipIf(!dbReady)('personal agent keys: authorization matrix (integratio
 				const full = path.join(dir, entry);
 				if (statSync(full).isDirectory()) walk(full, `${rel}/${entry}`);
 				else if (entry === '+server.ts') {
-					const routePath = `/api/agent${rel.replace(/\[(\w+)\]/g, '{$1}')}`;
+					const routePath = `/api/agent${rel.replace(/\[(\w+)(?:=\w+)?\]/g, '{$1}')}`;
 					for (const m of readFileSync(full, 'utf8').matchAll(/export\s+const\s+(GET|POST|PATCH|DELETE)\b/g)) {
 						discovered.push(`${routePath} ${m[1]}`);
 					}

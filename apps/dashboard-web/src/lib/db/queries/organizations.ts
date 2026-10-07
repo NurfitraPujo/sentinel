@@ -361,7 +361,7 @@ export type ClaimInvitationResult =
   | { ok: false; reason: 'not_found' | 'already_used' | 'expired' | 'inviter_no_longer_authorized' };
 
 // D31 (residual): mirrors the authority rule enforced at invitation CREATION time
-// (routes/api/organizations/[orgId]/invitations/+server.ts POST) -- only owner/admin may invite at
+// (routes/api/organizations/[orgId=uuid]/invitations/+server.ts POST) -- only owner/admin may invite at
 // all, and only owner may invite an owner. Re-applied at redemption against the inviter's CURRENT
 // role, not their role at the time they sent the invite.
 function inviterCanStillGrant(inviterRole: string, grantedRole: OrgRoleValue): boolean {

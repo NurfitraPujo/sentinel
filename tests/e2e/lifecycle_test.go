@@ -257,7 +257,7 @@ func TestU12_OlderReleaseRecurrenceDoesNotRegress(t *testing.T) {
 // ---------------------------------------------------------------------------------------------------
 
 // TestU13_IssueRelationsLinkAndUnlink is matrix row U13: issue relations link/unlink through the
-// dashboard JSON API. Route: apps/dashboard-web/src/routes/api/issues/[issueId]/relations/+server.ts.
+// dashboard JSON API. Route: apps/dashboard-web/src/routes/api/issues/[issueId=uuid]/relations/+server.ts.
 // This route used to 500 on every request because the Drizzle `issueRelations` table definition omitted
 // the DB's NOT NULL created_by_type/created_by columns; the schema (apps/dashboard-web/src/lib/db/schema.ts)
 // has since been fixed, so the link half of this row should now be reachable — this test verifies that,
@@ -335,7 +335,7 @@ func TestU13_IssueRelationsLinkAndUnlink(t *testing.T) {
 		remaining := lifecycleRelationCount(t, sourceID, targetID, "linked_to")
 		if remaining != 0 {
 			t.Fatalf("U13: unlink did not remove the issue_relations row (still %d present) after DELETE %s "+
-				"(status %d, body %q). apps/dashboard-web/src/routes/api/issues/[issueId]/relations/+server.ts "+
+				"(status %d, body %q). apps/dashboard-web/src/routes/api/issues/[issueId=uuid]/relations/+server.ts "+
 				"exports only POST — there is no DELETE handler anywhere in the dashboard routes for this "+
 				"resource (confirmed: grep for 'export const DELETE' and 'relationId' across "+
 				"apps/dashboard-web/src/routes and src/lib finds no issue-relations counterpart), so a relation "+

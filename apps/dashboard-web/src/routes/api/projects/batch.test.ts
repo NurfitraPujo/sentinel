@@ -44,7 +44,7 @@ const environmentAccess = {
 };
 vi.mock('$lib/server/environment-access', () => environmentAccess);
 
-const { POST } = await import('./[projectId]/issues/batch/+server');
+const { POST } = await import('./[projectId=uuid]/issues/batch/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

@@ -59,7 +59,7 @@ vi.mock('$lib/db/queries/issues', () => issueQueries);
 const acknowledgeEscalationQuietly = vi.fn();
 vi.mock('$lib/server/escalation', () => ({ acknowledgeEscalationQuietly }));
 
-const { PATCH } = await import('./[issueId]/status/+server');
+const { PATCH } = await import('./[issueId=uuid]/status/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

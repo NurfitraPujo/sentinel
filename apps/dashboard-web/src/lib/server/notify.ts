@@ -353,7 +353,7 @@ async function getIssueLinkInfo(
 
 /**
  * §8/§10: reports vs service-issue path, by `issue_type` -- `/[orgSlug]/reports/[issueId]` for
- * `user_report` (routes/[orgSlug]/reports/[issueId]), `/issues/[id]` for `system_error`.
+ * `user_report` (routes/[orgSlug]/reports/[issueId=uuid]), `/issues/[id]` for `system_error`.
  *
  * The service-issue half used to emit `/[orgSlug]/projects/[projectId]/issues/[issueId]`. Issue
  * detail existed at two URLs and that was the one nothing in the UI linked; `/issues/[id]` is now

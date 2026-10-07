@@ -7,6 +7,7 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
 import { denyPersonalKey } from '$lib/server/agent-access';
 import { revokePersonalKeysOfMember } from '$lib/server/cli-personal-keys';
+import { isUuid } from '$lib/uuid';
 
 async function findOrgMember(
 	executor: any,
@@ -14,12 +15,16 @@ async function findOrgMember(
 	memberId: string,
 	{ lock = false }: { lock?: boolean } = {}
 ) {
-	const byId = executor
-		.select()
-		.from(organizationMembers)
-		.where(and(eq(organizationMembers.organizationId, orgId), eq(organizationMembers.id, memberId)));
-	const [byIdRow] = lock ? await byId.for('update') : await byId;
-	if (byIdRow) return byIdRow;
+	// sentinel-issue-activity TASK-01: `memberId` may be a user id (text), so the route cannot carry the uuid matcher; only a
+	// UUID-shaped value is compared with the uuid `id` column (anything else is 22P02 -> 500), the rest go straight to userId.
+	if (isUuid(memberId)) {
+		const byId = executor
+			.select()
+			.from(organizationMembers)
+			.where(and(eq(organizationMembers.organizationId, orgId), eq(organizationMembers.id, memberId)));
+		const [byIdRow] = lock ? await byId.for('update') : await byId;
+		if (byIdRow) return byIdRow;
+	}
 
 	const byUserId = executor
 		.select()

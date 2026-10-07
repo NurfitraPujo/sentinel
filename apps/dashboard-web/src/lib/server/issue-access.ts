@@ -7,7 +7,7 @@ import { resolveEnvironmentScope } from './environment-access';
 /**
  * Org roles allowed to perform WRITE operations on issues (resolve/ignore/unresolve/assign).
  * Mirrors the allowlist enforced by the bulk path
- * (apps/dashboard-web/src/routes/api/projects/[projectId]/issues/batch/+server.ts:33) so a
+ * (apps/dashboard-web/src/routes/api/projects/[projectId=uuid]/issues/batch/+server.ts:33) so a
  * single-issue action can never be more permissive than the bulk one. D10/D23.
  */
 export const ISSUE_WRITE_ROLES = ['owner', 'admin', 'engineer', 'support'] as const;
@@ -266,7 +266,7 @@ export interface AccessibleProject {
  *
  * **It is deliberately NOT `getAccessibleProjectIds` widened in place.** That function keeps its
  * `project_members`-only derivation because decision 45 leaves one of its two callers
- * (`routes/api/organizations/[orgId]/reports/+server.ts`) exactly as it is: an org `viewer` sees
+ * (`routes/api/organizations/[orgId=uuid]/reports/+server.ts`) exactly as it is: an org `viewer` sees
  * zero reports today and widening it would make viewers start seeing their organization's reports,
  * which is an access decision and not a mechanical one (contract §12 *Known limits* 8). Both
  * derivations live here, beside each other, so the disagreement is written down rather than latent.

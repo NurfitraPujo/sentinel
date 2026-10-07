@@ -238,7 +238,7 @@ describe.skipIf(!dbReachable)(
 			async function relationsFor(userId: string | null, issueId: string) {
 				const { getIssueRelations } = await import('$lib/db/queries/issues');
 				const { resolveEnvironmentScopes } = await import('./environment-access');
-				// `null` is the FOURTH caller's shape -- `routes/api/agent/issues/[issueId]/+server.ts`
+				// `null` is the FOURTH caller's shape -- `routes/api/agent/issues/[issueId=uuid]/+server.ts`
 				// is key-authenticated with no user and no grant to resolve (*Known limits* 2), so it
 				// passes no scopes at all.
 				return userId === null

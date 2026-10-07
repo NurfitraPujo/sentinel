@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import Page from '../../../routes/issues/[id]/+page.svelte';
+import Page from '../../../routes/issues/[id=uuid]/+page.svelte';
 import {
 	pageData,
 	hostileFill,
@@ -93,7 +93,7 @@ describe('U2: no raw-HTML tag in the issue components or the issue page', () => 
 		const files = readdirSync(dir)
 			.filter((f) => f.endsWith('.svelte'))
 			.map((f) => join(dir, f))
-			.concat(join(process.cwd(), 'src/routes/issues/[id]/+page.svelte'));
+			.concat(join(process.cwd(), 'src/routes/issues/[id=uuid]/+page.svelte'));
 		expect(files.length).toBeGreaterThan(9);
 		for (const file of files) expect(readFileSync(file, 'utf8').includes(RAW_HTML_TAG), file).toBe(false);
 	});

@@ -193,6 +193,12 @@ vi.mock('$lib/server/span-pull', () => ({ requestSpanPull, SpanPullError }));
 const listOrgActivity = vi.fn();
 vi.mock('$lib/db/queries/events', () => ({ listOrgActivity }));
 
+// sentinel-issue-activity TASK-01: the paging/collapse query is mocked; its real-Postgres proof is
+// issue-activity.integration.test.ts.
+const listIssueActivityPage = vi.fn();
+class InvalidActivityCursorError extends Error {}
+vi.mock('$lib/db/queries/issue-activity', () => ({ listIssueActivityPage, InvalidActivityCursorError }));
+
 const handleAttachmentUpload = vi.fn();
 const checkDeclaredLength = vi.fn();
 vi.mock('$lib/server/upload-core', () => ({ handleAttachmentUpload, checkDeclaredLength }));
@@ -202,19 +208,20 @@ vi.mock('$lib/server/upload-core', () => ({ handleAttachmentUpload, checkDeclare
 // ---------------------------------------------------------------------------
 
 const issuesListRoute = await import('../../../routes/api/agent/issues/+server');
-const issueDetailRoute = await import('../../../routes/api/agent/issues/[issueId]/+server');
-const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId]/occurrences/+server');
+const issueDetailRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/+server');
+const issueActivityRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/activity/+server');
+const occurrencesRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/occurrences/+server');
 const traceRoute = await import('../../../routes/api/agent/traces/[traceId]/+server');
 const pullRoute = await import('../../../routes/api/agent/traces/[traceId]/pull/+server');
-const occurrenceRoute = await import('../../../routes/api/agent/occurrences/[occurrenceId]/+server');
-const claimRoute = await import('../../../routes/api/agent/issues/[issueId]/claim/+server');
+const occurrenceRoute = await import('../../../routes/api/agent/occurrences/[occurrenceId=uuid]/+server');
+const claimRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/claim/+server');
 const claimNextRoute = await import('../../../routes/api/agent/issues/claim-next/+server');
 const selfRoute = await import('../../../routes/api/agent/self/+server');
-const statusRoute = await import('../../../routes/api/agent/issues/[issueId]/status/+server');
-const commentsRoute = await import('../../../routes/api/agent/issues/[issueId]/comments/+server');
-const questionsRoute = await import('../../../routes/api/agent/issues/[issueId]/questions/+server');
-const progressRoute = await import('../../../routes/api/agent/issues/[issueId]/progress/+server');
-const relationsRoute = await import('../../../routes/api/agent/issues/[issueId]/relations/+server');
+const statusRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/status/+server');
+const commentsRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/comments/+server');
+const questionsRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/questions/+server');
+const progressRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/progress/+server');
+const relationsRoute = await import('../../../routes/api/agent/issues/[issueId=uuid]/relations/+server');
 const projectsRoute = await import('../../../routes/api/agent/projects/+server');
 const eventsRoute = await import('../../../routes/api/agent/events/+server');
 const uploadsRoute = await import('../../../routes/api/agent/uploads/+server');
@@ -375,6 +382,61 @@ describe('GET /api/agent/issues/{issueId}', () => {
 		await expect(issueDetailRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1', { issueId: 'issue-1' }))).rejects.toMatchObject({
 			status: 404,
 		});
+	});
+});
+
+describe('GET /api/agent/issues/{issueId}/activity', () => {
+	const at = '2026-10-01T12:00:00.123456Z';
+	const actor = (type: 'user' | 'agent' | 'system', id: string, name: string | null, personal = false) => ({ type, id, name, personal });
+
+	it('200: matches IssueActivityResponseSchema (every optional block present)', async () => {
+		listIssueActivityPage.mockResolvedValue({
+			entries: [
+				{
+					id: 'a-1', seq: 9, eventType: 'occurrence_burst', actorType: 'system', actorId: 'sentinel-processor',
+					actor: actor('system', 'sentinel-processor', 'Sentinel'), oldValue: null, newValue: { count: 40, lastSeen: at }, createdAt: at,
+					burst: { rows: 3, firstAt: at, lastAt: at, occurrencesFrom: 12, occurrencesTo: 40 },
+				},
+				{
+					id: 'a-2', seq: 8, eventType: 'commented', actorType: 'agent', actorId: 'agent-1',
+					actor: actor('agent', 'agent-1', 'Ada (CLI)', true), oldValue: null, newValue: { commentId: 'c-1', parentId: null }, createdAt: at,
+					comment: { id: 'c-1', excerpt: 'looking', deleted: false },
+				},
+				{
+					id: 'a-3', seq: 7, eventType: 'assigned', actorType: 'system', actorId: 'system',
+					actor: actor('system', 'system', 'System'), oldValue: null, newValue: { assigneeType: 'user', assignedTo: 'u-1' }, createdAt: at,
+					assignee: actor('user', 'u-1', 'Ada'),
+				},
+			],
+			nextCursor: 'MjAyNi0xMC0wMVQxMjowMDowMC4xMjM0NTZafDc',
+			hasMore: true,
+		});
+		const res = await issueActivityRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/activity?limit=3', { issueId: 'issue-1' }));
+		expect(res.status).toBe(200);
+		expect(S.IssueActivityResponseSchema.parse(await res.json())).toBeTruthy();
+		expect(listIssueActivityPage).toHaveBeenCalledWith({ issueId: 'issue-1', organizationId: 'org-1', limit: 3, before: null });
+	});
+
+	it('400: rejects an invalid limit before reading', async () => {
+		await expect(
+			issueActivityRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/activity?limit=-1', { issueId: 'issue-1' }))
+		).rejects.toMatchObject({ status: 400 });
+		expect(listIssueActivityPage).not.toHaveBeenCalled();
+	});
+
+	it('400: rejects a cursor that is not a nextCursor', async () => {
+		listIssueActivityPage.mockRejectedValue(new InvalidActivityCursorError('before must be a nextCursor from a previous page'));
+		await expect(
+			issueActivityRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/activity?before=garbage', { issueId: 'issue-1' }))
+		).rejects.toMatchObject({ status: 400 });
+	});
+
+	it('404: an issue outside the key\'s scope is the same 404 as GET /api/agent/issues/{issueId}, and nothing is read', async () => {
+		resolveAgentIssueScope.mockRejectedValue(Object.assign(new Error('Issue not found'), { status: 404, body: { message: 'Issue not found' } }));
+		await expect(
+			issueActivityRoute.GET(makeEvent('http://localhost/api/agent/issues/issue-1/activity', { issueId: 'issue-1' }))
+		).rejects.toMatchObject({ status: 404 });
+		expect(listIssueActivityPage).not.toHaveBeenCalled();
 	});
 });
 

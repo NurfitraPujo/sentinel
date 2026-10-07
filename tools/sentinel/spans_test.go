@@ -52,7 +52,7 @@ func TestIssuesOccurrences_WithSpansSendsFilterAndShowsStatusColumn(t *testing.T
 	srv, rec := newRecordingServer(t, 200, `{"occurrences":[{"id":"o1","spansStatus":"available","hasSpans":true},{"id":"o2","spansStatus":"pending","hasSpans":false}],"spansScan":{"scanned":2000,"exhausted":false},"nextBefore":"2026-10-01T00:00:00.000Z"}`)
 	e, out, errBuf := newTestEnv(srv, "k")
 	e.format = "table"
-	if code := cmdIssues(context.Background(), e, []string{"occurrences", "iss-1", "--with-spans", "--limit", "5"}); code != ExitOK {
+	if code := cmdIssues(context.Background(), e, []string{"occurrences", "11111111-1111-4111-8111-111111111111", "--with-spans", "--limit", "5"}); code != ExitOK {
 		t.Fatalf("exit %d: %s", code, errBuf)
 	}
 	if !strings.Contains(rec.Query, "hasSpans=true") || !strings.Contains(rec.Query, "limit=5") {
@@ -69,7 +69,7 @@ func TestIssuesOccurrences_WithSpansSendsFilterAndShowsStatusColumn(t *testing.T
 func TestIssuesOccurrences_WithoutFlagSendsNoFilter(t *testing.T) {
 	srv, rec := newRecordingServer(t, 200, `{"occurrences":[]}`)
 	e, _, _ := newTestEnv(srv, "k")
-	cmdIssues(context.Background(), e, []string{"occurrences", "iss-1"})
+	cmdIssues(context.Background(), e, []string{"occurrences", "11111111-1111-4111-8111-111111111111"})
 	if strings.Contains(rec.Query, "hasSpans") {
 		t.Fatalf("query = %q", rec.Query)
 	}

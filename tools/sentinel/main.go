@@ -30,8 +30,9 @@
 //	sentinel [--profile P] [-url URL] [-key KEY] [-format json|table] <command> [args...]
 //
 //	sentinel issues list [--type user_report|system_error] [--claimed true|false] [--project ID] [--waiting true]
-//	sentinel issues get <issueId>
+//	sentinel issues get <issueId>                       ("issue" = "issues", "show" = "get")
 //	sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]
+//	sentinel issue activity <issueId> [--limit N] [--before CURSOR] [--all] [--json]
 //	sentinel spans pull <traceId|occurrenceId> [--wait] [--timeout 3m]
 //	sentinel claim <issueId>
 //	sentinel claim-next [--type T] [--project ID] [--environment E] [--source S] [--sort firstSeen|lastSeen]
@@ -59,11 +60,15 @@
 //	sentinel profile list | use <name> | remove <name>
 //	sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]
 //	sentinel guide
+//	sentinel help [command]          (or: sentinel <command> --help)
 //	sentinel key rotate
 //	sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me] [--follow] [--interval SEC]
 //	sentinel batch -f ops.json [--stop-on-error=false]
 //	sentinel upload <file> --issue <id> [--comment <text>]
 //	sentinel upload <issueId> <file>   (deprecated two-positional form, issueId ignored)
+//
+// Every id argument is checked to be a UUID before any request (ids.go), and -h/--help anywhere prints the command's
+// usage instead of running it (help.go).
 //
 // Exit codes: 0 ok, 1 network/server error, 2 usage error, 3 auth failure (401/403), 4 not found
 // (404), 5 conflict (409), 6 validation error (400/422). On any non-zero exit the server's error
@@ -102,7 +107,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	format := fs.String("format", "json", `output format: "json" (default) or "table" (list-shaped commands only)`)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]")
-		fmt.Fprintln(stderr, "commands: login, logout, profile, config, version, guide, agent, issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
+		fmt.Fprintln(stderr, "commands: login, logout, profile, config, version, guide, agent, issues (issue), claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload, spans, help")
+		fmt.Fprintln(stderr, "run `sentinel <command> --help` for a command's usage")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -119,6 +125,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	name, cmdArgs := rest[0], rest[1:]
+
+	// Help is answered here, before any command runs (help.go): a command must never receive "--help" as an argument.
+	if name == "help" {
+		return printHelp(stdout, cmdArgs)
+	}
+	if helpRequested(cmdArgs) {
+		if u, ok := usageFor(name, cmdArgs); ok {
+			fmt.Fprintln(stdout, u)
+			return ExitOK
+		}
+	}
 
 	gflags := cfgFlags{URL: *urlFlag, Key: *keyFlag, Profile: *profileFlag}
 

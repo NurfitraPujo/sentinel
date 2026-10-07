@@ -692,6 +692,65 @@ export const EventsResponseSchema = z
 	.strict();
 
 // ---------------------------------------------------------------------------
+// GET /api/agent/issues/{issueId}/activity -- issue-activity.ts's `listIssueActivityPage` ($lib/issue-activity types)
+// ---------------------------------------------------------------------------
+
+export const IssueActivityQuerySchema = z
+	.object({
+		// Entries per page (an `occurrence_burst` run counts as one), clamped to [1, 200], default 50.
+		limit: z.string().regex(/^\d+$/).optional(),
+		// The previous page's `nextCursor` (opaque).
+		before: z.string().optional(),
+	})
+	.strict();
+
+const ActivityActorSchema = z
+	.object({
+		type: z.enum(['user', 'agent', 'system']),
+		id: z.string(),
+		// A user's name (else email); an org agent's name; "<owner name> (CLI)" for a personal CLI agent; a label for a
+		// system actor. Null only when the user/agent no longer exists.
+		name: z.string().nullable(),
+		personal: z.boolean(),
+	})
+	.strict();
+
+export const IssueActivityEntrySchema = z
+	.object({
+		id: z.string(),
+		seq: z.number(),
+		eventType: AgentEventTypeSchema,
+		actorType: z.enum(['user', 'agent', 'system']),
+		actorId: z.string(),
+		actor: ActivityActorSchema,
+		oldValue: z.unknown(),
+		newValue: z.unknown(),
+		createdAt: z.string(),
+		comment: z.object({ id: z.string(), excerpt: z.string().nullable(), deleted: z.boolean() }).strict().optional(),
+		assignee: ActivityActorSchema.optional(),
+		// occurrence_burst only: the run of consecutive burst rows this entry collapses.
+		burst: z
+			.object({
+				rows: z.number().int(),
+				firstAt: z.string(),
+				lastAt: z.string(),
+				occurrencesFrom: z.number().nullable(),
+				occurrencesTo: z.number().nullable(),
+			})
+			.strict()
+			.optional(),
+	})
+	.strict();
+
+export const IssueActivityResponseSchema = z
+	.object({
+		entries: z.array(IssueActivityEntrySchema),
+		nextCursor: z.string().nullable(),
+		hasMore: z.boolean(),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
 // POST /api/agent/uploads -- upload-core.ts's `UploadCoreResult`
 // ---------------------------------------------------------------------------
 

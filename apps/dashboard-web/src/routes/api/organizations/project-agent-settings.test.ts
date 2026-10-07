@@ -47,12 +47,12 @@ const agentSettingsQueries = {
 };
 vi.mock('$lib/db/queries/agent-settings', () => agentSettingsQueries);
 
-const { GET, PUT } = await import('./[orgId]/projects/[projectId]/agent-settings/+server');
+const { GET, PUT } = await import('./[orgId=uuid]/projects/[projectId=uuid]/agent-settings/+server');
 const {
 	GET: repoGET,
 	PUT: repoPUT,
 	DELETE: repoDELETE,
-} = await import('./[orgId]/projects/[projectId]/repo-connection/+server');
+} = await import('./[orgId=uuid]/projects/[projectId=uuid]/repo-connection/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

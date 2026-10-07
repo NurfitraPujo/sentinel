@@ -605,7 +605,7 @@ async function sweepAffectedSideTable(
  * here just leaves an invisible orphaned object, not a dangling DB reference.
  */
 // R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): exported so the report delete route
-// (routes/api/organizations/[orgId]/reports/[issueId]/+server.ts) reuses this exact helper
+// (routes/api/organizations/[orgId=uuid]/reports/[issueId=uuid]/+server.ts) reuses this exact helper
 // instead of growing a second copy of the same best-effort-delete-and-log pattern.
 // sentinel-sourcemaps §4.1: returns the keys whose delete FAILED (still logged, still swallowed)
 // so the sourcemap upload route can count each one under `uploads_total{outcome="storage_error"}`

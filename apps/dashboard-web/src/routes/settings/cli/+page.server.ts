@@ -2,12 +2,11 @@ import { error, fail } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { getPersonalKey, isLivePersonalKey, listPersonalKeysForUser, revokePersonalKey } from '$lib/server/cli-personal-keys';
 import { approveRequestIsSameOrigin } from '$lib/server/cli-approve';
+import { isUuid } from '$lib/uuid';
 
 // sentinel-cli-browser-login (docs/plans/CLI_BROWSER_LOGIN.md). /settings/cli -- "CLI sessions": the signed-in user's own
 // personal keys (one per device per organization), with Revoke. The parent +layout.server.ts enforces a session; this
 // file re-reads it for the user id. There is no "last used" column: keys do not track one, and none is invented here.
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const load: PageServerLoad = async ({ locals }) => {
 	const session = await locals.auth();
@@ -40,7 +39,7 @@ export const actions: Actions = {
 		if (!userId) return fail(401, { error: 'Sign in first.' });
 
 		const keyId = (await request.formData()).get('keyId');
-		const key = typeof keyId === 'string' && UUID_RE.test(keyId) ? await getPersonalKey(keyId) : undefined;
+		const key = typeof keyId === 'string' && isUuid(keyId) ? await getPersonalKey(keyId) : undefined;
 		// Only the caller's OWN key; anyone else's is indistinguishable from a missing one.
 		if (!key || key.ownerUserId !== userId) {
 			return fail(404, { error: 'CLI session not found.' });

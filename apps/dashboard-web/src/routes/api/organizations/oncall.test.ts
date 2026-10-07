@@ -56,10 +56,10 @@ vi.mock('$lib/db/queries/oncall', async (importOriginal) => {
 	return { ...actual, ...queries };
 });
 
-const { GET, PUT, PATCH, DELETE } = await import('./[orgId]/oncall/+server');
-const { POST: POST_OVERRIDE } = await import('./[orgId]/oncall/overrides/+server');
+const { GET, PUT, PATCH, DELETE } = await import('./[orgId=uuid]/oncall/+server');
+const { POST: POST_OVERRIDE } = await import('./[orgId=uuid]/oncall/overrides/+server');
 const { DELETE: DELETE_OVERRIDE } = await import(
-	'./[orgId]/oncall/overrides/[overrideId]/+server'
+	'./[orgId=uuid]/oncall/overrides/[overrideId=uuid]/+server'
 );
 
 const ORG = '11111111-1111-4111-8111-111111111111';

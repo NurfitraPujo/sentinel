@@ -125,7 +125,7 @@ describe.skipIf(!dbReachable)('grant lifecycle (integration, real Postgres)', ()
 	// ------------------------------------------------- decision 40, criterion 3 (first half)
 
 	it('removing an org member deletes their grants for that org\'s projects, and leaves other organizations\' grants alone', async () => {
-		const { DELETE } = await import('./[orgId]/members/[memberId]/+server');
+		const { DELETE } = await import('./[orgId=uuid]/members/[memberId]/+server');
 		const res = await DELETE({
 			params: { orgId, memberId },
 			locals: locals(ownerId),
@@ -160,7 +160,7 @@ describe.skipIf(!dbReachable)('grant lifecycle (integration, real Postgres)', ()
 			});
 		}) as never);
 
-		const { DELETE } = await import('./[orgId]/members/[memberId]/+server');
+		const { DELETE } = await import('./[orgId=uuid]/members/[memberId]/+server');
 		await expect(
 			DELETE({ params: { orgId, memberId }, locals: locals(ownerId) } as never)
 		).rejects.toBeInstanceOf(Abort);
@@ -182,7 +182,7 @@ describe.skipIf(!dbReachable)('grant lifecycle (integration, real Postgres)', ()
 	// -------------------------------------------------- §4.10a, criterion 3 (second half)
 
 	async function invite(environmentScopes?: unknown) {
-		const { POST } = await import('./[orgId]/invitations/+server');
+		const { POST } = await import('./[orgId=uuid]/invitations/+server');
 		const res = await POST({
 			params: { orgId },
 			request: new Request('http://x', {
@@ -214,7 +214,7 @@ describe.skipIf(!dbReachable)('grant lifecycle (integration, real Postgres)', ()
 	}
 
 	async function declareEnv(on: string, name: string) {
-		const { POST } = await import('./[orgId]/projects/[projectId]/environments/+server');
+		const { POST } = await import('./[orgId=uuid]/projects/[projectId=uuid]/environments/+server');
 		const res = await POST({
 			params: { orgId, projectId: on },
 			request: new Request('http://x', { method: 'POST', body: JSON.stringify({ name }) }),
@@ -350,7 +350,7 @@ describe.skipIf(!dbReachable)('grant lifecycle (integration, real Postgres)', ()
 			invite([{ projectId: otherOrgProjectId, environments: ['staging'] }])
 		).rejects.toMatchObject({ status: 404 });
 
-		const { POST } = await import('./[orgId]/invitations/+server');
+		const { POST } = await import('./[orgId=uuid]/invitations/+server');
 		await expect(
 			POST({
 				params: { orgId },

@@ -42,11 +42,26 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}',
 		method: 'get',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/+server.ts',
 		operationId: 'getIssue',
 		summary: 'Full issue detail (spans user_report and system_error)',
 		responses: {
 			'200': S.IssueDetailResponseSchema,
+			'401': S.UnauthorizedErrorSchema,
+			'404': S.MessageErrorSchema,
+		},
+	},
+	{
+		path: '/api/agent/issues/{issueId}/activity',
+		method: 'get',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/activity/+server.ts',
+		operationId: 'listIssueActivity',
+		summary:
+			'One issue\'s activity history, newest first, keyset-paged (before=<nextCursor>); a run of consecutive occurrence_burst rows is one entry with `burst`',
+		request: { querySchema: S.IssueActivityQuerySchema },
+		responses: {
+			'200': S.IssueActivityResponseSchema,
+			'400': S.MessageErrorSchema,
 			'401': S.UnauthorizedErrorSchema,
 			'404': S.MessageErrorSchema,
 		},
@@ -70,7 +85,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/occurrences',
 		method: 'get',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/occurrences/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/occurrences/+server.ts',
 		operationId: 'listIssueOccurrences',
 		summary:
 			'Newest-first page of occurrences (system_error issues), each with spansStatus/hasSpans; hasSpans=true keeps only occurrences with spans (a walk bounded to the newest 2,000 occurrences; before=<nextBefore> continues it)',
@@ -115,7 +130,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/occurrences/{occurrenceId}',
 		method: 'get',
-		routeFile: 'src/routes/api/agent/occurrences/[occurrenceId]/+server.ts',
+		routeFile: 'src/routes/api/agent/occurrences/[occurrenceId=uuid]/+server.ts',
 		operationId: 'getOccurrence',
 		summary:
 			"One occurrence of the calling key's organization, with its trace id and spans status (404 for a malformed id or one of another organization)",
@@ -128,7 +143,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/claim',
 		method: 'post',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/claim/+server.ts',
 		operationId: 'claimIssue',
 		summary:
 			'Atomically claim an issue (idempotent self-reclaim: re-claiming an issue you already hold returns 200 with alreadyClaimed:true, not 409; 409 only if held by someone else)',
@@ -143,7 +158,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/claim',
 		method: 'delete',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/claim/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/claim/+server.ts',
 		operationId: 'releaseClaim',
 		summary:
 			"Release your own claim (idempotent: releasing an already-unclaimed issue returns 200, not 409; cannot release another agent's claim)",
@@ -158,7 +173,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/status',
 		method: 'patch',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/status/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/status/+server.ts',
 		operationId: 'updateIssueStatus',
 		summary:
 			'Change issue status (idempotent: retrying the same status+resolved_in_version returns changed:false, no duplicate activity/notification)',
@@ -174,7 +189,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/comments',
 		method: 'get',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/comments/+server.ts',
 		operationId: 'listComments',
 		summary: 'Poll comments (e.g. to see answers to a blocking question)',
 		request: { querySchema: S.CommentsQuerySchema },
@@ -188,7 +203,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/comments',
 		method: 'post',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/comments/+server.ts',
 		operationId: 'postComment',
 		summary:
 			'Post a non-blocking comment (emails subscribers). Optional idempotency_key: a repeat replays the original comment with deduplicated:true, no second email',
@@ -205,7 +220,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/comments/{commentId}',
 		method: 'patch',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/[commentId]/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/comments/[commentId=uuid]/+server.ts',
 		operationId: 'editComment',
 		summary: 'Edit your own comment (403 for another author, agent or human)',
 		request: { bodySchema: S.EditCommentBodySchema },
@@ -220,7 +235,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/comments/{commentId}',
 		method: 'delete',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/comments/[commentId]/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/comments/[commentId=uuid]/+server.ts',
 		operationId: 'deleteComment',
 		summary: 'Delete your own comment (403 for another author, agent or human)',
 		responses: {
@@ -233,7 +248,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/report/severity',
 		method: 'patch',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/report/severity/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/report/severity/+server.ts',
 		operationId: 'updateReportSeverity',
 		summary: 'Set the severity of a user_report issue (400 for a system_error issue)',
 		request: { bodySchema: S.SeverityBodySchema },
@@ -248,7 +263,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/questions',
 		method: 'post',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/questions/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/questions/+server.ts',
 		operationId: 'askQuestion',
 		summary:
 			'Ask a blocking question (sets waiting_on, forces an immediate email). Optional idempotency_key: a repeat replays the original question comment id with deduplicated:true and no second email',
@@ -265,7 +280,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/progress',
 		method: 'post',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/progress/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/progress/+server.ts',
 		operationId: 'postProgress',
 		summary:
 			'Post an in-app-only progress update (no email). Optional idempotency_key: a repeat replays a deduplicated success with no second progress row',
@@ -282,7 +297,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/relations',
 		method: 'post',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/relations/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/relations/+server.ts',
 		operationId: 'addRelation',
 		summary:
 			"Add a relation from this issue to another (409 for an exact duplicate; also 409 for caused_by if the REVERSE pair already exists -- would create a 2-cycle)",
@@ -299,7 +314,7 @@ export const agentApiRegistry: RegistryEntry[] = [
 	{
 		path: '/api/agent/issues/{issueId}/relations',
 		method: 'delete',
-		routeFile: 'src/routes/api/agent/issues/[issueId]/relations/+server.ts',
+		routeFile: 'src/routes/api/agent/issues/[issueId=uuid]/relations/+server.ts',
 		operationId: 'removeRelation',
 		summary: 'Remove a relation, identified by (target_issue_id, relation_type)',
 		request: { bodySchema: S.RelationBodySchema },

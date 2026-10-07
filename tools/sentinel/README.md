@@ -131,7 +131,8 @@ group- or world-readable.
 | Command | HTTP call | Notes |
 |---|---|---|
 | `sentinel issues list [--type T] [--claimed true\|false] [--project ID] [--waiting true]` | `GET /api/agent/issues` | |
-| `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` | full detail: issue, report, latest occurrence, relations |
+| `sentinel issues get <issueId>` | `GET /api/agent/issues/:id` | full detail: issue, report, latest occurrence, relations; `sentinel issue show <issueId>` is the same |
+| `sentinel issue activity <issueId> [--limit N] [--before CURSOR] [--all] [--json]` | `GET /api/agent/issues/:id/activity` | the issue's history, newest first, as a table (WHEN (UTC), WHO, WHAT, DETAIL); a run of consecutive occurrence bursts is one line; prints the `--before` cursor for the next page on stderr; `--all` follows every page; `--json` prints the response (merged with `--all`) |
 | `sentinel issues occurrences <issueId> [--limit N] [--before TS] [--with-spans]` | `GET /api/agent/issues/:id/occurrences` | newest-first page; rows carry `spansStatus`; `--with-spans` sends `hasSpans=true` |
 | `sentinel spans pull <traceId\|occurrenceId> [--wait] [--timeout 3m]` | `POST /api/agent/traces/:id/pull` | pull a trace's spans now; `--wait` polls to available (exit 0) / finished with none (exit 4) / timeout (exit 1) |
 | `sentinel claim <issueId>` | `POST /api/agent/issues/:id/claim` | 409 on conflict |
@@ -160,7 +161,17 @@ group- or world-readable.
 | `sentinel upload <issueId> <file>` | `POST /api/agent/uploads` (multipart) | deprecated two-positional form; see mismatch note below |
 
 Global flags (`-url`, `-key`, `-format json|table`) go **before** the subcommand name; every
-per-command flag is accepted either before or after its positional arguments.
+per-command flag is accepted either before or after its positional arguments. `issue` is an alias of `issues`, and
+`show` of `get`.
+
+**Help.** `sentinel <command> [sub] --help` (or `-h`, or `sentinel help <command>`) prints that command's usage to
+stdout and exits 0 — it is decided before any command runs (`help.go`), so `--help` can never be sent as an id (it
+once was: `sentinel issues get --help` requested `/api/agent/issues/--help`).
+
+**Ids.** Every issue / comment / attachment / target-issue id argument must be a UUID (either case). Anything else —
+a flag where the id goes, a truncated id — is refused before any request with exit 2 and a message naming the
+argument (`ids.go`). The API has no short-id or prefix forms, so nothing else is accepted. `members remove` also takes
+a user id, so it only refuses a flag-looking value.
 
 `-format table` renders list-shaped responses (`issues list`, `issues occurrences`, `comments`,
 `projects`, `members list`, `events`, `batch`) as a column table instead of pretty JSON.
@@ -171,7 +182,7 @@ per-command flag is accepted either before or after its positional arguments.
 |---|---|
 | 0 | ok |
 | 1 | network failure, or an unmapped/5xx server error |
-| 2 | usage error (bad flags/arguments — no request was made) |
+| 2 | usage error (bad flags/arguments, an id that is not a UUID — no request was made) |
 | 3 | auth failure (401/403) |
 | 4 | not found (404) |
 | 5 | conflict (409) — e.g. claiming an already-claimed issue |

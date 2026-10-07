@@ -4,6 +4,7 @@ import { issues } from '$lib/db/schema';
 import { db } from '$lib/server/db';
 import type { AgentAuthContext } from '$lib/server/agent-auth';
 import { agentVisibility, isVisibleToAgent } from '$lib/server/agent-access';
+import { isUuid } from '$lib/uuid';
 
 /**
  * sentinel-cli-browser-login: an issue's relations as this key may see them. Unchanged for an org agent; for a personal key,
@@ -38,8 +39,7 @@ export async function redactLinkedEventTargets<E extends { eventType: string; ne
 	const ids = [...new Set(events.map(targetOf).filter((id): id is string => id !== null))];
 	if (ids.length === 0) return events;
 
-	const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-	const lookup = ids.filter((id) => UUID_RE.test(id));
+	const lookup = ids.filter((id) => isUuid(id));
 	const rows = lookup.length
 		? await db.select({ id: issues.id, projectId: issues.projectId, environment: issues.environment }).from(issues).where(inArray(issues.id, lookup))
 		: [];

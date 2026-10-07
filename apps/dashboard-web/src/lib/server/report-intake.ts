@@ -1,4 +1,5 @@
 import { reportErrorResponse } from '$lib/server/report-auth';
+import { isUuid } from '$lib/uuid';
 
 /**
  * sentinel-user-report-issue contract §4.1 — the request half of `POST /api/report`: the 1 MiB
@@ -48,8 +49,6 @@ export type ReportSeverity = (typeof REPORT_SEVERITIES)[number];
 export const DEFAULT_SEVERITY: ReportSeverity = 'medium';
 
 /** Canonical UUID v4-shaped id, as §4.1's `attachments` array declares. */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 const encoder = new TextEncoder();
 
 /** §4.1's request body, after validation. Every optional field is normalised to `null`. */
@@ -313,7 +312,7 @@ function parseAttachments(value: unknown): string[] {
 		// A malformed id is `invalid_request`, not `attachment_not_found`: the latter is reserved for
 		// an id that is well-formed but unknown/claimed/another tenant's, and it must stay a single
 		// undifferentiated answer so the endpoint cannot probe another tenant's attachment ids.
-		if (typeof entry !== 'string' || !UUID_RE.test(entry)) {
+		if (typeof entry !== 'string' || !isUuid(entry)) {
 			throw invalid('attachments must contain attachment ids.', 'attachments');
 		}
 		ids.push(entry);

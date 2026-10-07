@@ -54,7 +54,8 @@ is outside their projects. `members` and `repo-credentials` always return 403 fo
 
 ```
 sentinel issues list [--type T] [--claimed true|false] [--project ID] [--waiting true]
-sentinel issues get <issueId>
+sentinel issues get <issueId>                          # = sentinel issue show <issueId>
+sentinel issue activity <issueId> [--all] [--json]     # who claimed it, status changes, comments, progress, regressions, bursts
 sentinel issues occurrences <issueId> [--with-spans]   # spansStatus per row; --with-spans = only occurrences with spans
 sentinel spans pull <traceId|occurrenceId> [--wait]    # pull a trace's spans now; --wait: exit 0 available, 4 none, 1 timeout
 sentinel claim <issueId>            # 409 / exit 5 = owned by someone else, back off
@@ -74,6 +75,9 @@ sentinel batch -f ops.json                    # up to 20 mutations, one round tr
 Exit codes: `0` ok, `1` network/5xx, `2` usage, `3` auth, `4` not found, `5` conflict,
 `6` validation. On a non-zero exit the server's message is on stderr.
 
+`sentinel <command> --help` prints that command's usage and sends nothing. Ids are full UUIDs (there are no short
+forms); an id that is not one is refused locally with exit `2` — re-read it from `issues list`, don't guess.
+
 Spans: an occurrence's `spansStatus` is `available` | `pending` | `none` (null: no trace id). Few traces are pulled
 automatically; `spans pull` fetches one on demand (idempotent; only for organizations allow-listed for span pull —
 else 403/exit 3; ~30 accepted pulls per org per hour — shared by people AND agents — then 429/exit 1 with a Retry-After).
@@ -83,7 +87,9 @@ else 403/exit 3; ~30 accepted pulls per org per hour — shared by people AND ag
 1. **Discover** — `sentinel claim-next` (atomic pick + claim + detail) or `sentinel issues list
    --claimed false`.
 2. **Read** — `sentinel issues get <id>`: `system_error` → `latestOccurrence.stacktrace`;
-   `user_report` → `report.bodyMd` / `report.severity`.
+   `user_report` → `report.bodyMd` / `report.severity`. `sentinel issue activity <id>` shows what has
+   already happened to it (earlier claims, comments, regressions, how often it has been bursting) —
+   read it before re-doing someone else's work.
 3. **Act** — post a triage `comment` with your findings; if blocked on information, `question`
    (sets `waiting_on` and emails; ANY user reply clears it) and `release`; otherwise
    `status resolved` (or `ignored`) and `release`.

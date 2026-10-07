@@ -5,6 +5,7 @@ import { log } from '$lib/server/observability/log';
 import { earliestTraceOccurrenceAt } from '$lib/server/queries/trace-queries';
 import { getSpansState, type SpanScope } from '$lib/server/queries/span-queries';
 import type { SpansReason, SpansStatus } from '$lib/spans/status';
+import { isLowerUuid } from '$lib/uuid';
 
 /**
  * sentinel-occurrence-spans TASK-02 — pull ONE trace's spans from the trace store now, on a person's or an agent's
@@ -54,8 +55,6 @@ export interface SpanPullConfig {
 	limitPerHour: number;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
 /**
  * Read per call (`$env/dynamic/private` is dynamic). The value is the SAME `SPAN_PULL_SCOPES` the processor reads — the
  * chart renders it into both — so the two cannot disagree about who is allow-listed. A malformed entry is skipped here
@@ -65,7 +64,7 @@ export function getSpanPullConfig(): SpanPullConfig {
 	const scopes = new Map<string, string>();
 	for (const pair of (env.SPAN_PULL_SCOPES ?? '').split(',')) {
 		const [org, project, extra] = pair.trim().toLowerCase().split(':');
-		if (extra === undefined && org && project && UUID_RE.test(org) && UUID_RE.test(project)) scopes.set(org, project);
+		if (extra === undefined && org && project && isLowerUuid(org) && isLowerUuid(project)) scopes.set(org, project);
 	}
 	const raw = (env.SPAN_PULL_ON_DEMAND_LIMIT ?? '').trim();
 	const parsed = /^\d+$/.test(raw) ? Number(raw) : NaN;

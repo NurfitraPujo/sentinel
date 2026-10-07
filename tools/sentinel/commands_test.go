@@ -82,22 +82,22 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 		},
 		{
 			name:       "issues get",
-			args:       []string{"issues", "get", "iss-1"},
+			args:       []string{"issues", "get", "11111111-1111-4111-8111-111111111111"},
 			wantMethod: "GET",
-			wantPath:   "/api/agent/issues/iss-1",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111",
 		},
 		{
 			name:       "issues occurrences",
-			args:       []string{"issues", "occurrences", "iss-1", "--limit", "5", "--before", "2026-01-01T00:00:00Z"},
+			args:       []string{"issues", "occurrences", "11111111-1111-4111-8111-111111111111", "--limit", "5", "--before", "2026-01-01T00:00:00Z"},
 			wantMethod: "GET",
-			wantPath:   "/api/agent/issues/iss-1/occurrences",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/occurrences",
 			wantQuery:  map[string]string{"limit": "5", "before": "2026-01-01T00:00:00Z"},
 		},
 		{
 			name:       "claim",
-			args:       []string{"claim", "iss-1"},
+			args:       []string{"claim", "11111111-1111-4111-8111-111111111111"},
 			wantMethod: "POST",
-			wantPath:   "/api/agent/issues/iss-1/claim",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/claim",
 		},
 		{
 			name:       "claim-next with filters",
@@ -108,78 +108,78 @@ func TestCommands_MethodPathQueryBodyAndAuth(t *testing.T) {
 		},
 		{
 			name:       "release",
-			args:       []string{"release", "iss-1"},
+			args:       []string{"release", "11111111-1111-4111-8111-111111111111"},
 			wantMethod: "DELETE",
-			wantPath:   "/api/agent/issues/iss-1/claim",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/claim",
 		},
 		{
 			name:       "status with resolved-in",
-			args:       []string{"status", "iss-1", "resolved", "--resolved-in", "v2.3.0"},
+			args:       []string{"status", "11111111-1111-4111-8111-111111111111", "resolved", "--resolved-in", "v2.3.0"},
 			wantMethod: "PATCH",
-			wantPath:   "/api/agent/issues/iss-1/status",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/status",
 			wantBody:   map[string]interface{}{"status": "resolved", "resolved_in_version": "v2.3.0"},
 		},
 		{
 			name:       "comment",
-			args:       []string{"comment", "iss-1", "--body", "hello **world**"},
+			args:       []string{"comment", "11111111-1111-4111-8111-111111111111", "--body", "hello **world**"},
 			wantMethod: "POST",
-			wantPath:   "/api/agent/issues/iss-1/comments",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/comments",
 			wantBody:   map[string]interface{}{"body_md": "hello **world**"},
 		},
 		{
 			name:       "comment edit",
-			args:       []string{"comment", "edit", "iss-1", "c-1", "--body", "revised"},
+			args:       []string{"comment", "edit", "11111111-1111-4111-8111-111111111111", "c0000000-0000-4000-8000-000000000001", "--body", "revised"},
 			wantMethod: "PATCH",
-			wantPath:   "/api/agent/issues/iss-1/comments/c-1",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/comments/c0000000-0000-4000-8000-000000000001",
 			wantBody:   map[string]interface{}{"body_md": "revised"},
 		},
 		{
 			name:       "comment delete",
-			args:       []string{"comment", "delete", "iss-1", "c-1"},
+			args:       []string{"comment", "delete", "11111111-1111-4111-8111-111111111111", "c0000000-0000-4000-8000-000000000001"},
 			wantMethod: "DELETE",
-			wantPath:   "/api/agent/issues/iss-1/comments/c-1",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/comments/c0000000-0000-4000-8000-000000000001",
 		},
 		{
 			name:       "severity",
-			args:       []string{"severity", "iss-1", "high"},
+			args:       []string{"severity", "11111111-1111-4111-8111-111111111111", "high"},
 			wantMethod: "PATCH",
-			wantPath:   "/api/agent/issues/iss-1/report/severity",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/report/severity",
 			wantBody:   map[string]interface{}{"severity": "high"},
 		},
 		{
 			name:       "comments list with after",
-			args:       []string{"comments", "iss-1", "--after", "2026-01-01T00:00:00Z"},
+			args:       []string{"comments", "11111111-1111-4111-8111-111111111111", "--after", "2026-01-01T00:00:00Z"},
 			wantMethod: "GET",
-			wantPath:   "/api/agent/issues/iss-1/comments",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/comments",
 			wantQuery:  map[string]string{"after": "2026-01-01T00:00:00Z"},
 		},
 		{
 			name:       "question",
-			args:       []string{"question", "iss-1", "--body", "why?", "--waiting-on", "reporter"},
+			args:       []string{"question", "11111111-1111-4111-8111-111111111111", "--body", "why?", "--waiting-on", "reporter"},
 			wantMethod: "POST",
-			wantPath:   "/api/agent/issues/iss-1/questions",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/questions",
 			wantBody:   map[string]interface{}{"body_md": "why?", "audience": "reporter"},
 		},
 		{
 			name:       "progress",
-			args:       []string{"progress", "iss-1", "--body", "working on it"},
+			args:       []string{"progress", "11111111-1111-4111-8111-111111111111", "--body", "working on it"},
 			wantMethod: "POST",
-			wantPath:   "/api/agent/issues/iss-1/progress",
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/progress",
 			wantBody:   map[string]interface{}{"message_md": "working on it"},
 		},
 		{
 			name:       "link",
-			args:       []string{"link", "iss-1", "iss-2", "--type", "caused_by"},
+			args:       []string{"link", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "--type", "caused_by"},
 			wantMethod: "POST",
-			wantPath:   "/api/agent/issues/iss-1/relations",
-			wantBody:   map[string]interface{}{"target_issue_id": "iss-2", "relation_type": "caused_by"},
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/relations",
+			wantBody:   map[string]interface{}{"target_issue_id": "22222222-2222-4222-8222-222222222222", "relation_type": "caused_by"},
 		},
 		{
 			name:       "unlink",
-			args:       []string{"unlink", "iss-1", "iss-2", "--type", "linked_to"},
+			args:       []string{"unlink", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "--type", "linked_to"},
 			wantMethod: "DELETE",
-			wantPath:   "/api/agent/issues/iss-1/relations",
-			wantBody:   map[string]interface{}{"target_issue_id": "iss-2", "relation_type": "linked_to"},
+			wantPath:   "/api/agent/issues/11111111-1111-4111-8111-111111111111/relations",
+			wantBody:   map[string]interface{}{"target_issue_id": "22222222-2222-4222-8222-222222222222", "relation_type": "linked_to"},
 		},
 		{
 			name:       "projects",
@@ -269,7 +269,7 @@ func parseQuery(t *testing.T, raw string) url.Values {
 // server's 404 for an empty queue maps to ExitNotFound so a shell loop can stop on it.
 func TestClaimNext_EmptyBodyUsageAndEmptyQueue(t *testing.T) {
 	t.Run("no flags sends an empty JSON body", func(t *testing.T) {
-		srv, rec := newRecordingServer(t, 200, `{"issue":{"id":"iss-1"},"report":null,"latestOccurrence":null,"relations":[]}`)
+		srv, rec := newRecordingServer(t, 200, `{"issue":{"id":"11111111-1111-4111-8111-111111111111"},"report":null,"latestOccurrence":null,"relations":[]}`)
 		e, out, errBuf := newTestEnv(srv, "sk_test_key")
 		if code := commands["claim-next"](context.Background(), e, nil); code != ExitOK {
 			t.Fatalf("exit = %d, want 0; stderr=%s", code, errBuf.String())
@@ -280,7 +280,7 @@ func TestClaimNext_EmptyBodyUsageAndEmptyQueue(t *testing.T) {
 		if len(rec.Body) != 0 {
 			t.Errorf("body = %v, want empty object", rec.Body)
 		}
-		if !strings.Contains(out.String(), `"iss-1"`) {
+		if !strings.Contains(out.String(), `"11111111-1111-4111-8111-111111111111"`) {
 			t.Errorf("stdout should carry the detail response, got %q", out.String())
 		}
 	})
@@ -288,7 +288,7 @@ func TestClaimNext_EmptyBodyUsageAndEmptyQueue(t *testing.T) {
 	t.Run("positional argument is a usage error and makes no request", func(t *testing.T) {
 		srv, rec := newRecordingServer(t, 200, `{}`)
 		e, _, errBuf := newTestEnv(srv, "sk_test_key")
-		if code := commands["claim-next"](context.Background(), e, []string{"iss-1"}); code != ExitUsage {
+		if code := commands["claim-next"](context.Background(), e, []string{"11111111-1111-4111-8111-111111111111"}); code != ExitUsage {
 			t.Fatalf("exit = %d, want %d", code, ExitUsage)
 		}
 		if rec.Method != "" {
@@ -333,7 +333,7 @@ func TestExitCodeMapping(t *testing.T) {
 		srv, _ := newRecordingServer(t, tc.status, `{"error":"boom"}`)
 		e, _, errBuf := newTestEnv(srv, "k")
 
-		code := cmdClaim(context.Background(), e, []string{"iss-1"})
+		code := cmdClaim(context.Background(), e, []string{"11111111-1111-4111-8111-111111111111"})
 		if code != tc.want {
 			t.Errorf("status %d: exit code = %d, want %d", tc.status, code, tc.want)
 		}
@@ -352,7 +352,7 @@ func TestBatch_Stdin(t *testing.T) {
 	os.Stdin = r
 	defer func() { os.Stdin = oldStdin }()
 	go func() {
-		_, _ = w.WriteString(`{"operations":[{"op":"issues.claim","issueId":"iss-1"}]}`)
+		_, _ = w.WriteString(`{"operations":[{"op":"issues.claim","issueId":"11111111-1111-4111-8111-111111111111"}]}`)
 		w.Close()
 	}()
 
@@ -377,7 +377,7 @@ func TestBatch_StopOnErrorFlag(t *testing.T) {
 	e, _, _ := newTestEnv(srv, "k")
 
 	path := filepath.Join(t.TempDir(), "ops.json")
-	if err := os.WriteFile(path, []byte(`{"operations":[{"op":"issues.claim","issueId":"iss-1"}]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"operations":[{"op":"issues.claim","issueId":"11111111-1111-4111-8111-111111111111"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -477,7 +477,7 @@ func TestCmdIssuesList_NoFlagsOmitsPaginationParams(t *testing.T) {
 }
 
 func TestGoldenOutput_IssuesList(t *testing.T) {
-	body := `{"issues":[{"id":"iss-1","title":"NPE in checkout","status":"unresolved"},{"id":"iss-2","title":"Timeout","status":"resolved"}]}`
+	body := `{"issues":[{"id":"11111111-1111-4111-8111-111111111111","title":"NPE in checkout","status":"unresolved"},{"id":"22222222-2222-4222-8222-222222222222","title":"Timeout","status":"resolved"}]}`
 
 	t.Run("json", func(t *testing.T) {
 		srv, _ := newRecordingServer(t, 200, body)
@@ -487,7 +487,7 @@ func TestGoldenOutput_IssuesList(t *testing.T) {
 		if code != ExitOK {
 			t.Fatalf("exit = %d", code)
 		}
-		want := "{\n  \"issues\": [\n    {\n      \"id\": \"iss-1\",\n      \"title\": \"NPE in checkout\",\n      \"status\": \"unresolved\"\n    },\n    {\n      \"id\": \"iss-2\",\n      \"title\": \"Timeout\",\n      \"status\": \"resolved\"\n    }\n  ]\n}\n"
+		want := "{\n  \"issues\": [\n    {\n      \"id\": \"11111111-1111-4111-8111-111111111111\",\n      \"title\": \"NPE in checkout\",\n      \"status\": \"unresolved\"\n    },\n    {\n      \"id\": \"22222222-2222-4222-8222-222222222222\",\n      \"title\": \"Timeout\",\n      \"status\": \"resolved\"\n    }\n  ]\n}\n"
 		if out.String() != want {
 			t.Errorf("json output mismatch:\ngot:  %q\nwant: %q", out.String(), want)
 		}
@@ -505,7 +505,7 @@ func TestGoldenOutput_IssuesList(t *testing.T) {
 		if !strings.Contains(got, "id") || !strings.Contains(got, "title") || !strings.Contains(got, "status") {
 			t.Errorf("table header missing columns: %q", got)
 		}
-		if !strings.Contains(got, "iss-1") || !strings.Contains(got, "NPE in checkout") {
+		if !strings.Contains(got, "11111111-1111-4111-8111-111111111111") || !strings.Contains(got, "NPE in checkout") {
 			t.Errorf("table missing row data: %q", got)
 		}
 	})
@@ -587,11 +587,11 @@ func TestCommentEditAndSeverity_UsageGuards(t *testing.T) {
 		cmd  cmdFunc
 		args []string
 	}{
-		{"comment edit missing --body", cmdComment, []string{"edit", "iss-1", "c-1"}},
-		{"comment edit wrong arity", cmdComment, []string{"edit", "iss-1", "--body", "x"}},
-		{"comment delete wrong arity", cmdComment, []string{"delete", "iss-1"}},
-		{"severity invalid level", cmdSeverity, []string{"iss-1", "urgent"}},
-		{"severity wrong arity", cmdSeverity, []string{"iss-1"}},
+		{"comment edit missing --body", cmdComment, []string{"edit", "11111111-1111-4111-8111-111111111111", "c0000000-0000-4000-8000-000000000001"}},
+		{"comment edit wrong arity", cmdComment, []string{"edit", "11111111-1111-4111-8111-111111111111", "--body", "x"}},
+		{"comment delete wrong arity", cmdComment, []string{"delete", "11111111-1111-4111-8111-111111111111"}},
+		{"severity invalid level", cmdSeverity, []string{"11111111-1111-4111-8111-111111111111", "urgent"}},
+		{"severity wrong arity", cmdSeverity, []string{"11111111-1111-4111-8111-111111111111"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -715,7 +715,7 @@ func TestUpload_OneShotWithIssueAndComment(t *testing.T) {
 		rec.Body = body
 		requests = append(requests, rec)
 		w.WriteHeader(201)
-		fmt.Fprint(w, `{"comment":{"id":"c-1"}}`)
+		fmt.Fprint(w, `{"comment":{"id":"c0000000-0000-4000-8000-000000000001"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	e, _, errBuf := newTestEnv(srv, "k")
@@ -725,7 +725,7 @@ func TestUpload_OneShotWithIssueAndComment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code := cmdUpload(context.Background(), e, []string{tmp, "--issue", "iss-1", "--comment", "see attached"})
+	code := cmdUpload(context.Background(), e, []string{tmp, "--issue", "11111111-1111-4111-8111-111111111111", "--comment", "see attached"})
 	if code != ExitOK {
 		t.Fatalf("exit code = %d, want ExitOK; stderr=%s", code, errBuf.String())
 	}
@@ -736,8 +736,8 @@ func TestUpload_OneShotWithIssueAndComment(t *testing.T) {
 	if upload.Method != "POST" || upload.Path != "/api/agent/uploads" {
 		t.Errorf("first request = %s %s, want POST /api/agent/uploads", upload.Method, upload.Path)
 	}
-	if comment.Method != "POST" || comment.Path != "/api/agent/issues/iss-1/comments" {
-		t.Errorf("second request = %s %s, want POST /api/agent/issues/iss-1/comments", comment.Method, comment.Path)
+	if comment.Method != "POST" || comment.Path != "/api/agent/issues/11111111-1111-4111-8111-111111111111/comments" {
+		t.Errorf("second request = %s %s, want POST /api/agent/issues/11111111-1111-4111-8111-111111111111/comments", comment.Method, comment.Path)
 	}
 	if comment.Body["body_md"] != "see attached" {
 		t.Errorf("comment body_md = %v, want %q", comment.Body["body_md"], "see attached")
@@ -767,7 +767,7 @@ func TestUpload_DeprecatedTwoPositionalFormStillWorksAndWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code := cmdUpload(context.Background(), e, []string{"iss-1", tmp})
+	code := cmdUpload(context.Background(), e, []string{"11111111-1111-4111-8111-111111111111", tmp})
 	if code != ExitOK {
 		t.Fatalf("exit code = %d, want ExitOK; stderr=%s", code, errBuf.String())
 	}

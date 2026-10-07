@@ -10,7 +10,7 @@ import crypto from 'crypto';
  * (`organizationId`) MUST always come from the caller's authenticated membership, never from the
  * request body (B7) -- every function below takes it as an explicit parameter and callers are
  * responsible for having derived it from the credential/session (see the routes in
- * src/routes/api/organizations/[orgId]/agents/[agentId]/webhooks/).
+ * src/routes/api/organizations/[orgId=uuid]/agents/[agentId=uuid]/webhooks/).
  */
 
 export type WebhookStatus = 'active' | 'disabled' | 'failed';

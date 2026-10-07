@@ -37,8 +37,8 @@ vi.mock('$lib/db/queries/agents', () => agentQueries);
 const listPersonalKeysForOrg = vi.fn();
 vi.mock('$lib/server/cli-personal-keys', () => ({ listPersonalKeysForOrg }));
 
-const { GET, POST } = await import('./[orgId]/agents/+server');
-const { PATCH } = await import('./[orgId]/agents/[agentId]/+server');
+const { GET, POST } = await import('./[orgId=uuid]/agents/+server');
+const { PATCH } = await import('./[orgId=uuid]/agents/[agentId=uuid]/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

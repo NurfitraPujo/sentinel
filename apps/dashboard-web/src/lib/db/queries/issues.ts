@@ -428,7 +428,7 @@ export async function assignIssue(
 }
 
 // A12 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): mirrors the human relations route's
-// existing `duplicate_of` 2-cycle guard (routes/api/issues/[issueId]/relations/+server.ts:101-115)
+// existing `duplicate_of` 2-cycle guard (routes/api/issues/[issueId=uuid]/relations/+server.ts:101-115)
 // but for `caused_by`, and lives in the QUERY layer so both the human route and the agent op
 // (issuesRelationsAdd -> createIssueRelation) get it uniformly instead of duplicating the check at
 // each call site. 2-cycle only (A caused_by B, then B caused_by A) -- NOT full graph-cycle
@@ -567,7 +567,7 @@ export async function getIssueActivity(issueId: string) {
  *
  * `environmentScopes` defaults to an empty map, which is unrestricted (`scopeForProject`'s
  * absence-means-all). That default is what keeps the FOURTH caller,
- * `routes/api/agent/issues/[issueId]/+server.ts`, byte-for-byte unchanged: it is key-authenticated
+ * `routes/api/agent/issues/[issueId=uuid]/+server.ts`, byte-for-byte unchanged: it is key-authenticated
  * with no user and therefore has no grant to resolve (§12 *Known limits* 2).
  */
 export interface VisibleRelatedIssue {

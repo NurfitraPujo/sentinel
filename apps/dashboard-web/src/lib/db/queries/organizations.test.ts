@@ -363,7 +363,7 @@ describe('claimInvitation (D06, D07, D31)', () => {
 		it('refuses when the inviter has been demoted below the authority to grant the invited role', async () => {
 			// An 'owner' invite, but the inviter (who WAS owner when they sent it) has since been
 			// demoted to 'admin' -- an admin cannot grant owner (mirrors the creation-time rule in
-			// routes/api/organizations/[orgId]/invitations/+server.ts).
+			// routes/api/organizations/[orgId=uuid]/invitations/+server.ts).
 			const { token } = seedInvitation({ role: 'owner' });
 			store.organizationMembers.set('org-1:inviter-1', {
 				id: 'mem-inviter-1',

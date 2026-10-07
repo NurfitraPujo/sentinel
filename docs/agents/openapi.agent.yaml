@@ -677,6 +677,222 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+  /api/agent/issues/{issueId}/activity:
+    get:
+      operationId: listIssueActivity
+      summary: One issue's activity history, newest first, keyset-paged (before=<nextCursor>); a run of consecutive occurrence_burst rows is one entry with `burst`
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: ^\d+$
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        seq:
+                          type: number
+                        eventType:
+                          type: string
+                          enum:
+                            - status_changed
+                            - assigned
+                            - unassigned
+                            - regressed
+                            - ai_analysis
+                            - linked
+                            - commented
+                            - claimed
+                            - claim_released
+                            - progress_update
+                            - question_asked
+                            - question_answered
+                            - moved
+                            - attachment_added
+                            - report_edited
+                            - report_created
+                            - created
+                            - occurrence_burst
+                            - issue_deleted
+                        actorType:
+                          type: string
+                          enum:
+                            - user
+                            - agent
+                            - system
+                        actorId:
+                          type: string
+                        actor:
+                          type: object
+                          properties:
+                            type:
+                              type: string
+                              enum:
+                                - user
+                                - agent
+                                - system
+                            id:
+                              type: string
+                            name:
+                              type:
+                                - string
+                                - "null"
+                            personal:
+                              type: boolean
+                          required:
+                            - type
+                            - id
+                            - name
+                            - personal
+                          additionalProperties: false
+                        oldValue: {}
+                        newValue: {}
+                        createdAt:
+                          type: string
+                        comment:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            excerpt:
+                              type:
+                                - string
+                                - "null"
+                            deleted:
+                              type: boolean
+                          required:
+                            - id
+                            - excerpt
+                            - deleted
+                          additionalProperties: false
+                        assignee:
+                          type: object
+                          properties:
+                            type:
+                              type: string
+                              enum:
+                                - user
+                                - agent
+                                - system
+                            id:
+                              type: string
+                            name:
+                              type:
+                                - string
+                                - "null"
+                            personal:
+                              type: boolean
+                          required:
+                            - type
+                            - id
+                            - name
+                            - personal
+                          additionalProperties: false
+                        burst:
+                          type: object
+                          properties:
+                            rows:
+                              type: integer
+                            firstAt:
+                              type: string
+                            lastAt:
+                              type: string
+                            occurrencesFrom:
+                              type:
+                                - number
+                                - "null"
+                            occurrencesTo:
+                              type:
+                                - number
+                                - "null"
+                          required:
+                            - rows
+                            - firstAt
+                            - lastAt
+                            - occurrencesFrom
+                            - occurrencesTo
+                          additionalProperties: false
+                      required:
+                        - id
+                        - seq
+                        - eventType
+                        - actorType
+                        - actorId
+                        - actor
+                        - oldValue
+                        - newValue
+                        - createdAt
+                      additionalProperties: false
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                  hasMore:
+                    type: boolean
+                required:
+                  - entries
+                  - nextCursor
+                  - hasMore
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/issues/claim-next:
     post:
       operationId: claimNextIssue

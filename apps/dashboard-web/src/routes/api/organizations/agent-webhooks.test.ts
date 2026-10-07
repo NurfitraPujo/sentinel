@@ -39,8 +39,8 @@ const webhookQueries = {
 };
 vi.mock('$lib/db/queries/agent-webhooks', () => webhookQueries);
 
-const { GET, POST } = await import('./[orgId]/agents/[agentId]/webhooks/+server');
-const { PATCH, DELETE } = await import('./[orgId]/agents/[agentId]/webhooks/[webhookId]/+server');
+const { GET, POST } = await import('./[orgId=uuid]/agents/[agentId=uuid]/webhooks/+server');
+const { PATCH, DELETE } = await import('./[orgId=uuid]/agents/[agentId=uuid]/webhooks/[webhookId=uuid]/+server');
 
 function locals(session: { id: string } | null) {
 	return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;

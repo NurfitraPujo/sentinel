@@ -5,6 +5,7 @@ import { getSpansState } from '$lib/server/queries/span-queries';
 import { earliestTraceOccurrenceAt } from '$lib/server/queries/trace-queries';
 import { resolveViewerSpanScope } from '$lib/server/span-scope';
 import { SpanPullError, getSpanPullConfig, isSpanPullEnabled, requestSpanPull } from '$lib/server/span-pull';
+import { isUuid } from '$lib/uuid';
 
 // sentinel-occurrence-spans TASK-02. The dashboard's "Pull spans" button and its status poll.
 //
@@ -19,14 +20,12 @@ import { SpanPullError, getSpanPullConfig, isSpanPullEnabled, requestSpanPull } 
 // (membership + project access + environment grants). A viewer who cannot see an occurrence of the trace gets 404 — the
 // app's convention for things a viewer cannot see, so the endpoint is no oracle for which trace ids exist.
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
 async function resolve(locals: App.Locals, orgRaw: unknown, traceRaw: unknown) {
 	const session = await locals.auth();
 	if (!session?.user?.id) throw error(401, 'Unauthorized');
 	const organizationId = typeof orgRaw === 'string' ? orgRaw.toLowerCase() : '';
 	const traceId = typeof traceRaw === 'string' ? parseTraceId(traceRaw) : null;
-	if (!UUID_RE.test(organizationId) || !traceId) throw error(404, 'Trace not found');
+	if (!isUuid(organizationId) || !traceId) throw error(404, 'Trace not found');
 	const scope = await resolveViewerSpanScope(session.user.id, organizationId);
 	if (!scope) throw error(404, 'Trace not found');
 	return { userId: session.user.id, scope, traceId };

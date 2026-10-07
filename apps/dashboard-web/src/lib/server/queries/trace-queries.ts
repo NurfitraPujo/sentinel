@@ -4,6 +4,7 @@ import { and, count, countDistinct, eq, inArray, ne, sql, type SQL } from 'drizz
 import type { SelectedFields } from 'drizzle-orm/pg-core';
 import type { SelectResultFields } from 'drizzle-orm/query-builders/select.types';
 import { environmentScopeCondition } from '$lib/server/environment-access';
+import { isLowerUuid } from '$lib/uuid';
 
 /**
  * sentinel-cross-repo-trace-view D1–D6 — the ONE guarded read of "every occurrence sharing a trace
@@ -88,8 +89,6 @@ function isRealCreatedKey(text: string): boolean {
 	return true;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
 export function encodeTraceCursor(c: TraceCursor): string {
 	return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url');
 }
@@ -110,7 +109,7 @@ export function decodeTraceCursor(raw: string): TraceCursor {
 		typeof parsed.received !== 'string' ||
 		!NUMERIC_TEXT_RE.test(parsed.received) ||
 		typeof parsed.id !== 'string' ||
-		!UUID_RE.test(parsed.id)
+		!isLowerUuid(parsed.id)
 	) {
 		throw new Error('invalid cursor');
 	}

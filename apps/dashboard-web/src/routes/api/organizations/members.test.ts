@@ -58,8 +58,8 @@ vi.mock('$lib/server/email', () => ({
   sendInvitationEmail: (...args: any[]) => sendInvitationEmailMock(...args),
 }));
 
-const { PATCH, DELETE } = await import('./[orgId]/members/[memberId]/+server');
-const { POST: POST_INVITATION } = await import('./[orgId]/invitations/+server');
+const { PATCH, DELETE } = await import('./[orgId=uuid]/members/[memberId]/+server');
+const { POST: POST_INVITATION } = await import('./[orgId=uuid]/invitations/+server');
 
 function locals(session: { id: string } | null) {
   return { auth: async () => (session ? { user: { id: session.id } } : null) } as any;
@@ -662,7 +662,7 @@ describe('Organization Member Management Routes', () => {
 
     it('403s when caller is non-admin/non-owner (e.g. viewer) for GET list', async () => {
       dbMock.then.mockImplementationOnce((resolve: any) => resolve([{ role: 'viewer' }]));
-      const { GET: GET_INVITATIONS } = await import('./[orgId]/invitations/+server');
+      const { GET: GET_INVITATIONS } = await import('./[orgId=uuid]/invitations/+server');
       await expect(
         GET_INVITATIONS({ params: { orgId: 'org-1' }, locals: locals({ id: 'user-viewer' }) } as any)
       ).rejects.toMatchObject({ status: 403 });

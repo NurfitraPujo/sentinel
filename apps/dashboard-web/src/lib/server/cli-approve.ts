@@ -1,3 +1,4 @@
+import { isUuid } from '$lib/uuid';
 /**
  * sentinel-cli-browser-login: helpers for the /cli/approve page that must be importable by tests and by the sign-in page
  * (a route module may export only its handlers, B12).
@@ -40,11 +41,9 @@ export function approveRequestIsSameOrigin(request: Request, origin: string): bo
 	return request.headers.get('origin') === origin;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /** The approve action's `organizationId`, or null unless it is a UUID -- checked BEFORE it reaches a uuid column (else 500). */
 export function parseApproveOrganizationId(value: unknown): string | null {
-	return typeof value === 'string' && UUID_RE.test(value) ? value : null;
+	return typeof value === 'string' && isUuid(value) ? value : null;
 }
 
 /**
