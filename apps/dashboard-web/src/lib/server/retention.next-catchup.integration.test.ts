@@ -5,6 +5,26 @@ import { getTableName, type SQL } from 'drizzle-orm';
 import { db, type Tx } from '$lib/server/db';
 import { renderMetrics } from './metrics';
 
+// Since sentinel-issue-tag-facets (#55, dde0ea2) the sweep does not use the module singleton at all:
+// `cleanupRetainedData` opens a retention run on its own per-run client and sends every statement
+// through `run.db` (§5 "One run, one connection, one deadline"). A seam on the singleton's methods
+// therefore recorded nothing -- which is how this file went red on every push to main from that
+// commit on. The seam now wraps each run's `db` as `openRetentionRun` hands it out: the real
+// function, called with the real arguments, on the real per-run client; only its methods are
+// wrapped while a seam is installed.
+const runSeam = vi.hoisted(() => ({ onOpen: null as ((runDb: never) => void) | null }));
+vi.mock('$lib/server/retention-run', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$lib/server/retention-run')>();
+	return {
+		...actual,
+		openRetentionRun: (...args: Parameters<typeof actual.openRetentionRun>) => {
+			const run = actual.openRetentionRun(...args);
+			runSeam.onOpen?.(run.db as never);
+			return run;
+		},
+	};
+});
+
 /**
  * sentinel-releases-snooze §4.3 "Hourly" (flow I19; decisions 8, 15, 27, 30, 42) -- contract §11's
  * boundary for the `next` catch-up, against a REAL migrated Postgres, because every claim below is a
@@ -114,10 +134,6 @@ type ExecuteMethod = typeof db.execute;
 type SelectMethod = typeof db.select;
 type DeleteMethod = typeof db.delete;
 
-const realTransaction: TransactionMethod = db.transaction.bind(db);
-const realExecute: ExecuteMethod = db.execute.bind(db);
-const realSelect: SelectMethod = db.select.bind(db);
-const realDelete: DeleteMethod = db.delete.bind(db);
 let recorded: Recorded[] = [];
 
 function renderSql(session: Tx | typeof db, query: SQL): string {
@@ -134,7 +150,11 @@ function tableNameOf(source: unknown): string {
 	}
 }
 
-function installSeam(): void {
+function wrapRunDb(target: typeof db): void {
+	const realTransaction: TransactionMethod = target.transaction.bind(target);
+	const realExecute: ExecuteMethod = target.execute.bind(target);
+	const realSelect: SelectMethod = target.select.bind(target);
+	const realDelete: DeleteMethod = target.delete.bind(target);
 	const transaction: TransactionMethod = (callback, config) => {
 		const record: Recorded = { kind: 'transaction', statements: [] };
 		recorded.push(record);
@@ -150,7 +170,7 @@ function installSeam(): void {
 		}, config);
 	};
 	const execute = (async (query: SQL) => {
-		recorded.push({ kind: 'execute', sql: renderSql(db, query) });
+		recorded.push({ kind: 'execute', sql: renderSql(target, query) });
 		return realExecute(query);
 	}) as unknown as ExecuteMethod;
 	const select = ((...args: unknown[]) => {
@@ -169,29 +189,25 @@ function installSeam(): void {
 		return (realDelete as unknown as (t: unknown) => unknown)(table);
 	}) as unknown as DeleteMethod;
 
-	const target = db as {
+	const methods = target as {
 		transaction: TransactionMethod;
 		execute: ExecuteMethod;
 		select: SelectMethod;
 		delete: DeleteMethod;
 	};
-	target.transaction = transaction;
-	target.execute = execute;
-	target.select = select;
-	target.delete = del;
+	methods.transaction = transaction;
+	methods.execute = execute;
+	methods.select = select;
+	methods.delete = del;
+}
+
+// Applies to every run opened until removeSeam(); each run's client is fresh, so nothing to restore.
+function installSeam(): void {
+	runSeam.onOpen = wrapRunDb;
 }
 
 function removeSeam(): void {
-	const target = db as {
-		transaction: TransactionMethod;
-		execute: ExecuteMethod;
-		select: SelectMethod;
-		delete: DeleteMethod;
-	};
-	target.transaction = realTransaction;
-	target.execute = realExecute;
-	target.select = realSelect;
-	target.delete = realDelete;
+	runSeam.onOpen = null;
 	recorded = [];
 }
 
@@ -210,6 +226,48 @@ function describeRecord(r: Recorded): string {
 		case 'delete':
 			return `delete(${r.table})`;
 	}
+}
+
+// sentinel-issue-tag-facets (#55) added two steps of its own to the sweep, both database-wide and both
+// dependent on what other files left behind: the paced occurrence delete, FIRST, whose batches are
+// transactions taking `FOR UPDATE` on `issues` (the lock, then the DELETE), and the deferred tag-rollup
+// rebuild, LAST -- after the `next` catch-up, deliberately (retention.ts: "LAST, after the orphan sweep
+// and the catch-up") -- which reads the drift queue and then, per drifted issue, runs a lock-free size
+// probe and the rebuild, each in its own transaction. Neither is this file's subject. `sweepRecords`
+// checks both by their exact statements and sets them aside, so the assertions below are about the
+// same records they were written against: the catch-up is the last statement BEFORE the rebuild step.
+const OCCURRENCE_BATCH_SQL = [
+	/^select id from issues where id = any\(\$1::uuid\[\]\) order by id for update$/i,
+	/^delete from error_occurrences where id = any\(\$1::uuid\[\]\) and created_at < \$2::timestamptz returning id$/i,
+];
+const TAG_REBUILD_QUEUE_SQL = /^select issue_id from issue_tag_values_drift where rebuilt_at is null /i;
+const TAG_REBUILD_SQL =
+	/^select (count\(\*\)::int as n from \( ?select 1 from error_occurrences where issue_id = \$1::uuid limit \$2\) s|issue_tag_values_rebuild\(\$1::uuid\))$/i;
+
+function isOccurrenceBatch(r: Recorded): boolean {
+	return r.kind === 'transaction' && r.statements.length > 0 && OCCURRENCE_BATCH_SQL[0].test(r.statements[0]);
+}
+
+function sweepRecords(all: Recorded[]): Recorded[] {
+	const order = all.map(describeRecord).join(' → ');
+	const rebuildAt = all.findIndex((r) => r.kind === 'execute' && TAG_REBUILD_QUEUE_SQL.test(r.sql));
+	expect(rebuildAt, `tag-rollup rebuild step not found in: ${order}`).toBeGreaterThan(-1);
+	for (const r of all.slice(rebuildAt)) {
+		if (r.kind === 'execute') expect(r.sql, order).toContain('issue_tag_values_drift');
+		else if (r.kind === 'transaction') {
+			expect(r.statements, order).toHaveLength(1);
+			expect(r.statements[0], order).toMatch(TAG_REBUILD_SQL);
+		} else expect.fail(`unexpected ${describeRecord(r)} in the rebuild step: ${order}`);
+	}
+	const body = all.slice(0, rebuildAt);
+	const firstOtherTransaction = body.findIndex((r) => r.kind === 'transaction' && !isOccurrenceBatch(r));
+	body.forEach((r, i) => {
+		if (isOccurrenceBatch(r) && firstOtherTransaction >= 0) expect(i, order).toBeLessThan(firstOtherTransaction);
+	});
+	for (const r of body.filter(isOccurrenceBatch)) {
+		expect((r as Extract<Recorded, { kind: 'transaction' }>).statements[1], order).toMatch(OCCURRENCE_BATCH_SQL[1]);
+	}
+	return body.filter((r) => !isOccurrenceBatch(r));
 }
 
 function parseMetrics(body: string): Map<string, number> {
@@ -368,10 +426,26 @@ describe.skipIf(!dbReachable)('retention next catch-up (sentinel-releases-snooze
 		expect(await activityRows(fixture)).toBe(0);
 
 		// (6) the sweep's other results are unchanged by the statement's presence: RetentionResult has
-		// exactly the fields it had, the fixture (all recent) survived the orphan rule, and nothing of
-		// this file's was deleted or tombstoned.
+		// exactly the fields it had -- the catch-up adds none -- the fixture (all recent) survived the
+		// orphan rule, and nothing of this file's was deleted or tombstoned. The second group is
+		// sentinel-issue-tag-facets' (#55: the paced occurrence delete's and the rebuild step's report),
+		// which this list predates; it is listed rather than ignored so a field the catch-up added would
+		// still fail here.
 		expect(Object.keys(result).sort()).toEqual(
 			[
+				'occurrenceBacklogSeconds',
+				'occurrenceBatchSize',
+				'occurrenceBatches',
+				'occurrenceBatchesOverCeiling',
+				'occurrenceHeldMaxMs',
+				'occurrenceHeldP95Ms',
+				'occurrenceStepMs',
+				'occurrenceStopped',
+				'oldestOccurrenceAt',
+				'tagRollupDriftEvents',
+				'tagRollupRebuildsPending',
+				'tagRollupRebuildsOperatorOnly',
+				'rebuildStepMs',
 				'cutoffDate',
 				'deletedAffectedTenants',
 				'deletedAffectedUsers',
@@ -392,22 +466,24 @@ describe.skipIf(!dbReachable)('retention next catch-up (sentinel-releases-snooze
 
 		// LAST, in its OWN transaction, one statement, verbatim §4.3, no lock on `releases` -- read
 		// off what the sweep actually issued (the lock-order note in this file's header).
-		const order = recorded.map(describeRecord);
-		const last = recorded[recorded.length - 1];
+		const sweep = sweepRecords(recorded);
+		const order = sweep.map(describeRecord);
+		const last = sweep[sweep.length - 1];
 		expect(last.kind, `expected the catch-up transaction last in: ${order.join(' → ')}`).toBe('transaction');
 		const catchUp = last as Extract<Recorded, { kind: 'transaction' }>;
 		expect(catchUp.statements).toHaveLength(1);
 		expect(catchUp.statements[0]).toMatch(CATCHUP_SQL);
 		expect(catchUp.statements[0]).not.toMatch(/for (update|share)/i);
-		// The two side-table transactions come before it; nothing of the sweep comes after it.
-		const transactionIndexes = recorded
+		// The two side-table transactions come before it; nothing of the sweep but #55's rebuild step
+		// (split off by sweepRecords) comes after it.
+		const transactionIndexes = sweep
 			.map((r, i) => (r.kind === 'transaction' ? i : -1))
 			.filter((i) => i >= 0);
 		expect(transactionIndexes, order.join(' → ')).toHaveLength(3);
-		expect(transactionIndexes[2]).toBe(recorded.length - 1);
+		expect(transactionIndexes[2]).toBe(sweep.length - 1);
 		// And it is not the side-table steps' shape: it takes no `FOR UPDATE` and reads `releases`.
 		for (const i of transactionIndexes.slice(0, 2)) {
-			const t = recorded[i] as Extract<Recorded, { kind: 'transaction' }>;
+			const t = sweep[i] as Extract<Recorded, { kind: 'transaction' }>;
 			expect(t.statements).toHaveLength(3);
 			expect(t.statements[0]).toMatch(/for update/i);
 		}
@@ -475,8 +551,10 @@ describe.skipIf(!dbReachable)('retention next catch-up (sentinel-releases-snooze
 			expect(parseMetrics(body).get(COUNTER)).toBe(before + 1);
 			expect(body).not.toMatch(new RegExp(`^${COUNTER}\\{`, 'm'));
 
-			// The statement was issued, last, in its own transaction -- and it was the one that threw.
-			const last = recorded[recorded.length - 1];
+			// The statement was issued, last (before the rebuild step), in its own transaction -- and it
+			// was the one that threw.
+			const sweep = sweepRecords(recorded);
+			const last = sweep[sweep.length - 1];
 			expect(last.kind).toBe('transaction');
 			expect((last as Extract<Recorded, { kind: 'transaction' }>).statements).toHaveLength(1);
 			expect((last as Extract<Recorded, { kind: 'transaction' }>).statements[0]).toMatch(CATCHUP_SQL);

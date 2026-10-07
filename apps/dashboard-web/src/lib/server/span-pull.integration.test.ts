@@ -130,11 +130,16 @@ describe.skipIf(!ready)('spans status and on-demand pull (integration, real Post
 			await sql`delete from projects where organization_id in ${sql([orgA, orgB])}`;
 			await sql`delete from "user" where id in ${sql([member, stagingOnly, outsider])}`;
 			await sql`delete from organizations where id in ${sql([orgA, orgB])}`;
+			// A database-wide DROP of expired `spans` partitions, so it runs under the retention.*.integration
+			// family's lock: span-waterfall creates an expired partition and inserts into it, and this drop
+			// landing in between failed it under --sequence.shuffle (B13).
+			await sql`select pg_advisory_lock(hashtext('sentinel.retention.integration'))`;
 			await sql`select spans_drop_expired(14)`;
 		} finally {
+			await sql`select pg_advisory_unlock_all()`.catch(() => {});
 			await sql.end({ timeout: 5 }).catch(() => {});
 		}
-	});
+	}, 120_000);
 
 	async function scopeFor(userId: string, orgId = orgA) {
 		const { resolveViewerSpanScope } = await import('./span-scope');

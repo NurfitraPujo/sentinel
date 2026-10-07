@@ -166,6 +166,47 @@ current picture of module boundaries.
 
 ## Resolved
 
+### `dashboard` red on main — four suites stale since #20 / #55, unseen because PRs run no tests (RESOLVED 2026-10-07, MCR BUG-01)
+
+`dashboard`'s `pnpm test` failed on **every** push to main from 2026-09-11 and every PR stayed green: the
+test step carries `if: github.event_name != 'pull_request'` (PR scope, operator, 2026-09-06). Last
+green dashboard on main: `fccfc7d` (2026-09-09). Two independent first-bad commits:
+
+| Suite | First bad | Mechanism | Fix |
+|---|---|---|---|
+| `environments.integration` "GET …/projects: {id,name} only, sorted" | `678613b` (merge of main into the environments branch, landed via #20 `7e8eab6`) | #8 (`05f9308`) and the environments branch (`9258fd0`) each added a `GET` to the same route. The merge kept the union but re-selected rows from `projects` to drop inboxes, which put #8's `createdAt` back and dropped the resolver's name order (no `ORDER BY`). Both consumers type `{ id, name }`. | **Code**: the route filters `getAccessibleProjects`' sorted list by the non-inbox id set and returns `{ id, name }`. `projects.test.ts` had pinned the merge's shape; it is updated, and a new case proves order and shape. Both are red on the old route. |
+| `retention.affected` R1–R4, `retention.buckets` R1–R3, `retention.next-catchup` I19 + failure | `dde0ea2` (#55, tag facets) | `cleanupRetainedData` now sends every statement through its own per-run client (`openRetentionRun`, `run.db`), so the seams the suites installed on the module `db` recorded nothing. That is the "expected [] to have a length of 3", the null `ingest`, and the R4 fault that never fired. #55 also added the paced occurrence-delete transactions (first), the deferred tag-rebuild step after the `next` catch-up, and 13 `RetentionResult` fields. | **Tests**: a `vi.mock` of `$lib/server/retention-run` wraps each run's `db` as the real `openRetentionRun` returns it. #55's own transactions are recognised by their exact SQL and split off (the catch-up is last *before* the rebuild step), and I19's key list names #55's fields. Mutations (catch-up moved after the rebuild; the side-table `FOR UPDATE` removed) turn them red. |
+
+Also fixed, all pre-existing:
+
+- `notifications.flow`'s env mock dropped `DATABASE_URL`, so the query layer dialled `localhost:5432`.
+- Shuffle-order dependencies (B13), each seen failing under `--sequence.shuffle`:
+  - `repo-credentials` and `claim-next` chained state across cases, and vitest 2 shuffles cases within a file. Each case now seeds its own state.
+  - `reports.detail` swept the whole database without the `sentinel.retention.integration` family lock. That deleted `retention.affected`'s aged side rows and `retention.tombstones`' orphan. It now takes the lock around its one sweep.
+  - `span-waterfall` drops `spans` partitions itself. It now joins the family.
+  - `span-pull`'s teardown `spans_drop_expired` now takes the lock.
+  - `issue-queries.facets` seeds occurrence-less issues 100 h old, which `retention.claims`' one-day sweep deleted. It now holds the lock **shared**.
+- sdk-js B14 `flushOnHide`: `waitFor(1)` returned when the stub had the request, not when the client had settled it. A capture in that window was sent by the still-running hide-send. Reproduced 5/20 before the fix, 0/50 after.
+
+PR scope changed (operator, 2026-10-07 — supersedes the 2026-09-06 decision): every unit-suite step
+now runs on pull requests as on push to main — go-root `go test ./tests/unit/...`, go-sdk `go test -race`
+(both legs), go-migrations and sentinel-cli `go test`, dashboard's real migrations + `pnpm check` +
+`pnpm test`, sdk-js `pnpm test`, the tunnel-fixture check and `pnpm size`. A green PR now means the unit
+suites passed, so this class (red on main, green on every PR) is gated before merge. `integration`,
+`contract` and `e2e` stay `workflow_dispatch`-only. Rejected: a pre-push hook (client-side, bypassable,
+never sees the squash-merged commit) and a merge queue (`merge_group:`; more setup than needed). The
+record is ci.yml's header "PR scope" paragraph. Proof is the first PR run on #97 after that commit, not
+yet observed when this was written.
+
+| Evidence (disposable `postgres:15-alpine` on 127.0.0.1:55553, migrated by `go run ./cmd/migrate up -target dashboard`, the job's env) | Result |
+|---|---|
+| `pnpm test` on `3807a70` | 8 failed: the four CI suites + `notifications.flow` |
+| `pnpm test`, final tree: unshuffled + `--sequence.shuffle --sequence.seed=` 1, 42, 777, 20261007, 1337, 9001, 2024, 31337, 5, 8675309 (fresh DB each, except 2024 and 31337 on a dirty one) | 11/11 runs: 3383 passed, 9 skipped, 0 failed |
+| Route fix reverted | `projects.test.ts` 3 red, `environments.integration` red |
+| Mutations | Catch-up after the rebuild → `buckets` + `next-catchup` red. Side-table `FOR UPDATE` removed → `affected` + `buckets` red |
+| `pnpm check` / `pnpm build` | 2257 files, 0 errors, 0 warnings / pass |
+| sdk-js `typecheck`, `build`, `check:no-dependencies`, `test` (pnpm 10.34.5) | pass, 753/753. `hide.test.ts` ×50: 0 failed |
+
 ### `sentinel-cli-browser-login` — `sentinel login` device flow and personal agent keys (VERIFIED locally 2026-10-07, branch `NurfitraPujo/cbl-sentinel`, not yet merged)
 
 Proven end to end against the **built** dashboard on a disposable, freshly migrated Postgres 16 with the real CLI

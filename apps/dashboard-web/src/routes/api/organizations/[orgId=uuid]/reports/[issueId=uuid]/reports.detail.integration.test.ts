@@ -391,13 +391,24 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('GET /api/organizations/[o
 			const beforeSweep = await sql`select id from issues where id = ${issueId}`;
 			expect(beforeSweep).toHaveLength(1);
 
-			await cleanupRetainedData(30, 365, 30);
+			// A database-wide sweep, so it runs under the retention.*.integration family's lock like every
+			// other sweeping test -- unlocked, it deleted siblings' fixtures mid-file (retention.affected's
+			// aged side rows, retention.tombstones' orphan) under --sequence.shuffle (B13). Session-scoped,
+			// so on one reserved connection, not the pool.
+			const lock = await sql.reserve();
+			try {
+				await lock`select pg_advisory_lock(hashtext('sentinel.retention.integration'))`;
+				await cleanupRetainedData(30, 365, 30);
+			} finally {
+				await lock`select pg_advisory_unlock(hashtext('sentinel.retention.integration'))`.catch(() => {});
+				lock.release();
+			}
 
 			const afterSweep = await sql`select id from issues where id = ${issueId}`;
 			expect(afterSweep).toHaveLength(0);
 			// The companion went with it, through §4.6's ON DELETE CASCADE.
 			const companion = await sql`select issue_id from external_issue_reports where issue_id = ${issueId}`;
 			expect(companion).toHaveLength(0);
-		});
+		}, 120_000); // the family lock can wait out a sibling's whole file
 	});
 });

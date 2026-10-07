@@ -109,6 +109,9 @@ describe.skipIf(!dbReachable)('claimNextAgentIssue (integration, real Postgres)'
 
 	it('hands N concurrent callers N distinct issues, newest last_seen first, then null when drained', async () => {
 		const { claimNextAgentIssue } = await import('./agent-work');
+		// beforeAll's four, always queue's first four: the other cases push (and claim) their own rows
+		// after them, and under --sequence.shuffle (B13) they may already have run.
+		const seeded = queue.slice(0, 4);
 
 		const agents = ['agent-a-' + suffix, 'agent-b-' + suffix, 'agent-c-' + suffix, 'agent-d-' + suffix];
 		const results = await Promise.all(
@@ -119,7 +122,7 @@ describe.skipIf(!dbReachable)('claimNextAgentIssue (integration, real Postgres)'
 		const claimedIds = results.map((r) => r?.issue.id);
 		expect(claimedIds.every(Boolean)).toBe(true);
 		expect(new Set(claimedIds).size).toBe(agents.length);
-		expect(new Set(claimedIds)).toEqual(new Set(queue));
+		expect(new Set(claimedIds)).toEqual(new Set(seeded));
 
 		// Each row records the caller that won it, as an agent claim.
 		for (let i = 0; i < agents.length; i++) {
@@ -128,7 +131,7 @@ describe.skipIf(!dbReachable)('claimNextAgentIssue (integration, real Postgres)'
 			expect(results[i]!.issue.claimedAt).toBeInstanceOf(Date);
 		}
 
-		// The ineligible rows were never touched, even though they sort ahead of the queue.
+		// The ineligible rows were never touched, even though they sort ahead of the seeded rows.
 		expect(claimedIds).not.toContain(resolvedIssueId);
 		expect(claimedIds).not.toContain(preClaimedIssueId);
 		expect(claimedIds).not.toContain(foreignIssueId);
@@ -143,17 +146,17 @@ describe.skipIf(!dbReachable)('claimNextAgentIssue (integration, real Postgres)'
 		// one claimant subscription per issue, attributed to the winning agent.
 		const activity = await sql`
 			select issue_id, actor_id from issue_activity
-			where event_type = 'claimed' and actor_type = 'agent' and issue_id in ${sql(queue)}
+			where event_type = 'claimed' and actor_type = 'agent' and issue_id in ${sql(seeded)}
 		`;
-		expect(activity.length).toBe(queue.length);
+		expect(activity.length).toBe(seeded.length);
 		for (let i = 0; i < agents.length; i++) {
 			expect(activity.find((a) => a.issue_id === claimedIds[i])?.actor_id).toBe(agents[i]);
 		}
 		const subs = await sql`
 			select count(*)::int as n from issue_subscriptions
-			where subscriber_type = 'agent' and reason = 'claimant' and issue_id in ${sql(queue)}
+			where subscriber_type = 'agent' and reason = 'claimant' and issue_id in ${sql(seeded)}
 		`;
-		expect(subs[0].n).toBe(queue.length);
+		expect(subs[0].n).toBe(seeded.length);
 	});
 
 	it('serial calls walk the queue in last_seen DESC order (the list route\'s order)', async () => {

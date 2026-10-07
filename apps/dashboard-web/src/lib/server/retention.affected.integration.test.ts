@@ -1,8 +1,28 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import postgres from 'postgres';
 import { randomUUID } from 'node:crypto';
 import type { SQL } from 'drizzle-orm';
 import { db, type Tx } from '$lib/server/db';
+
+// Since sentinel-issue-tag-facets (#55, dde0ea2) the sweep does not use the module singleton at all:
+// `cleanupRetainedData` opens a retention run on its own per-run client and sends every statement
+// through `run.db` (§5 "One run, one connection, one deadline"). A seam on the singleton's methods
+// therefore recorded nothing -- which is how this file went red on every push to main from that
+// commit on. The seam now wraps each run's `db` as `openRetentionRun` hands it out: the real
+// function, called with the real arguments, on the real per-run client; only its methods are
+// wrapped while a seam is installed.
+const runSeam = vi.hoisted(() => ({ onOpen: null as ((runDb: never) => void) | null }));
+vi.mock('$lib/server/retention-run', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$lib/server/retention-run')>();
+	return {
+		...actual,
+		openRetentionRun: (...args: Parameters<typeof actual.openRetentionRun>) => {
+			const run = actual.openRetentionRun(...args);
+			runSeam.onOpen?.(run.db as never);
+			return run;
+		},
+	};
+});
 
 /**
  * sentinel-affected-users §4.5 (decisions 12, 23, 28; flows R1–R4) -- contract §11's
@@ -18,8 +38,8 @@ import { db, type Tx } from '$lib/server/db';
  * the sweep can prove the sweep.
  *
  * The concurrent and the fault-injected cases need a seam INSIDE the transaction, and retention.ts
- * deliberately has none: this file wraps the real `db.transaction` (the module singleton
- * retention.ts imports) so that each `tx.execute` is recorded and an optional hook runs after it.
+ * deliberately has none: this file wraps the real `transaction` of the run's own `db` (see runSeam
+ * below) so that each `tx.execute` is recorded and an optional hook runs after it.
  * The hook is where the ingest is fired while the sweep holds its locks, and where the fault is
  * thrown after the DELETE. Nothing in production code knows about it; `afterEach` restores the
  * real method.
@@ -100,20 +120,19 @@ const fresh = () => hoursAgo(FRESH_HOURS);
 // another file's fixture in the milliseconds between its seed and its own sweep (this file's
 // concurrent case even holds the issues row lock for 400ms on purpose). The family serialises
 // itself on one session-level advisory lock, taken in `beforeAll` and released in `afterAll`; the
-// key is the same in every member. `reports.detail.integration.test.ts` also sweeps and does NOT
-// take it (its recorded parallel-sweep failure is not this item's to repair), so the residual
-// exposure is one sweep in that file, the same exposure the tombstones test has always carried.
+// key is the same in every member. `reports.detail.integration.test.ts` sweeps once and takes it
+// around that sweep (it did not until 2026-10-07, and deleted this file's aged side rows mid-test
+// under --sequence.shuffle); fixtures a sweep would delete hold it SHARED (issue-queries.facets).
 const RETENTION_FAMILY_LOCK = 'sentinel.retention.integration';
 
 // ---------------------------------------------------------------------------------------------
-// The test-side seam: wrap the real `db.transaction` so every `tx.execute` inside it is recorded
-// (its rendered SQL, in order) and an optional hook runs AFTER it. The sweep is the only caller of
-// `db.transaction` on the `cleanupRetainedData` path, so the record IS the step's statement order.
+// The test-side seam: wrap the run's real `db.transaction` so every `tx.execute` inside it is recorded
+// (its rendered SQL, in order) and an optional hook runs AFTER it. Every transaction of the sweep goes
+// through `run.db`, so the record IS its transactional statement order (see sweepStepTransactions).
 // ---------------------------------------------------------------------------------------------
 type ExecuteHook = (statementIndex: number, sqlText: string) => Promise<void>;
 type TransactionMethod = typeof db.transaction;
 
-const realTransaction: TransactionMethod = db.transaction.bind(db);
 let executeHook: ExecuteHook | null = null;
 // One entry per transaction the sweep opened; each is that transaction's statements in order.
 let recordedTransactions: string[][] = [];
@@ -124,7 +143,8 @@ function renderSql(tx: Tx, query: SQL): string {
 	return dialect.sqlToQuery(query).sql.replace(/\s+/g, ' ').trim();
 }
 
-function installTransactionSeam(): void {
+function wrapRunDb(target: typeof db): void {
+	const realTransaction: TransactionMethod = target.transaction.bind(target);
 	const wrapped: TransactionMethod = (callback, config) =>
 		realTransaction(async (tx) => {
 			const statements: string[] = [];
@@ -139,13 +159,58 @@ function installTransactionSeam(): void {
 			(tx as { execute: typeof tx.execute }).execute = execute;
 			return callback(tx);
 		}, config);
-	(db as { transaction: TransactionMethod }).transaction = wrapped;
+	(target as { transaction: TransactionMethod }).transaction = wrapped;
+}
+
+// Applies to every run opened until removeTransactionSeam(); each run's client is fresh, so there is
+// nothing to restore.
+function installTransactionSeam(): void {
+	runSeam.onOpen = wrapRunDb;
 }
 
 function removeTransactionSeam(): void {
-	(db as { transaction: TransactionMethod }).transaction = realTransaction;
+	runSeam.onOpen = null;
 	executeHook = null;
 	recordedTransactions = [];
+}
+
+// sentinel-issue-tag-facets (#55) added two steps that open transactions of their own on the run, on
+// ANY issue in the database (the sweep is database-wide): the paced occurrence delete (FIRST, one
+// transaction per batch -- the issues lock, then the DELETE) and the deferred tag-rollup rebuild (LAST,
+// after the `next` catch-up -- per drifted issue a lock-free size probe, then the rebuild). Neither is
+// this file's subject, and whether either runs depends on what other files left behind. Each is
+// recognised by its exact statements and set aside, so the assertions below are about the same
+// transactions they were written against.
+const OCCURRENCE_BATCH_SQL = [
+	/^select id from issues where id = any\(\$1::uuid\[\]\) order by id for update$/i,
+	/^delete from error_occurrences where id = any\(\$1::uuid\[\]\) and created_at < \$2::timestamptz returning id$/i,
+];
+const TAG_REBUILD_SQL =
+	/^select (count\(\*\)::int as n from \( ?select 1 from error_occurrences where issue_id = \$1::uuid limit \$2\) s|issue_tag_values_rebuild\(\$1::uuid\))$/i;
+
+function isOccurrenceBatch(statements: string[]): boolean {
+	return statements.length > 0 && OCCURRENCE_BATCH_SQL[0].test(statements[0]);
+}
+
+function isTagRebuild(statements: string[]): boolean {
+	return statements.length === 1 && TAG_REBUILD_SQL.test(statements[0]);
+}
+
+/** The transactions of the steps this file is about, in order; #55's own are checked and dropped. */
+function sweepStepTransactions(): string[][] {
+	const steps: string[][] = [];
+	for (const statements of recordedTransactions) {
+		if (isOccurrenceBatch(statements)) {
+			// A batch is exactly the lock then the delete, and runs before every step of this file's.
+			expect(steps, 'an occurrence batch ran after a side-table step').toHaveLength(0);
+			expect(statements).toHaveLength(2);
+			expect(statements[1]).toMatch(OCCURRENCE_BATCH_SQL[1]);
+			continue;
+		}
+		if (isTagRebuild(statements)) continue;
+		steps.push(statements);
+	}
+	return steps;
 }
 
 describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, real Postgres)', () => {
@@ -383,10 +448,11 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 		// Three transactions: the two side-table steps, then -- LAST, sentinel-releases-snooze §4.3 --
 		// the one-statement `next` catch-up, which retention.next-catchup.integration.test.ts proves
 		// and which is only recognised here so the two side-table steps can still be asserted alone.
-		expect(recordedTransactions).toHaveLength(3);
-		expect(recordedTransactions[2]).toHaveLength(1);
-		expect(recordedTransactions[2][0]).toMatch(/^update "issues" i set resolved_in_version = r\.version/i);
-		for (const statements of recordedTransactions.slice(0, 2)) {
+		const steps = sweepStepTransactions();
+		expect(steps).toHaveLength(3);
+		expect(steps[2]).toHaveLength(1);
+		expect(steps[2][0]).toMatch(/^update "issues" i set resolved_in_version = r\.version/i);
+		for (const statements of steps.slice(0, 2)) {
 			expect(statements).toHaveLength(3);
 			expect(statements[0]).toMatch(
 				/^select "issues"\."id" as id from "issues" where "issues"\."id" in \( ?select distinct issue_id from "issue_affected_(users|tenants)" where last_seen < \$\d+::timestamptz ?\) order by "issues"\."id" for update$/i
@@ -398,8 +464,8 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 				/^update "issues" set "affected_(user|tenant)_count" = \( ?select count\(\*\) from "issue_affected_(users|tenants)" a where a\.issue_id = "issues"\."id" ?\) where "issues"\."id" = any\(\$\d+::uuid\[\]\)$/i
 			);
 		}
-		expect(recordedTransactions[0][1]).toContain('"issue_affected_users"');
-		expect(recordedTransactions[1][1]).toContain('"issue_affected_tenants"');
+		expect(steps[0][1]).toContain('"issue_affected_users"');
+		expect(steps[1][1]).toContain('"issue_affected_tenants"');
 	});
 
 	it('R1 (concurrent): an ingest for a touched issue waits on the issues row lock and completes without 40P01', async () => {
@@ -432,8 +498,9 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 		// the issues row lock and has deleted nothing yet. StoreEvent's order, on a separate
 		// connection: the issues row first (its upsert / regression UPDATE), then the side-table
 		// upsert, then the count bump when the upsert INSERTed (§4.3).
-		executeHook = async (statementIndex) => {
-			if (statementIndex !== 1) return;
+		executeHook = async (statementIndex, sqlText) => {
+			// The users step's lock SELECT, not an occurrence batch's (see sweepStepTransactions).
+			if (statementIndex !== 1 || !sqlText.includes('"issue_affected_users"')) return;
 			executeHook = null;
 			ingest = sql
 				.begin(async (s) => {
@@ -513,7 +580,8 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 		// step would leave "rows gone, count stale".
 		let faultsInjected = 0;
 		executeHook = async (statementIndex, sqlText) => {
-			if (statementIndex !== 2) return;
+			// The users step's DELETE, not an occurrence batch's (see sweepStepTransactions).
+			if (statementIndex !== 2 || OCCURRENCE_BATCH_SQL[1].test(sqlText)) return;
 			expect(sqlText).toMatch(/^delete from "issue_affected_users"/i);
 			faultsInjected += 1;
 			throw new Error('injected fault after the side-table DELETE');
@@ -524,7 +592,7 @@ describe.skipIf(!dbReachable)('retention side-table sweep (§4.5, integration, r
 		);
 		expect(faultsInjected).toBe(1);
 		// The tenants transaction was never opened: the throw left cleanupRetainedData entirely.
-		expect(recordedTransactions).toHaveLength(1);
+		expect(sweepStepTransactions()).toHaveLength(1);
 
 		// Nothing moved: not a row, not a count.
 		expect(await remainingUserIds(issueId)).toEqual(['f-new', 'f-old-1', 'f-old-2']);

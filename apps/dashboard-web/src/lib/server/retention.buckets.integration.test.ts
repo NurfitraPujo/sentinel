@@ -1,8 +1,28 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import postgres from 'postgres';
 import { randomUUID } from 'node:crypto';
 import { getTableName, type SQL } from 'drizzle-orm';
 import { db, type Tx } from '$lib/server/db';
+
+// Since sentinel-issue-tag-facets (#55, dde0ea2) the sweep does not use the module singleton at all:
+// `cleanupRetainedData` opens a retention run on its own per-run client and sends every statement
+// through `run.db` (§5 "One run, one connection, one deadline"). A seam on the singleton's methods
+// therefore recorded nothing -- which is how this file went red on every push to main from that
+// commit on. The seam now wraps each run's `db` as `openRetentionRun` hands it out: the real
+// function, called with the real arguments, on the real per-run client; only its methods are
+// wrapped while a seam is installed.
+const runSeam = vi.hoisted(() => ({ onOpen: null as ((runDb: never) => void) | null }));
+vi.mock('$lib/server/retention-run', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$lib/server/retention-run')>();
+	return {
+		...actual,
+		openRetentionRun: (...args: Parameters<typeof actual.openRetentionRun>) => {
+			const run = actual.openRetentionRun(...args);
+			runSeam.onOpen?.(run.db as never);
+			return run;
+		},
+	};
+});
 
 /**
  * sentinel-issue-trend §4.5 (flows R1–R3; decision 4) -- contract §11's `cleanupRetainedData`
@@ -161,10 +181,6 @@ type ExecuteMethod = typeof db.execute;
 type SelectMethod = typeof db.select;
 type DeleteMethod = typeof db.delete;
 
-const realTransaction: TransactionMethod = db.transaction.bind(db);
-const realExecute: ExecuteMethod = db.execute.bind(db);
-const realSelect: SelectMethod = db.select.bind(db);
-const realDelete: DeleteMethod = db.delete.bind(db);
 let recorded: Recorded[] = [];
 
 function renderSql(session: Tx | typeof db, query: SQL): string {
@@ -181,7 +197,11 @@ function tableNameOf(source: unknown): string {
 	}
 }
 
-function installSeam(): void {
+function wrapRunDb(target: typeof db): void {
+	const realTransaction: TransactionMethod = target.transaction.bind(target);
+	const realExecute: ExecuteMethod = target.execute.bind(target);
+	const realSelect: SelectMethod = target.select.bind(target);
+	const realDelete: DeleteMethod = target.delete.bind(target);
 	const transaction: TransactionMethod = (callback, config) => {
 		const started = performance.now();
 		const record: Recorded = { kind: 'transaction', statements: [], ms: 0 };
@@ -200,7 +220,7 @@ function installSeam(): void {
 		});
 	};
 	const execute = (async (query: SQL) => {
-		const record: Recorded = { kind: 'execute', sql: renderSql(db, query), ms: 0 };
+		const record: Recorded = { kind: 'execute', sql: renderSql(target, query), ms: 0 };
 		recorded.push(record);
 		const t0 = performance.now();
 		const result = await realExecute(query);
@@ -223,29 +243,25 @@ function installSeam(): void {
 		return (realDelete as unknown as (t: unknown) => unknown)(table);
 	}) as unknown as DeleteMethod;
 
-	const target = db as {
+	const methods = target as {
 		transaction: TransactionMethod;
 		execute: ExecuteMethod;
 		select: SelectMethod;
 		delete: DeleteMethod;
 	};
-	target.transaction = transaction;
-	target.execute = execute;
-	target.select = select;
-	target.delete = del;
+	methods.transaction = transaction;
+	methods.execute = execute;
+	methods.select = select;
+	methods.delete = del;
+}
+
+// Applies to every run opened until removeSeam(); each run's client is fresh, so nothing to restore.
+function installSeam(): void {
+	runSeam.onOpen = wrapRunDb;
 }
 
 function removeSeam(): void {
-	const target = db as {
-		transaction: TransactionMethod;
-		execute: ExecuteMethod;
-		select: SelectMethod;
-		delete: DeleteMethod;
-	};
-	target.transaction = realTransaction;
-	target.execute = realExecute;
-	target.select = realSelect;
-	target.delete = realDelete;
+	runSeam.onOpen = null;
 	recorded = [];
 }
 
@@ -263,6 +279,48 @@ function describeRecord(r: Recorded): string {
 		case 'delete':
 			return `delete(${r.table})`;
 	}
+}
+
+// sentinel-issue-tag-facets (#55) added two steps of its own to the sweep, both database-wide and both
+// dependent on what other files left behind: the paced occurrence delete, FIRST, whose batches are
+// transactions taking `FOR UPDATE` on `issues` (the lock, then the DELETE), and the deferred tag-rollup
+// rebuild, LAST -- after the `next` catch-up, deliberately (retention.ts: "LAST, after the orphan sweep
+// and the catch-up") -- which reads the drift queue and then, per drifted issue, runs a lock-free size
+// probe and the rebuild, each in its own transaction. Neither is this file's subject. `sweepRecords`
+// checks both by their exact statements and sets them aside, so the assertions below are about the
+// same records they were written against: the catch-up is the last statement BEFORE the rebuild step.
+const OCCURRENCE_BATCH_SQL = [
+	/^select id from issues where id = any\(\$1::uuid\[\]\) order by id for update$/i,
+	/^delete from error_occurrences where id = any\(\$1::uuid\[\]\) and created_at < \$2::timestamptz returning id$/i,
+];
+const TAG_REBUILD_QUEUE_SQL = /^select issue_id from issue_tag_values_drift where rebuilt_at is null /i;
+const TAG_REBUILD_SQL =
+	/^select (count\(\*\)::int as n from \( ?select 1 from error_occurrences where issue_id = \$1::uuid limit \$2\) s|issue_tag_values_rebuild\(\$1::uuid\))$/i;
+
+function isOccurrenceBatch(r: Recorded): boolean {
+	return r.kind === 'transaction' && r.statements.length > 0 && OCCURRENCE_BATCH_SQL[0].test(r.statements[0]);
+}
+
+function sweepRecords(all: Recorded[]): Recorded[] {
+	const order = all.map(describeRecord).join(' → ');
+	const rebuildAt = all.findIndex((r) => r.kind === 'execute' && TAG_REBUILD_QUEUE_SQL.test(r.sql));
+	expect(rebuildAt, `tag-rollup rebuild step not found in: ${order}`).toBeGreaterThan(-1);
+	for (const r of all.slice(rebuildAt)) {
+		if (r.kind === 'execute') expect(r.sql, order).toContain('issue_tag_values_drift');
+		else if (r.kind === 'transaction') {
+			expect(r.statements, order).toHaveLength(1);
+			expect(r.statements[0], order).toMatch(TAG_REBUILD_SQL);
+		} else expect.fail(`unexpected ${describeRecord(r)} in the rebuild step: ${order}`);
+	}
+	const body = all.slice(0, rebuildAt);
+	const firstOtherTransaction = body.findIndex((r) => r.kind === 'transaction' && !isOccurrenceBatch(r));
+	body.forEach((r, i) => {
+		if (isOccurrenceBatch(r) && firstOtherTransaction >= 0) expect(i, order).toBeLessThan(firstOtherTransaction);
+	});
+	for (const r of body.filter(isOccurrenceBatch)) {
+		expect((r as Extract<Recorded, { kind: 'transaction' }>).statements[1], order).toMatch(OCCURRENCE_BATCH_SQL[1]);
+	}
+	return body.filter((r) => !isOccurrenceBatch(r));
 }
 
 const round = (ms: number) => Math.round(ms * 1000) / 1000;
@@ -442,12 +500,13 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 		// delete, then the two side-table transactions (three statements each), then the bucket
 		// delete as ONE top-level autocommit statement, then the orphan candidate select on
 		// `issues` -- and no `FOR UPDATE` anywhere outside the two side-table transactions.
-		const order = recorded.map(describeRecord);
-		const bucketDeleteIndex = recorded.findIndex(
+		const sweep = sweepRecords(recorded);
+		const order = sweep.map(describeRecord);
+		const bucketDeleteIndex = sweep.findIndex(
 			(r) => r.kind === 'execute' && BUCKET_DELETE_SQL.test(r.sql)
 		);
 		expect(bucketDeleteIndex, `bucket delete not found in: ${order.join(' → ')}`).toBeGreaterThan(-1);
-		const transactionIndexes = recorded
+		const transactionIndexes = sweep
 			.map((r, i) => (r.kind === 'transaction' ? i : -1))
 			.filter((i) => i >= 0);
 		// Three transactions: the two side-table steps and -- LAST, after everything else the sweep
@@ -455,8 +514,8 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 		// retention.next-catchup.integration.test.ts. Only the first two are the side-table steps the
 		// bucket delete is ordered against.
 		expect(transactionIndexes, `expected three transactions in: ${order.join(' → ')}`).toHaveLength(3);
-		expect(transactionIndexes[2]).toBe(recorded.length - 1);
-		const orphanSelectIndex = recorded.findIndex((r) => r.kind === 'select' && r.table === 'issues');
+		expect(transactionIndexes[2]).toBe(sweep.length - 1);
+		const orphanSelectIndex = sweep.findIndex((r) => r.kind === 'select' && r.table === 'issues');
 		expect(orphanSelectIndex, `orphan candidate select not found in: ${order.join(' → ')}`).toBeGreaterThan(-1);
 
 		// After both side-table sweeps …
@@ -469,12 +528,12 @@ describe.skipIf(!dbReachable || measure)('retention bucket sweep (sentinel-issue
 		// Not inside any transaction (it is a top-level execute, so by construction), and it takes
 		// no lock: the only `FOR UPDATE` the sweep issues is the side-table step's, inside its
 		// transactions; nothing outside them mentions it, least of all the bucket delete.
-		const bucketDelete = recorded[bucketDeleteIndex] as Extract<Recorded, { kind: 'execute' }>;
+		const bucketDelete = sweep[bucketDeleteIndex] as Extract<Recorded, { kind: 'execute' }>;
 		expect(bucketDelete.sql).not.toMatch(/for update/i);
-		for (const r of recorded) {
+		for (const r of sweep) {
 			if (r.kind === 'execute') expect(r.sql).not.toMatch(/for update/i);
 		}
-		for (const [i, r] of recorded.entries()) {
+		for (const [i, r] of sweep.entries()) {
 			if (r.kind !== 'transaction') continue;
 			if (i === transactionIndexes[2]) {
 				// The last transaction is sentinel-releases-snooze §4.3's `next` catch-up: one

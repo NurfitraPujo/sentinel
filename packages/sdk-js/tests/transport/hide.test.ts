@@ -209,6 +209,10 @@ describe('B14 (unit, fake timers): the worker is not gated on visibility', () =>
     await s.waitFor(1); // no clock advance: sent at once
     expect(s.requests[0]?.ids).toEqual([a]);
     expect(h.fetches[0]?.keepalive).toBe(true);
+    // waitFor(1) returns when the STUB has the request, not when the client has its response: until then the
+    // hide-send's loop is still running, and an event captured now is the queue head it sends next (as it
+    // should — contract §4.4). Wait for the client to settle the batch, so `b` is captured after the hide-send.
+    await until(() => h.transport.stats().phase === 'idle', 'the hide-send resolved');
 
     doc.visibilityState = 'visible';
     const b = captureMessage('b');

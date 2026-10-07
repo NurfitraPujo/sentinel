@@ -108,6 +108,13 @@ describe.skipIf(!dbReachable)('getIssueFacets and the shared filters (integratio
 
 	beforeAll(async () => {
 		sql = postgres(connectionString, { connect_timeout: 5, max: 1 });
+		// The retention.*.integration family sweeps the WHOLE database -- retention.claims with a ONE-day
+		// cutoff -- and every issue below is occurrence-less with first_seen 100 h back, which is exactly
+		// the orphan rule: under --sequence.shuffle (B13) a sibling's sweep deleted part of this fixture
+		// mid-file. The family holds this key EXCLUSIVELY for each member's whole file; holding it SHARED
+		// here waits out a running sweep and keeps the next one out until afterAll, without serialising
+		// this file against anything but sweeps.
+		await sql`select pg_advisory_lock_shared(hashtext('sentinel.retention.integration'))`;
 		for (const [id, label] of [
 			[orgOwn, 'own'],
 			[orgForeign, 'foreign'],
@@ -136,7 +143,8 @@ describe.skipIf(!dbReachable)('getIssueFacets and the shared filters (integratio
 			values (${scopedUser}, ${projectA}, ${sql.array(['production'])}, ${openUser})`;
 
 		for (const s of seeds) await insert(s);
-	});
+		// The family's own hook ceiling: the shared lock can wait out a sibling's whole file.
+	}, 120_000);
 
 	afterAll(async () => {
 		if (!sql) return;
@@ -148,6 +156,7 @@ describe.skipIf(!dbReachable)('getIssueFacets and the shared filters (integratio
 			await sql`delete from "user" where id in (${openUser}, ${scopedUser})`;
 			await sql`delete from organizations where id in (${orgOwn}, ${orgForeign})`;
 		} finally {
+			await sql`select pg_advisory_unlock_all()`.catch(() => {});
 			await sql.end({ timeout: 5 }).catch(() => {});
 		}
 	});

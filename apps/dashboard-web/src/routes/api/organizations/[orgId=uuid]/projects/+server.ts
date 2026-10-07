@@ -32,7 +32,11 @@ import { requireOrgMembership } from '../keys/_shared';
  * internal landing place for unassigned reports, not something anyone chose to create, and they are
  * excluded from the error dashboard and alert evaluation for the same reason.
  *
- * Shape is unchanged — `{ id, name, createdAt }`.
+ * `{ id, name }` and nothing else, sorted by name — decision 31's shape, which both consumers (the
+ * invite modal and /[orgSlug]/settings/agents) type as exactly that. The 2026-09-10 merge of #8 into
+ * the environments branch (678613b) re-selected the rows from `projects` to drop inboxes and in doing
+ * so put #8's `createdAt` back and lost getAccessibleProjects' name order (no ORDER BY): the inbox
+ * filter below only narrows that list, so the order and shape are the resolver's.
  */
 export const GET: RequestHandler = async ({ params, locals }) => {
 	const session = await locals.auth();
@@ -58,8 +62,8 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		return json({ projects: [] });
 	}
 
-	const rows = await db
-		.select({ id: projects.id, name: projects.name, createdAt: projects.createdAt })
+	const visible = await db
+		.select({ id: projects.id })
 		.from(projects)
 		.where(
 			and(
@@ -70,8 +74,13 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 				eq(projects.isInbox, false)
 			)
 		);
+	const visibleIds = new Set(visible.map((r) => r.id));
 
-	return json({ projects: rows });
+	return json({
+		projects: accessible
+			.filter((p) => visibleIds.has(p.id))
+			.map((p) => ({ id: p.id, name: p.name })),
+	});
 };
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {

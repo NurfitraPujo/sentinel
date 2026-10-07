@@ -16,7 +16,7 @@ vi.mock('$lib/server/issue-access', () => ({
 const dbMock: any = { select: vi.fn(), from: vi.fn(), where: vi.fn() };
 dbMock.select.mockReturnValue(dbMock);
 dbMock.from.mockReturnValue(dbMock);
-dbMock.where.mockResolvedValue([{ id: 'proj-1', name: 'Web app', createdAt: null }]);
+dbMock.where.mockResolvedValue([{ id: 'proj-1' }]);
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
 
 vi.mock('$lib/db/schema', () => ({
@@ -45,7 +45,7 @@ beforeEach(() => {
 	]);
 	dbMock.select.mockReturnValue(dbMock);
 	dbMock.from.mockReturnValue(dbMock);
-	dbMock.where.mockResolvedValue([{ id: 'proj-1', name: 'Web app', createdAt: null }]);
+	dbMock.where.mockResolvedValue([{ id: 'proj-1' }]);
 });
 
 describe('POST /api/organizations/[orgId]/projects', () => {
@@ -87,7 +87,7 @@ describe('GET /api/organizations/[orgId]/projects', () => {
 		const res = await GET(event('user-1'));
 
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ projects: [{ id: 'proj-1', name: 'Web app', createdAt: null }] });
+		expect(await res.json()).toEqual({ projects: [{ id: 'proj-1', name: 'Web app' }] });
 	});
 
 	it('401s an anonymous caller', async () => {
@@ -130,13 +130,36 @@ describe('GET /api/organizations/[orgId]/projects', () => {
 			{ id: 'proj-1', name: 'Web app', organizationId: 'org-1' },
 			{ id: 'inbox-1', name: 'Triage', organizationId: 'org-1' },
 		]);
-		dbMock.where.mockResolvedValue([{ id: 'proj-1', name: 'Web app', createdAt: null }]);
+		dbMock.where.mockResolvedValue([{ id: 'proj-1' }]);
 
 		const res = await GET(event('user-1'));
 
 		expect(await res.json()).toEqual({
-			projects: [{ id: 'proj-1', name: 'Web app', createdAt: null }],
+			projects: [{ id: 'proj-1', name: 'Web app' }],
 		});
 		expect(dbMock.where).toHaveBeenCalledTimes(1);
+	});
+
+	// Decision 31: `{ id, name }` and nothing else, in the resolver's name order -- the picker renders
+	// it as-is. The inbox query has no ORDER BY and its rows are not the response: the 2026-09-10 merge
+	// returned them directly, which put `createdAt` back and the order at the planner's mercy (red on
+	// every push since in environments.integration.test.ts).
+	it('returns { id, name } only, in getAccessibleProjects\' name order, whatever order the inbox filter reads', async () => {
+		getAccessibleProjects.mockResolvedValue([
+			{ id: 'proj-a', name: 'Alpha', organizationId: 'org-1' },
+			{ id: 'proj-b', name: 'Beta', organizationId: 'org-1' },
+			{ id: 'proj-c', name: 'Gamma', organizationId: 'org-1' },
+		]);
+		dbMock.where.mockResolvedValue([{ id: 'proj-c' }, { id: 'proj-a' }, { id: 'proj-b' }]);
+
+		const res = await GET(event('user-1'));
+
+		expect(await res.json()).toEqual({
+			projects: [
+				{ id: 'proj-a', name: 'Alpha' },
+				{ id: 'proj-b', name: 'Beta' },
+				{ id: 'proj-c', name: 'Gamma' },
+			],
+		});
 	});
 });

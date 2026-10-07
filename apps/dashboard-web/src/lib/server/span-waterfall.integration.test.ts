@@ -82,6 +82,11 @@ describe.skipIf(!dbReachable)('the span waterfall query and span retention (inte
 
 	beforeAll(async () => {
 		sql = postgres(connectionString, { connect_timeout: 5, max: 1 });
+		// A member of the retention.*.integration family: this file drops `spans` day partitions itself
+		// (maintainSpans), and every family sweep runs maintainSpans too -- under --sequence.shuffle (B13) a
+		// sibling's sweep dropped the 16-day partition the retention case had just created, before its insert
+		// ("no partition of relation spans found for row"). Same key, held exclusively for the whole file.
+		await sql`select pg_advisory_lock(hashtext('sentinel.retention.integration'))`;
 		await sql`select spans_ensure_partitions(1, 2)`;
 
 		for (const [oid, label] of [[orgA, 'a'], [orgB, 'b']] as const) {
@@ -114,7 +119,8 @@ describe.skipIf(!dbReachable)('the span waterfall query and span retention (inte
 		await insertSpan(orgB, projB, 'mobile', 'production', TRACE, id.bm, 5);
 		await insertSpan(orgB, null, 'pulled', 'production', TRACE, id.bp, 6);
 		await insertSpan(orgB, null, 'pulled', 'production', TRACE_B_ONLY, hex16(), 7);
-	});
+		// The family's hook ceiling: the lock can wait out a sibling's whole file.
+	}, 120_000);
 
 	afterAll(async () => {
 		if (!sql) return;
@@ -129,6 +135,7 @@ describe.skipIf(!dbReachable)('the span waterfall query and span retention (inte
 			// Leave no partition behind that this file created for the retention case.
 			await sql`select spans_drop_expired(14)`;
 		} finally {
+			await sql`select pg_advisory_unlock_all()`.catch(() => {});
 			await sql.end({ timeout: 5 }).catch(() => {});
 		}
 	});

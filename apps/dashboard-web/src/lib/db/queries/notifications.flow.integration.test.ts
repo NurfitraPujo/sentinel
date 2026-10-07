@@ -5,8 +5,13 @@ import { randomUUID } from 'node:crypto';
 // email.ts reads EMAIL_SERVER fresh from `$env/dynamic/private` on every call (see
 // email.test.ts's comment) rather than from `process.env` directly, so the smtp://debug
 // jsonTransport assertion in step 7 below needs this mock rather than a plain
-// `process.env.EMAIL_SERVER = ...` mutation.
-const mockEnv: Record<string, string | undefined> = { EMAIL_SERVER: 'smtp://debug' };
+// `process.env.EMAIL_SERVER = ...` mutation. DATABASE_URL is passed through: db.ts reads it from
+// this same module, and without it the query layer silently fell back to localhost:5432 while this
+// file's own probe and fixture connection used DATABASE_URL -- two databases whenever they differ.
+const mockEnv: Record<string, string | undefined> = {
+	EMAIL_SERVER: 'smtp://debug',
+	DATABASE_URL: process.env.DATABASE_URL,
+};
 vi.mock('$env/dynamic/private', () => ({ env: mockEnv }));
 
 // Manual issues M4 (docs/plans/MANUAL_ISSUES_DESIGN.md §8; CLAUDE.md's "Final M4 stage"):
