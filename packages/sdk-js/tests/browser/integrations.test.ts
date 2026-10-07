@@ -60,7 +60,7 @@ describe('the page test: console, fetch, xhr, navigation, click all recorded on 
     xhr.open('POST', '/api/y?token=x0k');
     xhr.send('secret-xhr-body');
     await Promise.resolve();
-    history.pushState({}, '', '/reset?code=c0de');
+    history.pushState({}, '', '/reset?code=code-secret-marker');
     document.getElementById('secret')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     document.getElementById('save')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 20));
@@ -76,7 +76,7 @@ describe('the page test: console, fetch, xhr, navigation, click all recorded on 
     expect(serialised).not.toContain('secret-xhr-body');
     expect(serialised).not.toContain('t0k');
     expect(serialised).not.toContain('x0k');
-    expect(serialised).not.toContain('c0de');
+    expect(serialised).not.toContain('code-secret-marker');
     expect(serialised).not.toContain('start0k');
     expect(serialised).toContain('token=[Filtered]');
     expect(serialised).toContain('code=[Filtered]');

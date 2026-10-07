@@ -219,14 +219,17 @@ func TestMiddlewareQueryStringFiltered(t *testing.T) {
 	}
 }
 
+// Every marker must be unable to occur in generated content: the leak check
+// scans the whole event body, which carries random hex ids (event_id), so a
+// short hex-valid marker like "abc" matches by chance (~0.7% of runs).
 func TestMiddlewareURLHeadersFiltered(t *testing.T) {
 	cases := []struct {
 		name, header, value string
-		wantKey              bool
-		want                  string
-		marker                string
+		wantKey             bool
+		want                string
+		marker              string
 	}{
-		{"referer", "Referer", "https://app.example.test/reset?token=abc&x=1", true, "https://app.example.test/reset?token=[FILTERED]&x=1", "abc"},
+		{"referer", "Referer", "https://app.example.test/reset?token=tok-secret-referer-marker&x=1", true, "https://app.example.test/reset?token=[FILTERED]&x=1", "tok-secret-referer-marker"},
 		{"referer-userinfo-fragment", "Referer", "https://u:pw-marker@app.example.test/p?x=1#frag-marker", true, "https://app.example.test/p?x=1", "pw-marker"},
 		{"x-original-url", "X-Original-Url", "/reset?password=p-marker&id=7", true, "/reset?password=[FILTERED]&id=7", "p-marker"},
 		{"referer-unparsable", "Referer", "https://app.example.test/%zz?token=bad-marker", false, "", "bad-marker"},
