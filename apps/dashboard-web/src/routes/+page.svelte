@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import TrendSparkline from '$lib/components/issues/TrendSparkline.svelte';
+	import { formatTagParam, TAG_KEY_PATTERN } from '$lib/tag-filter';
 
 	let { data } = $props();
 
@@ -108,6 +109,13 @@
 		claim?: string;
 		q?: string;
 		volume?: string;
+		release?: string;
+		type?: string;
+		source?: string;
+		regressed?: boolean;
+		waiting?: string;
+		/** `formatTagParam` strings — re-emitted verbatim, never rebuilt from parts. */
+		tags?: string[];
 		seen?: string;
 		seen_from?: string;
 		seen_to?: string;
@@ -121,6 +129,18 @@
 			(params.project !== undefined && params.project !== data.filters.project)
 				? 'all'
 				: (params.environment ?? data.filters.environment);
+		// sentinel-issue-list-filters D4: `release` is per project, dropped on a project change like
+		// `environment`. The other five new filters are not project-scoped and survive it.
+		const release =
+			project === 'all' ||
+			(params.project !== undefined && params.project !== data.filters.project)
+				? 'all'
+				: (params.release ?? data.filters.release ?? 'all');
+		const issueType = params.type ?? data.filters.type ?? 'all';
+		const source = params.source ?? data.filters.source ?? 'all';
+		const regressed = params.regressed ?? data.filters.regressed ?? false;
+		const waiting = params.waiting ?? data.filters.waiting ?? 'all';
+		const tagParams = params.tags ?? (data.filters.tags ?? []).map((t: { param: string }) => t.param);
 		const sort = params.sort ?? data.filters.sort;
 		const newFilter = params.new ?? data.filters.new;
 		const claim = params.claim ?? data.filters.claim ?? 'all';
@@ -143,13 +163,83 @@
 		if (newFilter && newFilter !== 'all') q.set('new', newFilter);
 		if (claim && claim !== 'all') q.set('claim', claim);
 		if (volume && volume !== 'all') q.set('volume', volume);
+		if (release && release !== 'all') q.set('release', release);
+		if (issueType && issueType !== 'all') q.set('type', issueType);
+		if (source && source !== 'all') q.set('source', source);
+		if (regressed) q.set('regressed', '1');
+		if (waiting && waiting !== 'all') q.set('waiting', waiting);
 		if (seen && seen !== 'all') q.set('seen', seen);
 		if (seen === 'all' && seenFrom) q.set('seen_from', seenFrom);
 		if (seen === 'all' && seenTo) q.set('seen_to', seenTo);
 		if (searchQueryParam && searchQueryParam.trim()) q.set('q', searchQueryParam.trim());
 		if (limit && limit !== 20) q.set('limit', String(limit));
 		if (params.page && params.page > 1) q.set('page', String(params.page));
-		return `?${q.toString()}`;
+		// Tags are appended by hand: each `param` is already `encode(key):encode(value)` and is encoded
+		// once more as a query value (tag-filter.ts decisions 6-8). URLSearchParams would re-split it.
+		let out = `?${q.toString()}`;
+		for (const t of tagParams) out += `&tag=${encodeURIComponent(t)}`;
+		return out;
+	}
+
+	// sentinel-issue-list-filters §5: Release / Type / Source / Waiting selects, the Regressed chip
+	// and the tag form. All navigate through `href()`, which resets `page` to 1.
+	let releases = $derived((data.releases ?? []) as { version: string }[]);
+	let releaseOptions = $derived.by(() => {
+		const current = data.filters.release ?? 'all';
+		// A URL release outside the newest 50 is still applied and still shown (§5.1).
+		return current !== 'all' && !releases.some((r) => r.version === current)
+			? [{ version: current }, ...releases]
+			: releases;
+	});
+	let activeTags = $derived((data.filters.tags ?? []) as { key: string; value: string; param: string }[]);
+
+	const typeOptions = [
+		{ value: 'all', label: 'Type: All' },
+		{ value: 'system_error', label: 'System error' },
+		{ value: 'user_report', label: 'User report' },
+	];
+	const sourceLabels: Record<string, string> = {
+		ingestion_sdk: 'SDK',
+		manual_support: 'Manual (support)',
+		api: 'API',
+		user_report_api: 'User report API',
+	};
+	let sourceOptions = $derived([
+		{ value: 'all', label: 'Source: All' },
+		...((data.sources ?? []) as string[]).map((value) => ({ value, label: sourceLabels[value] ?? value })),
+	]);
+	const waitingOptions = [
+		{ value: 'all', label: 'Waiting: All' },
+		{ value: 'any', label: 'Waiting: any' },
+		{ value: 'reporter', label: 'Waiting: on reporter' },
+		{ value: 'team', label: 'Waiting: on team' },
+	];
+	const DERIVED_TAG_KEYS = ['browser.name', 'os.name', 'client_os.name', 'device.model', 'user.id'];
+
+	let tagFormOpen = $state(false);
+	let tagKeyChoice = $state(DERIVED_TAG_KEYS[0]);
+	let tagCustomKey = $state('');
+	let tagValue = $state('');
+	let tagError = $state('');
+
+	function applyTag() {
+		const key = tagKeyChoice === '__custom' ? tagCustomKey.trim() : tagKeyChoice;
+		if (!TAG_KEY_PATTERN.test(key)) {
+			tagError = 'Key must be 1-32 characters: letters, digits, _ . : -';
+			return;
+		}
+		if (tagValue === '') {
+			tagError = 'Value is required';
+			return;
+		}
+		tagError = '';
+		const param = formatTagParam(key, tagValue);
+		const next = activeTags.some((t) => t.param === param)
+			? activeTags.map((t) => t.param)
+			: [...activeTags.map((t) => t.param), param];
+		tagFormOpen = false;
+		tagValue = '';
+		goto(href({ tags: next }));
 	}
 
 	// sentinel-affected-users §4.1, flows `L2`/`L3`. The Sort group is a LIST of entries, not two
@@ -276,6 +366,12 @@
 			data.filters.claim !== 'all' ||
 			Boolean(data.filters.q) ||
 			data.filters.volume !== 'all' ||
+			(data.filters.release ?? 'all') !== 'all' ||
+			(data.filters.type ?? 'all') !== 'all' ||
+			(data.filters.source ?? 'all') !== 'all' ||
+			Boolean(data.filters.regressed) ||
+			(data.filters.waiting ?? 'all') !== 'all' ||
+			activeTags.length > 0 ||
 			dateRangeActive
 	);
 	let resetHref = $derived(
@@ -286,6 +382,12 @@
 			claim: 'all',
 			q: '',
 			volume: 'all',
+			release: 'all',
+			type: 'all',
+			source: 'all',
+			regressed: false,
+			waiting: 'all',
+			tags: [],
 			seen: 'all',
 			seen_from: '',
 			seen_to: '',
@@ -721,6 +823,98 @@
 					</div>
 				</div>
 
+				<div class="list-filters-row" data-testid="list-filters">
+					{#if projectSelected}
+						<select
+							class="filter-select"
+							data-testid="release-filter"
+							aria-label="Release"
+							value={data.filters.release ?? 'all'}
+							onchange={(e) => goto(href({ release: e.currentTarget.value }))}
+						>
+							<option value="all">Release: All</option>
+							{#each releaseOptions as r (r.version)}
+								<option value={r.version}>{r.version}</option>
+							{/each}
+						</select>
+					{/if}
+					<select
+						class="filter-select"
+						data-testid="type-filter"
+						aria-label="Type"
+						value={data.filters.type ?? 'all'}
+						onchange={(e) => goto(href({ type: e.currentTarget.value }))}
+					>
+						{#each typeOptions as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+					</select>
+					<select
+						class="filter-select"
+						data-testid="source-filter"
+						aria-label="Source"
+						value={data.filters.source ?? 'all'}
+						onchange={(e) => goto(href({ source: e.currentTarget.value }))}
+					>
+						{#each sourceOptions as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+					</select>
+					<select
+						class="filter-select"
+						data-testid="waiting-filter"
+						aria-label="Waiting"
+						value={data.filters.waiting ?? 'all'}
+						onchange={(e) => goto(href({ waiting: e.currentTarget.value }))}
+					>
+						{#each waitingOptions as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+					</select>
+					<a
+						href={href({ regressed: !data.filters.regressed })}
+						class="chip-btn"
+						class:active={Boolean(data.filters.regressed)}
+						data-testid="regressed-chip"
+					>
+						Regressed
+					</a>
+					{#each activeTags as tag (tag.param)}
+						<span class="tag-chip" data-testid="tag-chip">
+							{tag.key}: {tag.value}
+							<a
+								href={href({ tags: activeTags.filter((t) => t.param !== tag.param).map((t) => t.param) })}
+								aria-label="Remove tag {tag.key}: {tag.value}"
+								data-testid="tag-chip-remove">×</a
+							>
+						</span>
+					{/each}
+					<button
+						type="button"
+						class="chip-btn"
+						data-testid="tag-add"
+						aria-expanded={tagFormOpen}
+						onclick={() => (tagFormOpen = !tagFormOpen)}
+					>
+						+ Tag
+					</button>
+					{#if tagFormOpen}
+						<form
+							class="tag-form"
+							data-testid="tag-form"
+							onsubmit={(e) => {
+								e.preventDefault();
+								applyTag();
+							}}
+						>
+							<select bind:value={tagKeyChoice} aria-label="Tag key" class="filter-select">
+								{#each DERIVED_TAG_KEYS as k (k)}<option value={k}>{k}</option>{/each}
+								<option value="__custom">Custom key…</option>
+							</select>
+							{#if tagKeyChoice === '__custom'}
+								<input type="text" bind:value={tagCustomKey} aria-label="Custom tag key" placeholder="key" />
+							{/if}
+							<input type="text" bind:value={tagValue} aria-label="Tag value" placeholder="value" />
+							<button type="submit" class="btn-apply">Add</button>
+							{#if tagError}<span class="tag-error" role="alert">{tagError}</span>{/if}
+						</form>
+					{/if}
+				</div>
+
 				<div class="sub-filter-status-row">
 					<span class="filter-count-readout">Showing {data.pagination.total.toLocaleString()} matching issue{data.pagination.total === 1 ? '' : 's'}</span>
 					{#if anyFilterActive}
@@ -1069,6 +1263,37 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.list-filters-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem;
+		margin: 0.5rem 0;
+	}
+	.filter-select {
+		padding: 0.3rem 0.5rem;
+		border-radius: 6px;
+	}
+	.tag-chip {
+		display: inline-flex;
+		gap: 0.4rem;
+		align-items: center;
+		padding: 0.2rem 0.6rem;
+		border-radius: 999px;
+		border: 1px solid currentColor;
+		font-size: 0.85rem;
+	}
+	.tag-form {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		align-items: center;
+	}
+	.tag-error {
+		color: #b91c1c;
+		font-size: 0.8rem;
 	}
 
 	.environment-chip {

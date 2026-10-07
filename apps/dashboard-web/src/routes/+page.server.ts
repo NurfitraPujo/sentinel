@@ -4,10 +4,18 @@ import { issueQueries } from '$lib/server/queries/issue-queries';
 import { getUser } from '$lib/server/auth';
 import { getAccessibleProjects } from '$lib/server/issue-access';
 import { resolveEnvironmentScopes, scopeForProject } from '$lib/server/environment-access';
+import { AGENT_ISSUE_SOURCES } from '$lib/db/queries/agent-work';
+import { listPickerReleases } from '$lib/db/queries/releases';
 import { listProjectEnvironments, toEnvironmentApiShape } from '$lib/db/queries/environments';
 import {
 	coerceIssueNewFilter,
+	coerceIssueRegressed,
+	coerceIssueRelease,
 	coerceIssueSeen,
+	coerceIssueSource,
+	coerceIssueTags,
+	coerceIssueType,
+	coerceIssueWaiting,
 	coerceIssueSort,
 	coerceIssueStatus,
 	coerceIssueVolume,
@@ -100,7 +108,23 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 	const seenTo = seen === 'all' ? parseSeenInstant(url.searchParams.get('seen_to')) : undefined;
 	const seenAfter = seen === 'all' ? seenFrom : seenLowerBound(seen, now);
 
+	// sentinel-issue-list-filters §5: six more server filters, coerced here and echoed coerced.
+	// `release` is project-scoped exactly like `environment` (D4): `project=all` coerces it to `all`.
+	const releaseFilter =
+		projectIdFilter === 'all' ? 'all' : coerceIssueRelease(url.searchParams.get('release'));
+	const issueType = coerceIssueType(url.searchParams.get('type'));
+	const source = coerceIssueSource(url.searchParams.get('source'));
+	const regressed = coerceIssueRegressed(url.searchParams.get('regressed'));
+	const waiting = coerceIssueWaiting(url.searchParams.get('waiting'));
+	const tags = coerceIssueTags(url.searchParams.getAll('tag'));
+
 	const baseFilters = {
+		release: releaseFilter,
+		issueType,
+		source,
+		regressed,
+		waiting,
+		tags: tags.map(({ key, value }) => ({ key, value })),
 		status: statusFilter,
 		projectId: projectIdFilter,
 		projectIds: authorizedProjectIds,
@@ -189,6 +213,13 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 				)
 			: [];
 
+	// sentinel-issue-list-filters §5.1: the project's newest releases, only inside one authorised
+	// project (the same rule as `environments`); `[]` on `project=all`.
+	const releases =
+		projectIdFilter !== 'all' && authorizedProjectIds.includes(projectIdFilter)
+			? await listPickerReleases(projectIdFilter)
+			: [];
+
 	// §4.1's per-card series, decision 10: ONE query for the whole page, keyed on exactly the ids
 	// `listIssues` returned under the guards — it takes ids, never a project or a user, so it cannot
 	// widen the set (§2). Skipped outright when the page is empty: there is nothing to attach a
@@ -220,6 +251,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		issues: issuesWithProject,
 		projects: userProjects,
 		environments,
+		// Imported, not copied: the Source select's vocabulary.
+		sources: [...AGENT_ISSUE_SOURCES],
+		releases: releases.map((r) => ({ version: r.version })),
 		facets,
 		usersById,
 		orgUsers,
@@ -244,6 +278,12 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			claim: claimFilter,
 			q: searchQuery,
 			volume,
+			release: releaseFilter,
+			type: issueType,
+			source,
+			regressed,
+			waiting,
+			tags,
 			seen,
 			// ISO strings (or '') — the page derives the date trigger's label from the echo.
 			seen_from: seenFrom?.toISOString() ?? '',

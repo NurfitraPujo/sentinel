@@ -1,3 +1,6 @@
+import { AGENT_ISSUE_SOURCES, type AgentIssueSource } from '$lib/db/queries/agent-work';
+import { formatTagParam, MAX_TAG_FILTERS, parseTagParam, type TagFilter } from '$lib/tag-filter';
+
 /**
  * sentinel-affected-users §4.1, decision 10 — the `sort` parameter's vocabulary, in ONE place.
  *
@@ -130,6 +133,66 @@ export function parseSeenInstant(value: string | null | undefined): Date | undef
 	if (!value) return undefined;
 	const d = new Date(value);
 	return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
+/**
+ * sentinel-issue-list-filters §5 items 2-5 — `type`, `source`, `regressed`, `waiting`: server
+ * filters coerced like `volume` (the loader coerces once, the queries see the coerced value, the
+ * echo carries it so `href()` never rides a bad string). Anything unknown is the absence.
+ */
+export const ISSUE_TYPES = ['system_error', 'user_report'] as const;
+export type IssueTypeFilter = 'all' | (typeof ISSUE_TYPES)[number];
+
+export function coerceIssueType(value: string | null | undefined): IssueTypeFilter {
+	return (ISSUE_TYPES as readonly string[]).includes(value ?? '') ? (value as IssueTypeFilter) : 'all';
+}
+
+export type IssueSourceFilter = 'all' | AgentIssueSource;
+
+export function coerceIssueSource(value: string | null | undefined): IssueSourceFilter {
+	return (AGENT_ISSUE_SOURCES as readonly string[]).includes(value ?? '')
+		? (value as IssueSourceFilter)
+		: 'all';
+}
+
+/** `regressed=1` or absent; anything else is absent (`false`). */
+export function coerceIssueRegressed(value: string | null | undefined): boolean {
+	return value === '1';
+}
+
+export const ISSUE_WAITING = ['any', 'reporter', 'team'] as const;
+export type IssueWaitingFilter = 'all' | (typeof ISSUE_WAITING)[number];
+
+export function coerceIssueWaiting(value: string | null | undefined): IssueWaitingFilter {
+	return (ISSUE_WAITING as readonly string[]).includes(value ?? '') ? (value as IssueWaitingFilter) : 'all';
+}
+
+/** `release`: a non-empty version string, or `all`. Project scoping is the loader's. */
+export function coerceIssueRelease(value: string | null | undefined): string {
+	return value && value !== 'all' ? value : 'all';
+}
+
+/**
+ * Repeatable `tag=<key>:<value>`: parsed with `parseTagParam`, de-duplicated, first
+ * `MAX_TAG_FILTERS` kept, malformed ignored. `param` is `formatTagParam` — what `href()` re-emits.
+ */
+export interface IssueTagFilter extends TagFilter {
+	param: string;
+}
+
+export function coerceIssueTags(params: string[]): IssueTagFilter[] {
+	const tags: IssueTagFilter[] = [];
+	const seen = new Set<string>();
+	for (const raw of params) {
+		const parsed = parseTagParam(raw);
+		if (!parsed) continue;
+		const id = JSON.stringify([parsed.key, parsed.value]);
+		if (seen.has(id)) continue;
+		seen.add(id);
+		if (tags.length >= MAX_TAG_FILTERS) break;
+		tags.push({ ...parsed, param: formatTagParam(parsed.key, parsed.value) });
+	}
+	return tags;
 }
 
 /** `page` is an integer >= 1: NaN, zero and negatives are page 1 (D4). */

@@ -105,3 +105,57 @@ describe('fix-sentinel-issues-dashboard coercions', () => {
 		expect([coercePage('0'), coercePage('-2'), coercePage('abc'), coercePage(null), coercePage('7')]).toEqual([1, 1, 1, 1, 7]);
 	});
 });
+
+
+import {
+	coerceIssueRegressed,
+	coerceIssueRelease,
+	coerceIssueSource,
+	coerceIssueTags,
+	coerceIssueType,
+	coerceIssueWaiting,
+} from './issue-sort';
+
+describe('sentinel-issue-list-filters coercers', () => {
+	it('type: valid, unknown, empty', () => {
+		expect(coerceIssueType('system_error')).toBe('system_error');
+		expect(coerceIssueType('user_report')).toBe('user_report');
+		expect(coerceIssueType('banana')).toBe('all');
+		expect(coerceIssueType('')).toBe('all');
+		expect(coerceIssueType(null)).toBe('all');
+	});
+	it('source: every AGENT_ISSUE_SOURCES member is valid, anything else is all', () => {
+		for (const s of ['ingestion_sdk', 'manual_support', 'api', 'user_report_api']) {
+			expect(coerceIssueSource(s)).toBe(s);
+		}
+		expect(coerceIssueSource('nope')).toBe('all');
+		expect(coerceIssueSource('')).toBe('all');
+	});
+	it('regressed: only 1', () => {
+		expect(coerceIssueRegressed('1')).toBe(true);
+		expect(coerceIssueRegressed('true')).toBe(false);
+		expect(coerceIssueRegressed('')).toBe(false);
+		expect(coerceIssueRegressed(null)).toBe(false);
+	});
+	it('waiting: any|reporter|team, else all', () => {
+		expect(coerceIssueWaiting('any')).toBe('any');
+		expect(coerceIssueWaiting('reporter')).toBe('reporter');
+		expect(coerceIssueWaiting('team')).toBe('team');
+		expect(coerceIssueWaiting('all')).toBe('all');
+		expect(coerceIssueWaiting('x')).toBe('all');
+		expect(coerceIssueWaiting('')).toBe('all');
+	});
+	it('release: a version or all', () => {
+		expect(coerceIssueRelease('1.0.0')).toBe('1.0.0');
+		expect(coerceIssueRelease('all')).toBe('all');
+		expect(coerceIssueRelease('')).toBe('all');
+		expect(coerceIssueRelease(null)).toBe('all');
+	});
+	it('tags: parses, de-duplicates, caps and ignores malformed; echoes param', () => {
+		expect(coerceIssueTags(['a:b', 'a:b', 'bad', 'x:y:z', ':v', 'k:'])).toEqual([
+			{ key: 'a', value: 'b', param: 'a:b' },
+		]);
+		expect(coerceIssueTags(['k:a%20b'])).toEqual([{ key: 'k', value: 'a b', param: 'k:a%20b' }]);
+		expect(coerceIssueTags(Array.from({ length: 15 }, (_, i) => `k${i}:v`))).toHaveLength(10);
+	});
+});

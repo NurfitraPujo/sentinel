@@ -4,6 +4,8 @@ import { eq, ne, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort, firstSeenLowerBound, HIGH_VOLUME_THRESHOLD } from "$lib/server/issue-sort";
 import { DAY_MS, HOUR_MS, TREND_HOURLY_SLOTS, utcDayStart } from "$lib/server/trend-window";
+import { tagCondition } from "$lib/server/search";
+import type { TagFilter } from "$lib/tag-filter";
 import type { TagFacetRow } from "$lib/tag-facets";
 
 export interface IssueFilters {
@@ -69,6 +71,17 @@ export interface IssueFilters {
     seenAfter?: Date;
     /** D3 — `last_seen <= seenBefore` (`seen_to`). */
     seenBefore?: Date;
+    /**
+     * sentinel-issue-list-filters §5 — six server filters. Predicates live in `buildIssueConditions`
+     * only (not in `IssueFilterName`), so the list, the total and every facet group narrow together.
+     * `release` and `tags` reuse `tagCondition` — the one definition `/search` uses.
+     */
+    release?: string;
+    issueType?: string;
+    source?: string;
+    regressed?: boolean;
+    waiting?: string;
+    tags?: TagFilter[];
     /**
      * Claimant filter: 'all' | 'unclaimed' | 'claimed-me' | 'claimed-agent' | specific claimant string (user ID or email).
      */
@@ -208,6 +221,27 @@ function buildIssueConditions(filters: IssueFilters, omit: ReadonlySet<IssueFilt
     }
     if (filters.seenBefore) {
         conditions.push(lte(issues.lastSeen, filters.seenBefore));
+    }
+
+    if (filters.release && filters.release !== "all") {
+        conditions.push(tagCondition({ key: "release", value: filters.release }));
+    }
+    if (filters.issueType && filters.issueType !== "all") {
+        conditions.push(eq(issues.issueType, filters.issueType));
+    }
+    if (filters.source && filters.source !== "all") {
+        conditions.push(eq(issues.sourceChannel, filters.source));
+    }
+    if (filters.regressed) {
+        conditions.push(eq(issues.regressionStatus, "regressed"));
+    }
+    if (filters.waiting === "any") {
+        conditions.push(isNotNull(issues.waitingOn));
+    } else if (filters.waiting === "reporter" || filters.waiting === "team") {
+        conditions.push(eq(issues.waitingOn, filters.waiting));
+    }
+    for (const tag of filters.tags ?? []) {
+        conditions.push(tagCondition(tag));
     }
 
     if (!omit.has("claim") && filters.claim && filters.claim !== "all") {

@@ -16,6 +16,7 @@ const getAccessibleProjectsMock = vi.fn();
 const resolveEnvironmentScopesMock = vi.fn();
 const listProjectEnvironmentsMock = vi.fn();
 const listIssuesMock = vi.fn();
+const listPickerReleasesMock = vi.fn();
 const countIssuesMock = vi.fn();
 const listProjectsMock = vi.fn();
 // sentinel-issue-trend §4.1: the per-card series reader. Mocked like the queries — what it returns
@@ -58,6 +59,10 @@ vi.mock('$lib/db/queries/environments', async () => {
 			'$lib/db/queries/environments'
 		);
 	return { ...actual, listProjectEnvironments: listProjectEnvironmentsMock };
+});
+vi.mock('$lib/db/queries/releases', async () => {
+	const actual = await vi.importActual<typeof import('$lib/db/queries/releases')>('$lib/db/queries/releases');
+	return { ...actual, listPickerReleases: listPickerReleasesMock };
 });
 vi.mock('$lib/server/queries/issue-queries', () => ({
 	issueQueries: {
@@ -127,6 +132,7 @@ beforeEach(() => {
 	resolveEnvironmentScopesMock.mockResolvedValue(new Map());
 	listProjectEnvironmentsMock.mockResolvedValue([]);
 	listIssuesMock.mockResolvedValue([]);
+	listPickerReleasesMock.mockResolvedValue([]);
 	countIssuesMock.mockResolvedValue(0);
 	trendForIssuesMock.mockResolvedValue(new Map());
 	getIssueFacetsMock.mockResolvedValue(emptyFacets());
@@ -698,5 +704,67 @@ describe('GET / page load — status, server filters, page clamp (fix-sentinel-i
 		const data = await loadWith('?page=999');
 		expect(listIssuesMock).toHaveBeenCalledWith(expect.anything(), 1, 20);
 		expect(data.pagination).toMatchObject({ page: 1, total: 0, totalPages: 0 });
+	});
+});
+
+
+// sentinel-issue-list-filters §5: the six new server filters through the loader.
+describe('GET / list filters (sentinel-issue-list-filters)', () => {
+	it('coerces, echoes and passes every new filter to the list, the count and the facets', async () => {
+		const out = await loadWith(
+			`?project=${PROJECT_A}&release=1.2.0&type=user_report&source=api&regressed=1&waiting=team&tag=browser.name:Firefox&tag=os.name:Linux`
+		);
+		const expected = {
+			release: '1.2.0',
+			issueType: 'user_report',
+			source: 'api',
+			regressed: true,
+			waiting: 'team',
+			tags: [
+				{ key: 'browser.name', value: 'Firefox' },
+				{ key: 'os.name', value: 'Linux' },
+			],
+		};
+		expect(listIssuesMock.mock.calls[0][0]).toMatchObject(expected);
+		expect(countIssuesMock.mock.calls[0][0]).toMatchObject(expected);
+		expect(getIssueFacetsMock.mock.calls[0][0]).toMatchObject(expected);
+		expect(out.filters).toMatchObject({
+			release: '1.2.0',
+			type: 'user_report',
+			source: 'api',
+			regressed: true,
+			waiting: 'team',
+			tags: [
+				{ key: 'browser.name', value: 'Firefox', param: 'browser.name:Firefox' },
+				{ key: 'os.name', value: 'Linux', param: 'os.name:Linux' },
+			],
+		});
+	});
+
+	it('ignores bogus values: never a 500, never echoed', async () => {
+		const out = await loadWith('?type=banana&source=x&regressed=yes&waiting=nobody&tag=nocolon&tag=a:b:c&tag=:v');
+		expect(out.filters).toMatchObject({ type: 'all', source: 'all', regressed: false, waiting: 'all', tags: [] });
+	});
+
+	it('de-duplicates tags and keeps the first MAX_TAG_FILTERS', async () => {
+		const many = Array.from({ length: 12 }, (_, i) => `tag=k${i}:v`).join('&');
+		const out = await loadWith(`?tag=k0:v&${many}`);
+		expect(out.filters.tags).toHaveLength(10);
+		expect(out.filters.tags[0].key).toBe('k0');
+	});
+
+	it('coerces release to all on project=all and offers no releases', async () => {
+		const out = await loadWith('?project=all&release=1.2.0');
+		expect(out.filters.release).toBe('all');
+		expect(listIssuesMock.mock.calls[0][0].release).toBe('all');
+		expect(out.releases).toEqual([]);
+		expect(listPickerReleasesMock).not.toHaveBeenCalled();
+	});
+
+	it('offers the selected project’s releases beside environments', async () => {
+		listPickerReleasesMock.mockResolvedValue([{ version: '2.0.0', firstSeen: new Date() }]);
+		const out = await loadWith(`?project=${PROJECT_A}`);
+		expect(listPickerReleasesMock).toHaveBeenCalledWith(PROJECT_A);
+		expect(out.releases).toEqual([{ version: '2.0.0' }]);
 	});
 });
