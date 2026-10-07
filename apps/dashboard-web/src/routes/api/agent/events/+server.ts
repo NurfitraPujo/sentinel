@@ -1,7 +1,9 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
+import { agentVisibility } from '$lib/server/agent-access';
 import { listOrgActivity } from '$lib/db/queries/events';
+import { redactLinkedEventTargets } from '$lib/server/agent-relations';
 import {
 	AGENT_EVENT_TYPES,
 	EVENTS_DEFAULT_LIMIT,
@@ -13,6 +15,7 @@ import {
 // N1b (events feed). GET /api/agent/events?after=&limit=&type=&project=&claimed=me -- org-scoped
 // (B7: organizationId comes ONLY from the authenticated credential, never a request param),
 // seq-cursored feed over issue_activity. Mirrors /api/agent/issues's manual-validation style.
+// sentinel-cli-browser-login: a personal key's feed carries only events of issues its owner can see (listOrgActivity).
 
 export const GET: RequestHandler = async ({ request, url }) => {
 	const ctx = await authenticateAgentRequest(request);
@@ -65,6 +68,7 @@ export const GET: RequestHandler = async ({ request, url }) => {
 
 	const result = await listOrgActivity({
 		organizationId: ctx.organizationId,
+		visibility: agentVisibility(ctx),
 		after,
 		limit,
 		eventTypes,
@@ -72,5 +76,6 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		claimedByAgentId,
 	});
 
-	return json(result);
+	// A `linked` event's TARGET issue may be one this personal key cannot see; its id is redacted, as on the issue page.
+	return json({ ...result, events: await redactLinkedEventTargets(ctx, result.events) });
 };

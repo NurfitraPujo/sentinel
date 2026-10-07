@@ -1,9 +1,10 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
+import { agentVisibility, requireAgentWrite } from '$lib/server/agent-access';
+import { agentIssueRelations } from '$lib/server/agent-relations';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
 import { sendIssueNotificationEmails } from '$lib/server/notify';
-import { getIssueRelations } from '$lib/db/queries/issues';
 import { getAgentReportDetail, getLatestAgentOccurrence } from '$lib/db/queries/agent-reads';
 import {
 	claimNextAgentIssue,
@@ -44,6 +45,9 @@ function optionalString(body: Record<string, unknown>, key: string): string | un
 
 export const POST: RequestHandler = async ({ request, url }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: a claim is a mutation (403 for a read-only owner's personal key), and the candidate set
+	// is the owner's visibility, so a personal key never claims an issue it could not read.
+	requireAgentWrite(ctx);
 
 	const parsed: unknown = await request.json().catch(() => ({}));
 	const body: Record<string, unknown> = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
@@ -80,6 +84,7 @@ export const POST: RequestHandler = async ({ request, url }) => {
 
 	const claimed = await claimNextAgentIssue({
 		organizationId: ctx.organizationId,
+		visibility: agentVisibility(ctx),
 		agentId: ctx.agentId,
 		type,
 		projectId,
@@ -106,7 +111,7 @@ export const POST: RequestHandler = async ({ request, url }) => {
 	const [report, latestOccurrence, relations] = await Promise.all([
 		issue.issueType === 'user_report' ? getAgentReportDetail(issue.id) : Promise.resolve(null),
 		issue.issueType === 'system_error' ? getLatestAgentOccurrence(issue.id) : Promise.resolve(null),
-		getIssueRelations(issue.id),
+		agentIssueRelations(ctx, issue.id),
 	]);
 
 	return json({ issue, report, latestOccurrence, relations });

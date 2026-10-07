@@ -15,7 +15,7 @@ import { agentOpRoute } from '$lib/server/agent-ops';
 // agent-ops.ts, which is the SAME batch API also drives via POST /api/agent/batch. GET stays on
 // `withAgentIssue` -- batch is mutations only, so there is no `issues.comment.list` op to share.
 
-export const GET = withAgentIssue(async (_ctx, issue, event) => {
+export const GET = withAgentIssue('read', async (_ctx, issue, event) => {
 	const afterParam = event.url.searchParams.get('after');
 	let after: Date | undefined;
 	if (afterParam !== null) {

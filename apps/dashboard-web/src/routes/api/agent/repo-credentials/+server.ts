@@ -5,6 +5,7 @@ import { db } from '$lib/server/db';
 import { agents } from '$lib/db/schema';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
+import { denyPersonalKey } from '$lib/server/agent-access';
 import { fetchDecryptedCredentialsForAgent } from '$lib/db/queries/repo-credentials';
 import { isEncryptionKeyAvailable } from '$lib/server/repo-credential-crypto';
 
@@ -27,6 +28,9 @@ import { isEncryptionKeyAvailable } from '$lib/server/repo-credential-crypto';
  */
 export const GET: RequestHandler = async ({ request }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: never for a personal key, whatever its owner's role -- write-capable git tokens are for
+	// admin-provisioned org agents only (and a personal agent's flag can never be set; see the agents admin route).
+	denyPersonalKey(ctx, 'fetch repo credentials');
 
 	// Re-read the flag per request rather than caching it on the auth context: revoking access
 	// must take effect immediately, not at next key rotation.

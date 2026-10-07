@@ -12,15 +12,32 @@ tail the org's activity feed, and batch several mutations into one HTTP round tr
 
 ```bash
 curl -fsSL https://<your-sentinel-host>/install.sh | sh
-sentinel login --url https://<your-sentinel-host>   # paste your agent key when prompted (hidden)
+sentinel login --url https://<your-sentinel-host>   # prints a code and opens the browser: approve it, done
 sentinel agent install                              # give Claude Code / Codex / agy the sentinel-agent skill
 ```
 
 `install.sh` downloads the binary from the same server, verifies its sha256, and installs it atomically
 to `${SENTINEL_INSTALL_DIR:-$HOME/.local/bin}/sentinel` (it warns if that is not on your `PATH`, and warns
 about — never removes — an old `sentinel-cli`). `sentinel version` prints the dashboard release tag it was
-built with. Re-run the one-liner to upgrade. Agent keys are minted by an org owner/admin on the dashboard's
-*Settings → Agents* page, which also shows these three commands next to a new key.
+built with. Re-run the one-liner to upgrade.
+
+**Any org member can log in; no admin is needed.** `sentinel login` runs a device authorization flow (RFC 8628). It
+prints a short code and a URL (`<dashboard>/cli/approve?code=…`) and tries to open your browser. You check the code,
+pick the organization and click Approve, and the CLI receives a **personal key** and saves it. Over SSH or on a
+headless machine, open the URL on any device where you are signed in, or pass `--no-browser` to skip the attempt.
+
+A personal key acts as you and never exceeds your dashboard access, re-checked on every request:
+
+- It sees only your projects and environment grants.
+- It is read-only if your role is `support` or `viewer`.
+- It can never use `members` or `repo-credentials`.
+- It stops working when you leave the organization.
+- It expires after 90 days by default.
+
+You see and revoke your keys under *Settings → CLI sessions* (one per device per organization; a re-login from the
+same device replaces that device's key), and `sentinel logout` revokes the current one. Org agent keys for CI and
+automations are still minted by an org owner/admin on *Settings → Agents*. Use those with
+`sentinel login --key-stdin`.
 
 **Developers** — build from source:
 
@@ -39,7 +56,9 @@ revision, or `dev`).
 
 | Command | What it does |
 |---|---|
-| `sentinel login` | see *Configuration: profiles*; prompts for the URL and the key (echo off), verifies with `GET /api/agent/self` **before** saving, prints agent name / org id / key prefix only. Without a TTY, pass `--key-stdin` and pipe the key. |
+| `sentinel login` | browser login (above). It prompts for the URL on a terminal if none is known, verifies the key with `GET /api/agent/self` **before** saving, and prints who you are logged in as, the org and the key prefix. It never prints the key. `--device-name N` names this machine on the approval page and in *CLI sessions* (default: hostname). `--no-browser` only prints the URL. |
+| `sentinel login --key-stdin` | paste an existing agent key instead (CI, org agents): one line from stdin, or a hidden prompt on a terminal |
+| `sentinel logout [--profile P]` | revokes the profile's personal key on the server (`POST /api/agent/key/revoke`) and removes the profile. An org agent key is refused by the server and stays valid, and the CLI says so. On a network error nothing is removed. |
 | `sentinel config` | the profile in use + where the URL (value) and key (source only) come from |
 | `sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]` | writes the embedded `sentinel-agent` skill to each tool's **global** skill dir (no flag = every tool whose home dir exists) |
 | `sentinel guide` | prints the full agent guide (embedded copy of `docs/agents/SENTINEL_AGENT_GUIDE.md`) |
@@ -89,12 +108,13 @@ be silently paired with the file's key for a *different* Sentinel):
 | `SENTINEL_URL` set **without** `SENTINEL_AGENT_KEY` | **ignored**, with a warning naming the profile actually used |
 | none of the above | `current_profile`, else `default` |
 
-`sentinel whoami` and `sentinel config` print the profile in use and where url and key each came from —
-never the key. `sentinel login` warns about env variables that would shadow what it saves.
+`sentinel whoami` and `sentinel config` print the profile in use and where url and key each came from (never the
+key), and whose key it is: `identity: personal key of <you> (<role>, read-write|read-only)` or
+`identity: org agent "<name>"`. `sentinel login` warns about env variables that would shadow what it saves.
 
 | Command | |
 |---|---|
-| `sentinel login [--profile P] [--url U] [--key-stdin] [--use] [--yes]` | verify, then write/update profile P (default: the selected profile; on a fresh machine the server's suggested name, else `default`). First profile becomes current; `--use` forces it. Replacing an existing profile's URL asks first (`--yes` to skip; required without a TTY). |
+| `sentinel login [--profile P] [--url U] [--device-name N] [--no-browser] [--key-stdin] [--use] [--yes]` | log in (browser, or `--key-stdin`), verify, then write/update profile P (default: the selected profile; on a fresh machine the server's suggested name, else `default`). The first profile becomes current; `--use` forces it. Replacing an existing profile's URL asks first, before any key is minted (`--yes` skips the question and is required without a TTY). |
 | `sentinel profile list` | name, URL, `*` marks current, key prefix only |
 | `sentinel profile use <name>` / `remove <name>` | switch current / delete a profile |
 
@@ -132,7 +152,7 @@ group- or world-readable.
 | `sentinel members add <email> [--role <role>]` | `POST /api/agent/members` | invites a user to the organization (default role engineer) |
 | `sentinel members remove <memberId>` | `DELETE /api/agent/members/:id` | revokes an organization member's access |
 | `sentinel whoami` | `GET /api/agent/self` | prints agentId/name/organizationId + key id/prefix/expiresAt |
-| `sentinel key rotate` | `POST /api/agent/key/rotate` | mints a new secret, prints it to stdout ONCE; old key stays valid for its grace window |
+| `sentinel key rotate` | `POST /api/agent/key/rotate` | org agent key: mints a new secret, prints it to stdout ONCE; old key stays valid for its grace window. Personal key (`sentinel login`): the old key dies at once, the new one keeps its expiry and is saved into the profile, never printed |
 | `sentinel events [--after N] [--limit N] [--type T] [--project ID] [--claimed-me]` | `GET /api/agent/events` | one page |
 | `sentinel events --follow [--interval SEC]` | polls `GET /api/agent/events` | NDJSON to stdout, cursor persisted |
 | `sentinel batch -f ops.json\|- [--stop-on-error=false]` | `POST /api/agent/batch` | up to 20 ops, one round trip |

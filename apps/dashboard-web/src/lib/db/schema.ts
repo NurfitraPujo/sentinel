@@ -762,8 +762,45 @@ export const agents = pgTable('agents', {
 	// granted this flag may fetch decrypted repo credentials from GET /api/agent/repo-credentials;
 	// a plain agent key gets 403. Default false, toggled in the agent management UI, audited.
 	canAccessRepoCredentials: boolean('can_access_repo_credentials').notNull().default(false),
+	// 1725900000_add_cli_device_login.sql (docs/plans/CLI_BROWSER_LOGIN.md): set iff kind = 'personal' (CHECK
+	// agents_personal_owner_check). A personal agent acts for this user and is authorized against the user's LIVE
+	// membership, projects and environment grants on every request (agent-auth.ts); org agents keep NULL.
+	ownerUserId: text('owner_user_id').references(() => users.id, { onDelete: 'cascade' }),
 }, (table) => ({
 	idxAgentsOrg: index('idx_agents_org').on(table.orgId),
+	uqAgentsPersonalOwner: uniqueIndex('uq_agents_personal_owner')
+		.on(table.orgId, table.ownerUserId)
+		.where(sql`owner_user_id IS NOT NULL`),
+}));
+
+// 1725900000_add_cli_device_login.sql: one row per `sentinel login` device authorization (RFC 8628). Holds the sha256 of
+// the device_code, never the code itself, and never a key: the key is minted in the transaction that flips the row to
+// 'delivered' (routes/api/cli/device/token). Expiry is `expiresAt`; there is no 'expired' status.
+export const cliDeviceAuthorizations = pgTable('cli_device_authorizations', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	deviceCodeHash: varchar('device_code_hash', { length: 64 }).notNull().unique(),
+	userCode: varchar('user_code', { length: 8 }).notNull(),
+	status: varchar('status', { length: 20 }).notNull().default('pending'),
+	client: varchar('client', { length: 32 }).notNull().default(''),
+	clientVersion: varchar('client_version', { length: 64 }).notNull().default(''),
+	deviceName: varchar('device_name', { length: 64 }).notNull(),
+	requestedProfile: varchar('requested_profile', { length: 32 }).notNull().default(''),
+	requestedIp: varchar('requested_ip', { length: 64 }).notNull().default(''),
+	requestedUserAgent: varchar('requested_user_agent', { length: 255 }).notNull().default(''),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+	pollIntervalSeconds: integer('poll_interval_seconds').notNull().default(5),
+	lastPolledAt: timestamp('last_polled_at', { withTimezone: true }),
+	approvedByUserId: text('approved_by_user_id').references(() => users.id, { onDelete: 'cascade' }),
+	organizationId: uuid('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
+	decidedAt: timestamp('decided_at', { withTimezone: true }),
+	apiKeyId: uuid('api_key_id').references(() => projectApiKeys.id, { onDelete: 'set null' }),
+	deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+}, (table) => ({
+	uqPendingUserCode: uniqueIndex('uq_cli_device_authorizations_pending_user_code')
+		.on(table.userCode)
+		.where(sql`status = 'pending'`),
+	idxExpiresAt: index('idx_cli_device_authorizations_expires_at').on(table.expiresAt),
 }));
 
 // N10 part 2 (docs/plans/AGENT_WORKER_PLAN.md §4.5), source of truth is

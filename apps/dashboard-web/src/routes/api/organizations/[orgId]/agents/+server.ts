@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import { listAgents, createAgent } from '$lib/db/queries/agents';
 import { hasPermission } from '$lib/rbac';
 import { requireOrgMembership } from '../keys/_shared';
+import { listPersonalKeysForOrg } from '$lib/server/cli-personal-keys';
 
 const VALID_KINDS = ['ai', 'bot'] as const;
 
@@ -26,8 +27,21 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		throw error(403, 'Forbidden: only owners and admins can manage agents');
 	}
 
-	const agentRows = await listAgents(orgId!);
-	return json({ agents: agentRows });
+	// sentinel-cli-browser-login: personal (`sentinel login`) agents are not part of the org roster an admin manages; they
+	// are listed separately, per KEY, with their owner -- the Agents page's "Personal CLI keys" section, where an
+	// owner/admin can revoke them. Never any secret: only the key's id, prefix, device name and dates.
+	const agentRows = (await listAgents(orgId!)).filter((a) => a.kind !== 'personal');
+	const personalKeys = (await listPersonalKeysForOrg(orgId!)).map((k) => ({
+		keyId: k.keyId,
+		deviceName: k.deviceName,
+		keyPrefix: k.keyPrefix,
+		status: k.status,
+		createdAt: k.createdAt,
+		expiresAt: k.expiresAt,
+		revokedAt: k.revokedAt,
+		owner: { userId: k.ownerUserId, name: k.ownerName, email: k.ownerEmail },
+	}));
+	return json({ agents: agentRows, personalKeys });
 };
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {

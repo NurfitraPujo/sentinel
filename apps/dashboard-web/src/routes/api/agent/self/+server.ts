@@ -13,6 +13,10 @@ import { cliProfileName } from '$lib/server/cli-dist';
  *
  * N9 (docs/plans/AGENT_WORKER_PLAN.md, C6): `createdAt` is now included so a client can do
  * age-based rotation even for a key with no `expiresAt`.
+ *
+ * sentinel-cli-browser-login: `kind` ('ai' | 'bot' | 'personal') and `owner` -- the person a personal key acts for, with
+ * their CURRENT role and whether that role may make changes (`canWrite`), as resolved for this very request. `owner` is
+ * null for an org agent. `sentinel whoami` prints it; the key itself is never returned.
  */
 export const GET: RequestHandler = async ({ request }) => {
 	const ctx = await authenticateAgentRequest(request);
@@ -26,6 +30,16 @@ export const GET: RequestHandler = async ({ request }) => {
 		agentId: ctx.agentId,
 		name: ctx.agentName,
 		organizationId: ctx.organizationId,
+		kind: ctx.agentKind,
+		owner: ctx.owner
+			? {
+					userId: ctx.owner.userId,
+					name: ctx.owner.name,
+					email: ctx.owner.email,
+					role: ctx.owner.role,
+					canWrite: ctx.owner.canWrite,
+				}
+			: null,
 		key: {
 			id: ctx.keyId,
 			prefix: ctx.keyPrefix,

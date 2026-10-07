@@ -64,7 +64,11 @@ const otherProjectId = randomUUID();
 const externalReporterId = randomUUID();
 const memberId = `usr_member_${suffix}`;
 
-const OCCURRED_AT = new Date('2026-09-04T09:12:03.000Z');
+// RELATIVE to now, never a fixed date: `cleanupRetainedData` (default 30 days) deletes every occurrence
+// older than its cutoff -- and then the issues left without one -- across ALL projects, and the retention
+// integration files run it concurrently with this one. A hard-coded date silently aged past that cutoff
+// and the seeded candidates started disappearing mid-test. A day back keeps it well inside the window.
+const OCCURRED_AT = new Date(Math.floor((Date.now() - 24 * 60 * 60_000) / 1000) * 1000);
 const minutes = (n: number) => new Date(OCCURRED_AT.getTime() + n * 60_000);
 
 let sql: ReturnType<typeof postgres>;

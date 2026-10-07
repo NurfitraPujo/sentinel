@@ -12,14 +12,16 @@ import { SpanPullError, requestSpanPull } from '$lib/server/span-pull';
 // an occurrence in it (404, like a malformed id), at most SPAN_PULL_ON_DEMAND_LIMIT accepted requests per organization per hour
 // (429 + Retry-After). Idempotent: while the pull is pending a repeat writes nothing. The response is the trace's spans
 // state plus what this call did; poll GET /api/agent/traces/{traceId} (`spans`) for the outcome. An accepted request is
-// audited (the ledger row is the audit record: requested_by = the agent id).
+// audited (the ledger row is the audit record: requested_by = the agent id). sentinel-cli-browser-login: a personal key pulls
+// under its owner's scope (the dashboard button needs only read access to the trace, so this is a read for a personal key
+// too), and a trace with no occurrence the owner can see is the same 404.
 export const POST = async (event: RequestEvent): Promise<Response> => {
 	const ctx = await authenticateAgentRequest(event.request);
 
 	const traceId = parseTraceId(event.params.traceId);
 	if (!traceId) throw error(404, 'Trace not found');
 
-	const scope = await resolveAgentSpanScope(ctx.organizationId);
+	const scope = await resolveAgentSpanScope(ctx);
 	try {
 		const result = await requestSpanPull({ traceId, scope, requester: { kind: 'agent', id: ctx.agentId } });
 		if (result.requestId) {

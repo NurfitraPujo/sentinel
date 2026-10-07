@@ -2,6 +2,7 @@ import { db } from '$lib/server/db';
 import { issueActivity, issues, issueTombstones, projects } from '$lib/db/schema';
 import { and, asc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { EVENTS_LAG_GUARD_INTERVAL, type AgentEventType } from '$lib/server/agent-events';
+import { agentVisibilityCondition, type AgentVisibility } from '$lib/server/agent-access';
 
 // N8 (DECISIONS.md D20): a deleted issue surfaces on the feed as this synthetic eventType. The
 // tombstone is authored by retention (retention.ts), so the actor is fixed here, not stored.
@@ -44,6 +45,12 @@ export interface ListOrgActivityOptions {
 	eventTypes?: AgentEventType[];
 	projectId?: string;
 	claimedByAgentId?: string;
+	/**
+	 * sentinel-cli-browser-login: a PERSONAL key's owner visibility (agent-access.ts). Activity rows are kept only for
+	 * issues inside it; see `listOrgTombstones` for the deletion half. Omitted/null = the whole organization (an org
+	 * agent), byte-identical to before.
+	 */
+	visibility?: AgentVisibility | null;
 }
 
 export interface OrgActivityEvent {
@@ -94,6 +101,10 @@ export async function listOrgActivity(
 	if (options.claimedByAgentId) {
 		conditions.push(eq(issues.assigneeType, 'agent'));
 		conditions.push(eq(issues.assignedTo, options.claimedByAgentId));
+	}
+	const visibilityGuard = agentVisibilityCondition(options.visibility);
+	if (visibilityGuard) {
+		conditions.push(visibilityGuard);
 	}
 
 	const rows = await db
@@ -182,6 +193,16 @@ async function listOrgTombstones(options: ListOrgActivityOptions): Promise<OrgAc
 
 	if (options.projectId) {
 		conditions.push(eq(issueTombstones.projectId, options.projectId));
+	}
+	// sentinel-cli-browser-login: a tombstone snapshots the project but NOT the environment, so for a personal key it is
+	// shown only for a project the owner can see WITHOUT an environment grant there -- a narrowed owner might not have
+	// been allowed to see the deleted issue, and its message is on the tombstone. Conservative by construction.
+	if (options.visibility) {
+		const unrestricted = options.visibility.projectIds.filter((id) => !options.visibility!.environmentScopes.has(id));
+		if (unrestricted.length === 0) {
+			return [];
+		}
+		conditions.push(inArray(issueTombstones.projectId, unrestricted));
 	}
 	if (options.claimedByAgentId) {
 		conditions.push(eq(issueTombstones.assigneeType, 'agent'));

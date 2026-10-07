@@ -52,7 +52,9 @@
 //	sentinel members remove <memberId>
 //	sentinel whoami
 //	sentinel version | --version
-//	sentinel login [--url U] [--key-stdin]
+//	sentinel login [--url U] [--profile P] [--device-name N] [--no-browser]   (browser approval; a personal key)
+//	sentinel login [--url U] [--profile P] --key-stdin                       (paste an org agent key; CI)
+//	sentinel logout [--profile P]
 //	sentinel config
 //	sentinel profile list | use <name> | remove <name>
 //	sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]
@@ -100,7 +102,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	format := fs.String("format", "json", `output format: "json" (default) or "table" (list-shaped commands only)`)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: sentinel [-url URL] [-key KEY] [-format json|table] <command> [args...]")
-		fmt.Fprintln(stderr, "commands: login, profile, config, version, guide, agent, issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
+		fmt.Fprintln(stderr, "commands: login, logout, profile, config, version, guide, agent, issues, claim, claim-next, release, status, comment, comments, question, progress, link, unlink, projects, members, whoami, key, events, batch, upload")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -137,6 +139,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return cmdLogin(ctx, cmdArgs, gflags, stdLoginIO(stdout, stderr))
+	case "logout":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return cmdLogout(ctx, cmdArgs, gflags, stdout, stderr)
 	}
 
 	fn, ok := commands[name]

@@ -1,9 +1,12 @@
 import { error } from '@sveltejs/kit';
 import crypto from 'crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
-import { projectApiKeys, agents } from '$lib/db/schema';
+import { projectApiKeys, agents, organizationMembers, users } from '$lib/db/schema';
 import { checkRateLimitWithLimit } from '$lib/rate-limit';
+import { hasPermission, isKnownRole, type OrgRole } from '$lib/rbac';
+import { getAccessibleProjects } from '$lib/server/issue-access';
+import { resolveEnvironmentScopes } from '$lib/server/environment-access';
 
 /**
  * Manual Issues M5 stage 2 (docs/plans/MANUAL_ISSUES_DESIGN.md §7, Q5, Q6, B7): key
@@ -22,6 +25,26 @@ import { checkRateLimitWithLimit } from '$lib/rate-limit';
 // alternate lookup path.
 function hashKey(secretToken: string): string {
 	return crypto.createHash('sha256').update(secretToken).digest('hex');
+}
+
+/**
+ * sentinel-cli-browser-login (docs/plans/CLI_BROWSER_LOGIN.md): the person a PERSONAL key acts for, resolved LIVE on every
+ * request from the dashboard's own access helpers -- never from anything stored at mint time. A personal key can therefore
+ * never do more than its owner can do in the dashboard right now: removal from the organization makes the next request a
+ * 401, and a project/grant/role change applies to the next request.
+ */
+export interface PersonalKeyOwner {
+	userId: string;
+	name: string | null;
+	email: string;
+	/** The owner's CURRENT `organization_members.role` in the key's organization. */
+	role: OrgRole;
+	/** `getAccessibleProjects(userId, organizationId)` -- the dashboard's project rule (project_members ∪ ISSUE_WRITE_ROLES). */
+	projectIds: string[];
+	/** `resolveEnvironmentScopes(userId)` -- absence means every environment, exactly as in the dashboard. */
+	environmentScopes: Map<string, string[]>;
+	/** `rbac.ts` `hasPermission(role, 'write')`: owner/admin/engineer. support/viewer personal keys are read-only. */
+	canWrite: boolean;
 }
 
 export interface AgentAuthContext {
@@ -47,6 +70,10 @@ export interface AgentAuthContext {
 	 * age-based rotation even for keys minted with no `expires_at`.
 	 */
 	keyCreatedAt: Date | null;
+	/** `agents.kind`: 'ai' | 'bot' for org agents, 'personal' for a `sentinel login` key. */
+	agentKind: string;
+	/** The live owner of a personal key; `null` for an org agent (whose scope is the whole organization, unchanged). */
+	owner: PersonalKeyOwner | null;
 }
 
 /**
@@ -124,6 +151,8 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 			orgId: agents.orgId,
 			name: agents.name,
 			status: agents.status,
+			kind: agents.kind,
+			ownerUserId: agents.ownerUserId,
 		})
 		.from(agents)
 		.where(eq(agents.id, keyRow.agentId));
@@ -137,6 +166,21 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 	// other), but B7 means this function must never trust either alone without checking.
 	if (keyRow.organizationId !== agentRow.orgId) {
 		throw error(401, 'Invalid API key');
+	}
+
+	// sentinel-cli-browser-login: a personal key is only as good as its owner's CURRENT membership. Resolved before the
+	// rate limit for the same reason the other validity checks are: a key whose owner left is a dead key (401), and a dead
+	// key must not burn a limit or be told apart from any other invalid key.
+	let owner: PersonalKeyOwner | null = null;
+	if (agentRow.kind === 'personal' || agentRow.ownerUserId) {
+		if (agentRow.kind !== 'personal' || !agentRow.ownerUserId) {
+			// The CHECK agents_personal_owner_check makes this unreachable; fail closed if it ever is.
+			throw error(401, 'Invalid API key');
+		}
+		owner = await resolvePersonalKeyOwner(agentRow.ownerUserId, keyRow.organizationId);
+		if (!owner) {
+			throw error(401, 'Invalid API key');
+		}
 	}
 
 	// R19: enforce this key's own rate_limit_rpm, AFTER validation succeeds (see doc comment).
@@ -160,5 +204,39 @@ export async function authenticateAgentRequest(request: Request): Promise<AgentA
 		keyPrefix: keyRow.keyPrefix,
 		keyExpiresAt: keyRow.expiresAt,
 		keyCreatedAt: keyRow.createdAt,
+		agentKind: agentRow.kind,
+		owner,
+	};
+}
+
+/**
+ * The owner's live access in `organizationId`, or `null` when they are no longer a member there (or hold a role rbac.ts
+ * does not know -- fail closed). Three reads, all through the helpers the dashboard itself uses, so a personal key cannot
+ * drift into a second, looser access model.
+ */
+async function resolvePersonalKeyOwner(userId: string, organizationId: string): Promise<PersonalKeyOwner | null> {
+	const [member] = await db
+		.select({ role: organizationMembers.role, name: users.name, email: users.email })
+		.from(organizationMembers)
+		.innerJoin(users, eq(users.id, organizationMembers.userId))
+		.where(and(eq(organizationMembers.userId, userId), eq(organizationMembers.organizationId, organizationId)));
+
+	if (!member || !isKnownRole(member.role) || !hasPermission(member.role, 'read')) {
+		return null;
+	}
+
+	const [accessible, environmentScopes] = await Promise.all([
+		getAccessibleProjects(userId, organizationId),
+		resolveEnvironmentScopes(userId),
+	]);
+
+	return {
+		userId,
+		name: member.name,
+		email: member.email,
+		role: member.role as OrgRole,
+		projectIds: accessible.map((p) => p.id),
+		environmentScopes,
+		canWrite: hasPermission(member.role, 'write'),
 	};
 }

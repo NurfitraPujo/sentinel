@@ -310,6 +310,28 @@ here rather than built because A14's audit finding rated it a nice-to-have (one 
 infrequent) against real implementation cost (a new credential type to reason about token replay
 and expiry). Revisit if agent fleet size makes the manual step a bottleneck.
 
+### 8b. Personal CLI keys (`sentinel login`)
+
+Engineers no longer need an admin to use the CLI. `sentinel login --url <dashboard>` runs a browser device flow
+(RFC 8628). The member approves the printed code at `<dashboard>/cli/approve` and receives a **personal key** that
+acts as them. It is authorized against their live membership, projects, environment grants and role on every request,
+and is denied `members` and `repo-credentials`. Operator-facing facts:
+
+- **`AUTH_URL` must be the public dashboard URL.** The verification link the CLI prints is built from it, never from
+  the request's Host header. With no usable value, `POST /api/cli/device` answers 500.
+- **`CLI_PERSONAL_KEY_TTL_DAYS`** (helm `config.dashboard.cliPersonalKeyTtlDays`, default `90`, range `1..365`) sets
+  the lifetime of a personal key from its browser approval. `sentinel key rotate` keeps the expiry and never renews
+  it, and the rotated key dies at once (no grace). There is no non-expiring setting.
+- `POST /api/cli/device` and `POST /api/cli/device/token` are **unauthenticated** and rate-limited in-process (per
+  replica): 10 starts per IP per 10 minutes, 300 globally, and 120 polls per IP per minute. Behind a proxy, set
+  adapter-node's `ADDRESS_HEADER`/`XFF_DEPTH` so the per-IP limit and the IP shown on the approval page are the client's:
+  helm `config.dashboard.clientIp.{addressHeader,xffDepth}`, rendered only when set. The AWS values use
+  `x-forwarded-for` / `2`: the ALB appends the client and Emissary/Envoy then appends the ALB. A missing or short
+  header falls back to the TCP peer, never a 500. Re-check the depth after any change to the proxy chain.
+- Members revoke their own keys under *Settings → CLI sessions*. Owners/admins see and revoke everyone's under
+  *Settings → Agents*. Removing a member revokes their keys. Expired device requests are deleted by the retention cron.
+- The design and threat model are in `docs/plans/CLI_BROWSER_LOGIN.md`.
+
 ## 9. Agent key rate limiting
 
 Each agent key enforces its own `project_api_keys.rate_limit_rpm` (default 5000) via a

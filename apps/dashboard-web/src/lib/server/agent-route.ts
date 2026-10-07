@@ -1,7 +1,7 @@
 import { error } from '@sveltejs/kit';
 import type { RequestEvent } from '@sveltejs/kit';
 import { authenticateAgentRequest, type AgentAuthContext } from '$lib/server/agent-auth';
-import { resolveAgentIssueScope, type AgentIssueScope } from '$lib/server/agent-issue-scope';
+import { resolveAgentIssueScope, type AgentIssueAccess, type AgentIssueScope } from '$lib/server/agent-issue-scope';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
 import { ClaimConflictError } from '$lib/db/queries/reports';
 import { CommentValidationError, CommentNotFoundError } from '$lib/db/queries/comments';
@@ -57,7 +57,11 @@ function mapAgentIssueError(err: unknown): never {
 	throw err;
 }
 
-export function withAgentIssue(handler: AgentIssueHandler) {
+/**
+ * sentinel-cli-browser-login: `access` is REQUIRED -- 'read' for a GET, 'write' for anything that changes state -- so a
+ * personal key whose owner is read-only gets a 403 on a mutation, and no new route can be wired without choosing.
+ */
+export function withAgentIssue(access: AgentIssueAccess, handler: AgentIssueHandler) {
 	return async (event: RequestEvent): Promise<Response> => {
 		const ctx = await authenticateAgentRequest(event.request);
 
@@ -66,7 +70,7 @@ export function withAgentIssue(handler: AgentIssueHandler) {
 			throw error(400, 'Missing issueId');
 		}
 
-		const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+		const issue = await resolveAgentIssueScope(issueId, ctx, access);
 
 		let result: AgentIssueHandlerResult;
 		try {

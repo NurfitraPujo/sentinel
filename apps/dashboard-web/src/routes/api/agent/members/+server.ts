@@ -14,6 +14,7 @@ import crypto from 'crypto';
 import { sendInvitationEmail } from '$lib/server/email';
 import { log } from '$lib/server/observability/log';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
+import { denyPersonalKey } from '$lib/server/agent-access';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -21,6 +22,8 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // B7: organizationId from AgentAuthContext, never a param.
 export const GET: RequestHandler = async ({ request, url }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: member management (including the list) is never available to a personal CLI key.
+	denyPersonalKey(ctx, 'manage organization members');
 
 	const roleParam = url.searchParams.get('role');
 	let members = await listOrganizationMembers(ctx.organizationId);
@@ -35,6 +38,8 @@ export const GET: RequestHandler = async ({ request, url }) => {
 // POST /api/agent/members -- invites a user to the calling key's organization.
 export const POST: RequestHandler = async ({ request, url }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: member management (including the list) is never available to a personal CLI key.
+	denyPersonalKey(ctx, 'manage organization members');
 
 	let body: any;
 	try {

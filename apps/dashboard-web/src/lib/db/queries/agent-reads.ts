@@ -15,6 +15,7 @@ import {
 	type TraceCursor,
 } from '$lib/server/queries/trace-queries';
 import { getAgentSettingsForProjects, type RepoConnectionRow } from '$lib/db/queries/agent-settings';
+import { agentVisibilityCondition, type AgentVisibility } from '$lib/server/agent-access';
 
 /**
  * N1c (agent read endpoints). Own module per FILE OWNERSHIP -- queries backing
@@ -289,6 +290,9 @@ export async function listAgentTraceOccurrences(options: {
 	environment?: string;
 	limit?: number;
 	cursor?: string;
+	// sentinel-cli-browser-login: a personal key's owner visibility -- its projects become the scope's project set and
+	// its grants the environment guard, as on the dashboard's trace page. Omitted = the whole organization, unchanged.
+	visibility?: AgentVisibility | null;
 }): Promise<{ occurrences: AgentTraceOccurrence[]; nextCursor?: string }> {
 	const limit = Math.min(Math.max(options.limit ?? TRACE_DEFAULT_LIMIT, 1), TRACE_MAX_LIMIT);
 	const cursor: TraceCursor | undefined = options.cursor ? decodeTraceCursor(options.cursor) : undefined;
@@ -298,9 +302,19 @@ export async function listAgentTraceOccurrences(options: {
 		.from(projects)
 		.where(eq(projects.organizationId, options.organizationId));
 
+	// A personal key: only the owner's projects INSIDE this organization (both sets come from the credential, B7).
+	const orgProjectIds = orgProjects.map((p) => p.id);
+	const projectIds = options.visibility
+		? orgProjectIds.filter((id) => options.visibility!.projectIds.includes(id))
+		: orgProjectIds;
+
 	const { rows, nextCursor } = await listTraceOccurrences({
 		traceId: options.traceId,
-		scope: { projectIds: orgProjects.map((p) => p.id), environment: options.environment },
+		scope: {
+			projectIds,
+			environment: options.environment,
+			...(options.visibility ? { environmentScopes: options.visibility.environmentScopes } : {}),
+		},
 		limit,
 		cursor,
 		columns: {
@@ -324,7 +338,13 @@ export async function listAgentTraceOccurrences(options: {
  * an occurrence id to its trace). `organizationId` comes from `AgentAuthContext` (B7); an occurrence of another organization
  * is simply not found.
  */
-export async function getAgentOccurrenceInOrg(organizationId: string, occurrenceId: string): Promise<AgentTraceOccurrence | null> {
+export async function getAgentOccurrenceInOrg(
+	organizationId: string,
+	occurrenceId: string,
+	// sentinel-cli-browser-login: a personal key's owner visibility (agent-access.ts). Omitted/null = the whole
+	// organization (an org agent), unchanged. An occurrence outside it is the same "not found".
+	visibility: AgentVisibility | null = null
+): Promise<AgentTraceOccurrence | null> {
 	const [row] = await db
 		.select({
 			...agentOccurrenceColumns,
@@ -337,7 +357,9 @@ export async function getAgentOccurrenceInOrg(organizationId: string, occurrence
 		.from(errorOccurrences)
 		.innerJoin(issues, eq(issues.id, errorOccurrences.issueId))
 		.innerJoin(projects, eq(projects.id, issues.projectId))
-		.where(and(eq(errorOccurrences.id, occurrenceId), eq(projects.organizationId, organizationId)));
+		.where(
+			and(eq(errorOccurrences.id, occurrenceId), eq(projects.organizationId, organizationId), agentVisibilityCondition(visibility))
+		);
 	return (row as unknown as AgentTraceOccurrence | undefined) ?? null;
 }
 

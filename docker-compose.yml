@@ -349,6 +349,8 @@ services:
             MANUAL_ISSUE_RETENTION_DAYS: "365"
             CLAIM_STALE_HOURS: "24"
             AGENT_KEY_ROTATION_GRACE_HOURS: "24"
+            # sentinel-cli-browser-login: lifetime of a personal `sentinel login` key (days, 1-365).
+            CLI_PERSONAL_KEY_TTL_DAYS: "90"
             # sentinel-user-report-issue §8's remaining config knobs, with the contract's defaults.
             # REPORT_MATCH_WINDOW_MINUTES bounds §4.3's candidate query; ESCALATION_ACK_MINUTES is
             # §4.4's acknowledgement deadline and ESCALATION_MAX_HOPS its bound. There is no feature

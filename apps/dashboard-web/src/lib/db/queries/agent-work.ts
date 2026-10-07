@@ -10,6 +10,7 @@ import {
 import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
 import { recordClaim } from '$lib/db/queries/reports';
+import { agentVisibilityCondition, type AgentVisibility } from '$lib/server/agent-access';
 import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
 import {
 	findIdempotencyKey,
@@ -54,6 +55,12 @@ export interface AgentIssuesCursor {
 
 export interface ListAgentIssuesOptions {
 	organizationId: string;
+	/**
+	 * sentinel-cli-browser-login: a PERSONAL key's owner visibility (agent-access.ts) -- the owner's projects and
+	 * environment grants, as a GUARD (unlike `projectId`/`environment` below, which are caller-chosen filters). Omitted /
+	 * null = the whole organization (an org agent), byte-identical to before.
+	 */
+	visibility?: AgentVisibility | null;
 	type?: 'user_report' | 'system_error';
 	claimed?: boolean;
 	/**
@@ -170,6 +177,10 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 	const sortColumn = sort === 'firstSeen' ? issues.firstSeen : issues.lastSeen;
 
 	const conditions = [eq(projects.organizationId, options.organizationId)];
+	const visibilityGuard = agentVisibilityCondition(options.visibility);
+	if (visibilityGuard) {
+		conditions.push(visibilityGuard);
+	}
 
 	if (options.type) {
 		conditions.push(eq(issues.issueType, options.type));
@@ -301,6 +312,8 @@ export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<
 
 export interface ClaimNextAgentIssueOptions {
 	organizationId: string;
+	/** sentinel-cli-browser-login: as `ListAgentIssuesOptions.visibility` -- a personal key never claims what it cannot see. */
+	visibility?: AgentVisibility | null;
 	/** B7: the claimant, resolved from the credential -- never a request param. */
 	agentId: string;
 	type?: 'user_report' | 'system_error';
@@ -347,6 +360,10 @@ export async function claimNextAgentIssue(
 		isNull(issues.assignedTo),
 		eq(issues.status, 'unresolved'),
 	];
+	const visibilityGuard = agentVisibilityCondition(options.visibility);
+	if (visibilityGuard) {
+		conditions.push(visibilityGuard);
+	}
 	if (options.type) {
 		conditions.push(eq(issues.issueType, options.type));
 	}

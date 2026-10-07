@@ -17,6 +17,7 @@ const retention = {
 	reapStaleClaims: vi.fn(),
 	reapExpiredIdempotencyKeys: vi.fn(),
 	reapExpiredReportIdempotencyKeys: vi.fn(),
+	reapExpiredCliDeviceAuthorizations: vi.fn(),
 	maintainSpans: vi.fn(),
 };
 vi.mock('$lib/server/retention', () => retention);
@@ -114,6 +115,7 @@ beforeEach(() => {
 	retention.reapStaleClaims.mockResolvedValue({ releasedClaims: 0 });
 	retention.reapExpiredIdempotencyKeys.mockResolvedValue(0);
 	retention.reapExpiredReportIdempotencyKeys.mockResolvedValue(0);
+	retention.reapExpiredCliDeviceAuthorizations.mockResolvedValue(0);
 	retention.maintainSpans.mockResolvedValue({ createdPartitions: 0, droppedPartitions: 0, reapedPullQueue: 0, failed: false });
 });
 
@@ -143,6 +145,8 @@ describe('POST /api/cron/retention — retentionDays comes from the shared helpe
 			retention.reapStaleClaims.mock.calls[0][1],
 			retention.reapExpiredIdempotencyKeys.mock.calls[0][0],
 			retention.reapExpiredReportIdempotencyKeys.mock.calls[0][0],
+			// sentinel-cli-browser-login: expired device authorizations, same run connection.
+			retention.reapExpiredCliDeviceAuthorizations.mock.calls[0][0],
 			// sentinel-span-ingest D1: span partitions are kept on the same run connection.
 			retention.maintainSpans.mock.calls[0][0],
 		];

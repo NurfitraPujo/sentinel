@@ -422,5 +422,46 @@ describe('organization API key routes', () => {
 			expect(body.token).toBe('sent_org_newsecret');
 			assertNoKeyHash(body);
 		});
+
+		// sentinel-cli-browser-login: rotation returns the NEW secret, so for an agent key it is a credential grant.
+		it('an engineer cannot rotate an agent key (it would hand them the agent\'s new secret)', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('engineer')]));
+			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1', scope: 'agent', agentId: 'agent-1' });
+			await expect(
+				ROTATE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 403 });
+			expect(apikeyQueries.rotateApiKey).not.toHaveBeenCalled();
+		});
+
+		it('nobody -- not even an owner -- rotates a personal CLI key through this route', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1', scope: 'agent', agentId: 'agent-p' });
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-p', orgId: 'org-1', kind: 'personal', ownerUserId: 'user-9' });
+			await expect(
+				ROTATE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 403 });
+			expect(apikeyQueries.rotateApiKey).not.toHaveBeenCalled();
+		});
+
+		it('an owner still rotates an org agent key', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			apikeyQueries.getApiKeyById.mockResolvedValueOnce({ id: 'key-1', organizationId: 'org-1', scope: 'agent', agentId: 'agent-1' });
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-1', orgId: 'org-1', kind: 'ai', ownerUserId: null });
+			apikeyQueries.rotateApiKey.mockResolvedValueOnce({ apiKey: { id: 'key-2' }, secretToken: 'sent_agent_new' });
+			const res = await ROTATE({ params: { orgId: 'org-1', keyId: 'key-1' }, locals: locals({ id: 'user-1' }) } as any);
+			expect((await res.json()).token).toBe('sent_agent_new');
+		});
+	});
+
+	describe('POST /keys for a personal agent', () => {
+		it('is refused even for an owner: a personal agent gets keys only from its owner\'s sentinel login', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-p', orgId: 'org-1', kind: 'personal', ownerUserId: 'user-9' });
+			const request = new Request('http://x', { method: 'POST', body: JSON.stringify({ name: 'k', scope: 'agent', agentId: 'agent-p' }) });
+			await expect(POST({ params: { orgId: 'org-1' }, request, locals: locals({ id: 'user-1' }) } as any)).rejects.toMatchObject({
+				status: 400,
+			});
+			expect(apikeyQueries.createApiKey).not.toHaveBeenCalled();
+		});
 	});
 });

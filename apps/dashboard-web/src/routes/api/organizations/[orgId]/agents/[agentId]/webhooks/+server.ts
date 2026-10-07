@@ -31,6 +31,10 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	if (!agent || agent.orgId !== orgId) {
 		throw error(404, 'Agent not found');
 	}
+	// sentinel-cli-browser-login: webhooks belong to org agents; a personal (`sentinel login`) agent never gets one.
+	if (agent.kind === 'personal') {
+		throw error(400, 'Personal CLI agents cannot have webhooks');
+	}
 
 	// listAgentWebhooks's projection never includes the `secret` column -- only secretPrefix, so
 	// the signing secret is never re-exposed after creation.
@@ -56,6 +60,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 	const agent = await getAgentById(agentId!);
 	if (!agent || agent.orgId !== orgId) {
 		throw error(404, 'Agent not found');
+	}
+	// sentinel-cli-browser-login: webhooks belong to org agents; a personal (`sentinel login`) agent never gets one.
+	if (agent.kind === 'personal') {
+		throw error(400, 'Personal CLI agents cannot have webhooks');
 	}
 
 	const body = await request.json().catch(() => ({}) as any);

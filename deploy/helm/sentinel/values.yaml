@@ -115,6 +115,19 @@ config:
     # `sentinel login --url <origin> --profile <name>`, so an engineer using several Sentinels ends up with
     # one named profile per environment. Empty = no --profile in the printed commands.
     cliProfile: ""
+    # Lifetime in days of a PERSONAL CLI key minted by `sentinel login` (browser approval by any org member;
+    # docs/plans/CLI_BROWSER_LOGIN.md). Rendered as CLI_PERSONAL_KEY_TTL_DAYS. 1-365; there is deliberately no
+    # "never expires" value. `sentinel key rotate` cannot extend a personal key past it either.
+    cliPersonalKeyTtlDays: "90"
+    # How the dashboard finds the CLIENT's IP (adapter-node ADDRESS_HEADER / XFF_DEPTH). It feeds the per-IP limits
+    # of `sentinel login` (device start/poll) and the "requesting IP" its approval page shows, plus sign-in audit rows.
+    # Both empty (default) = not rendered = the TCP peer, which behind a proxy is the PROXY: every user then shares
+    # one per-IP bucket. Behind proxies, set addressHeader "x-forwarded-for" and xffDepth to the number of proxies
+    # that append to it (the client is the entry at position len-xffDepth). A missing/short header falls back to the
+    # TCP peer (apps/dashboard-web/src/lib/server/client-ip.ts), never a 500.
+    clientIp:
+      addressHeader: ""
+      xffDepth: ""
     authTrustHost: "true"
     emailFrom: "noreply@sentinel.example.com"
     dataRetentionDays: "30"

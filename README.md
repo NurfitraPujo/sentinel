@@ -51,6 +51,11 @@ occurrences, organizations, and alerting configuration.
 - `packages/db-migrations` — goose-based SQL migrations, one flat directory for every target
   (see `docs/memory/ARCHITECTURE.md`).
 - `packages/sdk-go` — the public Go client SDK.
+- `tools/sentinel` — the `sentinel` CLI over the agent API, installed from the dashboard (`curl -fsSL
+  <dashboard>/install.sh | sh`). `sentinel login` gives any org member a personal key that is scoped to their own
+  dashboard access, through a browser approval with no admin involved (see
+  [tools/sentinel/README.md](tools/sentinel/README.md) and
+  [docs/plans/CLI_BROWSER_LOGIN.md](docs/plans/CLI_BROWSER_LOGIN.md) for the design and threat model).
 - `tests/{unit,integration,contract,e2e,load}` — root-module tests; integration tests use testcontainers.
 
 The root module, `packages/sdk-go`, and `packages/db-migrations` are three separate Go modules joined by a

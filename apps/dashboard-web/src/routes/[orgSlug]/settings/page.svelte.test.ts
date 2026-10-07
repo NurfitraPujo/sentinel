@@ -19,7 +19,7 @@ function cardHrefs() {
 }
 
 describe('/[orgSlug]/settings hub tiles', () => {
-	it('lists exactly API keys, Members, Agents, On-call and the org projects', () => {
+	it('lists exactly API keys, Members, Agents, On-call, your CLI sessions and the org projects', () => {
 		render(Page, { data });
 
 		expect(cardHrefs()).toEqual([
@@ -27,6 +27,8 @@ describe('/[orgSlug]/settings hub tiles', () => {
 			'/acme/settings/members',
 			'/acme/settings/agents',
 			'/acme/settings/on-call',
+			// sentinel-cli-browser-login: the user's OWN `sentinel login` keys -- per-person, not instance-wide.
+			'/settings/cli',
 			'/acme/projects/proj-1/settings/keys',
 		]);
 		expect(screen.getByText('Projects')).toBeTruthy();

@@ -36,6 +36,10 @@ async function authorizeAndScope(
 	if (!agent || agent.orgId !== orgId) {
 		throw error(404, 'Agent not found');
 	}
+	// sentinel-cli-browser-login: webhooks belong to org agents; a personal (`sentinel login`) agent never gets one.
+	if (agent.kind === 'personal') {
+		throw error(400, 'Personal CLI agents cannot have webhooks');
+	}
 
 	const webhook = await getAgentWebhookById(webhookId!);
 	if (!webhook || webhook.organizationId !== orgId || webhook.agentId !== agentId) {

@@ -35,6 +35,18 @@
 		createdAt: string | null;
 	}
 
+	// sentinel-cli-browser-login: a member's `sentinel login` key, as GET /api/organizations/[orgId]/agents lists it. No secret.
+	interface PersonalKeyRow {
+		keyId: string;
+		deviceName: string;
+		keyPrefix: string;
+		status: string;
+		createdAt: string | null;
+		expiresAt: string | null;
+		revokedAt: string | null;
+		owner: { userId: string; name: string | null; email: string };
+	}
+
 	interface WebhookRow {
 		id: string;
 		agentId: string;
@@ -47,7 +59,14 @@
 	}
 
 	interface Props {
-		data: { orgId: string; orgSlug: string; agents: AgentRow[]; projects: { id: string; name: string }[]; cliProfile?: string };
+		data: {
+			orgId: string;
+			orgSlug: string;
+			agents: AgentRow[];
+			personalKeys?: PersonalKeyRow[];
+			projects: { id: string; name: string }[];
+			cliProfile?: string;
+		};
 	}
 
 	let { data }: Props = $props();
@@ -59,6 +78,8 @@
 	let agents = $state<AgentRow[]>(data.agents ?? []);
 	let keysByAgent = $state<Record<string, KeyRow[]>>({});
 	let keysLoaded = $state(false);
+	// svelte-ignore state_referenced_locally -- seeded once from the server load, like `agents` above.
+	let personalKeys = $state<PersonalKeyRow[]>(data.personalKeys ?? []);
 
 	let newAgentName = $state('');
 	let newAgentKind = $state<'ai' | 'bot'>('ai');
@@ -89,17 +110,52 @@
 	let savingCredential = $state(false);
 	let replacingCredentialId = $state<string | null>(null);
 
-	// Setup snippet shown under a freshly minted key. Uses the origin the admin is looking at (the page's
-	// own origin) and deliberately does NOT embed the key: `sentinel login` prompts for it with echo off.
+	// Setup snippet shown under a freshly minted ORG AGENT key. Uses the origin the admin is looking at (the page's
+	// own origin) and deliberately does NOT embed the key: `sentinel login --key-stdin` prompts for it with echo off.
 	// Only rendered after a client-side action, so `window` is always defined when this is read.
 	const cliOrigin = $derived(typeof window === 'undefined' ? '' : window.location.origin);
+	const profileFlag = $derived(data.cliProfile ? ` --profile ${data.cliProfile}` : '');
 	const cliSetupSnippet = $derived(
 		[
 			`curl -fsSL ${cliOrigin}/install.sh | sh`,
-			`sentinel login --url ${cliOrigin}${data.cliProfile ? ` --profile ${data.cliProfile}` : ''}   # paste the key when prompted`,
+			`sentinel login --url ${cliOrigin}${profileFlag} --key-stdin   # paste the key when prompted`,
 			`sentinel agent install`,
 		].join('\n')
 	);
+	// sentinel-cli-browser-login: what ANY member runs for their own personal key -- no admin, no key to paste. Rendered
+	// on the server too, so it reads the page origin lazily (empty until hydration; the commands stay readable).
+	const personalSetupSnippet = $derived(
+		[
+			`curl -fsSL ${cliOrigin || '<this dashboard>'}/install.sh | sh`,
+			`sentinel login --url ${cliOrigin || '<this dashboard>'}${profileFlag}   # approve the code in your browser`,
+			`sentinel agent install`,
+		].join('\n')
+	);
+
+	function shortDate(iso: string | null): string {
+		return iso ? new Date(iso).toLocaleDateString() : '—';
+	}
+
+	function personalKeyLive(k: PersonalKeyRow): boolean {
+		return k.status === 'active' && !k.revokedAt && (!k.expiresAt || new Date(k.expiresAt).getTime() > Date.now());
+	}
+
+	async function revokePersonalKey(keyId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/cli-keys/${keyId}`, { method: 'DELETE' });
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke CLI key' }));
+				showToast(err.message || `Error ${res.status}: failed to revoke CLI key`);
+				return;
+			}
+			personalKeys = personalKeys.map((k) =>
+				k.keyId === keyId ? { ...k, status: 'revoked', revokedAt: new Date().toISOString() } : k
+			);
+			showToast('CLI key revoked', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking CLI key');
+		}
+	}
 
 	async function copyCliSnippet() {
 		try {
@@ -692,6 +748,37 @@
 		</ul>
 	{/if}
 
+	<section class="personal-keys" data-testid="personal-cli-keys">
+		<header>
+			<h2>Personal CLI keys</h2>
+			<p class="subtitle">
+				Members connect the <code>sentinel</code> CLI themselves — no admin needed. Each key acts as its owner and can
+				never do more than that person can in the dashboard (checked on every request). You can revoke any of them.
+			</p>
+		</header>
+		<pre class="secret-token cli-setup" data-testid="personal-cli-setup-snippet">{personalSetupSnippet}</pre>
+		{#if personalKeys.length === 0}
+			<p class="empty-state small">No member has connected the CLI yet.</p>
+		{:else}
+			<ul>
+				{#each personalKeys as key (key.keyId)}
+					<li class="key-row">
+						<span>{key.owner.name || key.owner.email} <span class="subtitle">({key.owner.email})</span></span>
+						<span>{key.deviceName}</span>
+						<code>{key.keyPrefix}…</code>
+						<span class="subtitle">created {shortDate(key.createdAt)} · expires {shortDate(key.expiresAt)}</span>
+						<span class="key-status" class:is-revoked={!personalKeyLive(key)}>
+							{personalKeyLive(key) ? 'active' : key.status === 'active' ? 'expired' : key.status}
+						</span>
+						{#if personalKeyLive(key)}
+							<button type="button" class="danger small" onclick={() => revokePersonalKey(key.keyId)}>Revoke</button>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
 	<section class="repo-credentials">
 		<header>
 			<h2>Repository credentials</h2>
@@ -1104,6 +1191,29 @@
 		font-size: 0.7rem;
 		cursor: pointer;
 		user-select: none;
+	}
+
+	.personal-keys {
+		border-top: 1px solid var(--border-color);
+		padding-top: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.personal-keys h2 {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 700;
+	}
+
+	.personal-keys ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
 	}
 
 	.repo-credentials {

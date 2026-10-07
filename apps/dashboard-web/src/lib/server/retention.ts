@@ -1132,6 +1132,19 @@ export async function reapExpiredReportIdempotencyKeys(
 	return deleted.length;
 }
 
+/**
+ * sentinel-cli-browser-login: deletes `cli_device_authorizations` rows a day past their expiry. Expiry itself is
+ * enforced by the token endpoint and the approval page (`expires_at`), so this is table hygiene, not correctness; the
+ * day of slack keeps a just-expired request's "expired" answer readable for a while. The rows never hold a key or a raw
+ * device code. `idx_cli_device_authorizations_expires_at` keeps it off a full scan. Returns the count deleted.
+ */
+export async function reapExpiredCliDeviceAuthorizations(exec: Exec = db): Promise<number> {
+	const rows = await exec.execute<{ n: number }>(
+		sql`WITH d AS (DELETE FROM cli_device_authorizations WHERE expires_at < now() - interval '1 day' RETURNING 1) SELECT count(*)::int AS n FROM d`
+	);
+	return Number(rows[0]?.n ?? 0);
+}
+
 // N7c (A03): result of a single stale-claim reap pass.
 export interface ReapStaleClaimsResult {
 	releasedClaims: number;

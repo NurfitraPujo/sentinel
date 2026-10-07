@@ -31,6 +31,12 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 	if (!existing || existing.orgId !== orgId) {
 		throw error(404, 'Agent not found');
 	}
+	// sentinel-cli-browser-login: a personal agent is its owner's, not the org's. Its status and repo-credential flag are
+	// never set here (the flag in particular would hand write-capable git tokens to one person's laptop key); an admin
+	// manages it only by revoking its keys on the Agents page.
+	if (existing.kind === 'personal') {
+		throw error(400, 'Personal CLI agents cannot be changed here; revoke their keys instead');
+	}
 
 	const body = await request.json().catch(() => ({}) as any);
 

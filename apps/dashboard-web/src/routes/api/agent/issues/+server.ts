@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
+import { agentVisibility } from '$lib/server/agent-access';
 import {
 	listAgentIssues,
 	decodeAgentIssuesCursor,
@@ -17,6 +18,9 @@ import {
 // N7b (A02): adds since=&sort=&limit=&cursor= for bootstrap-friendly pagination. All four are
 // OPTIONAL and, when entirely absent, the response is byte-identical to pre-N7b (no `nextCursor`
 // field, no `.limit()` applied -- see agent-work.ts's listAgentIssues header).
+//
+// sentinel-cli-browser-login: a personal key lists only issues in its owner's projects and environment grants (a guard
+// composed in SQL, on top of the caller's own project/environment filters).
 
 const VALID_TYPES = ['user_report', 'system_error'] as const;
 const VALID_SORTS: readonly AgentIssuesSort[] = ['firstSeen', 'lastSeen'];
@@ -113,6 +117,7 @@ export const GET: RequestHandler = async ({ request, url }) => {
 
 	const result = await listAgentIssues({
 		organizationId: ctx.organizationId,
+		visibility: agentVisibility(ctx),
 		type,
 		claimed,
 		claimedByAgentId,

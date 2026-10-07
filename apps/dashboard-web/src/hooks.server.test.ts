@@ -46,7 +46,7 @@ vi.mock('$lib/db/schema', () => ({
 const environment = { dev: false, browser: false, building: false, version: 'test' };
 vi.mock('$app/environment', () => environment);
 
-const { orgHandle, csrfHandle } = await import('./hooks.server');
+const { orgHandle, csrfHandle, frameGuardHandle } = await import('./hooks.server');
 
 function makeEvent(pathname: string, authenticated: boolean) {
 	return {
@@ -233,5 +233,35 @@ describe('csrfHandle (§4.5 -- the intake exemption, and only that)', () => {
 		await csrfHandle({ event: csrfEvent('/api/uploads', request), resolve } as any);
 
 		expect(resolve).toHaveBeenCalledTimes(1);
+	});
+});
+
+// sentinel-cli-browser-login (security review, repair round 1): the approval page and its sign-in hop refuse framing,
+// on every response they produce (page, __data.json, action, error), and nothing else changes.
+describe('frameGuardHandle', () => {
+	const run = async (pathname: string, headers: Record<string, string> = {}) =>
+		(await frameGuardHandle({
+			event: { url: new URL(`http://dash${pathname}`) } as any,
+			resolve: async () => new Response('ok', { headers }),
+		})) as Response;
+
+	it.each(['/cli/approve', '/cli/approve/', '/cli/approve/__data.json', '/signin', '/signin/__data.json'])(
+		'%s gets frame-ancestors none and X-Frame-Options DENY',
+		async (pathname) => {
+			const res = await run(pathname);
+			expect(res.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+			expect(res.headers.get('x-frame-options')).toBe('DENY');
+		}
+	);
+
+	it('merges into an existing CSP instead of replacing it', async () => {
+		const res = await run('/cli/approve', { 'content-security-policy': "default-src 'self'" });
+		expect(res.headers.get('content-security-policy')).toBe("default-src 'self'; frame-ancestors 'none'");
+	});
+
+	it.each(['/cli/approvex', '/cli/download/linux/amd64', '/install.sh', '/acme/issues', '/signinx'])('%s is untouched', async (pathname) => {
+		const res = await run(pathname);
+		expect(res.headers.get('content-security-policy')).toBeNull();
+		expect(res.headers.get('x-frame-options')).toBeNull();
 	});
 });

@@ -1160,6 +1160,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -2373,6 +2385,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -2579,6 +2603,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -2690,6 +2726,18 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:
@@ -2876,6 +2924,18 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:
@@ -3168,6 +3228,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -3290,6 +3362,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -3371,6 +3455,18 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:
@@ -3496,6 +3592,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "404":
           description: Not found
           content:
@@ -3577,6 +3685,18 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:
@@ -3930,6 +4050,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
         "413":
           description: Payload too large
           content:
@@ -3969,7 +4101,7 @@ paths:
   /api/agent/self:
     get:
       operationId: getSelf
-      summary: "Identity of the calling key: agent, org, and the key row itself"
+      summary: "Identity of the calling key: agent, kind, org, the key row itself, and for a personal key its owner (live role and whether it may write)"
       responses:
         "200":
           description: OK
@@ -3986,6 +4118,38 @@ paths:
                     type: string
                   cliProfile:
                     type: string
+                  kind:
+                    type: string
+                  owner:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      userId:
+                        type: string
+                      name:
+                        type:
+                          - string
+                          - "null"
+                      email:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                          - owner
+                          - admin
+                          - engineer
+                          - support
+                          - viewer
+                      canWrite:
+                        type: boolean
+                    required:
+                      - userId
+                      - name
+                      - email
+                      - role
+                      - canWrite
+                    additionalProperties: false
                   key:
                     type: object
                     properties:
@@ -4016,6 +4180,8 @@ paths:
                   - agentId
                   - name
                   - organizationId
+                  - kind
+                  - owner
                   - key
                 additionalProperties: false
         "401":
@@ -4092,6 +4258,52 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/key/revoke:
+    post:
+      operationId: revokeKey
+      summary: Revoke the calling key (`sentinel logout`). Personal (`sentinel login`) keys only; an org agent key gets 403 and stays valid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  revokedKeyId:
+                    type: string
+                required:
+                  - success
+                  - revokedKeyId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:
@@ -4366,6 +4578,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
     post:
       operationId: inviteMember
       summary: Invite a new member to the calling key's organization
@@ -4443,6 +4667,18 @@ paths:
                 required:
                   - message
                 additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
   /api/agent/members/{id}:
     delete:
       operationId: removeMember
@@ -4482,6 +4718,18 @@ paths:
                 additionalProperties: false
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
           content:
             application/json:
               schema:

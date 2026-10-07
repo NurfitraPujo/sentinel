@@ -100,26 +100,34 @@ func normalizeURL(raw string) (string, error) {
 	return raw, nil
 }
 
-// cmdLogin implements `sentinel login [--profile P] [--url U] [--key-stdin] [--use] [--yes]`. It verifies
-// the candidate url+key against GET /api/agent/self BEFORE writing anything, then writes/updates profile P
-// in config.json atomically (0600, dir 0700). The key is never printed.
+// cmdLogin implements `sentinel login [--profile P] [--url U] [--device-name N] [--no-browser] [--key-stdin] [--use]
+// [--yes]`.
+//
+// Without --key-stdin it runs the browser device flow (device.go): the dashboard mints a PERSONAL key once the user
+// approves the printed code, so any org member can log in with no admin. --key-stdin keeps the paste flow for org agent
+// keys / CI: one line from stdin, or a hidden prompt on a terminal. Either way the key is verified against
+// GET /api/agent/self BEFORE anything is written, profile P is written/updated in config.json atomically (0600, dir
+// 0700), and the key is never printed.
 func cmdLogin(ctx context.Context, args []string, g cfgFlags, io_ *loginIO) int {
+	const usageLine = "usage: sentinel login [--profile P] [--url URL] [--device-name NAME] [--no-browser] [--key-stdin] [--use] [--yes]"
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(io_.stderr)
 	urlFlag := fs.String("url", "", "Sentinel server base URL")
 	profFlag := fs.String("profile", "", "profile to write (default: the selected profile)")
-	keyStdin := fs.Bool("key-stdin", false, "read the agent key as one line from stdin (required when stdin is not a terminal)")
+	keyStdin := fs.Bool("key-stdin", false, "paste an existing agent key instead of logging in through the browser (one line on stdin; a hidden prompt on a terminal)")
+	deviceName := fs.String("device-name", "", "name shown on the approval page and in CLI sessions (default: this machine's hostname)")
+	noBrowser := fs.Bool("no-browser", false, "do not try to open a browser; just print the URL and code")
 	use := fs.Bool("use", false, "make this profile the current one")
 	yes := fs.Bool("yes", false, "replace an existing profile's URL without asking")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(io_.stderr, "usage: sentinel login [--profile P] [--url URL] [--key-stdin] [--use] [--yes]")
+		fmt.Fprintln(io_.stderr, usageLine)
 		return ExitUsage
 	}
-	if !io_.isTTY && !*keyStdin {
-		fmt.Fprintln(io_.stderr, "error: stdin is not a terminal — pass --key-stdin and pipe the key on one line (the key is never accepted as an argument)")
+	if *keyStdin && (*deviceName != "" || *noBrowser) {
+		fmt.Fprintln(io_.stderr, "error: --device-name and --no-browser apply to browser login, not --key-stdin")
 		return ExitUsage
 	}
 
@@ -190,21 +198,62 @@ func cmdLogin(ctx context.Context, args []string, g cfgFlags, io_ *loginIO) int 
 		return ExitUsage
 	}
 
-	// Key.
+	// confirmReplace asks before pointing an existing profile at a different URL.
+	confirmReplace := func() bool {
+		if !profileExists || existing.URL == "" || existing.URL == baseURL || *yes {
+			return true
+		}
+		if !io_.isTTY {
+			fmt.Fprintf(io_.stderr, "error: profile %q already points to %s; pass --yes to replace it with %s (nothing was saved)\n", profile, existing.URL, baseURL)
+			return false
+		}
+		fmt.Fprintf(io_.stderr, "Profile %q currently points to %s. Replace with %s? [y/N]: ", profile, existing.URL, baseURL)
+		ans, _ := readLine(io_.stdin)
+		if a := strings.ToLower(ans); a != "y" && a != "yes" {
+			fmt.Fprintln(io_.stderr, "nothing was saved")
+			return false
+		}
+		return true
+	}
+
+	// Key: pasted (--key-stdin), or minted by the browser device flow.
 	var key string
+	var minted *deviceToken
 	if *keyStdin {
-		key, err = readLine(io_.stdin)
+		if io_.isTTY {
+			fmt.Fprint(io_.stderr, "Agent key (input hidden): ")
+			key, err = io_.readSecret(io_.stdin)
+		} else {
+			key, err = readLine(io_.stdin)
+		}
+		if err != nil {
+			fmt.Fprintln(io_.stderr, "error: reading key:", err)
+			return ExitUsage
+		}
+		if key == "" {
+			fmt.Fprintln(io_.stderr, "error: empty agent key")
+			return ExitUsage
+		}
 	} else {
-		fmt.Fprint(io_.stderr, "Agent key (input hidden): ")
-		key, err = io_.readSecret(io_.stdin)
-	}
-	if err != nil {
-		fmt.Fprintln(io_.stderr, "error: reading key:", err)
-		return ExitUsage
-	}
-	if key == "" {
-		fmt.Fprintln(io_.stderr, "error: empty agent key")
-		return ExitUsage
+		// Ask BEFORE a key is minted, so declining never strands a live key. (A fresh machine has no profile to
+		// replace, so the server-suggested name below can never need this.)
+		if !confirmReplace() {
+			return ExitUsage
+		}
+		name := strings.TrimSpace(*deviceName)
+		if name == "" {
+			name = defaultDeviceName()
+		}
+		requested := profile
+		if suggestable {
+			requested = ""
+		}
+		var code int
+		minted, code = runDeviceFlow(ctx, baseURL, name, requested, *noBrowser, io_)
+		if code != ExitOK {
+			return code
+		}
+		key = minted.Key
 	}
 
 	// Verify BEFORE writing.
@@ -219,40 +268,32 @@ func cmdLogin(ctx context.Context, args []string, g cfgFlags, io_ *loginIO) int 
 		fmt.Fprintf(io_.stderr, "error: server returned %d: %s\nnothing was saved\n", res.Status, errorMessage(res.Body))
 		return code
 	}
-	var self struct {
-		Name           string `json:"name"`
-		OrganizationID string `json:"organizationId"`
-		CLIProfile     string `json:"cliProfile"`
-		Key            struct {
-			Prefix string `json:"prefix"`
-		} `json:"key"`
-	}
+	var self selfIdentity
 	if err := json.Unmarshal(res.Body, &self); err != nil {
 		fmt.Fprintln(io_.stderr, "error: unexpected response from /api/agent/self (is this a Sentinel URL?):", err)
 		return ExitNetwork
 	}
-	if suggestable && self.CLIProfile != "" && validateProfileName(self.CLIProfile) == nil {
-		profile = self.CLIProfile
+	suggestion := self.CLIProfile
+	if minted != nil && minted.CLIProfile != "" {
+		suggestion = minted.CLIProfile
+	}
+	if suggestable && suggestion != "" && validateProfileName(suggestion) == nil {
+		profile = suggestion
 		existing, profileExists = cf.Profiles[profile]
 	}
 
-	// Replacing an existing profile's URL needs consent.
-	if profileExists && existing.URL != "" && existing.URL != baseURL && !*yes {
-		if !io_.isTTY {
-			fmt.Fprintf(io_.stderr, "error: profile %q already points to %s; pass --yes to replace it with %s (nothing was saved)\n", profile, existing.URL, baseURL)
-			return ExitUsage
-		}
-		fmt.Fprintf(io_.stderr, "Profile %q currently points to %s. Replace with %s? [y/N]: ", profile, existing.URL, baseURL)
-		ans, _ := readLine(io_.stdin)
-		if a := strings.ToLower(ans); a != "y" && a != "yes" {
-			fmt.Fprintln(io_.stderr, "nothing was saved")
-			return ExitUsage
-		}
+	// Replacing an existing profile's URL needs consent (asked before minting in the browser flow).
+	if minted == nil && !confirmReplace() {
+		return ExitUsage
 	}
 
 	first := len(cf.Profiles) == 0
 	prefix := displayPrefix(self.Key.Prefix, key)
-	cf.Profiles[profile] = Profile{URL: baseURL, Key: key, KeyPrefix: prefix}
+	stored := Profile{URL: baseURL, Key: key, KeyPrefix: prefix, Kind: self.Kind}
+	if self.Owner != nil {
+		stored.Owner = self.Owner.Email
+	}
+	cf.Profiles[profile] = stored
 	if first || *use || cf.CurrentProfile == "" && len(cf.Profiles) == 1 {
 		cf.CurrentProfile = profile
 	} else if cf.CurrentProfile == "" && cf.Legacy {
@@ -266,12 +307,58 @@ func cmdLogin(ctx context.Context, args []string, g cfgFlags, io_ *loginIO) int 
 	if cf.CurrentProfile == profile {
 		cur = " (current)"
 	}
-	fmt.Fprintf(io_.stdout, "Logged in to %s\nprofile: %s%s\nagent: %s\norganization: %s\nkey: %s\nsaved: %s (mode 0600)\n", baseURL, profile, cur, self.Name, self.OrganizationID, prefix, path)
+	fmt.Fprintf(io_.stdout, "Logged in to %s\n", baseURL)
+	if self.Owner != nil {
+		access := "read-only"
+		if self.Owner.CanWrite {
+			access = "read-write"
+		}
+		fmt.Fprintf(io_.stdout, "as: %s (%s, %s) — a personal key: it can do what you can do in the dashboard, nothing more\n", self.Owner.display(), self.Owner.Role, access)
+	} else {
+		fmt.Fprintf(io_.stdout, "agent: %s\n", self.Name)
+	}
+	org := self.OrganizationID
+	if minted != nil && minted.OrgSlug != "" {
+		org = minted.OrgSlug
+	}
+	expires := ""
+	if self.Key.ExpiresAt != nil && *self.Key.ExpiresAt != "" {
+		expires = " (expires " + (*self.Key.ExpiresAt)[:min(10, len(*self.Key.ExpiresAt))] + ")"
+	}
+	fmt.Fprintf(io_.stdout, "organization: %s\nprofile: %s%s\nkey: %s%s\nsaved: %s (mode 0600)\n", org, profile, cur, prefix, expires, path)
 	if cf.CurrentProfile != profile {
 		fmt.Fprintf(io_.stdout, "note: %q is not the current profile; use `sentinel --profile %s ...` or `sentinel profile use %s`\n", profile, profile, profile)
 	}
 	fmt.Fprintln(io_.stdout, "next: sentinel whoami   |   sentinel agent install")
 	return ExitOK
+}
+
+// selfIdentity is the part of GET /api/agent/self login and whoami read.
+type selfIdentity struct {
+	Name           string     `json:"name"`
+	OrganizationID string     `json:"organizationId"`
+	CLIProfile     string     `json:"cliProfile"`
+	Kind           string     `json:"kind"`
+	Owner          *selfOwner `json:"owner"`
+	Key            struct {
+		Prefix    string  `json:"prefix"`
+		ExpiresAt *string `json:"expiresAt"`
+	} `json:"key"`
+}
+
+// selfOwner is the person a personal key acts for (null for an org agent).
+type selfOwner struct {
+	Name     *string `json:"name"`
+	Email    string  `json:"email"`
+	Role     string  `json:"role"`
+	CanWrite bool    `json:"canWrite"`
+}
+
+func (o *selfOwner) display() string {
+	if o.Name != nil && strings.TrimSpace(*o.Name) != "" {
+		return fmt.Sprintf("%s <%s>", strings.TrimSpace(*o.Name), o.Email)
+	}
+	return o.Email
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -348,6 +435,12 @@ func writeConfigSummary(w io.Writer, r Resolved) {
 	fmt.Fprintf(w, "profile: %s\n", prof)
 	fmt.Fprintf(w, "url:     %s (from %s)\n", firstNonEmpty(r.URL, "-"), r.URLSource)
 	fmt.Fprintf(w, "key:     %s (from %s)\n", map[bool]string{true: "set", false: "not set"}[r.Key != ""], r.KeySource)
+	switch {
+	case r.Owner != "":
+		fmt.Fprintf(w, "identity: personal key of %s (sentinel login)\n", r.Owner)
+	case r.Kind != "":
+		fmt.Fprintf(w, "identity: org agent key (%s)\n", r.Kind)
+	}
 }
 
 // cmdProfile implements `sentinel profile list|use|remove`.
@@ -418,4 +511,75 @@ func cmdProfile(args []string, stdout, stderr io.Writer) int {
 		return ExitOK
 	}
 	return usage()
+}
+
+// cmdLogout implements `sentinel logout [--profile P]`: revokes the profile's key on the server (POST
+// /api/agent/key/revoke -- the key can only revoke ITSELF) and removes the profile. A personal key is revoked; an org agent
+// key is refused by the server (an admin retires those) and stays valid, which is said plainly. A key the server already
+// rejects (401) is just removed locally. On a network error nothing is removed: the key may still be live, and dropping
+// the only local copy would leave a live key nobody can revoke from this machine.
+func cmdLogout(ctx context.Context, args []string, g cfgFlags, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	profFlag := fs.String("profile", "", "profile to log out of (default: the selected profile)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: sentinel logout [--profile P]")
+		return ExitUsage
+	}
+	cf, err := loadConfigFile(func(m string) { fmt.Fprintln(stderr, m) })
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return ExitUsage
+	}
+	name := firstNonEmpty(*profFlag, g.Profile, os.Getenv("SENTINEL_PROFILE"), cf.effectiveCurrent())
+	prof, ok := cf.Profiles[name]
+	if !ok {
+		fmt.Fprintf(stderr, "error: unknown profile %q; profiles that exist: %s\n", name, listOrNone(cf.names()))
+		return ExitUsage
+	}
+
+	revoked := false
+	if prof.URL != "" && prof.Key != "" {
+		res, err := NewClient(prof.URL, prof.Key).Do(ctx, "POST", "/api/agent/key/revoke", nil, nil)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: could not reach the server to revoke the key:", strings.ReplaceAll(err.Error(), prof.Key, "***"))
+			fmt.Fprintf(stderr, "nothing was removed; retry, or drop it locally only with `sentinel profile remove %s`\n", name)
+			return ExitNetwork
+		}
+		switch {
+		case res.Status >= 200 && res.Status < 300:
+			revoked = true
+		case res.Status == 401:
+			fmt.Fprintln(stderr, "note: the server no longer accepts this key (expired or already revoked)")
+		case res.Status == 403:
+			fmt.Fprintf(stderr, "warning: %s\nthe key was NOT revoked and stays valid; ask an org owner/admin to revoke it if it should stop working\n", errorMessage(res.Body))
+		default:
+			fmt.Fprintf(stderr, "error: server returned %d: %s\nnothing was removed\n", res.Status, errorMessage(res.Body))
+			return exitCodeForStatus(res.Status)
+		}
+	}
+
+	wasCurrent := cf.effectiveCurrent() == name
+	delete(cf.Profiles, name)
+	if wasCurrent {
+		cf.CurrentProfile = ""
+		if names := cf.names(); len(names) > 0 {
+			cf.CurrentProfile = names[0]
+		}
+	}
+	if err := saveConfigFile(cf); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return ExitNetwork
+	}
+	if revoked {
+		fmt.Fprintf(stdout, "revoked key %s on %s\n", displayPrefix(prof.KeyPrefix, prof.Key), prof.URL)
+	}
+	fmt.Fprintf(stdout, "removed profile %s\n", name)
+	if wasCurrent && cf.CurrentProfile != "" {
+		fmt.Fprintf(stdout, "current profile: %s\n", cf.CurrentProfile)
+	}
+	return ExitOK
 }

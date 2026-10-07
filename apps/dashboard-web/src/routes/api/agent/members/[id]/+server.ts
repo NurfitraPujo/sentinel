@@ -5,6 +5,8 @@ import { db } from '$lib/server/db';
 import { organizationMembers, issues, projects, issueSubscriptions, projectEnvironmentGrants } from '$lib/db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
+import { denyPersonalKey } from '$lib/server/agent-access';
+import { revokePersonalKeysOfMember } from '$lib/server/cli-personal-keys';
 
 async function findOrgMember(
 	executor: any,
@@ -41,6 +43,8 @@ async function countLockedOwners(tx: any, orgId: string): Promise<number> {
 // Scoped by the agent key's own organization (B7).
 export const DELETE: RequestHandler = async ({ params, request }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: member management (including the list) is never available to a personal CLI key.
+	denyPersonalKey(ctx, 'manage organization members');
 
 	const { id } = params;
 	if (!id) {
@@ -90,6 +94,9 @@ export const DELETE: RequestHandler = async ({ params, request }) => {
 					)
 				);
 		}
+
+		// sentinel-cli-browser-login: and the member's personal CLI keys for this org (see the dashboard route).
+		await revokePersonalKeysOfMember(tx, { organizationId: ctx.organizationId, userId: target.userId, actorId: ctx.agentId });
 
 		// Clean up environment grants
 		await tx.delete(projectEnvironmentGrants).where(

@@ -20,6 +20,11 @@ type Config struct {
 	Key string `json:"agent_key"`
 	// KeyPrefix is the display prefix the server reported for Key at login (GET /api/agent/self).
 	KeyPrefix string `json:"key_prefix,omitempty"`
+	// Kind and Owner are what GET /api/agent/self reported at login: kind 'personal' + the owner's email for a
+	// `sentinel login` key, or the org agent's kind ('ai'/'bot') with no owner. Display only (`sentinel config`); the
+	// server re-decides what the key may do on every request.
+	Kind  string `json:"kind,omitempty"`
+	Owner string `json:"owner,omitempty"`
 }
 
 // Profile is one named {url, agent_key} entry in the config file.
@@ -232,6 +237,7 @@ func resolveConfigSources(f cfgFlags, warn func(string)) (Resolved, error) {
 	} else {
 		if exists {
 			r.URL, r.Key, r.KeyPrefix = prof.URL, prof.Key, prof.KeyPrefix
+			r.Kind, r.Owner = prof.Kind, prof.Owner
 			if prof.URL != "" {
 				r.URLSource = profileSource(name)
 			}
@@ -249,6 +255,7 @@ func resolveConfigSources(f cfgFlags, warn func(string)) (Resolved, error) {
 	}
 	if f.Key != "" {
 		r.Key, r.KeySource = f.Key, sourceFlag
+		r.Kind, r.Owner = "", "" // what the profile recorded is about ITS key, not this one
 	}
 	return r, nil
 }

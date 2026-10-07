@@ -37,6 +37,9 @@ dbMock.for.mockReturnValue(dbMock);
 dbMock.delete.mockReturnValue(dbMock);
 dbMock.then.mockImplementation((resolve: any) => resolve([]));
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
+// sentinel-cli-browser-login: member removal also revokes the member's personal CLI keys (cli-personal-keys.ts).
+const revokePersonalKeysOfMember = vi.fn().mockResolvedValue([]);
+vi.mock('$lib/server/cli-personal-keys', () => ({ revokePersonalKeysOfMember }));
 
 vi.mock('$lib/db/schema', () => ({
 	organizationMembers: { id: 'id', organizationId: 'organizationId', userId: 'userId', role: 'role' },
@@ -213,6 +216,12 @@ describe('DELETE /api/agent/members/[id]', () => {
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(body).toEqual({ success: true, memberId: 'm2', userId: 'u2' });
+		// sentinel-cli-browser-login: and the member's personal CLI keys for this org, in the same transaction.
+		expect(revokePersonalKeysOfMember).toHaveBeenCalledWith(expect.anything(), {
+			organizationId: CTX.organizationId,
+			userId: 'u2',
+			actorId: CTX.agentId,
+		});
 		expect(writeAgentAuditLog).toHaveBeenCalledWith(
 			CTX,
 			'agent.member_removed',

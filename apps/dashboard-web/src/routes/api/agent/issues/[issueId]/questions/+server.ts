@@ -20,7 +20,8 @@ function isValidAudience(value: unknown): value is Audience {
 	return typeof value === 'string' && (VALID_AUDIENCES as readonly string[]).includes(value);
 }
 
-export const POST = withAgentIssue(async (ctx, issue, event) => {
+// sentinel-cli-browser-login: 'write' -- a question sets waiting_on and emails, so a read-only owner's personal key gets 403.
+export const POST = withAgentIssue('write', async (ctx, issue, event) => {
 	const body = await event.request.json().catch(() => null);
 	if (!body || typeof body !== 'object') {
 		throw error(400, 'Expected a JSON body');

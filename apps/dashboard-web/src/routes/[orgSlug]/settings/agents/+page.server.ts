@@ -26,7 +26,8 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 		const err = await res.json().catch(() => ({ message: 'Failed to load agents' }));
 		throw error(res.status, err.message || 'Failed to fetch agents');
 	}
-	const { agents } = await res.json();
+	// sentinel-cli-browser-login: `personalKeys` -- members' `sentinel login` keys, with their owner (revocable here).
+	const { agents, personalKeys } = await res.json();
 
 	// 1724300000: the credential-scope UI on this page needs the org's projects — both to bind a
 	// credential to one project and to pick which projects an agent may receive credentials for.
@@ -39,6 +40,7 @@ export const load: PageServerLoad = async ({ params, fetch, locals }) => {
 		orgId: org.id,
 		orgSlug,
 		agents: agents || [],
+		personalKeys: personalKeys || [],
 		projects,
 		// Profile name the printed `sentinel login` command should carry (helm config.dashboard.cliProfile).
 		cliProfile: cliProfileName(),

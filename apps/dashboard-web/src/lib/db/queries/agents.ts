@@ -11,7 +11,9 @@ import { eq, and, desc } from 'drizzle-orm';
  * explicit parameter and callers are responsible for having derived it from the credential.
  */
 
-export type AgentKind = 'ai' | 'bot';
+// 'personal' (sentinel-cli-browser-login): a `sentinel login` agent owned by one user. Never created through createAgent --
+// only by the device flow's mint (cli-personal-keys.ts) -- and never in the org roster the agents admin API returns.
+export type AgentKind = 'ai' | 'bot' | 'personal';
 export type AgentStatus = 'active' | 'disabled';
 
 export interface AgentRow {
@@ -24,6 +26,8 @@ export interface AgentRow {
 	createdAt: Date | null;
 	// N10: admin-set gate for GET /api/agent/repo-credentials (default false).
 	canAccessRepoCredentials: boolean;
+	// Set iff kind = 'personal' (agents_personal_owner_check).
+	ownerUserId: string | null;
 }
 
 export async function listAgents(orgId: string): Promise<AgentRow[]> {
@@ -45,7 +49,7 @@ export async function getAgentById(id: string): Promise<AgentRow | undefined> {
 
 export async function createAgent(
 	actorUserId: string,
-	data: { orgId: string; name: string; kind: AgentKind }
+	data: { orgId: string; name: string; kind: Exclude<AgentKind, 'personal'> }
 ): Promise<AgentRow> {
 	const [newAgent] = await db
 		.insert(agents)

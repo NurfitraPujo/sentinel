@@ -39,11 +39,16 @@ If `sentinel` is not found or `whoami` fails (exit 3 = bad/expired key, exit 1 =
 URL / agent key configured", "unknown profile"), **stop and tell the human** to run:
 
 ```bash
-sentinel login --url https://<their-sentinel-host> [--profile <name>]   # prompts for the key (hidden), verifies, saves
+sentinel login --url https://<their-sentinel-host> [--profile <name>]   # prints a code; they approve it in the browser
 ```
 
-Never ask the human to paste a key into the chat, never print or log the key, and never write it into a
-repository. Agent keys (`sent_agent_...`) are minted by an org admin on the dashboard's Agents settings page.
+Any org member can run it (no admin needed); it gives them a **personal key** that acts as them. Never ask the human
+to paste a key into the chat, never print or log the key, and never write it into a repository.
+
+A personal key can do exactly what its owner can in the dashboard, and nothing more. `sentinel whoami` shows
+`identity: personal key of ... (<role>, read-write|read-only)`. A **403 "read-only"** on a mutation means the human's
+role cannot make changes: report what you found instead of retrying. A **404** on an issue you were given may mean it
+is outside their projects. `members` and `repo-credentials` always return 403 for personal keys.
 
 ## 2. Commands
 

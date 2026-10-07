@@ -32,6 +32,17 @@
 	</div>
 
 	<header class="page-header section-gap">
+		<h2 class="section-title">You</h2>
+		<p class="page-subtitle">Settings that belong to your account, in every organization.</p>
+	</header>
+	<div class="card-grid">
+		<a class="card" href="/settings/cli">
+			<span class="card-title">CLI sessions</span>
+			<span class="card-desc">Your <code>sentinel login</code> keys: see where you are signed in, and revoke.</span>
+		</a>
+	</div>
+
+	<header class="page-header section-gap">
 		<h2 class="section-title">Projects</h2>
 		<p class="page-subtitle">
 			A project's API key — the one an SDK reports with — lives in the project's own settings.

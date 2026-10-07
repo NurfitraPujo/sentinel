@@ -30,6 +30,17 @@ data:
   AUTH_URL: {{ .Values.config.dashboard.authUrl | quote }}
   AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
   SENTINEL_CLI_PROFILE: {{ .Values.config.dashboard.cliProfile | default "" | quote }}
+  # sentinel-cli-browser-login: lifetime of a personal (`sentinel login`) key, in days (1-365; anything else = 90).
+  CLI_PERSONAL_KEY_TTL_DAYS: {{ .Values.config.dashboard.cliPersonalKeyTtlDays | default "90" | quote }}
+  # sentinel-cli-browser-login: adapter-node's client-IP resolution, rendered only when set (values.yaml clientIp).
+  {{- with .Values.config.dashboard.clientIp }}
+  {{- if .addressHeader }}
+  ADDRESS_HEADER: {{ .addressHeader | quote }}
+  {{- end }}
+  {{- if .xffDepth }}
+  XFF_DEPTH: {{ .xffDepth | quote }}
+  {{- end }}
+  {{- end }}
   EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}
   DATA_RETENTION_DAYS: {{ .Values.config.dashboard.dataRetentionDays | quote }}
   # sentinel-user-report-issue §8's config knobs. Non-secret, so they belong here and not in the

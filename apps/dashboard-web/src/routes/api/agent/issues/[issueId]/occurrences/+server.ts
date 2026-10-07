@@ -14,7 +14,7 @@ import { resolveAgentSpanScope } from '$lib/server/span-scope';
 // newest 2,000 occurrences (see issue-spans.ts), so the response says what it looked at (`spansScan`) and, when older
 // occurrences may remain, where to continue (`nextBefore` -> `before`).
 
-export const GET = withAgentIssue(async (ctx, issue, event) => {
+export const GET = withAgentIssue('read', async (ctx, issue, event) => {
 	const limitParam = event.url.searchParams.get('limit');
 	let limit: number | undefined;
 	if (limitParam !== null) {
@@ -40,7 +40,7 @@ export const GET = withAgentIssue(async (ctx, issue, event) => {
 		throw error(400, 'hasSpans must be true or false');
 	}
 
-	const scope = await resolveAgentSpanScope(ctx.organizationId);
+	const scope = await resolveAgentSpanScope(ctx);
 
 	if (hasSpansParam === 'true') {
 		const want = Math.min(Math.max(limit ?? 20, 1), 50);

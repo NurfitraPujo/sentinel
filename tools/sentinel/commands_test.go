@@ -793,3 +793,73 @@ func TestUpload_UsageErrors(t *testing.T) {
 		t.Errorf("three positionals: exit code = %d, want ExitUsage", code)
 	}
 }
+
+// sentinel-cli-browser-login: SvelteKit renders a thrown error() as an HTML page unless the request asks for JSON,
+// so without `Accept: application/json` a personal key's 403 on `members` printed a whole HTML document. This
+// server negotiates exactly like SvelteKit (HTML unless JSON is accepted); the CLI must get the one-line message.
+func TestErrors_RequestJSONSoThrownErrorsAreOneLine(t *testing.T) {
+	const msg = "Forbidden: personal CLI keys cannot manage organization members; use the dashboard or an org agent key"
+	var accept string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accept = r.Header.Get("Accept")
+		w.WriteHeader(http.StatusForbidden)
+		if strings.Contains(accept, "application/json") {
+			fmt.Fprintf(w, `{"message":%q}`, msg)
+			return
+		}
+		fmt.Fprintf(w, "<!doctype html><html><head><title>%s</title></head><body>403</body></html>", msg)
+	}))
+	t.Cleanup(srv.Close)
+
+	e, _, errBuf := newTestEnv(srv, "sent_agent_personal")
+	if code := cmdMembers(context.Background(), e, []string{"list"}); code == ExitOK {
+		t.Fatal("a 403 must not exit 0")
+	}
+	if accept != "application/json" {
+		t.Errorf("Accept = %q, want application/json", accept)
+	}
+	if got := errBuf.String(); strings.Contains(got, "<html") || !strings.Contains(got, msg) {
+		t.Errorf("stderr = %q, want the one-line message and no HTML", got)
+	}
+}
+
+// sentinel-cli-browser-login: rotating a personal key revokes the old one at once (server side), so a personal
+// profile's key is replaced in place -- never printed -- while an org agent key keeps the print-once contract.
+func TestKeyRotate_PersonalProfileSavesNewKeyAndNeverPrintsIt(t *testing.T) {
+	const newSecret = "sent_agent_ROTATEDROTATEDROTATED"
+	srv, _ := newRecordingServer(t, 200, `{"success":true,"oldKey":{"id":"k-old","expiresAt":"2026-10-07T03:00:00.000Z"},"newKey":{"id":"k-new","prefix":"sent_agent_","secret":"`+newSecret+`"}}`)
+	loginHome(t)
+	writeProfiles(t, srv.URL)
+
+	for _, tc := range []struct {
+		profile    string
+		wantSaved  bool
+		wantSecret bool
+	}{
+		{"production", true, false}, // personal profile: saved, not printed
+		{"ci", false, true},         // org agent profile: printed once, file untouched
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			writeProfiles(t, srv.URL)
+			cfg, err := resolveConfig(cfgFlags{Profile: tc.profile}, func(string) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, out, errb := newTestEnv(srv, cfg.Key)
+			e.cfg = cfg
+			if rc := cmdKeyRotate(context.Background(), e, nil); rc != ExitOK {
+				t.Fatalf("rc=%d %s", rc, errb.String())
+			}
+			cf, _ := loadConfigFile(func(string) {})
+			if saved := cf.Profiles[tc.profile].Key == newSecret; saved != tc.wantSaved {
+				t.Errorf("saved=%v, want %v", saved, tc.wantSaved)
+			}
+			if printed := strings.Contains(out.String()+errb.String(), newSecret); printed != tc.wantSecret {
+				t.Errorf("secret printed=%v, want %v (out=%q)", printed, tc.wantSecret, out.String())
+			}
+			if tc.wantSaved && !strings.Contains(out.String(), "saved to profile production") {
+				t.Errorf("out=%q", out.String())
+			}
+		})
+	}
+}

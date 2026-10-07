@@ -33,6 +33,10 @@ const agentQueries = {
 };
 vi.mock('$lib/db/queries/agents', () => agentQueries);
 
+// sentinel-cli-browser-login: the roster route also lists members' personal CLI keys.
+const listPersonalKeysForOrg = vi.fn();
+vi.mock('$lib/server/cli-personal-keys', () => ({ listPersonalKeysForOrg }));
+
 const { GET, POST } = await import('./[orgId]/agents/+server');
 const { PATCH } = await import('./[orgId]/agents/[agentId]/+server');
 
@@ -79,11 +83,63 @@ describe('organization agent management routes', () => {
 		it.each(['owner', 'admin'])('200s and lists agents for org %s', async (role) => {
 			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow(role)]));
 			agentQueries.listAgents.mockResolvedValueOnce([{ id: 'agent-1', name: 'AutoFix' }]);
+			listPersonalKeysForOrg.mockResolvedValueOnce([]);
 
 			const res = await GET({ params: { orgId: 'org-1' }, locals: locals({ id: 'user-1' }) } as any);
 			const body = await res.json();
-			expect(body).toEqual({ agents: [{ id: 'agent-1', name: 'AutoFix' }] });
+			expect(body).toEqual({ agents: [{ id: 'agent-1', name: 'AutoFix' }], personalKeys: [] });
 			expect(agentQueries.listAgents).toHaveBeenCalledWith('org-1');
+		});
+
+		it('keeps personal agents out of the roster and lists their keys with the owner, never a secret', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('admin')]));
+			agentQueries.listAgents.mockResolvedValueOnce([
+				{ id: 'agent-1', name: 'AutoFix', kind: 'ai' },
+				{ id: 'agent-2', name: 'Ada (CLI)', kind: 'personal', ownerUserId: 'user-ada' },
+			]);
+			listPersonalKeysForOrg.mockResolvedValueOnce([
+				{
+					keyId: 'key-1',
+					deviceName: 'laptop',
+					keyPrefix: 'sent_agent_',
+					status: 'active',
+					createdAt: null,
+					expiresAt: null,
+					revokedAt: null,
+					agentId: 'agent-2',
+					organizationId: 'org-1',
+					organizationName: 'Org',
+					organizationSlug: 'org',
+					ownerUserId: 'user-ada',
+					ownerName: 'Ada',
+					ownerEmail: 'ada@example.test',
+				},
+			]);
+
+			const body = await (await GET({ params: { orgId: 'org-1' }, locals: locals({ id: 'user-1' }) } as any)).json();
+			expect(body.agents.map((a: { id: string }) => a.id)).toEqual(['agent-1']);
+			expect(body.personalKeys).toEqual([
+				{
+					keyId: 'key-1',
+					deviceName: 'laptop',
+					keyPrefix: 'sent_agent_',
+					status: 'active',
+					createdAt: null,
+					expiresAt: null,
+					revokedAt: null,
+					owner: { userId: 'user-ada', name: 'Ada', email: 'ada@example.test' },
+				},
+			]);
+		});
+
+		it('PATCH refuses a personal agent (status / repo-credential flag are never set by an admin)', async () => {
+			dbMock.then.mockImplementationOnce((resolve: any) => resolve([membershipRow('owner')]));
+			agentQueries.getAgentById.mockResolvedValueOnce({ id: 'agent-2', orgId: 'org-1', kind: 'personal' });
+			const request = new Request('http://x', { method: 'PATCH', body: JSON.stringify({ canAccessRepoCredentials: true }) });
+			await expect(
+				PATCH({ params: { orgId: 'org-1', agentId: 'agent-2' }, request, locals: locals({ id: 'user-1' }) } as any)
+			).rejects.toMatchObject({ status: 400 });
+			expect(agentQueries.setAgentStatus).not.toHaveBeenCalled();
 		});
 	});
 

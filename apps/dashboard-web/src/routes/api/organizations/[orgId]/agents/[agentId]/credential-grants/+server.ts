@@ -29,11 +29,15 @@ async function requireManageAgents(locals: App.Locals, orgId: string) {
 // agent in org B by naming its id in the path — the org in the URL is not proof of ownership.
 async function requireAgentInOrg(orgId: string, agentId: string) {
 	const [agent] = await db
-		.select({ id: agents.id })
+		.select({ id: agents.id, kind: agents.kind })
 		.from(agents)
 		.where(and(eq(agents.id, agentId), eq(agents.orgId, orgId)));
 	if (!agent) {
 		error(404, 'Agent not found in this organization');
+	}
+	// sentinel-cli-browser-login: repo-credential grants are for org agents; a personal agent can never fetch credentials.
+	if (agent.kind === 'personal') {
+		error(400, 'Personal CLI agents cannot hold repo-credential grants');
 	}
 }
 

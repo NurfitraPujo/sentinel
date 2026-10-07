@@ -113,6 +113,9 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Key)
 	req.Header.Set("User-Agent", userAgent())
+	// Without it SvelteKit renders a thrown error() (every 4xx the routes raise that way, e.g. a personal key's
+	// 403 on `members`) as an HTML error page, and errorMessage would print the whole page instead of {message}.
+	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -155,6 +158,7 @@ func (c *Client) UploadFile(ctx context.Context, path, filePath string, fileRead
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Key)
 	req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
 	resp, err := c.HTTP.Do(req)

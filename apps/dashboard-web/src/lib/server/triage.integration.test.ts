@@ -68,7 +68,11 @@ const otherProjectId = randomUUID();
 const reporterId = randomUUID();
 
 /** The instant the report says it happened. Every occurrence below is placed relative to it. */
-const OCCURRED_AT = new Date('2026-09-04T09:12:03.000Z');
+// RELATIVE to now, never a fixed date: `cleanupRetainedData` (default 30 days) deletes every occurrence
+// older than its cutoff -- and then the issues left without one -- across ALL projects, and the retention
+// integration files run it concurrently with this one. A hard-coded date silently aged past that cutoff
+// and the seeded candidates started disappearing mid-test. A day back keeps it well inside the window.
+const OCCURRED_AT = new Date(Math.floor((Date.now() - 24 * 60 * 60_000) / 1000) * 1000);
 const minutes = (n: number) => new Date(OCCURRED_AT.getTime() + n * 60_000);
 
 let sql: ReturnType<typeof postgres>;
@@ -487,24 +491,58 @@ describe.skipIf(!(dbReachable && explicitlyTargeted))('§4.3 triage against a re
 			// criterion 3's evidence. This assertion is the committed regression guard: it fails the
 			// moment the query is rewritten into a shape that stops using the index at all.
 			const { windowStart, windowEnd } = triage.triageWindow(OCCURRED_AT, 30);
-			const plan = await sql`
-				EXPLAIN (FORMAT TEXT)
-				SELECT i.id, occ.latest_occurrence_at
-				FROM issues i
-				CROSS JOIN LATERAL (
-					SELECT max(eo.created_at) AS latest_occurrence_at
-					FROM error_occurrences eo
-					WHERE eo.issue_id = i.id
-					  AND eo.created_at >= ${windowStart}
-					  AND eo.created_at <= ${windowEnd}
-				) occ
-				WHERE i.project_id = ${projectId}
-				  AND i.issue_type = 'system_error'
-				  AND occ.latest_occurrence_at IS NOT NULL
-				ORDER BY occ.latest_occurrence_at DESC, i.id ASC
-				LIMIT 5
-			`;
-			const text = plan.map((line: Record<string, string>) => Object.values(line)[0]).join('\n');
+			// The plan is a function of the table STATISTICS, so the test has to create the statistics it
+			// asserts on (it must not inherit them). `error_occurrences` is shared with every other
+			// integration file, and whichever ANALYZE ran last -- autovacuum, or a sibling file's explicit
+			// `analyze error_occurrences` -- decided this plan: analyzed while near-empty, every index on
+			// `issue_id` costs the same and the planner may pick `idx_occurrences_issue_release` with the
+			// window as a mere Filter, which says nothing about this query's shape. So: a realistic volume
+			// for this project (40 issues x 50 occurrences across the window and beyond it), analyzed in
+			// THIS transaction -- which also holds the ANALYZE lock, so no concurrent ANALYZE can replace
+			// the statistics between it and the EXPLAIN -- and then rolled back. Same claim, against the
+			// statistics production has rather than whatever the run order left behind.
+			let planRows: Record<string, string>[] = [];
+			const rollback = new Error('rollback: plan-only seed');
+			await sql
+				.begin(async (tx) => {
+					const volumeIssues = await tx<{ id: string }[]>`
+						insert into issues (id, project_id, environment, fingerprint, message, error_class, issue_type)
+						select gen_random_uuid(), ${projectId}, 'production', ${'fp-plan-' + suffix + '-'} || g,
+						       'plan volume', 'PostgresError', 'system_error'
+						from generate_series(1, 40) g
+						returning id
+					`;
+					await tx`
+						insert into error_occurrences (id, issue_id, environment, platform, created_at)
+						select gen_random_uuid(), i.id, 'production', 'go', ${OCCURRED_AT}::timestamptz - (g || ' minutes')::interval
+						from unnest(${tx.array(volumeIssues.map((r) => r.id))}::uuid[]) as i(id)
+						cross join generate_series(1, 50) g
+					`;
+					await tx`analyze error_occurrences`;
+					await tx`analyze issues`;
+					planRows = await tx`
+						EXPLAIN (FORMAT TEXT)
+						SELECT i.id, occ.latest_occurrence_at
+						FROM issues i
+						CROSS JOIN LATERAL (
+							SELECT max(eo.created_at) AS latest_occurrence_at
+							FROM error_occurrences eo
+							WHERE eo.issue_id = i.id
+							  AND eo.created_at >= ${windowStart}
+							  AND eo.created_at <= ${windowEnd}
+						) occ
+						WHERE i.project_id = ${projectId}
+						  AND i.issue_type = 'system_error'
+						  AND occ.latest_occurrence_at IS NOT NULL
+						ORDER BY occ.latest_occurrence_at DESC, i.id ASC
+						LIMIT 5
+					`;
+					throw rollback;
+				})
+				.catch((error: unknown) => {
+					if (error !== rollback) throw error;
+				});
+			const text = planRows.map((line) => Object.values(line)[0]).join('\n');
 			expect(text).toContain('idx_occurrences_issue_created');
 			expect(text).not.toMatch(/Seq Scan on error_occurrences/);
 		});

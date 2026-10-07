@@ -3,6 +3,8 @@ import { eq } from 'drizzle-orm';
 import { db } from '$lib/server/db';
 import { issues, projects } from '$lib/db/schema';
 import { getReporterId, type IssueReporter } from '$lib/server/report-access';
+import type { AgentAuthContext } from '$lib/server/agent-auth';
+import { isVisibleToAgent, requireAgentWrite } from '$lib/server/agent-access';
 
 /**
  * Manual Issues M5 stage 2 (design §7): resolves an issue for an agent-authenticated request and
@@ -30,11 +32,26 @@ export interface AgentIssueScope {
 	claimedAt: Date | null;
 }
 
-export async function resolveAgentIssueScope(issueId: string, organizationId: string): Promise<AgentIssueScope> {
+/**
+ * sentinel-cli-browser-login: takes the whole `AgentAuthContext` (not just its organization id) so a PERSONAL key is held
+ * to its owner's live access on every issue-scoped route and batch op -- an issue outside the owner's projects or
+ * environment grants is the same 404 as another organization's, and `access: 'write'` by a read-only owner is a 403.
+ * The signature changed from `(issueId, organizationId)` deliberately: every caller had to be revisited, and none can
+ * compile while forgetting the personal-key dimension. For an org agent the behaviour is unchanged.
+ */
+export type AgentIssueAccess = 'read' | 'write';
+
+export async function resolveAgentIssueScope(
+	issueId: string,
+	ctx: AgentAuthContext,
+	access: AgentIssueAccess
+): Promise<AgentIssueScope> {
+	const organizationId = ctx.organizationId;
 	const rows = await db
 		.select({
 			issueId: issues.id,
 			projectId: issues.projectId,
+			environment: issues.environment,
 			organizationId: projects.organizationId,
 			issueType: issues.issueType,
 			assignedTo: issues.assignedTo,
@@ -53,8 +70,16 @@ export async function resolveAgentIssueScope(issueId: string, organizationId: st
 	if (!row || row.organizationId !== organizationId) {
 		throw error(404, 'Issue not found');
 	}
+	// A personal key: outside the owner's projects/environments is the same 404 (decision 20's rule, and the dashboard's).
+	if (!isVisibleToAgent(ctx, row.projectId, row.environment)) {
+		throw error(404, 'Issue not found');
+	}
+	if (access === 'write') {
+		requireAgentWrite(ctx);
+	}
 
-	return row as AgentIssueScope;
+	const { environment: _environment, ...scope } = row;
+	return scope as AgentIssueScope;
 }
 
 /**

@@ -182,14 +182,16 @@ func TestLogin_EnvOverrideWarning(t *testing.T) {
 	}
 }
 
-func TestLogin_NonTTYRequiresKeyStdin(t *testing.T) {
+// sentinel-cli-browser-login: without --key-stdin, login is the browser device flow -- also on a non-terminal (SSH,
+// headless) -- and a key piped on stdin is never read. The device flow itself is covered in device_test.go.
+func TestLogin_WithoutKeyStdinNeverReadsAKeyFromStdin(t *testing.T) {
 	cfgPath := loginHome(t)
-	srv := selfServer(t, 200)
-	io_, _, errb := testLoginIO(testKey+"\n", false)
-	if rc := cmdLogin(context.Background(), []string{"--url", srv.URL}, cfgFlags{}, io_); rc != ExitUsage {
-		t.Fatalf("rc=%d", rc)
+	srv := selfServer(t, 200) // serves no /api/cli/device: the device flow fails to start
+	io_, out, errb := testLoginIO(testKey+"\n", false)
+	if rc := cmdLogin(context.Background(), []string{"--url", srv.URL, "--no-browser"}, cfgFlags{}, io_); rc != ExitNotFound {
+		t.Fatalf("rc=%d %s", rc, errb)
 	}
-	if !strings.Contains(errb.String(), "--key-stdin") {
+	if !strings.Contains(errb.String(), "--key-stdin") || strings.Contains(out.String()+errb.String(), "SECRETSECRET") {
 		t.Errorf("err: %q", errb)
 	}
 	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
@@ -201,7 +203,7 @@ func TestLogin_TTYPromptsForURLAndHiddenKey(t *testing.T) {
 	cfgPath := loginHome(t)
 	srv := selfServer(t, 200)
 	io_, out, errb := testLoginIO(srv.URL+"\n"+testKey+"\n", true)
-	if rc := cmdLogin(context.Background(), nil, cfgFlags{}, io_); rc != 0 {
+	if rc := cmdLogin(context.Background(), []string{"--key-stdin"}, cfgFlags{}, io_); rc != 0 {
 		t.Fatalf("rc=%d %s", rc, errb)
 	}
 	if !strings.Contains(errb.String(), "Agent key (input hidden)") || strings.Contains(out.String()+errb.String(), "SECRETSECRET") {

@@ -35,6 +35,8 @@ export async function writeAgentAuditLog(
 				agentName: ctx.agentName,
 				keyPrefix: ctx.keyPrefixForAudit,
 				organizationId: ctx.organizationId,
+				// sentinel-cli-browser-login: a personal key's action is attributable to the PERSON, not just their agent.
+				...(ctx.owner ? { ownerUserId: ctx.owner.userId } : {}),
 				...metadata,
 			},
 		});

@@ -16,6 +16,10 @@ vi.mock('$lib/db/queries/apikeys', () => ({ rotateAgentKeyWithGrace, AgentKeyRot
 const writeAgentAuditLog = vi.fn();
 vi.mock('$lib/server/agent-audit', () => ({ writeAgentAuditLog }));
 
+const rotatePersonalKey = vi.fn();
+class PersonalKeyRotationError extends Error {}
+vi.mock('$lib/server/cli-personal-keys', () => ({ rotatePersonalKey, PersonalKeyRotationError }));
+
 const { POST } = await import('./+server');
 
 function makeEvent() {
@@ -114,5 +118,51 @@ describe('POST /api/agent/key/rotate', () => {
 		rotateAgentKeyWithGrace.mockRejectedValue(new AgentKeyRotationError('not an agent key'));
 		await expect(POST(makeEvent())).rejects.toMatchObject({ status: 400 });
 		expect(writeAgentAuditLog).not.toHaveBeenCalled();
+	});
+
+	// sentinel-cli-browser-login: a PERSONAL key never takes the org-agent grace path. rotatePersonalKey (proved against a
+	// real Postgres in personal-keys.integration.test.ts) revokes the calling key at once and keeps its exact expiry.
+	describe('personal key', () => {
+		const personalCtx = { ...ctx, owner: { userId: 'u-1', role: 'engineer', canWrite: true } };
+
+		it('rotates via rotatePersonalKey with no grace window, even when AGENT_KEY_ROTATION_GRACE_HOURS is set', async () => {
+			mockEnv.AGENT_KEY_ROTATION_GRACE_HOURS = '48';
+			authenticateAgentRequest.mockResolvedValue(personalCtx);
+			const revokedAt = new Date('2026-10-07T03:00:00.000Z');
+			const expiresAt = new Date('2026-12-01T00:00:00.000Z');
+			rotatePersonalKey.mockResolvedValue({
+				oldKeyId: 'key-old',
+				revokedAt,
+				newKeyId: 'key-new',
+				keyPrefix: 'sent_agent_',
+				secretToken: 'sent_agent_personalsecret',
+				expiresAt,
+			});
+
+			const res = await POST(makeEvent());
+			expect(res.status).toBe(200);
+			expect(rotatePersonalKey).toHaveBeenCalledWith('key-old');
+			expect(rotateAgentKeyWithGrace).not.toHaveBeenCalled();
+			// The old key's expiry is its revocation instant -- there is no grace window to report.
+			expect(await res.json()).toEqual({
+				success: true,
+				oldKey: { id: 'key-old', expiresAt: revokedAt.toISOString() },
+				newKey: { id: 'key-new', prefix: 'sent_agent_', secret: 'sent_agent_personalsecret' },
+			});
+			expect(writeAgentAuditLog).toHaveBeenCalledWith(
+				personalCtx,
+				'agent.key.rotated',
+				'api_key',
+				'key-old',
+				expect.objectContaining({ newKeyId: 'key-new', graceHours: 0, personal: true, expiresAt: expiresAt.toISOString() })
+			);
+		});
+
+		it('maps PersonalKeyRotationError (key no longer live) to 400 and audits nothing', async () => {
+			authenticateAgentRequest.mockResolvedValue(personalCtx);
+			rotatePersonalKey.mockRejectedValue(new PersonalKeyRotationError('This key is no longer active'));
+			await expect(POST(makeEvent())).rejects.toMatchObject({ status: 400 });
+			expect(writeAgentAuditLog).not.toHaveBeenCalled();
+		});
 	});
 });

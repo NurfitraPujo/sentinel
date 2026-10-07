@@ -593,7 +593,11 @@ export type RelatedIssueView = VisibleRelatedIssue | RedactedRelatedIssue;
 
 export async function getIssueRelations(
 	issueId: string,
-	environmentScopes: Map<string, string[]> = new Map()
+	environmentScopes: Map<string, string[]> = new Map(),
+	// sentinel-cli-browser-login: a PERSONAL agent key's owner may not reach every project of the organization, and
+	// `issue_relations` crosses projects. When given, a related issue in a project outside this set is redacted exactly
+	// like one outside the environment grant. Omitted (every existing caller) means "every project", unchanged.
+	visibleProjectIds?: readonly string[]
 ) {
 	// `projectId` and `environment` are selected for the guard and then dropped: they are what
 	// decides the branch, and a placeholder that carried the related issue's project would be a
@@ -649,7 +653,7 @@ export async function getIssueRelations(
 	// BOTH branches, through one function. `outgoing` joins on `targetIssueId` and `incoming` on
 	// `sourceIssueId`; redacting one and not the other is the natural half-fix and is invisible from
 	// the page unless the relation happens to run the other way.
-	return [...outgoing, ...incoming].map((row) => redactOutOfScope(row, environmentScopes));
+	return [...outgoing, ...incoming].map((row) => redactOutOfScope(row, environmentScopes, visibleProjectIds));
 }
 
 function redactOutOfScope<
@@ -667,11 +671,12 @@ function redactOutOfScope<
 			environment: string;
 		};
 	},
->(row: T, environmentScopes: Map<string, string[]>) {
+>(row: T, environmentScopes: Map<string, string[]>, visibleProjectIds?: readonly string[]) {
 	const { projectId, environment, ...visible } = row.relatedIssue;
 	const scope = scopeForProject(environmentScopes, projectId);
+	const projectVisible = visibleProjectIds === undefined || visibleProjectIds.includes(projectId);
 
-	if (scope === null || scope.includes(environment)) {
+	if (projectVisible && (scope === null || scope.includes(environment))) {
 		return {
 			...row,
 			sourceIssueId: row.sourceIssueId as string | null,

@@ -69,6 +69,11 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		if (!agentRow || agentRow.orgId !== orgId) {
 			throw error(400, 'agentId not found in this organization');
 		}
+		// sentinel-cli-browser-login: a personal agent's keys come ONLY from its owner's `sentinel login` approval. An
+		// admin minting one would hold a credential that acts as (and is attributed to) another person.
+		if (agentRow.kind === 'personal') {
+			throw error(400, 'Personal CLI agents get keys only through their owner\'s `sentinel login`');
+		}
 	} else if (!hasPermission(membership.role, 'manage_keys')) {
 		// FR-007: only owner, admin, engineer may manage non-agent API keys.
 		throw error(403, 'Forbidden: only owners, admins, and engineers can create API keys');

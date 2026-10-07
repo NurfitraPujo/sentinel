@@ -769,6 +769,20 @@ export const SelfResponseSchema = z
 		// Suggested `sentinel` CLI profile name for this deployment (SENTINEL_CLI_PROFILE); present only
 		// when the operator configured one. `sentinel login` uses it to name the profile on a fresh machine.
 		cliProfile: z.string().optional(),
+		// sentinel-cli-browser-login: 'ai' | 'bot' for an org agent, 'personal' for a `sentinel login` key.
+		kind: z.string(),
+		// The person a personal key acts for, as resolved LIVE for this request; null for an org agent. `canWrite` is
+		// rbac.ts's `write` for their current role (false = this key is read-only).
+		owner: z
+			.object({
+				userId: z.string(),
+				name: z.string().nullable(),
+				email: z.string(),
+				role: z.enum(['owner', 'admin', 'engineer', 'support', 'viewer']),
+				canWrite: z.boolean(),
+			})
+			.strict()
+			.nullable(),
 		key: z
 			.object({
 				id: z.string(),
@@ -793,6 +807,17 @@ export const KeyRotateResponseSchema = z
 		success: z.literal(true),
 		oldKey: z.object({ id: z.string(), expiresAt: z.string().nullable() }).strict(),
 		newKey: z.object({ id: z.string(), prefix: z.string(), secret: z.string() }).strict(),
+	})
+	.strict();
+
+// ---------------------------------------------------------------------------
+// POST /api/agent/key/revoke -- sentinel-cli-browser-login (`sentinel logout`)
+// ---------------------------------------------------------------------------
+
+export const KeyRevokeResponseSchema = z
+	.object({
+		success: z.literal(true),
+		revokedKeyId: z.string(),
 	})
 	.strict();
 

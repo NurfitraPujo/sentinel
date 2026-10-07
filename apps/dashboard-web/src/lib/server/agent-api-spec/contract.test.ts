@@ -15,7 +15,8 @@ import * as S from './schemas';
  * BEHAVIOR IS FROZEN / existing tests stay unmodified).
  */
 
-const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc' };
+// sentinel-cli-browser-login: an ORG agent context (owner null); the personal-key shape is pinned by the self cases below.
+const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc', agentKind: 'ai', owner: null };
 const ISSUE_SCOPE = {
 	issueId: 'issue-1',
 	projectId: 'project-1',
@@ -327,6 +328,35 @@ describe('GET /api/agent/self', () => {
 		expect(S.SelfResponseSchema.parse(body)).toBeTruthy();
 		vi.unstubAllEnvs();
 	});
+
+	// sentinel-cli-browser-login: an org agent reports kind + owner: null; a personal key reports its live owner.
+	it('200: an org agent declares kind and a null owner', async () => {
+		authenticateAgentRequest.mockResolvedValue(selfCtx);
+		const body = S.SelfResponseSchema.parse(await (await selfRoute.GET(makeEvent('http://localhost/api/agent/self'))).json());
+		expect(body.kind).toBe('ai');
+		expect(body.owner).toBeNull();
+	});
+
+	it('200: a personal key declares its owner (live role, canWrite) and the schema stays strict', async () => {
+		authenticateAgentRequest.mockResolvedValue({
+			...selfCtx,
+			agentKind: 'personal',
+			owner: {
+				userId: 'user-1',
+				name: 'Ada',
+				email: 'ada@example.test',
+				role: 'viewer',
+				canWrite: false,
+				projectIds: ['project-1'],
+				environmentScopes: new Map(),
+			},
+		});
+		const body = await (await selfRoute.GET(makeEvent('http://localhost/api/agent/self'))).json();
+		expect(S.SelfResponseSchema.parse(body)).toBeTruthy();
+		expect(body.owner).toEqual({ userId: 'user-1', name: 'Ada', email: 'ada@example.test', role: 'viewer', canWrite: false });
+		// The owner's access lists are authorization state, never part of the contract.
+		expect(S.SelfResponseSchema.safeParse({ ...body, owner: { ...body.owner, projectIds: [] } }).success).toBe(false);
+	});
 });
 
 describe('GET /api/agent/issues/{issueId}', () => {
@@ -427,6 +457,7 @@ describe('GET /api/agent/traces/{traceId}', () => {
 			environment: 'production',
 			limit: 5,
 			cursor: undefined,
+			visibility: null,
 		});
 	});
 
@@ -525,7 +556,7 @@ describe('GET /api/agent/occurrences/{occurrenceId}', () => {
 		const res = await call();
 		const body = S.OccurrenceResponseSchema.parse(await res.json());
 		expect(body.occurrence).toMatchObject({ id: ID, spansStatus: 'pending', hasSpans: false });
-		expect(getAgentOccurrenceInOrg).toHaveBeenCalledWith('org-1', ID);
+		expect(getAgentOccurrenceInOrg).toHaveBeenCalledWith('org-1', ID, null);
 	});
 
 	it('404: malformed id never reaches the query; another organization\'s occurrence is not found', async () => {

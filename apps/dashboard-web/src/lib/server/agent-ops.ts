@@ -32,7 +32,7 @@ import type { AgentIssueScope } from '$lib/server/agent-issue-scope';
  * individual `/api/agent/issues/[issueId]/{status,claim,comments,progress,relations}` routes.
  *
  * Each op handler is a straight EXTRACTION of what its single route already did -- same
- * validation, same `resolveAgentIssueScope(issueId, ctx.organizationId)` scope resolution (B7:
+ * validation, same `resolveAgentIssueScope(issueId, ctx, 'write')` scope resolution (B7:
  * tenant scope from the credential, never the request), same domain-error -> HTTP-status mapping,
  * same audit descriptor. The single routes become thin wrappers (`agentOpRoute` below) so their
  * behavior -- and their existing tests -- must not change.
@@ -94,11 +94,11 @@ function extractIdempotencyKey(body: Record<string, unknown>): string | undefine
  * `HttpError` to extract the status/body correctly; a raw thrown `Response` falls through both as
  * an unmapped 500.
  */
-async function throwClaimConflict(issueId: string, organizationId: string, message: string): Promise<never> {
+async function throwClaimConflict(issueId: string, ctx: AgentAuthContext, message: string): Promise<never> {
 	let claimedBy: string | null = null;
 	let claimedAt: string | null = null;
 	try {
-		const fresh = await resolveAgentIssueScope(issueId, organizationId);
+		const fresh = await resolveAgentIssueScope(issueId, ctx, 'read');
 		claimedBy = fresh.assignedTo;
 		claimedAt = fresh.claimedAt ? fresh.claimedAt.toISOString() : null;
 	} catch {
@@ -135,7 +135,7 @@ function isValidStatus(value: unknown): value is IssueStatus {
 }
 
 const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	const { status } = body;
 	if (!isValidStatus(status)) {
@@ -188,7 +188,7 @@ const issuesStatus: AgentOpHandler = async (ctx, issueId, params, originUrl) => 
 };
 
 const issuesClaim: AgentOpHandler = async (ctx, issueId, _params, originUrl) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	try {
 		// N9 (sentinel-worker plan, C1): `alreadyClaimed` means this was an idempotent self-reclaim --
 		// the caller already holds the claim, no new activity/notification was written (notified is []),
@@ -209,14 +209,14 @@ const issuesClaim: AgentOpHandler = async (ctx, issueId, _params, originUrl) => 
 		};
 	} catch (err) {
 		if (err instanceof ClaimConflictError) {
-			await throwClaimConflict(issue.issueId, ctx.organizationId, err.message);
+			await throwClaimConflict(issue.issueId, ctx, err.message);
 		}
 		throw err;
 	}
 };
 
 const issuesClaimRelease: AgentOpHandler = async (ctx, issueId, _params, originUrl) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	try {
 		// Non-force: releaseClaim's own conditional UPDATE (`WHERE assigned_to = $agentId`) is what
 		// actually enforces "only the current claimant may release" -- an agent cannot pass someone
@@ -230,14 +230,14 @@ const issuesClaimRelease: AgentOpHandler = async (ctx, issueId, _params, originU
 		};
 	} catch (err) {
 		if (err instanceof ClaimConflictError) {
-			await throwClaimConflict(issue.issueId, ctx.organizationId, err.message);
+			await throwClaimConflict(issue.issueId, ctx, err.message);
 		}
 		throw err;
 	}
 };
 
 const issuesComment: AgentOpHandler = async (ctx, issueId, params, originUrl) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	if (typeof body.body_md !== 'string' || body.body_md.trim().length === 0) {
 		throw error(400, 'body_md is required');
@@ -317,7 +317,7 @@ async function loadOwnedAgentComment(issueId: string, commentId: unknown) {
 }
 
 const issuesCommentsEdit: AgentOpHandler = async (ctx, issueId, params) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	const comment = await loadOwnedAgentComment(issue.issueId, body.comment_id);
 
@@ -352,7 +352,7 @@ const issuesCommentsEdit: AgentOpHandler = async (ctx, issueId, params) => {
 };
 
 const issuesCommentsDelete: AgentOpHandler = async (ctx, issueId, params) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	const comment = await loadOwnedAgentComment(issue.issueId, body.comment_id);
 
@@ -396,7 +396,7 @@ function isValidSeverity(value: unknown): value is ReportSeverity {
  * found" 500-shaped error).
  */
 const issuesReportSeverity: AgentOpHandler = async (ctx, issueId, params) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	if (issue.issueType !== 'user_report') {
 		throw error(400, 'severity can only be set on user_report issues');
 	}
@@ -426,7 +426,7 @@ const issuesReportSeverity: AgentOpHandler = async (ctx, issueId, params) => {
 };
 
 const issuesProgress: AgentOpHandler = async (ctx, issueId, params) => {
-	const issue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const issue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	if (typeof body.message_md !== 'string' || body.message_md.trim().length === 0) {
 		throw error(400, 'message_md is required');
@@ -477,7 +477,7 @@ function isCheckViolation(err: unknown): boolean {
 }
 
 const issuesRelationsAdd: AgentOpHandler = async (ctx, issueId, params, originUrl) => {
-	const sourceIssue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const sourceIssue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	const targetIssueId = body.target_issue_id;
 	const relationType = body.relation_type;
@@ -492,8 +492,9 @@ const issuesRelationsAdd: AgentOpHandler = async (ctx, issueId, params, originUr
 		throw error(400, 'An issue cannot be related to itself');
 	}
 
-	// The target issue must also resolve within the agent's OWN org (B7).
-	await resolveAgentIssueScope(targetIssueId, ctx.organizationId);
+	// The target issue must also resolve within the agent's OWN org (B7) -- and, for a personal key, be visible to its
+	// owner. READ on the target, like the dashboard's relations route (`requireIssueAccess(target, 'read')`).
+	await resolveAgentIssueScope(targetIssueId, ctx, 'read');
 
 	try {
 		const { relation, notified } = await createIssueRelation(
@@ -530,7 +531,7 @@ const issuesRelationsAdd: AgentOpHandler = async (ctx, issueId, params, originUr
 };
 
 const issuesRelationsRemove: AgentOpHandler = async (ctx, issueId, params) => {
-	const sourceIssue = await resolveAgentIssueScope(issueId, ctx.organizationId);
+	const sourceIssue = await resolveAgentIssueScope(issueId, ctx, 'write');
 	const body = asRecord(params);
 	const targetIssueId = body.target_issue_id;
 	const relationType = body.relation_type;
@@ -542,7 +543,7 @@ const issuesRelationsRemove: AgentOpHandler = async (ctx, issueId, params) => {
 		throw error(400, `relation_type must be one of: ${VALID_RELATION_TYPES.join(', ')}`);
 	}
 
-	await resolveAgentIssueScope(targetIssueId, ctx.organizationId);
+	await resolveAgentIssueScope(targetIssueId, ctx, 'read');
 
 	const deleted = await deleteIssueRelation(sourceIssue.issueId, targetIssueId, relationType, 'agent', ctx.agentId);
 	if (!deleted) {

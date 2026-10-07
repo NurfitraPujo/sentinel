@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import { authenticateAgentRequest } from '$lib/server/agent-auth';
 import { handleAttachmentUpload, checkDeclaredLength } from '$lib/server/upload-core';
 import { writeAgentAuditLog } from '$lib/server/agent-audit';
+import { requireAgentWrite } from '$lib/server/agent-access';
 
 // Manual Issues M5 stage 2 (design §7 step 3): agent attachment upload, reusing the M2 upload
 // core with uploader_type 'agent'. organizationId is NOT read from the body/form -- it comes
@@ -10,6 +11,8 @@ import { writeAgentAuditLog } from '$lib/server/agent-audit';
 
 export const POST: RequestHandler = async ({ request }) => {
 	const ctx = await authenticateAgentRequest(request);
+	// sentinel-cli-browser-login: an upload is a write (it exists to be attached to a comment).
+	requireAgentWrite(ctx);
 
 	checkDeclaredLength(request);
 

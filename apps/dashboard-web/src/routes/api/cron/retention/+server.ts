@@ -5,6 +5,7 @@ import {
 	reapStaleClaims,
 	reapExpiredIdempotencyKeys,
 	reapExpiredReportIdempotencyKeys,
+	reapExpiredCliDeviceAuthorizations,
 	maintainSpans,
 } from '$lib/server/retention';
 import { reapAllExpiredInvitations } from '$lib/db/queries/organizations';
@@ -133,6 +134,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		// calling API key row's rather than an agent's.
 		const reapedReportIdempotencyKeys = await reapExpiredReportIdempotencyKeys(run.db);
 
+		// sentinel-cli-browser-login: and `sentinel login` device authorizations a day past expiry.
+		const reapedCliDeviceAuthorizations = await reapExpiredCliDeviceAuthorizations(run.db);
+
 		// A run that finished but stopped deleting occurrences early is `behind`, not `completed`.
 		const outcome = retentionRunOutcome(result);
 		recordRetentionRun(outcome);
@@ -144,6 +148,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			releasedClaims: claimReap.releasedClaims,
 			reapedIdempotencyKeys,
 			reapedReportIdempotencyKeys,
+			reapedCliDeviceAuthorizations,
 			spanMaintenance,
 			deletedOccurrences: result.deletedOccurrences,
 			// sentinel-affected-users §4.5 (flow R3): side rows deleted, NOT issues touched.

@@ -9,6 +9,7 @@ import { log } from '$lib/server/observability/log';
 import { HTTP_REQUEST_ID_HEADER } from '$lib/server/observability/constants';
 import { runWithTraceContext, traceContextForRequest } from '$lib/server/observability/trace';
 import { dev } from '$app/environment';
+import { applyFrameGuard, needsFrameGuard } from '$lib/server/cli-approve';
 import {
 	isCsrfExemptPath,
 	isForbiddenCrossSiteFormPost,
@@ -215,4 +216,12 @@ export const orgHandle = async ({ event, resolve }: any) => {
 	return resolve(event);
 };
 
-export const handle = sequence(requestContextHandle, csrfHandle, authHandle, orgHandle);
+// sentinel-cli-browser-login: `/cli/approve` (and its `/signin` hop) may not be framed -- clickjacking an Approve click
+// would hand an attacker's terminal the victim's access. Outermost, so it also covers the CSRF 403 and error pages.
+export const frameGuardHandle: Handle = async ({ event, resolve }) => {
+	const response = await resolve(event);
+	if (needsFrameGuard(event.url.pathname)) applyFrameGuard(response.headers);
+	return response;
+};
+
+export const handle = sequence(frameGuardHandle, requestContextHandle, csrfHandle, authHandle, orgHandle);

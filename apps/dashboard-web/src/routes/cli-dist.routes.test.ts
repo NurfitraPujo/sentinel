@@ -37,6 +37,9 @@ describe('GET /install.sh', () => {
 		expect(body.startsWith('#!/bin/sh\n')).toBe(true);
 		expect(body).toContain("SENTINEL_ORIGIN='https://sentinel.example.com'");
 		expect(body).toContain('sentinel login --url $SENTINEL_ORIGIN');
+		// sentinel-cli-browser-login: the next step is the browser login -- no admin, no key to paste.
+		expect(body).toContain('approve the code in your browser');
+		expect(body).not.toContain('paste your agent key');
 		const f = path.join(dir, 'install.sh');
 		writeFileSync(f, body);
 		execFileSync('sh', ['-n', f]); // throws on a syntax error

@@ -5,6 +5,7 @@ import { organizationMembers, issues, projects, issueSubscriptions, projectEnvir
 import { eq, and, inArray } from 'drizzle-orm';
 import { upsertOrganizationMember } from '$lib/db/queries/organizations';
 import { requireOrgMembership } from '../../keys/_shared';
+import { revokePersonalKeysOfMember } from '$lib/server/cli-personal-keys';
 
 const VALID_ROLES = ['owner', 'admin', 'engineer', 'support', 'viewer'] as const;
 type Role = typeof VALID_ROLES[number];
@@ -206,6 +207,11 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
           )
         );
     }
+
+    // sentinel-cli-browser-login: the member's personal CLI keys for this org are revoked in the same transaction. They
+    // already stop authenticating the moment the membership row is gone (agent-auth.ts re-checks it live); revoking
+    // them means a later re-invite does not bring the old keys back.
+    await revokePersonalKeysOfMember(tx, { organizationId: orgId, userId: target.userId, actorId: callerUserId });
 
     // sentinel-project-environments §4.10, decision 40: a grant does not outlive the membership it
     // narrows. Same transaction as the removal above and beside the issue_subscriptions delete --

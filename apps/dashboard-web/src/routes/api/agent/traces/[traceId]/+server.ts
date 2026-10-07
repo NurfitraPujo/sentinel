@@ -6,6 +6,7 @@ import { parseTraceId } from '$lib/server/queries/trace-queries';
 import { getSpansState } from '$lib/server/queries/span-queries';
 import { annotateSpans } from '$lib/server/agent-spans';
 import { resolveAgentSpanScope } from '$lib/server/span-scope';
+import { agentVisibility } from '$lib/server/agent-access';
 
 // sentinel-cross-repo-trace-view TASK-03 (contract D6). GET /api/agent/traces/{traceId}
 // ?limit=&cursor=&environment= -- oldest-first page of every occurrence sharing the trace id across
@@ -14,6 +15,8 @@ import { resolveAgentSpanScope } from '$lib/server/span-scope';
 // is a filter. sentinel-occurrence-spans: `spans` is the trace's spans state ({status, reason}) and every occurrence carries
 // `spansStatus`/`hasSpans`; this is also the status poll of POST /api/agent/traces/{traceId}/pull. A malformed trace id is a 404 without a query (D1); an unseen, foreign or hidden one is a
 // 200 with an empty list, so the three are indistinguishable. Read-only, so unaudited like the other agent reads.
+// sentinel-cli-browser-login: a personal key sees only its owner's projects/environment grants (an occurrence outside them
+// is simply absent, like a foreign one), and its spans state is computed under that same scope.
 export const GET = async (event: RequestEvent): Promise<Response> => {
 	const ctx = await authenticateAgentRequest(event.request);
 
@@ -42,8 +45,9 @@ export const GET = async (event: RequestEvent): Promise<Response> => {
 			environment,
 			limit,
 			cursor,
+			visibility: agentVisibility(ctx),
 		});
-		const scope = await resolveAgentSpanScope(ctx.organizationId);
+		const scope = await resolveAgentSpanScope(ctx);
 		const spans = await getSpansState(traceId, scope);
 		return json({ occurrences: await annotateSpans(occurrences, scope), ...(nextCursor ? { nextCursor } : {}), spans });
 	} catch (err) {

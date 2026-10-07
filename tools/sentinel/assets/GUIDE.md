@@ -111,6 +111,34 @@ null}` — never a missing field.
   actual trust boundary is (the fix container, not the command string).
 - One repo connection per project in v1 — `repo` is a single object, not a list.
 
+## 2b. Personal keys (`sentinel login`)
+
+There are two kinds of agent key, and `GET /api/agent/self` tells you which one you hold (`kind`, `owner`, §13):
+
+- An **org agent key** (`kind: "ai" | "bot"`, `owner: null`). An org owner/admin mints it on *Settings → Agents* for
+  an agent identity. It sees every project in the organization. This is unchanged.
+- A **personal key** (`kind: "personal"`, `owner: {userId, name, email, role, canWrite}`). Any org member gets one
+  with `sentinel login`: the CLI prints a code, the member approves it in the browser at `<dashboard>/cli/approve`,
+  and the key arrives once. No admin is involved. A personal key **acts as that person and can never do more than they
+  can in the dashboard**, re-checked on every request:
+  - **Lists** (`issues`, `events`, `projects`, `claim-next` candidates, trace occurrences, relations) contain only the
+    person's projects and environment grants. Anything else is a `404`, the same as another organization's object.
+  - **Mutations** (status, claim/release, comments, questions, progress, severity, relations, uploads, batch ops)
+    need a role with write access: `owner`, `admin` or `engineer`. A `support` or `viewer` member's key is
+    read-only, and every mutation gets `403` *"…your organization role is read-only…"* (`owner.canWrite` is `false`).
+  - **Never available to a personal key** (`403`): `members` (list/invite/remove) and `repo-credentials`.
+  - It stops working (`401`) the moment the person leaves the organization. Removal also revokes it, so re-inviting
+    them later does not bring it back. A role or grant change applies to the next request.
+  - It expires after 90 days by default (`CLI_PERSONAL_KEY_TTL_DAYS`). `sentinel key rotate` rotates only that key:
+    the old key stops working **immediately** (no grace window), the new one keeps the **same expiry** (only a new
+    `sentinel login` renews it), and the CLI saves it into the profile instead of printing it. `sentinel logout` revokes it (`POST /api/agent/key/revoke`). A new `sentinel login` from the
+    same device replaces it. The person sees and revokes their keys under *Settings → CLI sessions*; org
+    owners/admins see everyone's under *Settings → Agents*.
+  - Claims, comments and progress made with it show as **"<name> (CLI)"**.
+
+The device flow itself is `POST /api/cli/device` → approve → poll `POST /api/cli/device/token` (RFC 8628). Those
+routes are for the CLI and are documented in `docs/plans/CLI_BROWSER_LOGIN.md`, not in the agent OpenAPI.
+
 ## 3. Work discovery: the events feed
 
 `GET /api/agent/events` is a **seq-cursored, org-scoped feed** over `issue_activity`, joined out to
@@ -628,9 +656,12 @@ A zero-dependency Go CLI wrapping `/api/agent/*`, built for scripting triage loo
 **Install** (the binary is named `sentinel`; the version is the deployed dashboard's release tag):
 ```bash
 curl -fsSL https://<your-sentinel-host>/install.sh | sh   # served by the dashboard, sha256-verified, no sudo
-sentinel login --url https://<your-sentinel-host>         # prompts for the agent key (hidden), verifies, saves config
+sentinel login --url https://<your-sentinel-host>         # prints a code, opens the browser; approve it -> a personal key (§2b)
 sentinel agent install                                    # installs the sentinel-agent skill for Claude Code / Codex / agy
 ```
+`sentinel login` needs no admin and works over SSH: open the printed URL on any device where you are signed in. For CI
+or an admin-issued org agent key, use `sentinel login --key-stdin`: it reads one line from stdin, or prompts with
+echo off on a terminal.
 Developers can instead `go install github.com/tuju-ai/sentinel/tools/sentinel@latest` (private repo — needs
 `GOPRIVATE=github.com/tuju-ai` and `git config --global url."git@github.com:".insteadOf "https://github.com/"`)
 or `cd tools/sentinel && go build -o sentinel .` from a checkout. `sentinel version` prints the version.
@@ -649,7 +680,8 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 | `SENTINEL_URL` set without `SENTINEL_AGENT_KEY` | ignored, with a warning naming the profile used |
 | otherwise | `current_profile`, else `default` |
 
-`sentinel whoami` / `sentinel config` show the profile and where url and key came from (never the key);
+`sentinel whoami` / `sentinel config` show the profile, where url and key came from (never the key) and whose key it is
+(`identity: personal key of <name> (<role>, read-write|read-only)` or `identity: org agent "<name>"`);
 `sentinel profile list|use|remove` manage profiles. The key is never logged.
 
 | Command | HTTP call |
@@ -673,7 +705,9 @@ profile `default`). Profile selection: `--profile P` (global flag) > `SENTINEL_P
 | `sentinel link <issueId> <targetIssueId> --type <linked_to\|caused_by\|duplicate_of>` | `POST /api/agent/issues/:id/relations` |
 | `sentinel unlink <issueId> <targetIssueId> --type <...>` | `DELETE /api/agent/issues/:id/relations` |
 | `sentinel projects` | `GET /api/agent/projects` |
-| `sentinel login [--profile P] [--url U] [--key-stdin] [--use] [--yes]` | verifies via `GET /api/agent/self`, then writes profile P to the config file (`0600`); never prints the key |
+| `sentinel login [--profile P] [--url U] [--device-name N] [--no-browser] [--use] [--yes]` | browser login (§2b): `POST /api/cli/device`, approve at `/cli/approve`, poll `POST /api/cli/device/token`; then verifies via `GET /api/agent/self` and writes profile P (`0600`); never prints the key |
+| `sentinel login --key-stdin [--profile P] [--url U] [--use] [--yes]` | paste an existing key (CI / org agent): verifies via `GET /api/agent/self`, then writes profile P |
+| `sentinel logout [--profile P]` | `POST /api/agent/key/revoke` (personal keys; an org agent key gets 403 and stays valid), then removes the profile |
 | `sentinel profile list` / `use <name>` / `remove <name>` | *(local)* manage profiles |
 | `sentinel config` | *(local)* profile in use + where url / key come from; the key itself is never shown |
 | `sentinel agent install [--claude] [--codex] [--agy] [--dry-run] [--force] [--uninstall]` | *(local)* installs the embedded sentinel-agent skill globally for each agent tool |
@@ -742,6 +776,8 @@ key row) server-side for every request, and `GET /api/agent/self` now echoes exa
   "agentId": "...",
   "name": "Triage Bot",
   "organizationId": "...",
+  "kind": "personal",
+  "owner": { "userId": "...", "name": "Ada", "email": "ada@example.com", "role": "engineer", "canWrite": true },
   "key": {
     "id": "...",
     "prefix": "sent_agent_",
@@ -751,6 +787,10 @@ key row) server-side for every request, and `GET /api/agent/self` now echoes exa
   }
 }
 ```
+
+`kind` is `ai`/`bot` for an org agent and `personal` for a `sentinel login` key. `owner` is `null` for an org
+agent. For a personal key it is the person the key acts for, with their role **as of this request** and whether that
+role may write (§2b).
 
 `key.createdAt` (N9) is the key's mint time, ISO-8601 or `null` for keys created before the column
 was populated. `key.expiresAt` is the enforced expiry (`null` = non-expiring); once it passes, the
@@ -881,6 +921,28 @@ curl -s -X POST "$SENTINEL_URL/api/agent/batch" -H "$AUTH" \
 Wire-visible changes to `/api/agent/*`, newest first. Only additions and behaviour changes a
 deployed agent can observe are listed here; see `docs/agents/openapi.agent.yaml` for the exact
 shapes.
+
+### Personal keys and browser login (sentinel-cli-browser-login)
+
+- **`GET /api/agent/self`** additively returns `kind` and `owner` (null for org agents). The schema stays strict.
+- **New `POST /api/agent/key/revoke`** revokes the calling personal key (`sentinel logout`). An org agent key gets
+  `403` and stays valid.
+- **`POST /api/agent/key/rotate` on a personal key** revokes the calling key at once (no
+  `AGENT_KEY_ROTATION_GRACE_HOURS` window, so `oldKey.expiresAt` is the revocation time) and the new key keeps the
+  old key's expiry. Org agent keys are unchanged.
+- **`GET /api/agent/events` for a personal key:** a `linked` event whose target issue the owner cannot see has
+  `newValue.targetIssueId: null` and `newValue.targetRedacted: true`, as the issue page redacts the relation.
+- **Personal keys** (`kind: "personal"`, minted by `sentinel login`) are scoped to their owner on every route (§2b):
+  filtered lists, `404` outside the owner's projects and environment grants, `403` on mutations for a read-only role,
+  and `403` on `members` and `repo-credentials`. **Org agent keys behave exactly as before.**
+- **New unauthenticated dashboard routes** for the CLI: `POST /api/cli/device` and `POST /api/cli/device/token`,
+  plus the `/cli/approve` page.
+- **CLI:** `sentinel login` without `--key-stdin` now runs the browser flow (including on a non-terminal). The paste
+  flow needs `--key-stdin`. New: `--device-name`, `--no-browser`, `sentinel logout`, and identity lines in
+  `whoami`/`config`.
+- **Admin routes:** rotating an agent key through `/api/organizations/{org}/keys/{id}/rotate` now needs owner/admin
+  (it used to accept `manage_keys`, so an engineer could take an org agent's new secret). A personal key is never
+  rotated there.
 
 ### `sentinel` CLI distribution (sentinel-cli-install)
 

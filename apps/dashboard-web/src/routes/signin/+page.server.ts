@@ -6,6 +6,16 @@ import { logAuditEvent } from '$lib/server/audit';
 import { signIn } from '$lib/server/auth-config';
 import type { RequestEvent } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
+import { safeCliApproveNext } from '$lib/server/cli-approve';
+import { clientIp } from '$lib/server/client-ip';
+
+// sentinel-cli-browser-login: `/signin?next=` exists ONLY so a signed-out visitor of /cli/approve comes back to it after
+// signing in. `safeCliApproveNext` accepts `/cli/approve[?code=XXXX-XXXX]` and nothing else; every other value -- and the
+// absence of one -- keeps the historical destination '/'. It is never an open redirect.
+async function redirectTarget(event: RequestEvent, form?: FormData): Promise<string> {
+	const raw = form ? form.get('next') : (await event.request.clone().formData().catch(() => null))?.get('next');
+	return safeCliApproveNext(raw) ?? '/';
+}
 
 const emailSchema = z.object({
 	email: z.string().email('Invalid email address'),
@@ -47,6 +57,7 @@ export const load: PageServerLoad = async ({ url }) => {
 		// Auth.js redirects here after it has accepted the address and dispatched the mail; see
 		// `pages.verifyRequest` in auth-config.ts.
 		linkSent: url.searchParams.get('sent') === '1',
+		next: safeCliApproveNext(url.searchParams.get('next')),
 	};
 };
 
@@ -55,11 +66,11 @@ export const actions: Actions = {
 	// SvelteKit action that was never defined, so it answered 404 and Google sign-in was as dead
 	// as the magic link.
 	google: async (event) => {
-		await signIn(authEventFor(event, { providerId: 'google', redirectTo: '/' }));
+		await signIn(authEventFor(event, { providerId: 'google', redirectTo: await redirectTarget(event) }));
 	},
 
 	github: async (event) => {
-		await signIn(authEventFor(event, { providerId: 'github', redirectTo: '/' }));
+		await signIn(authEventFor(event, { providerId: 'github', redirectTo: await redirectTarget(event) }));
 	},
 
 	magiclink: async (event) => {
@@ -76,7 +87,7 @@ export const actions: Actions = {
 			logAuditEvent({
 				type: 'magic_link_requested',
 				email,
-				ip: event.getClientAddress(),
+				ip: clientIp(event),
 				error: `Rate limit exceeded - retry after ${rateLimit.retryAfter}s`,
 			});
 			return fail(429, {
@@ -89,11 +100,11 @@ export const actions: Actions = {
 		logAuditEvent({
 			type: 'magic_link_requested',
 			email,
-			ip: event.getClientAddress(),
+			ip: clientIp(event),
 		});
 
 		try {
-			await signIn(authEventFor(event, { providerId: 'email', email, redirectTo: '/' }));
+			await signIn(authEventFor(event, { providerId: 'email', email, redirectTo: await redirectTarget(event, formData) }));
 		} catch (err) {
 			// A successful send EXITS THROUGH HERE: `signIn` reports success by throwing SvelteKit's
 			// redirect to `pages.verifyRequest`. Swallowing it — which the previous shape did — turns
@@ -104,7 +115,7 @@ export const actions: Actions = {
 			logAuditEvent({
 				type: 'magic_link_failed',
 				email,
-				ip: event.getClientAddress(),
+				ip: clientIp(event),
 				error: err instanceof Error ? err.message : 'Unknown error',
 			});
 			return fail(500, { error: 'Failed to send magic link', email });

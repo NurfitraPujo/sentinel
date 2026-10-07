@@ -749,6 +749,19 @@ func cmdWhoami(ctx context.Context, e *env, args []string) int {
 	}
 
 	fmt.Fprintln(e.stdout, "auth: ok")
+	// sentinel-cli-browser-login: say up front WHO this key acts as -- a person (personal key) or an org agent.
+	var self selfIdentity
+	if json.Unmarshal(res.Body, &self) == nil {
+		if self.Owner != nil {
+			access := "read-only"
+			if self.Owner.CanWrite {
+				access = "read-write"
+			}
+			fmt.Fprintf(e.stdout, "identity: personal key of %s (%s, %s)\n", self.Owner.display(), self.Owner.Role, access)
+		} else if self.Name != "" {
+			fmt.Fprintf(e.stdout, "identity: org agent %q (%s)\n", self.Name, firstNonEmpty(self.Kind, "agent"))
+		}
+	}
 	if err := output(e.stdout, e.format, res.Body, ""); err != nil {
 		fmt.Fprintln(e.stderr, "error rendering response:", err)
 		return ExitNetwork
@@ -771,7 +784,7 @@ func cmdKey(ctx context.Context, e *env, args []string) int {
 // (AGENT_KEY_ROTATION_GRACE_HOURS server-side). The new secret is printed to STDOUT exactly
 // once, with a loud warning to STDERR — same one-time-reveal contract as the dashboard's own key
 // creation UI. Reconfigure SENTINEL_AGENT_KEY (env, flag, or config file) with the new secret
-// before the old key's grace window elapses.
+// before the old key's grace window elapses. A personal profile's key is the exception: see below.
 func cmdKeyRotate(ctx context.Context, e *env, args []string) int {
 	fs := flag.NewFlagSet("key rotate", flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
@@ -804,9 +817,40 @@ func cmdKeyRotate(ctx context.Context, e *env, args []string) int {
 		return ExitNetwork
 	}
 
+	// sentinel-cli-browser-login: a PERSONAL key (from `sentinel login`) is revoked by the server the moment it is
+	// rotated -- there is no grace window -- so the profile it came from would hold a dead key. Write the new one into
+	// that profile instead of printing it; the secret never reaches the terminal.
+	if e.cfg.Profile != "" && e.cfg.KeySource == profileSource(e.cfg.Profile) && (e.cfg.Owner != "" || e.cfg.Kind == "personal") {
+		err := saveRotatedProfileKey(e.cfg.Profile, parsed.NewKey.Secret, parsed.NewKey.Prefix)
+		if err == nil {
+			fmt.Fprintf(e.stdout, "rotated: the new key %s is saved to profile %s; the old key is revoked (expiry unchanged — `sentinel login` renews)\n", parsed.NewKey.Prefix, e.cfg.Profile)
+			return ExitOK
+		}
+		// Falling through prints the secret: the old key is already dead, so losing the new one would lock the user out.
+		fmt.Fprintf(e.stderr, "error: could not save the new key to profile %s: %v\n", e.cfg.Profile, err)
+	}
+
 	fmt.Fprintln(e.stderr, "WARNING: this secret is shown ONCE and never again. Store it now (e.g. update SENTINEL_AGENT_KEY) before it scrolls off your terminal.")
 	fmt.Fprintln(e.stdout, parsed.NewKey.Secret)
 	return ExitOK
+}
+
+// saveRotatedProfileKey replaces one profile's key in the config file (0600, atomic), keeping everything else.
+func saveRotatedProfileKey(profile, secret, prefix string) error {
+	cf, err := loadConfigFile(func(string) {})
+	if err != nil {
+		return err
+	}
+	p, ok := cf.Profiles[profile]
+	if !ok {
+		return fmt.Errorf("profile %q no longer exists", profile)
+	}
+	p.Key = secret
+	if prefix != "" {
+		p.KeyPrefix = prefix
+	}
+	cf.Profiles[profile] = p
+	return saveConfigFile(cf)
 }
 
 // --- events --------------------------------------------------------------------------------------

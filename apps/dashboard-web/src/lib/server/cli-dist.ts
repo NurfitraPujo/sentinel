@@ -156,8 +156,10 @@ main() {
   "$INSTALL_DIR/sentinel" version
   say ""
   say "Next steps:"
-  say "  ${login}    # paste your agent key when prompted"
+  say "  ${login}    # approve the code in your browser; any org member can, no admin needed"
   say "  sentinel agent install    # give Claude Code / Codex / agy the sentinel-agent skill"
+  say ""
+  say "(CI or an org agent key from an admin: add --key-stdin and pipe the key instead.)"
 }
 
 main "$@"

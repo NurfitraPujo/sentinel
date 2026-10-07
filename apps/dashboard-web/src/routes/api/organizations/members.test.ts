@@ -31,6 +31,9 @@ function makeDbMock() {
 const dbMock = makeDbMock();
 
 vi.mock('$lib/server/db', () => ({ db: dbMock }));
+// sentinel-cli-browser-login: member removal also revokes the member's personal CLI keys (cli-personal-keys.ts).
+const revokePersonalKeysOfMember = vi.fn().mockResolvedValue([]);
+vi.mock('$lib/server/cli-personal-keys', () => ({ revokePersonalKeysOfMember }));
 vi.mock('$lib/db/schema', () => ({
   organizationMembers: { id: 'id', organizationId: 'organizationId', userId: 'userId', role: 'role' },
   users: { id: 'id', email: 'email', name: 'name' },
@@ -302,6 +305,12 @@ describe('Organization Member Management Routes', () => {
       const body = await res.json();
       expect(body).toEqual({ success: true, memberId: 'mem-target', userId: 'user-target' });
       expect(dbMock.delete).toHaveBeenCalled();
+      // sentinel-cli-browser-login: the member's personal CLI keys for this org are revoked in the same transaction.
+      expect(revokePersonalKeysOfMember).toHaveBeenCalledWith(expect.anything(), {
+        organizationId: 'org-1',
+        userId: 'user-target',
+        actorId: 'user-caller',
+      });
     });
 
     // R1 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): removing a member must also delete their

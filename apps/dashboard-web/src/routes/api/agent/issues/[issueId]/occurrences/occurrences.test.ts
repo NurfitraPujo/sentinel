@@ -10,7 +10,7 @@ vi.mock('$lib/db/queries/agent-reads', () => ({ listAgentOccurrences, getAgentOc
 const getSpansStatuses = vi.fn();
 vi.mock('$lib/server/queries/span-queries', () => ({ getSpansStatuses }));
 vi.mock('$lib/server/span-scope', () => ({
-	resolveAgentSpanScope: async (orgId: string) => ({ orgId, projects: [], environmentScopes: new Map() }),
+	resolveAgentSpanScope: async (ctx: { organizationId: string }) => ({ orgId: ctx.organizationId, projects: [], environmentScopes: new Map() }),
 }));
 const walkOccurrencesWithSpans = vi.fn();
 vi.mock('$lib/server/issue-spans', () => ({ walkOccurrencesWithSpans }));

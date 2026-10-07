@@ -84,7 +84,7 @@ function makeEvent(payload: unknown) {
 	} as any;
 }
 
-const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc' };
+const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc', agentKind: 'ai', owner: null };
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -204,7 +204,7 @@ describe('POST /api/agent/batch', () => {
 		const data = await res.json();
 		expect(data.completed).toBe(0);
 		expect(data.results[0]).toMatchObject({ ok: false, status: 404 });
-		expect(resolveAgentIssueScope).toHaveBeenCalledWith('other-org-issue', 'org-1');
+		expect(resolveAgentIssueScope).toHaveBeenCalledWith('other-org-issue', expect.objectContaining({ organizationId: 'org-1' }), 'write');
 	});
 
 	it('reports an unknown op as a per-op 400, not a request-level failure', async () => {

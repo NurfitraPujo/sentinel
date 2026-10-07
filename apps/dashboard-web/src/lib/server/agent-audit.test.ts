@@ -34,6 +34,8 @@ const ctx = {
 	keyPrefix: 'sent_agent_',
 	keyExpiresAt: null,
 	keyCreatedAt: null,
+	agentKind: 'ai',
+	owner: null,
 };
 
 describe('writeAgentAuditLog', () => {

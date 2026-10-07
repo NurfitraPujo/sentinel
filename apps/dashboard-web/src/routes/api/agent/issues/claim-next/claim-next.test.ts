@@ -33,7 +33,7 @@ vi.mock('$lib/server/notify', () => ({ sendIssueNotificationEmails }));
 
 const { POST } = await import('./+server');
 
-const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc' };
+const CTX = { agentId: 'agent-1', organizationId: 'org-1', agentName: 'bot', keyPrefixForAudit: 'abc', agentKind: 'ai', owner: null };
 
 function makeEvent(body?: unknown, raw?: string) {
 	const url = new URL('http://localhost/api/agent/issues/claim-next');
@@ -88,6 +88,7 @@ describe('POST /api/agent/issues/claim-next -- body validation', () => {
 		expect(res.status).toBe(200);
 		expect(claimNextAgentIssue).toHaveBeenCalledWith({
 			organizationId: 'org-1',
+			visibility: null,
 			agentId: 'agent-1',
 			type: undefined,
 			projectId: undefined,
@@ -110,6 +111,7 @@ describe('POST /api/agent/issues/claim-next -- body validation', () => {
 		);
 		expect(claimNextAgentIssue).toHaveBeenCalledWith({
 			organizationId: 'org-1',
+			visibility: null,
 			agentId: 'agent-1',
 			type: 'user_report',
 			projectId: 'p-1',

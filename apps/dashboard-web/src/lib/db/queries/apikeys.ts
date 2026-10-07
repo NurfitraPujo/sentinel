@@ -82,6 +82,17 @@ export async function getAgentApiKeys(agentId: string) {
 		.where(eq(projectApiKeys.agentId, agentId));
 }
 
+/**
+ * The one spelling of a key secret: `<prefix>` + 32 random bytes as hex, and its sha256 hex -- the ONLY form stored
+ * (`project_api_keys.key_hash`, matched by agent-auth.ts and the ingestor's apikey.go). Shared by `createApiKey` and the
+ * CLI device flow's personal-key mint (cli-personal-keys.ts), which has to insert inside its own transaction.
+ */
+export function generateApiKeySecret(prefix: string): { secretToken: string; keyHash: string } {
+	const secretToken = `${prefix}${crypto.randomBytes(32).toString('hex')}`;
+	const keyHash = crypto.createHash('sha256').update(secretToken).digest('hex');
+	return { secretToken, keyHash };
+}
+
 export async function createApiKey(
 	userId: string,
 	data: {
@@ -103,11 +114,9 @@ export async function createApiKey(
 		expiresInDays?: number | null;
 	}
 ) {
-	const rawBytes = crypto.randomBytes(32).toString('hex');
 	const isAgentKey = data.scope === 'agent';
 	const prefix = isAgentKey ? 'sent_agent_' : data.projectId ? 'sent_live_' : 'sent_org_';
-	const secretToken = `${prefix}${rawBytes}`;
-	const keyHash = crypto.createHash('sha256').update(secretToken).digest('hex');
+	const { secretToken, keyHash } = generateApiKeySecret(prefix);
 
 	const expiresAt =
 		typeof data.expiresInDays === 'number' && data.expiresInDays > 0

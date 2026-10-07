@@ -151,6 +151,14 @@ config:
   dashboard:
     authUrl: "https://sentinel.staging.tuju.ai"
     cliProfile: "staging"
+    # Client IP behind AWS ALB -> Emissary/Envoy -> dashboard. The ALB appends the client's address to
+    # X-Forwarded-For; Envoy (default use_remote_address, xff_num_trusted_hops 0) then appends ITS peer, the ALB.
+    # So the header ends "<client>, <alb>" and the client is the 2nd entry from the right: xffDepth 2. Depth counts
+    # from the right, so a client-forged X-Forwarded-For prefix is never picked. Re-verify after any proxy change
+    # (log getClientAddress() for a known IP); a too-large depth falls back to the TCP peer, not an error.
+    clientIp:
+      addressHeader: "x-forwarded-for"
+      xffDepth: "2"
     authTrustHost: "true"
     # Kept on daya.ai for now (verified SES identity); rebrand at cutover.
     emailFrom: "noreply@daya.ai"

@@ -166,6 +166,41 @@ current picture of module boundaries.
 
 ## Resolved
 
+### `sentinel-cli-browser-login` — `sentinel login` device flow and personal agent keys (VERIFIED locally 2026-10-07, branch `NurfitraPujo/cbl-sentinel`, not yet merged)
+
+Proven end to end against the **built** dashboard on a disposable, freshly migrated Postgres 16 with the real CLI
+binary. The transcript is in `docs/plans/CLI_BROWSER_LOGIN.md` ("End-to-end walkthrough"). Approval was driven
+with a dashboard session cookie against the page's own form action, not a browser. Observed:
+
+- device start → approve → single delivery
+- a cross-site approve is refused, and a re-approve is refused
+- a personal key sees only its owner's projects (another project's issue returns 404)
+- a read-only role gets 403 on writes
+- `members` and `repo-credentials` return 403
+- after removal from the org, the very next request gets 401 and the key row is `revoked`
+- `sentinel logout` revokes server-side
+- audit rows are written
+- no key or session token appears in the server log
+
+| Gate | Command | Result |
+|---|---|---|
+| Dashboard | `pnpm check` / `pnpm build` | 2241 files, 0 errors, 0 warnings / pass |
+| Dashboard tests (fresh migrated DB, `DATABASE_URL` set) | `pnpm test` | 3201 passed, 8 failed. **The same 8 fail on `main` (`ed1786f`) on the same machine**: stale assertions in `retention.{affected,buckets,next-catchup}`, the `environments` projects shape, and one `notifications.flow` file that dials `::1:5432`. |
+| CBL integration | `personal-keys.integration.test.ts`, `cli-device.integration.test.ts` | 145 passed |
+| CLI | `cd tools/sentinel && GOWORK=off go vet ./... && go test ./...` | pass |
+| Migrations | `MIGRATIONS_TEST_DB_URL=... go test ./...` in `packages/db-migrations` | pass; replayed on a second goose ledger: no-op |
+| Helm | `helm lint` + `kube-linter` on every values file | clean |
+
+Two run-order flakes surfaced on fresh databases. Both are **pre-existing on `main`**, and both are fixed
+in the test code, not the product:
+
+- `triage.integration.test.ts`'s plan assertion inherited whatever statistics the last `ANALYZE` left on the
+  shared `error_occurrences` table. Analyzed while near-empty, the planner picks `idx_occurrences_issue_release`.
+  The test now builds its own statistics inside a rolled-back transaction.
+- `reports.detail` seeded occurrences at a hard-coded `2026-09-04`. The concurrent 30-day retention sweep began
+  deleting them once that date aged out. The seed date is now relative to the run.
+
+
 ### `sentinel-sentry-compat-ingest` — Sentry-compatible envelope/store routes, Sentry key auth, bounded decoder, Sentry → v2 mapper, Dart grouping, relay trust, Sentry project id (VERIFIED locally 2026-09-29, branch `NurfitraPujo/sentinel-sentry-compat-ingest-implementing.sentinel`)
 
 What runs, and what proved it (`GOFLAGS=-p=3`, `GOMEMLIMIT=3GiB`, `prlimit --as=10GiB` on every `go test`, one heavy command at a time):

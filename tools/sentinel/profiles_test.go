@@ -169,7 +169,7 @@ func TestLogin_ReplacingProfileURLNeedsConsent(t *testing.T) {
 	// TTY: answer "n" declines, "y" accepts.
 	io_, _, errb = testLoginIO(srv.URL+"\n"+testKey+"\nn\n", true)
 	writeRaw(t, twoProfiles)
-	if rc := cmdLogin(context.Background(), []string{"--profile", "staging"}, cfgFlags{}, io_); rc != ExitUsage || !strings.Contains(errb.String(), "Replace") {
+	if rc := cmdLogin(context.Background(), []string{"--profile", "staging", "--key-stdin"}, cfgFlags{}, io_); rc != ExitUsage || !strings.Contains(errb.String(), "Replace") {
 		t.Fatalf("decline: rc=%d %s", rc, errb)
 	}
 }

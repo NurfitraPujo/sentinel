@@ -34,6 +34,8 @@ describe('GET /api/agent/self', () => {
 			keyPrefix: 'sent_agent_',
 			keyCreatedAt: createdAt,
 			keyExpiresAt: expiresAt,
+			agentKind: 'ai',
+			owner: null,
 		});
 
 		const res = await GET(makeEvent());
@@ -44,6 +46,8 @@ describe('GET /api/agent/self', () => {
 			agentId: 'agent-1',
 			name: 'Triage Bot',
 			organizationId: 'org-1',
+			kind: 'ai',
+			owner: null,
 			key: {
 				id: 'key-1',
 				prefix: 'sent_agent_',
