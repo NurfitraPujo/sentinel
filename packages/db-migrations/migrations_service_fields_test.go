@@ -58,6 +58,13 @@ func TestServiceFieldsMigrationAndBackfill(t *testing.T) {
 	check("logger-bare", want{ns("api"), ns("logger"), false})
 	check("blank-service", want{ns(""), ns("job"), false})
 	check("untagged", want{ns(""), ns(""), false})
+	// Regression: tags without a usable `source` made the request_scoped expression NULL (SQLSTATE 23502).
+	check("no-source-service-only", want{ns("api"), ns(""), false})
+	check("empty-source", want{ns("api"), ns(""), false})
+	check("blank-source", want{ns(""), ns(""), false})
+	check("empty-tags", want{ns(""), ns(""), false})
+	check("other-tags-only", want{ns(""), ns(""), false})
+	check("no-source-next-to-logger", want{ns("api"), ns(""), false})
 
 	var n int
 	if err := db.QueryRow(`SELECT count(*) FROM error_occurrences WHERE service = 'batch' AND tag_source = 'worker_handler'`).Scan(&n); err != nil || n != 5000 {
@@ -101,6 +108,14 @@ func seedServiceFieldRows(t *testing.T, db *sql.DB) {
 	must(ins, issueID, "logger-bare", `{"service":"api","source":"logger"}`, nil, nil, nil)
 	must(ins, issueID, "blank-service", `{"service":"   ","source":"job"}`, nil, nil, nil)
 	must(ins, issueID, "untagged", nil, nil, nil, "sentry-compat")
+	must(ins, issueID, "no-source-service-only", `{"service":"api"}`, nil, nil, nil)
+	must(ins, issueID, "empty-source", `{"service":"api","source":""}`, nil, nil, nil)
+	must(ins, issueID, "blank-source", `{"source":"  "}`, nil, nil, nil)
+	must(ins, issueID, "empty-tags", `{}`, nil, nil, nil)
+	must(ins, issueID, "other-tags-only", `{"release":"1.0"}`, "GET /x", `{"url":"https://h/x"}`, nil)
+	// A logger row with request context sits in the same table (and, ids being random uuids, the same batches) as the
+	// no-source rows above, and a transaction/url on a no-source row must not make it request-scoped.
+	must(ins, issueID, "no-source-next-to-logger", `{"service":"api"}`, "GET /y", `{"url":"https://h/y"}`, nil)
 	must(`INSERT INTO error_occurrences (id, issue_id, environment, platform, metadata, tags)
 	      SELECT gen_random_uuid(), $1, 'production', 'go', '{}'::jsonb, '{"service":"batch","source":"worker_handler"}'::jsonb FROM generate_series(1, 5000)`, issueID)
 }

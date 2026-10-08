@@ -8,6 +8,8 @@
 --   tag_source      = tags.source, the same way
 --   request_scoped  = tag_source IN ('http_handler','http_panic')
 --                     OR (tag_source = 'logger' AND transaction set AND request.url set)
+--                     and false (never NULL) when tag_source is absent: the column is NOT NULL, and NULL IN (...)
+--                     OR (NULL = 'logger' AND ...) is NULL, so the expression is wrapped in COALESCE(..., false)
 --
 -- Batches of 5,000 rows, keyset-paginated on the primary key, each batch committed on its own, so no lock outlives one
 -- batch and none is held across the whole table. (A DO block may COMMIT only when it is not inside a transaction block,
@@ -41,28 +43,28 @@ BEGIN
         UPDATE error_occurrences o
            SET service = NULLIF(left(btrim(o.tags->>'service'), 64), ''),
                tag_source = NULLIF(left(btrim(o.tags->>'source'), 64), ''),
-               request_scoped = (
+               request_scoped = COALESCE((
                    NULLIF(left(btrim(o.tags->>'source'), 64), '') IN ('http_handler', 'http_panic')
                    OR (
                        NULLIF(left(btrim(o.tags->>'source'), 64), '') = 'logger'
                        AND COALESCE(o.transaction, '') <> ''
                        AND COALESCE(o.request->>'url', '') <> ''
                    )
-               )
+               ), false)
          WHERE o.tags IS NOT NULL
            AND (last_id IS NULL OR o.id > last_id)
            AND o.id <= next_id
            AND (o.service, o.tag_source, o.request_scoped) IS DISTINCT FROM (
                    NULLIF(left(btrim(o.tags->>'service'), 64), ''),
                    NULLIF(left(btrim(o.tags->>'source'), 64), ''),
-                   (
+                   COALESCE((
                        NULLIF(left(btrim(o.tags->>'source'), 64), '') IN ('http_handler', 'http_panic')
                        OR (
                            NULLIF(left(btrim(o.tags->>'source'), 64), '') = 'logger'
                            AND COALESCE(o.transaction, '') <> ''
                            AND COALESCE(o.request->>'url', '') <> ''
                        )
-                   )
+                   ), false)
                );
 
         COMMIT;
