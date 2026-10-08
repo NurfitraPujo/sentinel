@@ -16,12 +16,22 @@
 -- which is why this file is NO TRANSACTION.) lock_timeout = '5s': a batch that cannot get its row locks fails fast and
 -- the next sync re-runs the file.
 --
+-- statement_timeout = 0 for the length of the file. The production role's default is 5 minutes (v0.2.67 failed on it
+-- with SQLSTATE 57014, "canceling statement due to statement timeout"), and the whole DO block is ONE statement: its
+-- internal COMMITs end transactions, not the statement, so they do not reset the clock. The per-batch COMMIT and
+-- lock_timeout bound how long LOCKS are held, not how long the statement runs, so lifting statement_timeout does not
+-- loosen that guarantee. RESET at the end restores the role default for the session.
+--
 -- Idempotent: a re-run recomputes the same values from the same tags, so a repeated batch writes what is already there.
 -- The IS DISTINCT FROM guard skips rows already correct, so a re-run writes nothing.
 
 -- +goose Up
 -- +goose StatementBegin
 SET lock_timeout = '5s';
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+SET statement_timeout = 0;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
@@ -76,6 +86,10 @@ $backfill$;
 
 -- +goose StatementBegin
 RESET lock_timeout;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+RESET statement_timeout;
 -- +goose StatementEnd
 
 -- +goose Down

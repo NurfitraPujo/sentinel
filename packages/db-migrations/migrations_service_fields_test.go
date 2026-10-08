@@ -6,6 +6,8 @@ package dbmigrations
 
 import (
 	"database/sql"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -118,4 +120,47 @@ func seedServiceFieldRows(t *testing.T, db *sql.DB) {
 	must(ins, issueID, "no-source-next-to-logger", `{"service":"api"}`, "GET /y", `{"url":"https://h/y"}`, nil)
 	must(`INSERT INTO error_occurrences (id, issue_id, environment, platform, metadata, tags)
 	      SELECT gen_random_uuid(), $1, 'production', 'go', '{}'::jsonb, '{"service":"batch","source":"worker_handler"}'::jsonb FROM generate_series(1, 5000)`, issueID)
+}
+
+// The role's statement_timeout (5 minutes in production) applies to the backfill's single DO statement; its internal
+// COMMITs do not reset it. The file must lift it before the DO block and restore it after.
+func TestServiceFieldsBackfillLiftsStatementTimeout(t *testing.T) {
+	b, err := os.ReadFile("migrations/1726000100_backfill_error_occurrences_service_fields.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(b)
+	lift := strings.Index(sqlText, "SET statement_timeout = 0;")
+	do := strings.Index(sqlText, "DO $backfill$")
+	reset := strings.Index(sqlText, "RESET statement_timeout;")
+	if lift < 0 || do < 0 || reset < 0 || !(lift < do && do < reset) {
+		t.Fatalf("want SET statement_timeout = 0 (%d) < DO block (%d) < RESET statement_timeout (%d)", lift, do, reset)
+	}
+}
+
+// Runs the backfill under a database whose statement_timeout is far shorter than the backfill takes, as the production
+// role's 5 minutes is shorter than production's. Without `SET statement_timeout = 0` it fails with SQLSTATE 57014.
+func TestServiceFieldsBackfillSurvivesShortStatementTimeout(t *testing.T) {
+	db, cleanup := freshMigrationDatabase(t, "svcfieldsto")
+	defer cleanup()
+	migrateTo(t, db, serviceFieldsVersion-1)
+	seedServiceFieldRows(t, db)
+	migrateTo(t, db, serviceFieldsVersion)
+
+	var dbName string
+	if err := db.QueryRow(`SELECT current_database()`).Scan(&dbName); err != nil {
+		t.Fatal(err)
+	}
+	// New sessions pick this up; the pool is closed and reopened by forcing fresh connections below.
+	if _, err := db.Exec(`ALTER DATABASE ` + dbName + ` SET statement_timeout = '30ms'`); err != nil {
+		t.Fatalf("alter database: %v", err)
+	}
+	db.SetMaxIdleConns(0) // close pooled sessions so the migration runs on new ones carrying the 30ms default
+	db.SetMaxIdleConns(2) // then allow reuse, as in production, so session-level SETs reach the DO block
+	migrateTo(t, db, serviceFieldsBackfillVersion)
+
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM error_occurrences WHERE service = 'batch' AND tag_source = 'worker_handler'`).Scan(&n); err != nil || n != 5000 {
+		t.Fatalf("batch rows backfilled = %d (%v), want 5000", n, err)
+	}
 }
