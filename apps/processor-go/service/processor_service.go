@@ -670,6 +670,14 @@ func fillOccurrenceV2(ctx context.Context, occ *store.ErrorOccurrence, evt *even
 	occ.Transaction = evt.Transaction
 	occ.Dist = evt.Dist
 	occ.Source = evt.Source
+	// D18: service / tag_source / request_scoped from tags. occ.Source above is the wire capture origin and is
+	// NOT touched by this derivation.
+	requestURL := ""
+	if evt.Request != nil {
+		requestURL = evt.Request.URL
+	}
+	origin := event.DeriveOrigin(evt.Tags, evt.Transaction, requestURL)
+	occ.Service, occ.TagSource, occ.RequestScoped = origin.Service, origin.TagSource, origin.RequestScoped
 	if evt.TraceID != "" {
 		flags := int64(evt.TraceFlags)
 		occ.TraceFlags = &flags

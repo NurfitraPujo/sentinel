@@ -1657,6 +1657,32 @@ Run against a throwaway `postgres:16` (never the shared dev DB).
 | Order of checks, window arithmetic, window 0, error path, config parsing | `go test ./tests/unit/ -run 'SpanPullIssueWindow\|SpanPullConfig_IssueWindow'` | pass; red with the throttle removed |
 | Processor -> one pull per issue per window; 24 concurrent callers on two pools -> exactly 1 queued | `go test ./tests/integration/ -run SpanPull_IssueWindow` (TestMain pointed at the disposable DB) | pass 20/20; red with the throttle removed (5 occurrences -> 5 pulls, 24 -> 24) and with a non-atomic SELECT-then-upsert (24 -> 6) |
 
+## sentinel-reporting-and-dashboard (sentinel half: be + fe) — VERIFIED 2026-10-08 (branch `NurfitraPujo/sentinel-reporting-and-dashboard-implementing.sentinel`, pre-merge)
+
+What ran, with the command that proved it. Everything below was run against a disposable `postgres:15-alpine` and a local
+`datafuselabs/databend:v1.2.881` (the production version) — **not** against staging or production.
+
+| Claim | Proof |
+|---|---|
+| D18 migrations add `service`/`tag_source`/`request_scoped` (never `source`) and the batched backfill converges, is replay-safe and writes only those three columns | `packages/db-migrations`: `MIGRATIONS_TEST_DB_URL=… MIGRATIONS_TEST_REQUIRED=1 go test ./...` (`migrations_service_fields_test.go`, 5,003 tagged rows = two batches) |
+| `StoreEvent`'s insert is valid against the migrated schema (32 parameters) | `PREPARE` of the exact statement in `psql` against the migrated database |
+| D18 derivation, one test per rule row; D19 group order | `go test ./apps/processor-go/event/` (`origin_test.go`) |
+| D8a counters and D21 label bounds, through the OTel registry | `go test ./apps/processor-go/procmetrics/` |
+| `sli_hourly` upsert of all three kinds, 30-day backfill, 3-hour re-upsert, absent series writes no row, VM failure writes nothing | `pnpm vitest run src/lib/server/sli` with `DATABASE_URL` set (real Postgres, stub VictoriaMetrics); passes in any order under `--sequence.shuffle` |
+| Every D10 metric, D11 access (inaccessible project and restricted environment contribute 0), D5 deletes, D20 export bounds | `DATABEND_TEST_URL=http://127.0.0.1:18000 pnpm vitest run src/lib/server/analytics` (real Databend) |
+| `/` 308 rule, `/issues` `service` filter and facet, nav from the path, per-section "unavailable", empty state | `pnpm vitest run src/routes src/lib/components/dashboard` |
+| Gates | `pnpm build` (pass), `pnpm check` (2307 files, 0 errors, 0 warnings), `pnpm test --sequence.shuffle` (279 files, 3578 passed, 9 skipped) |
+
+**Not verified, and why it matters:**
+- The Databend integration tests **self-skip unless `DATABEND_TEST_URL` answers** (`DATABEND_INTEGRATION_REQUIRED=1` makes that a
+  failure). CI has no Databend service container today, so CI skips them until one is added; the SQL in `lib/server/analytics/metrics.ts`
+  is otherwise proved only by a developer running the line above.
+- Table shapes in `analytics/test-support.ts` are what cdc-pipeline is *expected* to land (uuid → VARCHAR, timestamptz → TIMESTAMP,
+  jsonb → VARIANT, plus `deleted_at`). The queries read `new_value['status']::String` and `event_user['id']::String`, which assume
+  jsonb lands as VARIANT. **Check on staging after TASK-04's initial load.**
+- No §12 measurement was taken (they need `kubectl exec` into the production dashboard pod), nor the spot checks against production.
+- `tests/integration` and `tests/e2e` need the compose stack or testcontainers and were not run here.
+
 ## Known-broken, STILL OPEN
 
 Each entry below was independently re-read against current code this pass (not assumed unchanged from

@@ -9,8 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
@@ -133,6 +135,8 @@ type IssueStore interface {
 
 type pgStore struct {
 	db *pgxpool.Pool
+	// projectNames caches projects.name for the D8a label (D21), keyed by project id.
+	projectNames sync.Map
 }
 
 // NewStore returns a concrete implementation of IssueStore using PostgreSQL.
@@ -216,15 +220,21 @@ type ErrorOccurrence struct {
 	Transaction string
 	Dist        string
 	Source      string
-	TraceFlags  *int64
-	ReceivedAt  *time.Time
-	SDK         json.RawMessage
-	User        json.RawMessage
-	Tags        json.RawMessage
-	Contexts    json.RawMessage
-	Request     json.RawMessage
-	Breadcrumbs json.RawMessage
-	Exception   json.RawMessage
+	// sentinel-reporting-and-dashboard D18: where the error came from, promoted out of tags. Service and
+	// TagSource are written through NULLIF(...,'') so "" is SQL NULL. TagSource is tags.source — NOT Source above,
+	// which is the wire's capture origin and keeps its meaning.
+	Service       string
+	TagSource     string
+	RequestScoped bool
+	TraceFlags    *int64
+	ReceivedAt    *time.Time
+	SDK           json.RawMessage
+	User          json.RawMessage
+	Tags          json.RawMessage
+	Contexts      json.RawMessage
+	Request       json.RawMessage
+	Breadcrumbs   json.RawMessage
+	Exception     json.RawMessage
 	// ReleaseInserted is WRITTEN BACK by StoreEvent, never read by it — the same idiom as IssueID
 	// above. It is true exactly when this delivery committed and step 4c's `releases` upsert INSERTed
 	// the (project_id, ReleaseVersion) row (RETURNING xmax = 0): a first sighting of that version by
@@ -1079,10 +1089,12 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		INSERT INTO error_occurrences (id, issue_id, environment, platform, release_version,
 			stacktrace, metadata, trace_id, span_id, created_at, event_id, project_id,
 			level, message, error_class, logger, server_name, transaction, dist, source,
-			trace_flags, received_at, sdk, event_user, tags, contexts, request, breadcrumbs, exception)
+			trace_flags, received_at, sdk, event_user, tags, contexts, request, breadcrumbs, exception,
+			service, tag_source, request_scoped)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''), $12,
 			$13, NULLIF($14,''), $15, NULLIF($16,''), NULLIF($17,''), NULLIF($18,''), NULLIF($19,''), NULLIF($20,''),
-			$21, $22, $23, $24, $25, $26, $27, $28, $29)
+			$21, $22, $23, $24, $25, $26, $27, $28, $29,
+			NULLIF($30,''), NULLIF($31,''), $32)
 		ON CONFLICT (project_id, event_id) WHERE project_id IS NOT NULL AND event_id IS NOT NULL DO NOTHING
 	`
 	tag, err := tx.Exec(ctx, occQuery,
@@ -1115,6 +1127,9 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 		nullableJSON(occ.Request),
 		nullableJSON(occ.Breadcrumbs),
 		nullableJSON(occ.Exception),
+		occ.Service,
+		occ.TagSource,
+		occ.RequestScoped,
 	)
 	if err != nil {
 		// The rollout-window tolerance (sentinel-occurrence-dedup-project decision 12, OQ-3 (a)):
@@ -1308,18 +1323,62 @@ func (s *pgStore) StoreEvent(ctx context.Context, issue *Issue, occ *ErrorOccurr
 	// wrote; the DO UPDATE arm reports what RETURNING status said. The step-1 snapshot's "no row
 	// yet" is deliberately not consulted: under a first-insert race two deliveries can both read
 	// that, but only the one whose upsert INSERTed (xmax = 0) is New.
+	outcome := IssueOutcomeExisting
 	switch {
 	case isRegressed:
-		return IssueOutcomeRegressed, true, nil
+		outcome = IssueOutcomeRegressed
 	case snoozeEnds:
-		return IssueOutcomeUnsnoozed, true, nil
+		outcome = IssueOutcomeUnsnoozed
 	case wasFreshInsert:
-		return IssueOutcomeNew, true, nil
+		outcome = IssueOutcomeNew
 	case postWriteStatus == "ignored":
-		return IssueOutcomeIgnored, true, nil
-	default:
-		return IssueOutcomeExisting, true, nil
+		outcome = IssueOutcomeIgnored
 	}
+	// D8a, after the commit like the counters above: only STORED occurrences count. Never fails or delays ingest.
+	s.recordStored(ctx, issue, occ, outcome, !unregisteredEnvironment)
+	return outcome, true, nil
+}
+
+// projectNameTTL bounds how stale a renamed project's label can be.
+const projectNameTTL = 5 * time.Minute
+
+type cachedProjectName struct {
+	name    string
+	fetched time.Time
+}
+
+// recordStored feeds the D8a counters. The project name comes from Postgres (D21), read at most once per
+// projectNameTTL per project; a failed read records the project as "unknown" rather than failing the event.
+func (s *pgStore) recordStored(ctx context.Context, issue *Issue, occ *ErrorOccurrence, outcome IssueOutcome, envDeclared bool) {
+	origin := event.Origin{Service: occ.Service, TagSource: occ.TagSource, RequestScoped: occ.RequestScoped}
+	procmetrics.RecordStored(ctx, procmetrics.StoredEvent{
+		ProjectName:    s.projectName(ctx, issue.ProjectID),
+		Environment:    occ.Environment,
+		EnvDeclared:    envDeclared,
+		Service:        occ.Service,
+		Group:          origin.Group(),
+		Level:          occ.Level,
+		IssueNew:       outcome == IssueOutcomeNew,
+		IssueRegressed: outcome == IssueOutcomeRegressed,
+	})
+}
+
+func (s *pgStore) projectName(ctx context.Context, projectID string) string {
+	if v, ok := s.projectNames.Load(projectID); ok {
+		if c := v.(cachedProjectName); time.Since(c.fetched) < projectNameTTL {
+			return c.name
+		}
+	}
+	var name string
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := s.db.QueryRow(qctx, `SELECT name FROM projects WHERE id = $1`, projectID).Scan(&name); err != nil {
+		slog.WarnContext(ctx, "project name lookup for the D8a counters failed; labelling the project unknown",
+			slog.String("project_id", projectID), slog.String("error", err.Error()))
+		return ""
+	}
+	s.projectNames.Store(projectID, cachedProjectName{name: name, fetched: time.Now()})
+	return name
 }
 
 func (s *pgStore) InsertOccurrence(ctx context.Context, occ *ErrorOccurrence) error {

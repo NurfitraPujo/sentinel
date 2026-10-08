@@ -60,7 +60,13 @@ const openRetentionRunClient = vi.fn((_onclose: () => void) => runClient);
 const mockedDb = {};
 vi.mock('$lib/server/db', () => ({ db: mockedDb, openRetentionRunClient }));
 const recordRetentionRun = vi.fn();
-vi.mock('$lib/server/metrics', () => ({ recordRetentionRun }));
+const recordDatabendRetentionRun = vi.fn();
+vi.mock('$lib/server/metrics', () => ({ recordRetentionRun, recordDatabendRetentionRun }));
+// sentinel-reporting-and-dashboard D5: the Databend half. The deletes themselves are proved against a real Databend in
+// analytics/retention.test.ts; what is proved HERE is that the route runs them, records them, and never lets them change
+// the Postgres run's own outcome.
+const purgeDatabend = vi.fn();
+vi.mock('$lib/server/analytics/retention', () => ({ purgeDatabend }));
 const organizations = await import('$lib/db/queries/organizations');
 const attachmentReaper = await import('$lib/server/attachment-reaper');
 const { RetentionDeadlineError, RetentionConnectionLost } = await import('$lib/server/retention-run');
@@ -378,5 +384,51 @@ describe('POST /api/cron/retention — span partition upkeep is independent (sen
 		const response = await POST(cronRequest('s3cret'));
 		expect(response.status).toBe(200);
 		expect((await response.json()).result.spanMaintenance.failed).toBe(true);
+	});
+});
+
+
+describe('POST /api/cron/retention — the Databend 13-month deletes (sentinel-reporting-and-dashboard D5)', () => {
+	const call = async () => {
+		const res = await POST(cronRequest('s3cret'));
+		return { res, body: await res.json() };
+	};
+
+	it('without DATABEND_URL the run is exactly today\'s: no purge, counted as unconfigured', async () => {
+		const { res, body } = await call();
+		expect(res.status).toBe(200);
+		expect(purgeDatabend).not.toHaveBeenCalled();
+		expect(recordDatabendRetentionRun).toHaveBeenCalledWith('unconfigured');
+		expect(body.result.databendRetention).toBe('unconfigured');
+	});
+
+	it('with DATABEND_URL it purges and counts the outcome', async () => {
+		dynamicEnv.DATABEND_URL = 'http://databend:8000';
+		purgeDatabend.mockResolvedValue({ outcome: 'completed', cutoff: new Date('2025-09-07T00:00:00Z') });
+		const { res, body } = await call();
+		expect(res.status).toBe(200);
+		expect(purgeDatabend).toHaveBeenCalledTimes(1);
+		expect(recordDatabendRetentionRun).toHaveBeenCalledWith('completed');
+		expect(body.result.databendRetention).toBe('completed');
+	});
+
+	it('a Databend failure is logged and counted, and changes neither the status nor the Postgres outcome', async () => {
+		dynamicEnv.DATABEND_URL = 'http://databend:8000';
+		purgeDatabend.mockResolvedValue({ outcome: 'failed', error: 'down', cutoff: new Date('2025-09-07T00:00:00Z') });
+		const { res, body } = await call();
+		expect(res.status).toBe(200);
+		expect(body.success).toBe(true);
+		expect(recordDatabendRetentionRun).toHaveBeenCalledWith('failed');
+		expect(logError).toHaveBeenCalledWith('retention_cron.databend_failed', expect.objectContaining({ error: 'down' }));
+		expect(recordRetentionRun).toHaveBeenCalledWith('completed'); // the Postgres sweep still completed
+	});
+
+	it('the Postgres steps all ran before the purge, so a Databend problem can never starve them', async () => {
+		dynamicEnv.DATABEND_URL = 'http://databend:8000';
+		const order: string[] = [];
+		retention.cleanupRetainedData.mockImplementation(async (...a: number[]) => { order.push('cleanup'); return { occurrenceStopped: 'drained', occurrenceBacklogSeconds: 0, deletedOccurrences: 0, deletedAffectedUsers: 0, deletedAffectedTenants: 0, deletedOccurrenceBuckets: 0, deletedOrphanedIssues: 0, tombstonesWritten: 0, deletedTombstones: 0, retentionDays: a[0], manualRetentionDays: a[1], tombstoneRetentionDays: a[2], cutoffDate: new Date() }; });
+		purgeDatabend.mockImplementation(async () => { order.push('purge'); return { outcome: 'completed', cutoff: new Date() }; });
+		await call();
+		expect(order).toEqual(['cleanup', 'purge']);
 	});
 });

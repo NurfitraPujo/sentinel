@@ -51,6 +51,12 @@ var (
 	// {empty, too_long, control_char}) — never the identifier itself.
 	affectedRollupSkipped metric.Int64Counter
 
+	// sentinel-reporting-and-dashboard D8a: the live per-project counters, recorded after commit by StoreEvent.
+	eventsStored         metric.Int64Counter
+	issuesCreated        metric.Int64Counter
+	issuesRegressed      metric.Int64Counter
+	serviceLabelOverflow metric.Int64Counter
+
 	// sentinel-releases-snooze §12: the one instrument that feature adds to the processor. UNLABELLED,
 	// like the four environment instruments — and unlike them it has a twin of the same name in the
 	// dashboard's registry (metrics.ts), which is why a label would be wrong rather than merely
@@ -155,6 +161,31 @@ func init() {
 	if err != nil {
 		slog.Error("procmetrics: failed to create affected rollup skipped counter", slog.String("error", err.Error()))
 		affectedRollupSkipped = nil
+	}
+
+	eventsStored, err = meter.Int64Counter(obs.MetricEventsStored,
+		metric.WithDescription("Occurrences stored, by project, environment, service, D19 group and level (D8a)"))
+	if err != nil {
+		slog.Error("procmetrics: failed to create events stored counter", slog.String("error", err.Error()))
+		eventsStored = nil
+	}
+	issuesCreated, err = meter.Int64Counter(obs.MetricIssuesCreated,
+		metric.WithDescription("Issues created, by project and environment (D8a)"))
+	if err != nil {
+		slog.Error("procmetrics: failed to create issues created counter", slog.String("error", err.Error()))
+		issuesCreated = nil
+	}
+	issuesRegressed, err = meter.Int64Counter(obs.MetricIssuesRegressed,
+		metric.WithDescription("Issues regressed, by project and environment (D8a)"))
+	if err != nil {
+		slog.Error("procmetrics: failed to create issues regressed counter", slog.String("error", err.Error()))
+		issuesRegressed = nil
+	}
+	serviceLabelOverflow, err = meter.Int64Counter(obs.MetricServiceLabelOverflow,
+		metric.WithDescription("Occurrences whose service exceeded the per-project label limit and were recorded as other (D21)"))
+	if err != nil {
+		slog.Error("procmetrics: failed to create service label overflow counter", slog.String("error", err.Error()))
+		serviceLabelOverflow = nil
 	}
 
 	releaseNextRewriteFailed, err = meter.Int64Counter(
@@ -399,5 +430,52 @@ func SetSourcemapCacheBytes(n int64) {
 func RecordSourcemapCacheEvent(kind string) {
 	if sourcemapCacheEvents != nil {
 		sourcemapCacheEvents.Add(context.Background(), 1, metric.WithAttributes(attribute.String(obs.LabelKind, kind)))
+	}
+}
+
+// StoredEvent is what StoreEvent hands the D8a counters after a commit. ProjectName is the raw Postgres project
+// name (slugified here, D21); the identifiers and message of the event are never part of it.
+type StoredEvent struct {
+	ProjectName string
+	Environment string
+	// EnvDeclared is true when the environment has a project_environments row (D21: else "other").
+	EnvDeclared bool
+	Service     string
+	Group       string
+	Level       string
+	// IssueNew / IssueRegressed are the post-write issue outcome of the same delivery.
+	IssueNew       bool
+	IssueRegressed bool
+}
+
+var serviceBounder = NewServiceBounder()
+
+// RecordStored increments the D8a counters for one committed occurrence. Every label passes through the D21 bounds.
+// It never returns an error and never blocks ingest: a nil instrument (failed registration) is a no-op.
+func RecordStored(ctx context.Context, e StoredEvent) {
+	project := Slug(e.ProjectName)
+	env := Environment(e.Environment, e.EnvDeclared)
+	svc, overflowed := serviceBounder.Bound(project, e.Service)
+	if overflowed && serviceLabelOverflow != nil {
+		serviceLabelOverflow.Add(ctx, 1, metric.WithAttributes(attribute.String(obs.LabelProject, project)))
+	}
+	if eventsStored != nil {
+		eventsStored.Add(ctx, 1, metric.WithAttributes(
+			attribute.String(obs.LabelProject, project),
+			attribute.String(obs.LabelEnvironment, env),
+			attribute.String(obs.LabelService, svc),
+			attribute.String(obs.LabelGroup, e.Group),
+			attribute.String(obs.LabelLevel, Level(e.Level)),
+		))
+	}
+	issueAttrs := metric.WithAttributes(
+		attribute.String(obs.LabelProject, project),
+		attribute.String(obs.LabelEnvironment, env),
+	)
+	if e.IssueNew && issuesCreated != nil {
+		issuesCreated.Add(ctx, 1, issueAttrs)
+	}
+	if e.IssueRegressed && issuesRegressed != nil {
+		issuesRegressed.Add(ctx, 1, issueAttrs)
 	}
 }

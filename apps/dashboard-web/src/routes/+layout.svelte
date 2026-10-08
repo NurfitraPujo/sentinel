@@ -4,9 +4,15 @@
 	import NotificationBell from '$lib/components/notifications/NotificationBell.svelte';
 	import OrganizationSwitcher from '$lib/components/orgs/OrganizationSwitcher.svelte';
 	import { onNavigate } from '$app/navigation';
-	import { updated } from '$app/state';
+	import { page, updated } from '$app/state';
 
 	let { data, children } = $props();
+
+	// sentinel-reporting-and-dashboard D12: the active nav item comes from the path, not a hard-coded class. "Dashboard"
+	// is `/` exactly; "Issues" is `/issues` and everything under it (the issue detail, /issues/{id}).
+	let path = $derived(page.url.pathname);
+	let dashboardActive = $derived(path === '/');
+	let issuesActive = $derived(path === '/issues' || path.startsWith('/issues/'));
 
 	onNavigate(async (navigation) => {
 		if (!navigation.to) return;
@@ -38,8 +44,8 @@
 				{/if}
 			</div>
 			<nav class="nav-menu">
-				<a href="/" class="nav-link active">Dashboard</a>
-				<a href="/issues" class="nav-link">Issues</a>
+				<a href="/" class="nav-link" class:active={dashboardActive} aria-current={dashboardActive ? 'page' : undefined}>Dashboard</a>
+				<a href="/issues" class="nav-link" class:active={issuesActive} aria-current={issuesActive ? 'page' : undefined}>Issues</a>
 				<!-- /search had exactly one inbound link in the entire app: its own "Clear" button.
 				     The page works and is substantial (trace/span/request/tenant/user filters), it
 				     just could not be found from anywhere. -->

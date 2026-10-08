@@ -58,6 +58,9 @@ externalSecrets:
     S3_SECRET_KEY: "/tuju/production/sentinel/shared/S3_SECRET_KEY"
     GITHUB_CLIENT_ID: "/tuju/production/sentinel/shared/GITHUB_CLIENT_ID"
     GITHUB_CLIENT_SECRET: "/tuju/production/sentinel/shared/GITHUB_CLIENT_SECRET"
+    # D4 / D20 (TASK-03 creates both SSM parameters before the PodMonitor's insights entry or the Databend sections work).
+    DATABEND_PASSWORD: "/tuju/production/sentinel/shared/DATABEND_PASSWORD"
+    METRICS_SCRAPE_TOKEN: "/tuju/production/sentinel/shared/METRICS_SCRAPE_TOKEN"
 
 # -----------------------------------------------------------------------------
 # First-party images (ECR, tuju prod account 576329195570, ap-southeast-1).
@@ -269,6 +272,49 @@ retentionCron:
 
 oncallCron:
   enabled: true
+
+# sentinel-reporting-and-dashboard D6/D7/D8: SLI collection from VictoriaMetrics, the SLI set, Databend analytics and
+# the PodMonitors. serviceSlis is the starting set from the contract (operator, 2026-10-07).
+sliCollectCron:
+  enabled: true
+
+podMonitor:
+  enabled: true
+
+analytics:
+  victoriaMetricsUrl: "http://monitoring.internal.tuju.ai:8428"
+  sliCluster: "tuju-production"
+  databend:
+    url: "http://databend-query.databend.svc.cluster.local:8000"
+    user: sentinel_app
+    database: sentinel
+
+serviceSlis:
+  - id: core-api
+    kind: http
+    project: core
+    source: api_core_80
+    availabilityTarget: 0.995
+    latency: { le: "1000.0", target: 0.94 }
+    service: api
+    windowDays: 28
+  - id: web
+    kind: http
+    project: web
+    source: web_web_80
+    availabilityTarget: 0.995
+    latency: { le: "1000.0", target: 0.95 }
+    windowDays: 28
+  - id: core-jobs
+    kind: jobs
+    project: core
+    source: daya_core_job_handler_runs_total
+    windowDays: 28
+  - id: core-nats
+    kind: nats
+    project: core
+    source: daya_core_nats_handler_runs_total
+    windowDays: 28
 
 prometheusRule:
   enabled: false

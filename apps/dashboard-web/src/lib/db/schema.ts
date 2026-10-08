@@ -504,6 +504,14 @@ export const errorOccurrences = pgTable('error_occurrences', {
 	// backfill; the BEFORE INSERT trigger sets TRUE on every row inserted since, whatever the insert names.
 	// No dashboard code reads or writes it (the agent API projects occurrence columns explicitly).
 	tagRollupApplied: boolean('tag_rollup_applied'),
+	// sentinel-reporting-and-dashboard D18 (1726000000_add_error_occurrences_service_fields.sql): where the error came from,
+	// promoted out of `tags` by the processor at store time. `tagSource` is tags.source (core's capture site) and is NOT the
+	// `source` column above, which is the wire's capture origin (window.onerror, sentry-compat) and keeps its meaning.
+	// Nothing in the dashboard writes them; the list reads the `service` facet from issue_tag_values, and Databend reads
+	// them through CDC.
+	service: text('service'),
+	tagSource: text('tag_source'),
+	requestScoped: boolean('request_scoped').notNull().default(false),
 }, (table) => ({
 	idxOccurrencesIssueRelease: index('idx_occurrences_issue_release').on(table.issueId, table.releaseVersion),
 	// 1725200000: partial unique index on (project_id, event_id), built CONCURRENTLY by the migration.
@@ -1120,3 +1128,17 @@ export const spanPullRequests = pgTable('span_pull_requests', {
 	requestedByKind: text('requested_by_kind').notNull(),
 	requestedAt: timestamp('requested_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+// sentinel-reporting-and-dashboard D6 (1726100000_add_sli_hourly.sql): the hourly denominators of the SLIs, written by
+// POST /api/cron/sli-collect and replicated to Databend through CDC (D2). One row per (sli, environment, hour); `fast` is
+// NULL for kinds with no latency objective.
+export const sliHourly = pgTable('sli_hourly', {
+	sliId: text('sli_id').notNull(),
+	environment: text('environment').notNull(),
+	hourStart: timestamp('hour_start', { withTimezone: true }).notNull(),
+	total: bigint('total', { mode: 'number' }).notNull(),
+	errors: bigint('errors', { mode: 'number' }).notNull(),
+	fast: bigint('fast', { mode: 'number' }),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.sliId, table.environment, table.hourStart] }),
+}));

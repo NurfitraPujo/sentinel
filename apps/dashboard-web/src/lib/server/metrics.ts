@@ -140,6 +140,14 @@ export const RETENTION_RUN_OUTCOME = {
 	Failed: 'failed',
 } as const;
 
+/**
+ * sentinel-reporting-and-dashboard D5: the outcome of the Databend half of a retention run. Closed set, same rule as
+ * above. `unconfigured` is the dashboard running without DATABEND_* (a CCE deployment); `failed` never changes the
+ * Postgres run's own outcome.
+ */
+export const DATABEND_RETENTION_OUTCOME = { Completed: 'completed', Failed: 'failed', Unconfigured: 'unconfigured' } as const;
+export type DatabendRetentionOutcomeLabel = (typeof DATABEND_RETENTION_OUTCOME)[keyof typeof DATABEND_RETENTION_OUTCOME];
+
 export type RetentionRunOutcomeLabel = (typeof RETENTION_RUN_OUTCOME)[keyof typeof RETENTION_RUN_OUTCOME];
 
 /** The one label this metric carries. Named once, so a typo cannot invent a second dimension. */
@@ -162,6 +170,7 @@ interface MetricsState {
 	releaseNextRewriteFailures: Counter<string> | null;
 	sourcemapUploads: Counter<typeof LABEL_OUTCOME> | null;
 	retentionRuns: Counter<typeof LABEL_OUTCOME> | null;
+	databendRetentionRuns: Counter<typeof LABEL_OUTCOME> | null;
 }
 
 const GLOBAL_KEY = Symbol.for('sentinel.dashboard.metrics');
@@ -301,6 +310,21 @@ function createState(): MetricsState {
 		retentionRuns = null;
 	}
 
+	let databendRetentionRuns: Counter<typeof LABEL_OUTCOME> | null = null;
+	try {
+		databendRetentionRuns = new Counter({
+			name: 'sentinel_databend_retention_runs_total',
+			help: 'Databend 13-month retention deletes (sentinel-reporting-and-dashboard D5) by outcome: completed, failed, unconfigured.',
+			labelNames: [LABEL_OUTCOME],
+			registers: [registry],
+		});
+		for (const outcome of Object.values(DATABEND_RETENTION_OUTCOME)) {
+			databendRetentionRuns.labels({ [LABEL_OUTCOME]: outcome }).inc(0);
+		}
+	} catch {
+		databendRetentionRuns = null;
+	}
+
 	return {
 		registry,
 		reportsReceived,
@@ -311,6 +335,7 @@ function createState(): MetricsState {
 		releaseNextRewriteFailures,
 		sourcemapUploads,
 		retentionRuns,
+		databendRetentionRuns,
 	};
 }
 
@@ -416,6 +441,10 @@ const KNOWN_RETENTION_RUN_OUTCOMES = new Set<string>(Object.values(RETENTION_RUN
 export function recordRetentionRun(outcome: RetentionRunOutcomeLabel): void {
 	if (!KNOWN_RETENTION_RUN_OUTCOMES.has(outcome)) return;
 	state().retentionRuns?.labels({ [LABEL_OUTCOME]: outcome }).inc();
+}
+
+export function recordDatabendRetentionRun(outcome: DatabendRetentionOutcomeLabel): void {
+	state().databendRetentionRuns?.labels({ [LABEL_OUTCOME]: outcome }).inc();
 }
 
 /** Renders the Prometheus text exposition format, with the content type a scraper expects. */

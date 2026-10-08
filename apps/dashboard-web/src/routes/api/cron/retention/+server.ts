@@ -26,7 +26,9 @@ import {
 	RETENTION_RUN_MIN_STATEMENT_MS,
 	retentionRunOutcome,
 } from '$lib/server/retention-batch';
-import { recordRetentionRun } from '$lib/server/metrics';
+import { recordRetentionRun, recordDatabendRetentionRun } from '$lib/server/metrics';
+import { createRun, databendConfigFromEnv } from '$lib/server/analytics/databend';
+import { purgeDatabend } from '$lib/server/analytics/retention';
 
 const CRON_SECRET_HEADER = 'x-cron-secret';
 
@@ -137,6 +139,19 @@ export const POST: RequestHandler = async ({ request }) => {
 		// sentinel-cli-browser-login: and `sentinel login` device authorizations a day past expiry.
 		const reapedCliDeviceAuthorizations = await reapExpiredCliDeviceAuthorizations(run.db);
 
+		// sentinel-reporting-and-dashboard D5: the Databend 13-month deletes, isolated from everything above. purgeDatabend
+		// never throws, and its outcome is logged and counted but never changes this run's own outcome or status.
+		const databendCfg = databendConfigFromEnv();
+		let databendRetention: { outcome: string; error?: string } = { outcome: 'unconfigured' };
+		if (databendCfg) {
+			const purged = await purgeDatabend(createRun(databendCfg));
+			databendRetention = { outcome: purged.outcome, error: purged.error };
+			recordDatabendRetentionRun(purged.outcome);
+			if (purged.outcome === 'failed') log.error('retention_cron.databend_failed', { error: purged.error, cutoff: purged.cutoff.toISOString() });
+		} else {
+			recordDatabendRetentionRun('unconfigured');
+		}
+
 		// A run that finished but stopped deleting occurrences early is `behind`, not `completed`.
 		const outcome = retentionRunOutcome(result);
 		recordRetentionRun(outcome);
@@ -149,6 +164,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			reapedIdempotencyKeys,
 			reapedReportIdempotencyKeys,
 			reapedCliDeviceAuthorizations,
+			databendRetention: databendRetention.outcome,
 			spanMaintenance,
 			deletedOccurrences: result.deletedOccurrences,
 			// sentinel-affected-users §4.5 (flow R3): side rows deleted, NOT issues touched.
@@ -185,6 +201,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				reapedIdempotencyKeys,
 				reapedReportIdempotencyKeys,
 				spanMaintenance,
+				databendRetention: databendRetention.outcome,
 				deletedOccurrences: result.deletedOccurrences,
 				deletedAffectedUsers: result.deletedAffectedUsers,
 				deletedAffectedTenants: result.deletedAffectedTenants,

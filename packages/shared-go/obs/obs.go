@@ -97,6 +97,19 @@ const (
 	// correctly installed feature with nothing to do looks like.
 	MetricAlertConfigsEnvironmentScoped = "sentinel_alert_configs_environment_scoped"
 
+	// sentinel-reporting-and-dashboard D8a/D21: the processor's live per-project counters, incremented
+	// AFTER commit. Unlike the instruments above they carry a project NAME label, which is why they live
+	// on the processor's :8081/metrics (reachable only inside the cluster), never on the ingestor's public
+	// :8080. Every label is bounded by procmetrics.Bounder (D21): project is the slugified name, environment
+	// a declared project_environments name or "other", service at most ServiceLabelLimit distinct per
+	// project (the rest "other"), level a closed set, group the D19 set.
+	MetricEventsStored    = "sentinel_events_stored_total"
+	MetricIssuesCreated   = "sentinel_issues_created_total"
+	MetricIssuesRegressed = "sentinel_issues_regressed_total"
+	// MetricServiceLabelOverflow counts occurrences whose service did not fit the per-project label limit and
+	// was recorded as "other" (D21). The dashboard's D20 export reuses the name for its own bound.
+	MetricServiceLabelOverflow = "sentinel_insight_service_label_overflow_total"
+
 	// MetricAffectedRollupSkipped counts user/tenant identifiers that the processor read out of event
 	// metadata but did NOT write to issue_affected_users / issue_affected_tenants because the value
 	// was unusable (sentinel-affected-users §4.3 decision 5: empty, longer than 255 bytes, or carrying
@@ -179,6 +192,12 @@ const (
 	// LabelKind names WHICH identifier MetricAffectedRollupSkipped skipped: AffectedKindUser or
 	// AffectedKindTenant. Nothing else records it.
 	LabelKind = "kind"
+	// D8a label keys.
+	LabelProject     = "project"
+	LabelEnvironment = "environment"
+	LabelService     = "service"
+	LabelGroup       = "group"
+	LabelLevel       = "level"
 	// LabelTo and LabelChanged are MetricSymbolicationInAppRederived's two labels and nothing
 	// else's: the re-derived in_app a rewritten frame was set TO (or `kept`), and whether that
 	// differs from the value the SDK sent (raw.in_app).

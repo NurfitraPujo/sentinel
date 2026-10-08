@@ -133,7 +133,7 @@ dashboard_issue_cards() {
   local sess; sess=$(awk '$6 ~ /session-token/ { print $7 }' "$jar" | tail -n1)
   if [ -z "$sess" ]; then echo "sign-in failed ($loc)"; return 0; fi
   while :; do
-    n=$(curl -sS -b "authjs.session-token=$sess" "$DASHBOARD_URL/?project=$SEED_PROJECT_ID&status=all&page=$page" | grep -o 'href="/issues/[0-9a-f-]*"' | sort -u | wc -l | tr -d ' ')
+    n=$(curl -sS -b "authjs.session-token=$sess" "$DASHBOARD_URL/issues?project=$SEED_PROJECT_ID&status=all&page=$page" | grep -o 'href="/issues/[0-9a-f-]*"' | sort -u | wc -l | tr -d ' ')
     [ "$n" -gt 0 ] || break
     total=$((total + n)); page=$((page + 1))
     [ "$page" -le 50 ] || break

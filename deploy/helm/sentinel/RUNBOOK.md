@@ -628,6 +628,22 @@ retention is in doubt: `sentinel_retention_runs_total` on each dashboard replica
 kubectl -n sentinel-<env> get jobs -l app.kubernetes.io/component=retention-cron   # no Failed
 ```
 
+### 2.x Reporting dashboard (sentinel-reporting-and-dashboard)
+
+Order, per environment:
+
+1. **SSM**: `DATABEND_PASSWORD` and `METRICS_SCRAPE_TOKEN` at `/tuju/{env}/sentinel/shared/` (infra TASK-03 creates them with the
+   `sentinel_app` login). Without `METRICS_SCRAPE_TOKEN` the PodMonitor's `insights` entry is not rendered (the chart checks the secret
+   pool), and `/api/metrics/insights` answers `503`.
+2. **Migrations** `1726000000` (columns) → `1726000100` (batched backfill of the last ≤ 30 days, 5,000 rows a batch, `lock_timeout` 5 s)
+   → `1726100000` (`sli_hourly`). Replay-safe. The backfill is the measurement in contract §12: run production in an operator window.
+3. **CDC**: once `1726100000` has run, append `sli_hourly` to the pipeline with a **full-config** `PUT` (contract D27). Discovery stays off.
+4. **Chart**: `sliCollectCron` (hourly at :05), `podMonitor`, `serviceSlis`, `analytics.*`. The first `sli-collect` run backfills 30 days
+   per SLI; `core-nats` has no rows until core ships `daya_core_nats_handler_runs_total`.
+
+With no `DATABEND_*` env the dashboard still runs: every analytics section says "unavailable", `/issues` is untouched, and the retention
+cron skips the Databend deletes (`sentinel_databend_retention_runs_total{outcome="unconfigured"}`).
+
 ## 3. Rollback
 
 ```bash

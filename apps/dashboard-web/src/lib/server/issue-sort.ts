@@ -173,6 +173,16 @@ export function coerceIssueRelease(value: string | null | undefined): string {
 }
 
 /**
+ * sentinel-reporting-and-dashboard D19: `service=<name>`, issues with at least one occurrence from that service. A
+ * non-empty string of at most 64 characters (the stored `service` cap), trimmed, or `all`. It is matched against the
+ * `issue_tag_values` rollup as a bound parameter, never interpolated.
+ */
+export function coerceIssueService(value: string | null | undefined): string {
+	const v = (value ?? '').trim();
+	return v && v !== 'all' && v.length <= 64 ? v : 'all';
+}
+
+/**
  * Repeatable `tag=<key>:<value>`: parsed with `parseTagParam`, de-duplicated, first
  * `MAX_TAG_FILTERS` kept, malformed ignored. `param` is `formatTagParam` — what `href()` re-emits.
  */

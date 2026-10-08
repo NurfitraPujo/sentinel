@@ -143,6 +143,36 @@ spec:
             {{- end }}
             - name: SPAN_PULL_ON_DEMAND_LIMIT
               value: {{ .Values.spans.pull.onDemandLimitPerHour | quote }}
+            # sentinel-reporting-and-dashboard: D6 SLI collection, D4 Databend analytics, D20 insights export. Every one
+            # is optional: unset means the dashboard runs without it and the affected sections say "unavailable".
+            {{- if .Values.serviceSlis }}
+            - name: SERVICE_SLI_CONFIG
+              value: {{ .Values.serviceSlis | toJson | quote }}
+            {{- end }}
+            {{- if .Values.analytics.victoriaMetricsUrl }}
+            - name: VICTORIAMETRICS_URL
+              value: {{ .Values.analytics.victoriaMetricsUrl | quote }}
+            {{- end }}
+            {{- if .Values.analytics.sliCluster }}
+            - name: SLI_CLUSTER
+              value: {{ .Values.analytics.sliCluster | quote }}
+            {{- end }}
+            {{- if .Values.analytics.databend.url }}
+            - name: DATABEND_URL
+              value: {{ .Values.analytics.databend.url | quote }}
+            - name: DATABEND_USER
+              value: {{ .Values.analytics.databend.user | quote }}
+            - name: DATABEND_DATABASE
+              value: {{ .Values.analytics.databend.database | quote }}
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "DATABEND_PASSWORD") }}
+            - name: DATABEND_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: DATABEND_PASSWORD } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "METRICS_SCRAPE_TOKEN") }}
+            - name: METRICS_SCRAPE_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: METRICS_SCRAPE_TOKEN } }
+            {{- end }}
           livenessProbe:
             httpGet: { path: {{ .Values.dashboard.livenessPath }}, port: http }
             initialDelaySeconds: 15

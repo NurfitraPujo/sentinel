@@ -112,6 +112,7 @@
 
 	import IssueRelations from '$lib/components/issues/IssueRelations.svelte';
 	import IssueTagFacets from '$lib/components/issues/IssueTagFacets.svelte';
+	import type { TagFacetBlock } from '$lib/tag-facets';
 	import IssueActivity from '$lib/components/issues/IssueActivity.svelte';
 	import TrendBarChart from '$lib/components/issues/TrendBarChart.svelte';
 	import { filterKnownRelationTypes } from '$lib/types/relation-type';
@@ -397,6 +398,11 @@
 		}
 		return parts.length === 0 ? 'indefinitely' : parts.join(' or ');
 	});
+
+	// D19: the services of this issue's occurrences, from the `service` tag-facet block (most frequent first).
+	let serviceNames = $derived(
+		(((data.tagFacets ?? []) as TagFacetBlock[]).find((b) => b.key === 'service')?.values ?? []).map((v) => v.value)
+	);
 </script>
 
 <!-- Decision 16's zero shape, the same as the list card's: the dash replaces the number only. -->
@@ -404,7 +410,7 @@
 
 <div class="issue-detail">
 	<header class="detail-nav">
-		<a href="/" class="back-link">&larr; Back to Issues</a>
+		<a href="/issues" class="back-link">&larr; Back to Issues</a>
 	</header>
 
 	<div class="issue-header">
@@ -539,6 +545,14 @@
 				shouting on every environment's first day.
 			-->
 			<span class="meta-item"><strong class="meta-label">Environment:</strong> {data.environmentDisplayName ?? data.issue.environment}</span>
+			<!--
+				sentinel-reporting-and-dashboard D19, flow R5: the service name(s) of this issue's occurrences, read off the
+				tag-facet block the page already has (the rollup's `service` key; the block's top values), so the
+				loader gains no query. Absent when no occurrence carries a service.
+			-->
+			{#if serviceNames.length > 0}
+				<span class="meta-item" data-testid="issue-services"><strong class="meta-label">{serviceNames.length === 1 ? 'Service' : 'Services'}:</strong> {serviceNames.join(', ')}</span>
+			{/if}
 			<span class="meta-item"><strong class="meta-label">First seen:</strong> {formatDate(data.issue.firstSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Last seen:</strong> {formatDate(data.issue.lastSeen)}</span>
 			<span class="meta-item"><strong class="meta-label">Occurrences:</strong> {Number(data.issue.count).toLocaleString()}</span>

@@ -1,0 +1,70 @@
+{{- if .Values.sliCollectCron.enabled }}
+{{- $secret := include "sentinel.secretName" . -}}
+# sentinel-reporting-and-dashboard D6: schedules POST /api/cron/sli-collect, which copies the hourly SLI denominators from
+# VictoriaMetrics into sli_hourly. Same shape as the retention CronJob; the Job reads the same CRON_SECRET.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "sentinel.fullname" . }}-sli-collect
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sli-collect-cron
+spec:
+  schedule: {{ .Values.sliCollectCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.sliCollectCron.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.sliCollectCron.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.sliCollectCron.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.sliCollectCron.backoffLimit }}
+      # A day: long enough to read a failure the next morning, short enough that a stale Failed Job does not keep
+      # a KubeJobFailed alert firing (the retention CronJob's BUG-89 note).
+      ttlSecondsAfterFinished: {{ .Values.sliCollectCron.ttlSecondsAfterFinished | default 86400 }}
+      activeDeadlineSeconds: {{ .Values.sliCollectCron.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sentinel.labels" . | nindent 12 }}
+            app.kubernetes.io/component: sli-collect-cron
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.affinity }}
+          affinity: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: sli-collect-cron
+              image: "{{ .Values.sliCollectCron.image.repository }}:{{ .Values.sliCollectCron.image.tag }}"
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              env:
+                - name: CRON_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: CRON_SECRET
+              command: ["/bin/sh", "-c"]
+              args:
+                # -sS quiet-but-loud-on-error, -f so a non-2xx fails the Job (backoffLimit retries),
+                # --max-time bounds a hung dashboard. The in-cluster Service DNS name never leaves the
+                # cluster, so the secret header is not exposed on any external hop.
+                - >-
+                  curl -sS -f --max-time {{ .Values.sliCollectCron.timeoutSeconds }}
+                  -X POST
+                  -H "x-cron-secret: ${CRON_SECRET}"
+                  {{ include "sentinel.fullname" . }}-dashboard:{{ .Values.dashboard.service.port }}/api/cron/sli-collect
+              resources:
+                {{- toYaml .Values.sliCollectCron.resources | nindent 16 }}
+{{- end }}

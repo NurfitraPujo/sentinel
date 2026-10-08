@@ -11,6 +11,7 @@ export const EMPTY_FACETS = {
 	age: { all: 0, new24h: 0 },
 	environment: { all: 0, byEnvironment: {} as Record<string, number> },
 	project: { all: 0, byProject: {} as Record<string, number> },
+	service: { byService: {} as Record<string, number> },
 	claim: {
 		total: 0,
 		unclaimed: 0,
@@ -29,6 +30,7 @@ export const FILTER_DEFAULTS = {
 	q: '',
 	volume: 'all',
 	release: 'all',
+	service: 'all',
 	type: 'all',
 	source: 'all',
 	regressed: false,

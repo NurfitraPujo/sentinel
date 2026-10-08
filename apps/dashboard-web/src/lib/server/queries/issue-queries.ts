@@ -1,5 +1,5 @@
 import { db } from "$lib/server/db";
-import { issues, errorOccurrences, projects, issueOccurrenceBuckets, users, organizationMembers, agents } from "$lib/db/schema";
+import { issues, errorOccurrences, projects, issueOccurrenceBuckets, issueTagValues, users, organizationMembers, agents } from "$lib/db/schema";
 import { eq, ne, gte, lte, desc, asc, sql, and, inArray, isNull, isNotNull, type SQL } from "drizzle-orm";
 import { environmentScopeCondition } from "$lib/server/environment-access";
 import { coerceIssueSort, firstSeenLowerBound, HIGH_VOLUME_THRESHOLD } from "$lib/server/issue-sort";
@@ -77,6 +77,12 @@ export interface IssueFilters {
      * `release` and `tags` reuse `tagCondition` — the one definition `/search` uses.
      */
     release?: string;
+    /**
+     * sentinel-reporting-and-dashboard D19 — `service=<name>`: issues with at least one occurrence from that service.
+     * Raw string tags already land in `issue_tag_values` (the rollup's `issue_tag_pairs` takes every tag whose key
+     * matches `^[a-zA-Z0-9_.:-]{1,32}$`), so `service` needs no derived key and rides the same `tagCondition`.
+     */
+    service?: string;
     issueType?: string;
     source?: string;
     regressed?: boolean;
@@ -101,7 +107,7 @@ export interface IssueFilters {
  * Deliberately a closed list of filter names: the two GUARDS (`projectIds`, `environmentScopes`) are
  * not on it, so no caller can express "drop the guard".
  */
-export type IssueFilterName = "status" | "new" | "environment" | "project" | "claim";
+export type IssueFilterName = "status" | "new" | "environment" | "project" | "claim" | "service";
 
 /**
  * fix-sentinel-issues-dashboard §4.1 — every sidebar count, over ALL issues the caller may see
@@ -115,6 +121,8 @@ export interface IssueFacets {
     /** Keyed by project id. */
     project: { all: number; byProject: Record<string, number> };
     claim: ClaimantFacetCounts;
+    /** D19: issues per service value under every other active filter; the facet drops its own filter. */
+    service: { byService: Record<string, number> };
 }
 
 export interface ClaimantFacetCounts {
@@ -225,6 +233,9 @@ function buildIssueConditions(filters: IssueFilters, omit: ReadonlySet<IssueFilt
 
     if (filters.release && filters.release !== "all") {
         conditions.push(tagCondition({ key: "release", value: filters.release }));
+    }
+    if (!omit.has("service") && filters.service && filters.service !== "all") {
+        conditions.push(tagCondition({ key: "service", value: filters.service }));
     }
     if (filters.issueType && filters.issueType !== "all") {
         conditions.push(eq(issues.issueType, filters.issueType));
@@ -611,7 +622,7 @@ export const issueQueries = {
         const newBound = firstSeenLowerBound("24h", now)!;
         const environmentSelected = Boolean(filters.projectId && filters.projectId !== "all");
 
-        const [statusRows, [ageRow], environmentRows, projectRows, claim] = await Promise.all([
+        const [statusRows, [ageRow], environmentRows, projectRows, claim, serviceRows] = await Promise.all([
             db.select({ status: issues.status, count }).from(issues).where(where("status")).groupBy(issues.status),
             db
                 .select({
@@ -634,6 +645,17 @@ export const issueQueries = {
                 .where(where("project", "environment"))
                 .groupBy(issues.projectId),
             issueQueries.getClaimantFacetCounts(filters, currentUserId),
+            // D19: one row per (issue, service) in the rollup, so count(*) is distinct issues per service. Joined to
+            // `issues` so every guard and filter (project, environment scope, status ...) applies; value <> ''
+            // excludes the rollup's overflow sentinel row.
+            db
+                .select({ value: issueTagValues.value, count })
+                .from(issueTagValues)
+                .innerJoin(issues, eq(issueTagValues.issueId, issues.id))
+                .where(and(eq(issueTagValues.key, "service"), sql`${issueTagValues.value} <> ''`, where("service")))
+                .groupBy(issueTagValues.value)
+                .orderBy(desc(count), asc(issueTagValues.value))
+                .limit(50),
         ]);
 
         const status = { all: 0, unresolved: 0, resolved: 0, ignored: 0 };
@@ -665,7 +687,28 @@ export const issueQueries = {
             environment: { all: environmentAll, byEnvironment },
             project: { all: projectAll, byProject },
             claim,
+            service: { byService: Object.fromEntries(serviceRows.map((r) => [r.value, n(r.count)])) },
         };
+    },
+
+    /**
+     * D19: the service name(s) of each issue's occurrences, for the list rows. ONE query keyed on the ids `listIssues`
+     * returned under the guards (it takes ids, never a project or user, so it cannot widen the set), like
+     * `trendForIssues`. At most `perIssue` names each, most frequent first. `[]` ids issues no query.
+     */
+    async servicesForIssues(ids: string[], perIssue = 5): Promise<Map<string, string[]>> {
+        const out = new Map<string, string[]>(ids.map((id) => [id, []]));
+        if (ids.length === 0) return out;
+        const rows = await db
+            .select({ issueId: issueTagValues.issueId, value: issueTagValues.value })
+            .from(issueTagValues)
+            .where(and(inArray(issueTagValues.issueId, ids), eq(issueTagValues.key, "service"), sql`${issueTagValues.value} <> ''`))
+            .orderBy(desc(issueTagValues.count), asc(issueTagValues.value));
+        for (const r of rows) {
+            const list = out.get(r.issueId);
+            if (list && list.length < perIssue) list.push(r.value);
+        }
+        return out;
     },
 
     /**

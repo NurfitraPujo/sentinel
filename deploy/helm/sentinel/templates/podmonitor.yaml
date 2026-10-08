@@ -1,0 +1,77 @@
+{{- if .Values.podMonitor.enabled }}
+# sentinel-reporting-and-dashboard D8: every Sentinel metrics endpoint is scraped on EKS. kube-prometheus-stack there
+# discovers PodMonitors in every namespace and ignores the prometheus.io/* annotations, so without these nothing
+# `sentinel_*` reaches VictoriaMetrics. Done when up{namespace="sentinel"} is 1 for every target.
+#
+#   ingestor   :8080/metrics               (public port; unlabelled-by-project counters only)
+#   processor  :8081/metrics               (cluster-internal; carries the D8a project-labelled counters)
+#   dashboard  :3000/api/metrics           (unauthenticated by design, closed label sets)
+#   dashboard  :3000/api/metrics/insights  (D20: project names, so token-gated; 60 s interval)
+{{- $secret := include "sentinel.secretName" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: ingestor
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "sentinel.fullname" . }}-processor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: processor
+  podMetricsEndpoints:
+    - port: health
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+  podMetricsEndpoints:
+    - port: http
+      path: /api/metrics
+      interval: {{ .Values.podMonitor.interval }}
+    {{- if include "sentinel.secretPoolContains" (list . "METRICS_SCRAPE_TOKEN") }}
+    - port: http
+      path: /api/metrics/insights
+      interval: {{ .Values.podMonitor.insightsInterval }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $secret }}
+          key: METRICS_SCRAPE_TOKEN
+    {{- end }}
+{{- end }}

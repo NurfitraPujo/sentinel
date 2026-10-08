@@ -559,6 +559,55 @@ oncallCron:
     limits: { cpu: 100m, memory: 64Mi }
 
 # -----------------------------------------------------------------------------
+# sliCollectCron -- sentinel-reporting-and-dashboard D6. POST /api/cron/sli-collect hourly at :05: copies each
+# SLI's hourly request / job-run / NATS-message totals from VictoriaMetrics into sli_hourly (Postgres), which CDC
+# carries to Databend. Off by default: it needs a VictoriaMetrics URL and a cluster name (below), which only the EKS
+# overlays set.
+# -----------------------------------------------------------------------------
+sliCollectCron:
+  enabled: false
+  schedule: "5 * * * *"
+  image:
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  # curl --max-time: the 30-day first-run backfill is a handful of query_range calls; a normal run is under ten.
+  timeoutSeconds: 120
+  startingDeadlineSeconds: 300
+  activeDeadlineSeconds: 400
+  backoffLimit: 1
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# D7: the SLI definitions, rendered to the dashboard's SERVICE_SLI_CONFIG (JSON) and validated at start. Empty = none.
+# `latency.le` must be one of the edge histogram's bucket values (apps/dashboard-web/src/lib/server/sli/config.ts).
+serviceSlis: []
+
+# D6 / D4: where the dashboard reads denominators and analytics from. Empty = the feature is off for this deployment
+# (the dashboard then shows "unavailable" for those sections; nothing fails).
+analytics:
+  # VictoriaMetrics HTTP API base, e.g. http://monitoring.internal.tuju.ai:8428
+  victoriaMetricsUrl: ""
+  # The Envoy/job-metric `cluster` label this deployment belongs to: tuju-production | tuju-staging.
+  sliCluster: ""
+  databend:
+    # HTTP query API base, e.g. http://databend-query.databend.svc.cluster.local:8000
+    url: ""
+    user: sentinel_app
+    database: sentinel
+
+# D8: PodMonitors (monitoring.coreos.com/v1) for the ingestor, processor and dashboard. Off by default because the CRD
+# belongs to the Prometheus Operator (the EKS overlays turn it on); the prometheus.io/* annotations stay for CCE.
+podMonitor:
+  enabled: false
+  interval: 30s
+  # /api/metrics/insights is token-gated (D20) and recomputed every 5 minutes, so it is scraped less often.
+  insightsInterval: 60s
+  labels: {}
+
+# -----------------------------------------------------------------------------
 # PrometheusRule — sentinel-user-report-issue §12's alert rules. Ships OFF because the CRD belongs
 # to the Prometheus Operator; enabling it on a cluster without the operator fails the release on an
 # unknown kind. See templates/prometheusrule.yaml for why the rules live in this chart at all.
