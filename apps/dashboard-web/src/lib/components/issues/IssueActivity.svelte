@@ -3,19 +3,23 @@
 	import {
 		absoluteTime,
 		activityDetail,
+		activityDetailIsMarkdown,
 		activityVerb,
 		actorLabel,
 		timeAgo,
 		type ActivityEntry,
 		type ActivityPage,
 	} from '$lib/issue-activity';
+	import Markdown from '$lib/components/Markdown.svelte';
 
 	// sentinel-issue-activity TASK-01: the issue's activity history (claims, status changes, comments, progress,
 	// regressions, occurrence bursts) on the issue page. Collapsed by default and read ONLY when opened: the page's own
 	// load runs no activity query (page.server.activity.test.ts holds its statement count). Pages come from
 	// GET /api/issues/{issueId}/activity -- the issue page's own access rule -- newest first, with runs of
 	// `occurrence_burst` already collapsed server-side; "Load older" follows `nextCursor`. All text is interpolated, never
-	// raw HTML (comment excerpts and progress notes are user/agent-authored Markdown, shown as plain text).
+	// raw HTML -- except comment excerpts and progress notes, which are user/agent-authored Markdown and render through the
+	// shared `Markdown` component (marked + DOMPurify, the renderer comment threads use), never raw HTML of our own. They are
+	// compact: headings are scaled down to the entry's text size, and a long one is clamped with "Show more".
 	interface Props {
 		issueId: string;
 		/** Open (and load) on mount. It also opens when the URL's hash is #activity, so a link can point at it. */
@@ -33,6 +37,16 @@
 	let loaded = $state(false);
 	let failure = $state<string | null>(null);
 	let now = $state(Date.now());
+	// Markdown details the reader has expanded, by entry id.
+	let expanded = $state<Record<string, boolean>>({});
+
+	// Clamped (with a "Show more" toggle) past this many lines or characters. Measured on the source, not the layout,
+	// so it is the same in every browser (and in jsdom).
+	const CLAMP_LINES = 4;
+	const CLAMP_CHARS = 240;
+	function isLong(md: string): boolean {
+		return md.length > CLAMP_CHARS || md.split('\n').length > CLAMP_LINES;
+	}
 
 	async function loadPage(before: string | null) {
 		loading = true;
@@ -113,7 +127,22 @@
 									<time class="when" datetime={entry.createdAt} title={absoluteTime(entry.createdAt)}>{timeAgo(entry.createdAt, now)}</time>
 								{/if}
 							</div>
-							{#if detail}
+							{#if detail && activityDetailIsMarkdown(entry)}
+								{@const long = isLong(detail)}
+								{@const isOpen = !!expanded[entry.id]}
+								<div class="detail detail-md" class:clamped={long && !isOpen} data-testid="activity-detail">
+									<Markdown source={detail} />
+								</div>
+								{#if long}
+									<button
+										type="button"
+										class="more"
+										data-testid="activity-detail-toggle"
+										aria-expanded={isOpen}
+										onclick={() => (expanded[entry.id] = !isOpen)}>{isOpen ? 'Show less' : 'Show more'}</button
+									>
+								{/if}
+							{:else if detail}
 								<div class="detail" data-testid="activity-detail">{detail}</div>
 							{/if}
 						</div>
@@ -229,6 +258,85 @@
 		line-clamp: 4;
 		-webkit-box-orient: vertical;
 		overflow: hidden;
+	}
+
+	/* Markdown in an entry: the entry's own scale, not a document's. Selectors go through .markdown-body so they outrank
+	   Markdown.svelte's own rules. */
+	.detail-md {
+		white-space: normal;
+		display: block;
+		-webkit-line-clamp: none;
+		line-clamp: none;
+		overflow: visible;
+	}
+
+	.detail-md.clamped {
+		max-height: 5.25rem;
+		overflow: hidden;
+		mask-image: linear-gradient(to bottom, #000 60%, transparent);
+		-webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent);
+	}
+
+	.detail-md :global(.markdown-body) {
+		font-size: 0.75rem;
+		line-height: 1.5;
+		color: var(--text-muted);
+	}
+
+	.detail-md :global(.markdown-body h1),
+	.detail-md :global(.markdown-body h2),
+	.detail-md :global(.markdown-body h3),
+	.detail-md :global(.markdown-body h4),
+	.detail-md :global(.markdown-body h5),
+	.detail-md :global(.markdown-body h6) {
+		font-size: inherit;
+		line-height: inherit;
+		font-weight: 600;
+		margin: 0.375rem 0 0.125rem 0;
+		color: var(--text-primary);
+	}
+
+	.detail-md :global(.markdown-body > :first-child) {
+		margin-top: 0;
+	}
+
+	.detail-md :global(.markdown-body p),
+	.detail-md :global(.markdown-body pre),
+	.detail-md :global(.markdown-body blockquote) {
+		margin: 0 0 0.25rem 0;
+	}
+
+	.detail-md :global(.markdown-body ul),
+	.detail-md :global(.markdown-body ol) {
+		margin: 0 0 0.25rem 1rem;
+		padding: 0;
+	}
+
+	.detail-md :global(.markdown-body code) {
+		font-size: 0.6875rem;
+	}
+
+	.detail-md :global(.markdown-body pre) {
+		padding: 0.375rem 0.5rem;
+	}
+
+	.detail-md :global(.markdown-body img) {
+		max-height: 6rem;
+	}
+
+	.more {
+		margin-top: 0.125rem;
+		padding: 0;
+		border: none;
+		background: none;
+		color: var(--color-primary);
+		font-size: 0.6875rem;
+		font-family: var(--font-sans);
+		cursor: pointer;
+	}
+
+	.more:hover {
+		text-decoration: underline;
 	}
 
 	.load-older {

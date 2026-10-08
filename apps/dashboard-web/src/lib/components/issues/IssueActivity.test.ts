@@ -134,4 +134,86 @@ describe('IssueActivity', () => {
 		await new Promise((r) => setTimeout(r, 20));
 		expect(failing).toHaveBeenCalledTimes(1);
 	});
+
+	describe('Markdown details (comment excerpts and progress notes)', () => {
+		const comment = (excerpt: string, over: Partial<ActivityEntry> = {}) =>
+			entry({ comment: { id: crypto.randomUUID(), excerpt, deleted: false }, ...over });
+		const one = (e: ActivityEntry): ActivityPage => ({ entries: [e], nextCursor: null, hasMore: false });
+
+		async function renderEntry(e: ActivityEntry): Promise<HTMLElement> {
+			mockFetch(one(e));
+			render(IssueActivity, { issueId: ISSUE });
+			await open();
+			const detail = await screen.findByTestId('activity-detail');
+			await waitFor(() => expect(detail.querySelector('.markdown-fallback')).toBeNull());
+			return detail;
+		}
+
+		it('renders bold, inline code, headings and lists instead of their raw syntax', async () => {
+			const detail = await renderEntry(
+				comment('Resolved and deployed in release **v0.2.1230**.\n\n### Verification\n- Release Tag: `v0.2.1230`\n- Pull request merged'),
+			);
+			expect(detail.querySelector('strong')!.textContent).toBe('v0.2.1230');
+			expect(detail.querySelector('h3')!.textContent).toBe('Verification');
+			expect(detail.querySelector('code')!.textContent).toBe('v0.2.1230');
+			expect([...detail.querySelectorAll('li')].map((li) => li.textContent)).toEqual([
+				'Release Tag: v0.2.1230',
+				'Pull request merged',
+			]);
+			expect(detail.textContent).not.toMatch(/\*\*|###|`/);
+		});
+
+		it('a progress note renders as Markdown too; a deleted comment stays our own plain words', async () => {
+			const progress = await renderEntry(entry({ eventType: 'progress_update', newValue: { messageMd: 'step _one_ done' } }));
+			expect(progress.querySelector('em')!.textContent).toBe('one');
+			document.body.innerHTML = '';
+
+			mockFetch(one(entry({ comment: { id: crypto.randomUUID(), excerpt: null, deleted: true } })));
+			render(IssueActivity, { issueId: ISSUE });
+			await open();
+			const deleted = await screen.findByTestId('activity-detail');
+			expect(deleted.textContent).toBe('(comment deleted)');
+			expect(deleted.querySelector('.markdown-body')).toBeNull();
+		});
+
+		it('a long excerpt is clamped behind "Show more"; a short one has no toggle', async () => {
+			const long = Array.from({ length: 8 }, (_, i) => `- item ${i}`).join('\n');
+			const detail = await renderEntry(comment(long));
+			expect(detail.classList.contains('clamped')).toBe(true);
+			const toggle = screen.getByTestId('activity-detail-toggle');
+			expect(toggle.textContent).toBe('Show more');
+			await fireEvent.click(toggle);
+			expect(detail.classList.contains('clamped')).toBe(false);
+			expect(toggle.textContent).toBe('Show less');
+			expect(toggle.getAttribute('aria-expanded')).toBe('true');
+			document.body.innerHTML = '';
+
+			await renderEntry(comment('short **note**'));
+			expect(screen.queryByTestId('activity-detail-toggle')).toBeNull();
+		});
+
+		it('is sanitized: no <script>, no handler attributes, no javascript: links', async () => {
+			const w = window as unknown as Record<string, unknown>;
+			const detail = await renderEntry(
+				comment(
+					'hi <script>window.__acmPwned = 1</script>\n\n<img src="x" onerror="window.__acmPwned2 = 1">\n\n' +
+						'[click](javascript:window.__acmPwned3=1) <a href="javascript:alert(1)" onclick="window.__acmPwned4=1">raw</a>',
+				),
+			);
+			expect(detail.innerHTML).not.toContain('<script');
+			expect(detail.querySelector('script')).toBeNull();
+			const img = detail.querySelector('img');
+			expect(img?.getAttribute('onerror') ?? null).toBeNull();
+			for (const a of detail.querySelectorAll('a')) {
+				expect(a.getAttribute('href') ?? '').not.toMatch(/^\s*javascript:/i);
+				expect(a.getAttribute('onclick')).toBeNull();
+			}
+			expect(detail.innerHTML).not.toMatch(/javascript:|onerror|onclick/i);
+			await new Promise((r) => setTimeout(r, 10));
+			expect(w.__acmPwned).toBeUndefined();
+			expect(w.__acmPwned2).toBeUndefined();
+			expect(w.__acmPwned3).toBeUndefined();
+			expect(w.__acmPwned4).toBeUndefined();
+		});
+	});
 });

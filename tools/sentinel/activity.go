@@ -285,9 +285,9 @@ func activityDetail(a activityEntry) string {
 		if a.Comment.Deleted || a.Comment.Excerpt == nil {
 			return "(comment deleted)"
 		}
-		return *a.Comment.Excerpt
+		return plainMarkdown(*a.Comment.Excerpt)
 	case "progress_update":
-		return str(nv, "messageMd")
+		return plainMarkdown(str(nv, "messageMd"))
 	case "claim_released":
 		if str(nv, "reason") == "stale" {
 			return "automatic: the claim went stale"
@@ -329,7 +329,7 @@ func activityDetail(a activityEntry) string {
 	return ""
 }
 
-// oneLine flattens a Markdown excerpt for a table cell and caps it.
+// oneLine flattens a cell (already plain text: see plainMarkdown) to one line and caps it.
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if r := []rune(s); len(r) > max {

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
 	activityDetail,
+	activityDetailIsMarkdown,
 	activityVerb,
 	actorLabel,
 	parseActivityLimit,
@@ -103,5 +104,17 @@ describe('timeAgo', () => {
 		expect(timeAgo('2026-10-01T11:55:00Z', now)).toBe('5m ago');
 		expect(timeAgo('2026-10-01T09:00:00Z', now)).toBe('3h ago');
 		expect(timeAgo('2026-09-28T12:00:00Z', now)).toBe('3d ago');
+	});
+});
+
+describe('activityDetailIsMarkdown', () => {
+	it('is true for authored text (a live comment excerpt, a progress note) and false for our own words', () => {
+		const live = { id: 'c', excerpt: '**hi**', deleted: false };
+		expect(activityDetailIsMarkdown(base({ eventType: 'commented', comment: live }))).toBe(true);
+		expect(activityDetailIsMarkdown(base({ eventType: 'question_asked', comment: live }))).toBe(true);
+		expect(activityDetailIsMarkdown(base({ eventType: 'progress_update', newValue: { messageMd: 'x' } }))).toBe(true);
+		expect(activityDetailIsMarkdown(base({ eventType: 'commented', comment: { id: 'c', excerpt: null, deleted: true } }))).toBe(false);
+		expect(activityDetailIsMarkdown(base({ eventType: 'commented' }))).toBe(false);
+		expect(activityDetailIsMarkdown(base({ eventType: 'status_changed', newValue: { status: 'resolved' } }))).toBe(false);
 	});
 });

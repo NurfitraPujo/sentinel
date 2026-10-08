@@ -217,6 +217,23 @@ export function activityDetail(entry: ActivityEntry): string | null {
 	}
 }
 
+/**
+ * Whether `activityDetail(entry)` is user/agent-authored Markdown (a comment excerpt or a progress note) that the
+ * Activity section renders through the shared sanitizing `Markdown` component, rather than plain words of our own.
+ * A deleted comment's "(comment deleted)" is ours, so it stays plain text.
+ */
+export function activityDetailIsMarkdown(entry: ActivityEntry): boolean {
+	switch (entry.eventType) {
+		case 'commented':
+		case 'question_asked':
+			return !!entry.comment && !entry.comment.deleted && entry.comment.excerpt !== null;
+		case 'progress_update':
+			return true;
+		default:
+			return false;
+	}
+}
+
 /** "just now" / "5m ago" / "3h ago" / "2d ago" -- the notification bell's format; the absolute time goes in a tooltip. */
 export function timeAgo(iso: string, now: number = Date.now()): string {
 	const t = Date.parse(iso);
