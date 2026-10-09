@@ -40,3 +40,6 @@ worktrees
 
 # compiled service binaries (go build -o bin/...) must never be committed
 apps/*/bin/
+
+# Built binary at repo root
+/processor-go

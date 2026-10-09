@@ -415,7 +415,8 @@ processor:
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
-  livenessPath: /health
+  # Liveness must NOT track dependencies: /health is 503 while the subscriber retries JetStream at startup.
+  livenessPath: /livez
   readinessPath: /health
 
 # -----------------------------------------------------------------------------

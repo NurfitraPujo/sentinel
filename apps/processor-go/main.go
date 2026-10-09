@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -249,41 +250,9 @@ func main() {
 	// service.ProcessEvent/processEventInternal opens) becomes a disconnected new root — every test
 	// still passes, but the cross-service trace silently never exists. See the report for how this was
 	// verified empirically (a span-recording exporter, not just a reading of this code).
-	err = subscriber.Subscribe(ctx, func(msgCtx context.Context, data []byte, headers nats.Header) error {
-		msgCtx = otel.GetTextMapPropagator().Extract(msgCtx, obs.NATSHeaderCarrier(headers))
-		// messaging.* attributes mirror the ingestor's producer span (apps/ingestor-go/service/
-		// service.go's publish) so a trace backend can group both sides of the hop by the same
-		// destination — natsCfg.Subject is the compile-time-fixed literal this consumer was
-		// constructed with above, not a per-message value, so there is no cardinality cost.
-		msgCtx, span := tracer.Start(msgCtx, "processor.process_event",
-			trace.WithSpanKind(trace.SpanKindConsumer),
-			trace.WithAttributes(
-				attribute.String("messaging.system", "nats"),
-				attribute.String("messaging.destination.name", natsCfg.Subject),
-			),
-		)
-		defer span.End()
-
-		err := proc.ProcessEvent(msgCtx, data)
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			// This span cannot know whether the subscriber will actually dead-letter this delivery:
-			// that decision (packages/shared-go/nats.Subscriber.handleMessage, private, out of scope
-			// here) also depends on the message's delivery count, which is not visible at this call
-			// site — a transient error on the last allowed delivery dead-letters even though
-			// nats.IsPermanent reports false for it (see processor_service.go's ProcessEvent doc
-			// comment for the identical caveat on OutcomeRetried vs OutcomeDeadLettered). What IS
-			// knowable here, and worth recording, is whether processing classified this failure as
-			// permanent (nats.Permanent(...) was returned somewhere on the call path) — a permanent
-			// error dead-letters unconditionally on this delivery regardless of count.
-			span.SetAttributes(attribute.Bool("sentinel.error_permanent", nats.IsPermanent(err)))
-		}
-		return err
-	})
-	if err != nil {
-		log.Fatalf("Failed to subscribe: %v", err)
-	}
+	// subscribed gates /health: not-ready (503) until Subscribe succeeds, so a JetStream outage at startup
+	// is retried in-process (subscribeWithRetry) rather than crash-looping the pod.
+	var subscribed atomic.Bool
 
 	// dlqDetailer is a second, read-only JetStream connection used only to enrich the DLQ health
 	// signal with the age/class of the oldest parked message — data DLQStats does not expose and that
@@ -302,12 +271,50 @@ func main() {
 
 	dlqThresholds := dlqmonitor.ThresholdsFromEnv()
 
-	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber, dlqDetailer, dlqThresholds, providers.MetricsHandler)
+	healthSrv := serveHealth(ctx, getEnv("PROCESSOR_HEALTH_ADDR", ":8081"), db, subscriber, &subscribed, dlqDetailer, dlqThresholds, providers.MetricsHandler)
 	defer func() {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
 		_ = healthSrv.Shutdown(shutdownCtx)
 	}()
+
+	subscribeFn := func() error {
+		return subscriber.Subscribe(ctx, func(msgCtx context.Context, data []byte, headers nats.Header) error {
+			msgCtx = otel.GetTextMapPropagator().Extract(msgCtx, obs.NATSHeaderCarrier(headers))
+			// messaging.* attributes mirror the ingestor's producer span (apps/ingestor-go/service/
+			// service.go's publish) so a trace backend can group both sides of the hop by the same
+			// destination — natsCfg.Subject is the compile-time-fixed literal this consumer was
+			// constructed with above, not a per-message value, so there is no cardinality cost.
+			msgCtx, span := tracer.Start(msgCtx, "processor.process_event",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithAttributes(
+					attribute.String("messaging.system", "nats"),
+					attribute.String("messaging.destination.name", natsCfg.Subject),
+				),
+			)
+			defer span.End()
+
+			err := proc.ProcessEvent(msgCtx, data)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				// This span cannot know whether the subscriber will actually dead-letter this delivery:
+				// that decision (packages/shared-go/nats.Subscriber.handleMessage, private, out of scope
+				// here) also depends on the message's delivery count, which is not visible at this call
+				// site — a transient error on the last allowed delivery dead-letters even though
+				// nats.IsPermanent reports false for it (see processor_service.go's ProcessEvent doc
+				// comment for the identical caveat on OutcomeRetried vs OutcomeDeadLettered). What IS
+				// knowable here, and worth recording, is whether processing classified this failure as
+				// permanent (nats.Permanent(...) was returned somewhere on the call path) — a permanent
+				// error dead-letters unconditionally on this delivery regardless of count.
+				span.SetAttributes(attribute.Bool("sentinel.error_permanent", nats.IsPermanent(err)))
+			}
+			return err
+		})
+	}
+	if err := subscribeWithRetry(ctx, subscribeFn, &subscribed, subscribeRetryInitial, subscribeRetryMax); err != nil {
+		log.Fatalf("Failed to subscribe: %v", err)
+	}
 
 	// The DLQ monitor is the "nothing watches that endpoint" fix: /health carries the signal for a
 	// human or an external prober, this loop is the in-process watcher that pages through the existing
@@ -529,14 +536,21 @@ func registerDLQObservables(sub *nats.Subscriber) {
 //
 // metricsHandler is mounted at /metrics alongside /health (OBSERVABILITY_PLAN.md §2/W2) — additive
 // only, /health's own JSON contract is untouched above.
-func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber, detailer dlqmonitor.OldestMessageSource, thresholds dlqmonitor.Thresholds, metricsHandler http.Handler) *http.Server {
+func serveHealth(ctx context.Context, addr string, db *pgxpool.Pool, sub *nats.Subscriber, subscribed *atomic.Bool, detailer dlqmonitor.OldestMessageSource, thresholds dlqmonitor.Thresholds, metricsHandler http.Handler) *http.Server {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		statusCode := http.StatusOK
 		body := map[string]any{"status": "healthy"}
 
 		reqCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
+
+		if !subscribed.Load() {
+			statusCode = http.StatusServiceUnavailable
+			body["status"] = "starting"
+			body["subscription"] = "not ready"
+		}
 
 		if err := db.Ping(reqCtx); err != nil {
 			statusCode = http.StatusServiceUnavailable
@@ -686,4 +700,12 @@ func runTagFacetsBackfill(parent context.Context, logger *slog.Logger, dbCfg dat
 			slog.String("event", "tag_facets.backfill.failed"), slog.String("error", err.Error()))
 	}
 	return backfillExitCode(err)
+}
+
+// livezHandler is the liveness probe: 200 while the process serves HTTP, with no DB/NATS checks, so a
+// dependency outage (e.g. JetStream retry at startup, when /health is 503) never gets the pod killed.
+func livezHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"alive"}`))
 }
