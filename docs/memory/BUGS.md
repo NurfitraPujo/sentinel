@@ -713,3 +713,25 @@ of which had been latent for some time:
 - Beware fixing this class *while* introducing it: the D29 tests added during this same work used a
   persistent `mockRejectedValue` on a shared `signIn` mock, which survived `clearAllMocks` and failed an
   unrelated later test with the previous test's error. Caught only by running the shuffle.
+
+## B14 — A Join That Is Correct At Test Scale And Times Out In Production
+
+`sentinel-reporting-and-dashboard/BUG-01`, 2026-10-09. Every insight query joined `error_occurrences` to `issues`
+(`OCC_FROM`). On prod Databend (5.75M occurrences, 1,521 issues) that hash join took 44-89 s against a 10 s per-query
+budget, so `insights.refresh_failed` fired on every 5-minute run and `/api/metrics/insights` served stale or empty
+values. The same queries returned the right answer on the test fixtures (tens of rows), and on a 3M-row local Databend
+the old join took only ~1.6 s: **a local container did not reproduce the pathology**, only the prod measurements did.
+
+**Fix**: aggregate occurrences first (window + occurrence-column filters, `GROUP BY issue_id, environment, <columns the
+outer query needs>`), then join `issues` on that ~1.5k-row aggregate (`OCC_ISSUES` in `metrics.ts`). `changeFailure`
+and `releaseWindows` read occurrences twice; their second read is pruned with `IN (SELECT ...)` semi-joins and a time
+lower bound before it joins. `error_occurrences.project_id` exists but is nullable (backfilled), so access is NOT
+filtered on it; project scope still comes from `issues.project_id`.
+
+**The rules**:
+
+- A new analytics query over `error_occurrences` must not `JOIN` it to anything before aggregating or semi-join pruning.
+- Output equivalence is pinned by the `BUG-01` snapshot suite in `metrics.integration.test.ts`, recorded from the
+  pre-rewrite SQL. Mutation-tested: dropping an access predicate, the `BASE_ISSUES` filter, or a window bound turns it
+  red. Fixture lesson: an ordering assertion over tied `(users, events)` is nondeterministic, so the fixture breaks ties.
+- `topIssues` with ties at the `LIMIT 10` cut returns an arbitrary member of the tie, before and after this change.

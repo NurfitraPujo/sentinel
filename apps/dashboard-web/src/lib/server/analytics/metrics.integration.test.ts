@@ -203,3 +203,118 @@ describe.skipIf(!run)('D10 metrics against Databend', () => {
 		expect(await m.latestReceivedAt(ctx({ scopes: [] }))).toBeNull();
 	});
 });
+
+// Pin suite for the occurrence-aggregation rewrite (sentinel-reporting-and-dashboard BUG-01): every query that reads
+// error_occurrences together with issues, over a fixture that exercises multi-project and per-environment access,
+// deleted issues, user reports (not system errors), null releases, 24 h change-failure edges and release windows, under
+// several access contexts. The snapshot in __snapshots__ was recorded from the pre-rewrite JOIN implementation; the
+// rewrite must reproduce it byte for byte. It lives in its own database so the file-parallel service tests cannot clobber it.
+const P3 = '33333333-3333-3333-3333-333333333333'; // a project the viewer never reaches
+let pinRun: Run | null = null;
+if (url && run) pinRun = await resetSchema(url, 'sentinel_test_pin');
+
+const win28: m.Window = { from: D(28), to: NOW };
+const win24h: m.Window = { from: H(24), to: NOW };
+
+describe.skipIf(!pinRun)('BUG-01: occurrence aggregation pins every rewritten query', () => {
+	beforeAll(async () => {
+		const occs: Parameters<typeof seed>[1]['occs'] = [];
+		let k = 0;
+		const occ = (issueId: string, environment: string, createdAt: Date, o: Partial<NonNullable<typeof occs>[number]> = {}) =>
+			occs!.push({ id: `o${k++}`, issueId, environment, createdAt, ...o });
+		// r1 (P1 production): p1-a emits 10 events inside 24 h of the release start -> fails on count alone, one user
+		for (let j = 0; j < 10; j++) occ('p1-a', 'production', H(100 - j), { release: 'r1', service: 'api', tagSource: 'http_handler', requestScoped: true, userId: 'u1', level: j % 2 ? 'error' : 'warning' });
+		// ... and p1-a keeps emitting under the later release r2, which p1-a did not introduce
+		for (let j = 0; j < 4; j++) occ('p1-a', 'production', H(40 - j), { release: 'r2', service: 'api', tagSource: 'logger', userId: `u${j}` });
+		// r2 introduced by p1-c: 12 events but only 2 inside the first 24 h, 1 user -> does not fail
+		occ('p1-c', 'production', H(40), { release: 'r2', service: 'jobs worker', tagSource: 'job' });
+		occ('p1-c', 'production', H(39), { release: 'r2', service: 'jobs worker', tagSource: 'job' });
+		for (let j = 0; j < 10; j++) occ('p1-c', 'production', H(10 - j / 2), { release: 'r2', service: 'jobs worker', tagSource: 'job', userId: 'u9' });
+		// r3 introduced by p1-d: three distinct users inside 24 h -> fails on users; also nats + unattributed
+		for (const u of ['x', 'y', 'z']) occ('p1-d', 'production', H(8), { release: 'r3', service: 'worker', tagSource: 'worker_handler', userId: u });
+		occ('p1-d', 'production', H(7), { release: 'r3' });
+		// occurrences without a release, a user_report issue that "introduces" r2 with 10 events inside 24 h (it must not make r2 fail), and a deleted issue
+		for (let j = 0; j < 3; j++) occ('p1-a', 'production', H(20 + j), { service: 'api', tagSource: 'http_handler', requestScoped: true, userId: `n${j}` });
+		occ('p1-a', 'production', H(21.5), { service: 'api', tagSource: 'http_handler', requestScoped: true, userId: 'n0' }); // breaks a top-issues tie with p1-d
+		for (let j = 0; j < 10; j++) occ('p1-rep', 'production', H(30), { release: 'r2', service: 'api', tagSource: 'http_handler', requestScoped: true });
+		occ('p1-dead', 'production', H(12), { release: 'r1', service: 'api', tagSource: 'http_handler', requestScoped: true, userId: 'd' });
+		// P1 staging has its own r1 window
+		for (let j = 0; j < 3; j++) occ('p1-s', 'staging', H(30 - j), { release: 'r1', service: 'api', tagSource: 'http_handler', requestScoped: true, userId: `s${j}`, receivedAt: H(1) });
+		// P2 production: release w1 with 10 events -> fails; P2 staging data the scope below hides
+		for (let j = 0; j < 13; j++) occ('p2-a', 'production', H(50 - j), { release: 'w1', service: 'api', tagSource: 'http_handler', requestScoped: true, userId: `p${j % 2}` });
+		occ('p2-s', 'staging', H(9), { release: 'w1', service: 'api', tagSource: 'http_handler', requestScoped: true });
+		// P3 is never reachable
+		for (let j = 0; j < 12; j++) occ('p3-a', 'production', H(3), { release: 'q1', service: 'api', tagSource: 'http_handler', requestScoped: true, userId: `q${j}` });
+		// outside the 28-day window, and one 24 h-old and one just-inside-the-window event
+		occ('p1-a', 'production', D(60), { release: 'r0', service: 'api', tagSource: 'http_handler', requestScoped: true, receivedAt: D(60) });
+		occ('p1-a', 'production', H(24), { release: 'r2', service: 'api', tagSource: 'logger' });
+		// twelve small issues so the top-10 cut and its tie-break matter
+		const small = [] as { id: string; projectId: string; environment: string; firstSeen: Date }[];
+		for (let j = 0; j < 12; j++) {
+			small.push({ id: `p1-t${j}`, projectId: P1, environment: 'production', firstSeen: D(3) });
+			for (let e = 0; e <= j; e++) occ(`p1-t${j}`, 'production', H(5 + e), { userId: `t${j % 4}-${e % 2}` });
+		}
+		await seed(pinRun!, {
+			issues: [
+				{ id: 'p1-a', projectId: P1, environment: 'production', firstSeen: D(5), firstRelease: 'r1' },
+				{ id: 'p1-c', projectId: P1, environment: 'production', firstSeen: D(2), firstRelease: 'r2' },
+				{ id: 'p1-d', projectId: P1, environment: 'production', firstSeen: D(1), firstRelease: 'r3' },
+				{ id: 'p1-s', projectId: P1, environment: 'staging', firstSeen: D(2), firstRelease: 'r1' },
+				{ id: 'p1-rep', projectId: P1, environment: 'production', firstSeen: D(1), issueType: 'user_report', firstRelease: 'r2' },
+				{ id: 'p1-dead', projectId: P1, environment: 'production', firstSeen: D(5), firstRelease: 'r1', deletedAt: D(1), status: 'resolved' },
+				{ id: 'p2-a', projectId: P2, environment: 'production', firstSeen: D(3), firstRelease: 'w1' },
+				{ id: 'p2-s', projectId: P2, environment: 'staging', firstSeen: D(1), firstRelease: 'w1' },
+				{ id: 'p3-a', projectId: P3, environment: 'production', firstSeen: D(1), firstRelease: 'q1' },
+				...small,
+			],
+			occs,
+			activity: [{ issueId: 'p1-d', eventType: 'regressed', createdAt: H(4), newValue: { releaseVersion: 'r3' } }],
+		});}, 120_000); // the seeder inserts row by row
+
+	const at = (access: Partial<AccessFilter>): m.MetricCtx => ({
+		run: pinRun!,
+		httpServices: ['api'],
+		access: { scopes: [{ projectId: P1, environments: null }], environment: 'all', knownEnvironments: ['production', 'staging'], ...access },
+	});
+	const norm = (rows: unknown[]) => rows.map((r) => JSON.stringify(r)).sort();
+	const contexts: Record<string, m.MetricCtx> = {
+		'P1 unrestricted': at({}),
+		'P1 + P2, P2 production only': at({ scopes: [{ projectId: P1, environments: null }, { projectId: P2, environments: ['production'] }] }),
+		'P1 production only': at({ scopes: [{ projectId: P1, environments: ['production'] }] }),
+		'P1 + P2 unrestricted, environment=staging': at({ scopes: [{ projectId: P1, environments: null }, { projectId: P2, environments: null }], environment: 'staging' }),
+		'no scopes': at({ scopes: [] }),
+		'empty environments': at({ scopes: [{ projectId: P1, environments: [] }] }),
+	};
+
+	for (const [label, c] of Object.entries(contexts)) {
+		it(`output is unchanged: ${label}`, async () => {
+			const sli = { id: 'x', project: 'core', source: 'x', windowDays: 28 } as const;
+			const out = {
+				errorEvents28: norm(await m.errorEvents(c, win28)),
+				errorEvents24h: norm(await m.errorEvents(c, win24h)),
+				series28d: norm(await m.errorEventsSeries(c, win28, 'day')),
+				series24h: norm(await m.errorEventsSeries(c, win24h, 'hour')),
+				topIssues: (await m.topIssues(c, win28)).map((r) => JSON.stringify(r)), // ordered: users, then events
+				topIssues24h: (await m.topIssues(c, win24h)).map((r) => JSON.stringify(r)),
+				changeFailure: norm(await m.changeFailure(c, win28)),
+				changeFailureNarrow: norm(await m.changeFailure(c, { from: D(3), to: D(1) })),
+				releaseWindows: (await m.releaseWindows(c, NOW, 10)).map((r) => JSON.stringify(r)),
+				releaseWindows1: (await m.releaseWindows(c, NOW, 1)).map((r) => JSON.stringify(r)),
+				sliHttp: await m.sliMatchingEvents(c, { ...sli, kind: 'http', service: 'api' }, P1, 'production', win28),
+				sliHttpStaging: await m.sliMatchingEvents(c, { ...sli, kind: 'http', service: 'api' }, P1, 'staging', win28),
+				sliHttpP2: await m.sliMatchingEvents(c, { ...sli, kind: 'http', service: 'api' }, P2, 'production', win28),
+				sliJobs: await m.sliMatchingEvents(c, { ...sli, kind: 'jobs' }, P1, 'production', win28),
+				sliNats: await m.sliMatchingEvents(c, { ...sli, kind: 'nats' }, P1, 'production', win28),
+				latest: (await m.latestReceivedAt(c))?.toISOString() ?? null,
+			};
+			expect(out).toMatchSnapshot();
+		});
+	}
+
+	it('the fixture is not vacuous: change failure fails on count (r1) and on users (r3) but not on a spread-out r2', async () => {
+		const rows = await m.changeFailure(contexts['P1 unrestricted'], win28);
+		expect(rows.find((r) => r.environment === 'production')).toMatchObject({ n: 3, failed: 2 });
+		expect(sum(await m.errorEvents(contexts['P1 unrestricted'], win28))).toBeGreaterThan(50);
+	});
+});
+

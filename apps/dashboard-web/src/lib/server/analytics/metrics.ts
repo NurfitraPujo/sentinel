@@ -37,7 +37,19 @@ const n = (v: string | null | undefined): number => (v === null || v === undefin
 const nOrNull = (v: string | null | undefined): number | null => (v === null || v === undefined || v === '' ? null : Number(v));
 
 const BASE_ISSUES = `i.issue_type = 'system_error'`;
-const OCC_FROM = `error_occurrences o JOIN issues i ON i.id = o.issue_id`;
+
+/**
+ * Databend's hash join of `error_occurrences` to `issues` takes 44-89 s at 5.75M x 1.5k rows (measured on prod,
+ * 2026-10-09), blowing the 10 s per-query budget. Every occurrence read therefore aggregates `error_occurrences` FIRST
+ * (window + occurrence-column filters, GROUP BY issue_id and the columns the outer query needs) and joins `issues` on
+ * that ~1.5k-row aggregate, which takes ~1.3 s with identical results. `issues` supplies project_id, the issue type and
+ * the access check; counts come back as `cnt` and are re-summed outside.
+ *
+ * An issue's identity includes its environment (processor `StoreEvent`), so all of an issue's occurrences share one
+ * `environment`: grouping by it as well as by issue_id loses nothing.
+ */
+const OCC_SELECT = `o.issue_id AS issue_id, o.environment AS environment`;
+const OCC_ISSUES = (agg: string) => `(${agg}) o JOIN issues i ON i.id = o.issue_id`;
 
 /** D19's five groups, decided in order. Group 1 needs the project's http SLI services (D7). */
 export function groupCase(httpServices: readonly string[]): string {
@@ -62,9 +74,12 @@ export interface EventRow extends CountRow {
 
 export async function errorEvents(c: MetricCtx, w: Window): Promise<EventRow[]> {
 	const rows = await c.run(`
-		SELECT i.project_id, o.environment, ${groupCase(c.httpServices)} AS grp, o.level, o.service, count(*) AS n
-		FROM ${OCC_FROM}
-		WHERE ${BASE_ISSUES} AND ${inRange('o.created_at', w)} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
+		SELECT i.project_id, o.environment, ${groupCase(c.httpServices)} AS grp, o.level, o.service, sum(o.cnt) AS n
+		FROM ${OCC_ISSUES(`
+		  SELECT ${OCC_SELECT}, o.level AS level, o.service AS service, o.tag_source AS tag_source, o.request_scoped AS request_scoped, count(*) AS cnt
+		  FROM error_occurrences o WHERE ${inRange('o.created_at', w)}
+		  GROUP BY o.issue_id, o.environment, o.level, o.service, o.tag_source, o.request_scoped`)}
+		WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
 		GROUP BY i.project_id, o.environment, grp, o.level, o.service`);
 	return rows.map((r) => ({ projectId: r[0]!, environment: r[1]!, group: r[2] as Group, level: r[3] ?? 'error', service: r[4], n: n(r[5]) }));
 }
@@ -80,9 +95,12 @@ export interface SeriesRow {
 export async function errorEventsSeries(c: MetricCtx, w: Window, bucket: 'hour' | 'day'): Promise<SeriesRow[]> {
 	const trunc = bucket === 'hour' ? 'to_start_of_hour' : 'to_start_of_day';
 	const rows = await c.run(`
-		SELECT ${trunc}(o.created_at) AS b, ${groupCase(c.httpServices)} AS grp, o.service, count(*) AS n
-		FROM ${OCC_FROM}
-		WHERE ${BASE_ISSUES} AND ${inRange('o.created_at', w)} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
+		SELECT o.b AS b, ${groupCase(c.httpServices)} AS grp, o.service, sum(o.cnt) AS n
+		FROM ${OCC_ISSUES(`
+		  SELECT ${OCC_SELECT}, ${trunc}(o.created_at) AS b, o.service AS service, o.tag_source AS tag_source, o.request_scoped AS request_scoped, count(*) AS cnt
+		  FROM error_occurrences o WHERE ${inRange('o.created_at', w)}
+		  GROUP BY o.issue_id, o.environment, b, o.service, o.tag_source, o.request_scoped`)}
+		WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
 		GROUP BY b, grp, o.service ORDER BY b`);
 	return rows.map((r) => ({ bucket: r[0]!, group: r[1] as Group, service: r[2], n: n(r[3]) }));
 }
@@ -163,9 +181,12 @@ export interface TopIssue {
 export async function topIssues(c: MetricCtx, w: Window): Promise<TopIssue[]> {
 	const rows = await c.run(`
 		SELECT i.id, i.project_id, i.environment, i.message, i.error_class,
-		  count(DISTINCT o.event_user['id']::String) AS users, count(*) AS events
-		FROM ${OCC_FROM}
-		WHERE ${BASE_ISSUES} AND ${inRange('o.created_at', w)} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
+		  sum(o.users) AS users, sum(o.cnt) AS events
+		FROM ${OCC_ISSUES(`
+		  SELECT ${OCC_SELECT}, count(DISTINCT o.event_user['id']::String) AS users, count(*) AS cnt
+		  FROM error_occurrences o WHERE ${inRange('o.created_at', w)}
+		  GROUP BY o.issue_id, o.environment`)}
+		WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
 		GROUP BY i.id, i.project_id, i.environment, i.message, i.error_class
 		ORDER BY users DESC, events DESC LIMIT 10`);
 	return rows.map((r) => ({ id: r[0]!, projectId: r[1]!, environment: r[2]!, message: r[3] ?? '', errorClass: r[4] ?? '', users: n(r[5]), events: n(r[6]) }));
@@ -243,18 +264,32 @@ export interface ChangeFailureRow extends CountRow {
  */
 export async function changeFailure(c: MetricCtx, w: Window): Promise<ChangeFailureRow[]> {
 	const rows = await c.run(`
-		WITH rel AS (
-		  SELECT i.project_id AS project_id, o.environment AS environment, o.release_version AS v, min(o.created_at) AS start_at
-		  FROM ${OCC_FROM}
-		  WHERE ${BASE_ISSUES} AND o.release_version IS NOT NULL AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
-		  GROUP BY i.project_id, o.environment, o.release_version
-		  HAVING min(o.created_at) >= ${tsLiteral(w.from)} AND min(o.created_at) < ${tsLiteral(w.to)}
-		), bad AS (
-		  SELECT r.project_id AS project_id, r.environment AS environment, r.v AS v
+		WITH occ_rel AS (
+		  SELECT ${OCC_SELECT}, o.release_version AS v, min(o.created_at) AS start_at
+		  FROM error_occurrences o WHERE o.release_version IS NOT NULL
+		  GROUP BY o.issue_id, o.environment, o.release_version
+		), rel AS (
+		  SELECT i.project_id AS project_id, o.environment AS environment, o.v AS v, min(o.start_at) AS start_at
+		  FROM occ_rel o JOIN issues i ON i.id = o.issue_id
+		  WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
+		  GROUP BY i.project_id, o.environment, o.v
+		  HAVING min(o.start_at) >= ${tsLiteral(w.from)} AND min(o.start_at) < ${tsLiteral(w.to)}
+		), cand AS (
+		  -- an issue has one first_release_version, so it matches at most one rel row: start_at is per issue
+		  SELECT r.project_id AS project_id, r.environment AS environment, r.v AS v, i.id AS issue_id, r.start_at AS start_at
 		  FROM rel r
 		  JOIN issues i ON i.project_id = r.project_id AND i.environment = r.environment AND i.first_release_version = r.v AND ${BASE_ISSUES}
-		  JOIN error_occurrences o ON o.issue_id = i.id AND o.created_at >= r.start_at AND o.created_at < add_hours(r.start_at, 24)
-		  GROUP BY r.project_id, r.environment, r.v, i.id
+		), occ24 AS (
+		  -- only the candidates' occurrences, inside the span of all their 24 h windows, reach the join below
+		  SELECT o.issue_id AS issue_id, o.created_at AS created_at, o.event_user AS event_user
+		  FROM error_occurrences o
+		  WHERE o.issue_id IN (SELECT issue_id FROM cand)
+		    AND o.created_at >= (SELECT min(start_at) FROM cand) AND o.created_at < add_hours((SELECT max(start_at) FROM cand), 24)
+		), bad AS (
+		  SELECT r.project_id AS project_id, r.environment AS environment, r.v AS v
+		  FROM cand r
+		  JOIN occ24 o ON o.issue_id = r.issue_id AND o.created_at >= r.start_at AND o.created_at < add_hours(r.start_at, 24)
+		  GROUP BY r.project_id, r.environment, r.v, r.issue_id
 		  HAVING count(*) >= 10 OR count(DISTINCT o.event_user['id']::String) >= 3
 		)
 		SELECT r.project_id, r.environment, count(*) AS n, count_if(b.v IS NOT NULL) AS failed
@@ -287,21 +322,33 @@ export async function releaseWindows(c: MetricCtx, now: Date, limitPerProjectEnv
 	if (!Number.isInteger(limitPerProjectEnv) || limitPerProjectEnv < 1 || limitPerProjectEnv > 50) throw new Error('bad release limit');
 	const nowLit = tsLiteral(now);
 	const rows = await c.run(`
-		WITH starts AS (
-		  SELECT i.project_id AS project_id, o.environment AS environment, o.release_version AS v, min(o.created_at) AS start_at
-		  FROM ${OCC_FROM}
-		  WHERE ${BASE_ISSUES} AND o.release_version IS NOT NULL AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
-		  GROUP BY i.project_id, o.environment, o.release_version
+		WITH occ_rel AS (
+		  SELECT ${OCC_SELECT}, o.release_version AS v, min(o.created_at) AS start_at
+		  FROM error_occurrences o WHERE o.release_version IS NOT NULL
+		  GROUP BY o.issue_id, o.environment, o.release_version
+		), starts AS (
+		  SELECT i.project_id AS project_id, o.environment AS environment, o.v AS v, min(o.start_at) AS start_at
+		  FROM occ_rel o JOIN issues i ON i.id = o.issue_id
+		  WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
+		  GROUP BY i.project_id, o.environment, o.v
 		), wins AS (
 		  SELECT project_id, environment, v, start_at,
 		    coalesce(lead(start_at) OVER (PARTITION BY project_id, environment ORDER BY start_at), ${nowLit}) AS end_at,
 		    row_number() OVER (PARTITION BY project_id, environment ORDER BY start_at DESC) AS rk
 		  FROM starts
-		), top AS (SELECT * FROM wins WHERE rk <= ${limitPerProjectEnv})
+		), top AS (SELECT * FROM wins WHERE rk <= ${limitPerProjectEnv}),
+		occ_top AS (
+		  -- only the shown releases' occurrences, from the earliest shown window start, reach the join below
+		  SELECT o.issue_id AS issue_id, o.environment AS environment, o.release_version AS release_version, o.created_at AS created_at,
+		    o.request_scoped AS request_scoped, o.tag_source AS tag_source, o.service AS service
+		  FROM error_occurrences o
+		  WHERE o.release_version IN (SELECT v FROM top) AND o.created_at >= (SELECT min(start_at) FROM top)
+		    AND o.issue_id IN (SELECT i.id FROM issues i WHERE ${BASE_ISSUES} AND i.project_id IN (SELECT project_id FROM top))
+		)
 		SELECT t.project_id, t.environment, t.v, t.start_at, t.end_at, 'ev' AS kind, ${groupCase(c.httpServices)} AS grp, count(*) AS n
 		FROM top t
 		JOIN issues i ON i.project_id = t.project_id AND ${BASE_ISSUES}
-		JOIN error_occurrences o ON o.issue_id = i.id AND o.environment = t.environment AND o.release_version = t.v
+		JOIN occ_top o ON o.issue_id = i.id AND o.environment = t.environment AND o.release_version = t.v
 		  AND o.created_at >= t.start_at AND o.created_at < t.end_at
 		GROUP BY t.project_id, t.environment, t.v, t.start_at, t.end_at, grp
 		UNION ALL
@@ -460,9 +507,12 @@ export async function sliMatchingEvents(c: MetricCtx, sli: ServiceSli, projectId
 	const match = sliEventMatch(sli);
 	if (!match) return null;
 	const rows = await c.run(`
-		SELECT count(*) FROM ${OCC_FROM}
-		WHERE ${BASE_ISSUES} AND i.project_id = ${uuidLiteral(projectId)} AND o.environment = ${enumLiteral(environment, [environment])}
-		  AND ${inRange('o.created_at', w)} AND (${match}) AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}`);
+		SELECT coalesce(sum(o.cnt), 0) FROM ${OCC_ISSUES(`
+		  SELECT ${OCC_SELECT}, count(*) AS cnt
+		  FROM error_occurrences o
+		  WHERE o.environment = ${enumLiteral(environment, [environment])} AND ${inRange('o.created_at', w)} AND (${match})
+		  GROUP BY o.issue_id, o.environment`)}
+		WHERE ${BASE_ISSUES} AND i.project_id = ${uuidLiteral(projectId)} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}`);
 	return n(rows[0]?.[0]);
 }
 
@@ -473,7 +523,9 @@ export function errorsPer1k(events: number | null, total: number): number | null
 /** The newest `received_at` Databend holds for the viewer's accessible data: the freshness line (D13). */
 export async function latestReceivedAt(c: MetricCtx): Promise<Date | null> {
 	const rows = await c.run(`
-		SELECT max(o.received_at) FROM ${OCC_FROM} WHERE ${accessPredicate(c.access, 'i.project_id', 'o.environment')}`);
+		SELECT max(o.received_at) FROM ${OCC_ISSUES(`
+		  SELECT ${OCC_SELECT}, max(o.received_at) AS received_at FROM error_occurrences o GROUP BY o.issue_id, o.environment`)}
+		WHERE ${accessPredicate(c.access, 'i.project_id', 'o.environment')}`);
 	const v = rows[0]?.[0];
 	if (!v) return null;
 	const d = new Date(v.replace(' ', 'T') + (/Z|[+-]\d\d:?\d\d$/.test(v) ? '' : 'Z'));
