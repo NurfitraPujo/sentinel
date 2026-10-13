@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// awsProductionRelayCidr is core's worker subnet on AWS production (the private subnet every production EKS node is
+// in), the one entry values.aws.production.yml carries since the mobile relay rollout
+// (sentinel-mobile-relay-enable-prod; core-sentinel-mobile-relay spec 7.2 R5).
+const awsProductionRelayCidr = "10.11.64.0/20"
+
+// minRelayCidrBits is the widest prefix (smallest bit count) the production list may hold: nothing broader than /16.
+const minRelayCidrBits = 16
+
 // P2.13 (sentinel-sentry-compat-ingest, contract D15): config.ingestor.sentryCompatTrustedProxyCidrs ships
-// EMPTY in values.yaml and in every overlay; core-sentinel-mobile-relay sets it at its rollout.
+// EMPTY in values.yaml and in every overlay except values.aws.production.yml, whose list is set by the mobile relay
+// rollout (sentinel-mobile-relay-enable-prod) to exactly awsProductionRelayCidr. The production entries are held to a
+// sanity bound (each a valid CIDR, none /0, none broader than /16, no duplicates) so a typo cannot widen the trust.
 func TestHelmSentryCompatTrustedProxyCidrs(t *testing.T) {
 	chart := enrChart()
 	base := readHelmValues(t, filepath.Join(chart, "values.yaml"))
@@ -37,7 +48,13 @@ func TestHelmSentryCompatTrustedProxyCidrs(t *testing.T) {
 		ing, _ := cfg["ingestor"].(map[string]any)
 		v, present := ing["sentryCompatTrustedProxyCidrs"]
 		name := filepath.Base(f)
-		if name == "values.aws.staging.yml" || name == "values.aws.production.yml" {
+		if name == "values.aws.production.yml" {
+			list, isList := v.([]any)
+			require.Truef(t, present && isList, "%s must set config.ingestor.sentryCompatTrustedProxyCidrs explicitly to a list", name)
+			assertRelayProductionCidrs(t, name, list)
+			continue
+		}
+		if name == "values.aws.staging.yml" {
 			list, isList := v.([]any)
 			require.Truef(t, present && isList, "%s must set config.ingestor.sentryCompatTrustedProxyCidrs explicitly to []", name)
 			assert.Emptyf(t, list, "%s: shipped empty (D15)", name)
@@ -67,4 +84,25 @@ func TestHelmSentryCompatTrustedProxyCidrs(t *testing.T) {
 		require.True(t, ok, f)
 		assert.Empty(t, l, f)
 	}
+}
+
+// assertRelayProductionCidrs holds values.aws.production.yml's list to exactly [awsProductionRelayCidr] and to the
+// sanity bound on every entry: a string that parses as a CIDR, not /0, not broader than minRelayCidrBits, and not a
+// duplicate (compared masked, so 10.11.64.1/20 repeats 10.11.64.0/20).
+func assertRelayProductionCidrs(t *testing.T, name string, list []any) {
+	t.Helper()
+	var got []string
+	seen := map[netip.Prefix]bool{}
+	for i, e := range list {
+		s, ok := e.(string)
+		require.Truef(t, ok, "%s: sentryCompatTrustedProxyCidrs[%d] must be a string, got %T", name, i, e)
+		p, err := netip.ParsePrefix(s)
+		require.NoErrorf(t, err, "%s: sentryCompatTrustedProxyCidrs[%d] %q must be a CIDR", name, i, s)
+		assert.NotZerof(t, p.Bits(), "%s: %q is /0, which trusts every address", name, s)
+		assert.GreaterOrEqualf(t, p.Bits(), minRelayCidrBits, "%s: %q is broader than /%d", name, s, minRelayCidrBits)
+		assert.Falsef(t, seen[p.Masked()], "%s: %q is a duplicate entry", name, s)
+		seen[p.Masked()] = true
+		got = append(got, s)
+	}
+	assert.Equalf(t, []string{awsProductionRelayCidr}, got, "%s: the production list is core's worker subnet and nothing else", name)
 }
