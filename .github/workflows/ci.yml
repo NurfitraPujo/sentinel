@@ -92,7 +92,31 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # cache: false: the Actions cache works on this pool but the entries
+          # are 1.5-4 GB and blow the repo's 10 GB budget, so keys get evicted
+          # ("Cache is not found") and the restores that do land take 100-370s.
+          # The S3 cache below streams the same directories over the VPC Gateway
+          # Endpoint instead.
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches from S3
+        id: go-cache
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-root-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            sentinel-go-root-${{ runner.os }}-
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: restore
 
       # Verified green on 2026-07-28 (`rtk go build ./...` with GOWORK=off). Hard-gate.
       - name: go build
@@ -108,6 +132,17 @@ jobs:
       # (~2,800 lines) in the suite — this hard-gate is what makes that regression visible again. Hard-gate.
       - name: go test ./tests/unit/...
         run: go test ./tests/unit/... -count=1
+
+      - name: Save Go caches to S3
+        if: always() && steps.go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-root-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # go-sdk: independent module (packages/sdk-go). Run with GOWORK=off so this job sees exactly what a real
@@ -137,7 +172,34 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-          cache-dependency-path: packages/sdk-go/go.sum
+          # cache: false, and keyed per matrix leg: the toolchains differ, so
+          # their GOCACHE entries do too. See the go-root note.
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches from S3
+        id: go-cache
+        # GOCACHE only for this matrix job. Its `go-version` can differ from the
+        # repo's go 1.25.8, so Go downloads a toolchain into GOMODCACHE at
+        # setup-go time — and restoring an archive that contains that
+        # read-only toolchain over the one already there fails ("tar: Cannot
+        # open: File exists") and aborts the restore. The other Go jobs pin
+        # `go-version-file` to the same version they run, so no toolchain is
+        # fetched and they cache GOMODCACHE too.
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-sdk-gocache-${{ matrix.go-version }}-${{ runner.os }}-${{ hashFiles('packages/sdk-go/go.sum') }}
+          restore-keys: |
+            sentinel-go-sdk-gocache-${{ matrix.go-version }}-${{ runner.os }}-
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+          mode: restore
 
       # Verified green on 2026-07-28 (`GOWORK=off go build ./... && GOWORK=off go vet ./... && GOWORK=off go
       # test ./... -count=1`, run from packages/sdk-go under go1.26). The 1.21 leg of the matrix has not been
@@ -154,6 +216,16 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go test -race ./... -count=1
+
+      - name: Save Go caches to S3
+        if: always() && steps.go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-sdk-gocache-${{ matrix.go-version }}-${{ runner.os }}-${{ hashFiles('packages/sdk-go/go.sum') }}
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # go-migrations: independent module (packages/db-migrations). This is what the root module currently
@@ -176,7 +248,26 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: packages/db-migrations/go.mod
-          cache-dependency-path: packages/db-migrations/go.sum
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches from S3
+        id: go-cache
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-migrations-${{ runner.os }}-${{ hashFiles('packages/db-migrations/go.sum') }}
+          restore-keys: |
+            sentinel-go-migrations-${{ runner.os }}-
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: restore
 
       # Verified green on 2026-07-28 (`GOWORK=off go build ./... && GOWORK=off go test ./... -count=1`, run
       # from packages/db-migrations). Hard-gate.
@@ -185,6 +276,17 @@ jobs:
 
       - name: go test
         run: go test ./... -count=1
+
+      - name: Save Go caches to S3
+        if: always() && steps.go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-migrations-${{ runner.os }}-${{ hashFiles('packages/db-migrations/go.sum') }}
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # sentinel-cli: independent module (tools/sentinel), N4 (AI-agent-native plan). Zero dependencies on
@@ -210,6 +312,28 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: tools/sentinel/go.mod
+          # cache: false. This module is stdlib-only (no go.sum), so only
+          # GOCACHE carries anything; see the go-root note.
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches from S3
+        id: go-cache
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-cli-${{ runner.os }}-${{ hashFiles('tools/sentinel/go.mod') }}
+          restore-keys: |
+            sentinel-go-cli-${{ runner.os }}-
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: restore
 
       - name: embedded copies in sync (skill + guide)
         working-directory: .
@@ -223,6 +347,17 @@ jobs:
 
       - name: go test
         run: go test ./... -count=1
+
+      - name: Save Go caches to S3
+        if: always() && steps.go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-cli-${{ runner.os }}-${{ hashFiles('tools/sentinel/go.mod') }}
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # dashboard: apps/dashboard-web (SvelteKit + Auth.js + Drizzle). All three steps below are hard-gates: `pnpm
@@ -324,15 +459,61 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: pnpm
-          cache-dependency-path: apps/dashboard-web/pnpm-lock.yaml
+          # cache: pnpm removed: the Actions cache works here, but a ~1.5 GB
+          # store entry evicts the repo's other keys under the 10 GB budget and
+          # its restores are slow. The S3 cache below carries it instead.
+
+      - name: Resolve pnpm store path
+        # Absolute and normalised: the S3 action tars with `-C /` and GNU tar
+        # strips a leading `..`, so the store lives beside the repo dir under
+        # `_work/`. Exported as npm_config_store_dir for the install below.
+        id: pnpm-store-path
+        run: |
+          ws="${{ runner.workspace }}"
+          store="${ws%/*}/.pnpm-store"
+          echo "store=$store" >> "$GITHUB_OUTPUT"
+          echo "PNPM_STORE=$store" >> "$GITHUB_ENV"
+
+      - name: Restore pnpm store from S3
+        id: pnpm-store
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-dashboard-pnpm-${{ runner.os }}-${{ hashFiles('apps/dashboard-web/pnpm-lock.yaml') }}
+          restore-keys: |
+            sentinel-dashboard-pnpm-${{ runner.os }}-
+          path: ${{ steps.pnpm-store-path.outputs.store }}
+          mode: restore
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: packages/db-migrations/go.mod
-          cache-dependency-path: packages/db-migrations/go.sum
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go caches from S3
+        id: go-cache
+        # Restore only: the go-migrations job owns the save for this key (same
+        # module, so the restore is shared).
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-go-migrations-${{ runner.os }}-${{ hashFiles('packages/db-migrations/go.sum') }}
+          restore-keys: |
+            sentinel-go-migrations-${{ runner.os }}-
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+          mode: restore
 
       - name: pnpm install
+        env:
+          npm_config_store_dir: ${{ env.PNPM_STORE }}
         run: pnpm install --frozen-lockfile
 
       # Runs the REAL migrations (packages/db-migrations/migrations/*.sql, goose's own filename-ordered Up
@@ -361,6 +542,15 @@ jobs:
       # execute instead of silently skipping. Hard-gate.
       - name: pnpm test
         run: pnpm test
+
+      - name: Save pnpm store to S3
+        if: always() && steps.pnpm-store.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-dashboard-pnpm-${{ runner.os }}-${{ hashFiles('apps/dashboard-web/pnpm-lock.yaml') }}
+          path: ${{ steps.pnpm-store-path.outputs.store }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # sdk-js-node: packages/sdk-js (the JavaScript/TypeScript SDK, sentinel-sdk-js contract §4.10, decisions 30
@@ -399,10 +589,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: pnpm
-          cache-dependency-path: packages/sdk-js/pnpm-lock.yaml
+          # cache: pnpm removed: see the dashboard job. The S3 cache below
+          # carries the store instead.
+      - name: Resolve pnpm store path
+        id: pnpm-store-path
+        run: |
+          ws="${{ runner.workspace }}"
+          store="${ws%/*}/.pnpm-store"
+          echo "store=$store" >> "$GITHUB_OUTPUT"
+          echo "PNPM_STORE=$store" >> "$GITHUB_ENV"
+
+      - name: Restore pnpm store from S3
+        id: pnpm-store
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-sdk-js-pnpm-${{ runner.os }}-${{ hashFiles('packages/sdk-js/pnpm-lock.yaml') }}
+          restore-keys: |
+            sentinel-sdk-js-pnpm-${{ runner.os }}-
+          path: ${{ steps.pnpm-store-path.outputs.store }}
+          mode: restore
 
       - name: pnpm install
+        env:
+          npm_config_store_dir: ${{ env.PNPM_STORE }}
         run: pnpm install --frozen-lockfile
 
       - name: pnpm typecheck
@@ -447,6 +657,17 @@ jobs:
       - name: pnpm size
         if: matrix.node == 20
         run: pnpm size
+
+      - name: Save pnpm store to S3
+        # node 20 leg only: both legs install the same lockfile, so one saver is
+        # enough and avoids two writers racing on the same key.
+        if: always() && matrix.node == 20 && steps.pnpm-store.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-sdk-js-pnpm-${{ runner.os }}-${{ hashFiles('packages/sdk-js/pnpm-lock.yaml') }}
+          path: ${{ steps.pnpm-store-path.outputs.store }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # sdk-js: the aggregate gate for sdk-js-node (decision 35). A matrix job's check runs are named
@@ -737,6 +958,29 @@ jobs:
           go-version: "1.26"
           cache: false
 
+      - name: Resolve Go cache paths
+        id: go-cache-path
+        run: |
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gobin=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go tool caches from S3
+        id: lint-cache
+        # install kube-linter re-downloads its ~125 modules and recompiles them
+        # on every run on a fresh instance (~70s, as measured in cdc-pipeline).
+        # Keyed on the pinned kube-linter version; adds GOBIN so the binary
+        # persists too.
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-lint-tools-${{ runner.os }}-kl-0.6.5
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+            ${{ steps.go-cache-path.outputs.gobin }}
+          mode: restore
+
       - name: Install kube-linter
         run: |
           go install golang.stackrox.io/kube-linter/cmd/kube-linter@v0.6.5
@@ -760,6 +1004,18 @@ jobs:
             echo "Linting $manifest ..."
             kube-linter lint --config ./deploy/helm/sentinel/.kube-linter.yaml "./tmp/$manifest-$timestamp.yaml"
           done
+
+      - name: Save Go tool caches to S3
+        if: always() && steps.lint-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: tuju-ai/workflow/.github/actions/ci-aws-runner-cache@main
+        with:
+          key: sentinel-lint-tools-${{ runner.os }}-kl-0.6.5
+          path: |
+            ${{ steps.go-cache-path.outputs.gocache }}
+            ${{ steps.go-cache-path.outputs.gomodcache }}
+            ${{ steps.go-cache-path.outputs.gobin }}
+          mode: save
 
   # ---------------------------------------------------------------------------------------------------------
   # build-images: proves all 7 first-party Dockerfiles still build (push: false).
