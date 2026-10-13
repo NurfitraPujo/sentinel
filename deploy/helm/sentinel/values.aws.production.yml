@@ -161,19 +161,10 @@ config:
     manualIssueRetentionDays: "365"
   ingestor:
     ratelimitStrictMode: "true"
-    # sentinel-sentry-compat-ingest (contract D15, spec 3.6/3.7): CIDRs of the proxies whose X-Forwarded-For the
-    # Sentry-compatible ingest routes believe; empty = fail closed -- X-Forwarded-For is ignored and the caller is the
-    # TCP peer. Since sentinel-relay-key-trust this does NOT grant relay identity: the X-Sentinel-Relay-* headers are
-    # honoured only for a project key with scope `relay`, from any peer (auth.ScopeRelay). Narrowest CIDR only.
-    # Why this value: core's `worker` pods (namespace `core`) call the ingestor Service sentinel-sentinel-ingestor.sentinel
-    # directly, so the immediate peer is the worker pod IP. Every production EKS node is in the private subnet
-    # 10.11.64.0/20 (tuju-production-private-ap-southeast-1a), observed 2026-10-13 (worker pod IPs 10.11.64.x-10.11.79.x,
-    # nodes 10.11.68.x-10.11.79.x). Chosen per core-sentinel-mobile-relay spec 7.2 R5 as the narrowest real subnet boundary.
-    # Caveat: this subnet also holds other pods (e.g. Emissary), so they are trusted proxies too; the `relay` key, not
-    # this list, is the real gate for relay identity. Revisit if a second AZ node group is added (add that private
-    # subnet) or if `relay` keys are ever issued to external parties.
-    sentryCompatTrustedProxyCidrs:
-      - "10.11.64.0/20"
+    # sentinel-sentry-compat-ingest (contract D15): empty = fail closed -- the relay's X-Forwarded-For and
+    # X-Sentinel-Relay-* headers are ignored. core-sentinel-mobile-relay sets this at its rollout, by the
+    # RUNBOOK entry "Sentry-compatible ingest: trusting core's relay". Narrowest CIDR only.
+    sentryCompatTrustedProxyCidrs: []
 
 # LIVE since the 2026-10-03 production cutover: CCE is write-frozen and DMS
 # CDC is stopped, so the wave-1 Sync hook runs Goose migrations against AWS
