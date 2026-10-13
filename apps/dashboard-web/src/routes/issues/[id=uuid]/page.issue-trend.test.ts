@@ -149,6 +149,13 @@ describe('/issues/{id} chart headings (contract §4.2, §3, flows D1, D2, decisi
 		expect(rects('trend-daily').length).toBe(30);
 	});
 
+	it('labels the 30-bar axis "Last 30 days" and names a 14-day data window only in the suffix', () => {
+		render(Page, { data: pageData({ retentionDays: 14 }) as unknown as PageData });
+		expect(text(screen.getByTestId('trend-daily-heading'))).toBe(
+			'Last 30 days (UTC): 2,345 (data kept for 14 days)'
+		);
+	});
+
 	it('carries no suffix at exactly 30 days', () => {
 		render(Page, { data: pageData({ retentionDays: 30 }) as unknown as PageData });
 		expect(text(screen.getByTestId('trend-daily-heading'))).toBe('Last 30 days (UTC): 2,345');

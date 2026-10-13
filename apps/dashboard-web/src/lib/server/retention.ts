@@ -759,11 +759,28 @@ async function sweep(
 		WHERE ${errorOccurrences.issueId} = ${issues.id}
 	)`;
 
-	// System-error (ingested) issues: unchanged behavior, gated on the short `retentionDays` cutoff.
+	// No comments: a correlated NOT EXISTS beside `noOccurrencesCondition`, same BUG-03 shape (no
+	// NOT IN, no materialised set). `${issueComments.issueId} = ${issues.id}` correlates to the
+	// OUTER issues row in both the candidate SELECT and the DELETE.
+	const noCommentsCondition = sql`NOT EXISTS (
+		SELECT 1 FROM ${issueComments}
+		WHERE ${issueComments.issueId} = ${issues.id}
+	)`;
+
+	// System-error (ingested) issues: raw occurrences expire at the short `retentionDays` cutoff, but
+	// triage state does not. An issue is deletable only when it has no occurrences left, is older than
+	// the cutoff, AND carries no triage state: status 'unresolved' (equality, not `<> 'resolved'`, so
+	// a future status is kept by default), unassigned, and uncommented. Resolved and ignored issues
+	// (including snoozes and "ignore until N more events") are therefore kept forever, which is what
+	// lets the processor's regression decision -- it reads only the issue row and `releases`, never
+	// occurrences -- still flag a regression after every occurrence has aged out.
 	const systemErrorOrphanCondition = and(
 		noOccurrencesCondition,
 		sql`${issues.issueType} <> 'user_report'`,
-		lt(issues.firstSeen, cutoffDate)
+		lt(issues.firstSeen, cutoffDate),
+		eq(issues.status, 'unresolved'),
+		isNull(issues.assignedTo),
+		noCommentsCondition
 	);
 
 	// A04: manual issues additionally require status IN ('resolved','ignored') -- never delete an
@@ -801,6 +818,9 @@ async function sweep(
 	// can still find the deletion via `?claimed=me`. Keyed by id so we tombstone ONLY the issues the
 	// DELETE actually removed (its WHERE re-evaluates orphanCondition; a concurrent occurrence insert
 	// could spare a candidate).
+	// Both orphan branches (systemErrorOrphanCondition and manualIssueOrphanCondition) now require
+	// assigned_to IS NULL, so a candidate never carries a claim: the retention tombstones written from
+	// these rows always have a null claim snapshot (assigneeType / assignedTo).
 	const candidateRows = await d
 		.select({
 			id: issues.id,

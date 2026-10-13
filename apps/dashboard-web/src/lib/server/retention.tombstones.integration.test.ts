@@ -119,11 +119,17 @@ describe.skipIf(!dbReachable)('retention tombstones (integration, real Postgres)
 		const { cleanupRetainedData } = await import('./retention');
 		const { listOrgActivity } = await import('$lib/db/queries/events');
 
+		// sentinel-retention-resolved-ignored-kept: a claimed issue is no longer deletable, so the
+		// issue deleted here is unassigned; the claimed one beside it must survive untombstoned.
 		const agentId = 'agent-claimer-' + suffix;
-		const issueId = await seedOrphanIssue({
-			fingerprint: 'tombstone-' + suffix,
+		const claimedId = await seedOrphanIssue({
+			fingerprint: 'tombstone-claimed-' + suffix,
 			assigneeType: 'agent',
 			assignedTo: agentId,
+			firstSeen: daysAgo(60),
+		});
+		const issueId = await seedOrphanIssue({
+			fingerprint: 'tombstone-' + suffix,
 			firstSeen: daysAgo(60),
 		});
 
@@ -134,7 +140,10 @@ describe.skipIf(!dbReachable)('retention tombstones (integration, real Postgres)
 		const issueRows = await sql`select id from issues where id = ${issueId}`;
 		expect(issueRows).toHaveLength(0);
 
-		// ...but the tombstone survives, carrying the claim snapshot and denormalized org/project.
+		expect(await sql`select id from issues where id = ${claimedId}`).toHaveLength(1);
+		expect(await sql`select issue_id from issue_tombstones where issue_id = ${claimedId}`).toHaveLength(0);
+
+		// ...but the tombstone survives, carrying the denormalized org/project.
 		const tombstones = await sql`
 			select issue_id, organization_id, project_id, assignee_type, assigned_to, reason, seq
 			from issue_tombstones where issue_id = ${issueId}
@@ -142,8 +151,8 @@ describe.skipIf(!dbReachable)('retention tombstones (integration, real Postgres)
 		expect(tombstones).toHaveLength(1);
 		expect(tombstones[0].organization_id).toBe(orgId);
 		expect(tombstones[0].project_id).toBe(projectId);
-		expect(tombstones[0].assignee_type).toBe('agent');
-		expect(tombstones[0].assigned_to).toBe(agentId);
+		expect(tombstones[0].assignee_type).toBeNull();
+		expect(tombstones[0].assigned_to).toBeNull();
 		expect(tombstones[0].reason).toBe('retention');
 		expect(Number(tombstones[0].seq)).toBeGreaterThan(0);
 
@@ -161,17 +170,6 @@ describe.skipIf(!dbReachable)('retention tombstones (integration, real Postgres)
 		// Events are returned strictly ascending by seq -- the deletion is ordered, not appended.
 		const seqs = feed.events.map((e) => e.seq);
 		expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
-
-		// A claim-holding agent finds its deleted issue via ?claimed=me despite the issues row being gone.
-		const claimedFeed = await listOrgActivity({
-			organizationId: orgId,
-			after: 0,
-			limit: 200,
-			claimedByAgentId: agentId,
-		});
-		expect(
-			claimedFeed.events.some((e) => e.eventType === 'issue_deleted' && e.issue.id === issueId)
-		).toBe(true);
 	});
 
 	it('prunes tombstones older than tombstoneRetentionDays', async () => {

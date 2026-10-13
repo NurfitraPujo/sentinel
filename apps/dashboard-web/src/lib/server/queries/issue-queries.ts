@@ -327,11 +327,19 @@ function issueOrder(sort: string | undefined): SQL[] {
 
 /**
  * Whether `countOccurrencesByIssueId` must take the exact `COUNT(*)` for an issue of this
- * `issue_type` instead of the bucket sum. True for exactly the issues retention.ts keeps past the
- * bucket cutoff: `'user_report'`, the A04 branch whose deletion is gated on `manualRetentionDays`
- * (`MANUAL_ISSUE_RETENTION_DAYS`, default 365) instead of `retentionDays` (`DATA_RETENTION_DAYS`,
- * which is also where every `issue_occurrence_buckets` row goes). Anything retained under that longer
- * constant would be undercounted by buckets swept at the shorter one, so it is counted exactly.
+ * `issue_type` instead of the bucket sum. True only for `'user_report'`, the A04 branch whose
+ * deletion is gated on `manualRetentionDays` (`MANUAL_ISSUE_RETENTION_DAYS`, default 365) instead of
+ * `retentionDays` (`DATA_RETENTION_DAYS`, which is also where every `issue_occurrence_buckets` row
+ * goes). Anything retained under that longer constant would be undercounted by buckets swept at the
+ * shorter one, so it is counted exactly.
+ *
+ * What decides the rule is whether the occurrences being counted can outlive the buckets being
+ * summed, not how long the issue ROW lives. Resolved, ignored, assigned and commented system-error
+ * issues now outlive the bucket cutoff as rows (retention.ts keeps them after every occurrence has
+ * aged out), but their occurrences and their buckets are still swept at ONE shared cutoff
+ * (`cutoffDate`: the occurrence delete and the `bucket_start < cutoffDate` bucket delete), so the
+ * bucket sum stays correct for them and an aged-out kept issue reads 0 either way. They therefore
+ * stay off this rule.
  *
  * As retention.ts stands, that undercount cannot happen: the occurrence delete applies the short
  * `cutoffDate` to every issue type, and manual issues have no `error_occurrences` rows by

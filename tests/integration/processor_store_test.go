@@ -724,3 +724,58 @@ func TestStoreEvent_LevelDefaultsToError(t *testing.T) {
 		assert.Equal(t, "error", *level, "the ingestor replaces an invalid level with \"\", which is stored as error")
 	})
 }
+
+// sentinel-retention-resolved-ignored-kept contract §5.3: retention keeps a resolved issue's row after
+// every one of its occurrences has aged out. This pins that the regression path reads only the issue
+// row and `releases`, never `error_occurrences`: a resolved issue with ZERO occurrence rows, receiving
+// one event in a later release, comes back unresolved/regressed on the SAME issue id.
+func TestStoreEvent_ResolvedIssueWithZeroOccurrencesRegresses(t *testing.T) {
+	s, pool := newEIDStoreAndPoolFromEnv(t)
+	projectID := eidSeedProject(t, pool, "zero-occ-regress")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fingerprint := eidFingerprint(t, "zero-occ-regress")
+
+	// Seed through an ordinary delivery in 1.0.0 (this also writes the releases row), resolve it
+	// there, then play the retention sweep: every occurrence row is gone, the issue row stays.
+	issue0 := eidIssue(projectID, fingerprint)
+	_, stored0, err := s.StoreEvent(ctx, issue0, eidOccurrence("evt-zero-occ-seed"), "1.0.0")
+	require.NoError(t, err)
+	require.True(t, stored0)
+
+	_, err = pool.Exec(ctx,
+		`UPDATE issues SET status = 'resolved', resolved_at = now(), resolved_in_version = '1.0.0',
+		        resolved_by_type = 'user', resolved_by = 'integration-test'
+		  WHERE id = $1`, issue0.ID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `DELETE FROM error_occurrences WHERE issue_id = $1`, issue0.ID)
+	require.NoError(t, err)
+
+	var occurrences int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM error_occurrences WHERE issue_id = $1`, issue0.ID).Scan(&occurrences))
+	require.Zero(t, occurrences, "precondition: the issue has no occurrence rows left")
+
+	outcome, stored, err := s.StoreEvent(ctx, eidIssue(projectID, fingerprint),
+		eidOccurrence("evt-zero-occ-regress-"+uuid.New().String()), "2.0.0")
+	require.NoError(t, err)
+	require.True(t, stored)
+	require.Equal(t, store.IssueOutcomeRegressed, outcome)
+
+	var status, regressionStatus string
+	var regressionCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, COALESCE(regression_status, ''), regression_count FROM issues WHERE id = $1`,
+		issue0.ID).Scan(&status, &regressionStatus, &regressionCount))
+	require.Equal(t, "unresolved", status)
+	require.Equal(t, "regressed", regressionStatus)
+	require.Equal(t, 1, regressionCount)
+
+	var issueRows int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM issues WHERE project_id = $1 AND fingerprint = $2`,
+		projectID, fingerprint).Scan(&issueRows))
+	require.Equal(t, 1, issueRows, "the regression must land on the existing issue, not a new one")
+}

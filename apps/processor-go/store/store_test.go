@@ -131,3 +131,39 @@ func TestDecideRegression(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideRegression_IssueWithoutOccurrences pins that the decision needs no occurrence rows:
+// decideRegression takes only the issue's resolution columns, the two `releases` rows and the
+// incoming release. Retention (sentinel-retention-resolved-ignored-kept) keeps a resolved issue's
+// row after every occurrence has aged out, so each case below is "a resolved issue whose
+// occurrences are gone receives one event".
+func TestDecideRegression_IssueWithoutOccurrences(t *testing.T) {
+	monday := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	wednesday := monday.Add(48 * time.Hour)
+	friday := monday.Add(-72 * time.Hour)
+	resolvedAt := monday.Add(12 * time.Hour)
+	present := func(at time.Time) releaseRow { return releaseRow{present: true, firstSeen: at} }
+
+	tests := []struct {
+		name       string
+		release    string
+		resolved   string
+		resolvedAt *time.Time
+		rowR, rowX releaseRow
+		want       bool
+	}{
+		{"resolved with no version: any later event regresses", "2.0.0", "", &resolvedAt, present(wednesday), releaseRow{}, true},
+		{"resolved in 1.0.0, event in a later release", "2.0.0", "1.0.0", &resolvedAt, present(wednesday), present(monday), true},
+		{"resolved in 1.0.0, event in the same release: the fix did not land", "1.0.0", "1.0.0", &resolvedAt, present(monday), present(monday), true},
+		{"resolved in 2.0.0, event in an earlier release: not a regression", "1.0.0", "2.0.0", &resolvedAt, present(friday), present(monday), false},
+		{"resolved in next, event in a release first seen after the resolution", "2.0.0", "next", &resolvedAt, present(wednesday), releaseRow{}, true},
+		{"resolved in next, event in a release that predates the resolution", "1.0.0", "next", &resolvedAt, present(monday), releaseRow{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := decideRegression(tt.release, tt.resolved, tt.resolvedAt, tt.rowR, tt.rowX); got != tt.want {
+				t.Errorf("decideRegression(R=%q, X=%q) = %v; want %v", tt.release, tt.resolved, got, tt.want)
+			}
+		})
+	}
+}

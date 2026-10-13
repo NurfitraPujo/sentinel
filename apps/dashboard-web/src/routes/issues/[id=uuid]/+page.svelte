@@ -148,8 +148,23 @@
 	// Decision 16: below 30 days of retention the leading days are zero by construction and the day
 	// the cutoff falls in is partial; the heading says so, after the sum. `retentionDays` is page
 	// data (affected-users decision 21) — never a literal 30 here.
+	// The label stays "Last 30 days (UTC)" at every retention: the chart always draws 30 daily bars,
+	// so the label describes that axis and this suffix names the window the data actually covers.
 	let dailyHeadingSuffix = $derived(
 		data.retentionDays < 30 ? ` (data kept for ${data.retentionDays} days)` : ''
+	);
+
+	// Retention keeps resolved / ignored / assigned / commented issues after their occurrences have
+	// aged out, so `issues.count` (lifetime) can exceed what is still retained.
+	let retainedTotal = $derived(Number(data.occurrenceTotal ?? data.occurrences.length));
+	let occurrencesAgedOut = $derived(
+		data.issue.issueType !== 'user_report' &&
+			data.occurrences.length === 0 && retainedTotal === 0 && Number(data.issue.count) > 0
+	);
+	let partiallyAgedOut = $derived(
+		data.issue.issueType !== 'user_report' &&
+			!occurrencesAgedOut &&
+			retainedTotal < Number(data.issue.count)
 	);
 
 	// The frame as the JSONB stores it. `column`, `symbolicated` and `raw` are sentinel-sourcemaps
@@ -774,7 +789,12 @@
 			heading now carries the loader's real `COUNT(*)` and the line below says how many of them
 			are actually listed, so the two numbers can differ on screen without either one lying.
 		-->
-		<h2 class="section-title">Occurrence History ({Number(data.occurrenceTotal ?? data.occurrences.length).toLocaleString()})</h2>
+		<h2 class="section-title">Occurrence History ({occurrencesAgedOut ? `${Number(data.issue.count).toLocaleString()} total` : retainedTotal.toLocaleString()})</h2>
+		{#if occurrencesAgedOut}
+			<p class="occurrence-window" data-testid="occurrences-aged-out">Occurrences older than {data.retentionDays} days have been removed.</p>
+		{:else if partiallyAgedOut}
+			<p class="occurrence-window" data-testid="occurrences-partially-aged-out">{retainedTotal.toLocaleString()} retained from the last {data.retentionDays} days, of {Number(data.issue.count).toLocaleString()} total.</p>
+		{/if}
 		{#if data.spansFilter}
 			<!-- sentinel-occurrence-spans TASK-01: a plain link, so the filter is a URL (shareable, back-button safe). -->
 			<p class="spans-filter" data-testid="spans-filter">
