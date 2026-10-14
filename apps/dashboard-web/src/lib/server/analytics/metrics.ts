@@ -263,7 +263,7 @@ export interface ChangeFailureRow extends CountRow {
  * (project, environment, version), over all history.
  */
 export async function changeFailure(c: MetricCtx, w: Window): Promise<ChangeFailureRow[]> {
-	const rows = await c.run(`
+	const step1Rows = await c.run(`
 		WITH occ_rel AS (
 		  SELECT ${OCC_SELECT}, o.release_version AS v, min(o.created_at) AS start_at
 		  FROM error_occurrences o WHERE o.release_version IS NOT NULL
@@ -274,29 +274,96 @@ export async function changeFailure(c: MetricCtx, w: Window): Promise<ChangeFail
 		  WHERE ${BASE_ISSUES} AND ${accessPredicate(c.access, 'i.project_id', 'o.environment')}
 		  GROUP BY i.project_id, o.environment, o.v
 		  HAVING min(o.start_at) >= ${tsLiteral(w.from)} AND min(o.start_at) < ${tsLiteral(w.to)}
-		), cand AS (
-		  -- an issue has one first_release_version, so it matches at most one rel row: start_at is per issue
-		  SELECT r.project_id AS project_id, r.environment AS environment, r.v AS v, i.id AS issue_id, r.start_at AS start_at
-		  FROM rel r
-		  JOIN issues i ON i.project_id = r.project_id AND i.environment = r.environment AND i.first_release_version = r.v AND ${BASE_ISSUES}
-		), occ24 AS (
-		  -- only the candidates' occurrences, inside the span of all their 24 h windows, reach the join below
-		  SELECT o.issue_id AS issue_id, o.created_at AS created_at, o.event_user AS event_user
-		  FROM error_occurrences o
-		  WHERE o.issue_id IN (SELECT issue_id FROM cand)
-		    AND o.created_at >= (SELECT min(start_at) FROM cand) AND o.created_at < add_hours((SELECT max(start_at) FROM cand), 24)
-		), bad AS (
-		  SELECT r.project_id AS project_id, r.environment AS environment, r.v AS v
-		  FROM cand r
-		  JOIN occ24 o ON o.issue_id = r.issue_id AND o.created_at >= r.start_at AND o.created_at < add_hours(r.start_at, 24)
-		  GROUP BY r.project_id, r.environment, r.v, r.issue_id
-		  HAVING count(*) >= 10 OR count(DISTINCT o.event_user['id']::String) >= 3
 		)
-		SELECT r.project_id, r.environment, count(*) AS n, count_if(b.v IS NOT NULL) AS failed
-		FROM rel r LEFT JOIN (SELECT DISTINCT project_id, environment, v FROM bad) b
-		  ON b.project_id = r.project_id AND b.environment = r.environment AND b.v = r.v
-		GROUP BY r.project_id, r.environment`);
-	return rows.map((r) => ({ projectId: r[0]!, environment: r[1]!, n: n(r[2]), failed: n(r[3]) }));
+		SELECT r.project_id, r.environment, r.v, r.start_at, i.id AS issue_id
+		FROM rel r
+		LEFT JOIN issues i ON i.project_id = r.project_id AND i.environment = r.environment AND i.first_release_version = r.v AND ${BASE_ISSUES}`);
+
+	if (step1Rows.length === 0) return [];
+
+	const parse = (s: string | null | undefined) =>
+		s ? new Date(s.replace(' ', 'T') + (s.includes('Z') || /[+-]\d\d:?\d\d$/.test(s) ? '' : 'Z')) : new Date(0);
+
+	const relsByPE = new Map<string, Set<string>>();
+	const candByIssue = new Map<string, { projectId: string; environment: string; version: string; startAt: Date; end24: Date }>();
+
+	for (const r of step1Rows) {
+		const peKey = `${r[0]}|${r[1]}`;
+		let vSet = relsByPE.get(peKey);
+		if (!vSet) {
+			vSet = new Set();
+			relsByPE.set(peKey, vSet);
+		}
+		vSet.add(r[2]!);
+
+		if (r[4]) {
+			const startAt = parse(r[3]);
+			const end24 = new Date(startAt.getTime() + 24 * 3_600_000);
+			candByIssue.set(r[4], {
+				projectId: r[0]!,
+				environment: r[1]!,
+				version: r[2]!,
+				startAt,
+				end24,
+			});
+		}
+	}
+
+	const failedReleases = new Set<string>();
+	const allCandList = [...candByIssue.entries()];
+
+	const BATCH_SIZE = 150;
+	for (let i = 0; i < allCandList.length; i += BATCH_SIZE) {
+		const chunk = allCandList.slice(i, i + BATCH_SIZE).filter(([_, cand]) => {
+			return !failedReleases.has(`${cand.projectId}|${cand.environment}|${cand.version}`);
+		});
+		if (chunk.length === 0) continue;
+
+		const starts = chunk.map(([_, cand]) => cand.startAt.getTime());
+		const ends = chunk.map(([_, cand]) => cand.end24.getTime());
+		const minStart = new Date(Math.min(...starts));
+		const maxEnd = new Date(Math.max(...ends));
+		const ids = chunk.map(([id]) => id);
+
+		const rows = await c.run(`
+			SELECT o.issue_id, o.created_at, o.event_user['id']::String AS uid
+			FROM error_occurrences o
+			WHERE o.issue_id IN (${enumList(ids, ids)})
+			  AND o.created_at >= ${tsLiteral(minStart)} AND o.created_at < ${tsLiteral(maxEnd)}`);
+
+		const issueStats = new Map<string, { count: number; users: Set<string> }>();
+		for (const row of rows) {
+			const issueId = row[0];
+			if (!issueId) continue;
+			const cand = candByIssue.get(issueId);
+			if (!cand) continue;
+			const createdAt = parse(row[1]);
+			if (createdAt >= cand.startAt && createdAt < cand.end24) {
+				let stats = issueStats.get(issueId);
+				if (!stats) {
+					stats = { count: 0, users: new Set() };
+					issueStats.set(issueId, stats);
+				}
+				stats.count++;
+				if (row[2]) stats.users.add(row[2]);
+
+				if (stats.count >= 10 || stats.users.size >= 3) {
+					failedReleases.add(`${cand.projectId}|${cand.environment}|${cand.version}`);
+				}
+			}
+		}
+	}
+
+	const result: ChangeFailureRow[] = [];
+	for (const [peKey, versions] of relsByPE.entries()) {
+		const [projectId, environment] = peKey.split('|');
+		let failed = 0;
+		for (const v of versions) {
+			if (failedReleases.has(`${projectId}|${environment}|${v}`)) failed++;
+		}
+		result.push({ projectId: projectId!, environment: environment!, n: versions.size, failed });
+	}
+	return result;
 }
 
 export interface ReleaseWindow {
@@ -321,7 +388,10 @@ const zeroGroups = (): Record<Group, number> => ({ api: 0, jobs: 0, nats: 0, oth
 export async function releaseWindows(c: MetricCtx, now: Date, limitPerProjectEnv: number): Promise<ReleaseWindow[]> {
 	if (!Number.isInteger(limitPerProjectEnv) || limitPerProjectEnv < 1 || limitPerProjectEnv > 50) throw new Error('bad release limit');
 	const nowLit = tsLiteral(now);
-	const rows = await c.run(`
+	const parse = (s: string | null | undefined) =>
+		s ? new Date(s.replace(' ', 'T') + (s.includes('Z') || /[+-]\d\d:?\d\d$/.test(s) ? '' : 'Z')) : new Date(0);
+
+	const topRows = await c.run(`
 		WITH occ_rel AS (
 		  SELECT ${OCC_SELECT}, o.release_version AS v, min(o.created_at) AS start_at
 		  FROM error_occurrences o WHERE o.release_version IS NOT NULL
@@ -336,48 +406,87 @@ export async function releaseWindows(c: MetricCtx, now: Date, limitPerProjectEnv
 		    coalesce(lead(start_at) OVER (PARTITION BY project_id, environment ORDER BY start_at), ${nowLit}) AS end_at,
 		    row_number() OVER (PARTITION BY project_id, environment ORDER BY start_at DESC) AS rk
 		  FROM starts
-		), top AS (SELECT * FROM wins WHERE rk <= ${limitPerProjectEnv}),
-		occ_top AS (
-		  -- only the shown releases' occurrences, from the earliest shown window start, reach the join below
-		  SELECT o.issue_id AS issue_id, o.environment AS environment, o.release_version AS release_version, o.created_at AS created_at,
-		    o.request_scoped AS request_scoped, o.tag_source AS tag_source, o.service AS service
-		  FROM error_occurrences o
-		  WHERE o.release_version IN (SELECT v FROM top) AND o.created_at >= (SELECT min(start_at) FROM top)
-		    AND o.issue_id IN (SELECT i.id FROM issues i WHERE ${BASE_ISSUES} AND i.project_id IN (SELECT project_id FROM top))
 		)
-		SELECT t.project_id, t.environment, t.v, t.start_at, t.end_at, 'ev' AS kind, ${groupCase(c.httpServices)} AS grp, count(*) AS n
-		FROM top t
-		JOIN issues i ON i.project_id = t.project_id AND ${BASE_ISSUES}
-		JOIN occ_top o ON o.issue_id = i.id AND o.environment = t.environment AND o.release_version = t.v
-		  AND o.created_at >= t.start_at AND o.created_at < t.end_at
-		GROUP BY t.project_id, t.environment, t.v, t.start_at, t.end_at, grp
-		UNION ALL
-		SELECT t.project_id, t.environment, t.v, t.start_at, t.end_at, 'new', '', count(*)
-		FROM top t JOIN issues i ON i.project_id = t.project_id AND i.environment = t.environment AND i.first_release_version = t.v AND ${BASE_ISSUES}
-		  AND i.first_seen >= t.start_at AND i.first_seen < t.end_at
-		GROUP BY t.project_id, t.environment, t.v, t.start_at, t.end_at
-		UNION ALL
-		SELECT t.project_id, t.environment, t.v, t.start_at, t.end_at, 'reg', '', count(*)
-		FROM top t JOIN issues i ON i.project_id = t.project_id AND i.environment = t.environment AND ${BASE_ISSUES}
-		JOIN issue_activity a ON a.issue_id = i.id AND a.event_type = 'regressed' AND a.new_value['releaseVersion']::String = t.v
-		  AND a.created_at >= t.start_at AND a.created_at < t.end_at
-		GROUP BY t.project_id, t.environment, t.v, t.start_at, t.end_at
-		UNION ALL
-		SELECT project_id, environment, v, start_at, end_at, 'win', '', 0 FROM top`);
+		SELECT project_id, environment, v, start_at, end_at FROM wins WHERE rk <= ${limitPerProjectEnv}
+		ORDER BY start_at DESC`);
+
+	if (topRows.length === 0) return [];
+
 	const byKey = new Map<string, ReleaseWindow>();
-	const parse = (s: string) => new Date(s.replace(' ', 'T') + (s.includes('Z') || /[+-]\d\d:?\d\d$/.test(s) ? '' : 'Z'));
-	for (const r of rows) {
+	for (const r of topRows) {
 		const key = `${r[0]}|${r[1]}|${r[2]}`;
-		let w = byKey.get(key);
-		if (!w) {
-			w = { projectId: r[0]!, environment: r[1]!, version: r[2]!, start: parse(r[3]!), end: parse(r[4]!), events: zeroGroups(), newIssues: 0, regressions: 0 };
-			byKey.set(key, w);
-		}
-		const kind = r[5];
-		if (kind === 'ev') w.events[r[6] as Group] += n(r[7]);
-		else if (kind === 'new') w.newIssues += n(r[7]);
-		else if (kind === 'reg') w.regressions += n(r[7]);
+		byKey.set(key, {
+			projectId: r[0]!,
+			environment: r[1]!,
+			version: r[2]!,
+			start: parse(r[3]),
+			end: parse(r[4]),
+			events: zeroGroups(),
+			newIssues: 0,
+			regressions: 0,
+		});
 	}
+
+	const versions = [...new Set(topRows.map((r) => r[2]!))];
+	const starts = topRows.map((r) => parse(r[3]).getTime());
+	const ends = topRows.map((r) => parse(r[4]).getTime());
+	const minStart = new Date(Math.min(...starts));
+	const maxEnd = new Date(Math.max(...ends));
+
+	const orClauses = topRows.map((r) => {
+		const pid = uuidLiteral(r[0]!);
+		const env = enumLiteral(r[1]!, [r[1]!]);
+		const ver = enumLiteral(r[2]!, [r[2]!]);
+		const endAt = tsLiteral(parse(r[4]));
+		return `(i.project_id = ${pid} AND o.environment = ${env} AND o.release_version = ${ver} AND o.created_at < ${endAt})`;
+	});
+
+	const [evRows, newRows, regRows] = await Promise.all([
+		c.run(`
+			SELECT i.project_id, o.environment, o.release_version, ${groupCase(c.httpServices)} AS grp, count(*) AS n
+			FROM error_occurrences o
+			JOIN issues i ON i.id = o.issue_id
+			WHERE o.release_version IN (${enumList(versions, versions)})
+			  AND o.created_at >= ${tsLiteral(minStart)} AND o.created_at < ${tsLiteral(maxEnd)}
+			  AND ${BASE_ISSUES}
+			  AND (${orClauses.join(' OR ')})
+			GROUP BY i.project_id, o.environment, o.release_version, grp`),
+		c.run(`
+			SELECT i.project_id, i.environment, i.first_release_version, i.first_seen
+			FROM issues i
+			WHERE ${BASE_ISSUES} AND i.first_release_version IN (${enumList(versions, versions)})`),
+		c.run(`
+			SELECT i.project_id, i.environment, a.new_value['releaseVersion']::String AS v, a.created_at
+			FROM issue_activity a
+			JOIN issues i ON i.id = a.issue_id
+			WHERE ${BASE_ISSUES} AND a.event_type = 'regressed'
+			  AND a.new_value['releaseVersion']::String IN (${enumList(versions, versions)})`),
+	]);
+
+	for (const r of evRows) {
+		const key = `${r[0]}|${r[1]}|${r[2]}`;
+		const w = byKey.get(key);
+		if (w) w.events[r[3] as Group] += n(r[4]);
+	}
+
+	for (const r of newRows) {
+		const key = `${r[0]}|${r[1]}|${r[2]}`;
+		const w = byKey.get(key);
+		if (w) {
+			const fs = parse(r[3]);
+			if (fs >= w.start && fs < w.end) w.newIssues += 1;
+		}
+	}
+
+	for (const r of regRows) {
+		const key = `${r[0]}|${r[1]}|${r[2]}`;
+		const w = byKey.get(key);
+		if (w) {
+			const ca = parse(r[3]);
+			if (ca >= w.start && ca < w.end) w.regressions += 1;
+		}
+	}
+
 	return [...byKey.values()].sort((a, b) => b.start.getTime() - a.start.getTime());
 }
 
