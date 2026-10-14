@@ -151,7 +151,10 @@ config:
     authTrustHost: "true"
     # Kept on daya.ai for now (verified SES identity); rebrand at cutover.
     emailFrom: "noreply@daya.ai"
-    dataRetentionDays: "30"
+    # Occurrence retention is being stepped down 30 -> 14 -> 7 by operator decision 2026-10-13. Resolved, ignored,
+    # assigned and commented issues are kept forever since v0.2.71; only raw occurrences, buckets and rollups age
+    # out. Step 2 (14 -> 7) follows once the backlog from step 1 has drained.
+    dataRetentionDays: "14"
     reportMatchWindowMinutes: "30"
     escalationAckMinutes: "15"
     escalationMaxHops: "3"
