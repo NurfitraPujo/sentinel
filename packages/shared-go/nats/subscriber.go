@@ -307,16 +307,42 @@ func (s *Subscriber) Subscribe(ctx context.Context, handler func(ctx context.Con
 	return nil
 }
 
+type deliveryCountKey struct{}
+
+// WithDeliveryCount returns ctx carrying the JetStream delivery count of the message being handled
+// (1 on the first delivery). The subscriber sets it on the context it hands to every handler, so a
+// handler that wants a bounded number of retries on top of the delayed-Nak path (sentinel-grouping-v2
+// §5.2) can read how many it has already had without a second source of truth.
+func WithDeliveryCount(ctx context.Context, n uint64) context.Context {
+	return context.WithValue(ctx, deliveryCountKey{}, n)
+}
+
+// DeliveryCountFromContext reports the delivery count set by WithDeliveryCount; ok is false for a
+// context that never passed through the subscriber (a direct call from a test).
+func DeliveryCountFromContext(ctx context.Context) (n uint64, ok bool) {
+	n, ok = ctx.Value(deliveryCountKey{}).(uint64)
+	return n, ok
+}
+
 // handleMessage runs handler against a single delivered message and decides
 // between Ack, Nak (retry), and dead-lettering based on the handler's error
 // (and whether it is a PermanentError) and the message's delivery count.
 func (s *Subscriber) handleMessage(ctx context.Context, msg *nats.Msg, handler func(ctx context.Context, data []byte, headers Header) error) {
 	numDelivered := uint64(1)
+	countKnown := false
 	if meta, metaErr := msg.Metadata(); metaErr == nil && meta != nil {
 		numDelivered = meta.NumDelivered
+		countKnown = true
 	}
 
-	err := handler(ctx, msg.Data, msg.Header)
+	// When the metadata is unavailable the count is UNKNOWN, not 1: the handler's context carries no
+	// delivery count, so a bounded-retry handler (sentinel-grouping-v2 §5.2) skips its retry instead
+	// of retrying on every redelivery. numDelivered stays 1 for the backoff and DLQ bookkeeping below.
+	hctx := ctx
+	if countKnown {
+		hctx = WithDeliveryCount(ctx, numDelivered)
+	}
+	err := handler(hctx, msg.Data, msg.Header)
 	if err == nil {
 		msg.Ack()
 		return

@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -149,7 +150,7 @@ func (symbolicationObserver) FetchDuration(d time.Duration) {
 // (the skipped_* reason, or the derivation of the frames' outcomes), one frames_total per frame
 // the gate admitted. projectID is ResolveProjectID's return, never anything from a frame. It
 // never fails the event (D7).
-func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEvent, projectID string) {
+func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEvent, projectID string) (transient bool) {
 	ok, skipped := symbolicate.Gate(s.symPlatforms, evt.Platform, evt.ReleaseVersion, len(evt.Stacktrace))
 	if !ok || s.symbolicator == nil {
 		if ok {
@@ -158,10 +159,21 @@ func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEven
 			skipped = symbolicate.EventSkippedPlatform
 		}
 		procmetrics.RecordSymbolicationEvent(ctx, string(skipped))
-		return
+		return false
+	}
+	// A redelivery (delivery count > 1) exists to try a failed lookup again, so it must not be
+	// answered from the negative cache for the fetch_error the previous delivery cached
+	// (sentinel-grouping-v2 §5.2; no_map and the other permanent answers stay cached). The bypass
+	// is for delivery 2 ONLY: delivery 3 uses the normal cache, so a persistent storage outage costs
+	// at most ONE uncached fetch per event (the retry), not one per redelivery.
+	if n, ok := nats.DeliveryCountFromContext(ctx); ok && n == 2 {
+		ctx = symbolicate.WithRetryFetchError(ctx)
 	}
 	res := evt.Symbolicate(ctx, s.symbolicator, projectID)
 	for i, o := range res.Outcomes {
+		if o == symbolicate.OutcomeTimeout || o == symbolicate.OutcomeFetchError {
+			transient = true
+		}
 		procmetrics.RecordSymbolicationFrame(ctx, string(o))
 		// turbopack-grouping §4.2's counter, one per frame in THIS loop so it sums to
 		// frames_total by construction (P9). Read off the post-copy frame: an applied frame
@@ -176,6 +188,30 @@ func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEven
 		procmetrics.RecordInAppRederived(ctx, to, changed)
 	}
 	procmetrics.RecordSymbolicationEvent(ctx, string(res.EventOutcome()))
+	return transient
+}
+
+// MaxSymbolicationRetries is sentinel-grouping-v2 §5.2's per-message budget: an event whose
+// source-map lookup ended timeout or fetch_error is returned to JetStream for the subscriber's
+// delayed Nak (1s, then 5s) at most this many times before it is processed with whatever hash its
+// frames give. Delivery N has spent N-1 retries, so the third delivery is processed regardless.
+const MaxSymbolicationRetries = 2
+
+// errSymbolicationRetry is the transient (non-Permanent) error that asks the subscriber to
+// redeliver; ProcessEvent classifies it as a retried delivery.
+var errSymbolicationRetry = errors.New("symbolication timeout or fetch error: event returned to NATS for delayed redelivery")
+
+// outcomeSymbolicationRetry is the log and span attribute value that tells a deliberate retry from a
+// failure: the delayed redelivery is the design working, not a store error, so withSpan records it
+// as an attribute and leaves the span's status alone. The process_total metric still counts the
+// delivery as obs.OutcomeRetried (it was returned to NATS), which keeps that metric's invariant.
+const outcomeSymbolicationRetry = "symbolication_retry"
+
+// shouldRetrySymbolication reports whether this delivery may still be redelivered. A context that
+// carries no delivery count (a direct call, not the subscriber) never retries.
+func shouldRetrySymbolication(ctx context.Context) bool {
+	n, ok := nats.DeliveryCountFromContext(ctx)
+	return ok && n >= 1 && n <= MaxSymbolicationRetries
 }
 
 // ProcessEvent is the entry point the NATS subscriber calls per message. Its
@@ -273,6 +309,10 @@ func withSpan(ctx context.Context, name string, fn func(ctx context.Context) err
 	spanCtx, span := tracer.Start(ctx, name)
 	defer span.End()
 	if err := fn(spanCtx); err != nil {
+		if errors.Is(err, errSymbolicationRetry) {
+			span.SetAttributes(attribute.String("processor.outcome", outcomeSymbolicationRetry))
+			return err
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return err
@@ -373,10 +413,22 @@ func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte
 		// then does the issue take its identity and the occurrence its JSONB. A client fingerprint
 		// without override survives verbatim through ComputeFingerprint's early return, frames
 		// rewritten or not (flow S7).
+		var symbolicationTransient bool
 		_ = withSpan(ctx, "processor.symbolicate", func(ctx context.Context) error {
-			s.symbolicate(ctx, evt, projectID)
+			symbolicationTransient = s.symbolicate(ctx, evt, projectID)
 			return nil
 		})
+		// sentinel-grouping-v2 §1.4: a minified-frame hash taken because the map was merely not
+		// ready would become a ghost issue per release. Only a server-computed identity depends on
+		// the frames, so a client fingerprint (without override) is never delayed. Nothing has been
+		// written yet, so redelivery is safe.
+		if symbolicationTransient && (evt.Fingerprint == "" || evt.FingerprintOverride) && shouldRetrySymbolication(ctx) {
+			delivery, _ := nats.DeliveryCountFromContext(ctx)
+			slog.InfoContext(ctx, "Symbolication incomplete; requesting delayed redelivery",
+				slog.String("outcome", outcomeSymbolicationRetry), slog.Uint64("delivery", delivery),
+				slog.Int("max_retries", MaxSymbolicationRetries))
+			return errSymbolicationRetry
+		}
 		evt.ComputeFingerprint(s.symPlatforms)
 		issue.Fingerprint = evt.Fingerprint
 		occ.Stacktrace, _ = json.Marshal(evt.Stacktrace)

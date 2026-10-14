@@ -492,6 +492,13 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 	if e.Fingerprint != "" && !e.FingerprintOverride {
 		return
 	}
+	e.Fingerprint = fingerprint.Compute(e.FingerprintInput(normalisePlatforms))
+}
+
+// FingerprintInput is the configuration ComputeFingerprint hands to fingerprint.Compute, exposed so
+// the grouping evidence (docs/audits/grouping-v2-evidence.md) can run other frame limits over the
+// very same input. It does not consult the client's fingerprint.
+func (e *ErrorEvent) FingerprintInput(normalisePlatforms []string) fingerprint.FingerprintConfig {
 	frames := make([]fingerprint.StackFrame, len(e.Stacktrace))
 	for i, f := range e.Stacktrace {
 		frames[i] = fingerprint.StackFrame{
@@ -504,7 +511,7 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 			Symbolicated: f.Symbolicated,
 		}
 	}
-	e.Fingerprint = fingerprint.Compute(fingerprint.FingerprintConfig{
+	return fingerprint.FingerprintConfig{
 		// sentinel-project-environments §4.9: the environment is part of issue identity, so it is
 		// part of the hash input.
 		Environment: e.Environment,
@@ -514,10 +521,11 @@ func (e *ErrorEvent) ComputeFingerprint(normalisePlatforms []string) {
 		// are byte-identical (tests/unit/fingerprint_golden_test.go, whose normalizable-class fixture
 		// goes red if this call is removed).
 		ErrorClass:         normalizer.NewNormalizer().NormalizeString(e.ErrorClass),
+		Message:            e.Message,
 		Stacktrace:         frames,
 		Platform:           e.Platform,
 		NormalisePlatforms: normalisePlatforms,
-	})
+	}
 }
 
 // Symbolicate runs sentinel-sourcemaps §4.4's stage over this event's frames and writes the

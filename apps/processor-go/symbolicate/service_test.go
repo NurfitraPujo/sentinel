@@ -369,7 +369,7 @@ func TestSymbolicate_SourcelessSegmentIsNoMapping(t *testing.T) {
 		t.Fatalf("line past the map: %s, want no_mapping", res.Outcomes[0])
 	}
 	// no_mapping is never negatively cached: the map is fine.
-	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, "/sourceless.js"}); ok {
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, "/sourceless.js"}, false); ok {
 		t.Fatal("no_mapping must not write a negative entry")
 	}
 }
@@ -620,11 +620,11 @@ func TestSymbolicate_IndexMap(t *testing.T) {
 				if h.fetcher.calls.Load() != fetchesBefore {
 					t.Fatal("no_map: nothing was stored for the stub, so nothing is fetched")
 				}
-				if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}); !ok || reason != OutcomeNoMap {
+				if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}, false); !ok || reason != OutcomeNoMap {
 					t.Fatalf("negative entry = (%s, %v); want no_map (negatively cached as today)", reason, ok)
 				}
 			case OutcomeNoSection, OutcomeNoMapping:
-				if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}); ok {
+				if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, c.path}, false); ok {
 					t.Fatalf("%s must not be negatively cached: the map is fine", c.outcome)
 				}
 			}
@@ -657,7 +657,7 @@ func TestSymbolicate_IndexMap_NoSectionThenApplied(t *testing.T) {
 	if frames[1].File != "turbopack:///[turbopack]/nodejs/runtime.ts" || frames[1].Line != 77 || frames[1].Column != 7 || frames[1].InApp {
 		t.Fatalf("I8 after a no_section on the same map: %+v", frames[1])
 	}
-	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexRuntimePath}); ok {
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexRuntimePath}, false); ok {
 		t.Fatal("no_section must not be negatively cached")
 	}
 	if OutcomeNoSection.negativelyCacheable() {
@@ -728,7 +728,7 @@ func TestSymbolicate_IndexMap_ZeroSectionsIsNoSection(t *testing.T) {
 	if res.Outcomes[0] != OutcomeNoSection || res.Outcomes[1] != OutcomeNoSection {
 		t.Fatalf("%v, want [no_section no_section]", res.Outcomes)
 	}
-	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexStubPathMin}); ok {
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, indexStubPathMin}, false); ok {
 		t.Fatal("a valid zero-section parse is not negatively cached")
 	}
 	if _, cached := h.svc.cache.pos["map-stub-by-hand"]; !cached {
@@ -767,7 +767,7 @@ func TestSymbolicate_IndexMap_ParseErrorsAreMapError(t *testing.T) {
 			if res.Outcomes[1] != OutcomeApplied || frames[1].Line != 77 {
 				t.Fatalf("the good index map's frame must still symbolicate: %s %+v", res.Outcomes[1], frames[1])
 			}
-			if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, path}); !ok || reason != OutcomeMapError {
+			if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, path}, false); !ok || reason != OutcomeMapError {
 				t.Fatalf("negative entry = (%s, %v); want map_error", reason, ok)
 			}
 		})
@@ -882,7 +882,7 @@ func TestSymbolicate_CraftedMapRecoversAsMapError(t *testing.T) {
 			if frames[0].Symbolicated || frames[0].File != path {
 				t.Fatalf("crafted map frame must pass through untouched: %+v", frames[0])
 			}
-			if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, path}); !ok || reason != OutcomeMapError {
+			if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, path}, false); !ok || reason != OutcomeMapError {
 				t.Fatalf("negative entry = (%s, %v); want map_error", reason, ok)
 			}
 			negHits := h.obs.count(CacheNegativeHit)
@@ -1031,7 +1031,7 @@ func TestSymbolicate_TimeoutWithBackgroundFill(t *testing.T) {
 	if frames[0].Symbolicated || frames[0].File != fixturePath {
 		t.Fatal("a timeout frame passes through untouched")
 	}
-	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, fixturePath}); ok {
+	if _, ok := h.svc.cache.negative(negKey{projectA, releaseR, fixturePath}, false); ok {
 		t.Fatal("timeout must never write a negative entry")
 	}
 	if h.fetcher.calls.Load() != 1 {
@@ -1096,7 +1096,7 @@ func TestSymbolicate_ParseCapNeverFetches(t *testing.T) {
 	if h.fetcher.calls.Load() != 0 {
 		t.Fatalf("fetcher called %d times; an oversize row is never fetched", h.fetcher.calls.Load())
 	}
-	if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, fixturePath}); !ok || reason != OutcomeOversize {
+	if reason, ok := h.svc.cache.negative(negKey{projectA, releaseR, fixturePath}, false); !ok || reason != OutcomeOversize {
 		t.Fatalf("negative entry = (%s, %v), want oversize", reason, ok)
 	}
 	if h.store.callCount() != 1 || h.obs.count(CacheNegativeHit) < 1 {
@@ -1291,5 +1291,47 @@ func TestParseConfig(t *testing.T) {
 	}
 	if _, err := New(Config{}, newStubStore(), &stubFetcher{}); err == nil {
 		t.Fatal("New must refuse a zero Config")
+	}
+}
+
+// WithRetryFetchError (sentinel-grouping-v2 R2): a redelivery bypasses a negatively cached
+// fetch_error and fetches again; the same context does not bypass no_map, and a failure on the retry
+// is cached afresh.
+func TestSymbolicate_RetryBypassesFetchErrorNegativeEntry(t *testing.T) {
+	retry := WithRetryFetchError(context.Background())
+	run := func(h *harness, ctx context.Context) Outcome {
+		return h.svc.Symbolicate(ctx, projectA, releaseR, []Frame{frame(fixturePath, 1, 10)}).Outcomes[0]
+	}
+
+	h := newHarness(t, nil)
+	h.seedFixture(t)
+	h.fetcher.err = errors.New("connection refused")
+	if got := run(h, context.Background()); got != OutcomeFetchError {
+		t.Fatalf("first: %s", got)
+	}
+	h.fetcher.err = nil
+	if got := run(h, context.Background()); got != OutcomeFetchError {
+		t.Fatalf("without the retry mark the entry stands: %s", got)
+	}
+	if got := run(h, retry); got != OutcomeApplied {
+		t.Fatalf("with the retry mark: %s, want applied", got)
+	}
+
+	h = newHarness(t, nil)
+	h.seedFixture(t)
+	h.fetcher.err = errors.New("still down")
+	run(h, context.Background())
+	if got := run(h, retry); got != OutcomeFetchError {
+		t.Fatalf("a retry that fails again: %s", got)
+	}
+	h.fetcher.err = nil
+	if got := run(h, context.Background()); got != OutcomeFetchError {
+		t.Fatalf("the failed retry must be cached afresh: %s", got)
+	}
+
+	h = newHarness(t, nil) // no row at all: no_map
+	run(h, context.Background())
+	if got := run(h, retry); got != OutcomeNoMap || h.store.callCount() != 1 {
+		t.Fatalf("no_map under the retry mark: %s after %d lookups; it is permanent and stays cached", got, h.store.callCount())
 	}
 }

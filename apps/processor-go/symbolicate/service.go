@@ -73,6 +73,22 @@ func (o Outcome) negativelyCacheable() bool {
 	return false
 }
 
+type retryFetchErrorKey struct{}
+
+// WithRetryFetchError marks ctx as a redelivery of an event whose lookup ended `fetch_error`
+// (sentinel-grouping-v2 §5.2): the stage ignores a negatively cached `fetch_error` for the triples
+// it looks up, so the retry can actually fetch again instead of being answered from the cache for
+// the rest of NegativeTTL. `no_map`, `map_error` and `oversize` stay cached (they are permanent
+// answers), and a fresh failure is cached again as usual.
+func WithRetryFetchError(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryFetchErrorKey{}, true)
+}
+
+func retryFetchErrorFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(retryFetchErrorKey{}).(bool)
+	return v
+}
+
 // Frame is the stage's own view of a stack frame. The caller copies event.StackFrame in, calls
 // Symbolicate, and copies out File/Line/Column/Function plus -- only when Symbolicated -- InApp
 // and the `symbolicated: true` and `raw` keys of §4.4 step 6. A frame that passed through has
@@ -375,7 +391,7 @@ func (s *Service) resolveGroup(row *Sourcemap, pm *parsedMap, frames []Frame, in
 // fill. It returns the parsed map with OutcomeApplied, or the pass-through reason for every frame
 // on the path.
 func (s *Service) lookup(ctx context.Context, k negKey) (*Sourcemap, *parsedMap, Outcome) {
-	if reason, ok := s.cache.negative(k); ok {
+	if reason, ok := s.cache.negative(k, retryFetchErrorFrom(ctx)); ok {
 		return nil, nil, reason
 	}
 	if row, pm, ok := s.cache.get(k); ok {

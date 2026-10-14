@@ -162,15 +162,16 @@ func (c *cache) removeLocked(e *posEntry) {
 }
 
 // negative returns the reason a triple was negatively cached with, counting a negative hit; an
-// expired entry is dropped and reads as absent.
-func (c *cache) negative(k negKey) (Outcome, bool) {
+// expired entry is dropped and reads as absent. retryFetchError drops a `fetch_error` entry too
+// (and counts no hit): the caller is a redelivery that exists to try the fetch again.
+func (c *cache) negative(k negKey, retryFetchError bool) (Outcome, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.neg[k]
 	if !ok {
 		return "", false
 	}
-	if !c.now().Before(e.expires) {
+	if !c.now().Before(e.expires) || (retryFetchError && e.reason == OutcomeFetchError) {
 		delete(c.neg, k)
 		return "", false
 	}

@@ -9,10 +9,6 @@ import (
 	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
 )
 
-const (
-	MaxAppFrames = 3
-)
-
 type FingerprintConfig struct {
 	CustomFingerprint string
 	// Environment is folded into the hash input (sentinel-project-environments §4.9) so the
@@ -22,16 +18,19 @@ type FingerprintConfig struct {
 	// the mechanism is the UNIQUE (project_id, environment, fingerprint) constraint.
 	Environment string
 	ErrorClass  string
-	Stacktrace  []StackFrame
+	// Message is the event's message; it joins the hash input only when the stack cannot decide
+	// (no usable frame, or a wrapper on top), after NormalizeMessage.
+	Message    string
+	Stacktrace []StackFrame
 	// Platform is the event's platform (sentinel-sourcemaps §4.4, "Fingerprint input
 	// normalisation"): when it is in NormalisePlatforms, every frame's File is passed through
 	// symbolicate.NormalizePath and — for a frame symbolication did not rewrite (decision 44) —
 	// the basename and directory rules of NormalizeHashInput, INSIDE Compute only, so a
 	// build-hash-renamed chunk hashes to the same identity across builds. The stored frame is
 	// untouched. Outside the set (Go, Python, an empty Platform) the
-	// hash input is byte-identical to what it was before the field existed, which is why every
-	// pre-feature issue of those platforms keeps its fingerprint (decision 7 of
-	// sentinel-project-environments had to guard a migration against exactly that kind of split).
+	// path normalisation does not run, but those platforms are NOT byte-identical to the
+	// pre-feature hash: v2 adds the version prefix, hashes up to MaxFrames frames, skips library
+	// frames and may add the normalised message, so they regroup once at the v2 reset.
 	Platform string
 	// NormalisePlatforms is the gate set — symbolicate.Config.Platforms, i.e. SYMBOLICATE_PLATFORMS
 	// (unset = {javascript, browser}; set and empty = off, decision 27's kill switch turns the
@@ -57,6 +56,13 @@ type StackFrame struct {
 }
 
 func Compute(cfg FingerprintConfig) string {
+	return ComputeWithFrameLimit(cfg, MaxFrames)
+}
+
+// ComputeWithFrameLimit is Compute with the frame count as a parameter. Production code calls
+// Compute; this exists so the evidence behind MaxFrames (docs/audits/grouping-v2-evidence.md) can
+// be re-run for the candidate values 3, 5 and 8 against the same corpus.
+func ComputeWithFrameLimit(cfg FingerprintConfig, limit int) string {
 	var input string
 	// §4.9: the CustomFingerprint early return is deliberately NOT environment-prefixed. Prefixing a
 	// client-chosen fingerprint would change identity for exactly the clients who chose it, which is
@@ -82,37 +88,68 @@ func Compute(cfg FingerprintConfig) string {
 		return NormalizeHashInput(frame.File)
 	}
 
-	var appFrames []string
+	// A frame symbolication did not rewrite, on a platform whose frames are minified, carries a
+	// minifier's name (`e`, `t`), which identifies nothing and changes between builds; only its
+	// build-hash-normalised file is an input. Everything else keeps file:function.
+	frameLabel := func(frame StackFrame) string {
+		if normalise && !frame.Symbolicated {
+			return hashFile(frame)
+		}
+		return fmt.Sprintf("%s:%s", hashFile(frame), frame.Function)
+	}
+
+	// Frame choice (sentinel-grouping-v2 §1.1, §1.3): library and platform frames are skipped
+	// whatever the SDK flagged; of what is left the in_app frames are preferred, else any frame
+	// (an SDK that never sets in_app still gets grouped on its own frames); a stack made only of library
+	// frames is still a stack and is used as it is. The first MaxFrames are hashed, crash-first.
+	var own []StackFrame
 	for _, frame := range cfg.Stacktrace {
+		if !isLibraryFrame(frame) {
+			own = append(own, frame)
+		}
+	}
+	chosen := make([]StackFrame, 0, limit)
+	for _, frame := range own {
 		if frame.InApp {
-			appFrames = append(appFrames, fmt.Sprintf("%s:%s", hashFile(frame), frame.Function))
-			if len(appFrames) >= MaxAppFrames {
-				break
-			}
+			chosen = append(chosen, frame)
 		}
 	}
-
-	// P4-3 / VERIFIED_STATE.md S11: when a client marks no frames in_app, the hash input used to
-	// degenerate to ErrorClass alone, collapsing every error of a class in a project into ONE issue.
-	// Clients that do not set in_app (anything other than the Go SDK today) still deserve grouping, so
-	// fall back to the top frames regardless of the flag. Frames are still capped at MaxAppFrames, so
-	// the fingerprint stays stable as deeper stack detail changes.
-	if len(appFrames) == 0 {
-		for _, frame := range cfg.Stacktrace {
-			appFrames = append(appFrames, fmt.Sprintf("%s:%s", hashFile(frame), frame.Function))
-			if len(appFrames) >= MaxAppFrames {
-				break
-			}
-		}
+	if len(chosen) == 0 {
+		chosen = own
+	}
+	if len(chosen) == 0 {
+		chosen = cfg.Stacktrace
+	}
+	if len(chosen) > limit {
+		chosen = chosen[:limit]
+	}
+	labels := make([]string, len(chosen))
+	for i, frame := range chosen {
+		labels[i] = frameLabel(frame)
 	}
 
-	input = cfg.Environment + "|" + cfg.ErrorClass
-	if len(appFrames) > 0 {
-		input += "|" + strings.Join(appFrames, "|")
+	input = AlgorithmVersion + "|" + cfg.Environment + "|" + cfg.ErrorClass
+	if len(labels) > 0 {
+		input += "|" + strings.Join(labels, "|")
+	}
+	// §1.2: when the stack cannot decide — nothing usable, the top frame is a known wrapper, or
+	// every hashed frame is an unsymbolicated minified one (file only, no function identity) — the
+	// normalised message is part of the identity.
+	if len(chosen) == 0 || isWrapperFrame(chosen[0]) || (normalise && !anySymbolicated(chosen)) {
+		input += "|msg=" + NormalizeMessage(cfg.Message)
 	}
 
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])[:16]
+}
+
+func anySymbolicated(frames []StackFrame) bool {
+	for _, f := range frames {
+		if f.Symbolicated {
+			return true
+		}
+	}
+	return false
 }
 
 // normalises is the platform gate: Platform ∈ NormalisePlatforms, exact string match on the

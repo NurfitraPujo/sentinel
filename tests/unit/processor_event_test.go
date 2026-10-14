@@ -393,6 +393,8 @@ func TestDeserialize_ComputesFingerprintWhenOverrideIsTrue(t *testing.T) {
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
+		// A stackless event: the message joins the hash input (sentinel-grouping-v2 §1.2).
+		Message: protoEvent.Message,
 	}), got.Fingerprint)
 }
 
@@ -405,6 +407,8 @@ func TestDeserialize_RecomputesProvidedFingerprintWhenOverrideIsTrue(t *testing.
 	assert.Equal(t, fingerprint.Compute(fingerprint.FingerprintConfig{
 		Environment: "production",
 		ErrorClass:  "RuntimeError",
+		// A stackless event: the message joins the hash input (sentinel-grouping-v2 §1.2).
+		Message: protoEvent.Message,
 	}), got.Fingerprint)
 	assert.NotEqual(t, "provided-fingerprint", got.Fingerprint)
 }

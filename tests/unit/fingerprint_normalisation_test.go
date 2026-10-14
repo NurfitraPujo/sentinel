@@ -181,7 +181,7 @@ func TestCompute_SymbolicatedFrameIsNeverHashStripped(t *testing.T) {
 	for _, c := range symbolicatedFrameCases {
 		t.Run(c.name, func(t *testing.T) {
 			verbatim := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.file, Function: "onClick", InApp: true}})
-			stripped := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.minified, Function: "onClick", InApp: true}})
+			stripped := unsymbolicatedHash("production", "TypeError", "", c.minified)
 
 			assert.Equal(t, verbatim, compute(c.file, true), "symbolicated: the source path is the hash input, untouched")
 			assert.Equal(t, c.minified, fingerprint.NormalizeHashInput(c.file), "decision 42's reading of the same name as a minified one stands")
@@ -229,16 +229,18 @@ func TestCompute_SymbolicatedFlagIsInertOutsideTheGateSet(t *testing.T) {
 	}
 }
 
-// ccc52aaHash is fingerprint.Compute's formula at the branch point, re-implemented here so the
-// "byte-identical no-op for golang" claim is measured against what the hash input WAS, not against
-// another call into the same function: environment, error class, then `file:function` for the
-// first three in_app frames (fallback: the first three frames), '|'-joined, SHA-256, 16 hex.
+// ccc52aaHash re-implements the hash input independently of fingerprint.Compute, so the "no-op for
+// golang" and "symbolicated frame is untouched" claims are measured against a stated formula and
+// not another call into the same function. Since sentinel-grouping-v2 that formula is the version
+// token, environment, error class, then `file:function` for the first MaxFrames in_app frames
+// (fallback: the first MaxFrames frames), '|'-joined, SHA-256, 16 hex. Its fixtures contain no
+// library or wrapper frames, so neither of those rules is mirrored here; they have their own tests.
 func ccc52aaHash(environment, errorClass string, frames []fingerprint.StackFrame) string {
 	var parts []string
 	for _, f := range frames {
 		if f.InApp {
 			parts = append(parts, f.File+":"+f.Function)
-			if len(parts) >= fingerprint.MaxAppFrames {
+			if len(parts) >= fingerprint.MaxFrames {
 				break
 			}
 		}
@@ -246,15 +248,29 @@ func ccc52aaHash(environment, errorClass string, frames []fingerprint.StackFrame
 	if len(parts) == 0 {
 		for _, f := range frames {
 			parts = append(parts, f.File+":"+f.Function)
-			if len(parts) >= fingerprint.MaxAppFrames {
+			if len(parts) >= fingerprint.MaxFrames {
 				break
 			}
 		}
 	}
-	input := environment + "|" + errorClass
+	input := fingerprint.AlgorithmVersion + "|" + environment + "|" + errorClass
 	if len(parts) > 0 {
 		input += "|" + strings.Join(parts, "|")
 	}
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// unsymbolicatedHash is the v2 input for a gated-platform frame symbolication did not rewrite
+// (sentinel-grouping-v2 repair R1): the version token, environment, error class, the
+// build-hash-normalised FILE of each frame and no function name, then the normalised message,
+// which joins because every hashed frame is unsymbolicated.
+func unsymbolicatedHash(environment, errorClass, message string, files ...string) string {
+	input := fingerprint.AlgorithmVersion + "|" + environment + "|" + errorClass
+	for _, f := range files {
+		input += "|" + f
+	}
+	input += "|msg=" + fingerprint.NormalizeMessage(message)
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])[:16]
 }
@@ -285,7 +301,7 @@ func TestCompute_NormalisationAppliesForJavascript(t *testing.T) {
 			})
 			// The expected value is ccc52aa's formula over the NORMALISED file: this pins that
 			// Compute rewrites File and nothing else, not merely that it changed something.
-			want := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.out, Function: "onClick", InApp: true}})
+			want := unsymbolicatedHash("production", "TypeError", "", c.out)
 			assert.Equal(t, want, raw, "rule: %s; in: %q → %q", c.rule, c.in, c.out)
 		})
 	}
@@ -317,8 +333,9 @@ func TestCompute_NormalisationIsANoOpForGolang(t *testing.T) {
 // decision 27's kill switch — turns the normalisation off for `javascript` too; and an operator
 // admitting `node` without a release (the point of the knob) gets the rule for it.
 func TestCompute_NormalisationFollowsTheGateSet(t *testing.T) {
-	frames := []fingerprint.StackFrame{{File: "/assets/index-3f2a1c.js", Line: 1, Function: "t", InApp: true}}
-	normalised := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: "/assets/index-*.js", Function: "t", InApp: true}})
+	frames := []fingerprint.StackFrame{{File: "/assets/index-3f2a1c.js", Line: 1, Function: "renderCart", InApp: true}}
+	normalised := unsymbolicatedHash("production", "TypeError", "", "/assets/index-*.js")
+	// Outside the gate set a function name is a real one and stays an input; no message joins.
 	verbatim := ccc52aaHash("production", "TypeError", frames)
 	require.NotEqual(t, normalised, verbatim)
 
@@ -349,22 +366,24 @@ func TestCompute_CustomFingerprintEarlyReturnIsUntouchedByNormalisation(t *testi
 	assert.Equal(t, "checkout-timeout", got)
 }
 
-// TestCompute_NormalisationNeverTouchesFunctionOrLine: the rule rewrites File in the hash input
-// and nothing else — a hash-looking function name and the line survive (line was never in the
-// input; function is). Two frames differing only in a hash-shaped function name must stay two
-// identities.
-func TestCompute_NormalisationNeverTouchesFunction(t *testing.T) {
-	compute := func(fn string) string {
+// TestCompute_FunctionIsNotAnInputForUnsymbolicatedFrames (R1): a minified name identifies
+// nothing, so on a gated-platform frame symbolication did not rewrite two names hash alike, and the
+// file keeps its build-hash normalisation. A symbolicated frame keeps its real name as an input.
+func TestCompute_FunctionIsNotAnInputForUnsymbolicatedFrames(t *testing.T) {
+	compute := func(fn string, symbolicated bool) string {
+		file := "/assets/index-3f2a1c.js"
+		if symbolicated {
+			file = "src/cart.ts"
+		}
 		return fingerprint.Compute(fingerprint.FingerprintConfig{
-			Environment: "production", ErrorClass: "TypeError",
+			Environment: "production", ErrorClass: "TypeError", Message: "boom",
 			Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
-			Stacktrace: []fingerprint.StackFrame{{File: "/assets/index-3f2a1c.js", Line: 1, Function: fn, InApp: true}},
+			Stacktrace: []fingerprint.StackFrame{{File: file, Line: 1, Function: fn, InApp: true, Symbolicated: symbolicated}},
 		})
 	}
-	assert.NotEqual(t, compute("a1b2c3"), compute("d4e5f6"), "function is never normalised")
-	assert.Equal(t,
-		ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: "/assets/index-*.js", Function: "a1b2c3", InApp: true}}),
-		compute("a1b2c3"))
+	assert.Equal(t, compute("e", false), compute("t", false), "a minified rename must not split an issue")
+	assert.Equal(t, unsymbolicatedHash("production", "TypeError", "boom", "/assets/index-*.js"), compute("e", false))
+	assert.NotEqual(t, compute("computeTotal", true), compute("renderCart", true), "a symbolicated name is identity")
 }
 
 // TestNormalizeHashInput_Base64urlMissRate is decision 42's measurement, re-run on every test run:
