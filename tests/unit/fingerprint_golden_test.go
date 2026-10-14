@@ -29,7 +29,7 @@ import (
 // base, Prepare after) -> ComputeFingerprint(symbolicate.DefaultPlatforms). It never calls
 // ValidatePayload or Prepare itself, so the same file compiles and passes at the base and after.
 //
-// sentinel-grouping-v2 (2026-10-13, regenerated again 2026-10-14 when an unsymbolicated gated frame stopped hashing its function): golden.json was regenerated, deliberately, when the hash
+// sentinel-grouping-v2 (2026-10-13, regenerated again 2026-10-14 when an unsymbolicated gated frame folded its minified function name instead of keeping or dropping it): golden.json was regenerated, deliberately, when the hash
 // input gained its `v2|` prefix, the frame cap moved from 3 to 5 and library frames began to be
 // skipped; every value in it is now a v2 value, and `git diff` of the file is the list of fixtures
 // whose identity moved. The invariant this test guards is unchanged: moving normalisation or

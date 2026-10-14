@@ -181,7 +181,7 @@ func TestCompute_SymbolicatedFrameIsNeverHashStripped(t *testing.T) {
 	for _, c := range symbolicatedFrameCases {
 		t.Run(c.name, func(t *testing.T) {
 			verbatim := ccc52aaHash("production", "TypeError", []fingerprint.StackFrame{{File: c.file, Function: "onClick", InApp: true}})
-			stripped := unsymbolicatedHash("production", "TypeError", "", c.minified)
+			stripped := unsymbolicatedHash("production", "TypeError", "", c.minified+":onClick")
 
 			assert.Equal(t, verbatim, compute(c.file, true), "symbolicated: the source path is the hash input, untouched")
 			assert.Equal(t, c.minified, fingerprint.NormalizeHashInput(c.file), "decision 42's reading of the same name as a minified one stands")
@@ -262,12 +262,13 @@ func ccc52aaHash(environment, errorClass string, frames []fingerprint.StackFrame
 }
 
 // unsymbolicatedHash is the v2 input for a gated-platform frame symbolication did not rewrite
-// (sentinel-grouping-v2 repair R1): the version token, environment, error class, the
-// build-hash-normalised FILE of each frame and no function name, then the normalised message,
+// (sentinel-grouping-v2 repair R1, narrowed by repair #2): the version token, environment, error
+// class, each frame's label (`<build-hash-normalised file>:<function>`, where a name the
+// minified-name detector flags is `*` and any other name is kept), then the normalised message,
 // which joins because every hashed frame is unsymbolicated.
-func unsymbolicatedHash(environment, errorClass, message string, files ...string) string {
+func unsymbolicatedHash(environment, errorClass, message string, labels ...string) string {
 	input := fingerprint.AlgorithmVersion + "|" + environment + "|" + errorClass
-	for _, f := range files {
+	for _, f := range labels {
 		input += "|" + f
 	}
 	input += "|msg=" + fingerprint.NormalizeMessage(message)
@@ -301,7 +302,7 @@ func TestCompute_NormalisationAppliesForJavascript(t *testing.T) {
 			})
 			// The expected value is ccc52aa's formula over the NORMALISED file: this pins that
 			// Compute rewrites File and nothing else, not merely that it changed something.
-			want := unsymbolicatedHash("production", "TypeError", "", c.out)
+			want := unsymbolicatedHash("production", "TypeError", "", c.out+":onClick")
 			assert.Equal(t, want, raw, "rule: %s; in: %q → %q", c.rule, c.in, c.out)
 		})
 	}
@@ -334,7 +335,7 @@ func TestCompute_NormalisationIsANoOpForGolang(t *testing.T) {
 // admitting `node` without a release (the point of the knob) gets the rule for it.
 func TestCompute_NormalisationFollowsTheGateSet(t *testing.T) {
 	frames := []fingerprint.StackFrame{{File: "/assets/index-3f2a1c.js", Line: 1, Function: "renderCart", InApp: true}}
-	normalised := unsymbolicatedHash("production", "TypeError", "", "/assets/index-*.js")
+	normalised := unsymbolicatedHash("production", "TypeError", "", "/assets/index-*.js:renderCart")
 	// Outside the gate set a function name is a real one and stays an input; no message joins.
 	verbatim := ccc52aaHash("production", "TypeError", frames)
 	require.NotEqual(t, normalised, verbatim)
@@ -366,24 +367,47 @@ func TestCompute_CustomFingerprintEarlyReturnIsUntouchedByNormalisation(t *testi
 	assert.Equal(t, "checkout-timeout", got)
 }
 
-// TestCompute_FunctionIsNotAnInputForUnsymbolicatedFrames (R1): a minified name identifies
-// nothing, so on a gated-platform frame symbolication did not rewrite two names hash alike, and the
-// file keeps its build-hash normalisation. A symbolicated frame keeps its real name as an input.
-func TestCompute_FunctionIsNotAnInputForUnsymbolicatedFrames(t *testing.T) {
-	compute := func(fn string, symbolicated bool) string {
-		file := "/assets/index-3f2a1c.js"
-		if symbolicated {
-			file = "src/cart.ts"
-		}
+// TestCompute_UnsymbolicatedFunctionFoldsOnlyWhenMinified (repair #2, ruling on
+// gv2-unsymbolicated-name-drop): on a gated-platform frame symbolication did not rewrite, a name the
+// minified-name detector flags is no identity (it changes between builds), while any other name is
+// stable across builds and stays in the key, so two callers behind one wrapper frame stay apart
+// (contract §5.1) on a project with no source map. A symbolicated frame keeps its real name.
+func TestCompute_UnsymbolicatedFunctionFoldsOnlyWhenMinified(t *testing.T) {
+	compute := func(file, fn string, symbolicated bool) string {
 		return fingerprint.Compute(fingerprint.FingerprintConfig{
 			Environment: "production", ErrorClass: "TypeError", Message: "boom",
 			Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
 			Stacktrace: []fingerprint.StackFrame{{File: file, Line: 1, Function: fn, InApp: true, Symbolicated: symbolicated}},
 		})
 	}
-	assert.Equal(t, compute("e", false), compute("t", false), "a minified rename must not split an issue")
-	assert.Equal(t, unsymbolicatedHash("production", "TypeError", "boom", "/assets/index-*.js"), compute("e", false))
-	assert.NotEqual(t, compute("computeTotal", true), compute("renderCart", true), "a symbolicated name is identity")
+	const bundle = "/assets/index-3f2a1c.js"
+	assert.Equal(t, compute(bundle, "e", false), compute(bundle, "t", false), "a minified rename must not split an issue")
+	assert.Equal(t, compute(bundle, "Ab", false), compute(bundle, "a1", false), "two-character minified names fold too")
+	assert.Equal(t, unsymbolicatedHash("production", "TypeError", "boom", "/assets/index-*.js:*"), compute(bundle, "e", false))
+	assert.Equal(t, unsymbolicatedHash("production", "TypeError", "boom", "/assets/index-*.js:loadCart"), compute(bundle, "loadCart", false))
+	assert.Equal(t, unsymbolicatedHash("production", "TypeError", "boom", "/assets/index-*.js:*.loadCart"), compute(bundle, "t.loadCart", false),
+		"only the minified segment of a dotted name folds")
+	assert.NotEqual(t, compute(bundle, "loadCart", false), compute(bundle, "loadFeed", false), "a real name is identity")
+	assert.NotEqual(t, compute("src/cart.ts", "computeTotal", true), compute("src/cart.ts", "renderCart", true), "a symbolicated name is identity")
+}
+
+// TestCompute_TwoCallersBehindOneWrapperAreDifferentWithoutASourceMap is contract §5.1's property on
+// a no_map javascript project: the wrapper frame is the top frame in the same file with the same
+// message, and only the caller's name tells the two failures apart. The blanket drop of R1 merged
+// them (gv2-unsymbolicated-name-drop); the narrowed drop must not.
+func TestCompute_TwoCallersBehindOneWrapperAreDifferentWithoutASourceMap(t *testing.T) {
+	compute := func(caller string) string {
+		return fingerprint.Compute(fingerprint.FingerprintConfig{
+			Environment: "production", ErrorClass: "Error", Message: "Request failed",
+			Platform: "javascript", NormalisePlatforms: symbolicate.DefaultPlatforms,
+			Stacktrace: []fingerprint.StackFrame{
+				{File: "/static/js/api.js", Line: 10, Function: "request", InApp: true},
+				{File: "/static/js/api.js", Line: 40, Function: caller, InApp: true},
+			},
+		})
+	}
+	assert.NotEqual(t, compute("loadCart"), compute("loadFeed"), "two callers behind one wrapper frame must be different")
+	assert.Equal(t, compute("loadCart"), compute("loadCart"))
 }
 
 // TestNormalizeHashInput_Base64urlMissRate is decision 42's measurement, re-run on every test run:

@@ -153,6 +153,9 @@ func evidencePairs() []evidencePair {
 		{"(3c) Dart: same failure with and without a trailing main.dart frame and a sibling app_core frame", true,
 			web("PostgrestException", fr("package:postgrest/src/a.dart", "A.then", true), fr("package:app/cart.dart", "Cart.load", true), fr("package:app_core/api.dart", "Api.get", true), fr("package:app/a.dart", "a", true), fr("package:app/b.dart", "b", true), fr("package:app/c.dart", "c", true)),
 			web("PostgrestException", fr("package:postgrest/src/a.dart", "A.then", true), fr("package:app/cart.dart", "Cart.load", true), fr("package:app_core/api.dart", "Api.get", true), fr("package:app/a.dart", "a", true), fr("package:app/b.dart", "b", true), fr("package:app/c.dart", "c", true), fr("package:app/main.dart", "main", true))},
+		{"(2c) two callers behind one wrapper, no source map: same file, same message, real names", false,
+			web("Request failed", fr("/static/js/api.js", "request", true), fr("/static/js/api.js", "loadCart", true)),
+			web("Request failed", fr("/static/js/api.js", "request", true), fr("/static/js/api.js", "loadFeed", true))},
 		{"(4) same bug, symbolicated vs not -> still two until the retry resolves it (not decided by Compute)", false,
 			web("x is undefined", fr("/assets/index-3f2a1c.js", "e", true)),
 			web("x is undefined", func() fingerprint.StackFrame {

@@ -259,16 +259,15 @@ breadcrumb `timestamp`) fails the decode of the whole body, as it does for every
   `error_class`, and the `file:function` of the first **5** usable frames, crash first, with line and column excluded.
   *Usable* means: frames that are clearly library or platform code are skipped whatever the SDK flagged in_app (Dart
   `dart:` and well-known `package:` libraries such as `dio` and `flutter`, Go standard-library, module-cache and vendored
-  paths including `-trimpath` forms, `node_modules`). For Dart the app's own package is the package of the frame whose
-  file is `package:<pkg>/main.dart`, and when the stack has one every other `package:` frame is skipped; without it the
-  well-known-library list decides. Of the usable frames, the `in_app` ones are used, else any; a stack of
+  paths including `-trimpath` forms, `node_modules`). For Dart a `package:` frame is library code iff its package is on a fixed, code-level list (decided per package, never from the rest of the stack); a dependency missing from the list counts as app code (grouping `v2`'s accepted limit). Of the usable frames, the `in_app` ones are used, else any; a stack of
   library frames only is hashed as it is. When no usable frame exists, the top one is a known wrapper (HTTP client,
   interceptor, logger or error-reporting helper), or every hashed frame is an unsymbolicated JavaScript frame, the
   **normalised message** is appended to the input (UUIDs, numbers, hex, quoted strings, emails and user paths folded;
   whitespace collapsed; 256 characters at most). For the JavaScript platforms, a frame symbolication did not rewrite
-  contributes only its file, with the build hashes folded, and never its function name: a minified name identifies
-  nothing, so a rename across builds does not split an issue and the message, not the name, tells two errors in one
-  bundle apart. A symbolicated frame contributes `file:function`. An event
+  contributes its file with the build hashes folded and its function name, except that a minified name (one or two
+  characters, per dotted segment) folds to `*`: a minified name identifies nothing, so a rename across builds does not
+  split an issue, while a real name is stable across builds and tells two callers behind one wrapper frame apart. The
+  message also joins, because an unsymbolicated stack alone cannot say which error it was. A symbolicated frame contributes `file:function`. An event
   whose source-map lookup ended `timeout` or `fetch_error` is redelivered by the processor at most twice (delayed
   1 s, then 5 s) before it is hashed on whatever frames it has; a redelivery ignores a cached `fetch_error` so it can succeed. A client-supplied `fingerprint` is stored verbatim, with
   no version token, exactly as sent. The rules are versioned by `fingerprint.AlgorithmVersion`; changing them

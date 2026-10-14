@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -123,7 +125,12 @@ const retryMinifiedFile = "/assets/index-3f2a1c.js"
 
 func retryEventBytes(t *testing.T, customFingerprint string) []byte {
 	t.Helper()
-	b, err := proto.Marshal(&sentinelv1.ErrorEvent{
+	return retryEventBytesOverride(t, customFingerprint, false)
+}
+
+func retryEventBytesOverride(t *testing.T, customFingerprint string, override bool) []byte {
+	t.Helper()
+	b, err := proto.Marshal(&sentinelv1.ErrorEvent{FingerprintOverride: override,
 		ProjectKey: "web", ProjectId: "11111111-1111-1111-1111-111111111111", Platform: "javascript",
 		Environment: "production", ErrorClass: "TypeError", Message: "x is undefined",
 		ReleaseVersion: "1.0.0", Fingerprint: customFingerprint, Timestamp: timestamppb.Now(),
@@ -137,7 +144,12 @@ func retryEventBytes(t *testing.T, customFingerprint string) []byte {
 
 func retryService(t *testing.T, lookup symbolicate.StoreFunc, fetch symbolicate.FetcherFunc) (*ProcessorService, *retryStore) {
 	t.Helper()
-	stage, err := symbolicate.New(symbolicate.DefaultConfig(), lookup, fetch)
+	return retryServiceWithConfig(t, symbolicate.DefaultConfig(), lookup, fetch)
+}
+
+func retryServiceWithConfig(t *testing.T, cfg symbolicate.Config, lookup symbolicate.StoreFunc, fetch symbolicate.FetcherFunc) (*ProcessorService, *retryStore) {
+	t.Helper()
+	stage, err := symbolicate.New(cfg, lookup, fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,6 +257,53 @@ func TestProcessEventInternal_NoMapIsNotRetried(t *testing.T) {
 	}
 }
 
+// B3 (gv2-timeout-retry-untested): a cold-cache TIMEOUT — the map row exists but its fetch has not
+// finished by the stage's deadline — is the ghost-issue case sentinel-grouping-v2 §1.4 names first,
+// so it must be retried exactly like fetch_error: delivery 1 returns the retry error before
+// StoreEvent, delivery 3 stores.
+func TestProcessEventInternal_TimeoutRetriesBeforeStoreEvent(t *testing.T) {
+	release := make(chan struct{})
+	cfg := symbolicate.DefaultConfig()
+	cfg.Deadline = 30 * time.Millisecond
+	s, rs := retryServiceWithConfig(t, cfg,
+		func(context.Context, string, string, string) (*symbolicate.Sourcemap, error) { return cartRow(), nil },
+		func(context.Context, string) ([]byte, error) { <-release; return []byte(cartMap), nil })
+	// Registered after the stage's Close, so it runs first: Close waits for the blocked fill.
+	t.Cleanup(func() { close(release) })
+	data := retryEventBytes(t, "")
+
+	if !s.symbolicate(context.Background(), jsEvent(), "11111111-1111-1111-1111-111111111111") {
+		t.Fatal("the stage must report a timed-out lookup as transient")
+	}
+	for _, n := range []uint64{1, 2} {
+		_, err := s.processEventInternal(nats.WithDeliveryCount(context.Background(), n), data)
+		if !errors.Is(err, errSymbolicationRetry) || nats.IsPermanent(err) {
+			t.Fatalf("delivery %d: err = %v; want the transient retry error", n, err)
+		}
+		if rs.storeCalls != 0 {
+			t.Fatalf("delivery %d reached StoreEvent after a timeout", n)
+		}
+	}
+	if _, err := s.processEventInternal(nats.WithDeliveryCount(context.Background(), 3), data); err != nil {
+		t.Fatalf("delivery 3: %v", err)
+	}
+	if rs.storeCalls != 1 || rs.issue.Fingerprint != minifiedFingerprint() {
+		t.Fatalf("delivery 3: %d store calls, fingerprint %q; want one call with the minified-frame hash", rs.storeCalls, rs.issue.Fingerprint)
+	}
+}
+
+// FingerprintOverride discards the client value, so the server computes the identity from the
+// frames and the event IS retried like an unfingerprinted one.
+func TestProcessEventInternal_FingerprintOverrideIsRetried(t *testing.T) {
+	s, rs := retryService(t, func(context.Context, string, string, string) (*symbolicate.Sourcemap, error) {
+		return nil, errors.New("db down")
+	}, func(context.Context, string) ([]byte, error) { return nil, errors.New("unused") })
+	_, err := s.processEventInternal(nats.WithDeliveryCount(context.Background(), 1), retryEventBytesOverride(t, "checkout-timeout", true))
+	if !errors.Is(err, errSymbolicationRetry) || rs.storeCalls != 0 {
+		t.Fatalf("err = %v, %d store calls; want the retry error before StoreEvent", err, rs.storeCalls)
+	}
+}
+
 // A client fingerprint does not depend on the frames, so it is never delayed.
 func TestProcessEventInternal_ClientFingerprintIsNotDelayed(t *testing.T) {
 	s, rs := retryService(t, func(context.Context, string, string, string) (*symbolicate.Sourcemap, error) {
@@ -309,5 +368,40 @@ func TestSymbolicate_FetchErrorCacheBypassOnlyOnDeliveryTwo(t *testing.T) {
 		if got := calls > before; got != c.bypass {
 			t.Errorf("delivery %d: fetched again = %v, want %v", c.n, got, c.bypass)
 		}
+	}
+}
+
+// main.go's consumer span (the one a dashboard reads) calls MarkSymbolicationRetry on the error
+// ProcessEvent returned: the deliberate redelivery is tagged and not an error; anything else is not
+// touched and is reported as such, so it is still recorded as a failure.
+func TestMarkSymbolicationRetry(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tr := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)).Tracer("test")
+
+	_, retry := tr.Start(context.Background(), "processor.process_event")
+	if !MarkSymbolicationRetry(retry, fmt.Errorf("wrapped: %w", errSymbolicationRetry)) {
+		t.Error("the symbolication retry (even wrapped) must be recognised")
+	}
+	retry.End()
+	_, other := tr.Start(context.Background(), "processor.process_event")
+	if MarkSymbolicationRetry(other, errors.New("db down")) {
+		t.Error("an ordinary error must not be treated as a retry")
+	}
+	other.End()
+
+	ended := rec.Ended()
+	if ended[0].Status().Code == codes.Error {
+		t.Error("the retry span was marked as an error")
+	}
+	tagged := func(s sdktrace.ReadOnlySpan) bool {
+		for _, a := range s.Attributes() {
+			if a.Key == "processor.outcome" && a.Value.AsString() == outcomeSymbolicationRetry {
+				return true
+			}
+		}
+		return false
+	}
+	if !tagged(ended[0]) || tagged(ended[1]) {
+		t.Errorf("outcome tag: retry=%v other=%v; want true/false", tagged(ended[0]), tagged(ended[1]))
 	}
 }

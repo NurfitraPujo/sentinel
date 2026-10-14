@@ -43,12 +43,23 @@ type corpusRecord struct {
 	} `json:"stacktrace"`
 }
 
-func (r corpusRecord) config() fingerprint.FingerprintConfig {
+func (r corpusRecord) config() fingerprint.FingerprintConfig { return r.configWith(false) }
+
+// isTurbopackSource reports a frame whose file is already a source-level Turbopack path
+// (`turbopack:///[project]/...`, `[turbopack]/browser/runtime/...`): only the symbolication stage
+// produces such paths, so the export that dropped the `symbolicated` key lost it for these frames.
+func isTurbopackSource(file string) bool {
+	return strings.HasPrefix(file, "turbopack:///") || strings.Contains(file, "[turbopack]/")
+}
+
+// configWith is config, optionally treating the turbopack source-level frames as symbolicated.
+func (r corpusRecord) configWith(turbopackSymbolicated bool) fingerprint.FingerprintConfig {
 	frames := make([]fingerprint.StackFrame, len(r.Stacktrace))
 	for i, f := range r.Stacktrace {
 		// The stored frame carries `symbolicated` only when the stage rewrote it (omitempty), and the
 		// corpus has none, so every frame is a frame symbolication did not rewrite.
-		frames[i] = fingerprint.StackFrame{File: f.File, Line: f.Line, Function: f.Function, InApp: f.InApp}
+		frames[i] = fingerprint.StackFrame{File: f.File, Line: f.Line, Function: f.Function, InApp: f.InApp,
+			Symbolicated: turbopackSymbolicated && isTurbopackSource(f.File)}
 	}
 	return fingerprint.FingerprintConfig{
 		Environment: r.Environment, ErrorClass: normalizer.NewNormalizer().NormalizeString(r.ErrorClass),
@@ -252,6 +263,50 @@ func TestGroupingV2Corpus(t *testing.T) {
 			detail.WriteString("- none\n")
 		}
 	}
+
+	// The export's two known losses, repaired in turn so the headline number is read with them: 125
+	// rows predate error_occurrences.message (a sibling occurrence of the same issue carries it), and
+	// the `symbolicated` key is gone (see isTurbopackSource). N=5; the widest fan-out is the largest
+	// number of v2 issues one current issue splits into, which the acceptance bound limits to 5.
+	issueMsg := map[string]string{}
+	for _, r := range recs {
+		if r.Message != "" && issueMsg[r.CurrentIssueID] == "" {
+			issueMsg[r.CurrentIssueID] = r.Message
+		}
+	}
+	type variant struct {
+		name         string
+		repairMsg    bool
+		turbopackSym bool
+	}
+	fmt.Fprintf(&detail, "\nv2 N=5 under the export's known losses (issues / widest split of one current issue):\n\n| variant | web | zasri-mobile | tuju-mobile |\n|---|---|---|---|\n")
+	for _, v := range []variant{{"as exported", false, false}, {"messages repaired from siblings", true, false}, {"messages repaired + turbopack frames symbolicated", true, true}} {
+		cells := map[string]string{}
+		for _, p := range projects {
+			groups := map[string]bool{}
+			perIssue := map[string]map[string]bool{}
+			for _, r := range byProject[p] {
+				if v.repairMsg && r.Message == "" {
+					r.Message = issueMsg[r.CurrentIssueID]
+				}
+				k := r.Environment + "|" + fingerprint.Compute(r.configWith(v.turbopackSym))
+				groups[k] = true
+				if perIssue[r.CurrentIssueID] == nil {
+					perIssue[r.CurrentIssueID] = map[string]bool{}
+				}
+				perIssue[r.CurrentIssueID][k] = true
+			}
+			widest := 0
+			for _, g := range perIssue {
+				if len(g) > widest {
+					widest = len(g)
+				}
+			}
+			cells[p] = fmt.Sprintf("%d / %d", len(groups), widest)
+		}
+		fmt.Fprintf(&detail, "| %s | %s | %s | %s |\n", v.name, cells["web"], cells["zasri-mobile"], cells["tuju-mobile"])
+	}
+
 	report := "\n" + sb.String() + detail.String()
 	t.Log(report)
 	if out := os.Getenv("GROUPING_CORPUS_REPORT"); out != "" {

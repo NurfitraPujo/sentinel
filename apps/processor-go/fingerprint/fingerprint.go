@@ -27,10 +27,10 @@ type FingerprintConfig struct {
 	// symbolicate.NormalizePath and — for a frame symbolication did not rewrite (decision 44) —
 	// the basename and directory rules of NormalizeHashInput, INSIDE Compute only, so a
 	// build-hash-renamed chunk hashes to the same identity across builds. The stored frame is
-	// untouched. Outside the set (Go, Python, an empty Platform) the
-	// path normalisation does not run, but those platforms are NOT byte-identical to the
-	// pre-feature hash: v2 adds the version prefix, hashes up to MaxFrames frames, skips library
-	// frames and may add the normalised message, so they regroup once at the v2 reset.
+	// untouched. Outside the set (Go, Python, Dart, an empty Platform) File and Function are hashed
+	// verbatim; the v2 rules (version token, 5 frames, library frames skipped, message when the stack
+	// cannot decide) still apply to them, which is why EVERY Go and Python hash moved at v2 and those
+	// platforms' issues regroup once at the reset (docs/audits/grouping-v2-evidence.md §5).
 	Platform string
 	// NormalisePlatforms is the gate set — symbolicate.Config.Platforms, i.e. SYMBOLICATE_PLATFORMS
 	// (unset = {javascript, browser}; set and empty = off, decision 27's kill switch turns the
@@ -73,10 +73,12 @@ func ComputeWithFrameLimit(cfg FingerprintConfig, limit int) string {
 	}
 
 	// §4.4: the normalisation applies to the hash input of every frame Compute reads — in_app or
-	// fallback — and to nothing else: never Function, never the stored frame. Step 1's path rule
-	// runs on every frame in the gate set; the hash-strip rules run ONLY on a frame symbolication
-	// did not rewrite (decision 44) — a symbolicated File is a source-level path, and a source
-	// path has no build hash. Decision 42's reading of a minified name is unchanged.
+	// fallback — and never to the stored frame. Step 1's path rule runs on every frame in the gate
+	// set; the hash-strip rules run ONLY on a frame symbolication did not rewrite (decision 44) — a
+	// symbolicated File is a source-level path, and a source path has no build hash. Decision 42's
+	// reading of a minified name is unchanged. Function: a symbolicated frame keeps its name; on an
+	// unsymbolicated gated frame a name the minified-name detector flags folds to `*` (it changes
+	// between builds) and any other name is kept (sentinel-grouping-v2 §5.1).
 	normalise := cfg.normalises()
 	hashFile := func(frame StackFrame) string {
 		switch {
@@ -88,14 +90,16 @@ func ComputeWithFrameLimit(cfg FingerprintConfig, limit int) string {
 		return NormalizeHashInput(frame.File)
 	}
 
-	// A frame symbolication did not rewrite, on a platform whose frames are minified, carries a
-	// minifier's name (`e`, `t`), which identifies nothing and changes between builds; only its
-	// build-hash-normalised file is an input. Everything else keeps file:function.
+	// A frame symbolication did not rewrite, on a platform whose frames are minified, may carry a
+	// minifier's name (`e`, `t`), which identifies nothing and changes between builds: the names the
+	// minified-name detector flags fold to `*`. Any other name is stable across builds and stays
+	// in the key, so two callers behind one wrapper frame still hash apart (contract §5.1).
 	frameLabel := func(frame StackFrame) string {
+		fn := frame.Function
 		if normalise && !frame.Symbolicated {
-			return hashFile(frame)
+			fn = foldMinifiedFunction(fn)
 		}
-		return fmt.Sprintf("%s:%s", hashFile(frame), frame.Function)
+		return fmt.Sprintf("%s:%s", hashFile(frame), fn)
 	}
 
 	// Frame choice (sentinel-grouping-v2 §1.1, §1.3): library and platform frames are skipped

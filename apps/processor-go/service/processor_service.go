@@ -207,6 +207,18 @@ var errSymbolicationRetry = errors.New("symbolication timeout or fetch error: ev
 // delivery as obs.OutcomeRetried (it was returned to NATS), which keeps that metric's invariant.
 const outcomeSymbolicationRetry = "symbolication_retry"
 
+// MarkSymbolicationRetry tags span with processor.outcome=symbolication_retry and reports true when err
+// is the deliberate symbolication redelivery; the span's status is left alone, so a retry is never read
+// as a failure. It reports false, touching nothing, for every other error. main.go's consumer span
+// uses it too: that span is the one a dashboard reads, and it used to mark every returned error.
+func MarkSymbolicationRetry(span trace.Span, err error) bool {
+	if !errors.Is(err, errSymbolicationRetry) {
+		return false
+	}
+	span.SetAttributes(attribute.String("processor.outcome", outcomeSymbolicationRetry))
+	return true
+}
+
 // shouldRetrySymbolication reports whether this delivery may still be redelivered. A context that
 // carries no delivery count (a direct call, not the subscriber) never retries.
 func shouldRetrySymbolication(ctx context.Context) bool {
@@ -309,8 +321,7 @@ func withSpan(ctx context.Context, name string, fn func(ctx context.Context) err
 	spanCtx, span := tracer.Start(ctx, name)
 	defer span.End()
 	if err := fn(spanCtx); err != nil {
-		if errors.Is(err, errSymbolicationRetry) {
-			span.SetAttributes(attribute.String("processor.outcome", outcomeSymbolicationRetry))
+		if MarkSymbolicationRetry(span, err) {
 			return err
 		}
 		span.RecordError(err)

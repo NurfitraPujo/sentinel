@@ -295,7 +295,9 @@ func main() {
 			defer span.End()
 
 			err := proc.ProcessEvent(msgCtx, data)
-			if err != nil {
+			// A symbolication retry is the design working (the delayed redelivery of sentinel-grouping-v2
+			// §5.2), not a failure: it is tagged and its status left alone.
+			if err != nil && !service.MarkSymbolicationRetry(span, err) {
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 				// This span cannot know whether the subscriber will actually dead-letter this delivery:

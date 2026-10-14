@@ -29,7 +29,29 @@ var (
 	hexRunRegex = regexp.MustCompile(`\b(?:0x[0-9a-fA-F]+|[0-9a-fA-F]{8,})\b`)
 	digitsRegex = regexp.MustCompile(`\d+`)
 	spacesRegex = regexp.MustCompile(`\s+`)
+	// minifiedName is the detector for a minifier's output: one or two characters (`e`, `t`, `Ab`, `a1`).
+	minifiedName = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]?$`)
 )
+
+// foldMinifiedFunction replaces each dot-separated segment of a function name that the minified-name
+// detector flags with `*`, so a rename across builds (`e` -> `t`) does not split an issue, and keeps
+// every other segment. Applied only to frames symbolication did not rewrite, on the platforms whose
+// frames are minified. A non-minified name (`loadCart`) is stable across builds, so keeping it cannot
+// create a ghost issue and it is what separates two callers behind one wrapper frame (contract
+// §5.1). A real one- or two-character name loses its identity here, which is acceptable because the
+// frame's file still contributes.
+func foldMinifiedFunction(fn string) string {
+	if fn == "" {
+		return fn
+	}
+	parts := strings.Split(fn, ".")
+	for i, p := range parts {
+		if minifiedName.MatchString(p) {
+			parts[i] = "*"
+		}
+	}
+	return strings.Join(parts, ".")
+}
 
 // NormalizeMessage folds the parts of a message that vary between occurrences of one failure: the
 // existing normaliser's UUIDs, long ids, addresses, emails, versions and user paths, then quoted
@@ -77,7 +99,7 @@ var dartLibraryPackages = map[string]bool{
 	"sqflite": true, "drift": true, "hive": true, "shared_preferences": true, "firebase_core": true,
 	"cloud_firestore": true, "firebase_auth": true, "go_router": true, "retrofit": true, "chopper": true,
 	"freezed_annotation": true, "json_annotation": true, "equatable": true, "meta": true, "path_provider": true,
-	"url_launcher": true, "cached_network_image": true, "connectivity_plus": true, "web_socket_channel": true,
+	"url_launcher": true, "intl": true, "cached_network_image": true, "connectivity_plus": true, "web_socket_channel": true,
 	// The supabase family and its transitive packages (named case 3b in the evidence note).
 	"supabase": true, "supabase_flutter": true, "postgrest": true, "gotrue": true, "realtime_client": true,
 	"storage_client": true, "functions_client": true, "yet_another_json_isolate": true, "mutex": true,

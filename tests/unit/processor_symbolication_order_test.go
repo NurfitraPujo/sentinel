@@ -341,8 +341,8 @@ func turbopackCompute(frames ...fingerprint.StackFrame) string {
 // SDK's rule marks the page's own chunks in-app). After the stage the six react-dom frames and
 // the two below are `false` (A1, rule 1), ChatList.tsx is `true` (A4's path, rule 3), and
 // Compute's appFrames loop reaches ChatList as the FIRST in_app frame — so the hash input is
-// `<env>|TypeError|…/ChatList.tsx:ChatList`, one app frame (MaxAppFrames is a cap, not a
-// minimum). Drop the InApp copy-back from ErrorEvent.Symbolicate, or the rule from the stage,
+// `v2|<env>|TypeError|…/ChatList.tsx:ChatList`, one app frame (fingerprint.MaxFrames, 5, is a cap,
+// not a minimum). Drop the InApp copy-back from ErrorEvent.Symbolicate, or the rule from the stage,
 // and the fingerprint becomes the react-dom triple instead.
 func TestSymbolicationOrder_P5_OneAppFrameAmongVendor(t *testing.T) {
 	stage := newTurbopackStage(t)
@@ -395,9 +395,9 @@ func TestSymbolicationOrder_P5_OneAppFrameAmongVendor(t *testing.T) {
 
 // TestSymbolicationOrder_P6_AllVendorFallsBackToTopThree is flow P6: a pure vendor stack (a Next
 // runtime error with no app frame), every frame sent `in_app: true` and every frame re-derived
-// `false`. Compute's existing P4-3 fallback takes the top three frames regardless of the flag —
-// today's behaviour for a Go stack with no in_app frame, unchanged — so the fingerprint is the
-// hash over the first three REWRITTEN frames, not env+class alone and not the frames as sent.
+// `false`. Compute's fallback takes the top frames regardless of the flag — the same rule as a Go
+// stack with no in_app frame — so the fingerprint is the hash over the first REWRITTEN frames (at most
+// fingerprint.MaxFrames, 5; the fixture has three), not env+class alone and not the frames as sent.
 func TestSymbolicationOrder_P6_AllVendorFallsBackToTopThree(t *testing.T) {
 	stage := newTurbopackStage(t)
 	proto := turbopackProtoEvent(

@@ -46,8 +46,10 @@ func TestCompute_GoldenInputs(t *testing.T) {
 		{"library frames skipped though flagged in_app", FingerprintConfig{Environment: "p", ErrorClass: "E", Stacktrace: []StackFrame{
 			fr("package:dio/src/dio.dart", "Dio.get"), fr("dart:async/zone.dart", "run"), fr("package:app/visits.dart", "load")}},
 			"v2|p|E|package:app/visits.dart:load"},
-		{"unsymbolicated gated frame: file only, message joins", web("Boom 7", fr("/assets/index-3f2a1c.js", "e")),
-			"v2|production|TypeError|/assets/index-*.js|msg=Boom <N>"},
+		{"unsymbolicated gated frame: minified name folds, message joins", web("Boom 7", fr("/assets/index-3f2a1c.js", "e")),
+			"v2|production|TypeError|/assets/index-*.js:*|msg=Boom <N>"},
+		{"unsymbolicated gated frame: a real name stays", web("Boom 7", fr("/static/js/api.js", "loadCart")),
+			"v2|production|TypeError|/static/js/api.js:loadCart|msg=Boom <N>"},
 		{"symbolicated frame keeps its name", web("m", StackFrame{File: "src/cart.ts", Function: "e", InApp: true, Symbolicated: true}),
 			"v2|production|TypeError|src/cart.ts:e"},
 		{"Dart: app package from main.dart, other packages skipped", FingerprintConfig{Environment: "p", ErrorClass: "E", Stacktrace: []StackFrame{
@@ -232,5 +234,53 @@ func TestIsLibraryFrame_DartIsPerPackage(t *testing.T) {
 		if isLibraryFrame(StackFrame{File: f}) {
 			t.Errorf("%s is app code", f)
 		}
+	}
+}
+
+// gv2-dart-library-denylist, coordinator decision: contract §1.3 is narrowed to a maintained library
+// list (docs/audits/grouping-v2-evidence.md §6). The reviewer's probe holds for LISTED dependencies: five
+// frames from the supabase family above one app frame, no main.dart, no release signal. The app frame
+// decides the identity, and churn in the dependency frames does not split the issue.
+func TestCompute_DartListedDependenciesProperty(t *testing.T) {
+	cfg := func(release, appFile, variant string) FingerprintConfig {
+		return FingerprintConfig{Environment: "p", ErrorClass: "PostgrestException", Platform: "dart", Stacktrace: []StackFrame{
+			fr("package:postgrest/src/postgrest_builder.dart", "PostgrestBuilder.then"),
+			fr("package:postgrest/src/"+variant+".dart", "Filter.eq"),
+			fr("package:supabase/src/supabase_client.dart", "SupabaseClient.rpc"),
+			fr("package:gotrue/src/gotrue_client.dart", "GoTrueClient.refresh"),
+			fr("package:gotrue/src/"+variant+".dart", "Api."+variant),
+			fr("package:zasri/"+appFile+".dart", "load")}}
+	}
+	if Compute(cfg("", "visits", "a")) == Compute(cfg("", "profile", "a")) {
+		t.Error("two different app frames behind the same listed dependency frames share a fingerprint")
+	}
+	if Compute(cfg("", "visits", "a")) != Compute(cfg("", "visits", "b")) {
+		t.Error("listed dependency churn above one app frame split the issue")
+	}
+}
+
+// The ACCEPTED LIMIT of the list (coordinator decision): a dependency nobody listed is treated as app
+// code. Here five unlisted-package frames fill the frame budget above one app frame, so two different
+// app frames hash ALIKE (§1.3's over-merge), and the same unlisted frames as the only frame source are
+// still hashed. Listing the package (as supabase was) is the fix; if this test goes red because the
+// rule gained an own-package signal, update the evidence note's §6 decision with it.
+func TestCompute_DartUnlistedDependencyIsAcceptedLimit(t *testing.T) {
+	cfg := func(appFile string) FingerprintConfig {
+		st := []StackFrame{}
+		for _, f := range []string{"a", "b", "c", "d", "e"} {
+			st = append(st, fr("package:some_unlisted_sdk/src/"+f+".dart", "Sdk."+f))
+		}
+		st = append(st, fr("package:zasri/"+appFile+".dart", "load"))
+		return FingerprintConfig{Environment: "p", ErrorClass: "SdkException", Platform: "dart", Stacktrace: st}
+	}
+	if Compute(cfg("visits")) != Compute(cfg("profile")) {
+		t.Error("the accepted limit disappeared: unlisted dependency frames no longer fill the budget")
+	}
+	only := func(file string) FingerprintConfig {
+		return FingerprintConfig{Environment: "p", ErrorClass: "E", Platform: "dart",
+			Stacktrace: []StackFrame{fr("package:some_unlisted_sdk/src/"+file+".dart", "f")}}
+	}
+	if Compute(only("a")) == Compute(only("b")) {
+		t.Error("an unlisted dependency as the only frame source must still be hashed")
 	}
 }
