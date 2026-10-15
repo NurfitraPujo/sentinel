@@ -85,10 +85,14 @@ export async function computeInsights(d: InsightsDeps): Promise<InsightsResult> 
 
 	for (const w of WINDOWS) {
 		const win: m.Window = { from: new Date(d.now.getTime() - w.ms), to: d.now };
-		const [ev, ni, rg, rs, mt, mr, cf] = await Promise.all([
-			m.errorEvents(c, win), m.newIssues(c, win), m.regressions(c, win), m.resolutions(c, win),
-			m.mtta(c, win, true), m.mttr(c, win, true), m.changeFailure(c, win),
+		// Stage queries so heavy error_occurrences scans (errorEvents and changeFailure) do not run in parallel
+		// with each other, avoiding Databend CPU thread saturation and memory panics on large windows (28d).
+		const [ni, rg, rs, mt, mr] = await Promise.all([
+			m.newIssues(c, win), m.regressions(c, win), m.resolutions(c, win),
+			m.mtta(c, win, true), m.mttr(c, win, true),
 		]);
+		const ev = await m.errorEvents(c, win);
+		const cf = await m.changeFailure(c, win);
 		windowEvents.set(w.label, ev);
 		for (const r of ev) {
 			touch(r);

@@ -85,6 +85,8 @@ async function section<T>(input: DashboardInput, name: string, compute: (c: m.Me
 		if (!(err instanceof DatabendUnavailableError)) {
 			// Any other failure is still contained to its section; the cause is logged by the caller's wrapper.
 			console.error(JSON.stringify({ level: 'error', event: 'dashboard.section_failed', section: name, error: String((err as Error)?.message ?? err).slice(0, 300) }));
+		} else {
+			console.warn(JSON.stringify({ level: 'warn', event: 'dashboard.section_unavailable', section: name, error: String((err as Error)?.message ?? err).slice(0, 300) }));
 		}
 		return { status: 'unavailable' };
 	}

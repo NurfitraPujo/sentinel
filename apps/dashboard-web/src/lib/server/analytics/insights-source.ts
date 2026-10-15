@@ -22,7 +22,7 @@ export async function insightsDeps(): Promise<InsightsDeps> {
 	const envsByProject = new Map<string, string[]>();
 	for (const e of envRows) envsByProject.set(e.projectId, [...(envsByProject.get(e.projectId) ?? []), e.name]);
 	return {
-		run: createRun(databendConfigFromEnv()),
+		run: createRun(databendConfigFromEnv(), fetch, 30_000),
 		projects: projectRows.map((p) => ({ id: p.id, name: p.name, environments: envsByProject.get(p.id) ?? [] })),
 		slis: parseServiceSliConfig(env.SERVICE_SLI_CONFIG),
 		sliEnvironment: env.SLI_CLUSTER ? environmentForCluster(env.SLI_CLUSTER) : null,
