@@ -272,6 +272,9 @@ ingress:
 
 retentionCron:
   enabled: true
+  # Paced from hourly to every 15 minutes to distribute occurrence deletion
+  # across smaller, smoother batches and prevent CDC replication slot lag spikes.
+  schedule: "*/15 * * * *"
 
 oncallCron:
   enabled: true
