@@ -2,27 +2,23 @@ import { describe, it, expect } from 'vitest';
 import { render, screen, within } from '@testing-library/svelte';
 import HealthRow from './HealthRow.svelte';
 import StackedBars from './StackedBars.svelte';
-import SliChart from './SliChart.svelte';
 import EventsTimeline from './EventsTimeline.svelte';
 import ReleaseTable from './ReleaseTable.svelte';
 import BacklogSection from './BacklogSection.svelte';
 import ResponseSection from './ResponseSection.svelte';
 import FilterBar from './FilterBar.svelte';
 import FreshnessLine from './FreshnessLine.svelte';
-import { delta, duration, listHref, perK, pct, GROUP_LABELS } from '$lib/dashboard-format';
+import { delta, duration, listHref, perK, pct, GROUP_LABELS, coerceSplit, deltaState, backlogSub, stackEvents, eventsBarHref, dashboardHref, MAX_SERVICE_SERIES } from '$lib/dashboard-format';
 
 // sentinel-reporting-and-dashboard D17 (fe): the sections, the D19 groups, D23's label, and the accessible table every
 // chart carries. The data shapes are the ones lib/server/analytics/service.ts returns.
 const groups = (o: Partial<Record<string, number>> = {}) => ({ api: 0, jobs: 0, nats: 0, other: 0, unattributed: 0, ...o });
-const sliTile = (o: Record<string, unknown> = {}) => ({
-	id: 'core-api', kind: 'http', project: 'core', availability: 0.98, availabilityTarget: 0.995, latency: 0.95, latencyTarget: 0.94,
-	budgetRemaining: -1, total: 1000, errors: 20, errorsPer1k: 5, events: 5, ...o,
-});
+const sliTile = (o: Record<string, unknown> = {}) => ({ id: 'core-api', kind: 'http', project: 'core', total: 1000, errorsPer1k: 5, events: 5, ...o });
 const health = (o: Record<string, unknown> = {}) => ({
 	events: { current: groups({ api: 5, jobs: 3, other: 2, unattributed: 1 }), previous: groups({ api: 2, jobs: 3 }) },
-	byLevel: {}, newIssues: { current: 4, previous: 2 }, regressions: { current: 1, previous: 1 }, backlog: { open: 12, unassigned: 9 },
-	slis: [sliTile(), sliTile({ id: 'core-jobs', kind: 'jobs', availabilityTarget: null, latencyTarget: null, availability: 0.99, latency: null, budgetRemaining: null, total: 100, errors: 3, errorsPer1k: 30, events: 3 }),
-		sliTile({ id: 'core-nats', kind: 'nats', availabilityTarget: null, latencyTarget: null, availability: null, latency: null, budgetRemaining: null, total: 0, errors: 0, errorsPer1k: null, events: null })],
+	byLevel: {}, newIssues: { current: 4, previous: 2 }, regressions: { current: 1, previous: 1 }, backlog: { open: 12, unassigned: 9, olderThan30d: 2 },
+	slis: [sliTile(), sliTile({ id: 'core-jobs', kind: 'jobs', total: 100, errorsPer1k: 30, events: 3 }),
+		sliTile({ id: 'core-nats', kind: 'nats', total: 0, errorsPer1k: null, events: null })],
 	...o,
 }) as never;
 const FILTERS = { project: 'all', environment: 'all', range: '7d' };
@@ -60,7 +56,7 @@ describe('dashboard-format', () => {
 	});
 });
 
-describe('HealthRow (H2, H3, H4)', () => {
+describe('HealthRow: the Error tracking tiles (H2, H3, H4)', () => {
 	it('shows the five D19 groups apart, each against the previous period', () => {
 		render(HealthRow, { data: health(), filters: FILTERS, apiService: 'api' });
 		const labels = ['API', 'Jobs', 'NATS', 'Other (outside a request)', 'Unattributed'];
@@ -75,26 +71,26 @@ describe('HealthRow (H2, H3, H4)', () => {
 		expect(document.body.textContent!.toLowerCase()).not.toContain('background');
 	});
 
-	it('shows availability vs target with budget left, and latency vs target, for an SLI with a target', () => {
+	it('no longer carries SLO tiles: the SLO table owns targets, budgets and the latency caveat (D2, D10)', () => {
 		render(HealthRow, { data: health(), filters: FILTERS });
-		const avail = screen.getByTestId('sli-availability-core-api');
-		expect(avail.textContent).toContain('98.00%');
-		expect(avail.textContent).toContain('target 99.5%');
-		expect(avail.textContent).toContain('budget left -100%');
-		expect(avail.className).toContain('state-bad'); // below target
-		const lat = screen.getByTestId('sli-latency-core-api');
-		expect(lat.textContent).toContain('95.00%');
-		expect(lat.className).toContain('state-ok'); // above its 94% target
-		// the untargeted rates get no SLI tile
-		expect(screen.queryByTestId('sli-tile-core-jobs')).toBeNull();
-		expect(screen.getByTestId('sli-note').textContent).toContain('long-lived streams');
+		expect(screen.queryByTestId('sli-tiles')).toBeNull();
+		expect(screen.queryByTestId('sli-note')).toBeNull();
+		expect(document.body.textContent).not.toContain('long-lived streams');
 	});
 
-	it('shows errors per 1k for API, jobs and NATS, and "no data" for core-nats before its counter ships', () => {
+	it('says "captured exceptions" with the denominator, never an unqualified "errors" (D9)', () => {
 		render(HealthRow, { data: health(), filters: FILTERS });
-		expect(screen.getByTestId('per1k-api').textContent).toContain('5.0');
-		expect(screen.getByTestId('per1k-jobs').textContent).toContain('30');
+		const api = screen.getByTestId('per1k-api');
+		expect(api.textContent).toContain('Captured API exceptions per 1k requests');
+		expect(api.textContent).toContain('5.0');
+		expect(api.textContent).toContain('5 exceptions / 1,000 requests');
+		expect(screen.getByTestId('per1k-jobs').textContent).toContain('Captured job exceptions per 1k runs');
+		expect(screen.getByTestId('per1k-jobs').textContent).toContain('3 exceptions / 100 runs');
+		expect(screen.getByTestId('per1k-nats').textContent).toContain('Captured NATS exceptions per 1k messages');
 		expect(screen.getByTestId('per1k-nats').textContent).toContain('no data');
+		expect(screen.getByTestId('health-row').textContent).toContain('Captured exceptions by origin');
+		expect(screen.getByTestId('group-total').textContent).toContain('All captured exceptions');
+		expect(screen.getByTestId('health-row').textContent).not.toMatch(/\berrors\b/i);
 	});
 
 	it('counts link into /issues where a filter exists and carry the project scope', () => {
@@ -109,9 +105,8 @@ describe('HealthRow (H2, H3, H4)', () => {
 		expect(within(screen.getByTestId('group-other')).queryByRole('link')).toBeNull();
 	});
 
-	it('shows no SLI tiles for a viewer with none visible, and still shows the rest', () => {
+	it('shows no per-SLI rates for a viewer with none visible, and still shows the rest', () => {
 		render(HealthRow, { data: health({ slis: [] }), filters: FILTERS });
-		expect(screen.queryByTestId('sli-tiles')).toBeNull();
 		expect(screen.getByTestId('per1k-api').textContent).toContain('no data');
 		expect(screen.getByTestId('tile-backlog').textContent).toContain('12');
 	});
@@ -147,30 +142,147 @@ describe('charts (keyboard and screen-reader parity)', () => {
 		expect(new Set(xs).size).toBe(2);
 	});
 
-	it('SliChart draws bars, the good-ratio line and the target, with a hidden table of the same numbers', () => {
-		render(SliChart, { id: 'core-api', goal: 0.995, testId: 's', points: [{ bucket: '2026-10-07 10:00:00', total: 1000, errors: 5 }, { bucket: '2026-10-07 11:00:00', total: 0, errors: 0 }, { bucket: '2026-10-07 12:00:00', total: 500, errors: 1 }] });
-		expect(screen.getByTestId('s-line')).toBeTruthy();
-		expect(screen.getByTestId('s-target')).toBeTruthy();
-		const rows = within(screen.getByTestId('s-table')).getAllByRole('row');
-		expect(rows[1].textContent).toContain('99.50%');
-		expect(rows[2].textContent).toContain('no data'); // a quiet hour is a gap in the line, never a 100%
-	});
-
-	it('EventsTimeline stacks by D19 group, and by service when one project is selected', () => {
+	it('EventsTimeline stacks by D19 origin, or by service on any project selection', () => {
 		const byGroup = [{ bucket: '2026-10-07 10:00:00', group: 'api', service: 'api', n: 3 }, { bucket: '2026-10-07 10:00:00', group: 'jobs', service: 'jobs worker', n: 2 }, { bucket: '2026-10-07 10:00:00', group: 'unattributed', service: null, n: 1 }];
-		const a = render(EventsTimeline, { data: { bucket: 'hour', byGroup, byService: false, releaseMarkers: [] } as never });
-		expect(screen.getByTestId('timeline').textContent).toContain('Error events by group');
+		const a = render(EventsTimeline, { data: { bucket: 'hour', byGroup, split: 'group', releaseMarkers: [] } as never });
+		expect(screen.getByTestId('timeline').textContent).toContain('Captured exceptions by origin');
 		expect(screen.getByTestId('timeline-legend').textContent).toContain('Other (outside a request)');
 		a.unmount();
-		render(EventsTimeline, { data: { bucket: 'hour', byGroup, byService: true, releaseMarkers: [{ version: 'v2', at: '2026-10-07T10:30:00.000Z' }] } as never });
-		expect(screen.getByTestId('timeline').textContent).toContain('Error events by service');
+		// project=all: the service split works there too, and release markers still appear only when the data carries them
+		render(EventsTimeline, { data: { bucket: 'hour', byGroup, split: 'service', releaseMarkers: [{ version: 'v2', at: '2026-10-07T10:30:00.000Z' }] } as never, filters: { project: 'all', environment: 'all', range: '7d', split: 'service' } });
+		expect(screen.getByTestId('timeline').textContent).toContain('Captured exceptions by service');
 		expect(screen.getByTestId('timeline-legend').textContent).toContain('jobs worker');
+		expect(screen.getByTestId('timeline-legend').textContent).toContain('Unattributed');
 		expect(screen.getAllByTestId('timeline-marker')).toHaveLength(1);
 	});
 });
 
+describe('events chart: split, palette, click-through (D12)', () => {
+	const ev = (service: string | null, n: number, group = 'other', bucket = '2026-10-07 10:00:00') => ({ bucket, group, service, n });
+
+	it('coerces split like range: anything unknown is by origin', () => {
+		expect(coerceSplit('service')).toBe('service');
+		expect(coerceSplit('group')).toBe('group');
+		expect(coerceSplit('rubbish')).toBe('group');
+		expect(coerceSplit(null)).toBe('group');
+	});
+
+	it('the toggle keeps the other filters, and the default split stays out of the URL', () => {
+		expect(dashboardHref({ project: 'p1', environment: 'staging', range: '28d', split: 'group' }, { split: 'service' })).toBe('/?project=p1&environment=staging&range=28d&split=service');
+		expect(dashboardHref({ project: 'all', environment: 'all', range: '7d', split: 'service' }, { split: 'group' })).toBe('/');
+		expect(dashboardHref({ project: 'all', environment: 'all', range: '7d', split: 'service' }, { range: '24h' })).toBe('/?range=24h&split=service');
+		render(EventsTimeline, { data: { bucket: 'hour', byGroup: [ev('api', 1)], split: 'group', releaseMarkers: [] } as never, filters: { project: 'p1', environment: 'all', range: '7d', split: 'group' } });
+		const links = within(screen.getByTestId('split-toggle')).getAllByRole('link');
+		expect(links.map((l) => l.textContent)).toEqual(['By origin', 'By service']);
+		expect(links.map((l) => l.getAttribute('href'))).toEqual(['/?project=p1', '/?project=p1&split=service']);
+		expect(links[0].getAttribute('aria-current')).toBe('true');
+	});
+
+	it('service split keeps the top 8 by events in range, folds the rest into Other services, and names events with no service', () => {
+		const rows = [...Array.from({ length: 11 }, (_, i) => ev(`svc${i}`, 100 - i)), ev(null, 5)];
+		const { series, keyOf } = stackEvents(rows, 'service');
+		expect(series.map((s) => s.label)).toEqual([...Array.from({ length: MAX_SERVICE_SERIES }, (_, i) => `svc${i}`), 'Other services', 'Unattributed']);
+		expect(keyOf(ev('svc7', 1))).toBe('svc7');
+		expect(keyOf(ev('svc8', 1))).toBe('__other');
+		expect(keyOf(ev('svc10', 1))).toBe('__other');
+		expect(keyOf(ev(null, 1))).toBe('unattributed');
+		expect(new Set(series.map((s) => s.tone)).size).toBe(series.length); // every series of the split has its own tone
+		expect(series.find((s) => s.key === '__other')!.tone).not.toBe(series.find((s) => s.key === 'unattributed')!.tone);
+	});
+
+	it('service split omits series that do not exist', () => {
+		expect(stackEvents([ev('a', 1)], 'service').series.map((s) => s.label)).toEqual(['a']);
+	});
+
+	it('the 326k "Other (outside a request)" no longer drowns the rest: services are the split on project=all', () => {
+		const a = render(EventsTimeline, { data: { bucket: 'hour', byGroup: [ev('api', 5, 'api'), ev('worker', 9, 'other'), ev(null, 2, 'unattributed')], split: 'service', releaseMarkers: [] } as never });
+		expect(screen.getAllByTestId('timeline-bar')).toHaveLength(3);
+		a.unmount();
+	});
+
+	it('a bar links to /issues with seen=all, the bucket as seen_from/seen_to, and the project/environment scope', () => {
+		render(EventsTimeline, {
+			data: { bucket: 'hour', byGroup: [ev('api', 3, 'api'), ev('jobs worker', 2, 'jobs'), ev('x', 4, 'other')], split: 'group', releaseMarkers: [] } as never,
+			filters: { project: 'p1', environment: 'production', range: '7d', split: 'group' }, apiService: 'api',
+		});
+		const hrefs = screen.getAllByTestId('timeline-link').map((a) => new URL(a.getAttribute('href')!, 'https://x.test'));
+		expect(hrefs).toHaveLength(3);
+		for (const u of hrefs) {
+			expect(u.pathname).toBe('/issues');
+			expect(u.searchParams.get('seen')).toBe('all');
+			expect(u.searchParams.get('seen_from')).toBe('2026-10-07T10:00:00.000Z');
+			expect(u.searchParams.get('seen_to')).toBe('2026-10-07T11:00:00.000Z');
+			expect(u.searchParams.get('project')).toBe('p1');
+			expect(u.searchParams.get('environment')).toBe('production');
+		}
+		expect(hrefs[0].searchParams.get('service')).toBe('api'); // group:api through listHref
+		expect(hrefs[1].searchParams.get('tag')).toBe('source:job'); // group:jobs
+		expect(hrefs[2].searchParams.get('service')).toBeNull(); // "other" has no list filter
+	});
+
+	it('daily buckets span a day; a service-split bar carries the service as the list filter', () => {
+		const href = eventsBarHref({ scope: { project: 'all' }, series: { key: 'worker', label: 'worker', tone: 0, filter: { kind: 'service', service: 'worker' } }, bucketStart: '2026-10-07 00:00:00', bucketMs: 86_400_000 });
+		const u = new URL(href, 'https://x.test');
+		expect(u.searchParams.get('service')).toBe('worker');
+		expect(u.searchParams.get('seen_from')).toBe('2026-10-07T00:00:00.000Z');
+		expect(u.searchParams.get('seen_to')).toBe('2026-10-08T00:00:00.000Z');
+		expect(u.searchParams.get('project')).toBeNull();
+	});
+
+	it('every bar is keyboard reachable and says its bucket and count; the drawing is exposed because it is interactive', () => {
+		render(EventsTimeline, { data: { bucket: 'hour', byGroup: [ev('api', 3, 'api')], split: 'group', releaseMarkers: [] } as never, apiService: 'api' });
+		const link = screen.getByTestId('timeline-link');
+		expect(link.tagName.toLowerCase()).toBe('a');
+		expect(link.getAttribute('tabindex')).not.toBe('-1');
+		expect(link.getAttribute('aria-label')).toBe('10-07 10:00 · API: 3');
+		expect(screen.getByTestId('timeline').querySelector('svg')!.getAttribute('aria-hidden')).toBeNull();
+	});
+
+	it('series use the palette tokens, one slot each, not shades of one hue', () => {
+		render(EventsTimeline, { data: { bucket: 'hour', byGroup: [ev('api', 3, 'api'), ev('w', 2, 'jobs')], split: 'group', releaseMarkers: [] } as never });
+		const fills = screen.getAllByTestId('timeline-bar').map((r) => r.getAttribute('fill'));
+		expect(fills).toEqual(['var(--chart-1)', 'var(--chart-2)']);
+		expect(screen.getByTestId('timeline-legend').innerHTML).toContain('var(--chart-4)'); // other keeps its own slot
+		expect(screen.getByTestId('timeline-legend').innerHTML).not.toContain('oklch(');
+	});
+});
+
+describe('deltas say good or bad (D13) and the backlog tile (D14)', () => {
+	it('an increase of 5% or more is warn, a decrease of 5% or more is ok, smaller is neutral', () => {
+		expect(deltaState(105, 100)).toBe('warn');
+		expect(deltaState(104, 100)).toBeUndefined();
+		expect(deltaState(96, 100)).toBeUndefined();
+		expect(deltaState(95, 100)).toBe('ok');
+		expect(deltaState(1, 100)).toBe('ok'); // −99% is not the same as +99%
+		expect(deltaState(199, 100)).toBe('warn');
+		expect(deltaState(5, 0)).toBe('warn');
+		expect(deltaState(0, 0)).toBeUndefined();
+		expect(deltaState(0, 7)).toBe('ok');
+		expect(deltaState(100, 100)).toBeUndefined();
+	});
+
+	it('colours the tiles that carry a trend, and keeps the sign in the text', () => {
+		render(HealthRow, { data: health({ events: { current: groups({ api: 1, jobs: 6 }), previous: groups({ api: 100, jobs: 3 }) }, newIssues: { current: 4, previous: 4 }, regressions: { current: 2, previous: 1 } }), filters: FILTERS });
+		expect(screen.getByTestId('group-api').className).toContain('state-ok');
+		expect(screen.getByTestId('group-api').textContent).toContain('−99% vs previous period');
+		expect(screen.getByTestId('group-jobs').className).toContain('state-warn');
+		expect(screen.getByTestId('group-jobs').textContent).toContain('+100% vs previous period');
+		expect(screen.getByTestId('tile-new-issues').className).not.toMatch(/state-/);
+		expect(screen.getByTestId('tile-regressions').className).toContain('state-warn');
+	});
+
+	it('the backlog sub-line says "none assigned" only when every open issue is unassigned', () => {
+		expect(backlogSub({ open: 1087, unassigned: 1087, olderThan30d: 300 })).toBe('none assigned · 300 older than 30 days');
+		expect(backlogSub({ open: 12, unassigned: 9, olderThan30d: 2 })).toBe('9 unassigned · 2 older than 30 days');
+		expect(backlogSub({ open: 0, unassigned: 0, olderThan30d: 0 })).toBe('0 unassigned · 0 older than 30 days');
+		render(HealthRow, { data: health({ backlog: { open: 6, unassigned: 6, olderThan30d: 1 } }), filters: FILTERS });
+		expect(screen.getByTestId('tile-backlog').textContent).toContain('none assigned · 1 older than 30 days');
+		expect(screen.getByTestId('tile-backlog').textContent).not.toContain('6 / 6');
+	});
+});
+
 describe('ReleaseTable (H6)', () => {
-	const row = (o = {}) => ({ version: 'v2.0.1', environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups({ api: 5, jobs: 1 }), newIssues: 2, regressions: 1, errorsPer1k: 3.2, change: 1.5, ...o });
+	const row = (o = {}) => ({ project: 'core', version: 'v2.0.1', environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups({ api: 5, jobs: 1 }), newIssues: 2, regressions: 1, errorsPer1k: 3.2, change: 1.5, ...o });
 	it('says "First seen", never "deployed", with the group columns and the change from the previous release', () => {
 		render(ReleaseTable, { rows: [row(), row({ version: 'v2.0.0', change: null, errorsPer1k: null })] as never });
 		const table = screen.getByTestId('release-table');

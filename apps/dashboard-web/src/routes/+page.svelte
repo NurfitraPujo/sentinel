@@ -7,7 +7,8 @@
 	import FreshnessLine from '$lib/components/dashboard/FreshnessLine.svelte';
 	import HealthRow from '$lib/components/dashboard/HealthRow.svelte';
 	import EventsTimeline from '$lib/components/dashboard/EventsTimeline.svelte';
-	import SliSection from '$lib/components/dashboard/SliSection.svelte';
+	import BudgetBurndown from '$lib/components/dashboard/BudgetBurndown.svelte';
+	import SloTable from '$lib/components/dashboard/SloTable.svelte';
 	import ReleaseTable from '$lib/components/dashboard/ReleaseTable.svelte';
 	import BacklogSection from '$lib/components/dashboard/BacklogSection.svelte';
 	import ResponseSection from '$lib/components/dashboard/ResponseSection.svelte';
@@ -37,8 +38,41 @@
 			{#if f.status === 'ok'}<FreshnessLine data={f.data} />{/if}
 		{/await}
 
-		<section aria-labelledby="h-health" class="section">
-			<h2 id="h-health">Health</h2>
+		<section aria-labelledby="h-slo" class="section">
+			<h2 id="h-slo">Service health (SLO)</h2>
+			{#await data.sections.slo}
+				<SectionState state="loading" name="slo" />
+			{:then s}
+				{#if s.status !== 'ok'}
+					<SectionState state="unavailable" name="slo" />
+				{:else if s.data.rows.length === 0}
+					<SectionState state="empty" name="slo" message="No service levels are tracked for the projects you can see." />
+				{:else}
+					<SloTable rows={s.data.rows} range={data.filters.range} natsBreakdown={data.sections.natsBreakdown} />
+				{/if}
+			{/await}
+		</section>
+
+		<section aria-labelledby="h-budget" class="section">
+			<h2 id="h-budget">Error budget</h2>
+			{#await data.sections.budget}
+				<SectionState state="loading" name="budget" />
+			{:then s}
+				{#if s.status !== 'ok'}
+					<SectionState state="unavailable" name="budget" />
+				{:else if s.data.charts.length === 0}
+					<SectionState state="empty" name="budget" message="No objective with a target to burn down." />
+				{:else}
+					<BudgetBurndown charts={s.data.charts} />
+				{/if}
+			{/await}
+		</section>
+
+		<section aria-labelledby="h-errors" class="section">
+			<h2 id="h-errors">Error tracking</h2>
+			<p class="lede" data-testid="errors-lede">
+				Exceptions the SDKs sent to Sentinel. These are not the SLO's failures: a 5xx with no exception, or an exception the service recovered from, counts in only one of them.
+			</p>
 			{#await data.sections.health}
 				<SectionState state="loading" name="health" />
 			{:then s}
@@ -48,34 +82,17 @@
 					<SectionState state="unavailable" name="health" />
 				{/if}
 			{/await}
-		</section>
-
-		<section aria-labelledby="h-timeline" class="section">
-			<h2 id="h-timeline">Error events over time</h2>
-			{#await data.sections.timeline}
-				<SectionState state="loading" name="timeline" />
-			{:then s}
-				{#if s.status === 'ok'}
-					<EventsTimeline data={s.data} />
-				{:else}
-					<SectionState state="unavailable" name="timeline" />
-				{/if}
-			{/await}
-		</section>
-
-		<section aria-labelledby="h-slis" class="section">
-			<h2 id="h-slis">Service levels</h2>
-			{#await data.sections.slis}
-				<SectionState state="loading" name="slis" />
-			{:then s}
-				{#if s.status !== 'ok'}
-					<SectionState state="unavailable" name="slis" />
-				{:else if s.data.length === 0}
-					<SectionState state="empty" name="slis" message="No service levels are tracked for the projects you can see." />
-				{:else}
-					<SliSection data={s.data} />
-				{/if}
-			{/await}
+			<div class="subsection">
+				{#await data.sections.timeline}
+					<SectionState state="loading" name="timeline" />
+				{:then s}
+					{#if s.status === 'ok'}
+						<EventsTimeline data={s.data} filters={data.filters} {apiService} />
+					{:else}
+						<SectionState state="unavailable" name="timeline" />
+					{/if}
+				{/await}
+			</div>
 		</section>
 
 		<section aria-labelledby="h-releases" class="section">
@@ -90,7 +107,10 @@
 				{:else if s.data.rows.length === 0}
 					<SectionState state="empty" name="releases" message="No releases have reported events for this selection." />
 				{:else}
-					<ReleaseTable rows={s.data.rows} showEnvironment={data.filters.environment === 'all'} />
+					<ReleaseTable rows={s.data.rows} showEnvironment={data.filters.environment === 'all'} showProject={s.data.allProjects} />
+					{#if s.data.allProjects}
+						<p class="hint" data-testid="releases-hint">Pick a project to see all its releases.</p>
+					{/if}
 				{/if}
 			{/await}
 		</section>
@@ -131,6 +151,9 @@
 	.to-issues { font-size: 0.8125rem; color: var(--color-primary); text-decoration: none; }
 	.to-issues:hover { text-decoration: underline; }
 	.section { padding-top: 0.5rem; border-top: 1px solid var(--border-color-muted); }
+	.hint { margin: 0.5rem 0 0; font-size: 0.75rem; color: var(--text-muted); }
+	.lede { margin: 0 0 0.625rem; font-size: 0.75rem; color: var(--text-muted); }
+	.subsection { margin-top: 0.75rem; }
 	.empty { padding: 2rem 1rem; text-align: center; color: var(--text-secondary); }
 	.empty h2 { text-transform: none; font-size: 1rem; color: var(--text-primary); letter-spacing: 0; }
 </style>

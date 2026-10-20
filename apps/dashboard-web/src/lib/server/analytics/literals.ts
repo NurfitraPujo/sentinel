@@ -46,8 +46,8 @@ export function intLiteral(n: number, max = 1_000_000): string {
 	return String(n);
 }
 
-import { RANGES, type Range } from '../../dashboard-format';
-export { RANGES, type Range };
+import { RANGES, coerceSplit, type Range, type Split } from '../../dashboard-format';
+export { RANGES, coerceSplit, type Range, type Split };
 export const RANGE_MS: Record<Range, number> = {
 	'24h': 24 * 3_600_000,
 	'7d': 7 * 24 * 3_600_000,

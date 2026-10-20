@@ -551,14 +551,16 @@ export interface SliHourRow {
 	hourStart: Date;
 	total: number;
 	errors: number;
+	/** null when the hour carried no latency count (jobs, nats, or an http SLI with no latency objective). */
+	fast: number | null;
 }
 
 export async function sliHourlyRows(c: MetricCtx, sliIds: readonly string[], w: Window, environment: string): Promise<SliHourRow[]> {
 	if (sliIds.length === 0) return [];
 	const rows = await c.run(`
-		SELECT sli_id, hour_start, total, errors FROM sli_hourly
+		SELECT sli_id, hour_start, total, errors, fast FROM sli_hourly
 		WHERE sli_id IN (${enumList(sliIds, sliIds)}) AND environment = ${enumLiteral(environment, ['production', 'staging'])} AND ${inRange('hour_start', w)}`);
-	return rows.map((r) => ({ sliId: r[0]!, hourStart: new Date(r[1]!.replace(' ', 'T') + 'Z'), total: n(r[2]), errors: n(r[3]) }));
+	return rows.map((r) => ({ sliId: r[0]!, hourStart: new Date(r[1]!.replace(' ', 'T') + 'Z'), total: n(r[2]), errors: n(r[3]), fast: nOrNull(r[4]) }));
 }
 
 /** Hourly or daily good-ratio series for one SLI (D13 section 3). */
@@ -589,7 +591,7 @@ export function latencyRatio(s: Pick<SliSums, 'fast' | 'totalWithFast'>): number
 	return s.fast === null || s.totalWithFast === 0 ? null : s.fast / s.totalWithFast;
 }
 
-/** Error budget left: `1 − (Σerrors/Σtotal)/(1 − target)` over the trailing 28 days, floored at −100% (−1). */
+/** Error budget left: `1 − (Σerrors/Σtotal)/(1 − target)` over the SLI's own budget window, floored at −100% (−1). */
 export function errorBudgetRemaining(s: Pick<SliSums, 'total' | 'errors'>, target: number): number | null {
 	if (s.total === 0 || !(target > 0 && target < 1)) return null;
 	return Math.max(-1, 1 - s.errors / s.total / (1 - target));

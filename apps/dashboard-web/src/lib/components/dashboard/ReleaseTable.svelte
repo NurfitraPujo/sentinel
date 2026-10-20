@@ -1,6 +1,6 @@
 <script lang="ts">
-	// D13 section 4, flow H6: release health for the selected project (and environment). The last 10 releases by window
-	// start. "First seen", never "deployed": D9 infers a release's start from its first event, nothing records a deploy.
+	// D13 section 4, flow H6: release health for the selected project (and environment): the last 10 releases by window
+	// start. With project=all (D15) the newest 3 of each project that owns a service SLI. "First seen", never "deployed": D9 infers a release's start from its first event, nothing records a deploy.
 	import { count, duration, perK } from '$lib/dashboard-format';
 	import type { ReleaseRow } from '$lib/server/analytics/service';
 
@@ -8,8 +8,10 @@
 		rows: ReleaseRow[];
 		/** Which environment each row is from matters only when the project has more than one in the table. */
 		showEnvironment?: boolean;
+		/** D15: `project=all` lists the newest releases of each SLI-owning project, so the table says whose each is. */
+		showProject?: boolean;
 	}
-	let { rows, showEnvironment = false }: Props = $props();
+	let { rows, showEnvironment = false, showProject = false }: Props = $props();
 	void duration;
 	const changeText = (r: ReleaseRow) => {
 		if (r.change === null) return '—';
@@ -25,6 +27,7 @@
 		<caption class="visually-hidden">Release health: the latest releases, by when their first error was seen</caption>
 		<thead>
 			<tr>
+				{#if showProject}<th scope="col">Project</th>{/if}
 				<th scope="col">Release</th>
 				{#if showEnvironment}<th scope="col">Environment</th>{/if}
 				<th scope="col">First seen</th>
@@ -39,8 +42,9 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each rows as r (r.environment + r.version)}
+			{#each rows as r (r.project + r.environment + r.version)}
 				<tr data-testid="release-row">
+					{#if showProject}<td data-testid="release-project">{r.project}</td>{/if}
 					<th scope="row" class="mono">{r.version}</th>
 					{#if showEnvironment}<td>{r.environment}</td>{/if}
 					<td>{new Date(r.firstSeen).toLocaleString('en-US')}</td>

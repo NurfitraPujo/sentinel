@@ -5,12 +5,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { getUserMock, loadShellMock, sections } = vi.hoisted(() => ({
 	getUserMock: vi.fn(),
 	loadShellMock: vi.fn(),
-	sections: { freshness: vi.fn(), health: vi.fn(), timeline: vi.fn(), sliSection: vi.fn(), releases: vi.fn(), backlog: vi.fn(), response: vi.fn() },
+	sections: { freshness: vi.fn(), health: vi.fn(), timeline: vi.fn(), sloStatus: vi.fn(), natsBreakdown: vi.fn(), budgetBurndown: vi.fn(), releases: vi.fn(), backlog: vi.fn(), response: vi.fn() },
 }));
 vi.mock('$lib/server/auth', () => ({ getUser: getUserMock }));
 vi.mock('$lib/server/analytics/shell', () => ({ loadShell: loadShellMock }));
 vi.mock('$lib/server/analytics/service', () => ({
-	freshness: sections.freshness, health: sections.health, timeline: sections.timeline, sliSection: sections.sliSection,
+	freshness: sections.freshness, health: sections.health, timeline: sections.timeline, sloStatus: sections.sloStatus, natsBreakdown: sections.natsBreakdown, budgetBurndown: sections.budgetBurndown,
 	releases: sections.releases, backlog: sections.backlog, response: sections.response,
 }));
 
@@ -18,7 +18,7 @@ import { load } from './+page.server';
 import { LIST_ONLY_PARAMS } from '$lib/server/dashboard-routing';
 
 const call = (qs: string) => load({ url: new URL(`https://sentinel.test/${qs}`), locals: {} } as never) as Promise<any>;
-const input = { slis: [{ kind: 'http', service: 'api' }, { kind: 'jobs' }], project: 'all', environment: 'all', range: '7d' };
+const input = { slis: [{ kind: 'http', service: 'api' }, { kind: 'jobs' }], project: 'all', environment: 'all', range: '7d', split: 'group' };
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -70,12 +70,26 @@ describe('GET / the dashboard (R1, R8)', () => {
 
 	it('hands the viewer\'s selection to the shell and returns it as the echoed filters', async () => {
 		await call('?project=p1&environment=staging&range=24h');
-		expect(loadShellMock).toHaveBeenCalledWith('u1', { project: 'p1', environment: 'staging', range: '24h' });
+		expect(loadShellMock).toHaveBeenCalledWith('u1', { project: 'p1', environment: 'staging', range: '24h', split: null });
+	});
+
+	it('hands the raw split to the shell (which coerces it) and echoes the shell\'s effective value (D12)', async () => {
+		await call('?split=service');
+		expect(loadShellMock).toHaveBeenCalledWith('u1', expect.objectContaining({ split: 'service' }));
+		loadShellMock.mockResolvedValue({ input: { ...input, split: 'service' }, projects: [{ id: 'p1', name: 'core' }], environments: [], databendConfigured: true, newestPostgresOccurrence: async () => null });
+		expect((await call('?split=service')).filters).toMatchObject({ split: 'service' });
+		loadShellMock.mockResolvedValue({ input: { ...input, split: 'group' }, projects: [{ id: 'p1', name: 'core' }], environments: [], databendConfigured: true, newestPostgresOccurrence: async () => null });
+		expect((await call('?split=rubbish')).filters).toMatchObject({ split: 'group' });
+	});
+
+	it('does not treat split as a list-only parameter: it never redirects to /issues', async () => {
+		expect(LIST_ONLY_PARAMS.has('split')).toBe(false);
+		expect((await call('?split=service')).empty).toBe(false);
 	});
 
 	it('returns every section as its own promise, so one can stream before another', async () => {
 		const out = await call('');
-		expect(Object.keys(out.sections).sort()).toEqual(['backlog', 'freshness', 'health', 'releases', 'response', 'slis', 'timeline']);
+		expect(Object.keys(out.sections).sort()).toEqual(['backlog', 'budget', 'freshness', 'health', 'natsBreakdown', 'releases', 'response', 'slo', 'timeline']);
 		for (const p of Object.values(out.sections)) expect(typeof (p as Promise<unknown>).then).toBe('function');
 		expect(sections.health).toHaveBeenCalledTimes(1);
 	});

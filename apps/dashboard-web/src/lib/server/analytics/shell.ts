@@ -10,7 +10,7 @@ import { environmentForCluster } from '../sli/collect';
 import { createRun, databendConfigFromEnv, type Run } from './databend';
 import type { Scope } from './access';
 import { coerceProject, type DashboardInput, type ProjectInfo } from './service';
-import { coerceRange, isUuid } from './literals';
+import { coerceRange, coerceSplit, isUuid } from './literals';
 
 /**
  * sentinel-reporting-and-dashboard D11/D12/D14: everything the `/` loader needs from Sentinel's Postgres before any
@@ -44,7 +44,12 @@ export function sliEnvironmentFromEnv(): string | null {
 	}
 }
 
-export async function loadShell(userId: string, params: { project: string | null; environment: string | null; range: string | null }, run?: Run): Promise<DashboardShell> {
+/** VictoriaMetrics as configured for `sli-collect` (same env); null when either is unset. */
+export function vmFromEnv(): { url: string; cluster: string } | null {
+	return env.VICTORIAMETRICS_URL && env.SLI_CLUSTER ? { url: env.VICTORIAMETRICS_URL, cluster: env.SLI_CLUSTER } : null;
+}
+
+export async function loadShell(userId: string, params: { project: string | null; environment: string | null; range: string | null; split?: string | null }, run?: Run): Promise<DashboardShell> {
 	const accessible = await getAccessibleProjects(userId);
 	const projects: ProjectInfo[] = accessible.map((p) => ({ id: p.id, name: p.name }));
 	const scopeMap = await resolveEnvironmentScopes(userId);
@@ -75,7 +80,7 @@ export async function loadShell(userId: string, params: { project: string | null
 
 function finish(
 	userId: string, projects: ProjectInfo[], scopes: Scope[], known: string[], project: string,
-	environments: { name: string; displayName: string }[], params: { environment: string | null; range: string | null }, run?: Run
+	environments: { name: string; displayName: string }[], params: { environment: string | null; range: string | null; split?: string | null }, run?: Run
 ): DashboardShell {
 	void userId;
 	const requestedEnv = params.environment ?? 'all';
@@ -84,6 +89,7 @@ function finish(
 	const cfg = databendConfigFromEnv();
 	const input: DashboardInput = {
 		range: coerceRange(params.range),
+		split: coerceSplit(params.split),
 		project,
 		environment,
 		now: new Date(),
@@ -92,6 +98,7 @@ function finish(
 		knownEnvironments: known,
 		slis: loadSliConfig(),
 		sliEnvironment: sliEnvironmentFromEnv(),
+		vm: vmFromEnv(),
 		run: run ?? createRun(cfg),
 	};
 	const ids = scopes.filter((s) => (project === 'all' || s.projectId === project) && s.environments?.length !== 0).map((s) => s.projectId);

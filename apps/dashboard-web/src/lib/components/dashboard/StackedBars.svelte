@@ -3,13 +3,16 @@
 	// library), in the style of TrendBarChart. `mode='stacked'` stacks the series in each bucket (error events by D19
 	// group or by service); `mode='grouped'` puts them side by side (opened vs resolved per week).
 	//
-	// Colour is state-only (PRODUCT.md): series are told apart by a luminance ramp of the one primary hue plus a pattern
-	// of position in the legend, never by a rainbow. The drawing is aria-hidden; the visually hidden <table> carries every
-	// number, one row per bucket, so a screen reader and the keyboard get the same data (parity with TrendBarChart).
-	// Every bar's tooltip is a <title> child of its <rect>, never a title attribute.
+	// Series are told apart by the categorical palette tokens (--chart-1..10, app.css; sentinel-dashboard-metrics-improvement
+	// D12): distinct hues that each hold 3:1 against the background, not shades of one blue. With `href`, every bar is a link
+	// (keyboard reachable, aria-label naming its bucket and count) and the drawing is exposed; without it the drawing is
+	// aria-hidden. The visually hidden <table> carries every number, one row per bucket, so a screen reader and the keyboard
+	// get the same data (parity with TrendBarChart). Every bar's tooltip is a <title> child of its <rect>.
 	interface Series {
 		key: string;
 		label: string;
+		/** Palette slot (0-based); defaults to the series' position, so a group can keep its colour whatever else is drawn. */
+		tone?: number;
 	}
 	interface Bucket {
 		/** The bucket's start, in whatever form the caller writes it (`formatBucket` is applied for display). */
@@ -30,9 +33,11 @@
 		/** Release-start markers (D13): drawn as a tick on the bucket and listed in the table's caption. */
 		markers?: Marker[];
 		labelEvery?: number;
+		/** Where a bar leads. null = this bar is not a link. */
+		href?: (bucketStart: string, series: Series) => string | null;
 		testId: string;
 	}
-	let { heading, series, buckets, mode = 'stacked', formatBucket = (s) => s, markers = [], labelEvery = 6, testId }: Props = $props();
+	let { heading, series, buckets, mode = 'stacked', formatBucket = (s) => s, markers = [], labelEvery = 6, href, testId }: Props = $props();
 
 	const SLOT = 20;
 	const HEIGHT = 120;
@@ -46,8 +51,8 @@
 			: Math.max(1, ...buckets.flatMap((b) => series.map((s) => b.values[s.key] ?? 0)))
 	);
 	const plotH = HEIGHT - PAD_TOP - PAD_BOTTOM;
-	// luminance ramp of the primary hue; the nth series is the nth step
-	const shade = (i: number, n: number) => `oklch(${0.45 + (0.4 * i) / Math.max(1, n - 1)} 0.14 255)`;
+	const PALETTE = 10;
+	const colorOf = (s: Series, i: number) => `var(--chart-${((s.tone ?? i) % PALETTE) + 1})`;
 	let sum = $derived(totals.reduce((a, b) => a + b, 0));
 
 	function bars(b: Bucket, bi: number) {
@@ -78,17 +83,26 @@
 	{:else}
 		<ul class="legend" data-testid="{testId}-legend">
 			{#each series as s, si (s.key)}
-				<li><span class="swatch" style="background: {shade(si, series.length)}"></span>{s.label}</li>
+				<li><span class="swatch" style="background: {colorOf(s, si)}"></span>{s.label}</li>
 			{/each}
 		</ul>
-		<svg viewBox="0 0 {width} {HEIGHT}" class="svg" aria-hidden="true" focusable="false">
+		<svg viewBox="0 0 {width} {HEIGHT}" class="svg" aria-hidden={href ? undefined : 'true'} focusable="false">
 			<line x1="0" x2={width} y1={PAD_TOP + plotH} y2={PAD_TOP + plotH} class="axis" />
 			{#each buckets as b, bi (b.start)}
 				{#each bars(b, bi) as bar (bar.s.key)}
 					{#if bar.h > 0}
-						<rect x={bar.x} y={bar.y} width={bar.w} height={bar.h} fill={shade(bar.si, series.length)} data-testid="{testId}-bar">
-							<title>{formatBucket(b.start)} · {bar.s.label}: {Number(bar.v).toLocaleString('en-US')}</title>
-						</rect>
+						{@const to = href?.(b.start, bar.s) ?? null}
+						{#if to}
+							<a href={to} class="bar-link" aria-label="{formatBucket(b.start)} · {bar.s.label}: {Number(bar.v).toLocaleString('en-US')}" data-testid="{testId}-link">
+								<rect x={bar.x} y={bar.y} width={bar.w} height={bar.h} fill={colorOf(bar.s, bar.si)} data-testid="{testId}-bar">
+									<title>{formatBucket(b.start)} · {bar.s.label}: {Number(bar.v).toLocaleString('en-US')}</title>
+								</rect>
+							</a>
+						{:else}
+							<rect x={bar.x} y={bar.y} width={bar.w} height={bar.h} fill={colorOf(bar.s, bar.si)} data-testid="{testId}-bar">
+								<title>{formatBucket(b.start)} · {bar.s.label}: {Number(bar.v).toLocaleString('en-US')}</title>
+							</rect>
+						{/if}
 					{/if}
 				{/each}
 				{#if bi === 0 || bi === buckets.length - 1 || bi % labelEvery === 0}
@@ -127,6 +141,10 @@
 	.legend { display: flex; flex-wrap: wrap; gap: 0.25rem 0.875rem; list-style: none; padding: 0; margin: 0 0 0.375rem; font-size: 0.75rem; color: var(--text-muted); }
 	.swatch { display: inline-block; width: 0.625rem; height: 0.625rem; border-radius: 2px; margin-right: 0.3125rem; vertical-align: -1px; }
 	.svg { width: 100%; height: auto; max-height: 11rem; display: block; }
+	.bar-link { cursor: pointer; }
+	.bar-link:hover rect { opacity: 0.8; }
+	.bar-link:focus-visible { outline: none; }
+	.bar-link:focus-visible rect { stroke: var(--text-primary); stroke-width: 1.5; }
 	.axis { stroke: var(--border-color); stroke-width: 1; }
 	.label { fill: var(--text-subtle); font-size: 8px; font-family: var(--font-mono); }
 	.marker { stroke: var(--status-open-text); stroke-width: 1; stroke-dasharray: 2 2; }

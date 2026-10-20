@@ -1,29 +1,21 @@
 <script lang="ts">
-	// D13 section 2: error events over time, stacked by D19 group, or by service when one project is selected, with
-	// release-start markers for one project. Hourly buckets for 24h and 7d, daily for 28d and 90d.
+	// D13 section 2 as the Error tracking half's chart (sentinel-dashboard-metrics-improvement D12): captured exceptions over
+	// time, split by origin (the five D19 groups) or by service (top 8, the rest "Other services"), on every project
+	// selection. Hourly buckets for 24h and 7d, daily for 28d and 90d. A bar opens the issues seen in its bucket.
 	import StackedBars from './StackedBars.svelte';
-	import { GROUP_KEYS, GROUP_LABELS } from '$lib/dashboard-format';
+	import { SPLITS, SPLIT_LABELS, dashboardHref, eventsBarHref, stackEvents, type DashboardFilters, type Split } from '$lib/dashboard-format';
 	import type { TimelineData } from '$lib/server/analytics/service';
 
 	interface Props {
 		data: TimelineData;
+		filters?: DashboardFilters;
+		apiService?: string;
 	}
-	let { data }: Props = $props();
+	let { data, filters = { project: 'all', environment: 'all', range: '7d' }, apiService }: Props = $props();
 
-	// at most this many services get a series; the rest are summed into "Other services" so the stack stays legible
-	const MAX_SERVICES = 6;
-	let stacking = $derived.by(() => {
-		if (!data.byService) return { series: GROUP_KEYS.map((g) => ({ key: g as string, label: GROUP_LABELS[g] })), keyOf: (r: { group: string; service: string | null }) => r.group };
-		const totals = new Map<string, number>();
-		for (const r of data.byGroup) {
-			const k = r.service ?? 'unattributed';
-			totals.set(k, (totals.get(k) ?? 0) + r.n);
-		}
-		const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, MAX_SERVICES).map(([k]) => k);
-		const series = top.map((k) => ({ key: k, label: k === 'unattributed' ? 'Unattributed' : k }));
-		if (totals.size > top.length) series.push({ key: '__other', label: 'Other services' });
-		return { series, keyOf: (r: { group: string; service: string | null }) => { const k = r.service ?? 'unattributed'; return top.includes(k) ? k : '__other'; } };
-	});
+	let split = $derived((data.split ?? 'group') as Split);
+	let stacking = $derived(stackEvents(data.byGroup, split));
+	let bucketMs = $derived(data.bucket === 'hour' ? 3_600_000 : 86_400_000);
 	let buckets = $derived.by(() => {
 		const by = new Map<string, Record<string, number>>();
 		for (const r of data.byGroup) {
@@ -45,14 +37,35 @@
 			})
 			.filter((m): m is { start: string; label: string } => m !== null)
 	);
+	const scope = $derived({ project: filters.project, environment: filters.environment });
 </script>
 
-<StackedBars
-	heading={data.byService ? 'Error events by service' : 'Error events by group'}
-	series={stacking.series}
-	{buckets}
-	formatBucket={fmt}
-	{markers}
-	labelEvery={data.bucket === 'hour' ? 12 : 4}
-	testId="timeline"
-/>
+<div class="timeline">
+	<div class="split" role="group" aria-label="Split the chart" data-testid="split-toggle">
+		{#each SPLITS as s (s)}
+			<a href={dashboardHref(filters, { split: s })} class:active={split === s} aria-current={split === s ? 'true' : undefined}>{SPLIT_LABELS[s]}</a>
+		{/each}
+	</div>
+	<StackedBars
+		heading={split === 'service' ? 'Captured exceptions by service' : 'Captured exceptions by origin'}
+		series={stacking.series}
+		{buckets}
+		formatBucket={fmt}
+		{markers}
+		labelEvery={data.bucket === 'hour' ? 12 : 4}
+		href={(start, s) => {
+			const series = stacking.series.find((x) => x.key === s.key);
+			return series ? eventsBarHref({ scope, series, bucketStart: start, bucketMs, apiService }) : null;
+		}}
+		testId="timeline"
+	/>
+</div>
+
+<style>
+	.timeline { display: flex; flex-direction: column; gap: 0.375rem; }
+	.split { align-self: flex-start; display: inline-flex; border: 1px solid var(--border-color); border-radius: var(--radius-md); overflow: hidden; }
+	a { padding: 0.25rem 0.625rem; font-size: 0.8125rem; color: var(--text-secondary); text-decoration: none; border-right: 1px solid var(--border-color); }
+	a:last-child { border-right: none; }
+	a:hover { background: var(--bg-surface-hover); }
+	a.active { background: var(--color-primary-subtle); color: var(--text-primary); font-weight: 600; }
+</style>

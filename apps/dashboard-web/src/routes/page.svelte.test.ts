@@ -17,13 +17,14 @@ const base = {
 	empty: false,
 	apiServices: ['api'],
 };
-const health = { events: { current: groups, previous: groups }, byLevel: {}, newIssues: { current: 1, previous: 1 }, regressions: { current: 0, previous: 0 }, backlog: { open: 3, unassigned: 1 }, slis: [] };
+const health = { events: { current: groups, previous: groups }, byLevel: {}, newIssues: { current: 1, previous: 1 }, regressions: { current: 0, previous: 0 }, backlog: { open: 3, unassigned: 1, olderThan30d: 0 }, slis: [] };
 const sections = (over: Record<string, Promise<unknown>> = {}) => ({
 	freshness: ok({ analyticsAsOf: '2026-10-07T10:00:00.000Z', lagMinutes: 0, warn: false }),
 	health: ok(health),
 	timeline: ok({ bucket: 'hour', byGroup: [], byService: false, releaseMarkers: [] }),
-	slis: ok([]),
-	releases: ok({ rows: [], needsProject: true }),
+	slo: ok({ rows: [] }),
+	budget: ok({ charts: [] }),
+	releases: ok({ rows: [], needsProject: true, allProjects: false }),
 	backlog: ok({ weekly: [], age: { '0-7d': 0, '7-30d': 0, '30-90d': 0, '90d+': 0 }, open: 0, unassigned: 0, top: [] }),
 	response: ok({ mtta: null, mttr: null, regressionRate: null, changeFailureRate: null, releasesInRange: 0, reportsWaiting: 0 }),
 	...over,
@@ -35,7 +36,7 @@ describe('/ the dashboard page', () => {
 		render(Page, { data: { ...base, sections: sections() } as never });
 		await settle();
 		const headings = screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent);
-		expect(headings).toEqual(['Health', 'Error events over time', 'Service levels', 'Release health', 'Backlog', 'Response']);
+		expect(headings).toEqual(['Service health (SLO)', 'Error budget', 'Error tracking', 'Release health', 'Backlog', 'Response']);
 		expect(screen.getByTestId('to-issues').getAttribute('href')).toBe('/issues');
 		expect(screen.getByTestId('health-row')).toBeTruthy();
 		expect(screen.getByTestId('freshness').textContent).toContain('analytics as of');
@@ -43,10 +44,10 @@ describe('/ the dashboard page', () => {
 	});
 
 	it('Databend down: every section says unavailable while the page, the filters and the issues link keep working (H10)', async () => {
-		const down = Object.fromEntries(['freshness', 'health', 'timeline', 'slis', 'releases', 'backlog', 'response'].map((k) => [k, unavailable()]));
+		const down = Object.fromEntries(['freshness', 'health', 'timeline', 'slo', 'budget', 'releases', 'backlog', 'response'].map((k) => [k, unavailable()]));
 		render(Page, { data: { ...base, sections: down } as never });
 		await settle();
-		for (const name of ['health', 'timeline', 'slis', 'releases', 'backlog', 'response']) {
+		for (const name of ['health', 'timeline', 'slo', 'budget', 'releases', 'backlog', 'response']) {
 			expect(screen.getByTestId(`${name}-unavailable`).textContent).toContain('Unavailable');
 		}
 		expect(screen.getByTestId('to-issues')).toBeTruthy();
@@ -78,14 +79,33 @@ describe('/ the dashboard page', () => {
 	it('shows no service levels message when none are tracked', async () => {
 		render(Page, { data: { ...base, sections: sections() } as never });
 		await settle();
-		expect(screen.getByTestId('slis-empty').textContent).toContain('No service levels');
+		expect(screen.getByTestId('slo-empty').textContent).toContain('No service levels');
 	});
 
 	it('lists the release table when a project is selected', async () => {
-		const row = { version: 'v2', environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups, newIssues: 0, regressions: 0, errorsPer1k: null, change: null };
-		render(Page, { data: { ...base, filters: { ...base.filters, project: 'p1' }, sections: sections({ releases: ok({ rows: [row], needsProject: false }) }) } as never });
+		const row = { project: 'core', version: 'v2', environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups, newIssues: 0, regressions: 0, errorsPer1k: null, change: null };
+		render(Page, { data: { ...base, filters: { ...base.filters, project: 'p1' }, sections: sections({ releases: ok({ rows: [row], needsProject: false, allProjects: false }) }) } as never });
 		await settle();
 		expect(within(screen.getByTestId('release-table')).getAllByTestId('release-row')).toHaveLength(1);
+	});
+});
+
+describe('/ release health on all projects (D15)', () => {
+	it('shows the Project column and the hint under the table', async () => {
+		const mk = (project: string, version: string) => ({ project, version, environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups, newIssues: 0, regressions: 0, errorsPer1k: null, change: null });
+		render(Page, { data: { ...base, sections: sections({ releases: ok({ rows: [mk('core', 'v2'), mk('web', 'v9')], needsProject: false, allProjects: true }) }) } as never });
+		await settle();
+		const table = screen.getByTestId('release-table');
+		expect(within(table).getByText('Project')).toBeTruthy();
+		expect(screen.getAllByTestId('release-project').map((c) => c.textContent)).toEqual(['core', 'web']);
+		expect(screen.getByTestId('releases-hint').textContent).toBe('Pick a project to see all its releases.');
+	});
+	it('one project: no Project column, no hint', async () => {
+		const row = { project: 'core', version: 'v2', environment: 'production', firstSeen: '2026-10-07T10:00:00.000Z', events: groups, newIssues: 0, regressions: 0, errorsPer1k: null, change: null };
+		render(Page, { data: { ...base, filters: { ...base.filters, project: 'p1' }, sections: sections({ releases: ok({ rows: [row], needsProject: false, allProjects: false }) }) } as never });
+		await settle();
+		expect(screen.queryByTestId('release-project')).toBeNull();
+		expect(screen.queryByTestId('releases-hint')).toBeNull();
 	});
 });
 

@@ -1,8 +1,10 @@
 import type { ServiceSli } from '../sli/config';
 import { accessPredicate, type AccessFilter, type Scope } from './access';
 import { DatabendUnavailableError, type Run } from './databend';
-import { RANGE_MS, isUuid, type Range } from './literals';
+import { RANGE_MS, isUuid, type Range, type Split } from './literals';
 import * as m from './metrics';
+import { fetchNatsBreakdown, type NatsBreakdown, type VmConfig } from '../sli/nats-breakdown';
+import { buildSlo, type BudgetChart, type SloRow } from './slo';
 
 /**
  * sentinel-reporting-and-dashboard D13/D14: the dashboard page's data, one function per section, each independent.
@@ -24,6 +26,8 @@ export interface ProjectInfo {
 
 export interface DashboardInput {
 	range: Range;
+	/** D12: how the events chart is split. Absent = by origin. */
+	split?: Split;
 	/** 'all' or one project id the viewer can reach. */
 	project: string;
 	/** 'all' or one environment name (only honoured with one project). */
@@ -35,6 +39,8 @@ export interface DashboardInput {
 	slis: ServiceSli[];
 	/** The environment this deployment's `sli_hourly` rows carry (from SLI_CLUSTER); null disables SLI sections. */
 	sliEnvironment: string | null;
+	/** VictoriaMetrics, for the live NATS breakdown (D8); absent/null = "breakdown unavailable". */
+	vm?: VmConfig | null;
 	run: Run;
 }
 
@@ -131,19 +137,15 @@ export function visibleSlis(i: Pick<DashboardInput, 'slis' | 'projects' | 'scope
 	return out;
 }
 
+/** D9: the Error-tracking half's per-SLI rate: Sentinel-captured exceptions over the SLI's own denominator. */
 export interface SliTile {
 	id: string;
 	kind: ServiceSli['kind'];
 	project: string;
-	availability: number | null;
-	availabilityTarget: number | null;
-	latency: number | null;
-	latencyTarget: number | null;
-	budgetRemaining: number | null;
 	total: number;
-	errors: number;
-	/** Errors per 1k of this SLI's own denominator; null = no matching-event definition or no traffic ("no data"). */
+	/** Captured exceptions per 1k of this SLI's own denominator; null = no matching-event definition or no traffic ("no data"). */
 	errorsPer1k: number | null;
+	/** Captured exceptions matching the SLI (not the SLI's failures: those are the Service health half). */
 	events: number | null;
 }
 
@@ -152,7 +154,7 @@ export interface HealthData {
 	byLevel: Record<string, number>;
 	newIssues: { current: number; previous: number };
 	regressions: { current: number; previous: number };
-	backlog: { open: number; unassigned: number };
+	backlog: { open: number; unassigned: number; olderThan30d: number };
 	slis: SliTile[];
 }
 
@@ -171,7 +173,7 @@ export function health(input: DashboardInput): Promise<Section<HealthData>> {
 			byLevel,
 			newIssues: { current: sumN(niCur), previous: sumN(niPrev) },
 			regressions: { current: sumN(rgCur), previous: sumN(rgPrev) },
-			backlog: { open: sumN(backlog), unassigned: backlog.reduce((a, r) => a + r.unassigned, 0) },
+			backlog: { open: sumN(backlog), unassigned: backlog.reduce((a, r) => a + r.unassigned, 0), olderThan30d: backlog.filter((r) => r.age === '30-90d' || r.age === '90d+').reduce((a, r) => a + r.n, 0) },
 			slis,
 		};
 	});
@@ -181,36 +183,27 @@ async function sliTiles(input: DashboardInput, c: m.MetricCtx, cur: m.Window): P
 	const vis = visibleSlis(input);
 	if (vis.length === 0 || !input.sliEnvironment) return [];
 	const env = input.sliEnvironment;
-	const budgetWindow: m.Window = { from: new Date(input.now.getTime() - 28 * 86_400_000), to: input.now };
-	const ids = vis.map((v) => v.sli.id);
-	const [rangeSums, budgetSums] = await Promise.all([m.sliSums(c, ids, cur, env), m.sliSums(c, ids, budgetWindow, env)]);
+	const rangeSums = await m.sliSums(c, vis.map((v) => v.sli.id), cur, env);
 	return Promise.all(
 		vis.map(async ({ sli, projectId }) => {
-			const s = rangeSums.find((x) => x.sliId === sli.id) ?? { sliId: sli.id, environment: env, total: 0, errors: 0, fast: null, totalWithFast: 0 };
-			const b = budgetSums.find((x) => x.sliId === sli.id);
+			const total = rangeSums.find((x) => x.sliId === sli.id)?.total ?? 0;
 			const events = await m.sliMatchingEvents(c, sli, projectId, env, cur);
-			return {
-				id: sli.id, kind: sli.kind, project: sli.project,
-				availability: m.availability(s), availabilityTarget: sli.availabilityTarget ?? null,
-				latency: m.latencyRatio(s), latencyTarget: sli.latency?.target ?? null,
-				budgetRemaining: b && sli.availabilityTarget ? m.errorBudgetRemaining(b, sli.availabilityTarget) : null,
-				total: s.total, errors: s.errors,
-				errorsPer1k: m.errorsPer1k(events, s.total), events,
-			};
+			return { id: sli.id, kind: sli.kind, project: sli.project, total, errorsPer1k: m.errorsPer1k(events, total), events };
 		})
 	);
 }
 
 export interface TimelineData {
 	bucket: 'hour' | 'day';
-	/** `group` series always; `service` series when one project is selected (D13). */
+	split: Split;
+	/** Events by (bucket, D19 group, service); the chart folds them into series for the split (`stackEvents`). */
 	byGroup: m.SeriesRow[];
-	byService: boolean;
 	releaseMarkers: { version: string; at: string }[];
 }
 
 export function timeline(input: DashboardInput): Promise<Section<TimelineData>> {
-	return section(input, 'timeline', async (c) => {
+	const split = input.split ?? 'group';
+	return section(input, `timeline:${split}`, async (c) => {
 		const { cur } = windows(input);
 		const bucket = bucketFor(input.range);
 		const byGroup = await m.errorEventsSeries(c, cur, bucket);
@@ -219,35 +212,66 @@ export function timeline(input: DashboardInput): Promise<Section<TimelineData>> 
 			const wins = await m.releaseWindows(c, input.now, 10);
 			releaseMarkers = wins.filter((w) => w.start >= cur.from).map((w) => ({ version: w.version, at: w.start.toISOString() }));
 		}
-		return { bucket, byGroup, byService: input.project !== 'all', releaseMarkers };
+		return { bucket, split, byGroup, releaseMarkers };
 	});
 }
 
-export interface SliSeriesData {
-	id: string;
-	bucket: 'hour' | 'day';
-	points: m.SliPoint[];
-	total: number;
-	errors: number;
-	availabilityTarget: number | null;
+export interface SloData {
+	rows: SloRow[];
 }
 
-export function sliSection(input: DashboardInput): Promise<Section<SliSeriesData[]>> {
-	return section(input, 'slis', async (c) => {
+export interface BudgetData {
+	charts: BudgetChart[];
+}
+
+/**
+ * D2/D3/D11: both SLO sections read the same two things for every visible SLI, once: Σ over the selected range and the
+ * hourly rows over the longest budget window. Shared through the 60 s cache so the table and the burn-down never
+ * disagree and never cost two round trips.
+ */
+async function sloInputs(input: DashboardInput, c: m.MetricCtx) {
+	const vis = visibleSlis(input);
+	const key = JSON.stringify(['slo-inputs', input.range, input.project, input.scopes, input.sliEnvironment, vis.map((v) => v.sli.id), Math.floor(input.now.getTime() / CACHE_TTL_MS)]);
+	return cached(key, input.now, async () => {
+		const ids = vis.map((v) => v.sli.id);
+		const env = input.sliEnvironment!;
+		const longest = Math.max(...vis.map((v) => v.sli.windowDays));
+		const [rangeSums, hourly] = await Promise.all([
+			m.sliSums(c, ids, windows(input).cur, env),
+			m.sliHourlyRows(c, ids, { from: new Date(input.now.getTime() - longest * 86_400_000), to: input.now }, env),
+		]);
+		return buildSlo({ slis: vis.map((v) => v.sli), rangeSums, hourly, now: input.now });
+	});
+}
+
+export function sloStatus(input: DashboardInput): Promise<Section<SloData>> {
+	return section(input, 'slo', async (c) => {
 		const vis = visibleSlis(input);
-		if (vis.length === 0 || !input.sliEnvironment) return [];
-		const { cur } = windows(input);
-		const bucket = bucketFor(input.range);
-		return Promise.all(
-			vis.map(async ({ sli }) => {
-				const points = await m.sliSeries(c, sli.id, cur, bucket, input.sliEnvironment!);
-				return { id: sli.id, bucket, points, total: points.reduce((a, p) => a + p.total, 0), errors: points.reduce((a, p) => a + p.errors, 0), availabilityTarget: sli.availabilityTarget ?? null };
-			})
-		);
+		if (vis.length === 0) return { rows: [] };
+		return { rows: (await sloInputs(input, c)).rows };
+	});
+}
+
+/**
+ * D8: the top NATS contributors, its own promise so the SLO table never waits on VictoriaMetrics. null when no nats SLI is
+ * visible; a VM failure is `{ status: 'unavailable' }` and touches nothing else.
+ */
+export function natsBreakdown(input: DashboardInput): Promise<NatsBreakdown | null> {
+	if (!visibleSlis(input).some((v) => v.sli.kind === 'nats')) return Promise.resolve(null);
+	const key = JSON.stringify(['nats-breakdown', input.range, input.sliEnvironment, Math.floor(input.now.getTime() / CACHE_TTL_MS)]);
+	return cached(key, input.now, () => fetchNatsBreakdown(input.vm, input.range, input.now)).catch((): NatsBreakdown => ({ status: 'unavailable' }));
+}
+
+export function budgetBurndown(input: DashboardInput): Promise<Section<BudgetData>> {
+	return section(input, 'budget', async (c) => {
+		if (visibleSlis(input).length === 0) return { charts: [] };
+		return { charts: (await sloInputs(input, c)).charts };
 	});
 }
 
 export interface ReleaseRow {
+	/** The project's name (D15: the Project column on `project=all`). */
+	project: string;
 	version: string;
 	environment: string;
 	firstSeen: string;
@@ -259,31 +283,50 @@ export interface ReleaseRow {
 	change: number | null;
 }
 
-export function releases(input: DashboardInput): Promise<Section<{ rows: ReleaseRow[]; needsProject: boolean }>> {
+/** D15: with `project=all`, this many newest releases of each project that owns a service SLI. */
+export const ALL_PROJECTS_RELEASES = 3;
+
+export interface ReleasesData {
+	rows: ReleaseRow[];
+	/** `project=all` with no SLI-owning project to show releases for: the section asks for a project. */
+	needsProject: boolean;
+	/** `project=all`: rows span several projects (show the Project column and the hint). */
+	allProjects: boolean;
+}
+
+export function releases(input: DashboardInput): Promise<Section<ReleasesData>> {
 	return section(input, 'releases', async (c) => {
-		if (input.project === 'all') return { rows: [], needsProject: true };
+		const all = input.project === 'all';
+		const vis = visibleSlis(input).filter((v) => v.sli.kind === 'http' && v.sli.service);
+		// one project, or (D15) every project that owns a service SLI
+		const projectIds = all ? [...new Set(visibleSlis(input).map((v) => v.projectId))] : [input.project];
+		if (all && projectIds.length === 0) return { rows: [], needsProject: true, allProjects: true };
 		// one extra window per (project, environment) so the oldest listed release still has a "previous" to compare with
-		const wins = (await m.releaseWindows(c, input.now, 11)).filter((w) => w.projectId === input.project);
-		const project = input.projects.find((p) => p.id === input.project);
-		const vis = visibleSlis(input).filter((v) => v.projectId === input.project && v.sli.kind === 'http' && v.sli.service);
+		const wins = (await m.releaseWindows(c, input.now, 11)).filter((w) => projectIds.includes(w.projectId));
 		const hourly = vis.length && input.sliEnvironment && wins.length
 			? await m.sliHourlyRows(c, vis.map((v) => v.sli.id), { from: new Date(Math.min(...wins.map((w) => w.start.getTime()))), to: input.now }, input.sliEnvironment)
 			: [];
-		const rate = (w: m.ReleaseWindow): number | null => {
-			if (!vis.length || w.environment !== input.sliEnvironment) return null;
-			const denom = hourly.filter((h) => h.hourStart >= w.start && h.hourStart < w.end).reduce((a, h) => a + h.total, 0);
-			return m.errorsPer1k(w.events.api, denom);
+		const rowsFor = (projectId: string): ReleaseRow[] => {
+			const own = vis.filter((v) => v.projectId === projectId);
+			const rate = (w: m.ReleaseWindow): number | null => {
+				if (!own.length || w.environment !== input.sliEnvironment) return null;
+				const ids = own.map((v) => v.sli.id);
+				const denom = hourly.filter((h) => ids.includes(h.sliId) && h.hourStart >= w.start && h.hourStart < w.end).reduce((a, h) => a + h.total, 0);
+				return m.errorsPer1k(w.events.api, denom);
+			};
+			const name = input.projects.find((p) => p.id === projectId)?.name ?? '';
+			const sorted = wins.filter((w) => w.projectId === projectId).sort((a, b) => b.start.getTime() - a.start.getTime());
+			return sorted.map((w, idx) => {
+				const prev = sorted.slice(idx + 1).find((p) => p.environment === w.environment);
+				const r = rate(w);
+				const pr = prev ? rate(prev) : null;
+				const change = prev ? (r !== null && pr !== null ? r - pr : total(w.events) - total(prev.events)) : null;
+				return { project: name, version: w.version, environment: w.environment, firstSeen: w.start.toISOString(), events: w.events, newIssues: w.newIssues, regressions: w.regressions, errorsPer1k: r, change };
+			});
 		};
-		void project;
-		const sorted = wins.slice().sort((a, b) => b.start.getTime() - a.start.getTime());
-		const rows: ReleaseRow[] = sorted.map((w, idx) => {
-			const prev = sorted.slice(idx + 1).find((p) => p.environment === w.environment);
-			const r = rate(w);
-			const pr = prev ? rate(prev) : null;
-			const change = prev ? (r !== null && pr !== null ? r - pr : total(w.events) - total(prev.events)) : null;
-			return { version: w.version, environment: w.environment, firstSeen: w.start.toISOString(), events: w.events, newIssues: w.newIssues, regressions: w.regressions, errorsPer1k: r, change };
-		});
-		return { rows: rows.slice(0, 10), needsProject: false };
+		if (!all) return { rows: rowsFor(input.project).slice(0, 10), needsProject: false, allProjects: false };
+		const rows = projectIds.flatMap((id) => rowsFor(id).slice(0, ALL_PROJECTS_RELEASES));
+		return { rows, needsProject: false, allProjects: true };
 	});
 }
 

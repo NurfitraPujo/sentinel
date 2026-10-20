@@ -95,21 +95,13 @@ export function floorHour(t: Date): Date {
 	return new Date(Math.floor(t.getTime() / HOUR_MS) * HOUR_MS);
 }
 
-async function queryRange(
-	fetchFn: typeof fetch,
-	vmUrl: string,
-	query: string,
-	firstEval: Date,
-	lastEval: Date
-): Promise<Map<number, number>> {
-	const url = new URL('/api/v1/query_range', vmUrl);
-	url.searchParams.set('query', query);
-	url.searchParams.set('start', String(firstEval.getTime() / 1000));
-	url.searchParams.set('end', String(lastEval.getTime() / 1000));
-	url.searchParams.set('step', '3600');
+/** One GET against VictoriaMetrics' Prometheus-compatible API; throws VictoriaMetricsError on anything but success. */
+export async function vmGet(fetchFn: typeof fetch, vmUrl: string, path: string, params: Record<string, string>, timeoutMs = 30_000): Promise<{ result: any[] }> {
+	const url = new URL(path, vmUrl);
+	for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 	let res: Response;
 	try {
-		res = await fetchFn(url, { signal: AbortSignal.timeout(30_000) });
+		res = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs) });
 	} catch (err) {
 		throw new VictoriaMetricsError(`VictoriaMetrics request failed: ${(err as Error).message}`);
 	}
@@ -123,6 +115,19 @@ async function queryRange(
 	if (body?.status !== 'success' || !Array.isArray(body?.data?.result)) {
 		throw new VictoriaMetricsError(`VictoriaMetrics answered status ${String(body?.status)}`);
 	}
+	return body.data;
+}
+
+async function queryRange(
+	fetchFn: typeof fetch,
+	vmUrl: string,
+	query: string,
+	firstEval: Date,
+	lastEval: Date
+): Promise<Map<number, number>> {
+	const body = { data: await vmGet(fetchFn, vmUrl, '/api/v1/query_range', {
+		query, start: String(firstEval.getTime() / 1000), end: String(lastEval.getTime() / 1000), step: '3600',
+	}) };
 	// `sum(...)` yields at most one series; sum across any that appear, per timestamp.
 	const out = new Map<number, number>();
 	for (const series of body.data.result) {
@@ -172,3 +177,4 @@ export async function collectSli(opts: CollectOptions): Promise<SliHourRow[]> {
 	if (rows.length) await opts.store.upsert(rows);
 	return rows;
 }
+export { q as promQuote };

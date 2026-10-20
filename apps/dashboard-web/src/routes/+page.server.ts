@@ -28,10 +28,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 		project: url.searchParams.get('project'),
 		environment: url.searchParams.get('environment'),
 		range: url.searchParams.get('range'),
+		split: url.searchParams.get('split'),
 	});
 	const { input } = shell;
 
-	const filters = { project: input.project, environment: input.environment, range: input.range };
+	const filters = { project: input.project, environment: input.environment, range: input.range, split: input.split ?? 'group' };
 	const base = { filters, projects: shell.projects, environments: shell.environments, databendConfigured: shell.databendConfigured };
 
 	if (shell.projects.length === 0) return { ...base, empty: true as const, sections: null };
@@ -45,7 +46,9 @@ export const load: PageServerLoad = async ({ url, locals }) => {
 			freshness: svc.freshness(input, shell.newestPostgresOccurrence),
 			health: svc.health(input),
 			timeline: svc.timeline(input),
-			slis: svc.sliSection(input),
+			slo: svc.sloStatus(input),
+			natsBreakdown: svc.natsBreakdown(input),
+			budget: svc.budgetBurndown(input),
 			releases: svc.releases(input),
 			backlog: svc.backlog(input),
 			response: svc.response(input),

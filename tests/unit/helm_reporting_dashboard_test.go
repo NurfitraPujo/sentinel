@@ -65,7 +65,7 @@ func TestHelmReportingDashboardAWSOverlays(t *testing.T) {
 			assert.EqualValues(t, 0.95, byID["web"]["latency"].(map[string]any)["target"])
 			assert.Nil(t, byID["web"]["service"], "web events carry no service (contract §2)")
 			for _, id := range []string{"core-jobs", "core-nats"} {
-				assert.Nil(t, byID[id]["availabilityTarget"], "%s is tracked, not an SLO", id)
+				assert.EqualValues(t, 0.995, byID[id]["availabilityTarget"], "%s carries the 0.995 availability target (sentinel-dashboard-metrics-improvement D7)", id)
 				assert.Nil(t, byID[id]["latency"], id)
 			}
 			// every http latency `le` is one of the edge histogram's buckets (D7)

@@ -336,11 +336,13 @@ serviceSlis:
     kind: jobs
     project: core
     source: daya_core_job_handler_runs_total
+    availabilityTarget: 0.995
     windowDays: 28
   - id: core-nats
     kind: nats
     project: core
     source: daya_core_nats_handler_runs_total
+    availabilityTarget: 0.995
     windowDays: 28
 
 prometheusRule:
