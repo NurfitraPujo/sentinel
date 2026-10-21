@@ -83,7 +83,7 @@ export function queriesFor(sli: ServiceSli, cluster: string): { total: string; e
 			};
 		case 'nats':
 			return {
-				total: `sum(increase(daya_core_nats_handler_runs_total{cluster="${c}"}[1h]))`,
+				total: `sum(increase(daya_core_nats_handler_runs_total{cluster="${c}", status=~"success|error"}[1h]))`,
 				errors: `sum(increase(daya_core_nats_handler_runs_total{cluster="${c}", status="error"}[1h]))`,
 				fast: null,
 			};

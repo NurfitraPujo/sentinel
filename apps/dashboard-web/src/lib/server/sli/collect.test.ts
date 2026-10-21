@@ -132,6 +132,9 @@ describe('queriesFor (D6 table)', () => {
 		expect(queriesFor(coreJobs, 'c').fast).toBeNull();
 		expect(queriesFor(coreNats, 'c').errors).toBe('sum(increase(daya_core_nats_handler_runs_total{cluster="c", status="error"}[1h]))');
 	});
+	it('nats total ignores rejected runs (a rejection is neither good nor bad availability)', () => {
+		expect(queriesFor(coreNats, 'c').total).toBe('sum(increase(daya_core_nats_handler_runs_total{cluster="c", status=~"success|error"}[1h]))');
+	});
 });
 
 describe('parseServiceSliConfig (D7)', () => {
