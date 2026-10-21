@@ -224,6 +224,26 @@ describe('SLO sections over a stub run (D2, D3, D5)', () => {
 		expect(await svc.natsBreakdown(input(stub(), { slis: withTargets.slice(0, 2) }))).toBeNull();
 	});
 
+	// rev-d8-breakdown-access-gate-untested: the nats SLI stays CONFIGURED; it is the viewer who loses it. The breakdown is
+	// its own streamed key, so a gate on the raw config would send core's (stream, consumer) list to a viewer without core.
+	it.each([
+		['no project scopes', { scopes: [] }],
+		['a selected project that is not the nats SLI\'s', { project: P2 }],
+	])('the nats SLI is configured but the viewer cannot see it (%s): no breakdown and no VictoriaMetrics call', async (_name, over) => {
+		const fetchFn = vi.fn(async () => ({ ok: true, json: async () => ({ status: 'success', data: { result: [] } }) }) as never);
+		const sliWeb: ServiceSli = { id: 'web-api', kind: 'http', project: 'web', source: 'api_web_80', availabilityTarget: 0.995, service: 'api', windowDays: 28 };
+		const inp = input(stub(), {
+			slis: [...withTargets, sliWeb],
+			projects: [{ id: P1, name: 'core' }, { id: P2, name: 'web' }],
+			scopes: [{ projectId: P1, environments: null }, { projectId: P2, environments: null }],
+			vm: { url: 'http://vm', cluster: 'c', fetchFn: fetchFn as never },
+			...over,
+		});
+		expect(inp.slis.some((s) => s.kind === 'nats')).toBe(true);
+		expect(await svc.natsBreakdown(inp)).toBeNull();
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
 	it('switching the range inside 60 s returns the new range\'s counts, not the cached ones (rev-slo-cache-key-range)', async () => {
 		const run = vi.fn<Run>(async (sql) => {
 			if (sql.includes('FROM sli_hourly') && sql.includes('GROUP BY sli_id')) {
