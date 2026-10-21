@@ -29,6 +29,8 @@ export interface SliHourRow {
 	total: number;
 	errors: number;
 	fast: number | null;
+	/** http only: the latency ratio's denominator (requests on `source` alone). NULL for jobs/nats. */
+	latencyTotal: number | null;
 }
 
 export interface SliStore {
@@ -61,17 +63,23 @@ export function environmentForCluster(cluster: string): string {
 
 const q = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
-/** The three PromQL expressions of a kind (D6 table). `fast` is null for kinds with no latency objective. */
-export function queriesFor(sli: ServiceSli, cluster: string): { total: string; errors: string; fast: string | null } {
+/** The PromQL expressions of a kind (D6 table). `fast` is null for kinds with no latency objective; `latencyTotal` is non-null
+ *  only when an http SLI has a `streamSource` (otherwise it equals `total`, and the collector reuses that value). */
+export function queriesFor(sli: ServiceSli, cluster: string): { total: string; errors: string; fast: string | null; latencyTotal: string | null } {
 	const c = q(cluster);
 	switch (sli.kind) {
 		case 'http': {
 			const n = q(sli.source);
+			// Latency reads the ordinary cluster only; availability also reads the SSE cluster so stream failures count.
+			const avail = sli.streamSource ? `=~"${n}|${q(sli.streamSource)}"` : `="${n}"`;
 			return {
-				total: `sum(increase(envoy_cluster_upstream_rq_xx{cluster="${c}", envoy_cluster_name="${n}"}[1h]))`,
-				errors: `sum(increase(envoy_cluster_upstream_rq_xx{cluster="${c}", envoy_cluster_name="${n}", envoy_response_code_class="5"}[1h]))`,
+				total: `sum(increase(envoy_cluster_upstream_rq_xx{cluster="${c}", envoy_cluster_name${avail}}[1h]))`,
+				errors: `sum(increase(envoy_cluster_upstream_rq_xx{cluster="${c}", envoy_cluster_name${avail}, envoy_response_code_class="5"}[1h]))`,
 				fast: sli.latency
 					? `sum(increase(envoy_cluster_upstream_rq_time_bucket{cluster="${c}", envoy_cluster_name="${n}", le="${q(sli.latency.le)}"}[1h]))`
+					: null,
+				latencyTotal: sli.streamSource
+					? `sum(increase(envoy_cluster_upstream_rq_xx{cluster="${c}", envoy_cluster_name="${n}"}[1h]))`
 					: null,
 			};
 		}
@@ -80,12 +88,14 @@ export function queriesFor(sli: ServiceSli, cluster: string): { total: string; e
 				total: `sum(increase(daya_core_job_handler_runs_total{cluster="${c}"}[1h]))`,
 				errors: `sum(increase(daya_core_job_handler_runs_total{cluster="${c}", status="error"}[1h]))`,
 				fast: null,
+				latencyTotal: null,
 			};
 		case 'nats':
 			return {
 				total: `sum(increase(daya_core_nats_handler_runs_total{cluster="${c}", status=~"success|error"}[1h]))`,
 				errors: `sum(increase(daya_core_nats_handler_runs_total{cluster="${c}", status="error"}[1h]))`,
 				fast: null,
+				latencyTotal: null,
 			};
 	}
 }
@@ -159,6 +169,7 @@ export async function collectSli(opts: CollectOptions): Promise<SliHourRow[]> {
 		const total = await queryRange(fetchFn, opts.vmUrl, qs.total, firstEval, lastEval);
 		const errors = await queryRange(fetchFn, opts.vmUrl, qs.errors, firstEval, lastEval);
 		const fast = qs.fast ? await queryRange(fetchFn, opts.vmUrl, qs.fast, firstEval, lastEval) : null;
+		const latencyTotal = qs.latencyTotal ? await queryRange(fetchFn, opts.vmUrl, qs.latencyTotal, firstEval, lastEval) : null;
 
 		for (let h = firstHour.getTime(); h <= lastHour.getTime(); h += HOUR_MS) {
 			const evalSec = (h + HOUR_MS) / 1000;
@@ -171,6 +182,8 @@ export async function collectSli(opts: CollectOptions): Promise<SliHourRow[]> {
 				total: Math.round(t),
 				errors: Math.round(errors.get(evalSec) ?? 0),
 				fast: fast ? (fast.has(evalSec) ? Math.round(fast.get(evalSec)!) : null) : null,
+				// http: requests on `source` alone when a stream cluster is split off, else the same value as `total`.
+				latencyTotal: sli.kind !== 'http' ? null : latencyTotal ? (latencyTotal.has(evalSec) ? Math.round(latencyTotal.get(evalSec)!) : null) : Math.round(t),
 			});
 		}
 	}

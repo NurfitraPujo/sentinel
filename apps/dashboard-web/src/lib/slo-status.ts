@@ -38,6 +38,8 @@ export interface HourlyInput {
 	total: number;
 	errors: number;
 	fast: number | null;
+	/** The latency denominator; null/absent (rows written before 1726200000) means `total`. */
+	latencyTotal?: number | null;
 }
 
 export type ObjectiveKind = 'availability' | 'latency';
@@ -46,7 +48,10 @@ export function bucketsFor(rows: readonly HourlyInput[], kind: ObjectiveKind): H
 	const out: HourBucket[] = [];
 	for (const r of rows) {
 		if (kind === 'availability') out.push({ hourStart: r.hourStart, total: r.total, bad: r.errors });
-		else if (r.fast !== null) out.push({ hourStart: r.hourStart, total: r.total, bad: r.total - r.fast });
+		else if (r.fast !== null) {
+			const lt = r.latencyTotal ?? r.total;
+			out.push({ hourStart: r.hourStart, total: lt, bad: lt - r.fast });
+		}
 	}
 	return out;
 }
@@ -112,7 +117,7 @@ export function latencyThreshold(le: string): string {
 }
 const trim = (n: number) => String(Number(n.toFixed(2)));
 
-/** The page-wide SSE caveat, now on the latency rows it is about (D10). Item F removes it. */
+/** The page-wide SSE caveat, now on the latency rows it is about (D10). Not shown for an SLI with a `streamSource`. */
 export const SSE_CAVEAT =
 	'The edge sees long-lived streams as slow requests and has no route label to exclude them, so latency reads lower than ordinary requests feel.';
 

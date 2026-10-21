@@ -81,6 +81,17 @@ describe('latency budget (D6)', () => {
 		expect(budgetLeft(sumBuckets(b), 0.94)).toBeCloseTo(1 - 0.04 / 0.06);
 		expect(budgetLeft({ total: 1000, bad: 900 }, 0.94)).toBe(-1);
 	});
+	it('uses latencyTotal as the denominator and falls back to total for rows written before it existed', () => {
+		const rows = [
+			{ sliId: 'a', hourStart: new Date(T0), total: 1000, errors: 0, fast: 810, latencyTotal: 900 }, // 100 SSE requests in total
+			{ sliId: 'a', hourStart: new Date(T0 - HOUR_MS), total: 1000, errors: 0, fast: 940, latencyTotal: null },
+			{ sliId: 'a', hourStart: new Date(T0 - 2 * HOUR_MS), total: 1000, errors: 0, fast: 940 },
+		];
+		const b = bucketsFor(rows, 'latency');
+		expect(b.map((x) => x.total)).toEqual([900, 1000, 1000]);
+		expect(sumBuckets(b)).toEqual({ total: 2900, bad: 90 + 60 + 60 });
+		expect(bucketsFor(rows, 'availability').map((x) => x.total)).toEqual([1000, 1000, 1000]); // availability keeps total
+	});
 	it('is null when no hour carries fast', () => {
 		const b = bucketsFor([{ sliId: 'a', hourStart: new Date(T0), total: 1000, errors: 0, fast: null }], 'latency');
 		expect(b).toEqual([]);

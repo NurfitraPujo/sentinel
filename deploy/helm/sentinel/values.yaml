@@ -583,6 +583,7 @@ sliCollectCron:
     limits: { cpu: 100m, memory: 64Mi }
 
 # D7: the SLI definitions, rendered to the dashboard's SERVICE_SLI_CONFIG (JSON) and validated at start. Empty = none.
+# `streamSource` (http only) is the SSE cluster: latency reads `source` alone, availability reads both.
 # `latency.le` must be one of the edge histogram's bucket values (apps/dashboard-web/src/lib/server/sli/config.ts).
 serviceSlis: []
 

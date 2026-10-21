@@ -170,6 +170,16 @@ describe('SLO sections over a stub run (D2, D3, D5)', () => {
 		expect(run.mock.calls.filter(([q]) => q.includes('FROM sli_hourly')).length).toBe(2); // the range sums and the hourly rows
 	});
 
+	it('every latency denominator is latency_total, falling back to total for older rows', async () => {
+		const run = stub();
+		await svc.sloStatus(input(run, { slis: withTargets }));
+		const sums = run.mock.calls.map(([sql]) => sql).filter((sql) => sql.includes('FROM sli_hourly') && sql.includes('GROUP BY'));
+		expect(sums.length).toBeGreaterThan(0);
+		for (const sql of sums) expect(sql).toContain('sum(CASE WHEN fast IS NULL THEN 0 ELSE coalesce(latency_total, total) END)');
+		const hourly = run.mock.calls.map(([sql]) => sql).find((sql) => sql.includes('FROM sli_hourly') && !sql.includes('GROUP BY'))!;
+		expect(hourly).toContain('latency_total');
+	});
+
 	it('the longest budget window sets how far back the hourly rows are read (D5)', async () => {
 		const run = stub();
 		await svc.sloStatus(input(run, { slis: withTargets.map((x) => ({ ...x, windowDays: 7 })) }));

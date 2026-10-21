@@ -529,7 +529,7 @@ export interface SliSums {
 	errors: number;
 	/** null when no row in the window carried a latency count. */
 	fast: number | null;
-	/** Σtotal over only the rows that carry `fast` — the latency ratio's denominator (rows with fast NULL are excluded). */
+	/** Σ(latency_total, else total) over only the rows that carry `fast` — the latency ratio's denominator (rows with fast NULL are excluded). */
 	totalWithFast: number;
 }
 
@@ -539,7 +539,7 @@ export async function sliSums(c: MetricCtx, sliIds: readonly string[], w: Window
 	const envClause = environment ? ` AND environment = ${enumLiteral(environment, ['production', 'staging'])}` : '';
 	const rows = await c.run(`
 		SELECT sli_id, environment, sum(total) AS total, sum(errors) AS errors, sum(fast) AS fast,
-		  sum(CASE WHEN fast IS NULL THEN 0 ELSE total END) AS total_with_fast
+		  sum(CASE WHEN fast IS NULL THEN 0 ELSE coalesce(latency_total, total) END) AS total_with_fast
 		FROM sli_hourly WHERE sli_id IN (${enumList(sliIds, sliIds)}) AND ${inRange('hour_start', w)}${envClause}
 		GROUP BY sli_id, environment`);
 	return rows.map((r) => ({ sliId: r[0]!, environment: r[1]!, total: n(r[2]), errors: n(r[3]), fast: nOrNull(r[4]), totalWithFast: n(r[5]) }));
@@ -553,14 +553,16 @@ export interface SliHourRow {
 	errors: number;
 	/** null when the hour carried no latency count (jobs, nats, or an http SLI with no latency objective). */
 	fast: number | null;
+	/** null for jobs/nats and for rows written before 1726200000 (readers use `total`). */
+	latencyTotal: number | null;
 }
 
 export async function sliHourlyRows(c: MetricCtx, sliIds: readonly string[], w: Window, environment: string): Promise<SliHourRow[]> {
 	if (sliIds.length === 0) return [];
 	const rows = await c.run(`
-		SELECT sli_id, hour_start, total, errors, fast FROM sli_hourly
+		SELECT sli_id, hour_start, total, errors, fast, latency_total FROM sli_hourly
 		WHERE sli_id IN (${enumList(sliIds, sliIds)}) AND environment = ${enumLiteral(environment, ['production', 'staging'])} AND ${inRange('hour_start', w)}`);
-	return rows.map((r) => ({ sliId: r[0]!, hourStart: new Date(r[1]!.replace(' ', 'T') + 'Z'), total: n(r[2]), errors: n(r[3]), fast: nOrNull(r[4]) }));
+	return rows.map((r) => ({ sliId: r[0]!, hourStart: new Date(r[1]!.replace(' ', 'T') + 'Z'), total: n(r[2]), errors: n(r[3]), fast: nOrNull(r[4]), latencyTotal: nOrNull(r[5]) }));
 }
 
 /** Hourly or daily good-ratio series for one SLI (D13 section 3). */
@@ -575,7 +577,7 @@ export interface SliPoint {
 export async function sliSeries(c: MetricCtx, sliId: string, w: Window, bucket: 'hour' | 'day', environment: string): Promise<SliPoint[]> {
 	const trunc = bucket === 'hour' ? 'to_start_of_hour' : 'to_start_of_day';
 	const rows = await c.run(`
-		SELECT ${trunc}(hour_start) AS b, sum(total), sum(errors), sum(fast), sum(CASE WHEN fast IS NULL THEN 0 ELSE total END)
+		SELECT ${trunc}(hour_start) AS b, sum(total), sum(errors), sum(fast), sum(CASE WHEN fast IS NULL THEN 0 ELSE coalesce(latency_total, total) END)
 		FROM sli_hourly WHERE sli_id = ${enumLiteral(sliId, [sliId])} AND environment = ${enumLiteral(environment, ['production', 'staging'])} AND ${inRange('hour_start', w)}
 		GROUP BY b ORDER BY b`);
 	return rows.map((r) => ({ bucket: r[0]!, total: n(r[1]), errors: n(r[2]), fast: nOrNull(r[3]), totalWithFast: n(r[4]) }));

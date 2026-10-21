@@ -16,14 +16,14 @@ export const pgSliStore: SliStore = {
 			for (let i = 0; i < rows.length; i += 500) {
 				const chunk = rows.slice(i, i + 500);
 				const values = sql.join(
-					chunk.map((r) => sql`(${r.sliId}, ${r.environment}, ${r.hourStart.toISOString()}::timestamptz, ${r.total}, ${r.errors}, ${r.fast})`),
+					chunk.map((r) => sql`(${r.sliId}, ${r.environment}, ${r.hourStart.toISOString()}::timestamptz, ${r.total}, ${r.errors}, ${r.fast}, ${r.latencyTotal})`),
 					sql`, `
 				);
 				await tx.execute(sql`
-					INSERT INTO sli_hourly (sli_id, environment, hour_start, total, errors, fast)
+					INSERT INTO sli_hourly (sli_id, environment, hour_start, total, errors, fast, latency_total)
 					VALUES ${values}
 					ON CONFLICT (sli_id, environment, hour_start)
-					DO UPDATE SET total = EXCLUDED.total, errors = EXCLUDED.errors, fast = EXCLUDED.fast
+					DO UPDATE SET total = EXCLUDED.total, errors = EXCLUDED.errors, fast = EXCLUDED.fast, latency_total = EXCLUDED.latency_total
 				`);
 			}
 		});

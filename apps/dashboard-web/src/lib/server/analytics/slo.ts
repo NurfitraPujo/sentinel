@@ -15,6 +15,8 @@ export interface SloRow {
 	sliId: string;
 	kind: ObjectiveKind;
 	sliKind: ServiceSli['kind'];
+	/** Latency excludes the SSE cluster, so the D10 caveat does not apply. */
+	streamsExcluded: boolean;
 	project: string;
 	/** Plain words, e.g. "requests not 5xx at the edge". */
 	objective: string;
@@ -96,7 +98,7 @@ export function buildSlo(i: {
 				: kind === 'availability' ? { total: sums.total, bad: sums.errors }
 				: sums.fast === null ? { total: 0, bad: 0 } : { total: sums.totalWithFast, bad: sums.totalWithFast - sums.fast };
 			rows.push({
-				key, sliId: sli.id, kind, sliKind: sli.kind, project: sli.project, ...words, windowDays: sli.windowDays, target,
+				key, sliId: sli.id, kind, sliKind: sli.kind, streamsExcluded: !!sli.streamSource, project: sli.project, ...words, windowDays: sli.windowDays, target,
 				lastHour: { ratio: last ? ratioOf(last) : null, hourStart: last ? last.hourStart.toISOString() : null },
 				range: { ratio: ratioOf(rangeTotals), failed: rangeTotals.bad, total: rangeTotals.total },
 				budgetLeft: budget,

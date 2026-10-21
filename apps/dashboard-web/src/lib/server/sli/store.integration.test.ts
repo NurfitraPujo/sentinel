@@ -94,6 +94,29 @@ describe.skipIf(!reachable)('sli-collect against real Postgres', () => {
 		expect(await rowsOf(ids.http)).toBe(720); // upsert, not insert
 	});
 
+	it('writes latency_total for http (total when there is no streamSource), NULL for jobs, and a re-upsert overwrites it', async () => {
+		const { slis, ids } = slisFor();
+		const sse = slis.map((s) => (s.kind === 'http' ? { ...s, streamSource: 'api_core_80_sse' } : s));
+		// total (both clusters) 100; ordinary-only 80 — the stub answers by query text
+		const split = (total: number, ordinary: number): typeof fetch => (async (u: URL | string) => {
+			const q = new URL(String(u)).searchParams;
+			const query = q.get('query')!;
+			const v = query.includes('=~') || !query.includes('envoy') ? total : query.includes('rq_time_bucket') ? 70 : query.includes('class="5"') ? 1 : ordinary;
+			const start = Number(q.get('start')), end = Number(q.get('end'));
+			const values: [number, string][] = [];
+			for (let t = start; t <= end; t += 3600) values.push([t, String(query.includes('class="5"') ? 1 : v)]);
+			return new Response(JSON.stringify({ status: 'success', data: { result: [{ metric: {}, values }] } }));
+		}) as unknown as typeof fetch;
+		await collectSli({ slis: sse, cluster: 'tuju-production', vmUrl: 'http://vm', store: pgSliStore, now: NOW, fetchFn: split(100, 80) });
+		const [h] = await sql`SELECT total, latency_total FROM sli_hourly WHERE sli_id = ${ids.http} AND hour_start = '2026-10-07T11:00:00Z'`;
+		expect(h).toMatchObject({ total: '100', latency_total: '80' });
+		const [j] = await sql`SELECT latency_total FROM sli_hourly WHERE sli_id = ${ids.jobs} AND hour_start = '2026-10-07T11:00:00Z'`;
+		expect(j.latency_total).toBeNull();
+		await collectSli({ slis: sse, cluster: 'tuju-production', vmUrl: 'http://vm', store: pgSliStore, now: NOW, fetchFn: split(120, 90) });
+		const [h2] = await sql`SELECT latency_total FROM sli_hourly WHERE sli_id = ${ids.http} AND hour_start = '2026-10-07T11:00:00Z'`;
+		expect(h2.latency_total).toBe('90');
+	});
+
 	it('is idempotent: a second identical run changes nothing', async () => {
 		const { slis, ids } = slisFor();
 		const fetchFn = vm((kind, which) => (kind === 'nats' ? 7 : which === 'total' ? 10 : which === 'errors' ? 1 : 9));

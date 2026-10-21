@@ -43,7 +43,7 @@
 					<th scope="row" class="mono">{#if i === 0 || rows[i - 1].sliId !== r.sliId}{r.sliId}{:else}<span class="visually-hidden">{r.sliId}</span>{/if}</th>
 					<td data-testid="slo-objective-{r.key}">
 						{r.objective}
-						{#if r.kind === 'latency'}
+						{#if r.kind === 'latency' && !r.streamsExcluded}
 							<button type="button" class="info" aria-label={SSE_CAVEAT} title={SSE_CAVEAT} data-testid="slo-sse-{r.key}">ⓘ</button>
 						{/if}
 					</td>

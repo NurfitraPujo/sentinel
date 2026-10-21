@@ -15,6 +15,8 @@ export interface ServiceSli {
 	project: string;
 	/** http: the Envoy cluster name (`api_core_80`). jobs/nats: the metric name, informational. */
 	source: string;
+	/** http only: the SSE cluster (`api_core_80_sse`). Latency reads `source` only; total and 5xx read both, so stream failures still count against availability. */
+	streamSource?: string;
 	/** Fraction in (0,1), e.g. 0.995. Absent for tracked, untargeted rates. */
 	availabilityTarget?: number;
 	/** http only: the edge histogram bucket `le` (ms, spelled as the histogram spells it) and the fraction under it. */
@@ -69,6 +71,15 @@ export function parseServiceSliConfig(raw: string | undefined): ServiceSli[] {
 		if (!source) problems.push(`${at}.source is required`);
 		if (kind === 'http' && source && !/^[A-Za-z0-9_.:-]+$/.test(source)) problems.push(`${at}.source is not a valid Envoy cluster name`);
 
+		let streamSource: string | undefined;
+		if (e.streamSource !== undefined) {
+			const ss = str('streamSource');
+			if (kind !== 'http') problems.push(`${at}.streamSource is only valid for kind http`);
+			else if (!ss || !/^[A-Za-z0-9_.:-]+$/.test(ss)) problems.push(`${at}.streamSource is not a valid Envoy cluster name`);
+			else if (ss === source) problems.push(`${at}.streamSource must differ from source`);
+			else streamSource = ss;
+		}
+
 		let availabilityTarget: number | undefined;
 		if (e.availabilityTarget !== undefined) {
 			const t = e.availabilityTarget;
@@ -91,7 +102,7 @@ export function parseServiceSliConfig(raw: string | undefined): ServiceSli[] {
 			problems.push(`${at}.windowDays must be an integer 1..90`);
 
 		if (id && kind && KINDS.includes(kind) && project && source && typeof windowDays === 'number') {
-			out.push({ id, kind, project, source, availabilityTarget, latency, service, windowDays });
+			out.push({ id, kind, project, source, streamSource, availabilityTarget, latency, service, windowDays });
 		}
 	});
 	if (problems.length) throw new Error(`SERVICE_SLI_CONFIG is invalid:\n- ${problems.join('\n- ')}`);

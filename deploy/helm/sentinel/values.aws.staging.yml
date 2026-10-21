@@ -321,6 +321,8 @@ serviceSlis:
     kind: http
     project: core
     source: api_core_80
+    # SSE routes get their own Envoy cluster (infra cluster_tag: sse): latency reads `source` only, availability reads both.
+    streamSource: api_core_80_sse
     availabilityTarget: 0.995
     latency: { le: "1000.0", target: 0.94 }
     service: api

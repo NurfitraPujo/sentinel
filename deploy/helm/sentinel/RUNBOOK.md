@@ -636,7 +636,10 @@ Order, per environment:
    `sentinel_app` login). Without `METRICS_SCRAPE_TOKEN` the PodMonitor's `insights` entry is not rendered (the chart checks the secret
    pool), and `/api/metrics/insights` answers `503`.
 2. **Migrations** `1726000000` (columns) → `1726000100` (batched backfill of the last ≤ 30 days, 5,000 rows a batch, `lock_timeout` 5 s)
-   → `1726100000` (`sli_hourly`). Replay-safe. The backfill is the measurement in contract §12: run production in an operator window.
+   → `1726100000` (`sli_hourly`) → `1726200000` (`sli_hourly.latency_total`, nullable; the latency denominator once an SLI has a
+   `streamSource`). Replay-safe. CDC needs no config change: the cdc-pipeline evolves the Databend table on ADD COLUMN (its ADR 0014).
+   **Run `1726200000` before rolling the dashboard image** — the collector's upsert writes the column. No backfill: older rows read
+   `coalesce(latency_total, total)`. The backfill is the measurement in contract §12: run production in an operator window.
 3. **CDC**: once `1726100000` has run, append `sli_hourly` to the pipeline with a **full-config** `PUT` (contract D27). Discovery stays off.
 4. **Chart**: `sliCollectCron` (hourly at :05), `podMonitor`, `serviceSlis`, `analytics.*`. The first `sli-collect` run backfills 30 days
    per SLI; `core-nats` has no rows until core ships `daya_core_nats_handler_runs_total`.

@@ -58,6 +58,8 @@ func TestHelmReportingDashboardAWSOverlays(t *testing.T) {
 			require.Len(t, byID, 4)
 			assert.Equal(t, "http", byID["core-api"]["kind"])
 			assert.Equal(t, "api_core_80", byID["core-api"]["source"])
+			assert.Equal(t, "api_core_80_sse", byID["core-api"]["streamSource"], "latency excludes the SSE cluster, availability keeps it")
+			assert.Nil(t, byID["web"]["streamSource"], "web has no SSE cluster (out of scope)")
 			assert.EqualValues(t, 0.995, byID["core-api"]["availabilityTarget"])
 			assert.EqualValues(t, 0.94, byID["core-api"]["latency"].(map[string]any)["target"])
 			assert.Equal(t, "api", byID["core-api"]["service"])

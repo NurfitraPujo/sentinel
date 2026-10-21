@@ -35,6 +35,23 @@ describe('buildSlo (D2)', () => {
 		expect(bare.burn).toEqual({ h1: null, h6: null, h24: null });
 	});
 
+	it('flags an SLI with a streamSource as streamsExcluded, and leaves the others', () => {
+		const withStream = buildSlo({ slis: [{ ...slis[0], streamSource: 'a_sse' }, slis[1]], rangeSums, hourly: rows, now: NOW }).rows;
+		expect(withStream.filter((r) => r.sliId === 'core-api').map((r) => r.streamsExcluded)).toEqual([true, true]);
+		expect(withStream.find((r) => r.sliId === 'core-nats')!.streamsExcluded).toBe(false);
+		expect(out.rows[0].streamsExcluded).toBe(false);
+	});
+
+	it('latency per-hour buckets use latencyTotal, so SSE requests are not in the denominator', () => {
+		const lat = (latencyTotal?: number | null) => buildSlo({
+			slis: [slis[0]], rangeSums: [], now: NOW,
+			hourly: [{ sliId: 'core-api', hourStart: H(1), total: 1000, errors: 0, fast: 540, ...(latencyTotal === undefined ? {} : { latencyTotal }) }],
+		}).rows.find((r) => r.kind === 'latency')!;
+		expect(lat(600).lastHour.ratio).toBeCloseTo(0.9); // 540 / 600
+		expect(lat(null).lastHour.ratio).toBeCloseTo(0.54); // pre-migration row: total
+		expect(lat().lastHour.ratio).toBeCloseTo(0.54);
+	});
+
 	it('names the objective and what "failed" means in each row', () => {
 		const [avail, lat, nats] = out.rows;
 		expect(avail).toMatchObject({ objective: 'requests not 5xx at the edge', failedLabel: '5xx at edge', threshold: null });

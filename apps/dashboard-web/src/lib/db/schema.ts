@@ -1139,6 +1139,9 @@ export const sliHourly = pgTable('sli_hourly', {
 	total: bigint('total', { mode: 'number' }).notNull(),
 	errors: bigint('errors', { mode: 'number' }).notNull(),
 	fast: bigint('fast', { mode: 'number' }),
+	// 1726200000_add_sli_hourly_latency_total.sql: the latency ratio's denominator; NULL for jobs/nats and for rows written
+	// before it existed (readers coalesce to `total`).
+	latencyTotal: bigint('latency_total', { mode: 'number' }),
 }, (table) => ({
 	pk: primaryKey({ columns: [table.sliId, table.environment, table.hourStart] }),
 }));

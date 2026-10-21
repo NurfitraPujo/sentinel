@@ -16,7 +16,7 @@ export const DDL = [
 	`CREATE OR REPLACE TABLE issue_activity (id VARCHAR, issue_id VARCHAR, event_type VARCHAR, old_value VARIANT NULL,
 	   new_value VARIANT NULL, created_at TIMESTAMP, deleted_at TIMESTAMP NULL)`,
 	`CREATE OR REPLACE TABLE sli_hourly (sli_id VARCHAR, environment VARCHAR, hour_start TIMESTAMP, total BIGINT, errors BIGINT,
-	   fast BIGINT NULL, deleted_at TIMESTAMP NULL)`,
+	   fast BIGINT NULL, latency_total BIGINT NULL, deleted_at TIMESTAMP NULL)`,
 ];
 
 export function testRun(url: string, database = 'sentinel_test'): { run: Run; admin: Run } {
@@ -49,7 +49,7 @@ export interface SeedOcc {
 }
 export interface SeedActivity { issueId: string; eventType: string; createdAt: Date; newValue?: object | null; oldValue?: object | null }
 
-export async function seed(run: Run, d: { issues?: SeedIssue[]; occs?: SeedOcc[]; activity?: SeedActivity[]; sli?: [string, string, Date, number, number, number | null][] }) {
+export async function seed(run: Run, d: { issues?: SeedIssue[]; occs?: SeedOcc[]; activity?: SeedActivity[]; sli?: [string, string, Date, number, number, number | null, (number | null)?][] }) {
 	for (const i of d.issues ?? []) {
 		await run(`INSERT INTO issues VALUES (${q(i.id)}, ${q(i.projectId)}, ${q(i.environment)}, ${q(i.message ?? 'boom')}, 'Err', ${q(i.status ?? 'unresolved')},
 		  ${q(i.issueType ?? 'system_error')}, ${i.assignedTo ? q(i.assignedTo) : 'NULL'}, ${ts(i.firstSeen)}, ${ts(i.firstSeen)}, ${i.firstRelease ? q(i.firstRelease) : 'NULL'}, ${ts(i.deletedAt ?? null)})`);
@@ -63,6 +63,6 @@ export async function seed(run: Run, d: { issues?: SeedIssue[]; occs?: SeedOcc[]
 		await run(`INSERT INTO issue_activity VALUES ('${Math.random().toString(36).slice(2)}', ${q(a.issueId)}, ${q(a.eventType)}, ${a.oldValue ? q(a.oldValue) : 'NULL'}, ${a.newValue ? q(a.newValue) : 'NULL'}, ${ts(a.createdAt)}, NULL)`);
 	}
 	for (const s of d.sli ?? []) {
-		await run(`INSERT INTO sli_hourly VALUES (${q(s[0])}, ${q(s[1])}, ${ts(s[2])}, ${s[3]}, ${s[4]}, ${s[5] === null ? 'NULL' : s[5]}, NULL)`);
+		await run(`INSERT INTO sli_hourly VALUES (${q(s[0])}, ${q(s[1])}, ${ts(s[2])}, ${s[3]}, ${s[4]}, ${s[5] === null ? 'NULL' : s[5]}, ${s[6] == null ? 'NULL' : s[6]}, NULL)`);
 	}
 }

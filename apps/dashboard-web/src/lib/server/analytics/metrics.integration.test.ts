@@ -190,6 +190,20 @@ describe.skipIf(!run)('D10 metrics against Databend', () => {
 		expect(await m.sliSums(ctx(), [], win7)).toEqual([]);
 	});
 
+	it('SLI latency denominator: latency_total where present, total for rows without it, availability keeps total', async () => {
+		await run!(`DELETE FROM sli_hourly WHERE sli_id = 'core-stream'`);
+		await seed(run!, { sli: [
+			['core-stream', 'production', H(5), 1000, 10, 810, 900], // 100 of the 1000 were SSE
+			['core-stream', 'production', H(6), 1000, 10, 940, null], // written before latency_total existed
+		] });
+		const [s] = await m.sliSums(ctx(), ['core-stream'], win7, 'production');
+		expect(s).toMatchObject({ total: 2000, errors: 20, fast: 1750, totalWithFast: 1900 });
+		expect(m.availability(s)).toBeCloseTo(0.99);
+		const pts = await m.sliSeries(ctx(), 'core-stream', win7, 'hour', 'production');
+		expect(pts.map((p) => p.totalWithFast).sort()).toEqual([1000, 900]);
+		await run!(`DELETE FROM sli_hourly WHERE sli_id = 'core-stream'`);
+	});
+
 	it('SLI series buckets by hour', async () => {
 		const pts = await m.sliSeries(ctx(), 'core-api', win7, 'hour', 'production');
 		expect(pts.map((p) => p.total)).toEqual([1000, 1000]);

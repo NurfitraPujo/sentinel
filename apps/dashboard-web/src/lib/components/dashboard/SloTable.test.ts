@@ -24,6 +24,18 @@ const nats = row({
 });
 const bare = row({ key: 'x:availability', sliId: 'x', target: null, budgetLeft: null, burn: { h1: null, h6: null, h24: null }, status: evaluateStatus({ hasTarget: false, budget: null, burn1h: null, burn6h: null, burn24h: null }) });
 
+describe('SloTable SSE caveat (sentinel-latency-excludes-streams D3)', () => {
+	it('shows the caveat on a latency row whose SLI still counts streams', () => {
+		render(SloTable, { rows: [{ ...latency, streamsExcluded: false }] as never, range: '7d' });
+		expect(screen.getByTestId('slo-sse-core-api:latency').getAttribute('title')).toBe(SSE_CAVEAT);
+	});
+	it('drops it once the SLI has a streamSource, and never put it on availability', () => {
+		render(SloTable, { rows: [row({ streamsExcluded: true }), { ...latency, streamsExcluded: true }] as never, range: '7d' });
+		expect(screen.queryByTestId('slo-sse-core-api:latency')).toBeNull();
+		expect(screen.queryByTestId('slo-sse-core-api:availability')).toBeNull();
+	});
+});
+
 describe('SloTable', () => {
 	it('renders a row per objective with the range label in the header', () => {
 		render(SloTable, { rows: [row(), latency, nats, bare] as never, range: '7d' });

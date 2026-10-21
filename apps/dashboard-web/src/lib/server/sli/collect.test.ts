@@ -9,6 +9,7 @@ const coreApi: ServiceSli = {
 	id: 'core-api', kind: 'http', project: 'core', source: 'api_core_80', availabilityTarget: 0.995,
 	latency: { le: '1000.0', target: 0.94 }, windowDays: 28,
 };
+const coreApiSse: ServiceSli = { ...coreApi, streamSource: 'api_core_80_sse' };
 const coreJobs: ServiceSli = { id: 'core-jobs', kind: 'jobs', project: 'core', source: 'daya_core_job_handler_runs_total', windowDays: 28 };
 const coreNats: ServiceSli = { id: 'core-nats', kind: 'nats', project: 'core', source: 'daya_core_nats_handler_runs_total', windowDays: 28 };
 
@@ -26,7 +27,7 @@ class MemStore implements SliStore {
 }
 
 /** A stub VictoriaMetrics: `series[kind][hourStartMs] = value`, answered as query_range at hour_start+1h. */
-function stubVm(series: Record<string, Record<number, number>>, opts: { fail?: boolean } = {}) {
+function stubVm(series: Record<string, Record<number, number>>, opts: { fail?: boolean; streams?: boolean } = {}) {
 	const queries: string[] = [];
 	const fetchFn = (async (input: URL | string) => {
 		const url = new URL(String(input));
@@ -38,6 +39,8 @@ function stubVm(series: Record<string, Record<number, number>>, opts: { fail?: b
 		const key = query.includes('rq_time_bucket') ? 'fast'
 			: query.includes('envoy_response_code_class') ? 'errors'
 			: query.includes('status="error"') ? 'errors'
+			// with a stream cluster, the total over `source` alone (no `=~`) is the latency denominator
+			: opts.streams && query.includes('envoy_cluster_upstream_rq') && !query.includes('=~') ? 'latencyTotal'
 			: 'total';
 		const prefix = query.includes('envoy_cluster_upstream_rq') ? 'http'
 			: query.includes('job_handler') ? 'jobs' : 'nats';
@@ -65,6 +68,34 @@ describe('collectSli', () => {
 		expect(rows[0]).toMatchObject({ sliId: 'core-api', environment: 'production', total: 100, errors: 0, fast: 90 });
 		expect(rows[1]).toMatchObject({ total: 201, errors: 2, fast: 190 });
 		expect(vm.queries).toHaveLength(3); // total, errors, fast
+	});
+
+	it('an http SLI without a streamSource writes latencyTotal = total; jobs and nats write NULL', async () => {
+		const store = new MemStore();
+		store.seeded.add('core-api|production');
+		store.seeded.add('core-jobs|production');
+		const h = HOUR('2026-10-07T11:00:00Z');
+		const vm = stubVm({ 'http.total': { [h]: 300.4 }, 'http.fast': { [h]: 280 }, 'jobs.total': { [h]: 10 } });
+		const rows = await collectSli({ slis: [coreApi, coreJobs], cluster: 'tuju-production', vmUrl: 'http://vm', store, now: NOW, fetchFn: vm.fetchFn });
+		expect(rows.find((r) => r.sliId === 'core-api')).toMatchObject({ total: 300, latencyTotal: 300, fast: 280 });
+		expect(rows.find((r) => r.sliId === 'core-jobs')!.latencyTotal).toBeNull();
+		expect(vm.queries).toHaveLength(5); // http 3 + jobs 2: no extra latencyTotal query without a streamSource
+	});
+
+	it('with a streamSource, total counts both clusters and latencyTotal counts the ordinary cluster only', async () => {
+		const store = new MemStore();
+		store.seeded.add('core-api|production');
+		const h = HOUR('2026-10-07T11:00:00Z');
+		const vm = stubVm({
+			'http.total': { [h]: 1000 }, // ordinary + SSE
+			'http.latencyTotal': { [h]: 900 }, // ordinary only
+			'http.errors': { [h]: 4 },
+			'http.fast': { [h]: 850 },
+		}, { streams: true });
+		const rows = await collectSli({ slis: [coreApiSse], cluster: 'tuju-production', vmUrl: 'http://vm', store, now: NOW, fetchFn: vm.fetchFn });
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ total: 1000, errors: 4, fast: 850, latencyTotal: 900 });
+		expect(vm.queries).toHaveLength(4); // total, errors, fast, latencyTotal
 	});
 
 	it('re-upserting the same hours is idempotent and absorbs a late scrape', async () => {
@@ -128,6 +159,16 @@ describe('queriesFor (D6 table)', () => {
 		expect(q.errors).toContain('envoy_response_code_class="5"');
 		expect(q.fast).toBe('sum(increase(envoy_cluster_upstream_rq_time_bucket{cluster="tuju-production", envoy_cluster_name="api_core_80", le="1000.0"}[1h]))');
 	});
+	it('http without a streamSource reads one cluster everywhere and has no separate latency denominator', () => {
+		expect(queriesFor(coreApi, 'tuju-production').latencyTotal).toBeNull();
+	});
+	it('http with a streamSource: total and 5xx read both clusters, latency and its denominator read source only', () => {
+		const q = queriesFor(coreApiSse, 'tuju-production');
+		expect(q.total).toBe('sum(increase(envoy_cluster_upstream_rq_xx{cluster="tuju-production", envoy_cluster_name=~"api_core_80|api_core_80_sse"}[1h]))');
+		expect(q.errors).toBe('sum(increase(envoy_cluster_upstream_rq_xx{cluster="tuju-production", envoy_cluster_name=~"api_core_80|api_core_80_sse", envoy_response_code_class="5"}[1h]))');
+		expect(q.fast).toBe('sum(increase(envoy_cluster_upstream_rq_time_bucket{cluster="tuju-production", envoy_cluster_name="api_core_80", le="1000.0"}[1h]))');
+		expect(q.latencyTotal).toBe('sum(increase(envoy_cluster_upstream_rq_xx{cluster="tuju-production", envoy_cluster_name="api_core_80"}[1h]))');
+	});
 	it('jobs and nats have no latency objective', () => {
 		expect(queriesFor(coreJobs, 'c').fast).toBeNull();
 		expect(queriesFor(coreNats, 'c').errors).toBe('sum(increase(daya_core_nats_handler_runs_total{cluster="c", status="error"}[1h]))');
@@ -150,6 +191,14 @@ describe('parseServiceSliConfig (D7)', () => {
 	it('names every problem, rejects duplicates and bad kinds', () => {
 		const bad = JSON.stringify([{ id: 'a', kind: 'grpc', project: 'p', source: 's' }, { id: 'a', kind: 'jobs', project: 'p', source: 's', availabilityTarget: 2 }]);
 		expect(() => parseServiceSliConfig(bad)).toThrow(/kind must be one of[\s\S]*duplicated[\s\S]*availabilityTarget/);
+	});
+	it('accepts a streamSource on an http SLI and rejects one on other kinds, a bad name, or the same as source', () => {
+		const base = { id: 'a', kind: 'http', project: 'p', source: 'api_core_80' };
+		expect(parseServiceSliConfig(JSON.stringify([{ ...base, streamSource: 'api_core_80_sse' }]))[0].streamSource).toBe('api_core_80_sse');
+		expect(parseServiceSliConfig(JSON.stringify([base]))[0].streamSource).toBeUndefined();
+		expect(() => parseServiceSliConfig(JSON.stringify([{ ...base, kind: 'jobs', streamSource: 'x' }]))).toThrow(/only valid for kind http/);
+		expect(() => parseServiceSliConfig(JSON.stringify([{ ...base, streamSource: 'a|b' }]))).toThrow(/not a valid Envoy cluster name/);
+		expect(() => parseServiceSliConfig(JSON.stringify([{ ...base, streamSource: 'api_core_80' }]))).toThrow(/must differ from source/);
 	});
 	it('rejects non-JSON', () => expect(() => parseServiceSliConfig('{')).toThrow(/not valid JSON/));
 });
