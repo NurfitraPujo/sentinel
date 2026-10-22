@@ -458,7 +458,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           # cache: pnpm removed: the Actions cache works here, but a ~1.5 GB
           # store entry evicts the repo's other keys under the 10 GB budget and
           # its restores are slow. The S3 cache below carries it instead.
