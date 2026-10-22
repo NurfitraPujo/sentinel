@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM docker.io/library/node:20-alpine AS builder
+FROM docker.io/library/node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -40,7 +40,7 @@ RUN set -eu; mkdir -p /out; \
     cd /out && sha256sum sentinel-* > checksums.txt && cat checksums.txt
 
 # Stage 2: Production
-FROM docker.io/library/node:20-alpine
+FROM docker.io/library/node:22-alpine
 
 RUN apk add --no-cache ca-certificates tzdata
 
