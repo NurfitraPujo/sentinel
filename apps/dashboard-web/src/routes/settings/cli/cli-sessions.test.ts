@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /** sentinel-cli-browser-login: /settings/cli -- a user sees and revokes only their OWN personal keys. */

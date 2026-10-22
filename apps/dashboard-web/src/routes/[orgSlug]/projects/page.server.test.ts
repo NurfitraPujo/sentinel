@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const dbMock: any = { select: vi.fn(), from: vi.fn(), where: vi.fn() };
