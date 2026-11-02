@@ -762,6 +762,9 @@ init:
     errorEvents:
       maxAge: ""
       maxBytes: ""
+    # ERROR_EVENTS_DLQ MaxBytes, passed as ERROR_EVENTS_DLQ_MAX_BYTES. Empty means the script's 1GiB.
+    errorEventsDlq:
+      maxBytes: ""
   minio:
     enabled: true
     image: ghcr.io/nurfitrapujo/sentinel/minio-init

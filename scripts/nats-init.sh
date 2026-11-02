@@ -74,7 +74,9 @@ DLQ_SUBJECT="error_events.dlq"
 # sustained failure that dead-letters a meaningful fraction of traffic for the full 30-day window.
 DLQ_DISCARD="old"
 DLQ_MAX_AGE="30d"
-DLQ_MAX_BYTES="1GiB"
+# Overridable per environment (ERROR_EVENTS_DLQ_MAX_BYTES, from the chart's
+# init.nats.errorEventsDlq.maxBytes) like ERROR_EVENTS above.
+DLQ_MAX_BYTES="${ERROR_EVENTS_DLQ_MAX_BYTES:-1GiB}"
 
 # --- SPANS / SPANS_DLQ -------------------------------------------------------
 #

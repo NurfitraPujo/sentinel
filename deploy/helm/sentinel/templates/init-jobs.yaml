@@ -65,6 +65,10 @@ spec:
             - name: ERROR_EVENTS_MAX_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with (.Values.init.nats.errorEventsDlq).maxBytes }}
+            - name: ERROR_EVENTS_DLQ_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
 {{- end }}
 {{- if .Values.init.minio.enabled }}
 ---
