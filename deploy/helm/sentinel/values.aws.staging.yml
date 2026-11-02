@@ -284,6 +284,16 @@ init:
     enabled: false
     image: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
     tag: "v0.2.40-staging"
+    # Staging NATS caps each server's JetStream file store at 18GiB (infra
+    # k8s/clusters/tuju-staging/platform/nats/values.yaml) and reserves MaxBytes
+    # up front, so the 10GiB / 1GiB defaults crowded out other streams
+    # (media_jobs could not be placed). Staging holds a few MB of errors. While
+    # this job is off nothing applies these sizes: edit the live streams to
+    # match with `nats stream edit --max-bytes`. They apply if it is enabled.
+    errorEvents:
+      maxBytes: "2GiB"
+    errorEventsDlq:
+      maxBytes: "256MiB"
   minio:
     enabled: false
 
