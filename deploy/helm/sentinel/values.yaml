@@ -765,6 +765,9 @@ init:
     # ERROR_EVENTS_DLQ MaxBytes, passed as ERROR_EVENTS_DLQ_MAX_BYTES. Empty means the script's 1GiB.
     errorEventsDlq:
       maxBytes: ""
+    # SPANS MaxBytes, passed as SPANS_MAX_BYTES. Empty means the script's 2GiB.
+    spans:
+      maxBytes: ""
   minio:
     enabled: true
     image: ghcr.io/nurfitrapujo/sentinel/minio-init

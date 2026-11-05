@@ -258,6 +258,18 @@ init:
     enabled: false
     image: 576329195570.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
     tag: "v0.2.54"
+    # Production NATS caps each server's JetStream store at 50GiB and reserves
+    # MaxBytes up front; nats-1 was down to 392MiB free (media-processor/TASK-28).
+    # Sized from what production holds (2026-11-05): ERROR_EVENTS ~24MB/24h,
+    # SPANS ~1.5MB/24h, ERROR_EVENTS_DLQ empty. While this job is off nothing
+    # applies these sizes: the live streams were edited to match with
+    # `nats stream edit --max-bytes`. They apply if it is enabled.
+    errorEvents:
+      maxBytes: "2GiB"
+    errorEventsDlq:
+      maxBytes: "256MiB"
+    spans:
+      maxBytes: "512MiB"
   minio:
     # AWS: object storage is external (Huawei OBS during the migration window,
     # S3 after) — minio-init must NEVER be enabled here. It has no ECR image
