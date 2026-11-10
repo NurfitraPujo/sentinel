@@ -193,7 +193,7 @@ ingestor:
   podDisruptionBudget:
     enabled: false
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    requests: { cpu: 10m, memory: 64Mi }
     limits: { cpu: "1", memory: 512Mi }
 
 processor:
@@ -207,7 +207,7 @@ processor:
   podDisruptionBudget:
     enabled: false
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
+    requests: { cpu: 35m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
 
 dashboard:
@@ -224,7 +224,7 @@ dashboard:
   podDisruptionBudget:
     enabled: false
   resources:
-    requests: { cpu: 100m, memory: 256Mi }
+    requests: { cpu: 35m, memory: 256Mi }
     limits: { cpu: "1", memory: 768Mi }
 
 # Bundled stateful deps: all OFF — managed/shared equivalents above.
