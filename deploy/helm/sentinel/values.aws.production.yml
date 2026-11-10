@@ -151,10 +151,15 @@ config:
     authTrustHost: "true"
     # Kept on daya.ai for now (verified SES identity); rebrand at cutover.
     emailFrom: "noreply@daya.ai"
-    # Occurrence retention is being stepped down 30 -> 14 -> 7 by operator decision 2026-10-13. Resolved, ignored,
-    # assigned and commented issues are kept forever since v0.2.71; only raw occurrences, buckets and rollups age
-    # out. Step 2 (14 -> 7) follows once the backlog from step 1 has drained.
-    dataRetentionDays: "14"
+    # Occurrence retention. Resolved, ignored, assigned and commented issues are kept forever since v0.2.71; only
+    # raw occurrences, buckets and rollups age out.
+    # 90 is a BRIDGE (aws-infra-cost-review/BUG-11, 2026-11-10): the analytics warehouse has captured nothing since
+    # the Databend CDC pipeline stopped on 2026-10-28, so Postgres is the only copy of every occurrence since then
+    # until Sentinel's ClickHouse port takes its initial snapshot. At 14 those rows started to be deleted for good on
+    # 2026-11-11. The earlier 30 -> 14 -> 7 plan (2026-10-13) is cancelled. Return to 30 once the warehouse is
+    # live: 30 days is what the Postgres screens use (the 30-bar issue trend, the ingestor's 30-day MaxEventAge).
+    # About 9k occurrences a day: 90 days is about 1.8 GB, inside the table's current 3.6 GB.
+    dataRetentionDays: "90"
     reportMatchWindowMinutes: "30"
     escalationAckMinutes: "15"
     escalationMaxHops: "3"
