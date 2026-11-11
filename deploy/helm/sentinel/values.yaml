@@ -1,0 +1,794 @@
+# Default values for the Sentinel chart.
+# These defaults render a WORKING but NON-PRODUCTION stack (bundled deps, in-repo secrets).
+# For production, copy values-prod-example.yaml, disable the bundled dependencies, and supply
+# real secrets via `existingSecret` or an external secret manager. See ../../../DEPLOYMENT.md.
+
+# -----------------------------------------------------------------------------
+# Global settings shared by every service.
+# -----------------------------------------------------------------------------
+global:
+  # Cloud target. "generic" keeps the demo/nginx path; "k8s" enables the CCE
+  # ingresses and external-services. K8s env files set this to "k8s".
+  provider: generic
+  # Prefix for image repositories. Leave empty to use the fully-qualified repos below as-is.
+  imageRegistry: ""
+  imagePullSecrets: []
+  # A namespace-wide name prefix is derived from the release name; see _helpers.tpl.
+
+# Common image pull policy for first-party images.
+imagePullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# First-party application images. Point these at your registry + built tags.
+# The three app Dockerfiles live at apps/<svc>/Dockerfile in the repo.
+# -----------------------------------------------------------------------------
+images:
+  ingestor:
+    repository: ghcr.io/nurfitrapujo/sentinel/ingestor-go
+    tag: "" # defaults to .Chart.AppVersion when empty
+  processor:
+    repository: ghcr.io/nurfitrapujo/sentinel/processor-go
+    tag: ""
+  dashboard:
+    repository: ghcr.io/nurfitrapujo/sentinel/dashboard-web
+    tag: ""
+  # The migrate Job and dlq-drainer reuse a Go toolchain / the built tools image.
+  migrate:
+    repository: ghcr.io/nurfitrapujo/sentinel/db-migrate
+    tag: ""
+  dlqDrainer:
+    repository: ghcr.io/nurfitrapujo/sentinel/dlq-drainer
+    tag: ""
+
+# -----------------------------------------------------------------------------
+# Secrets. In production set `create: false` and reference a pre-provisioned Secret
+# (e.g. from External Secrets Operator / Vault / cloud secret manager) via existingSecret.
+# The Secret MUST contain every key listed under `data` below.
+# -----------------------------------------------------------------------------
+secrets:
+  create: true
+  existingSecret: "" # when set, `create` is ignored and this Secret name is mounted instead
+  # Secret backend. "plain" renders the in-chart Secret from `data` (demo only).
+  # "sealed" renders a SealedSecret from `sealedData` (K8s CCE via
+  # kubeseal-encryptor — seal per namespace, paste ciphertext into sealedData).
+  backend: plain
+  sealedData: {}
+  # These INSECURE defaults exist only so `helm install` renders on a kicking-the-tyres cluster.
+  # NEVER ship them. `helm lint`/CI should reject any release that keeps a `change-me` value.
+  data:
+    POSTGRES_PASSWORD: "change-me-postgres"
+    REDIS_PASSWORD: ""
+    S3_ACCESS_KEY: "change-me-s3-access"
+    S3_SECRET_KEY: "change-me-s3-secret"
+    # dashboard-only secrets
+    AUTH_SECRET: "change-me-auth-secret-min-32-chars-long"
+    SETTINGS_ENCRYPTION_KEY: "change-me-settings-key-exactly-32ch"
+    # N10: base64 of exactly 32 random bytes (`openssl rand -base64 32`); repo-credential
+    # endpoints return 503 until it is set to a real value.
+    SENTINEL_ENCRYPTION_KEY: "change-me-base64-of-32-random-bytes"
+    CRON_SECRET: "change-me-cron-secret"
+    GOOGLE_CLIENT_ID: ""
+    GOOGLE_CLIENT_SECRET: ""
+    GITHUB_CLIENT_ID: ""
+    GITHUB_CLIENT_SECRET: ""
+    # SMTP DSN for invitation / magic-link email. Without it, invitations cannot be delivered
+    # (a deliberate consequence of design decision D06). e.g. smtp://user:pass@smtp.host:587
+    EMAIL_SERVER: ""
+
+# -----------------------------------------------------------------------------
+# Non-secret shared configuration (rendered into a ConfigMap).
+# -----------------------------------------------------------------------------
+config:
+  postgres:
+    # Host/port/user/db for ALL three services. Password comes from the Secret above.
+    # When `dependencies.postgres.enabled`, host defaults to the bundled StatefulSet service.
+    host: "" # empty => bundled postgres service name; set to your managed host in prod
+    port: 5432
+    user: sentinel
+    database: sentinel
+    # sslmode for the dashboard DATABASE_URL and migrate DB_URL_*. Use "require" or stricter in prod.
+    sslmode: require
+  nats:
+    # empty => bundled nats service; else nats://host:4222 of your managed cluster
+    url: ""
+  redis:
+    # empty => bundled redis service; else host:port
+    addr: ""
+    db: 0
+  s3:
+    # Server-side (in-cluster / VPC) endpoint used for all server S3 calls.
+    # empty => bundled minio service; else e.g. https://s3.us-east-1.amazonaws.com or an R2 endpoint.
+    endpoint: ""
+    # Browser-reachable endpoint used ONLY to sign presigned PUT URLs (M6 large uploads).
+    # MUST be resolvable from end-user browsers. SigV4 signs the host, so a wrong value here
+    # makes large uploads fail from the browser while server-side uploads keep working.
+    publicEndpoint: "https://uploads.example.com"
+    bucket: sentinel-attachments
+  otel:
+    # OTLP HTTP collector endpoint. Empty disables trace export (services stay fully functional).
+    exporterEndpoint: ""
+  dashboard:
+    # Public URL of the dashboard (Auth.js AUTH_URL). MUST be the externally-visible https URL.
+    authUrl: "https://sentinel.example.com"
+    # Name of the `sentinel` CLI config profile this deployment installs/logs in as (rendered as
+    # SENTINEL_CLI_PROFILE). install.sh and the Agents page then print
+    # `sentinel login --url <origin> --profile <name>`, so an engineer using several Sentinels ends up with
+    # one named profile per environment. Empty = no --profile in the printed commands.
+    cliProfile: ""
+    # Lifetime in days of a PERSONAL CLI key minted by `sentinel login` (browser approval by any org member;
+    # docs/plans/CLI_BROWSER_LOGIN.md). Rendered as CLI_PERSONAL_KEY_TTL_DAYS. 1-365; there is deliberately no
+    # "never expires" value. `sentinel key rotate` cannot extend a personal key past it either.
+    cliPersonalKeyTtlDays: "90"
+    # How the dashboard finds the CLIENT's IP (adapter-node ADDRESS_HEADER / XFF_DEPTH). It feeds the per-IP limits
+    # of `sentinel login` (device start/poll) and the "requesting IP" its approval page shows, plus sign-in audit rows.
+    # Both empty (default) = not rendered = the TCP peer, which behind a proxy is the PROXY: every user then shares
+    # one per-IP bucket. Behind proxies, set addressHeader "x-forwarded-for" and xffDepth to the number of proxies
+    # that append to it (the client is the entry at position len-xffDepth). A missing/short header falls back to the
+    # TCP peer (apps/dashboard-web/src/lib/server/client-ip.ts), never a 500.
+    clientIp:
+      addressHeader: ""
+      xffDepth: ""
+    authTrustHost: "true"
+    emailFrom: "noreply@sentinel.example.com"
+    dataRetentionDays: "30"
+    # sentinel-user-report-issue §8's config knobs, with the defaults the contract states.
+    # There is no feature flag here and that is the decision, not an omission: the `report` key
+    # scope IS the switch (OQ-3), and no key that exists today carries it.
+    #
+    # §4.3's triage window: how far back the matcher looks for candidate error issues.
+    reportMatchWindowMinutes: "30"
+    # §4.4's acknowledgement deadline, in minutes. Lengthening it past the sweep interval is safe;
+    # shortening it below one sweep period is not, since the sweep is what enforces it.
+    escalationAckMinutes: "15"
+    # §4.4's bound. "It does not loop the rotation forever — a pager that keeps moving is a pager
+    # nobody owns."
+    escalationMaxHops: "3"
+    # §4.5's per-key upload throttle and rolling-24h byte ceiling (SR-5, counted in Postgres).
+    reportUploadRpm: "10"
+    reportUploadBytesPerDay: "262144000"
+    # Health endpoints the observability page reads. Left empty on purpose: the configmap then
+    # derives in-cluster service DNS from the release name, which is correct for every normal
+    # deployment. Set these only when processor/ingestor are reachable somewhere else.
+    processorHealthUrl: ""
+    ingestorHealthUrl: ""
+    # Retention-cron knobs (N9). Code defaults are 24 / 365; set explicitly
+    # per env to make them visible and tunable.
+    claimStaleHours: "24"
+    manualIssueRetentionDays: "365"
+    # sentinel-sourcemaps §4.1 / §12: the upload route's caps and the adapter's body limit.
+    # Every value here is a STRING in the syntax the reader of the variable expects -- the
+    # operator turning one reads nothing else.
+    #
+    # BODY_SIZE_LIMIT -- adapter-node's own syntax: an integer with an optional K/M/G suffix.
+    # Without it the adapter 413s every real map before the route runs (adapter-node defaults to
+    # 512KB); 110M covers two 50 MiB maps plus multipart overhead in one request.
+    # docker-compose.yml sets the same variable for the same reason.
+    bodySizeLimit: "110M"
+    # SOURCEMAP_MAX_BYTES -- plain integer bytes, per file part. 52428800 = 50 MiB (decision 10).
+    sourcemapMaxBytes: "52428800"
+    # SOURCEMAP_MAX_FILES_PER_REQUEST / SOURCEMAP_MAX_FILES_PER_RELEASE -- plain integers
+    # (decision 10). A request over the first is 400; a release that would exceed the second is
+    # 422 release_full with nothing written (§4.1). The per-release value is 2000, not decision
+    # 10's 500: one Next.js (Turbopack) release is ~1240 maps (sentinel-sdk-js decision 26).
+    sourcemapMaxFilesPerRequest: "50"
+    sourcemapMaxFilesPerRelease: "2000"
+  ingestor:
+    # When true, requests with an unresolvable API key are rejected rather than soft-allowed.
+    ratelimitStrictMode: "true"
+    # TRUSTED_PROXY_CIDRS (sentinel-event-enrichment spec §3.3) -- a YAML list of CIDR prefixes (a bare
+    # address is a single-address prefix), rendered comma-joined as plain env on the ingestor container
+    # only (templates/ingestor.yaml), never in the shared ConfigMap. X-Forwarded-For is believed only
+    # through proxies in these ranges. This list NEVER grants relay identity: the Sentry-compatible routes
+    # believe X-Sentinel-Relay-* headers only from a `relay` scoped API key (sentinel-relay-key-trust). Empty = trust nothing: the caller is the connection's peer, and
+    # a derived caller IP is stored only if it is public. An unparseable or IPv4-mapped entry makes
+    # the ingestor exit 1 at startup.
+    trustedProxyCidrs: []
+    # SENTRY_COMPAT_TRUSTED_PROXY_CIDRS (sentinel-sentry-compat-ingest spec §3.6) -- CIDR prefixes whose
+    # X-Forwarded-For the Sentry-compatible routes believe on top of trustedProxyCidrs, for callers that are NOT a
+    # relay. It no longer affects relay identity: since sentinel-relay-key-trust the X-Sentinel-Relay-* headers and
+    # the relayed client IP are honoured only for a `relay` scoped API key, from any peer (RUNBOOK "Sentry-compatible
+    # ingest: trusting core's relay"). /ingest and /ingest/batch never read this list. Same syntax and start-up check
+    # as trustedProxyCidrs. Empty (the default, contract D15, and it stays empty).
+    sentryCompatTrustedProxyCidrs: []
+  processor:
+    # sentinel-sourcemaps §12: the symbolication knobs (decisions 9, 11, 27, 37, 38). Rendered as
+    # plain env on the processor container (templates/processor.yaml), never in the ConfigMap the
+    # other two services also read. Every value is a STRING in the syntax stated beside it -- the
+    # operator turning one reads nothing else. S3_ENDPOINT/S3_BUCKET reach the processor via the
+    # ConfigMap already; S3_ACCESS_KEY/S3_SECRET_KEY come from the Secret (the same two keys the
+    # dashboard mounts). There is no chart switch for the startup check: a processor with a
+    # non-empty SYMBOLICATE_PLATFORMS and no S3 credentials log.Fatalf's before it subscribes
+    # (decision 32) -- see RUNBOOK.md §2's pre-deploy check.
+    #
+    # SYMBOLICATE_PLATFORMS -- comma-separated lowercase list of `platform` values the stage (and
+    # §4.4's frame normalisation) runs for. Unset = "javascript,browser"; set-and-EMPTY = off,
+    # which is the kill switch (decision 27) -- so this key must stay present and non-empty to
+    # keep symbolication on.
+    symbolicatePlatforms: "javascript,browser"
+    # SOURCEMAP_CACHE_BYTES -- plain integer bytes of RAW map size the in-process cache holds
+    # before evicting (decision 11). No Mi/M suffix. 67108864 = 64 MiB. The parsed maps the
+    # cache actually holds are a multiple of this, so this number is DERIVED from the memory
+    # limit, not asserted (contract §12): the arithmetic is beside `processor.gomemlimit` below,
+    # and tests/unit/helm_processor_memory_test.go re-checks it. The code's own default is still
+    # 128 MiB (decision 11's number); it is the chart that carries the derived value, because
+    # the chart is where the limit it is derived from lives.
+    sourcemapCacheBytes: "67108864"
+    # SOURCEMAP_NEGATIVE_TTL -- Go duration string. How long a "no map for this frame" answer is
+    # remembered (decision 9); a map uploaded inside this window is not seen until it expires.
+    # docker-compose.yml sets 5s so the e2e case does not wait it out.
+    sourcemapNegativeTtl: "60s"
+    # SOURCEMAP_POSITIVE_TTL -- Go duration string. How long a parsed map is served before it is
+    # re-fetched; a replaced map propagates within this per pod (Known limit 3).
+    sourcemapPositiveTtl: "10m"
+    # SYMBOLICATE_DEADLINE -- Go duration string. Per-event wall-clock bound on cold fetch+parse
+    # (decision 37): past it the event's unresolved frames pass through `timeout` and the fill
+    # finishes in the background. Raising it means raising the NATS AckWait in
+    # apps/processor-go/main.go with it (>= BatchSize x this deadline) -- that follows in code,
+    # not here.
+    symbolicateDeadline: "5s"
+    # SOURCEMAP_MAX_PARSE_BYTES -- plain integer bytes. A `sourcemaps` row whose size_bytes is
+    # over this is never fetched (`oversize`, decision 38): the lever that keeps the biggest maps
+    # out of RSS. Default = the upload cap (SOURCEMAP_MAX_BYTES, 52428800), kept: decision 35
+    # keeps the 50 MiB upload cap so that a cap-size map IS symbolicated, and the memory for it
+    # is carried by the limit / gomemlimit / cache triple below. It MUST stay <= sourcemapCacheBytes
+    # so a map the processor is allowed to parse is never too large for the cache (a map over the
+    # CACHE bound is fetched and parsed per event, never retained -- the thrash row of §12).
+    sourcemapMaxParseBytes: "52428800"
+
+# -----------------------------------------------------------------------------
+# External managed endpoints (K8s CCE only). Each entry renders a
+# selector-less Service + Endpoints bridging the in-cluster name to the VPC
+# private IP. Empty (default) renders nothing. K8s env files define
+# rds-postgres-sentinel / dcs-redis-sentinel here.
+# -----------------------------------------------------------------------------
+externalServices: []
+
+# -----------------------------------------------------------------------------
+# Database migration Job. Runs `migrate up` for every target as a pre-install/pre-upgrade hook.
+# -----------------------------------------------------------------------------
+migrate:
+  enabled: true
+  # Which goose targets to migrate. Each shares one physical database (see A1 in the repo).
+  targets:
+    - processor
+    - ingestor
+    - dashboard
+  # WHO THE MIGRATIONS RUN AS, WHICH IS NOT ALWAYS THE APPLICATION ROLE.
+  #
+  # ALTER TABLE requires OWNERSHIP of the table and no GRANT substitutes for it,
+  # so the migration job must connect as whichever role owns the schema. That is
+  # not the same role in every environment:
+  #
+  #   staging    all 50 public tables are owned by example-migration-user, while the
+  #              app connects as example-sentinel-user -- so an ALTER fails with
+  #              "must be owner of table" (report-an-issue/BUG-68)
+  #   production example-sentinel-user owns its tables, so the app identity IS the
+  #              owner and nothing needs overriding
+  #
+  # Empty means "use the application identity", which keeps production, the
+  # K8s values and the demo path exactly as they were.
+  postgres:
+    user: ""
+    # Key inside the release Secret holding that role's password. Required when
+    # `user` is set, and on AWS it must also appear in externalSecrets.secrets --
+    # both are enforced at template time, because the alternative is a job that
+    # starts and then cannot authenticate.
+    passwordSecretKey: ""
+  backoffLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# -----------------------------------------------------------------------------
+# ingestor-go — the only externally exposed first-party service (error ingest :8080).
+# -----------------------------------------------------------------------------
+ingestor:
+  replicaCount: 2
+  containerPort: 8080
+  service:
+    type: ClusterIP
+    port: 8080
+    # Set with type: NodePort on K8s CCE (verified-free ports per env file).
+    nodePort: null
+  # K8s CCE ingress (ingestor-ingress.yaml). Ignored unless
+  # global.provider == "k8s".
+  ingress:
+    enabled: false
+    host: ""
+    elbId: ""
+    tlsCertIds: ""
+  resources:
+    # 256Mi (was 128Mi, sentinel-event-enrichment spec §8.4): +~60 MiB resident GeoLite2-City database,
+    # ~2x transiently while a reload swaps it.
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # HTTP probes hit /health on the container port.
+  livenessPath: /health
+  readinessPath: /health
+
+# -----------------------------------------------------------------------------
+# geoip — server-side geo enrichment (sentinel-event-enrichment spec §5, §8). Ingestor pods load a
+# GeoLite2-City database from S3-compatible object storage and reload a newer copy without a restart;
+# they NEVER contact MaxMind. The refresh CronJob (`ingestor geoip-refresh`, the ingestor image) is the
+# only thing that does: twice a week, downloading only when MaxMind has a newer file. Every failure
+# (no database, missing, corrupt, stale) means no geo, never an unready pod. Moving from OBS to AWS S3
+# is a values-and-secret change only (spec §8.3).
+# -----------------------------------------------------------------------------
+geoip:
+  # Renders the ingestor's GEOIP_* env. Off: the ingestor logs geoip.state to=disabled and stores no geo.
+  enabled: false
+  # GEOIP_POLL_INTERVAL -- a Go duration >= 1m; how often pods check the object's ETag.
+  pollInterval: "1h"
+  # GEOIP_MAX_AGE -- a Go duration >= 1h; a database older than this (by build time) answers nothing.
+  # 720h is the GeoLite EULA's 30 days.
+  maxAge: "720h"
+  storage:
+    # GEOIP_S3_ENDPOINT -- URL with scheme (https = TLS). "" = config.s3.endpoint (else bundled MinIO).
+    endpoint: ""
+    # GEOIP_S3_REGION -- the SigV4 region.
+    region: "us-east-1"
+    # GEOIP_S3_BUCKET -- "" = config.s3.bucket.
+    bucket: ""
+    # GEOIP_S3_PREFIX -- key prefix, used verbatim; the object is <prefix>GeoLite2-City.mmdb.
+    prefix: "geoip/"
+    # GEOIP_S3_FORCE_PATH_STYLE -- "" = by host shape (a dotted host is virtual-hosted, which OBS
+    # requires); otherwise true/false.
+    forcePathStyle: ""
+    # NAMES of keys in the chart Secret that hold the S3 credentials (GEOIP_S3_ACCESS_KEY /
+    # GEOIP_S3_SECRET_KEY). Until the AWS S3 move this is the existing read-write key, an accepted risk
+    # (contract decision 8); at the move, point these at a read-only key scoped to <prefix>*.
+    accessKeySecretKey: S3_ACCESS_KEY
+    secretKeySecretKey: S3_SECRET_KEY
+  refreshCron:
+    # Ships OFF (chart convention). Needs MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY in the Secret;
+    # without them the Job starts, logs why, and fails (geo stays empty).
+    enabled: false
+    # Wed + Sat 06:00 UTC: after MaxMind's Tue/Fri GeoLite releases. At most one download per run.
+    schedule: "0 6 * * 3,6"
+    timeZone: "Etc/UTC"
+    startingDeadlineSeconds: 3600
+    activeDeadlineSeconds: 900
+    # 0: a retry could be a second download; the next run is 3-4 days away.
+    backoffLimit: 0
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    # NAMES of the Secret keys the CronJob writes with. "" = geoip.storage.accessKeySecretKey /
+    # secretKeySecretKey; set to the write key at the AWS S3 move, when the ingestor's becomes read-only.
+    accessKeySecretKey: ""
+    secretKeySecretKey: ""
+    resources:
+      requests: { cpu: 50m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+
+# -----------------------------------------------------------------------------
+# processor-go — NATS consumer, no inbound app traffic. :8081 serves /health,/metrics,/dlq.
+# -----------------------------------------------------------------------------
+processor:
+  replicaCount: 2
+  healthPort: 8081
+  service:
+    # Headless-ish ClusterIP so Prometheus can scrape /metrics; no external exposure.
+    type: ClusterIP
+    port: 8081
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    # 1Gi, not 512Mi: the raise decision 11 reserved for review, taken on §13 M2's number (below).
+    # values-k8s-{staging,production}.yml override this block and carry the same 1Gi -- an
+    # overlay that lowers it without lowering gomemlimit puts the soft limit ABOVE the kernel's.
+    limits: { cpu: "1", memory: 1Gi }
+  # GOMEMLIMIT -- a Go memory-limit string (the runtime's own syntax: an integer with an optional
+  # B/KiB/MiB/GiB suffix, e.g. 800MiB), and it MUST stay below resources.limits.memory above so
+  # the runtime collects before the kernel OOM-kills (sentinel-sourcemaps decision 35). The
+  # symbolication cache accounts RAW map bytes (config.processor.sourcemapCacheBytes) and holds
+  # parsed maps that are a multiple of that, so the gauge under-reads real usage; this value is
+  # derived, not asserted: sourcemapCacheBytes x parsed:raw ratio + baseline < GOMEMLIMIT, with the
+  # ratio the §13 M2 measurement reports. Raise the memory limit and this together.
+  #
+  # The arithmetic, from M2 as taken on 2026-09-15 (prd sentinel-sourcemaps/status/be.md, M2):
+  # one 50 MiB cap-size map parsed and held = 387 MiB of RSS, parsed:raw ratio 7.65 (7.69 for the
+  # whole bundle; 7.7 used below), baseline RSS 28.3 MiB with the cache empty (29 used below).
+  #   steady state (the contract's formula):  64 MiB x 7.7 + 29 MiB = 522 MiB < 800 MiB GOMEMLIMIT
+  #   peak, the moment before eviction:  (64 + 50) MiB x 7.7 + 29 MiB = 907 MiB < 1024 MiB limit
+  # The second line exists because the cache admits a map AFTER parsing it and only then evicts
+  # (apps/processor-go/symbolicate/cache.go, put): with the cache full, a cold cap-size map
+  # (sourcemapMaxParseBytes, 50 MiB) is held in RSS alongside everything already cached until it
+  # is inserted. That peak may cross GOMEMLIMIT (a soft limit: the runtime collects harder, the
+  # process lives) but must not cross the kernel limit. The shipped 128 MiB / 400MiB / 512Mi
+  # failed the first line alone (128 x 7.7 + 29 = 1015 MiB): two cap-size maps referenced by
+  # events fit that raw bound, RSS would reach ~800 MiB, and the pod would be OOM-killed into a
+  # crash loop with a cold cache. tests/unit/helm_processor_memory_test.go asserts both lines against this file
+  # and the K8s overlays; re-derive all three numbers when M2 is re-taken (§13's held task).
+  gomemlimit: "800MiB"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Liveness must NOT track dependencies: /health is 503 while the subscriber retries JetStream at startup.
+  livenessPath: /livez
+  readinessPath: /health
+
+# -----------------------------------------------------------------------------
+# dashboard-web — SvelteKit UI + JSON API (:3000).
+# -----------------------------------------------------------------------------
+dashboard:
+  replicaCount: 2
+  containerPort: 3000
+  service:
+    type: ClusterIP
+    port: 3000
+    # Set with type: NodePort on K8s CCE (verified-free ports per env file).
+    nodePort: null
+  # K8s CCE ingress (dashboard-ingress.yaml). Ignored unless
+  # global.provider == "k8s".
+  ingress:
+    enabled: false
+    host: ""
+    elbId: ""
+    tlsCertIds: ""
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  livenessPath: /
+  readinessPath: /
+
+# -----------------------------------------------------------------------------
+# dlq-drainer — scheduled DLQ maintenance. Ships gated OFF (matches compose default).
+# -----------------------------------------------------------------------------
+dlqDrainer:
+  enabled: true
+  # Both must be true for anything destructive to happen (see tools/dlq + D14).
+  drainerEnabled: "false"
+  drainerExecute: "false"
+  stream: ERROR_EVENTS_DLQ
+  intervalSeconds: "3600"
+  limit: "50"
+  maxReplays: "3"
+  stateFile: /var/lib/dlq-drainer/state.json
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+# -----------------------------------------------------------------------------
+# retention-cron — schedules POST /api/cron/retention (N9). A batch/v1 CronJob that runs a short
+# curl Job on `schedule`, POSTing the in-cluster dashboard Service with CRON_SECRET (from the chart
+# Secret). The same run force-releases stale agent claims (CLAIM_STALE_HOURS) and applies retention
+# windows. Ships ENABLED — unlike the destructive dlq-drainer, this only invokes an endpoint that is
+# itself the authority on what it deletes, and a stack with no scheduler leaks crashed-agent claims.
+# -----------------------------------------------------------------------------
+retentionCron:
+  enabled: true
+  # Standard cron syntax (cluster timezone). Default: hourly, matching the compose interval.
+  schedule: "0 * * * *"
+  image:
+    # A plain curl image — the Job only makes one HTTP POST, no first-party code.
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  # curl --max-time. sentinel-issue-tag-facets §5: a run may take up to its 170 s deadline (the occurrence
+  # step's 120 s budget, the deferred rebuilds' 9 s, 30 s for the rest), and the deadline must be <= this
+  # minus 10 s so a live run has answered before curl gives up. tests/unit/tag_facets_gate_test.go
+  # asserts it, and that the compose loop's RETENTION_CRON_TIMEOUT_SECONDS equals it.
+  timeoutSeconds: 180
+  # If the controller misses a scheduled time by more than this (e.g. controller downtime), skip it.
+  startingDeadlineSeconds: 120
+  # Kill a run that hangs past this so a wedged Job cannot block the next (concurrencyPolicy: Forbid).
+  # Three attempts of 180 s fit, still far inside the hourly interval.
+  activeDeadlineSeconds: 600
+  backoffLimit: 2
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# tagFacetsBackfill -- sentinel-issue-tag-facets spec §4.1. `processor backfill-tag-facets` (the processor
+# image) counts the occurrences stored before the issue_tag_values triggers existed, once per environment.
+# The template renders a SUSPENDED CronJob with a never-firing schedule and no sync hook: ArgoCD syncs it
+# and never runs it; the operator creates one Job from it (RUNBOOK.md "Tag facets backfill"). Enabled by
+# default so the operator can create that Job after the deploy; after P2 passes an overlay MAY set
+# enabled: false, which removes the CronJob and the Jobs it owns.
+# -----------------------------------------------------------------------------
+tagFacetsBackfill:
+  enabled: true
+  # -batch: rows per batch transaction (1-5000). Every batch locks every hot issue it touches for its
+  # duration, so the size bounds a delivery's wait (~26 ms p95 measured at 200), not throughput.
+  batch: 200
+  # -pause: the floor of the sleep between batches (a Go duration).
+  pause: 200ms
+  # -duty: the most of the wall-clock time a batch may hold its issues; the sleep after a batch of
+  # t is max(pause, t x (1 - duty) / duty).
+  duty: 0.25
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# -----------------------------------------------------------------------------
+# oncall-escalation cron — sentinel-user-report-issue §4.4b. A SECOND scheduled job, not a
+# widening of retentionCron above: retention runs hourly and a 15-minute acknowledgement deadline
+# swept hourly is a 75-minute deadline. This one runs every minute.
+#
+# Ships OFF, per this chart's convention for scheduled jobs and per §4.4b's "off by default". §12
+# names the consequence of leaving it off: escalation-at-intake still assigns the on-call engineer,
+# but an unacknowledged deadline never reassigns, and the prometheusRule alerts below are the only
+# thing that notices.
+# -----------------------------------------------------------------------------
+oncallCron:
+  enabled: false
+  # Every minute. §4.4b fixes this value; it is not a tuning knob in the way retention's is.
+  schedule: "*/1 * * * *"
+  image:
+    # The same plain curl image retentionCron uses — the Job only makes one HTTP POST.
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  timeoutSeconds: 20
+  # A minute-period job that misses its slot by more than this should be skipped rather than
+  # stacked: the next run is 60 seconds away and will find the same due rows.
+  startingDeadlineSeconds: 45
+  # Below the 60s period, so a wedged run cannot sit in front of the next one under Forbid.
+  activeDeadlineSeconds: 50
+  # No retries: the next scheduled run is a minute away and the sweep is idempotent, so a retry
+  # buys nothing a re-run does not.
+  backoffLimit: 0
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# sliCollectCron -- sentinel-reporting-and-dashboard D6. POST /api/cron/sli-collect hourly at :05: copies each
+# SLI's hourly request / job-run / NATS-message totals from VictoriaMetrics into sli_hourly (Postgres), which CDC
+# carries to Databend. Off by default: it needs a VictoriaMetrics URL and a cluster name (below), which only the EKS
+# overlays set.
+# -----------------------------------------------------------------------------
+sliCollectCron:
+  enabled: false
+  schedule: "5 * * * *"
+  image:
+    repository: docker.io/curlimages/curl
+    tag: "8.7.1"
+  # curl --max-time: the 30-day first-run backfill is a handful of query_range calls; a normal run is under ten.
+  timeoutSeconds: 120
+  startingDeadlineSeconds: 300
+  activeDeadlineSeconds: 400
+  backoffLimit: 1
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { cpu: 100m, memory: 64Mi }
+
+# D7: the SLI definitions, rendered to the dashboard's SERVICE_SLI_CONFIG (JSON) and validated at start. Empty = none.
+# `streamSource` (http only) is the SSE cluster: latency reads `source` alone, availability reads both.
+# `latency.le` must be one of the edge histogram's bucket values (apps/dashboard-web/src/lib/server/sli/config.ts).
+serviceSlis: []
+
+# D6 / D4: where the dashboard reads denominators and analytics from. Empty = the feature is off for this deployment
+# (the dashboard then shows "unavailable" for those sections; nothing fails).
+analytics:
+  # VictoriaMetrics HTTP API base, e.g. http://monitoring.internal.example.com:8428
+  victoriaMetricsUrl: ""
+  # The Envoy/job-metric `cluster` label this deployment belongs to: example-production | example-staging.
+  sliCluster: ""
+  databend:
+    # HTTP query API base, e.g. http://databend-query.databend.svc.cluster.local:8000
+    url: ""
+    user: sentinel_app
+    database: sentinel
+
+# D8: PodMonitors (monitoring.coreos.com/v1) for the ingestor, processor and dashboard. Off by default because the CRD
+# belongs to the Prometheus Operator (the EKS overlays turn it on); the prometheus.io/* annotations stay for CCE.
+podMonitor:
+  enabled: false
+  interval: 30s
+  # /api/metrics/insights is token-gated (D20) and recomputed every 5 minutes, so it is scraped less often.
+  insightsInterval: 60s
+  labels: {}
+
+# -----------------------------------------------------------------------------
+# PrometheusRule — sentinel-user-report-issue §12's alert rules. Ships OFF because the CRD belongs
+# to the Prometheus Operator; enabling it on a cluster without the operator fails the release on an
+# unknown kind. See templates/prometheusrule.yaml for why the rules live in this chart at all.
+# -----------------------------------------------------------------------------
+prometheusRule:
+  enabled: false
+  # Extra labels the cluster's Prometheus uses to select rule objects (e.g. `release: kube-prom`).
+  labels: {}
+  # Evaluation window for the two "above zero" signals. Long enough that one scrape gap cannot
+  # clear a real exhaustion, short enough to page while the report still matters.
+  window: 15m
+  # Both signals are counters of events that already happened; a `for` beyond one evaluation cycle
+  # would only delay a page nobody can un-fire.
+  for: 5m
+  # The stalled-escalation backstop compares two counters over the same window, so the window has
+  # to be long enough for a normal quiet period not to look like a stall.
+  stalledWindow: 1h
+  # sentinel-retention: the failure alerts look back two hourly runs; "not completing" three.
+  retentionWindow: 2h
+  retentionStalledWindow: 3h
+  severity:
+    exhausted: critical
+    unresolved: warning
+    stalled: warning
+    # The sentinel-sourcemaps group (DORMANT until a Prometheus consumes Sentinel's rules — see the
+    # group's header in templates/prometheusrule.yaml). All warning: every one degrades to
+    # pass-through and none stops ingest (contract §12, *Failure modes*).
+    sourcemapFetchErrors: warning
+    sourcemapCacheThrash: warning
+    sourcemapUploadStorageErrors: warning
+    # The sentinel-retention group (sentinel-issue-tag-facets §5): a stale route lock stops occurrence
+    # deletion and every reaper on the route, so it pages.
+    retentionLockStale: critical
+    retentionFailing: warning
+    retentionNotCompleting: warning
+
+# -----------------------------------------------------------------------------
+# Ingress. Two hosts: the dashboard UI and the ingestor ingest endpoint.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    # One secret per host, or a shared wildcard cert. cert-manager can populate these.
+  dashboard:
+    host: sentinel.example.com
+    tlsSecret: sentinel-dashboard-tls
+  ingestor:
+    host: ingest.example.com
+    tlsSecret: sentinel-ingest-tls
+    # Large-payload note: ingest bodies are small, but bump proxy-body-size if you change limits.
+
+# -----------------------------------------------------------------------------
+# Bundled stateful dependencies. DISABLE these in production and use managed services
+# (RDS/Cloud SQL, a managed NATS or self-run StatefulSet, ElastiCache/managed Redis,
+# real S3/R2/GCS). Enabled here only so a demo cluster comes up with one command.
+# -----------------------------------------------------------------------------
+dependencies:
+  postgres:
+    enabled: true
+    image: postgres:15-alpine
+    storage:
+      size: 20Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "2", memory: 2Gi }
+  nats:
+    enabled: true
+    image: nats:2.10-alpine
+    # JetStream file storage MUST be persistent — this is the durability boundary for the pipeline.
+    storage:
+      size: 20Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  redis:
+    enabled: true
+    image: redis:7-alpine
+    storage:
+      size: 5Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  minio:
+    enabled: true
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    storage:
+      size: 50Gi
+      storageClass: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+
+# -----------------------------------------------------------------------------
+# sentinel-span-ingest: spans for the trace page's waterfall. Ships OFF.
+#   enabled  SPAN_INGEST_ENABLED on the ingestor and the processor: the ingestor publishes the spans of a Sentry-
+#            compatible `transaction` item to the SPANS stream (scripts/nats-init.sh creates it) and the processor
+#            writes them to the day-partitioned `spans` table. Off, a transaction item is discarded as before.
+#   pull     D3: when an error with a canonical trace id is stored in an organization that is a key of `scopes`, the
+#            processor fetches that trace's spans from core's trace store 2 and 10 minutes later. All three of
+#            scopes, storeKind and storeUrl must be set; empty = off.
+#            scopes is a comma-separated list of `<org_uuid>:<core_project_uuid>`. The organization is THE guard
+#            (trace ids are client-asserted, so an organization not listed can never cause core's trace to be copied
+#            into it), and the project is what GOVERNS the pulled spans: they are core's data, shown only to a viewer
+#            who can reach that core project and whose environment grant on it permits the span's environment,
+#            whichever project's error queued the trace. storeKind is tempo (K8s) or jaeger (AWS VictoriaTraces);
+#            storeUrl is the base URL, no trailing path.
+#            At processor start every entry is checked against the database: the project must exist and belong to
+#            the organization it is listed under, otherwise that entry is dropped with an ERROR log. An organization
+#            listed twice is refused entirely (ERROR). Until the check has succeeded nothing is enqueued or pulled.
+#            issueWindow (SPAN_PULL_ISSUE_WINDOW, a Go duration): at most ONE pull is queued per issue per window, so
+#            a noisy error whose every occurrence carries its own trace queues one pull, not one per occurrence
+#            (2026-10-06: 1,806 pulls, 1.34M spans in one hour from one issue). "0" turns the throttle off; a
+#            negative or malformed value stops the processor at start.
+#            onDemandLimitPerHour (SPAN_PULL_ON_DEMAND_LIMIT on the DASHBOARD): the "Pull spans" button and POST
+#            /api/agent/traces/{id}/pull queue ONE immediate fetch of one trace (never touching the per-issue window above).
+#            This is the most accepted on-demand requests per organization per rolling hour, counted in the database
+#            (span_pull_requests) so it holds across dashboard replicas; over it the API answers 429 with Retry-After.
+#            The dashboard also gets SPAN_PULL_SCOPES (the allow-list above) but only when scopes, storeKind and storeUrl are
+#            ALL set; otherwise no button is offered. A request for an organization outside the list is refused (403).
+# -----------------------------------------------------------------------------
+spans:
+  enabled: false
+  pull:
+    scopes: ""
+    storeKind: ""
+    storeUrl: ""
+    issueWindow: "10m"
+    onDemandLimitPerHour: "30"
+
+# Optional: run the NATS/MinIO one-shot init steps as Jobs (create the JetStream streams /
+# the attachments bucket). Disable if your managed deps are pre-provisioned.
+init:
+  nats:
+    enabled: true
+    image: ghcr.io/nurfitrapujo/sentinel/nats-init
+    tag: ""
+    # ERROR_EVENTS stream limits, passed to scripts/nats-init.sh as ERROR_EVENTS_MAX_AGE /
+    # ERROR_EVENTS_MAX_BYTES so a re-size is a values change, not an image rebuild. Empty means
+    # the script's defaults (24h / 10GiB, derivation in its comment block). Values are what
+    # `nats stream edit --max-age/--max-bytes` accepts, e.g. "24h", "10GiB". Size against the
+    # JetStream store the target cluster actually has - see the script's derivation for the
+    # shared-cluster numbers - before raising maxBytes.
+    errorEvents:
+      maxAge: ""
+      maxBytes: ""
+    # ERROR_EVENTS_DLQ MaxBytes, passed as ERROR_EVENTS_DLQ_MAX_BYTES. Empty means the script's 1GiB.
+    errorEventsDlq:
+      maxBytes: ""
+    # SPANS MaxBytes, passed as SPANS_MAX_BYTES. Empty means the script's 2GiB.
+    spans:
+      maxBytes: ""
+  minio:
+    enabled: true
+    image: ghcr.io/nurfitrapujo/sentinel/minio-init
+    tag: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

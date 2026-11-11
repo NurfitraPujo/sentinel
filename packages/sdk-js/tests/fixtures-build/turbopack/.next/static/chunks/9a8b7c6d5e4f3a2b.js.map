@@ -1,0 +1,1 @@
+{"version":3,"sources":["turbopack:///[project]/app/orphan.tsx"],"sourcesContent":["// turbopack:///[project]/app/orphan.tsx\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

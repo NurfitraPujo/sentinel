@@ -1,0 +1,23 @@
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Node (if tooling is added later)
+node_modules/
+dist/
+.spec-kit-memory/
+
+# Temporary files
+*.tmp
+*.bak
+*.log

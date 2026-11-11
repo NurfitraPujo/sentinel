@@ -1,0 +1,29 @@
+{{- if and (eq (.Values.global.provider | default "generic") "k8s") .Values.ingestor.ingress.enabled }}
+# K8s CCE ingress for the ingest endpoint. The shared internal ELB does L7
+# SNI routing, so this is one rule on the shared LB, not a new LB.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sentinel.fullname" . }}-ingestor
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestor
+  annotations:
+    kubernetes.io/elb.class: union
+    kubernetes.io/elb.id: {{ required "ingestor.ingress.elbId is required on K8s" .Values.ingestor.ingress.elbId | quote }}
+    kubernetes.io/elb.port: "443"
+    kubernetes.io/elb.tls-certificate-ids: {{ required "ingestor.ingress.tlsCertIds is required on K8s" .Values.ingestor.ingress.tlsCertIds | quote }}
+spec:
+  ingressClassName: cce
+  rules:
+    - host: {{ required "ingestor.ingress.host is required on K8s" .Values.ingestor.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentinel.fullname" . }}-ingestor
+                port:
+                  number: {{ .Values.ingestor.service.port }}
+{{- end }}

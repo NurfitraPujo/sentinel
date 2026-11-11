@@ -1,0 +1,22 @@
+{
+  "operations": [
+    { "op": "issues.claim", "issueId": "iss_01HXAMPLE0000000000000002" },
+    {
+      "op": "issues.comment",
+      "issueId": "iss_01HXAMPLE0000000000000002",
+      "params": {
+        "body_md": "Triage: NPE thrown in checkout handler when `cart.items` is empty. Root cause looks like a missing null check introduced in v1.2.3."
+      }
+    },
+    {
+      "op": "issues.status",
+      "issueId": "iss_01HXAMPLE0000000000000002",
+      "params": { "status": "resolved", "resolved_in_version": "v1.2.4" }
+    },
+    {
+      "op": "issues.claim.release",
+      "issueId": "iss_01HXAMPLE0000000000000002"
+    }
+  ],
+  "stopOnError": true
+}

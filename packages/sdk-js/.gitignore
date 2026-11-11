@@ -1,0 +1,6 @@
+# dist/ is built by `prepare` on every install (contract §4.1 / D1: no committed dist).
+dist
+node_modules
+# Written by the consumer path (`npm install && npm run prepare`, contract §4.1 rule 4);
+# pnpm-lock.yaml is the only lockfile this package commits (rule 3).
+package-lock.json

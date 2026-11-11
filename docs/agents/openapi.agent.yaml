@@ -1,0 +1,4970 @@
+openapi: 3.1.0
+info:
+  title: Sentinel Agent API
+  version: 1.0.0
+  description: GENERATED -- do not hand-edit. Source of truth is apps/dashboard-web/src/lib/server/agent-api-spec/ (schemas.ts + registry.ts); regenerate with `pnpm openapi:agent` after any change there. docs/agents/SENTINEL_AGENT_GUIDE.md remains the prose-authoritative reference; this file is a machine-readable schema kept in lockstep with the route handlers under apps/dashboard-web/src/routes/api/agent/** by openapi-drift.test.ts and completeness.test.ts.
+servers:
+  - url: https://{host}
+    variables:
+      host:
+        default: sentinel.example.com
+security:
+  - agentKey: []
+components:
+  securitySchemes:
+    agentKey:
+      type: http
+      scheme: bearer
+      bearerFormat: sent_agent_<64 lowercase hex chars>
+      description: Org-scoped agent key. project_api_keys.scope='agent', linked to one agent, one organization. organizationId is always derived from this credential server-side, never from any request parameter.
+paths:
+  /api/agent/issues:
+    get:
+      operationId: listIssues
+      summary: List issues in the calling key's organization
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - any
+              - user_report
+              - system_error
+        - name: claimed
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+              - me
+        - name: project
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: waiting
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - firstSeen
+              - lastSeen
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issues:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        projectId:
+                          type: string
+                        projectName:
+                          type: string
+                        isInbox:
+                          type: boolean
+                        issueType:
+                          type: string
+                        message:
+                          type: string
+                        errorClass:
+                          type: string
+                        status:
+                          type: string
+                        assigneeType:
+                          type:
+                            - string
+                            - "null"
+                        assignedTo:
+                          type:
+                            - string
+                            - "null"
+                        waitingOn:
+                          type:
+                            - string
+                            - "null"
+                        firstSeen:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        lastSeen:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        count:
+                          type: number
+                        severity:
+                          type:
+                            - string
+                            - "null"
+                        reporterId:
+                          type:
+                            - string
+                            - "null"
+                        isWaiting:
+                          type: boolean
+                        environment:
+                          type: string
+                        waitingSince:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        claimedAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        affectedUserCount:
+                          type: integer
+                          minimum: 0
+                        affectedTenantCount:
+                          type: integer
+                          minimum: 0
+                      required:
+                        - id
+                        - projectId
+                        - projectName
+                        - isInbox
+                        - issueType
+                        - message
+                        - errorClass
+                        - status
+                        - assigneeType
+                        - assignedTo
+                        - waitingOn
+                        - firstSeen
+                        - lastSeen
+                        - count
+                        - severity
+                        - reporterId
+                        - isWaiting
+                        - environment
+                        - waitingSince
+                        - claimedAt
+                        - affectedUserCount
+                        - affectedTenantCount
+                      additionalProperties: false
+                  nextCursor:
+                    type: string
+                required:
+                  - issues
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                required:
+                  - error
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}:
+    get:
+      operationId: getIssue
+      summary: Full issue detail (spans user_report and system_error)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issue:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      projectId:
+                        type: string
+                      environment:
+                        type: string
+                      fingerprint:
+                        type: string
+                      message:
+                        type: string
+                      errorClass:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - unresolved
+                          - resolved
+                          - ignored
+                      regressionStatus:
+                        type: string
+                      issueType:
+                        type: string
+                      sourceChannel:
+                        type: string
+                      assigneeType:
+                        type:
+                          - string
+                          - "null"
+                      assignedTo:
+                        type:
+                          - string
+                          - "null"
+                      resolvedInVersion:
+                        type:
+                          - string
+                          - "null"
+                      resolvedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      resolvedByType:
+                        type:
+                          - string
+                          - "null"
+                      resolvedBy:
+                        type:
+                          - string
+                          - "null"
+                      regressionCount:
+                        type: number
+                      lastRegressedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      firstSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      lastSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      count:
+                        type: number
+                      waitingOn:
+                        type:
+                          - string
+                          - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - projectId
+                      - environment
+                      - fingerprint
+                      - message
+                      - errorClass
+                      - status
+                      - regressionStatus
+                      - issueType
+                      - sourceChannel
+                      - assigneeType
+                      - assignedTo
+                      - resolvedInVersion
+                      - resolvedAt
+                      - resolvedByType
+                      - resolvedBy
+                      - regressionCount
+                      - lastRegressedAt
+                      - firstSeen
+                      - lastSeen
+                      - count
+                      - waitingOn
+                      - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
+                    additionalProperties: false
+                  report:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      bodyMd:
+                        type: string
+                      severity:
+                        type: string
+                      reporterId:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - bodyMd
+                      - severity
+                      - reporterId
+                    additionalProperties: false
+                  latestOccurrence:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      id:
+                        type: string
+                      environment:
+                        type: string
+                      platform:
+                        type: string
+                      releaseVersion:
+                        type:
+                          - string
+                          - "null"
+                      stacktrace: {}
+                      metadata: {}
+                      traceId:
+                        type:
+                          - string
+                          - "null"
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
+                    required:
+                      - id
+                      - environment
+                      - platform
+                      - releaseVersion
+                      - stacktrace
+                      - metadata
+                      - traceId
+                      - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
+                    additionalProperties: false
+                  relations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        sourceIssueId:
+                          type: string
+                        targetIssueId:
+                          type: string
+                        relationType:
+                          type: string
+                          enum:
+                            - linked_to
+                            - caused_by
+                            - duplicate_of
+                        createdByType:
+                          type: string
+                        createdBy:
+                          type: string
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        direction:
+                          type: string
+                          enum:
+                            - outgoing
+                            - incoming
+                        relatedIssue:
+                          type: object
+                          additionalProperties: true
+                      required:
+                        - id
+                        - sourceIssueId
+                        - targetIssueId
+                        - relationType
+                        - createdByType
+                        - createdBy
+                        - createdAt
+                        - direction
+                        - relatedIssue
+                      additionalProperties: true
+                required:
+                  - issue
+                  - report
+                  - latestOccurrence
+                  - relations
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/activity:
+    get:
+      operationId: listIssueActivity
+      summary: One issue's activity history, newest first, keyset-paged (before=<nextCursor>); a run of consecutive occurrence_burst rows is one entry with `burst`
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: ^\d+$
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        seq:
+                          type: number
+                        eventType:
+                          type: string
+                          enum:
+                            - status_changed
+                            - assigned
+                            - unassigned
+                            - regressed
+                            - ai_analysis
+                            - linked
+                            - commented
+                            - claimed
+                            - claim_released
+                            - progress_update
+                            - question_asked
+                            - question_answered
+                            - moved
+                            - attachment_added
+                            - report_edited
+                            - report_created
+                            - created
+                            - occurrence_burst
+                            - issue_deleted
+                        actorType:
+                          type: string
+                          enum:
+                            - user
+                            - agent
+                            - system
+                        actorId:
+                          type: string
+                        actor:
+                          type: object
+                          properties:
+                            type:
+                              type: string
+                              enum:
+                                - user
+                                - agent
+                                - system
+                            id:
+                              type: string
+                            name:
+                              type:
+                                - string
+                                - "null"
+                            personal:
+                              type: boolean
+                          required:
+                            - type
+                            - id
+                            - name
+                            - personal
+                          additionalProperties: false
+                        oldValue: {}
+                        newValue: {}
+                        createdAt:
+                          type: string
+                        comment:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            excerpt:
+                              type:
+                                - string
+                                - "null"
+                            deleted:
+                              type: boolean
+                          required:
+                            - id
+                            - excerpt
+                            - deleted
+                          additionalProperties: false
+                        assignee:
+                          type: object
+                          properties:
+                            type:
+                              type: string
+                              enum:
+                                - user
+                                - agent
+                                - system
+                            id:
+                              type: string
+                            name:
+                              type:
+                                - string
+                                - "null"
+                            personal:
+                              type: boolean
+                          required:
+                            - type
+                            - id
+                            - name
+                            - personal
+                          additionalProperties: false
+                        burst:
+                          type: object
+                          properties:
+                            rows:
+                              type: integer
+                            firstAt:
+                              type: string
+                            lastAt:
+                              type: string
+                            occurrencesFrom:
+                              type:
+                                - number
+                                - "null"
+                            occurrencesTo:
+                              type:
+                                - number
+                                - "null"
+                          required:
+                            - rows
+                            - firstAt
+                            - lastAt
+                            - occurrencesFrom
+                            - occurrencesTo
+                          additionalProperties: false
+                      required:
+                        - id
+                        - seq
+                        - eventType
+                        - actorType
+                        - actorId
+                        - actor
+                        - oldValue
+                        - newValue
+                        - createdAt
+                      additionalProperties: false
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                  hasMore:
+                    type: boolean
+                required:
+                  - entries
+                  - nextCursor
+                  - hasMore
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/claim-next:
+    post:
+      operationId: claimNextIssue
+      summary: Atomically select, claim and return full detail for the next unclaimed unresolved issue (one round trip; concurrent callers never receive the same issue). 404 when no eligible issue exists
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type:
+                  type: string
+                  enum:
+                    - any
+                    - user_report
+                    - system_error
+                project:
+                  type: string
+                environment:
+                  type: string
+                source:
+                  type: string
+                  enum:
+                    - ingestion_sdk
+                    - manual_support
+                    - api
+                    - user_report_api
+                sort:
+                  type: string
+                  enum:
+                    - firstSeen
+                    - lastSeen
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issue:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      projectId:
+                        type: string
+                      environment:
+                        type: string
+                      fingerprint:
+                        type: string
+                      message:
+                        type: string
+                      errorClass:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - unresolved
+                          - resolved
+                          - ignored
+                      regressionStatus:
+                        type: string
+                      issueType:
+                        type: string
+                      sourceChannel:
+                        type: string
+                      assigneeType:
+                        type:
+                          - string
+                          - "null"
+                      assignedTo:
+                        type:
+                          - string
+                          - "null"
+                      resolvedInVersion:
+                        type:
+                          - string
+                          - "null"
+                      resolvedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      resolvedByType:
+                        type:
+                          - string
+                          - "null"
+                      resolvedBy:
+                        type:
+                          - string
+                          - "null"
+                      regressionCount:
+                        type: number
+                      lastRegressedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      firstSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      lastSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      count:
+                        type: number
+                      waitingOn:
+                        type:
+                          - string
+                          - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - projectId
+                      - environment
+                      - fingerprint
+                      - message
+                      - errorClass
+                      - status
+                      - regressionStatus
+                      - issueType
+                      - sourceChannel
+                      - assigneeType
+                      - assignedTo
+                      - resolvedInVersion
+                      - resolvedAt
+                      - resolvedByType
+                      - resolvedBy
+                      - regressionCount
+                      - lastRegressedAt
+                      - firstSeen
+                      - lastSeen
+                      - count
+                      - waitingOn
+                      - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
+                    additionalProperties: false
+                  report:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      bodyMd:
+                        type: string
+                      severity:
+                        type: string
+                      reporterId:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - bodyMd
+                      - severity
+                      - reporterId
+                    additionalProperties: false
+                  latestOccurrence:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      id:
+                        type: string
+                      environment:
+                        type: string
+                      platform:
+                        type: string
+                      releaseVersion:
+                        type:
+                          - string
+                          - "null"
+                      stacktrace: {}
+                      metadata: {}
+                      traceId:
+                        type:
+                          - string
+                          - "null"
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
+                    required:
+                      - id
+                      - environment
+                      - platform
+                      - releaseVersion
+                      - stacktrace
+                      - metadata
+                      - traceId
+                      - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
+                    additionalProperties: false
+                  relations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        sourceIssueId:
+                          type: string
+                        targetIssueId:
+                          type: string
+                        relationType:
+                          type: string
+                          enum:
+                            - linked_to
+                            - caused_by
+                            - duplicate_of
+                        createdByType:
+                          type: string
+                        createdBy:
+                          type: string
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        direction:
+                          type: string
+                          enum:
+                            - outgoing
+                            - incoming
+                        relatedIssue:
+                          type: object
+                          additionalProperties: true
+                      required:
+                        - id
+                        - sourceIssueId
+                        - targetIssueId
+                        - relationType
+                        - createdByType
+                        - createdBy
+                        - createdAt
+                        - direction
+                        - relatedIssue
+                      additionalProperties: true
+                required:
+                  - issue
+                  - report
+                  - latestOccurrence
+                  - relations
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/occurrences:
+    get:
+      operationId: listIssueOccurrences
+      summary: Newest-first page of occurrences (system_error issues), each with spansStatus/hasSpans; hasSpans=true keeps only occurrences with spans (a walk bounded to the newest 2,000 occurrences; before=<nextBefore> continues it)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+        - name: before
+          in: query
+          required: false
+          schema:
+            oneOf:
+              - type: string
+                format: date-time
+              - type: string
+        - name: hasSpans
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  occurrences:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        environment:
+                          type: string
+                        platform:
+                          type: string
+                        releaseVersion:
+                          type:
+                            - string
+                            - "null"
+                        stacktrace: {}
+                        metadata: {}
+                        traceId:
+                          type:
+                            - string
+                            - "null"
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        level:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - fatal
+                            - error
+                            - warning
+                            - info
+                            - debug
+                        message:
+                          type:
+                            - string
+                            - "null"
+                        errorClass:
+                          type:
+                            - string
+                            - "null"
+                        logger:
+                          type:
+                            - string
+                            - "null"
+                        serverName:
+                          type:
+                            - string
+                            - "null"
+                        transaction:
+                          type:
+                            - string
+                            - "null"
+                        dist:
+                          type:
+                            - string
+                            - "null"
+                        source:
+                          type:
+                            - string
+                            - "null"
+                        traceFlags:
+                          type:
+                            - integer
+                            - "null"
+                        receivedAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        sdk:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            name:
+                              type: string
+                            version:
+                              type: string
+                          additionalProperties: true
+                        user:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            id:
+                              type: string
+                            username:
+                              type: string
+                            email:
+                              type: string
+                            ip_address:
+                              type: string
+                            geo:
+                              type: object
+                              properties:
+                                city:
+                                  type: string
+                                region:
+                                  type: string
+                                country_code:
+                                  type: string
+                                subdivision:
+                                  type: string
+                              additionalProperties: true
+                          additionalProperties: true
+                        tags:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        contexts:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        request:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            method:
+                              type: string
+                            url:
+                              type: string
+                            query_string:
+                              type: string
+                            headers:
+                              type: object
+                              additionalProperties: true
+                            data: {}
+                            env:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                        breadcrumbs:
+                          type:
+                            - array
+                            - "null"
+                          items:
+                            type: object
+                            properties:
+                              timestamp:
+                                type: string
+                              type:
+                                type: string
+                              category:
+                                type: string
+                              level:
+                                type: string
+                              message:
+                                type: string
+                              data:
+                                type: object
+                                additionalProperties: true
+                            additionalProperties: true
+                        exception:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            values:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  type:
+                                    type: string
+                                  value:
+                                    type: string
+                                  mechanism:
+                                    type: object
+                                    properties:
+                                      type:
+                                        type: string
+                                      handled:
+                                        type: boolean
+                                    additionalProperties: true
+                                  stacktrace: {}
+                                additionalProperties: true
+                          required:
+                            - values
+                          additionalProperties: true
+                        spansStatus:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - available
+                            - pending
+                            - none
+                        hasSpans:
+                          type: boolean
+                      required:
+                        - id
+                        - environment
+                        - platform
+                        - releaseVersion
+                        - stacktrace
+                        - metadata
+                        - traceId
+                        - createdAt
+                        - level
+                        - message
+                        - errorClass
+                        - logger
+                        - serverName
+                        - transaction
+                        - dist
+                        - source
+                        - traceFlags
+                        - receivedAt
+                        - sdk
+                        - user
+                        - tags
+                        - contexts
+                        - request
+                        - breadcrumbs
+                        - exception
+                        - spansStatus
+                        - hasSpans
+                      additionalProperties: false
+                  spansScan:
+                    type: object
+                    properties:
+                      scanned:
+                        type: integer
+                      exhausted:
+                        type: boolean
+                    required:
+                      - scanned
+                      - exhausted
+                    additionalProperties: false
+                  nextBefore:
+                    type: string
+                required:
+                  - occurrences
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/traces/{traceId}:
+    get:
+      operationId: getTrace
+      summary: Oldest-first page of every occurrence sharing a trace id across the calling key's organization (32-hex trace id; 404 for a malformed id, 200 with an empty list for one the key's organization has no occurrence of)
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  occurrences:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        environment:
+                          type: string
+                        platform:
+                          type: string
+                        releaseVersion:
+                          type:
+                            - string
+                            - "null"
+                        stacktrace: {}
+                        metadata: {}
+                        traceId:
+                          type:
+                            - string
+                            - "null"
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        level:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - fatal
+                            - error
+                            - warning
+                            - info
+                            - debug
+                        message:
+                          type:
+                            - string
+                            - "null"
+                        errorClass:
+                          type:
+                            - string
+                            - "null"
+                        logger:
+                          type:
+                            - string
+                            - "null"
+                        serverName:
+                          type:
+                            - string
+                            - "null"
+                        transaction:
+                          type:
+                            - string
+                            - "null"
+                        dist:
+                          type:
+                            - string
+                            - "null"
+                        source:
+                          type:
+                            - string
+                            - "null"
+                        traceFlags:
+                          type:
+                            - integer
+                            - "null"
+                        receivedAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        sdk:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            name:
+                              type: string
+                            version:
+                              type: string
+                          additionalProperties: true
+                        user:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            id:
+                              type: string
+                            username:
+                              type: string
+                            email:
+                              type: string
+                            ip_address:
+                              type: string
+                            geo:
+                              type: object
+                              properties:
+                                city:
+                                  type: string
+                                region:
+                                  type: string
+                                country_code:
+                                  type: string
+                                subdivision:
+                                  type: string
+                              additionalProperties: true
+                          additionalProperties: true
+                        tags:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        contexts:
+                          type:
+                            - object
+                            - "null"
+                          additionalProperties: true
+                        request:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            method:
+                              type: string
+                            url:
+                              type: string
+                            query_string:
+                              type: string
+                            headers:
+                              type: object
+                              additionalProperties: true
+                            data: {}
+                            env:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                        breadcrumbs:
+                          type:
+                            - array
+                            - "null"
+                          items:
+                            type: object
+                            properties:
+                              timestamp:
+                                type: string
+                              type:
+                                type: string
+                              category:
+                                type: string
+                              level:
+                                type: string
+                              message:
+                                type: string
+                              data:
+                                type: object
+                                additionalProperties: true
+                            additionalProperties: true
+                        exception:
+                          type:
+                            - object
+                            - "null"
+                          properties:
+                            values:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  type:
+                                    type: string
+                                  value:
+                                    type: string
+                                  mechanism:
+                                    type: object
+                                    properties:
+                                      type:
+                                        type: string
+                                      handled:
+                                        type: boolean
+                                    additionalProperties: true
+                                  stacktrace: {}
+                                additionalProperties: true
+                          required:
+                            - values
+                          additionalProperties: true
+                        projectId:
+                          type: string
+                        projectName:
+                          type: string
+                        issueId:
+                          type: string
+                        spanId:
+                          type:
+                            - string
+                            - "null"
+                        spansStatus:
+                          type:
+                            - string
+                            - "null"
+                          enum:
+                            - available
+                            - pending
+                            - none
+                        hasSpans:
+                          type: boolean
+                      required:
+                        - id
+                        - environment
+                        - platform
+                        - releaseVersion
+                        - stacktrace
+                        - metadata
+                        - traceId
+                        - createdAt
+                        - level
+                        - message
+                        - errorClass
+                        - logger
+                        - serverName
+                        - transaction
+                        - dist
+                        - source
+                        - traceFlags
+                        - receivedAt
+                        - sdk
+                        - user
+                        - tags
+                        - contexts
+                        - request
+                        - breadcrumbs
+                        - exception
+                        - projectId
+                        - projectName
+                        - issueId
+                        - spanId
+                        - spansStatus
+                        - hasSpans
+                      additionalProperties: false
+                  nextCursor:
+                    type: string
+                  spans:
+                    type: object
+                    properties:
+                      status:
+                        type: string
+                        enum:
+                          - available
+                          - pending
+                          - none
+                      reason:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - not_pulled
+                          - not_found
+                          - too_large
+                          - failed
+                          - not_allowed
+                          - not_visible
+                    required:
+                      - status
+                      - reason
+                    additionalProperties: false
+                required:
+                  - occurrences
+                  - spans
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/traces/{traceId}/pull:
+    post:
+      operationId: pullTraceSpans
+      summary: Pull a trace's spans from the trace store NOW (idempotent; no body). Only for organizations allow-listed for span pull (403 otherwise), at most SPAN_PULL_ON_DEMAND_LIMIT (default 30) accepted requests per organization per hour (429 + Retry-After). Returns the trace's spans state; poll GET /api/agent/traces/{traceId} (`spans`) until it is `available`, or `none` with a reason
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - available
+                      - pending
+                      - none
+                  reason:
+                    type:
+                      - string
+                      - "null"
+                    enum:
+                      - not_pulled
+                      - not_found
+                      - too_large
+                      - failed
+                      - not_allowed
+                      - not_visible
+                  action:
+                    type: string
+                    enum:
+                      - none
+                      - queued
+                      - pulled_forward
+                      - rearmed
+                      - already_pending
+                  requestId:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - status
+                  - reason
+                  - action
+                  - requestId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "429":
+          description: "429"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/occurrences/{occurrenceId}:
+    get:
+      operationId: getOccurrence
+      summary: One occurrence of the calling key's organization, with its trace id and spans status (404 for a malformed id or one of another organization)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  occurrence:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      environment:
+                        type: string
+                      platform:
+                        type: string
+                      releaseVersion:
+                        type:
+                          - string
+                          - "null"
+                      stacktrace: {}
+                      metadata: {}
+                      traceId:
+                        type:
+                          - string
+                          - "null"
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      level:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - fatal
+                          - error
+                          - warning
+                          - info
+                          - debug
+                      message:
+                        type:
+                          - string
+                          - "null"
+                      errorClass:
+                        type:
+                          - string
+                          - "null"
+                      logger:
+                        type:
+                          - string
+                          - "null"
+                      serverName:
+                        type:
+                          - string
+                          - "null"
+                      transaction:
+                        type:
+                          - string
+                          - "null"
+                      dist:
+                        type:
+                          - string
+                          - "null"
+                      source:
+                        type:
+                          - string
+                          - "null"
+                      traceFlags:
+                        type:
+                          - integer
+                          - "null"
+                      receivedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      sdk:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          name:
+                            type: string
+                          version:
+                            type: string
+                        additionalProperties: true
+                      user:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          id:
+                            type: string
+                          username:
+                            type: string
+                          email:
+                            type: string
+                          ip_address:
+                            type: string
+                          geo:
+                            type: object
+                            properties:
+                              city:
+                                type: string
+                              region:
+                                type: string
+                              country_code:
+                                type: string
+                              subdivision:
+                                type: string
+                            additionalProperties: true
+                        additionalProperties: true
+                      tags:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      contexts:
+                        type:
+                          - object
+                          - "null"
+                        additionalProperties: true
+                      request:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          method:
+                            type: string
+                          url:
+                            type: string
+                          query_string:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties: true
+                          data: {}
+                          env:
+                            type: object
+                            additionalProperties: true
+                        additionalProperties: true
+                      breadcrumbs:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: object
+                          properties:
+                            timestamp:
+                              type: string
+                            type:
+                              type: string
+                            category:
+                              type: string
+                            level:
+                              type: string
+                            message:
+                              type: string
+                            data:
+                              type: object
+                              additionalProperties: true
+                          additionalProperties: true
+                      exception:
+                        type:
+                          - object
+                          - "null"
+                        properties:
+                          values:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                value:
+                                  type: string
+                                mechanism:
+                                  type: object
+                                  properties:
+                                    type:
+                                      type: string
+                                    handled:
+                                      type: boolean
+                                  additionalProperties: true
+                                stacktrace: {}
+                              additionalProperties: true
+                        required:
+                          - values
+                        additionalProperties: true
+                      projectId:
+                        type: string
+                      projectName:
+                        type: string
+                      issueId:
+                        type: string
+                      spanId:
+                        type:
+                          - string
+                          - "null"
+                      spansStatus:
+                        type:
+                          - string
+                          - "null"
+                        enum:
+                          - available
+                          - pending
+                          - none
+                      hasSpans:
+                        type: boolean
+                    required:
+                      - id
+                      - environment
+                      - platform
+                      - releaseVersion
+                      - stacktrace
+                      - metadata
+                      - traceId
+                      - createdAt
+                      - level
+                      - message
+                      - errorClass
+                      - logger
+                      - serverName
+                      - transaction
+                      - dist
+                      - source
+                      - traceFlags
+                      - receivedAt
+                      - sdk
+                      - user
+                      - tags
+                      - contexts
+                      - request
+                      - breadcrumbs
+                      - exception
+                      - projectId
+                      - projectName
+                      - issueId
+                      - spanId
+                      - spansStatus
+                      - hasSpans
+                    additionalProperties: false
+                required:
+                  - occurrence
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/claim:
+    post:
+      operationId: claimIssue
+      summary: "Atomically claim an issue (idempotent self-reclaim: re-claiming an issue you already hold returns 200 with alreadyClaimed:true, not 409; 409 only if held by someone else)"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  issue:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      projectId:
+                        type: string
+                      environment:
+                        type: string
+                      fingerprint:
+                        type: string
+                      message:
+                        type: string
+                      errorClass:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - unresolved
+                          - resolved
+                          - ignored
+                      regressionStatus:
+                        type: string
+                      issueType:
+                        type: string
+                      sourceChannel:
+                        type: string
+                      assigneeType:
+                        type:
+                          - string
+                          - "null"
+                      assignedTo:
+                        type:
+                          - string
+                          - "null"
+                      resolvedInVersion:
+                        type:
+                          - string
+                          - "null"
+                      resolvedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      resolvedByType:
+                        type:
+                          - string
+                          - "null"
+                      resolvedBy:
+                        type:
+                          - string
+                          - "null"
+                      regressionCount:
+                        type: number
+                      lastRegressedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      firstSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      lastSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      count:
+                        type: number
+                      waitingOn:
+                        type:
+                          - string
+                          - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - projectId
+                      - environment
+                      - fingerprint
+                      - message
+                      - errorClass
+                      - status
+                      - regressionStatus
+                      - issueType
+                      - sourceChannel
+                      - assigneeType
+                      - assignedTo
+                      - resolvedInVersion
+                      - resolvedAt
+                      - resolvedByType
+                      - resolvedBy
+                      - regressionCount
+                      - lastRegressedAt
+                      - firstSeen
+                      - lastSeen
+                      - count
+                      - waitingOn
+                      - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
+                    additionalProperties: false
+                  alreadyClaimed:
+                    type: boolean
+                    enum:
+                      - true
+                required:
+                  - success
+                  - issue
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  claimedBy:
+                    type:
+                      - string
+                      - "null"
+                  claimedAt:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - message
+                  - claimedBy
+                  - claimedAt
+                additionalProperties: false
+    delete:
+      operationId: releaseClaim
+      summary: "Release your own claim (idempotent: releasing an already-unclaimed issue returns 200, not 409; cannot release another agent's claim)"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  issue:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      projectId:
+                        type: string
+                      environment:
+                        type: string
+                      fingerprint:
+                        type: string
+                      message:
+                        type: string
+                      errorClass:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - unresolved
+                          - resolved
+                          - ignored
+                      regressionStatus:
+                        type: string
+                      issueType:
+                        type: string
+                      sourceChannel:
+                        type: string
+                      assigneeType:
+                        type:
+                          - string
+                          - "null"
+                      assignedTo:
+                        type:
+                          - string
+                          - "null"
+                      resolvedInVersion:
+                        type:
+                          - string
+                          - "null"
+                      resolvedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      resolvedByType:
+                        type:
+                          - string
+                          - "null"
+                      resolvedBy:
+                        type:
+                          - string
+                          - "null"
+                      regressionCount:
+                        type: number
+                      lastRegressedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      firstSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      lastSeen:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      count:
+                        type: number
+                      waitingOn:
+                        type:
+                          - string
+                          - "null"
+                      claimedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      affectedUserCount:
+                        type: integer
+                        minimum: 0
+                      affectedTenantCount:
+                        type: integer
+                        minimum: 0
+                      snoozedUntil:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                      snoozeOccurrenceTarget:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                      snoozeCountAt:
+                        type:
+                          - integer
+                          - "null"
+                      firstReleaseVersion:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - projectId
+                      - environment
+                      - fingerprint
+                      - message
+                      - errorClass
+                      - status
+                      - regressionStatus
+                      - issueType
+                      - sourceChannel
+                      - assigneeType
+                      - assignedTo
+                      - resolvedInVersion
+                      - resolvedAt
+                      - resolvedByType
+                      - resolvedBy
+                      - regressionCount
+                      - lastRegressedAt
+                      - firstSeen
+                      - lastSeen
+                      - count
+                      - waitingOn
+                      - claimedAt
+                      - affectedUserCount
+                      - affectedTenantCount
+                      - snoozedUntil
+                      - snoozeOccurrenceTarget
+                      - snoozeCountAt
+                      - firstReleaseVersion
+                    additionalProperties: false
+                required:
+                  - success
+                  - issue
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  claimedBy:
+                    type:
+                      - string
+                      - "null"
+                  claimedAt:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - message
+                  - claimedBy
+                  - claimedAt
+                additionalProperties: false
+  /api/agent/issues/{issueId}/status:
+    patch:
+      operationId: updateIssueStatus
+      summary: "Change issue status (idempotent: retrying the same status+resolved_in_version returns changed:false, no duplicate activity/notification)"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - unresolved
+                    - resolved
+                    - ignored
+                resolved_in_version:
+                  type: string
+                  description: 'Free text, trimmed, at most 100 characters; meaningful only with status=resolved. The literal `next` is reserved: "resolved in the next release, whichever it turns out to be" -- rewritten to the first release the PROJECT sees after the resolve (project-level, any environment: a version already seen on staging is not the next release). Compared byte-for-byte after trimming (`Next` is a version).'
+                snoozed_until:
+                  type: string
+                  format: date-time
+                  description: "Only with status=ignored: ignore until this instant (full ISO 8601 date-time with seconds and a zone -- `Z` or `±hh:mm`; offsets accepted). Must be strictly in the future. 400 `snoozedUntil is only valid with status ignored` / `snoozedUntil must be a future timestamp`. An empty string is treated as omitted."
+                snooze_occurrences:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000000
+                  description: "Only with status=ignored: ignore until this many MORE occurrences have been stored (stored as snoozeOccurrenceTarget, with snoozeCountAt = the count at the time). 400 `snoozeOccurrences is only valid with status ignored` / `snoozeOccurrences must be an integer between 1 and 1000000`. An empty string is treated as omitted."
+              required:
+                - status
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  status:
+                    type: string
+                    enum:
+                      - unresolved
+                      - resolved
+                      - ignored
+                  changed:
+                    type: boolean
+                required:
+                  - success
+                  - status
+                  - changed
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/comments:
+    get:
+      operationId: listComments
+      summary: Poll comments (e.g. to see answers to a blocking question)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comments:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                required:
+                  - comments
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+    post:
+      operationId: postComment
+      summary: "Post a non-blocking comment (emails subscribers). Optional idempotency_key: a repeat replays the original comment with deduplicated:true, no second email"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body_md:
+                  type: string
+                attachment_ids:
+                  type: array
+                  items:
+                    type: string
+                idempotency_key:
+                  type: string
+              required:
+                - body_md
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      issueId:
+                        type: string
+                      parentId:
+                        type:
+                          - string
+                          - "null"
+                      authorType:
+                        type: string
+                        enum:
+                          - user
+                          - agent
+                      authorId:
+                        type: string
+                      blocking:
+                        type: boolean
+                      bodyMd:
+                        type: string
+                      createdAt:
+                        type: string
+                        format: date-time
+                      editedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                    required:
+                      - id
+                      - issueId
+                      - parentId
+                      - authorType
+                      - authorId
+                      - blocking
+                      - bodyMd
+                      - createdAt
+                      - editedAt
+                    additionalProperties: false
+                  deduplicated:
+                    type: boolean
+                    enum:
+                      - true
+                required:
+                  - comment
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/comments/{commentId}:
+    patch:
+      operationId: editComment
+      summary: Edit your own comment (403 for another author, agent or human)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body_md:
+                  type: string
+              required:
+                - body_md
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      issueId:
+                        type: string
+                      parentId:
+                        type:
+                          - string
+                          - "null"
+                      authorType:
+                        type: string
+                        enum:
+                          - user
+                          - agent
+                      authorId:
+                        type: string
+                      blocking:
+                        type: boolean
+                      bodyMd:
+                        type: string
+                      createdAt:
+                        type: string
+                        format: date-time
+                      editedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                    required:
+                      - id
+                      - issueId
+                      - parentId
+                      - authorType
+                      - authorId
+                      - blocking
+                      - bodyMd
+                      - createdAt
+                      - editedAt
+                    additionalProperties: false
+                required:
+                  - comment
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+    delete:
+      operationId: deleteComment
+      summary: Delete your own comment (403 for another author, agent or human)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  issueId:
+                    type: string
+                required:
+                  - success
+                  - issueId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/report/severity:
+    patch:
+      operationId: updateReportSeverity
+      summary: Set the severity of a user_report issue (400 for a system_error issue)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                severity:
+                  type: string
+                  enum:
+                    - low
+                    - medium
+                    - high
+                    - critical
+              required:
+                - severity
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  severity:
+                    type: string
+                    enum:
+                      - low
+                      - medium
+                      - high
+                      - critical
+                required:
+                  - success
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/questions:
+    post:
+      operationId: askQuestion
+      summary: "Ask a blocking question (sets waiting_on, forces an immediate email). Optional idempotency_key: a repeat replays the original question comment id with deduplicated:true and no second email"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body_md:
+                  type: string
+                audience:
+                  type: string
+                  enum:
+                    - reporter
+                    - team
+                idempotency_key:
+                  type: string
+              required:
+                - body_md
+                - audience
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comment:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      issueId:
+                        type: string
+                      parentId:
+                        type:
+                          - string
+                          - "null"
+                      authorType:
+                        type: string
+                        enum:
+                          - user
+                          - agent
+                      authorId:
+                        type: string
+                      blocking:
+                        type: boolean
+                      bodyMd:
+                        type: string
+                      createdAt:
+                        type: string
+                        format: date-time
+                      editedAt:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                    required:
+                      - id
+                      - issueId
+                      - parentId
+                      - authorType
+                      - authorId
+                      - blocking
+                      - bodyMd
+                      - createdAt
+                      - editedAt
+                    additionalProperties: false
+                  deduplicated:
+                    type: boolean
+                    enum:
+                      - true
+                required:
+                  - comment
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/progress:
+    post:
+      operationId: postProgress
+      summary: "Post an in-app-only progress update (no email). Optional idempotency_key: a repeat replays a deduplicated success with no second progress row"
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message_md:
+                  type: string
+                idempotency_key:
+                  type: string
+              required:
+                - message_md
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  deduplicated:
+                    type: boolean
+                    enum:
+                      - true
+                required:
+                  - success
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/issues/{issueId}/relations:
+    post:
+      operationId: addRelation
+      summary: Add a relation from this issue to another (409 for an exact duplicate; also 409 for caused_by if the REVERSE pair already exists -- would create a 2-cycle)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_issue_id:
+                  type: string
+                relation_type:
+                  type: string
+                  enum:
+                    - linked_to
+                    - caused_by
+                    - duplicate_of
+              required:
+                - target_issue_id
+                - relation_type
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  sourceIssueId:
+                    type: string
+                  targetIssueId:
+                    type: string
+                  relationType:
+                    type: string
+                    enum:
+                      - linked_to
+                      - caused_by
+                      - duplicate_of
+                  createdByType:
+                    type: string
+                  createdBy:
+                    type: string
+                  createdAt:
+                    type:
+                      - string
+                      - "null"
+                    format: date-time
+                required:
+                  - id
+                  - sourceIssueId
+                  - targetIssueId
+                  - relationType
+                  - createdByType
+                  - createdBy
+                  - createdAt
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+    delete:
+      operationId: removeRelation
+      summary: Remove a relation, identified by (target_issue_id, relation_type)
+      parameters:
+        - name: issueId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_issue_id:
+                  type: string
+                relation_type:
+                  type: string
+                  enum:
+                    - linked_to
+                    - caused_by
+                    - duplicate_of
+              required:
+                - target_issue_id
+                - relation_type
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                required:
+                  - success
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/projects:
+    get:
+      operationId: listProjects
+      summary: List the calling key's organization's projects
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        isInbox:
+                          type: boolean
+                        agentSettings:
+                          type: object
+                          properties:
+                            fixEnabled:
+                              type: boolean
+                            maxPrsPerDay:
+                              type:
+                                - integer
+                                - "null"
+                            repo:
+                              type:
+                                - object
+                                - "null"
+                              properties:
+                                provider:
+                                  type: string
+                                  enum:
+                                    - github
+                                    - bitbucket
+                                owner:
+                                  type: string
+                                repo:
+                                  type: string
+                                defaultBranch:
+                                  type: string
+                                testCmd:
+                                  type: string
+                                agentCmd:
+                                  type:
+                                    - string
+                                    - "null"
+                                cloneDepth:
+                                  type:
+                                    - integer
+                                    - "null"
+                              required:
+                                - provider
+                                - owner
+                                - repo
+                                - defaultBranch
+                                - testCmd
+                                - agentCmd
+                                - cloneDepth
+                              additionalProperties: false
+                          required:
+                            - fixEnabled
+                            - maxPrsPerDay
+                            - repo
+                          additionalProperties: false
+                      required:
+                        - id
+                        - name
+                        - isInbox
+                        - agentSettings
+                      additionalProperties: false
+                required:
+                  - projects
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/events:
+    get:
+      operationId: listEvents
+      summary: Seq-cursored org activity feed (at-least-once, ~2s lag guard)
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: ^\d+$
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: ^\d+$
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: project
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: claimed
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - me
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq:
+                          type: number
+                        eventType:
+                          type: string
+                          enum:
+                            - status_changed
+                            - assigned
+                            - unassigned
+                            - regressed
+                            - ai_analysis
+                            - linked
+                            - commented
+                            - claimed
+                            - claim_released
+                            - progress_update
+                            - question_asked
+                            - question_answered
+                            - moved
+                            - attachment_added
+                            - report_edited
+                            - report_created
+                            - created
+                            - occurrence_burst
+                            - issue_deleted
+                        actorType:
+                          type: string
+                          enum:
+                            - user
+                            - agent
+                            - system
+                        actorId:
+                          type: string
+                        oldValue: {}
+                        newValue: {}
+                        createdAt:
+                          type:
+                            - string
+                            - "null"
+                          format: date-time
+                        issue:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            title:
+                              type: string
+                            status:
+                              type: string
+                            issueType:
+                              type: string
+                            projectId:
+                              type: string
+                            assigneeType:
+                              type:
+                                - string
+                                - "null"
+                            assignedTo:
+                              type:
+                                - string
+                                - "null"
+                            claimedAt:
+                              type:
+                                - string
+                                - "null"
+                              format: date-time
+                            waitingOn:
+                              type:
+                                - string
+                                - "null"
+                          required:
+                            - id
+                            - title
+                            - status
+                            - issueType
+                            - projectId
+                            - assigneeType
+                            - assignedTo
+                            - claimedAt
+                            - waitingOn
+                          additionalProperties: false
+                      required:
+                        - seq
+                        - eventType
+                        - actorType
+                        - actorId
+                        - oldValue
+                        - newValue
+                        - createdAt
+                        - issue
+                      additionalProperties: false
+                  cursor:
+                    type: number
+                  hasMore:
+                    type: boolean
+                required:
+                  - events
+                  - cursor
+                  - hasMore
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                required:
+                  - error
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/uploads:
+    post:
+      operationId: uploadAttachment
+      summary: Upload an attachment (multipart; not associated with an issue until referenced in a comment)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                filename:
+                  type: string
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  url:
+                    type: string
+                  filename:
+                    type: string
+                  contentType:
+                    type: string
+                  sizeBytes:
+                    type: number
+                required:
+                  - id
+                  - url
+                  - filename
+                  - contentType
+                  - sizeBytes
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "413":
+          description: Payload too large
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "415":
+          description: Unsupported media type
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "503":
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/self:
+    get:
+      operationId: getSelf
+      summary: "Identity of the calling key: agent, kind, org, the key row itself, and for a personal key its owner (live role and whether it may write)"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentId:
+                    type: string
+                  name:
+                    type: string
+                  organizationId:
+                    type: string
+                  cliProfile:
+                    type: string
+                  kind:
+                    type: string
+                  owner:
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      userId:
+                        type: string
+                      name:
+                        type:
+                          - string
+                          - "null"
+                      email:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                          - owner
+                          - admin
+                          - engineer
+                          - support
+                          - viewer
+                      canWrite:
+                        type: boolean
+                    required:
+                      - userId
+                      - name
+                      - email
+                      - role
+                      - canWrite
+                    additionalProperties: false
+                  key:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      prefix:
+                        type: string
+                      createdAt:
+                        type:
+                          - string
+                          - "null"
+                      expiresAt:
+                        type:
+                          - string
+                          - "null"
+                      lastUsedAt:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - prefix
+                      - createdAt
+                      - expiresAt
+                      - lastUsedAt
+                    additionalProperties: false
+                required:
+                  - agentId
+                  - name
+                  - organizationId
+                  - kind
+                  - owner
+                  - key
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/key/rotate:
+    post:
+      operationId: rotateKey
+      summary: "Rotate the calling key: mints a new secret, keeps the old key valid for AGENT_KEY_ROTATION_GRACE_HOURS (default 24, 0 = immediate)"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  oldKey:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      expiresAt:
+                        type:
+                          - string
+                          - "null"
+                    required:
+                      - id
+                      - expiresAt
+                    additionalProperties: false
+                  newKey:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      prefix:
+                        type: string
+                      secret:
+                        type: string
+                    required:
+                      - id
+                      - prefix
+                      - secret
+                    additionalProperties: false
+                required:
+                  - success
+                  - oldKey
+                  - newKey
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/key/revoke:
+    post:
+      operationId: revokeKey
+      summary: Revoke the calling key (`sentinel logout`). Personal (`sentinel login`) keys only; an org agent key gets 403 and stays valid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  revokedKeyId:
+                    type: string
+                required:
+                  - success
+                  - revokedKeyId
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/repo-credentials:
+    get:
+      operationId: getRepoCredentials
+      summary: Decrypted git credentials for this org. 403 unless an admin granted this agent can_access_repo_credentials; every served credential is audited. 503 when SENTINEL_ENCRYPTION_KEY is not configured.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  credentials:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        provider:
+                          type: string
+                          enum:
+                            - github
+                            - bitbucket
+                        label:
+                          type: string
+                        secret:
+                          oneOf:
+                            - type: object
+                              properties:
+                                token:
+                                  type: string
+                              required:
+                                - token
+                              additionalProperties: false
+                            - type: object
+                              properties:
+                                username:
+                                  type: string
+                                appPassword:
+                                  type: string
+                              required:
+                                - username
+                                - appPassword
+                              additionalProperties: false
+                      required:
+                        - id
+                        - provider
+                        - label
+                        - secret
+                      additionalProperties: false
+                required:
+                  - credentials
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "503":
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/batch:
+    post:
+      operationId: runBatch
+      summary: Run up to 20 mutations sequentially in one HTTP round trip
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                operations:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      op:
+                        type: string
+                        enum:
+                          - issues.status
+                          - issues.claim
+                          - issues.claim.release
+                          - issues.comment
+                          - comments.edit
+                          - comments.delete
+                          - issues.report.severity
+                          - issues.progress
+                          - issues.relations.add
+                          - issues.relations.remove
+                      issueId:
+                        type: string
+                      params: {}
+                    required:
+                      - op
+                      - issueId
+                    additionalProperties: false
+                  minItems: 1
+                  maxItems: 20
+                stopOnError:
+                  type: boolean
+              required:
+                - operations
+              additionalProperties: false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ok:
+                          type: boolean
+                        status:
+                          type: number
+                        result: {}
+                        error:
+                          type: string
+                        skipped:
+                          type: boolean
+                        claimedBy:
+                          type:
+                            - string
+                            - "null"
+                        claimedAt:
+                          type:
+                            - string
+                            - "null"
+                      required:
+                        - ok
+                        - status
+                      additionalProperties: false
+                  completed:
+                    type: number
+                required:
+                  - results
+                  - completed
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/members:
+    get:
+      operationId: listMembers
+      summary: List organization members in the calling key's organization
+      parameters:
+        - name: role
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - owner
+              - admin
+              - engineer
+              - support
+              - viewer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        userId:
+                          type: string
+                        role:
+                          type: string
+                        user:
+                          type: object
+                          properties:
+                            name:
+                              type: string
+                            email:
+                              type: string
+                          required:
+                            - name
+                            - email
+                          additionalProperties: false
+                      required:
+                        - id
+                        - userId
+                        - role
+                        - user
+                      additionalProperties: false
+                required:
+                  - members
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+    post:
+      operationId: inviteMember
+      summary: Invite a new member to the calling key's organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                role:
+                  type: string
+                  enum:
+                    - owner
+                    - admin
+                    - engineer
+                    - support
+                    - viewer
+              required:
+                - email
+                - role
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  email:
+                    type: string
+                  role:
+                    type: string
+                  status:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  delivered:
+                    type: boolean
+                required:
+                  - id
+                  - email
+                  - role
+                  - status
+                  - expiresAt
+                  - delivered
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+  /api/agent/members/{id}:
+    delete:
+      operationId: removeMember
+      summary: Remove a member from the calling key's organization
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  memberId:
+                    type: string
+                  userId:
+                    type: string
+                required:
+                  - success
+                  - memberId
+                  - userId
+                additionalProperties: false
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "403":
+          description: "403"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                required:
+                  - message
+                additionalProperties: false

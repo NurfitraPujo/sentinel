@@ -1,0 +1,310 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > environment 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "staging",
+      "p-1",
+      "p-2",
+      "staging",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_occurrences"."environment" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_occurrences"."environment" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "staging",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_occurrences"."environment" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > everything, under an environment scope 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "production",
+      "p-1",
+      "production",
+      "javascript",
+      "boom:*",
+      "u-1",
+      "t-1",
+      "p-1",
+      "production",
+      "p-1",
+      "production",
+      "javascript",
+      "boom:*",
+      "u-1",
+      "t-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where (("issues"."project_id" <> $1 or "issues"."environment" in ($2)) and "issues"."project_id" = $3 and "error_occurrences"."environment" = $4 and "error_occurrences"."platform" = $5 and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $6) and ("error_search_index"."user_id" = $7 or "error_search_index"."tenant_id" = $8)) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where (("issues"."project_id" <> $9 or "issues"."environment" in ($10)) and "issues"."project_id" = $11 and "error_occurrences"."environment" = $12 and "error_occurrences"."platform" = $13 and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $14) and ("error_search_index"."user_id" = $15 or "error_search_index"."tenant_id" = $16)) order by "issues"."last_seen" desc, "issues"."id" asc limit $17",
+  },
+  {
+    "params": [
+      "p-1",
+      "production",
+      "p-1",
+      "production",
+      "javascript",
+      "boom:*",
+      "u-1",
+      "t-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where (("issues"."project_id" <> $1 or "issues"."environment" in ($2)) and "issues"."project_id" = $3 and "error_occurrences"."environment" = $4 and "error_occurrences"."platform" = $5 and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $6) and ("error_search_index"."user_id" = $7 or "error_search_index"."tenant_id" = $8))",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > no filter 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "p-1",
+      "p-2",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where "issues"."project_id" in ($1, $2) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where "issues"."project_id" in ($3, $4) order by "issues"."last_seen" desc, "issues"."id" asc limit $5",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where "issues"."project_id" in ($1, $2)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > platform 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "go",
+      "p-1",
+      "p-2",
+      "go",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_occurrences"."platform" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_occurrences"."platform" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "go",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_occurrences"."platform" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > project 1`] = `
+[
+  {
+    "params": [
+      "p-2",
+      "p-2",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where "issues"."project_id" = $1 order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where "issues"."project_id" = $2 order by "issues"."last_seen" desc, "issues"."id" asc limit $3",
+  },
+  {
+    "params": [
+      "p-2",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where "issues"."project_id" = $1",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > request_id 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "rq-1",
+      "p-1",
+      "p-2",
+      "rq-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."request_id" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_search_index"."request_id" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "rq-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."request_id" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > search 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "timeout:* & conn & fail:*",
+      "p-1",
+      "p-2",
+      "timeout:* & conn & fail:*",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $3)) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $6)) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "timeout:* & conn & fail:*",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and to_tsvector('english', "issues"."message") @@ to_tsquery('english', $3))",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > span_id 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "sp-1",
+      "p-1",
+      "p-2",
+      "sp-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."span_id" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_search_index"."span_id" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "sp-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."span_id" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > tenant_id 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "t-1",
+      "p-1",
+      "p-2",
+      "t-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."tenant_id" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_search_index"."tenant_id" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "t-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."tenant_id" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > trace_id 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "tr-1",
+      "p-1",
+      "p-2",
+      "tr-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."trace_id" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_search_index"."trace_id" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "tr-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."trace_id" = $3)",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > user_id + trace_id (the OR group) 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "u-1",
+      "tr-1",
+      "p-1",
+      "p-2",
+      "u-1",
+      "tr-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and ("error_search_index"."user_id" = $3 or "error_search_index"."trace_id" = $4)) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($5, $6) and ("error_search_index"."user_id" = $7 or "error_search_index"."trace_id" = $8)) order by "issues"."last_seen" desc, "issues"."id" asc limit $9",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "u-1",
+      "tr-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and ("error_search_index"."user_id" = $3 or "error_search_index"."trace_id" = $4))",
+  },
+]
+`;
+
+exports[`searchErrors without a tag filter is exactly today (spec §6.6) > user_id 1`] = `
+[
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "u-1",
+      "p-1",
+      "p-2",
+      "u-1",
+      50,
+    ],
+    "sql": "select "issues"."id", "issues"."project_id", "issues"."fingerprint", "issues"."message", "issues"."error_class", "issues"."status", "issues"."count", "issues"."first_seen", "issues"."last_seen", "projects"."name", "error_occurrences"."id", "error_occurrences"."environment", "error_occurrences"."platform", "error_occurrences"."trace_id", "error_occurrences"."span_id", "error_occurrences"."created_at", "error_search_index"."user_id", "error_search_index"."tenant_id", "error_search_index"."trace_id", "error_search_index"."span_id", "error_search_index"."request_id" from "issues" inner join "projects" on "issues"."project_id" = "projects"."id" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" inner join (select distinct on ("issues"."id") "error_occurrences"."id" from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."user_id" = $3) order by "issues"."id", "error_occurrences"."created_at" desc, "error_occurrences"."id" desc) "chosen_occurrence" on "chosen_occurrence"."id" = "error_occurrences"."id" where ("issues"."project_id" in ($4, $5) and "error_search_index"."user_id" = $6) order by "issues"."last_seen" desc, "issues"."id" asc limit $7",
+  },
+  {
+    "params": [
+      "p-1",
+      "p-2",
+      "u-1",
+    ],
+    "sql": "select cast(count(DISTINCT "issues"."id") as integer) from "issues" inner join "error_occurrences" on "error_occurrences"."issue_id" = "issues"."id" inner join "error_search_index" on "error_search_index"."occurrence_id" = "error_occurrences"."id" where ("issues"."project_id" in ($1, $2) and "error_search_index"."user_id" = $3)",
+  },
+]
+`;

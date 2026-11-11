@@ -1,0 +1,124 @@
+{{- $secret := include "sentinel.secretName" . }}
+{{- if .Values.init.nats.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-nats-init
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats-init
+  annotations:
+    # Create the JetStream streams before the app pods (wave 2) consume them.
+    # ArgoCD Sync hook: a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up. HookSucceeded+BeforeHookCreation deletes the
+    # completed Job so the next release re-runs fresh.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
+    "argocd.argoproj.io/sync-wave": "1"
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nats-init
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nats-init
+          image: "{{ .Values.init.nats.image }}:{{ .Values.init.nats.tag | default .Chart.AppVersion }}"
+          env:
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- else }}
+            - name: NATS_URL
+              value: {{ include "sentinel.natsUrl" . | quote }}
+            {{- end }}
+            {{- /*
+              ERROR_EVENTS limits, read by scripts/nats-init.sh as ERROR_EVENTS_MAX_AGE /
+              ERROR_EVENTS_MAX_BYTES. Rendered only when set so an unset value falls through to
+              the script's own defaults (and their derivation) instead of overriding them with "".
+            */}}
+            {{- with .Values.init.nats.errorEvents.maxAge }}
+            - name: ERROR_EVENTS_MAX_AGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.init.nats.errorEvents.maxBytes }}
+            - name: ERROR_EVENTS_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.init.nats.errorEventsDlq).maxBytes }}
+            - name: ERROR_EVENTS_DLQ_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.init.nats.spans).maxBytes }}
+            - name: SPANS_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+{{- end }}
+{{- if .Values.init.minio.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-minio-init
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-init
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-init
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: minio-init
+          image: "{{ .Values.init.minio.image }}:{{ .Values.init.minio.tag | default .Chart.AppVersion }}"
+          env:
+            - name: S3_ENDPOINT
+              value: {{ include "sentinel.s3Endpoint" . | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.config.s3.bucket | quote }}
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_SECRET_KEY } }
+{{- end }}

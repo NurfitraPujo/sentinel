@@ -1,0 +1,13 @@
+{
+  // Declaration-only emit for `dist/`; the JavaScript comes from esbuild (scripts/build.mjs), which bundles
+  // each entry into one self-contained file (contract §4.1: the pinned size method measures the raw entry).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}

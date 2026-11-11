@@ -1,0 +1,108 @@
+{{- if .Values.geoip.refreshCron.enabled }}
+{{- $secret := include "sentinel.secretName" . -}}
+{{- $img := .Values.images.ingestor -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $st := .Values.geoip.storage -}}
+{{- $cron := .Values.geoip.refreshCron -}}
+# sentinel-event-enrichment spec §8.1-§8.4: `ingestor geoip-refresh`, the ONLY code that contacts
+# MaxMind. Twice a week it asks MaxMind whether GeoLite2-City changed (a free metadata check) and, only
+# when it did, downloads it once, validates it and uploads it through the S3 API for the ingestor pods.
+# backoffLimit 0 and concurrencyPolicy Forbid mean at most one download per run: <= 2 a week per env.
+# The MaxMind account id and licence key are optional secretKeyRefs: with TASK-07's keys absent the pod
+# still starts and the Job fails at its first step, loudly, and geo stays empty. The licence key never
+# reaches the ingestor Deployment.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "sentinel.fullname" . }}-geoip-refresh
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: geoip-refresh
+spec:
+  schedule: {{ $cron.schedule | quote }}
+  timeZone: {{ $cron.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ $cron.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ $cron.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $cron.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $cron.backoffLimit }}
+      # HOW LONG A FINISHED JOB LINGERS (report-an-issue/BUG-89).
+      #
+      # failedJobsHistoryLimit caps how MANY failed Jobs are kept and says nothing
+      # about how OLD they get, while KubeJobFailed fires on the existence of a
+      # Failed Job with no time bound. This cron's own failures from 2026-10-01
+      # were still firing that alert two and a half days later, with the newest
+      # runs completing in four seconds -- so the alert described a fixed problem.
+      #
+      # A day: long enough to read a failure the next morning, short enough that
+      # the alert resolves itself.
+      ttlSecondsAfterFinished: {{ $cron.ttlSecondsAfterFinished | default 86400 }}
+      activeDeadlineSeconds: {{ $cron.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sentinel.labels" . | nindent 12 }}
+            app.kubernetes.io/component: geoip-refresh
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.affinity }}
+          affinity: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: geoip-refresh
+              image: "{{ $img.repository }}:{{ $tag }}"
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              args: ["geoip-refresh"]
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              env:
+                - name: GEOIP_S3_ENDPOINT
+                  value: {{ $st.endpoint | default (include "sentinel.s3Endpoint" .) | quote }}
+                - name: GEOIP_S3_REGION
+                  value: {{ $st.region | quote }}
+                - name: GEOIP_S3_BUCKET
+                  value: {{ $st.bucket | default .Values.config.s3.bucket | quote }}
+                - name: GEOIP_S3_PREFIX
+                  value: {{ $st.prefix | quote }}
+                - name: GEOIP_S3_FORCE_PATH_STYLE
+                  value: {{ $st.forcePathStyle | quote }}
+                - name: GEOIP_S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: {{ $cron.accessKeySecretKey | default $st.accessKeySecretKey }}
+                - name: GEOIP_S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: {{ $cron.secretKeySecretKey | default $st.secretKeySecretKey }}
+                - name: MAXMIND_ACCOUNT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: MAXMIND_ACCOUNT_ID
+                      optional: true
+                - name: MAXMIND_LICENSE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secret }}
+                      key: MAXMIND_LICENSE_KEY
+                      optional: true
+              resources:
+                {{- toYaml $cron.resources | nindent 16 }}
+{{- end }}

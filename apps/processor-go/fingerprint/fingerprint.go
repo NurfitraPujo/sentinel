@@ -1,0 +1,428 @@
+package fingerprint
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
+)
+
+type FingerprintConfig struct {
+	CustomFingerprint string
+	// Environment is folded into the hash input (sentinel-project-environments §4.9) so the
+	// fingerprint VALUE itself is environment-distinct, and idx_issues_fingerprint — a
+	// fingerprint-only, non-unique index from 1716508800_init.sql — cannot be read as
+	// cross-environment identity by a future query. It is defence in depth, not the mechanism:
+	// the mechanism is the UNIQUE (project_id, environment, fingerprint) constraint.
+	Environment string
+	ErrorClass  string
+	// Message is the event's message; it joins the hash input only when the stack cannot decide
+	// (no usable frame, or a wrapper on top), after NormalizeMessage.
+	Message    string
+	Stacktrace []StackFrame
+	// Platform is the event's platform (sentinel-sourcemaps §4.4, "Fingerprint input
+	// normalisation"): when it is in NormalisePlatforms, every frame's File is passed through
+	// symbolicate.NormalizePath and — for a frame symbolication did not rewrite (decision 44) —
+	// the basename and directory rules of NormalizeHashInput, INSIDE Compute only, so a
+	// build-hash-renamed chunk hashes to the same identity across builds. The stored frame is
+	// untouched. Outside the set (Go, Python, Dart, an empty Platform) File and Function are hashed
+	// verbatim; the v2 rules (version token, 5 frames, library frames skipped, message when the stack
+	// cannot decide) still apply to them, which is why EVERY Go and Python hash moved at v2 and those
+	// platforms' issues regroup once at the reset (docs/audits/grouping-v2-evidence.md §5).
+	Platform string
+	// NormalisePlatforms is the gate set — symbolicate.Config.Platforms, i.e. SYMBOLICATE_PLATFORMS
+	// (unset = {javascript, browser}; set and empty = off, decision 27's kill switch turns the
+	// normalisation off with the stage). Nil or empty means no platform is normalised; callers
+	// that want the contract default pass symbolicate.DefaultPlatforms explicitly.
+	NormalisePlatforms []string
+}
+
+type StackFrame struct {
+	File     string
+	Line     int32
+	Function string
+	InApp    bool
+	// Symbolicated is §4.4 step 6's record on the event frame (event.StackFrame.Symbolicated),
+	// carried here for decision 44: File is then the map's ORIGINAL source path
+	// (`src/components/UserProfileCard.tsx`), which has no build hash to strip, so the basename
+	// and directory rules must not run on it — decision 42's digitless clause reads a three-word
+	// camelCase identifier as a hash token and would collapse every such file in a directory into
+	// one identity. Only a frame the stage did not rewrite (outcome no_map, map_error,
+	// no_mapping, timeout, oversize, or an event the stage never saw) still carries a minified
+	// name, and only that frame gets the rules. False for every pre-feature caller.
+	Symbolicated bool
+}
+
+func Compute(cfg FingerprintConfig) string {
+	return ComputeWithFrameLimit(cfg, MaxFrames)
+}
+
+// ComputeWithFrameLimit is Compute with the frame count as a parameter. Production code calls
+// Compute; this exists so the evidence behind MaxFrames (docs/audits/grouping-v2-evidence.md) can
+// be re-run for the candidate values 3, 5 and 8 against the same corpus.
+func ComputeWithFrameLimit(cfg FingerprintConfig, limit int) string {
+	var input string
+	// §4.9: the CustomFingerprint early return is deliberately NOT environment-prefixed. Prefixing a
+	// client-chosen fingerprint would change identity for exactly the clients who chose it, which is
+	// the one thing a custom fingerprint exists to prevent. Two environments sending the SAME custom
+	// fingerprint still get two issue rows, because the unique key is what splits identity.
+	if cfg.CustomFingerprint != "" {
+		return cfg.CustomFingerprint
+	}
+
+	// §4.4: the normalisation applies to the hash input of every frame Compute reads — in_app or
+	// fallback — and never to the stored frame. Step 1's path rule runs on every frame in the gate
+	// set; the hash-strip rules run ONLY on a frame symbolication did not rewrite (decision 44) — a
+	// symbolicated File is a source-level path, and a source path has no build hash. Decision 42's
+	// reading of a minified name is unchanged. Function: a symbolicated frame keeps its name; on an
+	// unsymbolicated gated frame a name the minified-name detector flags folds to `*` (it changes
+	// between builds) and any other name is kept (sentinel-grouping-v2 §5.1).
+	normalise := cfg.normalises()
+	hashFile := func(frame StackFrame) string {
+		switch {
+		case !normalise:
+			return frame.File
+		case frame.Symbolicated:
+			return symbolicate.NormalizePath(frame.File)
+		}
+		return NormalizeHashInput(frame.File)
+	}
+
+	// A frame symbolication did not rewrite, on a platform whose frames are minified, may carry a
+	// minifier's name (`e`, `t`), which identifies nothing and changes between builds: the names the
+	// minified-name detector flags fold to `*`. Any other name is stable across builds and stays
+	// in the key, so two callers behind one wrapper frame still hash apart (contract §5.1).
+	frameLabel := func(frame StackFrame) string {
+		fn := frame.Function
+		if normalise && !frame.Symbolicated {
+			fn = foldMinifiedFunction(fn)
+		}
+		return fmt.Sprintf("%s:%s", hashFile(frame), fn)
+	}
+
+	// Frame choice (sentinel-grouping-v2 §1.1, §1.3): library and platform frames are skipped
+	// whatever the SDK flagged; of what is left the in_app frames are preferred, else any frame
+	// (an SDK that never sets in_app still gets grouped on its own frames); a stack made only of library
+	// frames is still a stack and is used as it is. The first MaxFrames are hashed, crash-first.
+	var own []StackFrame
+	for _, frame := range cfg.Stacktrace {
+		if !isLibraryFrame(frame) {
+			own = append(own, frame)
+		}
+	}
+	chosen := make([]StackFrame, 0, limit)
+	for _, frame := range own {
+		if frame.InApp {
+			chosen = append(chosen, frame)
+		}
+	}
+	if len(chosen) == 0 {
+		chosen = own
+	}
+	if len(chosen) == 0 {
+		chosen = cfg.Stacktrace
+	}
+	if len(chosen) > limit {
+		chosen = chosen[:limit]
+	}
+	labels := make([]string, len(chosen))
+	for i, frame := range chosen {
+		labels[i] = frameLabel(frame)
+	}
+
+	input = AlgorithmVersion + "|" + cfg.Environment + "|" + cfg.ErrorClass
+	if len(labels) > 0 {
+		input += "|" + strings.Join(labels, "|")
+	}
+	// §1.2: when the stack cannot decide — nothing usable, the top frame is a known wrapper, or
+	// every hashed frame is an unsymbolicated minified one (file only, no function identity) — the
+	// normalised message is part of the identity.
+	if len(chosen) == 0 || isWrapperFrame(chosen[0]) || (normalise && !anySymbolicated(chosen)) {
+		input += "|msg=" + NormalizeMessage(cfg.Message)
+	}
+
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])[:16]
+}
+
+func anySymbolicated(frames []StackFrame) bool {
+	for _, f := range frames {
+		if f.Symbolicated {
+			return true
+		}
+	}
+	return false
+}
+
+// normalises is the platform gate: Platform ∈ NormalisePlatforms, exact string match on the
+// lowercase, trimmed values symbolicate.ParsePlatforms produced (the proto admits only
+// `^[a-z0-9]+$`, so no case-folding is needed on the event side).
+func (cfg FingerprintConfig) normalises() bool {
+	for _, p := range cfg.NormalisePlatforms {
+		if p == cfg.Platform {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeHashInput is sentinel-sourcemaps §4.4's "Fingerprint input normalisation", applied to a
+// frame's File inside Compute for the platforms in the gate set when symbolication did not rewrite
+// the frame (decision 44; a symbolicated frame gets step 1 alone): symbolicate.NormalizePath first
+// (step 1's scheme+host / query / fragment rule, so `https://app.example.com/assets/x.js` and
+// `/assets/x.js` hash alike), then the directory rule on every directory segment and the basename
+// rule on the last one. Everything the rules do not name is byte-identical. Exported so the
+// fixture table (decision 6's deliverable, status/be.md) is asserted on the function AND through
+// Compute.
+//
+// The rules, in the contract's words (decisions 6 and 29):
+//
+//   - Basename rule: in the last path segment, a separator `-` or `.` followed by a hash token
+//     immediately before the extension(s) is replaced by `-*` / `.*`; a bare-hash basename with no
+//     separator has its whole stem as the token (`8f7a6b5c3d2e1f0a.js` → `*.js`). Only the ONE
+//     token immediately before the extension run is examined (`vendor-react-a3f9b2.js` →
+//     `vendor-react-*.js`; `react` is never looked at).
+//   - Hash token (decisions 41 and 42): 6–64 chars of [A-Za-z0-9_-] that is not a word — it
+//     contains at least one digit, OR it is entirely [0-9a-f], OR it is digitless with ≥ 2
+//     upper-case letters after position 0 and no vowel run longer than 2 (Rollup's default
+//     base64url hashes: `CuqmStVf`, `oQLsOyVD`; `d_kdqh_W` by its inner `_`). The separator
+//     search skips a `-` that sits INSIDE such a token unconditionally (`cart-oQ-sOyVD.js` →
+//     `cart-*.js`, `chunk-Ab-xyz9Qw.js` → `chunk-*.js`, `chunk--rv42314.js` → `chunk-*.js`):
+//     the candidate widens back across every `-` whose preceding piece is hash-shaped and the
+//     widest candidate that is a token wins, so a word (`react`, `main`) or a numeric chunk id
+//     (`1234`) is never absorbed.
+//   - Extension run: the trailing sequence of `.<ext>` segments where each ext is 1–8 chars of
+//     [a-z] with no digit (`.js`, `.chunk.js`, `.min.js`, `.js.map`); `main.a1b2c3d4.chunk.js` →
+//     `main.*.chunk.js`.
+//   - Directory rule: a whole DIRECTORY segment (every segment but the last — the basename is the
+//     basename rule's alone) of ≥ 16 chars of [A-Za-z0-9_-] containing a digit is replaced by `*`
+//     (`/_next/static/AbC123xyz_-9pQrStUv/_buildManifest.js` → `/_next/static/*/_buildManifest.js`).
+//   - Turbopack suffix rule (sentinel-sourcemaps-turbopack-grouping §4.3, D5, decisions 9 and
+//     10): a PREFIX step inside the basename rule, after the extension run is split and BEFORE
+//     the separator search. (1) Admit one `._` into the extension run: if the stem ends with
+//     `._`, move it — stem `_052cc036._` / ext `.js` → stem `_052cc036` / ext `._.js`. Only one,
+//     only innermost, only immediately before a non-empty run. (2) If the stem is ≥ 9 chars and
+//     ends with `_` followed by exactly 8 lower-case hex chars (`[0-9a-f]{8}`) — the `_` may be
+//     the stem's first byte — replace those 8 chars with `*` and return: `_052cc036._.js` →
+//     `_*._.js`, `node_modules__pnpm_52f51f25._.js` → `node_modules__pnpm_*._.js`,
+//     `…_app-route_f5a91902.js` → `…_app-route_*.js`. The separator search and the hash token
+//     do NOT run on such a stem, so the whole-stem collapse to `*.js` no longer happens for
+//     these names. (3) Otherwise the existing rule, unchanged, on the stem as step (1) left it
+//     (`main.a1b2c3d4._.js` → `main.*._.js`). The `<5-hex>_` directory-hash prefix (`0264e_`)
+//     is kept (decision 10); `user_12345678.js` → `user_*.js` and `chunk-Ab_deadbeef.js` →
+//     `chunk-Ab_*.js` are the stated false positives (T28, T29).
+func NormalizeHashInput(file string) string {
+	file = symbolicate.NormalizePath(file)
+	segments := strings.Split(file, "/")
+	last := len(segments) - 1
+	for i := 0; i < last; i++ {
+		if isBuildIDSegment(segments[i]) {
+			segments[i] = "*"
+		}
+	}
+	segments[last] = normalizeBasename(segments[last])
+	return strings.Join(segments, "/")
+}
+
+// normalizeBasename is the basename rule on one path segment.
+func normalizeBasename(base string) string {
+	stem, ext := splitExtensionRun(base)
+	if stem == "" {
+		return base
+	}
+	// Turbopack's server chunk names (sentinel-sourcemaps-turbopack-grouping §4.3, D5) end in
+	// `_<8-hex>` with an optional `._` before the run, and neither `._` (not an extension) nor
+	// `_` (not a separator) is anything the rule below reads -- so `_052cc036._.js` came out
+	// unchanged and `…_app-route_f5a91902.js` collapsed to `*.js`. Two prefix steps, before the
+	// separator search: one `._` immediately before a non-empty run is moved into the run; then
+	// a stem of ≥ 9 bytes ending in `_` + exactly 8 lower-case hex has those 8 replaced and
+	// returns without the separator search (`_*._.js`, `node_modules__pnpm_*._.js`). A stem the
+	// suffix test refuses falls through to the existing rule as step one left it
+	// (`main.a1b2c3d4._.js` → `main.*._.js`, T30).
+	if ext != "" && strings.HasSuffix(stem, "._") {
+		stem, ext = stem[:len(stem)-2], "._"+ext
+	}
+	if n := len(stem); n >= 9 && stem[n-9] == '_' {
+		suffixHex := true
+		for i := n - 8; i < n; i++ {
+			c := stem[i]
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				suffixHex = false
+				break
+			}
+		}
+		if suffixHex {
+			return stem[:n-8] + "*" + ext
+		}
+	}
+	// The candidate starts as the piece after the LAST separator, then widens back across `-`
+	// separators only (a `.` is never inside a token) for as long as the piece being crossed is
+	// hash-shaped; the widest candidate that is a token wins (decision 42: the `-` inside a
+	// base64url token is skipped unconditionally -- whether or not the last piece happens to be a
+	// token on its own, so `chunk-Ab-xyz9Qw.js` and `cart-oQ-sOyVD.js` both strip to
+	// `chunk-*.js` / `cart-*.js`, and `chunk-EF--2AAw.js` crosses an intermediate candidate that
+	// is not one). A lower-case word (`react`, `main`, `http`) or a numeric chunk id (`1234`) is
+	// never hash-shaped, so `vendor-react-a3f9b2.js` → `vendor-react-*.js`, `1234-abcdef.js` →
+	// `1234-*.js` and `main-a1b2c.js` stay as §4.4 states.
+	sep := strings.LastIndexAny(stem, "-.")
+	tokenSep, found := sep, isHashToken(stem[sep+1:])
+	for sep >= 0 && stem[sep] == '-' {
+		prev := strings.LastIndexAny(stem[:sep], "-.")
+		if !isHashFragment(stem[prev+1 : sep]) {
+			break
+		}
+		sep = prev
+		if isHashToken(stem[sep+1:]) {
+			tokenSep, found = sep, true
+		}
+	}
+	if !found {
+		return base
+	}
+	return stem[:tokenSep+1] + "*" + ext
+}
+
+// isHashFragment says whether a `-`-separated piece may be the front part of one hash token whose
+// `-` the separator search must skip (decision 42): empty (a leading `-`, `chunk--rv42314.js`),
+// or carrying an upper-case letter (`A`, `Ab`, `oQ`, `CuqmSt`), or carrying a digit without being
+// all digits (`a1b2c3`, `rv42`). A word is never a fragment, and neither is a vowel-less one
+// (`http`, `css`, `x`) nor a numeric chunk id (`1234`): `http-Bx-3kQz9.js` → `http-*.js`,
+// `1234-abcdef.js` → `1234-*.js`, `vendor-react-a3f9b2.js` → `vendor-react-*.js`.
+func isHashFragment(s string) bool {
+	hasDigit, allDigits := false, true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+			continue
+		case c >= 'A' && c <= 'Z':
+			return true
+		}
+		allDigits = false
+	}
+	if allDigits {
+		return len(s) == 0
+	}
+	return hasDigit
+}
+
+func isVowel(c byte) bool {
+	switch c {
+	case 'a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U':
+		return true
+	}
+	return false
+}
+
+// splitExtensionRun splits a basename into its stem and the trailing run of `.<ext>` segments,
+// each ext 1–8 chars of [a-z]. `main.a1b2c3d4.chunk.js` → (`main.a1b2c3d4`, `.chunk.js`);
+// `README` → (`README`, an empty run). A leading dot-file (`.env`) has an empty stem and is left alone.
+func splitExtensionRun(base string) (stem, ext string) {
+	stem = base
+	for {
+		i := strings.LastIndexByte(stem, '.')
+		if i < 0 {
+			return stem, ext
+		}
+		candidate := stem[i+1:]
+		if !isExtension(candidate) {
+			return stem, ext
+		}
+		ext = stem[i:] + ext
+		stem = stem[:i]
+	}
+}
+
+func isExtension(s string) bool {
+	if len(s) < 1 || len(s) > 8 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 'a' || s[i] > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+// isHashToken is the contract's hash-token definition (§4.4, decisions 41 and 42): 6–64 chars of
+// [A-Za-z0-9_-], and not a word — at least one digit, OR entirely [0-9a-f], OR digitless with
+// ≥ 2 upper-case letters after position 0 AND no vowel run longer than 2 (decision 42's measured
+// reading of decision 41's "mixed-case": Rollup's default `hashCharacters: 'base64'` names
+// `CuqmStVf`, `oQLsOyVD`, `FksjBCVK`, `LVliPaoS`). The contract's own negatives are what fix the
+// reading: `Header` has no upper-case letter after position 0, `getUser` and `_buildManifest`
+// (the directory rule's example) have one, `useAuth` has one and the run `eAu`. `parseHTML`
+// strips -- an accepted false positive of the same class as `decade.js` under the all-hex clause.
+//
+// One digitless shape the case count refuses is kept from decision 41 because §4.4 names it as a
+// hash: an inner `_` in a mixed-case token (`d_kdqh_W` -- a single upper-case letter after
+// position 0, but snake and camel do not mix in a word). Both clauses still require no vowel run
+// over 2.
+func isHashToken(s string) bool {
+	if len(s) < 6 || len(s) > 64 {
+		return false
+	}
+	hasDigit, allHex, hasLower, innerUnderscore, longVowelRun := false, true, false, false, false
+	uppersAfterFirst, vowelRun := 0, 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c >= 'a' && c <= 'f':
+			hasLower = true
+		case c >= 'g' && c <= 'z':
+			allHex = false
+			hasLower = true
+		case c >= 'A' && c <= 'Z':
+			allHex = false
+			if i > 0 {
+				uppersAfterFirst++
+			}
+		case c == '_':
+			allHex = false
+			innerUnderscore = innerUnderscore || i > 0
+		case c == '-':
+			allHex = false
+		default:
+			return false
+		}
+		if isVowel(c) {
+			vowelRun++
+		} else {
+			vowelRun = 0
+		}
+		if vowelRun > 2 {
+			longVowelRun = true
+		}
+	}
+	if hasDigit || allHex {
+		return true
+	}
+	if longVowelRun {
+		return false
+	}
+	return uppersAfterFirst >= 2 || (innerUnderscore && hasLower && uppersAfterFirst >= 1)
+}
+
+// isBuildIDSegment is the directory rule's predicate: ≥ 16 chars of [A-Za-z0-9_-] with a digit.
+func isBuildIDSegment(s string) bool {
+	if len(s) < 16 {
+		return false
+	}
+	hasDigit := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return hasDigit
+}

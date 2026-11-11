@@ -1,0 +1,73 @@
+{{- if .Values.migrate.enabled }}
+{{- $img := .Values.images.migrate -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sentinel.fullname" . }}-migrate
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Run migrations before the app pods start, on every install and upgrade.
+    # ArgoCD Sync hook (not a plain manifest, not a Helm hook): ArgoCD strips
+    # Helm hooks, and a plain sync-wave Job blocks the sync forever once the
+    # finished Job is cleaned up (health Missing gates wave 2). As a Sync hook
+    # in wave 1 it runs after infra (wave -1/0), gates app Deployments
+    # (wave 2), and HookSucceeded+BeforeHookCreation deletes the completed Job
+    # so the next release re-runs fresh without spec.template immutability.
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": HookSucceeded,BeforeHookCreation
+    "argocd.argoproj.io/sync-wave": "1"
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            {{- include "sentinel.migratePostgresEnv" . | nindent 12 }}
+            - name: SSLMODE
+              value: {{ .Values.config.postgres.sslmode | quote }}
+            - name: DB_URL_PROCESSOR
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+            - name: DB_URL_INGESTOR
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+            - name: DB_URL_DASHBOARD
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=$(SSLMODE)"
+          # The migrate image's entrypoint is `migrate`; run every requested target in order.
+          # All targets share one physical database (A1) and each migration is idempotent.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              {{- range .Values.migrate.targets }}
+              echo ">> migrating target={{ . }}"
+              migrate up -target={{ . }}
+              {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+{{- end }}

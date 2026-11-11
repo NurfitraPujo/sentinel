@@ -1,0 +1,29 @@
+{{- if and (eq (.Values.global.provider | default "generic") "k8s") .Values.dashboard.ingress.enabled }}
+# K8s CCE ingress for the dashboard UI/API. Same shared internal ELB as the
+# ingestor ingress — one rule per host on the shared LB.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+  annotations:
+    kubernetes.io/elb.class: union
+    kubernetes.io/elb.id: {{ required "dashboard.ingress.elbId is required on K8s" .Values.dashboard.ingress.elbId | quote }}
+    kubernetes.io/elb.port: "443"
+    kubernetes.io/elb.tls-certificate-ids: {{ required "dashboard.ingress.tlsCertIds is required on K8s" .Values.dashboard.ingress.tlsCertIds | quote }}
+spec:
+  ingressClassName: cce
+  rules:
+    - host: {{ required "dashboard.ingress.host is required on K8s" .Values.dashboard.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentinel.fullname" . }}-dashboard
+                port:
+                  number: {{ .Values.dashboard.service.port }}
+{{- end }}

@@ -1,0 +1,13 @@
+# Fully qualified + pinned. Podman resolves no unqualified short names unless
+# /etc/containers/registries.conf defines unqualified-search-registries, so a bare
+# "natsio/nats-box" builds only while a cached copy happens to exist locally — the moment an image
+# prune evicts it, `docker compose up --build` aborts with `short-name ... did not resolve to an
+# alias` BEFORE recreating any service. Every container then keeps running its PREVIOUS build while
+# answering 200 on every health probe, which is indistinguishable from a successful rebuild (B9).
+# That happened twice on 2026-07-31, once costing a full rebuild cycle spent validating stale images.
+# Docker treats the qualified form identically, so this costs nothing. :latest was pinned at the same
+# time — an unpinned base means this image's behavior can change on any prune+pull.
+FROM docker.io/natsio/nats-box:0.14.5
+COPY nats-init.sh /scripts/nats-init.sh
+RUN chmod +x /scripts/nats-init.sh
+ENTRYPOINT ["/bin/sh", "/scripts/nats-init.sh"]

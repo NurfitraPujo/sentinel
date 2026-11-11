@@ -1,0 +1,1354 @@
+<script lang="ts">
+	// Manual Issues M5 §7/§9: agent identity + agent-key issuance/revocation, owner/admin only.
+	// Key listing reuses GET /api/organizations/[orgId]/keys (already permission-gated on
+	// 'read') and filters client-side by agentId, rather than adding a second listing endpoint —
+	// there is exactly one source of truth for "which keys exist" (src/lib/db/queries/apikeys.ts)
+	// and this page just narrows the view onto it, same as ApiKeyTable does for the org-wide list.
+	interface AgentRow {
+		id: string;
+		name: string;
+		kind: 'ai' | 'bot';
+		status: 'active' | 'disabled';
+		createdAt: string | null;
+		// N10: admin-set gate for the repo-credentials delivery endpoint.
+		canAccessRepoCredentials?: boolean;
+	}
+
+	// N10 part 2: metadata-only shape -- the server never returns the secret after initial set,
+	// and unlike keys/webhook secrets there is deliberately NO one-time reveal tray for it.
+	interface RepoCredentialRow {
+		id: string;
+		provider: 'github' | 'bitbucket';
+		label: string;
+		secretPrefix: string;
+		status: 'active' | 'revoked';
+		createdAt: string | null;
+		lastFetchedAt: string | null;
+	}
+
+	interface KeyRow {
+		id: string;
+		agentId: string | null;
+		name: string;
+		keyPrefix: string;
+		status: string;
+		createdAt: string | null;
+	}
+
+	// sentinel-cli-browser-login: a member's `sentinel login` key, as GET /api/organizations/[orgId]/agents lists it. No secret.
+	interface PersonalKeyRow {
+		keyId: string;
+		deviceName: string;
+		keyPrefix: string;
+		status: string;
+		createdAt: string | null;
+		expiresAt: string | null;
+		revokedAt: string | null;
+		owner: { userId: string; name: string | null; email: string };
+	}
+
+	interface WebhookRow {
+		id: string;
+		agentId: string;
+		url: string;
+		secretPrefix: string;
+		eventTypes: string[];
+		status: 'active' | 'disabled' | 'failed';
+		consecutiveFailures: number;
+		createdAt: string | null;
+	}
+
+	interface Props {
+		data: {
+			orgId: string;
+			orgSlug: string;
+			agents: AgentRow[];
+			personalKeys?: PersonalKeyRow[];
+			projects: { id: string; name: string }[];
+			cliProfile?: string;
+		};
+	}
+
+	let { data }: Props = $props();
+
+	// svelte-ignore state_referenced_locally -- deliberate: seeds initial state once from the
+	// server-loaded prop at mount, same as SubscriptionToggle.svelte's identical initializer;
+	// this page does not track later changes to `data.agents` after mount (mutations flow
+	// through the local `agents` state instead, same as settings/keys/+page.svelte's `keys`).
+	let agents = $state<AgentRow[]>(data.agents ?? []);
+	let keysByAgent = $state<Record<string, KeyRow[]>>({});
+	let keysLoaded = $state(false);
+	// svelte-ignore state_referenced_locally -- seeded once from the server load, like `agents` above.
+	let personalKeys = $state<PersonalKeyRow[]>(data.personalKeys ?? []);
+
+	let newAgentName = $state('');
+	let newAgentKind = $state<'ai' | 'bot'>('ai');
+	let creating = $state(false);
+
+	let toastMessage = $state<string | null>(null);
+	let toastType = $state<'error' | 'success'>('error');
+	let newlyIssuedToken = $state<string | null>(null);
+	let issuingForAgent = $state<string | null>(null);
+
+	// N3a: webhooks, keyed by agentId, mirroring keysByAgent's shape/lifecycle above.
+	let webhooksByAgent = $state<Record<string, WebhookRow[]>>({});
+	let webhooksLoaded = $state<Record<string, boolean>>({});
+	let newWebhookUrlByAgent = $state<Record<string, string>>({});
+	let creatingWebhookForAgent = $state<string | null>(null);
+	let newlyIssuedWebhookSecret = $state<string | null>(null);
+
+	// N10 part 2: repository credentials (write-only). The secret fields below are cleared the
+	// moment the create/replace call returns, and nothing read back from the server ever
+	// contains them.
+	let repoCredentials = $state<RepoCredentialRow[]>([]);
+	let repoCredentialsLoaded = $state(false);
+	let newCredProvider = $state<'github' | 'bitbucket'>('github');
+	let newCredLabel = $state('');
+	let newCredToken = $state('');
+	let newCredUsername = $state('');
+	let newCredAppPassword = $state('');
+	let savingCredential = $state(false);
+	let replacingCredentialId = $state<string | null>(null);
+
+	// Setup snippet shown under a freshly minted ORG AGENT key. Uses the origin the admin is looking at (the page's
+	// own origin) and deliberately does NOT embed the key: `sentinel login --key-stdin` prompts for it with echo off.
+	// Only rendered after a client-side action, so `window` is always defined when this is read.
+	const cliOrigin = $derived(typeof window === 'undefined' ? '' : window.location.origin);
+	const profileFlag = $derived(data.cliProfile ? ` --profile ${data.cliProfile}` : '');
+	const cliSetupSnippet = $derived(
+		[
+			`curl -fsSL ${cliOrigin}/install.sh | sh`,
+			`sentinel login --url ${cliOrigin}${profileFlag} --key-stdin   # paste the key when prompted`,
+			`sentinel agent install`,
+		].join('\n')
+	);
+	// sentinel-cli-browser-login: what ANY member runs for their own personal key -- no admin, no key to paste. Rendered
+	// on the server too, so it reads the page origin lazily (empty until hydration; the commands stay readable).
+	const personalSetupSnippet = $derived(
+		[
+			`curl -fsSL ${cliOrigin || '<this dashboard>'}/install.sh | sh`,
+			`sentinel login --url ${cliOrigin || '<this dashboard>'}${profileFlag}   # approve the code in your browser`,
+			`sentinel agent install`,
+		].join('\n')
+	);
+
+	function shortDate(iso: string | null): string {
+		return iso ? new Date(iso).toLocaleDateString() : '—';
+	}
+
+	function personalKeyLive(k: PersonalKeyRow): boolean {
+		return k.status === 'active' && !k.revokedAt && (!k.expiresAt || new Date(k.expiresAt).getTime() > Date.now());
+	}
+
+	async function revokePersonalKey(keyId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/cli-keys/${keyId}`, { method: 'DELETE' });
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke CLI key' }));
+				showToast(err.message || `Error ${res.status}: failed to revoke CLI key`);
+				return;
+			}
+			personalKeys = personalKeys.map((k) =>
+				k.keyId === keyId ? { ...k, status: 'revoked', revokedAt: new Date().toISOString() } : k
+			);
+			showToast('CLI key revoked', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking CLI key');
+		}
+	}
+
+	async function copyCliSnippet() {
+		try {
+			await navigator.clipboard.writeText(cliSetupSnippet);
+			showToast('Setup commands copied', 'success');
+		} catch {
+			showToast('Could not copy — select the commands and copy manually');
+		}
+	}
+
+	function showToast(message: string, type: 'error' | 'success' = 'error') {
+		toastMessage = message;
+		toastType = type;
+		setTimeout(() => {
+			if (toastMessage === message) toastMessage = null;
+		}, 5000);
+	}
+
+	async function loadKeys() {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys`);
+			if (!res.ok) return;
+			const body = await res.json();
+			const grouped: Record<string, KeyRow[]> = {};
+			for (const key of (body.keys ?? []) as KeyRow[]) {
+				if (!key.agentId) continue;
+				(grouped[key.agentId] ??= []).push(key);
+			}
+			keysByAgent = grouped;
+		} finally {
+			keysLoaded = true;
+		}
+	}
+
+	$effect(() => {
+		void loadKeys();
+	});
+
+	async function loadWebhooks(agentId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks`);
+			if (!res.ok) return;
+			const body = await res.json();
+			webhooksByAgent = { ...webhooksByAgent, [agentId]: body.webhooks ?? [] };
+		} finally {
+			webhooksLoaded = { ...webhooksLoaded, [agentId]: true };
+		}
+	}
+
+	$effect(() => {
+		for (const agent of agents) {
+			if (!webhooksLoaded[agent.id]) void loadWebhooks(agent.id);
+		}
+	});
+
+	async function loadRepoCredentials() {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/repo-credentials`);
+			if (!res.ok) return;
+			const body = await res.json();
+			repoCredentials = body.credentials ?? [];
+		} finally {
+			repoCredentialsLoaded = true;
+		}
+	}
+
+	$effect(() => {
+		void loadRepoCredentials();
+	});
+
+	function clearCredentialForm() {
+		newCredLabel = '';
+		newCredToken = '';
+		newCredUsername = '';
+		newCredAppPassword = '';
+	}
+
+	// 1724300000: an agent's project grants. The master switch above says WHETHER an agent may
+	// fetch credentials at all; these say WHICH projects' credentials are in range. Org-wide
+	// credentials (no project) still reach any agent past the switch — narrowing is opt-in, per
+	// credential, so no already-deployed worker loses access when this ships.
+	let grantsForAgent = $state<Record<string, string[]>>({});
+	let grantsLoaded = $state<Record<string, boolean>>({});
+	let savingGrantsFor = $state<string | null>(null);
+
+	async function loadGrants(agentId: string) {
+		if (grantsLoaded[agentId]) return;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/credential-grants`);
+			if (!res.ok) {
+				showToast('Failed to load credential scope');
+				return;
+			}
+			const body = await res.json();
+			grantsForAgent = { ...grantsForAgent, [agentId]: body.projectIds ?? [] };
+			grantsLoaded = { ...grantsLoaded, [agentId]: true };
+		} catch {
+			showToast('Failed to load credential scope');
+		}
+	}
+
+	async function toggleGrant(agentId: string, projectId: string, granted: boolean) {
+		const current = grantsForAgent[agentId] ?? [];
+		const next = granted ? [...new Set([...current, projectId])] : current.filter((id) => id !== projectId);
+
+		savingGrantsFor = agentId;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/credential-grants`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ projectIds: next })
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to save credential scope' }));
+				showToast(err.message || 'Failed to save credential scope');
+				return;
+			}
+			const body = await res.json();
+			grantsForAgent = { ...grantsForAgent, [agentId]: body.projectIds ?? next };
+		} catch {
+			showToast('Failed to save credential scope');
+		} finally {
+			savingGrantsFor = null;
+		}
+	}
+
+	function credentialSecretBody(): Record<string, string> | null {
+		if (newCredProvider === 'github') {
+			if (!newCredToken.trim()) {
+				showToast('A token is required');
+				return null;
+			}
+			return { token: newCredToken.trim() };
+		}
+		if (newCredToken.trim()) return { token: newCredToken.trim() };
+		if (!newCredUsername.trim() || !newCredAppPassword.trim()) {
+			showToast('Bitbucket needs a token, or a username and app password');
+			return null;
+		}
+		return { username: newCredUsername.trim(), appPassword: newCredAppPassword.trim() };
+	}
+
+	async function saveCredential() {
+		const secret = credentialSecretBody();
+		if (!secret) return;
+		const replacing = replacingCredentialId;
+		if (!replacing && !newCredLabel.trim()) {
+			showToast('A label is required');
+			return;
+		}
+		savingCredential = true;
+		try {
+			const res = replacing
+				? await fetch(`/api/organizations/${data.orgId}/repo-credentials/${replacing}`, {
+						method: 'PUT',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ provider: newCredProvider, ...secret }),
+					})
+				: await fetch(`/api/organizations/${data.orgId}/repo-credentials`, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ provider: newCredProvider, label: newCredLabel.trim(), ...secret }),
+					});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to save credential' }));
+				showToast(err.message || `Error ${res.status}: failed to save credential`);
+				return;
+			}
+			const { credential } = await res.json();
+			repoCredentials = replacing
+				? repoCredentials.map((c) => (c.id === replacing ? credential : c))
+				: [credential, ...repoCredentials];
+			replacingCredentialId = null;
+			clearCredentialForm();
+			showToast(replacing ? 'Credential secret replaced' : 'Credential stored (write-only — it cannot be viewed again)', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while saving credential');
+		} finally {
+			savingCredential = false;
+		}
+	}
+
+	async function revokeCredential(credentialId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/repo-credentials/${credentialId}`, {
+				method: 'DELETE',
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke credential' }));
+				showToast(err.message || `Error ${res.status}: failed to revoke credential`);
+				return;
+			}
+			const { credential } = await res.json();
+			repoCredentials = repoCredentials.map((c) => (c.id === credentialId ? credential : c));
+			if (replacingCredentialId === credentialId) replacingCredentialId = null;
+			showToast('Credential revoked', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking credential');
+		}
+	}
+
+	async function setRepoCredentialAccess(agent: AgentRow, allow: boolean) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agent.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ canAccessRepoCredentials: allow }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to update agent' }));
+				showToast(err.message || `Error ${res.status}: failed to update agent`);
+				return;
+			}
+			agents = agents.map((a) => (a.id === agent.id ? { ...a, canAccessRepoCredentials: allow } : a));
+			showToast(allow ? 'Repo credential access granted' : 'Repo credential access withdrawn', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while updating agent');
+		}
+	}
+
+	async function createAgent() {
+		if (!newAgentName.trim()) {
+			showToast('Agent name is required');
+			return;
+		}
+		creating = true;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name: newAgentName.trim(), kind: newAgentKind }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to create agent' }));
+				showToast(err.message || `Error ${res.status}: failed to create agent`);
+				return;
+			}
+			const { agent } = await res.json();
+			agents = [agent, ...agents];
+			newAgentName = '';
+			showToast('Agent created', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while creating agent');
+		} finally {
+			creating = false;
+		}
+	}
+
+	async function setStatus(agent: AgentRow, status: 'active' | 'disabled') {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agent.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ status }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to update agent' }));
+				showToast(err.message || `Error ${res.status}: failed to update agent`);
+				return;
+			}
+			agents = agents.map((a) => (a.id === agent.id ? { ...a, status } : a));
+			showToast(status === 'disabled' ? 'Agent disabled' : 'Agent re-enabled', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while updating agent');
+		}
+	}
+
+	async function issueKey(agent: AgentRow) {
+		issuingForAgent = agent.id;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name: `${agent.name} key`, scope: 'agent', agentId: agent.id }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to issue key' }));
+				showToast(err.message || `Error ${res.status}: failed to issue key`);
+				return;
+			}
+			const { key, token } = await res.json();
+			newlyIssuedToken = token;
+			keysByAgent = { ...keysByAgent, [agent.id]: [key, ...(keysByAgent[agent.id] ?? [])] };
+			showToast('Agent key issued', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while issuing key');
+		} finally {
+			issuingForAgent = null;
+		}
+	}
+
+	async function revokeKey(agentId: string, keyId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/keys/${keyId}`, { method: 'DELETE' });
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to revoke key' }));
+				showToast(err.message || `Error ${res.status}: failed to revoke key`);
+				return;
+			}
+			keysByAgent = {
+				...keysByAgent,
+				[agentId]: (keysByAgent[agentId] ?? []).map((k) => (k.id === keyId ? { ...k, status: 'revoked' } : k)),
+			};
+			showToast('Agent key revoked', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while revoking key');
+		}
+	}
+
+	async function createWebhook(agent: AgentRow) {
+		const url = (newWebhookUrlByAgent[agent.id] ?? '').trim();
+		if (!url) {
+			showToast('Webhook URL is required');
+			return;
+		}
+		creatingWebhookForAgent = agent.id;
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agent.id}/webhooks`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ url }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to create webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to create webhook`);
+				return;
+			}
+			const { webhook, secret } = await res.json();
+			newlyIssuedWebhookSecret = secret;
+			webhooksByAgent = { ...webhooksByAgent, [agent.id]: [webhook, ...(webhooksByAgent[agent.id] ?? [])] };
+			newWebhookUrlByAgent = { ...newWebhookUrlByAgent, [agent.id]: '' };
+			showToast('Webhook created', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while creating webhook');
+		} finally {
+			creatingWebhookForAgent = null;
+		}
+	}
+
+	async function setWebhookStatus(agentId: string, webhook: WebhookRow, status: 'active' | 'disabled') {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks/${webhook.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ status }),
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to update webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to update webhook`);
+				return;
+			}
+			const { webhook: updated } = await res.json();
+			webhooksByAgent = {
+				...webhooksByAgent,
+				[agentId]: (webhooksByAgent[agentId] ?? []).map((w) => (w.id === webhook.id ? updated : w)),
+			};
+			showToast(status === 'disabled' ? 'Webhook disabled' : 'Webhook re-enabled', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while updating webhook');
+		}
+	}
+
+	async function deleteWebhook(agentId: string, webhookId: string) {
+		try {
+			const res = await fetch(`/api/organizations/${data.orgId}/agents/${agentId}/webhooks/${webhookId}`, {
+				method: 'DELETE',
+			});
+			if (!res.ok) {
+				const err = await res.json().catch(() => ({ message: 'Failed to delete webhook' }));
+				showToast(err.message || `Error ${res.status}: failed to delete webhook`);
+				return;
+			}
+			webhooksByAgent = {
+				...webhooksByAgent,
+				[agentId]: (webhooksByAgent[agentId] ?? []).filter((w) => w.id !== webhookId),
+			};
+			showToast('Webhook deleted', 'success');
+		} catch (err: any) {
+			showToast(err?.message || 'Network error while deleting webhook');
+		}
+	}
+</script>
+
+<div class="agents-page">
+	<header class="agents-header">
+		<div>
+			<h1>Agents</h1>
+			<p class="subtitle">
+				AI/bot identities that can claim and work manual reports on this organization's behalf. Owner/admin only.
+			</p>
+		</div>
+	</header>
+
+	{#if toastMessage}
+		<div class="toast" class:toast-error={toastType === 'error'} class:toast-success={toastType === 'success'} role="status">
+			<span>{toastMessage}</span>
+			<button type="button" onclick={() => (toastMessage = null)}>✕</button>
+		</div>
+	{/if}
+
+	{#if newlyIssuedToken}
+		<div class="secret-tray" role="alert">
+			<div class="secret-tray-head">
+				<strong>Save this agent key now — it will never be shown again.</strong>
+				<button type="button" onclick={() => (newlyIssuedToken = null)}>✕</button>
+			</div>
+			<code class="secret-token">{newlyIssuedToken}</code>
+			<div class="secret-tray-head cli-setup-head">
+				<strong>Set up the sentinel CLI on your machine (the key is not included — paste it when prompted)</strong>
+				<button type="button" onclick={copyCliSnippet}>Copy</button>
+			</div>
+			<pre class="secret-token cli-setup" data-testid="cli-setup-snippet">{cliSetupSnippet}</pre>
+		</div>
+	{/if}
+
+	{#if newlyIssuedWebhookSecret}
+		<div class="secret-tray" role="alert">
+			<div class="secret-tray-head">
+				<strong>Save this webhook secret now — it will never be shown again.</strong>
+				<button type="button" onclick={() => (newlyIssuedWebhookSecret = null)}>✕</button>
+			</div>
+			<code class="secret-token">{newlyIssuedWebhookSecret}</code>
+		</div>
+	{/if}
+
+	<section class="create-agent">
+		<input
+			type="text"
+			placeholder="Agent name (e.g. AutoFix Agent)"
+			bind:value={newAgentName}
+			maxlength="255"
+		/>
+		<select bind:value={newAgentKind}>
+			<option value="ai">AI</option>
+			<option value="bot">Bot</option>
+		</select>
+		<button type="button" disabled={creating} onclick={createAgent}>
+			{creating ? 'Creating…' : '+ Create agent'}
+		</button>
+	</section>
+
+	{#if agents.length === 0}
+		<p class="empty-state">No agents yet. Create one above to let it claim and work manual reports.</p>
+	{:else}
+		<ul class="agent-list">
+			{#each agents as agent (agent.id)}
+				<li class="agent-card">
+					<div class="agent-card-head">
+						<div>
+							<span class="agent-name">{agent.kind === 'ai' ? '🤖' : '⚙️'} {agent.name}</span>
+							<span class="agent-status" class:is-disabled={agent.status === 'disabled'}>{agent.status}</span>
+						</div>
+						<div class="agent-actions">
+							<label class="repo-access-toggle" title="Allow this agent to fetch decrypted repository credentials from GET /api/agent/repo-credentials">
+								<input
+									type="checkbox"
+									checked={agent.canAccessRepoCredentials ?? false}
+									onchange={(e) => setRepoCredentialAccess(agent, (e.currentTarget as HTMLInputElement).checked)}
+								/>
+								Repo credential access
+							</label>
+							<button type="button" onclick={() => issueKey(agent)} disabled={issuingForAgent === agent.id}>
+								{issuingForAgent === agent.id ? 'Issuing…' : 'Issue key'}
+							</button>
+							{#if agent.status === 'active'}
+								<button type="button" class="danger" onclick={() => setStatus(agent, 'disabled')}>Disable</button>
+							{:else}
+								<button type="button" onclick={() => setStatus(agent, 'active')}>Re-enable</button>
+							{/if}
+						</div>
+					</div>
+
+					{#if agent.canAccessRepoCredentials}
+						<details class="credential-scope" ontoggle={() => loadGrants(agent.id)}>
+							<summary>
+								Credential scope
+								{#if grantsLoaded[agent.id]}
+									<span class="scope-count">
+										{(grantsForAgent[agent.id] ?? []).length === 0
+											? 'org-wide credentials only'
+											: `${(grantsForAgent[agent.id] ?? []).length} project(s)`}
+									</span>
+								{/if}
+							</summary>
+							<p class="scope-help">
+								Credentials with no project are delivered to this agent regardless. Tick a project to
+								also deliver credentials bound to that project.
+							</p>
+							{#if data.projects.length === 0}
+								<p class="scope-help">This organization has no projects yet.</p>
+							{:else}
+								<div class="scope-list">
+									{#each data.projects as project}
+										<label class="scope-item">
+											<input
+												type="checkbox"
+												disabled={savingGrantsFor === agent.id || !grantsLoaded[agent.id]}
+												checked={(grantsForAgent[agent.id] ?? []).includes(project.id)}
+												onchange={(e) =>
+													toggleGrant(agent.id, project.id, (e.currentTarget as HTMLInputElement).checked)}
+											/>
+											{project.name}
+										</label>
+									{/each}
+								</div>
+							{/if}
+						</details>
+					{/if}
+
+					<div class="agent-keys">
+						{#if !keysLoaded}
+							<p class="empty-state small">Loading keys…</p>
+						{:else if (keysByAgent[agent.id] ?? []).length === 0}
+							<p class="empty-state small">No keys issued yet.</p>
+						{:else}
+							<ul>
+								{#each keysByAgent[agent.id] as key (key.id)}
+									<li class="key-row">
+										<code>{key.keyPrefix}…</code>
+										<span class="key-status" class:is-revoked={key.status === 'revoked'}>{key.status}</span>
+										{#if key.status === 'active'}
+											<button type="button" class="danger small" onclick={() => revokeKey(agent.id, key.id)}>Revoke</button>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</div>
+
+					<div class="agent-webhooks">
+						<div class="webhooks-head">Webhooks</div>
+						{#if !webhooksLoaded[agent.id]}
+							<p class="empty-state small">Loading webhooks…</p>
+						{:else if (webhooksByAgent[agent.id] ?? []).length === 0}
+							<p class="empty-state small">No webhooks registered.</p>
+						{:else}
+							<ul>
+								{#each webhooksByAgent[agent.id] as webhook (webhook.id)}
+									<li class="webhook-row">
+										<div class="webhook-row-main">
+											<code>{webhook.url}</code>
+											<span class="key-status" class:is-revoked={webhook.status !== 'active'}>
+												{webhook.status}
+											</span>
+										</div>
+										<div class="webhook-row-meta">
+											<span>{webhook.secretPrefix}…</span>
+											<span>{webhook.eventTypes.length === 0 ? 'all events' : webhook.eventTypes.join(', ')}</span>
+											{#if webhook.consecutiveFailures > 0}
+												<span class="webhook-failures">{webhook.consecutiveFailures} consecutive failures</span>
+											{/if}
+										</div>
+										<div class="webhook-row-actions">
+											{#if webhook.status === 'active'}
+												<button type="button" class="danger small" onclick={() => setWebhookStatus(agent.id, webhook, 'disabled')}>
+													Disable
+												</button>
+											{:else}
+												<button type="button" class="small" onclick={() => setWebhookStatus(agent.id, webhook, 'active')}>
+													Re-enable
+												</button>
+											{/if}
+											<button type="button" class="danger small" onclick={() => deleteWebhook(agent.id, webhook.id)}>
+												Delete
+											</button>
+										</div>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+
+						<div class="webhook-create">
+							<input
+								type="text"
+								placeholder="https://example.com/webhooks/sentinel"
+								value={newWebhookUrlByAgent[agent.id] ?? ''}
+								oninput={(e) => (newWebhookUrlByAgent = { ...newWebhookUrlByAgent, [agent.id]: (e.currentTarget as HTMLInputElement).value })}
+							/>
+							<button
+								type="button"
+								disabled={creatingWebhookForAgent === agent.id}
+								onclick={() => createWebhook(agent)}
+							>
+								{creatingWebhookForAgent === agent.id ? 'Adding…' : '+ Add webhook'}
+							</button>
+						</div>
+					</div>
+				</li>
+			{/each}
+		</ul>
+	{/if}
+
+	<section class="personal-keys" data-testid="personal-cli-keys">
+		<header>
+			<h2>Personal CLI keys</h2>
+			<p class="subtitle">
+				Members connect the <code>sentinel</code> CLI themselves — no admin needed. Each key acts as its owner and can
+				never do more than that person can in the dashboard (checked on every request). You can revoke any of them.
+			</p>
+		</header>
+		<pre class="secret-token cli-setup" data-testid="personal-cli-setup-snippet">{personalSetupSnippet}</pre>
+		{#if personalKeys.length === 0}
+			<p class="empty-state small">No member has connected the CLI yet.</p>
+		{:else}
+			<ul>
+				{#each personalKeys as key (key.keyId)}
+					<li class="key-row">
+						<span>{key.owner.name || key.owner.email} <span class="subtitle">({key.owner.email})</span></span>
+						<span>{key.deviceName}</span>
+						<code>{key.keyPrefix}…</code>
+						<span class="subtitle">created {shortDate(key.createdAt)} · expires {shortDate(key.expiresAt)}</span>
+						<span class="key-status" class:is-revoked={!personalKeyLive(key)}>
+							{personalKeyLive(key) ? 'active' : key.status === 'active' ? 'expired' : key.status}
+						</span>
+						{#if personalKeyLive(key)}
+							<button type="button" class="danger small" onclick={() => revokePersonalKey(key.keyId)}>Revoke</button>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
+	<section class="repo-credentials">
+		<header>
+			<h2>Repository credentials</h2>
+			<p class="subtitle">
+				Git tokens the fix worker uses to push branches and open PRs. Stored encrypted, write-only:
+				a secret can be set, replaced, or revoked, but never viewed again. Served only to agents
+				with "Repo credential access" enabled.
+			</p>
+		</header>
+
+		{#if !repoCredentialsLoaded}
+			<p class="empty-state small">Loading credentials…</p>
+		{:else if repoCredentials.length === 0}
+			<p class="empty-state small">No repository credentials stored.</p>
+		{:else}
+			<ul class="credential-list">
+				{#each repoCredentials as cred (cred.id)}
+					<li class="credential-row">
+						<div class="credential-row-main">
+							<span class="credential-label">{cred.label}</span>
+							<code>{cred.provider} · {cred.secretPrefix}…</code>
+							<span class="key-status" class:is-revoked={cred.status === 'revoked'}>{cred.status}</span>
+						</div>
+						<div class="credential-row-meta">
+							<span>{cred.lastFetchedAt ? `last fetched ${new Date(cred.lastFetchedAt).toLocaleString()}` : 'never fetched'}</span>
+						</div>
+						{#if cred.status === 'active'}
+							<div class="webhook-row-actions">
+								<button
+									type="button"
+									class="small"
+									onclick={() => {
+										replacingCredentialId = replacingCredentialId === cred.id ? null : cred.id;
+										newCredProvider = cred.provider;
+										clearCredentialForm();
+									}}
+								>
+									{replacingCredentialId === cred.id ? 'Cancel replace' : 'Replace secret'}
+								</button>
+								<button type="button" class="danger small" onclick={() => revokeCredential(cred.id)}>Revoke</button>
+							</div>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{/if}
+
+		<div class="credential-form">
+			{#if replacingCredentialId}
+				<p class="empty-state small">Replacing the secret of the selected credential ({newCredProvider}).</p>
+			{:else}
+				<select bind:value={newCredProvider}>
+					<option value="github">GitHub</option>
+					<option value="bitbucket">Bitbucket</option>
+				</select>
+				<input type="text" placeholder="Label (e.g. CI fix bot)" bind:value={newCredLabel} maxlength="255" />
+			{/if}
+			<input
+				type="password"
+				placeholder={newCredProvider === 'github' ? 'Fine-grained PAT' : 'Access token (or leave empty for app password)'}
+				bind:value={newCredToken}
+				autocomplete="off"
+			/>
+			{#if newCredProvider === 'bitbucket'}
+				<input type="text" placeholder="Username" bind:value={newCredUsername} autocomplete="off" />
+				<input type="password" placeholder="App password" bind:value={newCredAppPassword} autocomplete="off" />
+			{/if}
+			<button type="button" disabled={savingCredential} onclick={saveCredential}>
+				{savingCredential ? 'Saving…' : replacingCredentialId ? 'Replace secret' : '+ Store credential'}
+			</button>
+		</div>
+	</section>
+</div>
+
+<style>
+	.agents-page {
+		max-width: 56rem;
+		margin: 0 auto;
+		padding: 1.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 1.25rem;
+		color: var(--text-primary);
+	}
+
+	.agents-header h1 {
+		margin: 0;
+		font-size: 1.25rem;
+		font-weight: 700;
+	}
+
+	.subtitle {
+		margin: 0.25rem 0 0;
+		font-size: 0.8rem;
+		color: var(--text-primary);
+		opacity: 0.7;
+	}
+
+	.toast {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.75rem 1rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-color);
+		font-size: 0.8rem;
+	}
+
+	.toast-error {
+		border-color: #b91c1c;
+		color: #fca5a5;
+	}
+
+	.toast-success {
+		border-color: #15803d;
+		color: #86efac;
+	}
+
+	.toast button {
+		background: none;
+		border: none;
+		color: inherit;
+		cursor: pointer;
+		font-weight: 700;
+	}
+
+	.secret-tray {
+		border: 2px solid #d97706;
+		border-radius: var(--radius-sm);
+		padding: 0.875rem 1rem;
+		background: var(--bg-surface);
+	}
+
+	.secret-tray-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.8rem;
+	}
+
+	.secret-tray-head button {
+		background: none;
+		border: none;
+		color: inherit;
+		cursor: pointer;
+	}
+
+	.secret-token {
+		display: block;
+		word-break: break-all;
+		font-family: monospace;
+		font-size: 0.8rem;
+		padding: 0.5rem;
+		background: var(--bg-root);
+		border-radius: var(--radius-sm);
+	}
+
+	.cli-setup-head {
+		margin-top: 0.75rem;
+	}
+
+	.cli-setup {
+		margin: 0;
+		white-space: pre-wrap;
+	}
+
+	.create-agent {
+		display: flex;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.create-agent input,
+	.create-agent select {
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.625rem;
+		font-size: 0.8rem;
+	}
+
+	.create-agent input {
+		flex: 1;
+		min-width: 12rem;
+	}
+
+	.create-agent button,
+	.agent-actions button,
+	.key-row button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.create-agent button:hover,
+	.agent-actions button:hover,
+	.key-row button:hover {
+		background: var(--bg-surface-hover);
+	}
+
+	.create-agent button:disabled,
+	.agent-actions button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.danger {
+		color: #f87171;
+		border-color: #b91c1c;
+	}
+
+	.empty-state {
+		font-size: 0.8rem;
+		opacity: 0.7;
+	}
+
+	.empty-state.small {
+		margin: 0.25rem 0 0;
+	}
+
+	.agent-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.agent-card {
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		background: var(--bg-surface);
+		padding: 0.875rem 1rem;
+	}
+
+	.agent-card-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.agent-name {
+		font-weight: 600;
+		font-size: 0.85rem;
+	}
+
+	.agent-status {
+		margin-left: 0.5rem;
+		font-size: 0.65rem;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		padding: 0.125rem 0.375rem;
+		border-radius: 999px;
+		background: rgba(34, 197, 94, 0.15);
+		color: #4ade80;
+	}
+
+	.agent-status.is-disabled {
+		background: rgba(248, 113, 113, 0.15);
+		color: #f87171;
+	}
+
+	.agent-actions {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.agent-keys {
+		margin-top: 0.625rem;
+		padding-top: 0.625rem;
+		border-top: 1px dashed var(--border-color);
+	}
+
+	.agent-keys ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
+	}
+
+	.key-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.key-status {
+		font-size: 0.65rem;
+		text-transform: uppercase;
+		opacity: 0.7;
+	}
+
+	.key-status.is-revoked {
+		color: #f87171;
+	}
+
+	.key-row button.small {
+		padding: 0.25rem 0.5rem;
+	}
+
+	.agent-webhooks {
+		margin-top: 0.625rem;
+		padding-top: 0.625rem;
+		border-top: 1px dashed var(--border-color);
+	}
+
+	.webhooks-head {
+		font-size: 0.7rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		opacity: 0.7;
+		margin-bottom: 0.375rem;
+	}
+
+	.agent-webhooks ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.webhook-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.625rem;
+	}
+
+	.webhook-row-main {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.webhook-row-meta {
+		display: flex;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+		font-size: 0.7rem;
+		opacity: 0.75;
+	}
+
+	.webhook-failures {
+		color: #f87171;
+	}
+
+	.webhook-row-actions {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.webhook-create {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.5rem;
+	}
+
+	.webhook-create input {
+		flex: 1;
+		min-width: 12rem;
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.webhook-create button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.webhook-create button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.repo-access-toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		font-size: 0.7rem;
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.personal-keys {
+		border-top: 1px solid var(--border-color);
+		padding-top: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.personal-keys h2 {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 700;
+	}
+
+	.personal-keys ul {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
+	}
+
+	.repo-credentials {
+		border-top: 1px solid var(--border-color);
+		padding-top: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.repo-credentials h2 {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 700;
+	}
+
+	.credential-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.credential-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.625rem;
+	}
+
+	.credential-row-main {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.credential-label {
+		font-weight: 600;
+	}
+
+	.credential-row-meta {
+		font-size: 0.7rem;
+		opacity: 0.75;
+	}
+
+	.credential-row button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.25rem 0.5rem;
+		font-size: 0.7rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.credential-form {
+		display: flex;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.credential-form input,
+	.credential-form select {
+		background: var(--bg-root);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.credential-form input {
+		flex: 1;
+		min-width: 10rem;
+	}
+
+	.credential-form button {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.4rem 0.75rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.credential-form button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.credential-scope {
+		margin: 0.5rem 0 0.75rem;
+		border: 1px solid var(--border-color);
+		border-radius: var(--radius-sm);
+		padding: 0.5rem 0.75rem;
+	}
+
+	.credential-scope summary {
+		cursor: pointer;
+		font-size: 0.8125rem;
+		font-weight: 500;
+	}
+
+	.scope-count {
+		font-weight: 400;
+		color: var(--text-muted);
+		margin-left: 0.375rem;
+	}
+
+	.scope-help {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		margin: 0.5rem 0;
+		line-height: 1.4;
+	}
+
+	.scope-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.scope-item {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.8125rem;
+	}
+</style>

@@ -1,0 +1,1162 @@
+import crypto from 'crypto';
+import { db, type Tx } from '$lib/server/db';
+import {
+	issues,
+	issueActivity,
+	manualIssueReports,
+	projects,
+	users,
+	attachments,
+	issueComments,
+	externalIssueReports,
+	externalReporters,
+} from '$lib/db/schema';
+import { eq, and, isNull, desc, sql } from 'drizzle-orm';
+import { subscribe } from '$lib/db/queries/subscriptions';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { insertReportIdempotency } from '$lib/server/report-idempotency';
+import {
+	environmentScopeCondition,
+	resolveEnvironmentScopes,
+} from '$lib/server/environment-access';
+
+/**
+ * Manual Issues M1 (docs/plans/MANUAL_ISSUES_DESIGN.md §2, §6, §9, §10). Every write here
+ * follows D18 (throw inside db.transaction, never return early to signal failure) and writes
+ * exactly one issue_activity row in the same transaction as the mutation it describes.
+ */
+
+export type ReportSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * sentinel-project-environments §3's accepted set for an environment name (decision 10), and the
+ * literal every user report falls back to (decision 24).
+ *
+ * Deliberately NOT global-flagged: a `/g` RegExp carries `lastIndex` between `.test()` calls and
+ * would return alternating results for the same input.
+ *
+ * `_unspecified` -- the migration's transient DEFAULT -- fails this pattern on its leading
+ * underscore, and that is the whole of decision 51's enforcement: no writer in this system can
+ * produce it. There is no reserved-word check here and none is to be added.
+ */
+export const ENV_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,49}$/;
+
+/** §4.8a: what a report with no valid assertion is filed under. */
+export const DEFAULT_REPORT_ENVIRONMENT = 'production';
+
+/**
+ * §4.8a: ONE definition, TWO `insert(issues)` call sites in this file, and both triage call sites.
+ *
+ * `createManualIssue` and `createExternalIssueReport` meet in this file and nowhere narrower --
+ * neither calls the other, and `createExternalIssueReport`'s doc comment records that keeping them
+ * apart was deliberate. A rule stated at each writer would be two rules that drift.
+ *
+ * The return value is **the environment of the request**: it is what `issues.environment` is written
+ * with AND what triage is filtered on (decision 50). One value per request, never two. Passing the
+ * RAW `context.environment` to triage instead is not a smaller version of this -- under decision
+ * 50's hard filter a `null` matches no row, so every report that asserts nothing (the majority path,
+ * filed as `production` by the line below) would get zero candidates and no auto-link at all.
+ *
+ * Takes `unknown` rather than `string | null | undefined` because both `/api/report` call sites read
+ * it straight out of a `Record<string, unknown>` context object; anything that is not a matching
+ * string -- absent, `null`, `''`, `42`, `'Production'` -- is the default.
+ */
+export function resolveReportEnvironment(asserted: unknown): string {
+	return typeof asserted === 'string' && ENV_NAME_RE.test(asserted)
+		? asserted
+		: DEFAULT_REPORT_ENVIRONMENT;
+}
+
+/**
+ * The `attachments_uploader_type_check` vocabulary. `'external_reporter'` is
+ * sentinel-user-report-issue §4.6's third value, added by
+ * `1724100000_add_user_report_intake_and_oncall.sql` with the same catalog-guarded CHECK swap the
+ * rest of that migration uses. It exists here so `claimDraftAttachmentsOnto`'s uploader-type match
+ * (R10) stays exhaustive rather than being widened by a cast at one call site.
+ */
+export type AttachmentUploaderType = 'user' | 'agent' | 'external_reporter';
+
+/**
+ * §2, Q12: find-or-create the per-org Triage inbox project, lazily, on first use. No backfill
+ * migration -- an org with no manual reports yet simply has no Triage project until one is
+ * needed. Called from inside createManualIssue's transaction when the caller omits a projectId,
+ * so the provisioning and the report creation are atomic together.
+ *
+ * Looks up by (organizationId, isInbox=true) rather than by name -- §2 is explicit that the
+ * inbox is marked by the durable `is_inbox` column, never a name convention, so a user
+ * renaming "Triage" must not break this lookup or cause a second Triage project to appear.
+ */
+async function findOrCreateTriageProject(tx: Tx, organizationId: string): Promise<string> {
+	const existing = await tx
+		.select({ id: projects.id })
+		.from(projects)
+		.where(and(eq(projects.organizationId, organizationId), eq(projects.isInbox, true)));
+
+	if (existing.length > 0) {
+		return existing[0].id;
+	}
+
+	// Inbox projects get no API key (§2) -- apiKey/apiKeyHash are NOT NULL columns, so this
+	// stores inert placeholder values rather than a usable credential. Nothing in the ingestion
+	// path (auth/apikey.go) can ever look these up, since it only ever queries by hash of a real
+	// SDK-issued key, and this project is never handed a real one.
+	// `projects.api_key` is `varchar(64)` (schema.ts). `inbox_` (6 chars) + hex(randomBytes(n)) must
+	// fit inside that, so n <= 29 -- 24 bytes (48 hex chars, 54 total) leaves headroom while keeping
+	// plenty of entropy for a value nothing ever looks up by. `randomBytes(32)` here silently
+	// exceeded the column (70 chars) and every first-use Triage provisioning threw
+	// `value too long for type character varying(64)` -- caught by the M1 end-to-end flow test
+	// (reports.e2e-flow.integration.test.ts) against a real migrated Postgres, not by any mock-based
+	// unit test, because mocked `db.transaction` calls never round-trip through Postgres's column
+	// typing.
+	// R2 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): this SELECT-then-INSERT has a window
+	// between the SELECT above and this INSERT where a concurrent call for the same org can win
+	// the race -- without a uniqueness constraint, two concurrent first-uses both insert an inbox
+	// project. `idx_projects_org_inbox_unique` (partial unique on
+	// projects(organization_id) WHERE is_inbox, 1723000000_pr13_remediation.sql) makes the loser's
+	// INSERT a no-op (`onConflictDoNothing`) instead of a duplicate row; the loser then re-selects
+	// to return the WINNER's project id rather than its own discarded insert.
+	const placeholder = crypto.randomBytes(24).toString('hex');
+	const [created] = await tx
+		.insert(projects)
+		.values({
+			organizationId,
+			name: 'Triage',
+			apiKey: `inbox_${placeholder}`,
+			apiKeyHash: crypto.createHash('sha256').update(placeholder).digest('hex'),
+			isInbox: true,
+		})
+		// NOTE: `onConflictDoNothing`'s partial-index predicate option is named `where` in this
+		// drizzle-orm version (0.30.10), NOT `targetWhere` -- `targetWhere`/`setWhere` only exist on
+		// `onConflictDoUpdate` here. Passing `targetWhere` here compiles (same config type is
+		// accepted) but is silently DROPPED from the generated SQL, producing a bare
+		// `on conflict ("organization_id") do nothing` with no `WHERE is_inbox` -- which Postgres
+		// then rejects at runtime with 42P10 "no unique or exclusion constraint matching the ON
+		// CONFLICT specification", since the arbiter can't be inferred without the partial
+		// predicate. Caught by reports.e2e-flow.integration.test.ts against a real migrated
+		// Postgres, not by the mock-based unit test above (which never executes real SQL).
+		.onConflictDoNothing({ target: [projects.organizationId], where: eq(projects.isInbox, true) })
+		.returning({ id: projects.id });
+
+	if (created) {
+		return created.id;
+	}
+
+	// Lost the race: some other concurrent call already created (and committed, or is about to
+	// commit) the inbox project. Re-select to return the winner's id.
+	const [winner] = await tx
+		.select({ id: projects.id })
+		.from(projects)
+		.where(and(eq(projects.organizationId, organizationId), eq(projects.isInbox, true)));
+
+	if (!winner) {
+		// Should be unreachable (the conflict target guarantees a winning row exists), but throw
+		// rather than return undefined -- D18: never signal failure by returning early with a
+		// falsy value from inside a transaction callback.
+		throw new Error('Triage project conflict resolution found no winner');
+	}
+
+	return winner.id;
+}
+
+export interface CreateManualIssueInput {
+	organizationId: string;
+	projectId: string | null;
+	reporterId: string;
+	title: string;
+	bodyMd: string;
+	severity: ReportSeverity;
+	sourceChannel?: 'manual_support' | 'api';
+	/**
+	 * §4.8a: the caller's environment assertion, read by the route from the body field
+	 * `environment` or the `X-Sentinel-Environment` header (body wins). Absent, `null` and `''` are
+	 * all "not asserted" and fall through to `production`. The route rejects a PRESENT value that
+	 * fails §3's pattern with a 400 before it reaches here; this field is `string | null` rather
+	 * than a validated brand because the resolution below is total either way.
+	 */
+	environment?: string | null;
+	/**
+	 * Manual Issues M2 (design §4): ids of DRAFT attachments (uploaded via POST /api/uploads,
+	 * issue_id/comment_id still NULL) to claim onto the new issue in the SAME transaction as its
+	 * creation. Ownership/org checks happen in `claimDraftAttachments` below, not here.
+	 */
+	attachmentIds?: string[];
+}
+
+/**
+ * §2: a manual issue IS an `issues` row (issue_type='user_report') plus a 1:1
+ * `manual_issue_reports` companion, created together with a `report_created`-shaped activity
+ * entry. `fingerprint` is a random UUID hex -- manual issues are never deduped by fingerprint,
+ * only `UNIQUE(project_id, fingerprint)` needs satisfying. `error_class` is the fixed literal
+ * `'user_report'`; `message` mirrors the report title so the existing issues list/search
+ * columns render something sensible if ever viewed unfiltered.
+ *
+ * D18: throws instead of returning early from inside the transaction callback -- a partial
+ * failure (e.g. the report insert violating a CHECK) must roll back the issues insert and the
+ * Triage provisioning together, not commit a half-created report.
+ */
+export async function createManualIssue(input: CreateManualIssueInput) {
+	const title = input.title.trim();
+	if (title.length === 0) {
+		throw new Error('title must not be empty');
+	}
+
+	return await db.transaction(async (tx) => {
+		const projectId = input.projectId ?? (await findOrCreateTriageProject(tx, input.organizationId));
+
+		const fingerprint = crypto.randomBytes(16).toString('hex');
+
+		const [issue] = await tx
+			.insert(issues)
+			.values({
+				projectId,
+				// §4.8a. The registry is NOT consulted: findOrCreateTriageProject provisions inbox
+				// projects on first use and a fresh project has zero declared environments
+				// (decision 8), so a rule that required a registry row would fail the first report
+				// into every new organisation.
+				environment: resolveReportEnvironment(input.environment),
+				fingerprint,
+				message: title,
+				errorClass: 'user_report',
+				issueType: 'user_report',
+				sourceChannel: input.sourceChannel ?? 'manual_support',
+			})
+			.returning();
+
+		if (!issue) {
+			throw new Error('Failed to create issue row for manual report');
+		}
+
+		const [report] = await tx
+			.insert(manualIssueReports)
+			.values({
+				issueId: issue.id,
+				reporterId: input.reporterId,
+				bodyMd: input.bodyMd,
+				severity: input.severity,
+			})
+			.returning();
+
+		// R12 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): creation writes 'report_created', not
+		// 'report_edited' -- the latter previously mislabeled creation as an edit; it is now
+		// reserved for R11's actual body/title/severity edits.
+		await tx.insert(issueActivity).values({
+			issueId: issue.id,
+			eventType: 'report_created',
+			actorType: 'user',
+			actorId: input.reporterId,
+			newValue: { action: 'created', title, severity: input.severity, projectId },
+		});
+
+		// §8 auto-subscribe: the reporter is subscribed to their own report. No fan-out here --
+		// nobody else is subscribed to a brand-new issue yet, so notifyIssueEvent would be a no-op.
+		await subscribe(
+			{ issueId: issue.id, subscriberType: 'user', subscriberId: input.reporterId, reason: 'reporter' },
+			tx
+		);
+
+		// §4/§4 linking step: claim any DRAFT attachments onto the new issue, in the SAME
+		// transaction as creation. Folds into the creation activity above rather than writing a
+		// second `attachment_added` row per design §6 ("... or fold into creation activity").
+		if (input.attachmentIds && input.attachmentIds.length > 0) {
+			const claimed = await claimDraftAttachments(
+				tx,
+				input.attachmentIds,
+				issue.id,
+				input.reporterId,
+				input.organizationId
+			);
+
+			if (claimed.length > 0) {
+				await tx.insert(issueActivity).values({
+					issueId: issue.id,
+					eventType: 'attachment_added',
+					actorType: 'user',
+					actorId: input.reporterId,
+					newValue: { attachmentIds: claimed.map((a) => a.id) },
+				});
+			}
+		}
+
+		return { issue, report };
+	});
+}
+
+/**
+ * Thrown by `createExternalIssueReport` when an id in §4.1's `attachments` array is unknown,
+ * already claimed, uploaded by a different reporter, or belongs to another organization.
+ *
+ * §4.1 is explicit that this is all-or-nothing: "Each must be a draft attachment in this key's
+ * organization or the whole request is `400 attachment_not_found` and **nothing is created**" --
+ * which is the opposite of `claimDraftAttachments`' own contract, where a stale id is silently
+ * skipped so a browser form does not lose a whole report over one expired draft. Both are right
+ * for their caller, so the strictness lives here rather than being pushed down into the shared
+ * helper and changing behaviour for `/reports/new`.
+ *
+ * Thrown, never returned: D18 -- returning early from inside a `db.transaction` callback COMMITS
+ * whatever the callback already did, which here would be a report with half its screenshots.
+ */
+export class ReportAttachmentNotFoundError extends Error {
+	constructor() {
+		super('One or more attachment ids are unknown, already claimed, or not in this organization');
+		this.name = 'ReportAttachmentNotFoundError';
+	}
+}
+
+export interface CreateExternalIssueReportInput {
+	/** From the credential, never the body (B7). Used for the attachment tenancy check. */
+	organizationId: string;
+	/** Always known: the key fixes it, or `X-Project-Key`/`project_key` resolved inside the org. */
+	projectId: string;
+	/** `external_reporters.id`, already upserted for `(project_id, external_id)`. */
+	externalReporterId: string;
+	/** Supplied by the caller, or derived by §4.5a. `issues.message` is NOT NULL either way. */
+	title: string;
+	/** §4.1's `text`, stored as Markdown -- sanitised at render, never trusted (design §3). */
+	bodyMd: string;
+	severity: ReportSeverity;
+	/** §4.1's `context` verbatim, unknown keys kept. */
+	context: Record<string, unknown>;
+	/** Stored on the companion row for provenance; the dedupe itself is `idempotency` below. */
+	idempotencyKey: string | null;
+	/** §4.5 draft attachment ids, at most 5, all-or-nothing (see the error above). */
+	attachmentIds: string[];
+	/**
+	 * When present, `report_idempotency_keys` gets its row in THIS transaction. A duplicate key
+	 * therefore fails the whole transaction and creates nothing -- see `report-idempotency.ts`'s
+	 * header for why reserving the key in a separate earlier statement would not deduplicate
+	 * concurrent requests at all.
+	 */
+	idempotency?: { apiKeyId: string; idempotencyKey: string; requestHash: string } | null;
+}
+
+/**
+ * sentinel-user-report-issue §4.1 + §4.6 (OQ-6): creates one externally-submitted report.
+ *
+ * An `issues` row (`issue_type='user_report'`, `source_channel='user_report_api'`) plus its 1:1
+ * `external_issue_reports` companion -- **`manual_issue_reports` is not written**, which is the
+ * decision OQ-6 records and §1's "the org-member report path is not widened" promises. The two
+ * companions are siblings, never alternatives to each other on the same row.
+ *
+ * Deliberately NOT `createManualIssue` with a different `sourceChannel`: that function writes
+ * `manual_issue_reports`, subscribes `reporterId` as a `users` row, and can lazily provision the
+ * Triage inbox project. An external reporter is not a Sentinel user, has no subscription, and its
+ * project is fixed by the credential -- three things that would have had to become conditional
+ * inside a shipped path this feature promises not to touch.
+ *
+ * D18 throughout: every failure throws so the transaction rolls back. Nothing here returns early.
+ */
+export async function createExternalIssueReport(input: CreateExternalIssueReportInput) {
+	const title = input.title.trim();
+	if (title.length === 0) {
+		// Unreachable through the endpoint -- §4.5a's derivation is total and falls back to
+		// "User report" -- but `issues.message` is NOT NULL and a caller of this function directly
+		// must not be able to write an empty one.
+		throw new Error('title must not be empty');
+	}
+
+	return await db.transaction(async (tx) => {
+		// Manual issues are never deduped by fingerprint; only UNIQUE(project_id, fingerprint) needs
+		// satisfying. Same rule for external ones -- §4.1's dedupe is `idempotency_key`, and a
+		// content fingerprint would silently merge two users reporting the same wording.
+		const fingerprint = crypto.randomBytes(16).toString('hex');
+
+		const [issue] = await tx
+			.insert(issues)
+			.values({
+				projectId: input.projectId,
+				// §4.8a: `context.environment` IS this route's assertion -- it is already one of the
+				// four keys parseContext type-checks, and adding a second top-level field beside it
+				// would mean a client that set only the shipped key got a report filed as
+				// `production` whose triage matched against `staging`. The context object itself is
+				// still stored VERBATIM on the companion row below, including a non-matching
+				// "Production": this resolution changes what the issue is filed under, never what
+				// was recorded as sent.
+				environment: resolveReportEnvironment(input.context.environment),
+				fingerprint,
+				message: title,
+				errorClass: 'user_report',
+				issueType: 'user_report',
+				// OQ-8's new `issues_source_channel_check` value. This is what the /reports filter and
+				// badge separate on, and what tells every existing reader of `user_report` rows that
+				// this one came from an untrusted external caller.
+				sourceChannel: 'user_report_api',
+			})
+			.returning();
+
+		if (!issue) {
+			throw new Error('Failed to create issue row for external report');
+		}
+
+		const [report] = await tx
+			.insert(externalIssueReports)
+			.values({
+				issueId: issue.id,
+				externalReporterId: input.externalReporterId,
+				bodyMd: input.bodyMd,
+				severity: input.severity,
+				context: input.context,
+				idempotencyKey: input.idempotencyKey,
+			})
+			.returning();
+
+		if (!report) {
+			throw new Error('Failed to create external_issue_reports row');
+		}
+
+		// The same `report_created` entry the org-member path writes, so an external report's
+		// timeline is not empty. `actor_type` is 'system' because the CHECK admits only
+		// user|agent|system and an external reporter is none of the three -- it is DATA, never a
+		// Sentinel principal (§2). Who it was is in `new_value.externalReporterId`, not in
+		// `actor_id`, so nothing downstream can mistake a reporter id for a user id.
+		await tx.insert(issueActivity).values({
+			issueId: issue.id,
+			eventType: 'report_created',
+			actorType: 'system',
+			actorId: 'user_report_api',
+			newValue: {
+				action: 'created',
+				source: 'user_report_api',
+				externalReporterId: input.externalReporterId,
+				severity: input.severity,
+				projectId: input.projectId,
+			},
+		});
+
+		// §4.5's draft-then-claim handoff, in the SAME transaction as creation (the item names
+		// `reports.ts:225` for exactly this). All-or-nothing, unlike the org-member path.
+		if (input.attachmentIds.length > 0) {
+			const claimed = await claimDraftAttachments(
+				tx,
+				input.attachmentIds,
+				issue.id,
+				input.externalReporterId,
+				input.organizationId,
+				'external_reporter'
+			);
+
+			if (claimed.length !== input.attachmentIds.length) {
+				throw new ReportAttachmentNotFoundError();
+			}
+
+			await tx.insert(issueActivity).values({
+				issueId: issue.id,
+				eventType: 'attachment_added',
+				actorType: 'system',
+				actorId: 'user_report_api',
+				newValue: { attachmentIds: claimed.map((a) => a.id) },
+			});
+		}
+
+		if (input.idempotency) {
+			await insertReportIdempotency(tx, { ...input.idempotency, issueId: issue.id });
+		}
+
+		return { issue, report };
+	});
+}
+
+/**
+ * §4 linking: claims DRAFT attachments (issue_id/comment_id both NULL) onto `issueId`. Each
+ * candidate id is verified to (a) exist, (b) still be a draft, (c) belong to `organizationId`
+ * (B7: tenant scope from the caller's already-established org, never re-derived from the
+ * attachment row), and (d) have been uploaded by `uploaderId` -- a caller cannot claim someone
+ * else's draft upload onto their own report. Ids that fail any check are silently skipped rather
+ * than throwing (a stale/foreign id in the array must not abort creating the whole report) --
+ * callers that need to know what was actually claimed use the returned array.
+ */
+export async function claimDraftAttachments(
+	tx: Tx,
+	attachmentIds: string[],
+	issueId: string,
+	uploaderId: string,
+	organizationId: string,
+	uploaderType: AttachmentUploaderType = 'user'
+): Promise<{ id: string }[]> {
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { issueId }, uploaderId, organizationId, uploaderType);
+}
+
+/**
+ * Manual Issues M3 (design §5 groundwork, §4): the comment-attachment sibling of
+ * `claimDraftAttachments` -- same verification (still a draft, same org (B7), uploaded by the
+ * commenting author), just setting `comment_id` instead of `issue_id`. Both delegate to
+ * `claimDraftAttachmentsOnto` below so the verification logic cannot drift between the two call
+ * sites.
+ */
+export async function claimDraftAttachmentsForComment(
+	tx: Tx,
+	attachmentIds: string[],
+	commentId: string,
+	authorId: string,
+	organizationId: string,
+	uploaderType: AttachmentUploaderType = 'user'
+): Promise<{ id: string }[]> {
+	return await claimDraftAttachmentsOnto(tx, attachmentIds, { commentId }, authorId, organizationId, uploaderType);
+}
+
+// R10 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md): `uploaderType` is now matched alongside
+// `uploaderId`, not just `uploaderId` alone -- `attachments.uploader_id` is a bare varchar shared
+// across the 'user' and 'agent' id spaces (users.id vs. agents.id), so an id collision between
+// the two (unlikely, but not prevented by any constraint) previously let a caller's draft claim
+// silently match a same-valued id from the OTHER actor type.
+async function claimDraftAttachmentsOnto(
+	tx: Tx,
+	attachmentIds: string[],
+	target: { issueId: string } | { commentId: string },
+	uploaderId: string,
+	organizationId: string,
+	uploaderType: AttachmentUploaderType = 'user'
+): Promise<{ id: string }[]> {
+	if (attachmentIds.length === 0) {
+		return [];
+	}
+
+	const claimed: { id: string }[] = [];
+
+	for (const attachmentId of attachmentIds) {
+		const rows = await tx
+			.select({
+				id: attachments.id,
+				orgId: attachments.orgId,
+				uploaderId: attachments.uploaderId,
+				uploaderType: attachments.uploaderType,
+				issueId: attachments.issueId,
+				commentId: attachments.commentId,
+				status: attachments.status,
+			})
+			.from(attachments)
+			.where(eq(attachments.id, attachmentId));
+
+		const row = rows[0];
+		if (
+			!row ||
+			row.orgId !== organizationId ||
+			row.uploaderId !== uploaderId ||
+			row.uploaderType !== uploaderType ||
+			row.issueId !== null ||
+			row.commentId !== null ||
+			// M6 Feature A: the load-bearing security property -- a 'pending' object (bytes not yet
+			// validated by finalize's ranged-GET sniff) must never become linkable.
+			row.status !== 'ready'
+		) {
+			continue;
+		}
+
+		const updated = await tx
+			.update(attachments)
+			.set(target)
+			.where(
+				and(
+					eq(attachments.id, attachmentId),
+					isNull(attachments.issueId),
+					isNull(attachments.commentId),
+					// Defense-in-depth alongside the pre-check above: even under a race, the
+					// conditional UPDATE itself refuses to flip a 'pending' row's parent.
+					eq(attachments.status, 'ready')
+				)
+			)
+			.returning({ id: attachments.id });
+
+		if (updated.length > 0) {
+			claimed.push(updated[0]);
+		}
+	}
+
+	return claimed;
+}
+
+/**
+ * §4: fetches an attachment row by id, or null. Used by both the download route (access-control
+ * decisions) and reaping.
+ */
+export async function getAttachmentById(attachmentId: string) {
+	const rows = await db.select().from(attachments).where(eq(attachments.id, attachmentId));
+	return rows[0] ?? null;
+}
+
+/**
+ * Manual Issues M2 (design §4/§10): attachments linked to a given issue, oldest first, for the
+ * report detail page's attachments section. Deliberately does not include DRAFT attachments
+ * (issueId still NULL) -- those only ever exist transiently on the /reports/new form, before the
+ * issue they'll be claimed onto has been created.
+ */
+export async function listIssueAttachments(issueId: string) {
+	return await db
+		.select()
+		.from(attachments)
+		.where(eq(attachments.issueId, issueId))
+		.orderBy(attachments.createdAt);
+}
+
+
+export type ReportTab = 'all' | 'mine' | 'claimed-by-me' | 'unclaimed' | 'needs-input' | 'triage';
+
+/**
+ * sentinel-user-report-issue *Decisions taken*, OQ-8: the separation between an org-member report
+ * and an externally-submitted one is `issues.source_channel` plus a filter and a badge -- not the
+ * `is_inbox` Triage project, and not nothing. This is the filter half; the badge is fe.md's.
+ */
+export const REPORT_SOURCE_CHANNELS = ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'] as const;
+
+export type ReportSourceChannel = (typeof REPORT_SOURCE_CHANNELS)[number];
+
+export interface ListReportsOptions {
+	organizationId: string;
+	tab: ReportTab;
+	userId: string;
+	/** Restrict to a set of project ids the caller may see (viewer scoping mirrors issues.ts). */
+	accessibleProjectIds?: Set<string> | null;
+	/** OQ-8's `source` filter. Omitted = every source, which is the pre-existing behaviour. */
+	source?: ReportSourceChannel;
+}
+
+/**
+ * §10: tabs All / My reports / Claimed by me / Unclaimed / Needs input / Triage. All tabs are
+ * scoped to `issue_type='user_report'` (§9 strict separation is the whole point of this table
+ * existing alongside issues.ts's error-dashboard queries, not a shared listing).
+ */
+export async function listReports({ organizationId, tab, userId, accessibleProjectIds, source }: ListReportsOptions) {
+	const conditions = [eq(projects.organizationId, organizationId), eq(issues.issueType, 'user_report')];
+
+	// sentinel-project-environments §2.2, decision 36 — **a guard point of its own, and
+	// `requireIssueAccessAnyType`'s does not reach it.** `GET /api/organizations/{orgId}/reports`
+	// guards at the ORGANIZATION level (`requireReportAccess(userId, orgId, 'read')`) and then hands
+	// this function `accessibleProjectIds = null` — the whole organization — for any role above
+	// `viewer`, so the per-issue dispatch never runs on this path. §4.8a writes the literal
+	// `production` on every report with no client assertion, so without this predicate a member
+	// granted only `{staging}` reads most of the organization's reports, and §12 *Known limits* 5 is
+	// a promise the product does not keep.
+	//
+	// Resolved PER PROJECT and from `userId` — the caller's own id, the same one the `mine` and
+	// `claimed-by-me` tabs use. The list is org-scoped, so there is no single `projectId` to hand
+	// the single-project resolver; a per-organization scope would pass the narrow case and leak the
+	// one that matters (narrowed in project A, unrestricted in project B).
+	//
+	// **The tab counts.** There is no count query on `main` — the tabs are unbadged links and any
+	// number on that page is derived from the rows this function returned, so "the count agrees with
+	// the list" holds by construction. The first count anybody adds must carry this same predicate.
+	const environmentScope = environmentScopeCondition(await resolveEnvironmentScopes(userId));
+	if (environmentScope) {
+		conditions.push(environmentScope);
+	}
+
+	switch (tab) {
+		case 'mine':
+			conditions.push(eq(manualIssueReports.reporterId, userId));
+			break;
+		case 'claimed-by-me':
+			conditions.push(eq(issues.assignedTo, userId));
+			conditions.push(eq(issues.assigneeType, 'user'));
+			break;
+		case 'unclaimed':
+			conditions.push(isNull(issues.assignedTo));
+			break;
+		case 'needs-input':
+			// R7: waitingOn is now cleared on resolve/ignore, so this condition alone should already
+			// exclude them going forward -- kept as an explicit filter too (belt-and-suspenders) for
+			// any pre-existing row from before that fix still carries a stale waitingOn value.
+			conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
+			conditions.push(eq(issues.status, 'unresolved'));
+			break;
+		case 'triage':
+			conditions.push(eq(projects.isInbox, true));
+			break;
+		case 'all':
+		default:
+			break;
+	}
+
+	if (accessibleProjectIds) {
+		if (accessibleProjectIds.size === 0) {
+			return [];
+		}
+		conditions.push(sql`${issues.projectId} IN (${sql.join(
+			[...accessibleProjectIds].map((id) => sql`${id}`),
+			sql`, `
+		)})`);
+	}
+
+	if (source) {
+		conditions.push(eq(issues.sourceChannel, source));
+	}
+
+	// §4.2's correction, applied to the list: a `user_report` issue has EXACTLY ONE companion, and
+	// which table it lives in depends on which door it came through. Requiring one of the two keeps
+	// this query's original guarantee (never surface a `system_error` row through the reports list)
+	// while no longer silently dropping every report this feature creates.
+	conditions.push(
+		sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+	);
+
+	const rows = await db
+		.select({
+			issue: issues,
+			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
+			projectName: projects.name,
+			projectIsInbox: projects.isInbox,
+			reporterName: users.name,
+			reporterEmail: users.email,
+			// M3 (design §5/§10): the "Comments" column that rendered "–" in M1 -- a correlated
+			// scalar subquery rather than a join+group, since a join would fan the base row out
+			// once per comment and force an outer aggregation this query didn't otherwise need.
+			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
+		})
+		.from(issues)
+		// §4.2's correction: LEFT, not INNER. An externally-submitted report has no
+		// `manual_issue_reports` row and no `"user"` row (Decisions taken, OQ-6), so the INNER join
+		// this used to carry returned nothing for every report this feature creates.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
+		.innerJoin(projects, eq(projects.id, issues.projectId))
+		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
+		.where(and(...conditions))
+		.orderBy(desc(issues.firstSeen));
+
+	return rows.map(withUnifiedReportFields);
+}
+
+/**
+ * The two companions, reduced to the fields every reader of a report needs regardless of which
+ * door it came through. Added, never substituted: `report`, `reporterName` and `reporterEmail`
+ * keep exactly the values they had before this feature for an org-member report, so §6's "no
+ * field removed, no type or nullability changed" holds for the existing `fe` consumer.
+ */
+function withUnifiedReportFields<
+	T extends {
+		report: typeof manualIssueReports.$inferSelect | null;
+		externalReport: typeof externalIssueReports.$inferSelect | null;
+		externalReporter: typeof externalReporters.$inferSelect | null;
+		reporterName: string | null;
+		reporterEmail: string | null;
+	}
+>(row: T) {
+	const isExternal = row.externalReport !== null;
+	return {
+		...row,
+		/** §4.2 `reporter.kind`. */
+		reporterKind: (isExternal ? 'external' : 'org_member') as 'external' | 'org_member',
+		// Both queries that call this require one companion or the other in their WHERE, so exactly
+		// one of the two is present and these are `string`, not `string | null`. The `!` is that
+		// predicate restated for the type checker -- delete the predicate and this becomes a lie.
+		/** The report text, from whichever companion holds it. */
+		bodyMd: row.report ? row.report.bodyMd : row.externalReport!.bodyMd,
+		/** The severity, from whichever companion holds it. */
+		severity: row.report ? row.report.severity : row.externalReport!.severity,
+		/** §4.2 `reporter.displayName`. */
+		reporterDisplayName: isExternal ? (row.externalReporter?.displayName ?? null) : row.reporterName,
+		/** §4.2 `reporter.email`. The UI must not render an external reporter's address as a mailto
+		 *  link -- there is no reply channel (§1). */
+		reporterEmailAddress: isExternal ? (row.externalReporter?.email ?? null) : row.reporterEmail,
+		/** §4.2 `reporter.externalId`. `null` for an org member. */
+		reporterExternalId: isExternal ? (row.externalReporter?.externalId ?? null) : null,
+		/** §4.2 `reporter.firstSeenAt`. `null` for an org member. */
+		reporterFirstSeenAt: isExternal ? (row.externalReporter?.firstSeenAt ?? null) : null,
+		/** §4.2 `context`, verbatim, or `null` for an org-member report. */
+		context: (row.externalReport?.context ?? null) as Record<string, unknown> | null,
+	};
+}
+
+/**
+ * §10, single-report detail view: the issue, its manual_issue_reports companion, project, and
+ * reporter, in one row. Returns null if the issue does not exist or is not a manual report
+ * (callers should treat both the same -- 404, never leak a system_error issue through this path).
+ */
+export async function getReportDetail(issueId: string) {
+	const rows = await db
+		.select({
+			issue: issues,
+			report: manualIssueReports,
+			externalReport: externalIssueReports,
+			externalReporter: externalReporters,
+			projectId: projects.id,
+			projectName: projects.name,
+			projectIsInbox: projects.isInbox,
+			organizationId: projects.organizationId,
+			reporterName: users.name,
+			reporterEmail: users.email,
+			// M3: same "Comments" count surfacing as listReports above.
+			commentCount: sql<number>`(select count(*)::int from ${issueComments} where ${issueComments.issueId} = ${issues.id})`,
+		})
+		.from(issues)
+		// §4.2's correction, and the reason this endpoint 404'd for every externally-submitted
+		// report: LEFT, not INNER, on both the org-member companion and the `"user"` row, plus the
+		// external companion and its reporter. The guard that made the INNER join safe -- "never
+		// leak a `system_error` issue through this path" -- is now the explicit predicate below.
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
+		.innerJoin(projects, eq(projects.id, issues.projectId))
+		.leftJoin(users, eq(users.id, manualIssueReports.reporterId))
+		.where(
+			and(
+				eq(issues.id, issueId),
+				eq(issues.issueType, 'user_report'),
+				sql`(${manualIssueReports.issueId} IS NOT NULL OR ${externalIssueReports.issueId} IS NOT NULL)`
+			)
+		);
+
+	const row = rows[0];
+	return row ? withUnifiedReportFields(row) : null;
+}
+
+/**
+ * §2/§10 write-role "move to project" action: re-homes a manual issue and logs a `moved`
+ * activity entry with old/new project ids. D18: throw, don't return, on a bad target.
+ *
+ * §8 M4 scope note: deliberately NO notifyIssueEvent call here. `notifications.kind`'s CHECK
+ * constraint only allows the catalog in the design doc (commented|claimed|status_changed|
+ * resolved|linked|progress_update|question_asked) -- 'moved' is not among them, and folding a
+ * move under 'status_changed' would be semantically wrong (nothing about the issue's status
+ * changed). A move gets no notification in v1; revisit if/when the CHECK grows a 'moved' kind.
+ */
+export async function moveIssueToProject(
+	issueId: string,
+	targetProjectId: string,
+	actorType: 'user' | 'agent' | 'system',
+	actorId: string
+) {
+	return await db.transaction(async (tx) => {
+		const [existing] = await tx
+			.select({ projectId: issues.projectId })
+			.from(issues)
+			.where(eq(issues.id, issueId));
+
+		if (!existing) {
+			throw new Error(`Issue ${issueId} not found`);
+		}
+
+		const [targetProject] = await tx
+			.select({ id: projects.id })
+			.from(projects)
+			.where(eq(projects.id, targetProjectId));
+
+		if (!targetProject) {
+			throw new Error(`Project ${targetProjectId} not found`);
+		}
+
+		await tx.update(issues).set({ projectId: targetProjectId }).where(eq(issues.id, issueId));
+
+		await tx.insert(issueActivity).values({
+			issueId,
+			eventType: 'moved',
+			actorType,
+			actorId,
+			oldValue: { projectId: existing.projectId },
+			newValue: { projectId: targetProjectId },
+		});
+
+		return { issueId, fromProjectId: existing.projectId, toProjectId: targetProjectId };
+	});
+}
+
+export interface UpdateManualIssueReportInput {
+	issueId: string;
+	actorId: string;
+	title?: string;
+	bodyMd?: string;
+	severity?: ReportSeverity;
+	/** N7e (A09): who made this edit, for the `report_edited` activity row's `actorType`. Defaults
+	 *  to 'user' -- every pre-existing caller (the session-authenticated route) is a user and must
+	 *  keep attributing edits to 'user' unchanged; only the agent severity op passes 'agent'. */
+	actorType?: 'user' | 'agent';
+}
+
+/**
+ * R11 (docs/plans/PR13_REVIEW_REMEDIATION_PLAN.md, §9): author-only edit of a report's
+ * title/body/severity, until the issue is resolved (enforced by the route layer, not here --
+ * this function trusts the caller already checked `canEditReport` + issue status). Updates
+ * `issues.message` (title mirror) and/or `manual_issue_reports.body_md`/`severity` in one
+ * transaction with a `report_edited` activity row carrying old/new values (D18: throw, not
+ * return, on a missing issue/report so a partial update never commits).
+ */
+export async function updateManualIssueReport(input: UpdateManualIssueReportInput) {
+	return await db.transaction(async (tx) => {
+		const [existingIssue] = await tx
+			.select({ id: issues.id, message: issues.message })
+			.from(issues)
+			.where(eq(issues.id, input.issueId));
+
+		if (!existingIssue) {
+			throw new Error(`Issue ${input.issueId} not found`);
+		}
+
+		// §4.2's correction reaches this write too: a `user_report` issue has exactly one companion
+		// and it may be the external one. Looking only at `manual_issue_reports` made the agent
+		// severity op (agent-ops.ts, A09) throw "Report not found" -- a 500 -- for every report this
+		// feature creates. `companion` names which table the rest of this function updates.
+		const [existingManualReport] = await tx
+			.select({ bodyMd: manualIssueReports.bodyMd, severity: manualIssueReports.severity })
+			.from(manualIssueReports)
+			.where(eq(manualIssueReports.issueId, input.issueId));
+
+		const [existingExternalReport] = existingManualReport
+			? []
+			: await tx
+					.select({ bodyMd: externalIssueReports.bodyMd, severity: externalIssueReports.severity })
+					.from(externalIssueReports)
+					.where(eq(externalIssueReports.issueId, input.issueId));
+
+		const existingReport = existingManualReport ?? existingExternalReport;
+		const companion = existingManualReport ? manualIssueReports : externalIssueReports;
+
+		if (!existingReport) {
+			throw new Error(`Report ${input.issueId} not found`);
+		}
+
+		const oldValue: Record<string, unknown> = {};
+		const newValue: Record<string, unknown> = {};
+
+		if (input.title !== undefined && input.title !== existingIssue.message) {
+			oldValue.title = existingIssue.message;
+			newValue.title = input.title;
+			await tx.update(issues).set({ message: input.title }).where(eq(issues.id, input.issueId));
+		}
+
+		const reportUpdate: { bodyMd?: string; severity?: string } = {};
+		if (input.bodyMd !== undefined && input.bodyMd !== existingReport.bodyMd) {
+			oldValue.bodyMd = existingReport.bodyMd;
+			newValue.bodyMd = input.bodyMd;
+			reportUpdate.bodyMd = input.bodyMd;
+		}
+		if (input.severity !== undefined && input.severity !== existingReport.severity) {
+			oldValue.severity = existingReport.severity;
+			newValue.severity = input.severity;
+			reportUpdate.severity = input.severity;
+		}
+		if (Object.keys(reportUpdate).length > 0) {
+			await tx.update(companion).set(reportUpdate).where(eq(companion.issueId, input.issueId));
+		}
+
+		if (Object.keys(newValue).length > 0) {
+			await tx.insert(issueActivity).values({
+				issueId: input.issueId,
+				eventType: 'report_edited',
+				actorType: input.actorType ?? 'user',
+				actorId: input.actorId,
+				oldValue,
+				newValue,
+			});
+		}
+
+		const [updatedIssue] = await tx.select().from(issues).where(eq(issues.id, input.issueId));
+		const [updatedReport] = await tx
+			.select()
+			.from(companion)
+			.where(eq(companion.issueId, input.issueId));
+
+		return { issue: updatedIssue, report: updatedReport };
+	});
+}
+
+/**
+ * R11 (§9, R6): deletes a manual issue entirely (author until resolved, owner/admin anytime --
+ * enforced by the route layer). `issues` row delete cascades away `manual_issue_reports`,
+ * `issue_activity`, `issue_comments`, `issue_subscriptions`, and `attachments` rows (all FK
+ * `ON DELETE CASCADE`, schema.ts) -- but MinIO has no transactional participation in that
+ * cascade, so attachment storage_keys (both linked directly to the issue AND to one of its
+ * comments) are collected BEFORE the delete, same pattern as retention.ts's R6 fix and
+ * `deleteComment` (queries/comments.ts). Returns the collected keys so the route can best-effort
+ * delete the objects AFTER the transaction commits.
+ */
+export async function deleteManualIssue(issueId: string): Promise<{ storageKeys: string[] }> {
+	return await db.transaction(async (tx) => {
+		const [existingIssue] = await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId));
+		if (!existingIssue) {
+			throw new Error(`Issue ${issueId} not found`);
+		}
+
+		const commentRows = await tx
+			.select({ id: issueComments.id })
+			.from(issueComments)
+			.where(eq(issueComments.issueId, issueId));
+		const commentIds = commentRows.map((row) => row.id);
+
+		const directAttachmentRows = await tx
+			.select({ storageKey: attachments.storageKey })
+			.from(attachments)
+			.where(eq(attachments.issueId, issueId));
+
+		let commentAttachmentRows: { storageKey: string }[] = [];
+		if (commentIds.length > 0) {
+			commentAttachmentRows = await tx
+				.select({ storageKey: attachments.storageKey })
+				.from(attachments)
+				.where(sql`${attachments.commentId} IN (${sql.join(commentIds.map((id) => sql`${id}`), sql`, `)})`);
+		}
+
+		const storageKeys = [...directAttachmentRows, ...commentAttachmentRows].map((row) => row.storageKey);
+
+		await tx.delete(issues).where(eq(issues.id, issueId));
+
+		return { storageKeys };
+	});
+}
+
+export class ClaimConflictError extends Error {
+	constructor(message = 'Issue is already claimed') {
+		super(message);
+		this.name = 'ClaimConflictError';
+	}
+}
+
+/**
+ * §7/§9: atomic conditional claim -- `WHERE assigned_to IS NULL`, 0 rows updated means someone
+ * else won the race, and this throws `ClaimConflictError` rather than silently no-op'ing (D18:
+ * the caller must be able to distinguish "I claimed it" from "I did nothing"). Works for both
+ * users and agents; `actorType` records which.
+ *
+ * N9 (sentinel-worker plan, contract correction C1): self-reclaim is idempotent, mirroring
+ * releaseClaim's A13 guard below. 0 rows updated used to always mean ClaimConflictError, which
+ * made a plain network retry of a SUCCESSFUL claim (response dropped, agent retries)
+ * wire-indistinguishable from someone else holding the issue. Re-read to tell the two apart: if
+ * the CURRENT claimant is this same actor (both `assignedTo` AND `assigneeType` -- assigned_to is
+ * a bare varchar shared across the user/agent id spaces, see R10), return the existing claim with
+ * `alreadyClaimed: true`, no second activity row, no second notification. Anyone else holding it
+ * is still a real conflict.
+ */
+export async function claimIssue(
+	issueId: string,
+	actorType: 'user' | 'agent',
+	actorId: string
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[]; alreadyClaimed?: boolean }> {
+	return await db.transaction(async (tx) => {
+		const updated = await tx
+			.update(issues)
+			.set({ assigneeType: actorType, assignedTo: actorId, claimedAt: new Date() })
+			.where(and(eq(issues.id, issueId), isNull(issues.assignedTo)))
+			.returning();
+
+		if (updated.length === 0) {
+			const [current] = await tx.select().from(issues).where(eq(issues.id, issueId));
+			if (current && current.assignedTo === actorId && current.assigneeType === actorType) {
+				return { issue: current, notified: [], alreadyClaimed: true };
+			}
+			throw new ClaimConflictError();
+		}
+
+		const notified = await recordClaim(tx, issueId, actorType, actorId);
+
+		return { issue: updated[0], notified };
+	});
+}
+
+/**
+ * The three writes that accompany a successful claim UPDATE, in the claim's own transaction:
+ * the `claimed` activity row, the claimant auto-subscription, and the notification fan-out.
+ * Extracted from `claimIssue` (unchanged behaviour) so `claimNextAgentIssue` (agent-work.ts) --
+ * which wins its row with a different UPDATE (queue-select + SKIP LOCKED) -- records a claim
+ * indistinguishable from a single-issue one instead of drifting its own copy of these rows.
+ * The caller has ALREADY won the row; this never checks.
+ */
+export async function recordClaim(
+	tx: Tx,
+	issueId: string,
+	actorType: 'user' | 'agent',
+	actorId: string
+): Promise<NotifiedUser[]> {
+	await tx.insert(issueActivity).values({
+		issueId,
+		eventType: 'claimed',
+		actorType,
+		actorId,
+		newValue: { assigneeType: actorType, assignedTo: actorId },
+	});
+
+	// §7/§8/M5: the claimant is auto-subscribed (reason 'claimant'), for BOTH actor types as of
+	// M5. M4 only subscribed user claimants (a correct simplification while nothing ever claimed
+	// as an agent); M5's work-loop makes agent claims real, and design §7 step 2 explicitly
+	// requires the subscription ROW to exist ("claimant auto-subscribed") even though
+	// `notifyIssueEvent` (design §8) still skips agent subscribers when building `notifications`
+	// rows -- agents poll comments/activity rather than receive notification rows, so this row's
+	// only consumer today is the subscription-list UI/toggle, not the email/notification fan-out.
+	await subscribe({ issueId, subscriberType: actorType, subscriberId: actorId, reason: 'claimant' }, tx);
+
+	return await notifyIssueEvent(tx, {
+		issueId,
+		kind: 'claimed',
+		actorType,
+		actorId,
+		payload: { assigneeType: actorType, assignedTo: actorId },
+	});
+}
+
+/**
+ * §7: release a claim. Non-force release is itself an atomic conditional UPDATE scoped to the
+ * current claimant (`WHERE assigned_to = $actorId`) so a caller cannot release someone else's
+ * claim by simply calling this with their own id -- that path is `force`, gated by the caller
+ * (owner/admin only, enforced in report-access.ts, not here). 0 rows updated (non-force) throws
+ * `ClaimConflictError` the same way claimIssue does, for the same reason: the caller must be able
+ * to tell "released" from "nothing happened".
+ *
+ * M5: `actorType` used to be hardcoded 'user' here (the M1 stub), which meant an agent release
+ * (via `/api/agent/issues/[id]/claim` DELETE) recorded a false activity/notification actor type
+ * -- the issue_activity row said 'user' even though `actorId` was an agent id. It now defaults to
+ * 'user' only for source compatibility with the session-authenticated route, which never passes
+ * it; callers that release on behalf of an agent MUST pass `actorType: 'agent'`.
+ */
+export async function releaseClaim(
+	issueId: string,
+	actorId: string,
+	options: { force?: boolean; actorType?: 'user' | 'agent' } = {}
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] }> {
+	const actorType = options.actorType ?? 'user';
+	return await db.transaction(async (tx) => {
+		// R10: `assigneeType` is now matched alongside `assignedTo` in the non-force conditional
+		// UPDATE too -- `assigned_to` is a bare varchar shared across the 'user'/'agent' id spaces
+		// (same rationale as claimDraftAttachmentsOnto's uploaderType check above), so without this
+		// an id collision across the two spaces could let one actor type release a claim actually
+		// held by the other.
+		const whereClause = options.force
+			? eq(issues.id, issueId)
+			: and(eq(issues.id, issueId), eq(issues.assignedTo, actorId), eq(issues.assigneeType, actorType));
+
+		const updated = await tx
+			.update(issues)
+			.set({ assigneeType: null, assignedTo: null, claimedAt: null })
+			.where(whereClause)
+			.returning();
+
+		if (updated.length === 0) {
+			// A13 (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7d): 0 rows updated used to always
+			// mean ClaimConflictError, which made a plain network retry of a SUCCESSFUL release
+			// (response dropped, agent retries) wire-indistinguishable from someone else actually
+			// holding the issue. Re-read to tell the two apart: if the issue is simply unclaimed now
+			// (by anyone), the release already happened -- idempotent success, no second activity row,
+			// no second notification. Only "claimed by someone/something else" (or force's target row
+			// having vanished entirely) is a real conflict.
+			const [current] = await tx.select().from(issues).where(eq(issues.id, issueId));
+			if (current && current.assignedTo === null) {
+				return { issue: current, notified: [] };
+			}
+			throw new ClaimConflictError('Issue is not claimed by this actor');
+		}
+
+		await tx.insert(issueActivity).values({
+			issueId,
+			eventType: 'claim_released',
+			actorType,
+			actorId,
+			newValue: { force: Boolean(options.force) },
+		});
+
+		// §8: 'claim_released' is not in notifications.kind's CHECK -- reuse 'claimed' with a
+		// `released: true` payload flag (per the M4 task's instruction), rather than the
+		// activity-timeline eventType.
+		const notified = await notifyIssueEvent(tx, {
+			issueId,
+			kind: 'claimed',
+			actorType,
+			actorId,
+			payload: { released: true, force: Boolean(options.force) },
+		});
+
+		return { issue: updated[0], notified };
+	});
+}
+
+// Not issue-type-specific -- issue_activity is the single shared timeline for both issue
+// types (§6). Re-exported here so callers of the reports query module don't need a second
+// import from queries/issues.ts.
+export { getIssueActivity } from './issues';

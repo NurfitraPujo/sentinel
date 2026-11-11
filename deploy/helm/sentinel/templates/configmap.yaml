@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sentinel.configMapName" . }}
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+data:
+  # Shared, non-secret configuration. Passwords/keys live in the Secret, not here.
+  {{- if include "sentinel.natsUrlIsSecret" . }}
+  # NATS_URL is injected from the Secret (authenticated DSN) — see pod env.
+  {{- else }}
+  NATS_URL: {{ include "sentinel.natsUrl" . | quote }}
+  {{- end }}
+  REDIS_ADDR: {{ include "sentinel.redisAddr" . | quote }}
+  REDIS_DB: {{ .Values.config.redis.db | quote }}
+  S3_ENDPOINT: {{ include "sentinel.s3Endpoint" . | quote }}
+  S3_PUBLIC_ENDPOINT: {{ .Values.config.s3.publicEndpoint | quote }}
+  S3_BUCKET: {{ .Values.config.s3.bucket | quote }}
+  OTEL_SERVICE_NAME_INGESTOR: "ingestor-go"
+  OTEL_SERVICE_NAME_PROCESSOR: "processor-go"
+  OTEL_SERVICE_NAME_DASHBOARD: "dashboard-web"
+  RATELIMIT_STRICT_MODE: {{ .Values.config.ingestor.ratelimitStrictMode | quote }}
+  # Where the dashboard's /settings/observability page fetches processor and ingestor health.
+  # These were never set in this chart, and lib/server/observability.ts falls back to
+  # http://localhost:8081 / :8080 when they are absent — so the dashboard fetched ITSELF on ports
+  # nothing listens on, and the page reported both services "offline" with "Database: unreachable"
+  # while both were healthy. In-cluster service DNS by default; overridable per environment.
+  PROCESSOR_HEALTH_URL: {{ .Values.config.dashboard.processorHealthUrl | default (printf "http://%s-processor:%v" (include "sentinel.fullname" .) .Values.processor.service.port) | quote }}
+  INGESTOR_HEALTH_URL: {{ .Values.config.dashboard.ingestorHealthUrl | default (printf "http://%s-ingestor:%v" (include "sentinel.fullname" .) .Values.ingestor.service.port) | quote }}
+  AUTH_URL: {{ .Values.config.dashboard.authUrl | quote }}
+  AUTH_TRUST_HOST: {{ .Values.config.dashboard.authTrustHost | quote }}
+  SENTINEL_CLI_PROFILE: {{ .Values.config.dashboard.cliProfile | default "" | quote }}
+  # sentinel-cli-browser-login: lifetime of a personal (`sentinel login`) key, in days (1-365; anything else = 90).
+  CLI_PERSONAL_KEY_TTL_DAYS: {{ .Values.config.dashboard.cliPersonalKeyTtlDays | default "90" | quote }}
+  # sentinel-cli-browser-login: adapter-node's client-IP resolution, rendered only when set (values.yaml clientIp).
+  {{- with .Values.config.dashboard.clientIp }}
+  {{- if .addressHeader }}
+  ADDRESS_HEADER: {{ .addressHeader | quote }}
+  {{- end }}
+  {{- if .xffDepth }}
+  XFF_DEPTH: {{ .xffDepth | quote }}
+  {{- end }}
+  {{- end }}
+  EMAIL_FROM: {{ .Values.config.dashboard.emailFrom | quote }}
+  DATA_RETENTION_DAYS: {{ .Values.config.dashboard.dataRetentionDays | quote }}
+  # sentinel-user-report-issue §8's config knobs. Non-secret, so they belong here and not in the
+  # Secret; read by apps/dashboard-web through `$env/dynamic/private`.
+  REPORT_MATCH_WINDOW_MINUTES: {{ .Values.config.dashboard.reportMatchWindowMinutes | quote }}
+  ESCALATION_ACK_MINUTES: {{ .Values.config.dashboard.escalationAckMinutes | quote }}
+  ESCALATION_MAX_HOPS: {{ .Values.config.dashboard.escalationMaxHops | quote }}
+  REPORT_UPLOAD_RPM: {{ .Values.config.dashboard.reportUploadRpm | quote }}
+  REPORT_UPLOAD_BYTES_PER_DAY: {{ .Values.config.dashboard.reportUploadBytesPerDay | quote }}
+  # Retention-cron knobs (N9). Tunable per env on K8s; code defaults are
+  # 24 / 365 when the values are empty.
+  CLAIM_STALE_HOURS: {{ .Values.config.dashboard.claimStaleHours | default "24" | quote }}
+  MANUAL_ISSUE_RETENTION_DAYS: {{ .Values.config.dashboard.manualIssueRetentionDays | default "365" | quote }}

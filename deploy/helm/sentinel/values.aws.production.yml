@@ -1,0 +1,360 @@
+# values.aws.production.yml — AWS EKS production values (dual-cloud chart).
+# Ported from values-k8s-production.yml (K8s CCE). Conventions vs CCE:
+#   - global.provider=aws switches templates/secret.yaml to an ExternalSecret
+#     (SSM Parameter Store via ESO) and gates off the CCE Ingresses +
+#     externalServices Endpoints. No ciphertext in git, no in-chart plaintext.
+#   - ENV_VAR -> full SSM path map under externalSecrets.secrets; seed each
+#     path as SecureString (/example/production/sentinel/shared/<KEY>). Pinned
+#     explicitly — no bulk dataFrom.find — to avoid the ESO path-flattening
+#     trap (see cloud-migration.todo.md §4.5.2).
+#   - Services are ClusterIP-only; edge routing is Emissary (infra repo owns
+#     Hosts + Mappings: sentinel.example.com -> dashboard, and
+#     api-sentinel.example.com -> ingestor). Wildcard Host *.example.com? No — the
+#     apex/cert covers example.ai; infra creates explicit Hosts where needed.
+#   - No imagePullSecrets on EKS (same-account ECR via node instance role).
+#   - Canonical production host: sentinel.example.com (mirrors sentinel.example.com).
+#
+# LIVE since the 2026-10-03 production cutover (cloud-migration.todo.md §4.2e):
+# CCE is write-frozen and DMS CDC is stopped, so this file runs the full
+# production shape — migrate.enabled=true, ingestor/processor/dashboard at 2
+# replicas, retentionCron + oncallCron on. init.nats stays OFF (the §5 NATS
+# cutover owns the already-restored streams/consumers) and dlqDrainer stays OFF
+# (needs a StorageClass decision) — see each block.
+#
+# Pre-flight before first sync:
+#   1. Create the 6 sentinel-* ECR repos (infra terraform/live/shared/ecr).
+#   2. Seed /example/production/sentinel/shared/* (done 2026-09-26, 10/10).
+#   3. Push sentinel images to ECR and pin the tags below (done — v0.2.54
+#      verified in all six repos; replicas 0 means nothing pulls, but an
+#      unpinned tag would ImagePullBackOff on scale-up).
+#   4. Start the production cache (example-cache-production is stopped; Redis auth
+#      must answer PONG before scale-up).
+
+global:
+  provider: aws
+  environment: production
+  org: example
+  repoName: sentinel
+
+environment: production
+
+# CCE-only: manual Endpoints for K8s private IPs. Empty on AWS (VPC DNS).
+externalServices: []
+
+# Cross-component secrets -> k8s Secret sentinel-sentinel-secrets (ExternalSecret).
+externalSecrets:
+  enabled: true
+  storeName: aws-parameter-store
+  secrets:
+    POSTGRES_PASSWORD: "/example/production/sentinel/shared/POSTGRES_PASSWORD"
+    REDIS_PASSWORD: "/example/production/sentinel/shared/REDIS_PASSWORD"
+    NATS_URL: "/example/production/sentinel/shared/NATS_URL"
+    AUTH_SECRET: "/example/production/sentinel/shared/AUTH_SECRET"
+    CRON_SECRET: "/example/production/sentinel/shared/CRON_SECRET"
+    EMAIL_SERVER: "/example/production/sentinel/shared/EMAIL_SERVER"
+    SENTINEL_ENCRYPTION_KEY: "/example/production/sentinel/shared/SENTINEL_ENCRYPTION_KEY"
+    SETTINGS_ENCRYPTION_KEY: "/example/production/sentinel/shared/SETTINGS_ENCRYPTION_KEY"
+    S3_ACCESS_KEY: "/example/production/sentinel/shared/S3_ACCESS_KEY"
+    S3_SECRET_KEY: "/example/production/sentinel/shared/S3_SECRET_KEY"
+    GITHUB_CLIENT_ID: "/example/production/sentinel/shared/GITHUB_CLIENT_ID"
+    GITHUB_CLIENT_SECRET: "/example/production/sentinel/shared/GITHUB_CLIENT_SECRET"
+    # D4 / D20 (TASK-03 creates both SSM parameters before the PodMonitor's insights entry or the Databend sections work).
+    DATABEND_PASSWORD: "/example/production/sentinel/shared/DATABEND_PASSWORD"
+    METRICS_SCRAPE_TOKEN: "/example/production/sentinel/shared/METRICS_SCRAPE_TOKEN"
+
+# -----------------------------------------------------------------------------
+# First-party images (ECR, example prod account 123456789012, ap-southeast-1).
+# Tags are pinned declaratively (not only via CI `argocd app set` parameters)
+# so a fresh sync or an Application recreate can never fall back to
+# Chart.AppVersion (0.1.0, in no registry) and wedge the app in
+# ImagePullBackOff. Pinned to v0.2.54 — the newest production tag verified
+# present in all six ECR repos at cutover time (2026-10-03).
+# -----------------------------------------------------------------------------
+images:
+  ingestor:
+    repository: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-ingestor
+    tag: "v0.2.54"
+  processor:
+    repository: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-processor
+    tag: "v0.2.54"
+  dashboard:
+    repository: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dashboard
+    tag: "v0.2.54"
+  migrate:
+    repository: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-db-migrate
+    tag: "v0.2.54"
+  dlqDrainer:
+    repository: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-dlq-drainer
+    tag: "v0.2.54"
+
+imagePullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# EKSNodeGroupType selects the x86-64 spot pool (verified live on both
+# clusters); kubernetes.io/arch+os are kubelet-guaranteed belt-and-braces so a
+# drifted custom label can never reschedule amd64-only images onto Graviton.
+nodeSelector:
+  EKSNodeGroupType: medium-size-x86-64-spot
+  kubernetes.io/arch: amd64
+  kubernetes.io/os: linux
+# Soft anti-affinity: spread the 2-replica Deployments across nodes when
+# capacity allows, without blocking scheduling on a constrained spot pool.
+# labelSelector matches the chart's common pod labels (app.kubernetes.io/name:
+# sentinel on every workload pod).
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sentinel
+tolerations: []
+
+config:
+  postgres:
+    host: rds.production.internal.example.com
+    port: 5432
+    user: example-sentinel-user
+    database: sentinel-production
+    # rds.force_ssl=0 on the AWS parameter group (matches core/webhook).
+    sslmode: disable
+  nats:
+    # Authenticated DSN arrives via the Secret (NATS_URL) — see the helper.
+    url: ""
+  redis:
+    addr: "redis.production.internal.example.com:6379"
+    # Dedicated index: AWS cache DB0=core, DB1=core-jobs+webhook, DB2=webhook-jobs.
+    # Sentinel only caches API-key lookups + rate-limit counters (ephemeral), so
+    # a fresh index is safe and avoids key collisions.
+    db: "3"
+  s3:
+    # K8s OBS retained during the migration window (mirrors core's OBS_* dual
+    # run). Production S3 keys are real OBS credentials (verified 2026-09-26).
+    endpoint: "https://obs.example.com"
+    publicEndpoint: "https://obs.example.com"
+    bucket: sentinel-production
+  otel:
+    exporterEndpoint: ""
+  dashboard:
+    authUrl: "https://sentinel.example.com"
+    cliProfile: "production"
+    # Client IP behind AWS ALB -> Emissary/Envoy -> dashboard. The ALB appends the client's address to
+    # X-Forwarded-For; Envoy (default use_remote_address, xff_num_trusted_hops 0) then appends ITS peer, the ALB.
+    # So the header ends "<client>, <alb>" and the client is the 2nd entry from the right: xffDepth 2. Depth counts
+    # from the right, so a client-forged X-Forwarded-For prefix is never picked. Re-verify after any proxy change
+    # (log getClientAddress() for a known IP); a too-large depth falls back to the TCP peer, not an error.
+    clientIp:
+      addressHeader: "x-forwarded-for"
+      xffDepth: "2"
+    authTrustHost: "true"
+    # Kept on example.ai for now (verified SES identity); rebrand at cutover.
+    emailFrom: "noreply@example.ai"
+    # Occurrence retention. Resolved, ignored, assigned and commented issues are kept forever since v0.2.71; only
+    # raw occurrences, buckets and rollups age out.
+    # 90 is a BRIDGE (aws-infra-cost-review/BUG-11, 2026-11-10): the analytics warehouse has captured nothing since
+    # the Databend CDC pipeline stopped on 2026-10-28, so Postgres is the only copy of every occurrence since then
+    # until Sentinel's ClickHouse port takes its initial snapshot. At 14 those rows started to be deleted for good on
+    # 2026-11-11. The earlier 30 -> 14 -> 7 plan (2026-10-13) is cancelled. Return to 30 once the warehouse is
+    # live: 30 days is what the Postgres screens use (the 30-bar issue trend, the ingestor's 30-day MaxEventAge).
+    # About 9k occurrences a day: 90 days is about 1.8 GB, inside the table's current 3.6 GB.
+    dataRetentionDays: "90"
+    reportMatchWindowMinutes: "30"
+    escalationAckMinutes: "15"
+    escalationMaxHops: "3"
+    reportUploadRpm: "10"
+    reportUploadBytesPerDay: "262144000"
+    claimStaleHours: "24"
+    manualIssueRetentionDays: "365"
+  ingestor:
+    ratelimitStrictMode: "true"
+    # sentinel-sentry-compat-ingest (contract D15): empty = fail closed -- the relay's X-Forwarded-For and
+    # X-Sentinel-Relay-* headers are ignored. core-sentinel-mobile-relay sets this at its rollout, by the
+    # RUNBOOK entry "Sentry-compatible ingest: trusting core's relay". Narrowest CIDR only.
+    sentryCompatTrustedProxyCidrs: []
+
+# LIVE since the 2026-10-03 production cutover: CCE is write-frozen and DMS
+# CDC is stopped, so the wave-1 Sync hook runs Goose migrations against AWS
+# RDS on every sync (idempotent — reconciles schema only).
+migrate:
+  enabled: true
+  targets:
+    - processor
+    - ingestor
+    - dashboard
+
+ingestor:
+  replicaCount: 2
+  containerPort: 8080
+  service:
+    type: ClusterIP
+    port: 8080
+    nodePort: null
+  ingress:
+    enabled: false
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+processor:
+  replicaCount: 2
+  healthPort: 8081
+  service:
+    type: ClusterIP
+    port: 8081
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests: { cpu: 35m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+dashboard:
+  replicaCount: 2
+  containerPort: 3000
+  service:
+    type: ClusterIP
+    port: 3000
+    nodePort: null
+  ingress:
+    enabled: false
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests: { cpu: 35m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
+
+# Bundled stateful deps: all OFF — managed/shared equivalents above.
+dependencies:
+  postgres:
+    enabled: false
+  nats:
+    enabled: false
+  redis:
+    enabled: false
+  minio:
+    enabled: false
+
+# Dormant: the §5 NATS cutover owns JetStream stream creation. Enable at cutover.
+# Tag pinned to v0.2.43 (verified in ECR, matches live ArgoCD parameters) for
+# the same ImagePullBackOff reason as images.* above.
+# sentinel-span-ingest: AWS reads VictoriaTraces' Jaeger query API (no auth, reachable from the VPC; core exports
+# its traces to monitoring.internal.example.com:4317, VictoriaTraces serves them at :10428/select/jaeger/api). Enabled
+# 2026-10-05 (sentinel-aws-error-reporting/TASK-01): the cutover left this off, so no span was stored after
+# 2026-10-03 01:59 UTC. SPANS / SPANS_DLQ / processor-spans already exist on the EKS NATS. Scope: the Example
+# organization pulls through its core project (`<org uuid>:<core project uuid>`), as on K8s.
+spans:
+  enabled: true
+  pull:
+    scopes: "98867bbe-5594-471e-a5c0-16b39d6afabc:7d95eb6d-6551-4096-a8b2-ef8944dfefcf"
+    storeKind: jaeger
+    storeUrl: http://monitoring.internal.example.com:10428
+
+init:
+  nats:
+    enabled: false
+    image: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sentinel-nats-init
+    tag: "v0.2.54"
+    # Production NATS caps each server's JetStream store at 50GiB and reserves
+    # MaxBytes up front; nats-1 was down to 392MiB free (media-processor/TASK-28).
+    # Sized from what production holds (2026-11-05): ERROR_EVENTS ~24MB/24h,
+    # SPANS ~1.5MB/24h, ERROR_EVENTS_DLQ empty. While this job is off nothing
+    # applies these sizes: the live streams were edited to match with
+    # `nats stream edit --max-bytes`. They apply if it is enabled.
+    errorEvents:
+      maxBytes: "2GiB"
+    errorEventsDlq:
+      maxBytes: "256MiB"
+    spans:
+      maxBytes: "512MiB"
+  minio:
+    # AWS: object storage is external (K8s OBS during the migration window,
+    # S3 after) — minio-init must NEVER be enabled here. It has no ECR image
+    # override, so enabling it would render ghcr.io/nurfitrapujo/sentinel/
+    # minio-init:0.1.0 (a registry with no imagePullSecrets on EKS, a tag that
+    # exists nowhere, and a likely amd64-only image).
+    enabled: false
+
+# Legacy combined ingress renders nothing on AWS.
+ingress:
+  enabled: false
+
+retentionCron:
+  enabled: true
+  # Paced from hourly to every 15 minutes to distribute occurrence deletion
+  # across smaller, smoother batches and prevent CDC replication slot lag spikes.
+  schedule: "*/15 * * * *"
+
+oncallCron:
+  enabled: true
+
+# sentinel-reporting-and-dashboard D6/D7/D8: SLI collection from VictoriaMetrics, the SLI set, Databend analytics and
+# the PodMonitors. serviceSlis is the starting set from the contract (operator, 2026-10-07).
+sliCollectCron:
+  enabled: true
+
+podMonitor:
+  enabled: true
+
+analytics:
+  victoriaMetricsUrl: "http://monitoring.internal.example.com:8428"
+  sliCluster: "example-production"
+  databend:
+    url: "http://databend-query.databend.svc.cluster.local:8000"
+    user: sentinel_app
+    database: sentinel
+
+serviceSlis:
+  - id: core-api
+    kind: http
+    project: core
+    source: api_core_80
+    # SSE routes get their own Envoy cluster (infra cluster_tag: sse): latency reads `source` only, availability reads both.
+    streamSource: api_core_80_sse
+    availabilityTarget: 0.995
+    latency: { le: "1000.0", target: 0.94 }
+    service: api
+    windowDays: 28
+  - id: web
+    kind: http
+    project: web
+    source: web_web_80
+    availabilityTarget: 0.995
+    latency: { le: "1000.0", target: 0.95 }
+    windowDays: 28
+  - id: core-jobs
+    kind: jobs
+    project: core
+    source: example_core_job_handler_runs_total
+    availabilityTarget: 0.995
+    windowDays: 28
+  - id: core-nats
+    kind: nats
+    project: core
+    source: example_core_nats_handler_runs_total
+    availabilityTarget: 0.995
+    windowDays: 28
+
+prometheusRule:
+  enabled: false
+
+dlqDrainer:
+  enabled: false
+  drainerEnabled: "false"
+  drainerExecute: "false"
+  persistence:
+    enabled: false
+    storageClass: "gp3"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

@@ -1,0 +1,409 @@
+version: "3.8"
+
+services:
+    postgres:
+        image: postgres:15-alpine
+        container_name: sentinel-postgres
+        environment:
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+        ports:
+            - "5432:5432"
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U sentinel"]
+            interval: 5s
+            timeout: 5s
+            retries: 5
+
+    redis:
+        image: redis:7-alpine
+        container_name: sentinel-redis
+        ports:
+            - "6379:6379"
+        volumes:
+            - redis_data:/data
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    nats:
+        image: nats:2.10-alpine
+        container_name: sentinel-nats
+        # Host ports are parameterized because 4222/8222 are the default NATS ports and therefore the
+        # ports another stack on the same machine is most likely to have already taken — rootless podman
+        # then fails the whole `up` with "listen tcp 0.0.0.0:4222: bind: address already in use", and
+        # every service that depends on nats (nats-init, ingestor, processor, dashboard) silently never
+        # starts. The defaults are unchanged, so CI and a clean machine behave exactly as before; set
+        # NATS_HOST_PORT / NATS_MONITOR_HOST_PORT to coexist with another NATS.
+        #
+        # Only the HOST side moves. In-cluster traffic uses nats://nats:4222 over the compose network and
+        # is unaffected. Host-side clients — tests/e2e, tests/integration, tools/dlq — read NATS_URL.
+        ports:
+            - "${NATS_HOST_PORT:-4222}:4222"
+            - "${NATS_MONITOR_HOST_PORT:-8222}:8222"
+        volumes:
+            - nats_data:/data
+        command: ["-js", "--server_name", "sentinel-nats", "--sd", "/data/jetstream"]
+        healthcheck:
+            test: ["CMD", "nc", "-z", "localhost", "4222"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    nats-init:
+        build:
+            context: ./scripts
+            dockerfile: Dockerfile.nats-init
+        depends_on:
+            nats:
+                condition: service_healthy
+        environment:
+            NATS_URL: nats://nats:4222
+        restart: "no"
+
+    minio:
+        # Manual Issues M2 (docs/plans/MANUAL_ISSUES_DESIGN.md §4): S3-compatible object store for
+        # attachments. Client is S3-compatible so prod can point at real S3/R2 instead. Host ports
+        # are parameterized for the same reason as `nats` above (another stack squatting on 9000/9001).
+        image: docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+        container_name: sentinel-minio
+        command: ["server", "/data", "--console-address", ":9001"]
+        environment:
+            MINIO_ROOT_USER: "${S3_ACCESS_KEY:-minioadmin}"
+            MINIO_ROOT_PASSWORD: "${S3_SECRET_KEY:-minioadmin}"
+        ports:
+            - "${MINIO_HOST_PORT:-9000}:9000"
+            - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+        volumes:
+            - minio_data:/data
+        healthcheck:
+            test: ["CMD", "mc", "ready", "local"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    minio-init:
+        build:
+            context: ./scripts
+            dockerfile: Dockerfile.minio-init
+        depends_on:
+            minio:
+                condition: service_healthy
+        environment:
+            S3_ENDPOINT: http://minio:9000
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+        restart: "no"
+
+    jaeger:
+        # Fully qualified on purpose. Podman resolves no unqualified short names unless
+        # /etc/containers/registries.conf defines unqualified-search-registries, so the bare
+        # "jaegertracing/all-in-one:1.65.0" fails with `short-name ... did not resolve to an alias`
+        # and the whole `up` continues WITHOUT a trace backend — the services start fine (they must,
+        # by the degradation mandate), so nothing looks broken until a trace assertion has nowhere to
+        # read from. The other images here only work unqualified because they were already pulled
+        # locally. Docker treats this form identically, so qualifying costs nothing.
+        image: docker.io/jaegertracing/all-in-one:1.65.0
+        container_name: sentinel-jaeger
+        # D-c (docs/plans/OBSERVABILITY_PLAN.md): all-in-one dev/CI trace backend, OTLP in directly —
+        # no separate collector. Host ports are parameterized for exactly the reason documented on the
+        # `nats` service above: this machine runs other stacks that can already be squatting on
+        # Jaeger's default ports, and a host bind failure must not take `docker compose up` down for
+        # services that don't even require Jaeger to be reachable. Only the HOST side moves; in-cluster
+        # traffic (ingestor/processor's OTEL_EXPORTER_OTLP_ENDPOINT below) always uses
+        # http://jaeger:4318 over the compose network, unaffected by these host mappings. Ingestor and
+        # processor deliberately do NOT `depends_on` this service, healthy or otherwise: the whole point
+        # of W0's degradation mandate is that both start and stay fully functional whether or not
+        # Jaeger is up.
+        environment:
+            COLLECTOR_OTLP_ENABLED: "true"
+        ports:
+            - "${JAEGER_OTLP_GRPC_HOST_PORT:-4317}:4317" # OTLP gRPC
+            - "${JAEGER_OTLP_HTTP_HOST_PORT:-4318}:4318" # OTLP HTTP — what ingestor/processor's OTEL_EXPORTER_OTLP_ENDPOINT targets in-cluster
+            - "${JAEGER_UI_HOST_PORT:-16686}:16686" # Jaeger UI — http://localhost:16686
+
+    migrate:
+        image: golang:1.25-alpine
+        container_name: sentinel-migrate
+        working_dir: /workspace/packages/db-migrations
+        volumes:
+            - .:/workspace:ro
+        depends_on:
+            postgres:
+                condition: service_healthy
+        environment:
+            DB_URL_PROCESSOR: postgres://sentinel:changeme@postgres:5432/sentinel?sslmode=disable
+            DB_URL_INGESTOR: postgres://sentinel:changeme@postgres:5432/sentinel?sslmode=disable
+            DB_URL_DASHBOARD: postgres://sentinel:changeme@postgres:5432/sentinel?sslmode=disable
+        entrypoint: ["sh", "-c"]
+        command:
+            - "go run ./cmd/migrate up -target=processor"
+        restart: "no"
+
+    ingestor:
+        build:
+            context: .
+            dockerfile: apps/ingestor-go/Dockerfile
+        container_name: sentinel-ingestor
+        ports:
+            - "${INGESTOR_HOST_PORT:-8080}:8080"
+        depends_on:
+            postgres:
+                condition: service_healthy
+            nats:
+                condition: service_healthy
+            nats-init:
+                condition: service_completed_successfully
+            redis:
+                condition: service_healthy
+            migrate:
+                condition: service_completed_successfully
+        environment:
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+            NATS_URL: nats://nats:4222
+            # sentinel-span-ingest D2: SPANS stream (created by nats-init) + `spans` table. Dev default ON.
+            SPAN_INGEST_ENABLED: "true"
+            REDIS_ADDR: redis:6379
+            REDIS_PASSWORD: ""
+            REDIS_DB: 0
+            RATELIMIT_STRICT_MODE: "false"
+            # W0 (docs/plans/OBSERVABILITY_PLAN.md): in-cluster address, never the host-mapped port
+            # above. If jaeger is down, obs.Bootstrap degrades to one warning log and the ingestor
+            # stays fully functional — this is not a hard dependency (see the jaeger service's comment).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: ingestor-go
+
+    processor:
+        ports:
+            # D47: kept host-published deliberately. tests/e2e (harness_test.go, tracing_test.go's
+            # U35, resilience_test.go) dial this port directly for /health and /metrics — unpublishing
+            # it breaks the e2e suite, not just local dev. /health and /metrics expose only this
+            # instance's own status and Prometheus counters, no per-tenant payloads. /dlq is the one
+            # that mattered: as of P2-6 (D12) it no longer returns a synthetic or real per-event
+            # "items" array — main.go's /dlq handler now serves aggregates only (total_depth etc.), so
+            # there is nothing tenant-scoped left on this port to authenticate. If /dlq ever grows a
+            # real per-event listing again, gate it (and re-evaluate this port) before that ships.
+            - "8081:8081" # /health, /metrics, /dlq (aggregates only) — see comment above
+        build:
+            context: .
+            dockerfile: apps/processor-go/Dockerfile
+        container_name: sentinel-processor
+        depends_on:
+            postgres:
+                condition: service_healthy
+            nats:
+                condition: service_healthy
+            nats-init:
+                condition: service_completed_successfully
+            migrate:
+                condition: service_completed_successfully
+        environment:
+            PROCESSOR_HEALTH_ADDR: ":8081"
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+            NATS_URL: nats://nats:4222
+            # sentinel-span-ingest D2: SPANS stream (created by nats-init) + `spans` table. Dev default ON.
+            SPAN_INGEST_ENABLED: "true"
+            # W0 (docs/plans/OBSERVABILITY_PLAN.md): in-cluster address, never the host-mapped port
+            # above. If jaeger is down, obs.Bootstrap degrades to one warning log and the processor
+            # stays fully functional — this is not a hard dependency (see the jaeger service's comment).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: processor-go
+            # N3b: outbound webhook delivery dispatcher (apps/processor-go/webhooks). Off by
+            # default — flip to "true" to activate. Interval/threshold below are the same
+            # defaults the code falls back to when unset; listed here for discoverability.
+            WEBHOOK_DISPATCH_ENABLED: "false"
+            WEBHOOK_DISPATCH_INTERVAL: "5s"
+            WEBHOOK_FAILURE_THRESHOLD: "20"
+            # N7a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md): throttle window for the
+            # 'occurrence_burst' issue_activity discovery event — at most one per issue per this
+            # many seconds. Default matches the code's own fallback; listed for discoverability.
+            OCCURRENCE_EVENT_MIN_INTERVAL_SECONDS: "3600"
+            # sentinel-sourcemaps §12: the processor reads maps from the same bucket the dashboard
+            # writes them to (§4.4), so it carries the same S3 env the `dashboard` and `minio-init`
+            # services already do — the in-cluster endpoint, never the host-mapped port. A processor
+            # with symbolication on and no S3_ACCESS_KEY/S3_SECRET_KEY refuses to start (decision 32).
+            S3_ENDPOINT: http://minio:9000
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
+            # Go duration string; the chart default is 60s (deploy/helm/sentinel/values.yaml,
+            # config.processor.sourcemapNegativeTtl). Low here so the e2e case that uploads a map
+            # AFTER an event referenced it does not wait out the negative cache (contract §11, §12).
+            SOURCEMAP_NEGATIVE_TTL: "${SOURCEMAP_NEGATIVE_TTL:-5s}"
+
+    dlq-drainer:
+        build:
+            context: .
+            dockerfile: scripts/Dockerfile.dlq-drainer
+        container_name: sentinel-dlq-drainer
+        depends_on:
+            nats:
+                condition: service_healthy
+            nats-init:
+                condition: service_completed_successfully
+        environment:
+            NATS_URL: nats://nats:4222
+            DLQ_STREAM: ERROR_EVENTS_DLQ
+            # --- schedule gates: both must be "true" for anything destructive to happen ---
+            DLQ_DRAINER_ENABLED: "false" # flip to "true" to activate the schedule
+            DLQ_DRAINER_EXECUTE: "false" # flip to "true" to let it actually replay/delete; "false" = dry-run reports only
+            # --- schedule tuning ---
+            DLQ_DRAINER_INTERVAL_SECONDS: "3600" # how often it runs (1h)
+            DLQ_DRAINER_LIMIT: "50" # cap on matched messages handled per run (tools/dlq -limit)
+            DLQ_DRAINER_MAX_REPLAYS: "3" # cap on replays per distinct message content, across runs (tools/dlq -max-replays)
+            DLQ_DRAINER_STATE_FILE: /var/lib/dlq-drainer/state.json
+        volumes:
+            - dlq_drainer_state:/var/lib/dlq-drainer
+        restart: unless-stopped
+
+    dashboard:
+        build:
+            context: .
+            dockerfile: apps/dashboard-web/Dockerfile
+        container_name: sentinel-dashboard
+        ports:
+            - "${DASHBOARD_HOST_PORT:-3000}:3000"
+        depends_on:
+            postgres:
+                condition: service_healthy
+            migrate:
+                condition: service_completed_successfully
+            nats:
+                condition: service_healthy
+            minio-init:
+                condition: service_completed_successfully
+        environment:
+            DATABASE_URL: postgres://sentinel:changeme@postgres:5432/sentinel
+            # Manual Issues M2 (design §4): in-cluster MinIO endpoint, never the host-mapped port
+            # above — mirrors NATS_URL's in-cluster-vs-host split. Used for all SERVER-side S3 calls
+            # (upload proxy, download stream, finalize sniff).
+            S3_ENDPOINT: http://minio:9000
+            # M6 Feature A: browser-reachable endpoint used ONLY to sign presigned PUT URLs. A
+            # presigned URL is handed to the browser, which cannot resolve the in-cluster `minio`
+            # hostname above — so it must be signed against the host-mapped port. In a real
+            # deployment set this to the public S3/MinIO URL (e.g. https://uploads.example.com).
+            S3_PUBLIC_ENDPOINT: "http://localhost:${MINIO_HOST_PORT:-9000}"
+            S3_BUCKET: "${S3_BUCKET:-sentinel-attachments}"
+            # sentinel-user-report-issue §4.5 / §8: the intake upload knobs. REPORT_UPLOAD_RPM is the
+            # per-key per-minute throttle for POST /api/report/attachments only;
+            # REPORT_UPLOAD_BYTES_PER_DAY is the rolling-24h byte ceiling summed in Postgres over
+            # this org's uploader_type='external_reporter' rows (SR-5). Both are passthrough so a
+            # local run can lower them without editing this file.
+            REPORT_UPLOAD_RPM: "${REPORT_UPLOAD_RPM:-10}"
+            REPORT_UPLOAD_BYTES_PER_DAY: "${REPORT_UPLOAD_BYTES_PER_DAY:-262144000}"
+            # adapter-node caps a request body at 512 kB by default, which is below MAX_UPLOAD_BYTES
+            # and therefore below what every upload route in this app already advertises. Was the
+            # 25 MB attachment cap plus multipart envelope headroom (27M); sentinel-sourcemaps §12
+            # raises it to 110M so a POST /api/sourcemaps request carrying two maps at the 50 MiB
+            # SOURCEMAP_MAX_BYTES cap (§4.1) reaches the route instead of a 413 from the adapter
+            # — the cap enforced by the application is still the one the caller actually meets.
+            # Same value as the chart's config.dashboard.bodySizeLimit.
+            BODY_SIZE_LIMIT: "${BODY_SIZE_LIMIT:-110M}"
+            S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
+            S3_SECRET_KEY: "${S3_SECRET_KEY:-minioadmin}"
+            POSTGRES_HOST: postgres
+            POSTGRES_PORT: 5432
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: changeme
+            POSTGRES_DB: sentinel
+            # Traces export to the same collector the Go services use. Absent/unreachable must mean
+            # "no traces", never "no dashboard" — instrumentation.mjs degrades on its own, and there is
+            # deliberately no depends_on: jaeger anywhere (OBSERVABILITY_PLAN.md D-b).
+            OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+            OTEL_SERVICE_NAME: dashboard-web
+            # Without this the dashboard cannot invalidate a revoked API key. createNatsPublisher in
+            # src/lib/db/queries/apikeys.ts defaults to nats://localhost:4222, which inside a container is
+            # nothing, so every api_key.invalidated publish failed with ECONNREFUSED and revocation
+            # silently degraded from "<100ms" to "up to APIKEY_CACHE_TTL" (60s). Both sides of the feature
+            # were correct and wired; only the deployment never connected them, and the fallback logs
+            # rather than fails — so nothing surfaced it until U15/U16 measured 37s.
+            NATS_URL: nats://nats:4222
+            AUTH_SECRET: dev-only-insecure-secret-change-me-please-32chars
+            AUTH_URL: http://localhost:3000
+            AUTH_TRUST_HOST: "true"
+            GOOGLE_CLIENT_ID: ""
+            GOOGLE_CLIENT_SECRET: ""
+            GITHUB_CLIENT_ID: ""
+            GITHUB_CLIENT_SECRET: ""
+            EMAIL_SERVER: smtp://debug
+            EMAIL_FROM: noreply@sentinel.local
+            SETTINGS_ENCRYPTION_KEY: default-long-and-secure-key-32-chars
+            # N10 dev master key for the git-credentials store: base64("dev-only-32-byte-key-4-sentinel!").
+            SENTINEL_ENCRYPTION_KEY: ZGV2LW9ubHktMzItYnl0ZS1rZXktNC1zZW50aW5lbCE=
+            CRON_SECRET: dev-only-cron-secret-change-me
+            DATA_RETENTION_DAYS: "30"
+            MANUAL_ISSUE_RETENTION_DAYS: "365"
+            CLAIM_STALE_HOURS: "24"
+            AGENT_KEY_ROTATION_GRACE_HOURS: "24"
+            # sentinel-cli-browser-login: lifetime of a personal `sentinel login` key (days, 1-365).
+            CLI_PERSONAL_KEY_TTL_DAYS: "90"
+            # sentinel-user-report-issue §8's remaining config knobs, with the contract's defaults.
+            # REPORT_MATCH_WINDOW_MINUTES bounds §4.3's candidate query; ESCALATION_ACK_MINUTES is
+            # §4.4's acknowledgement deadline and ESCALATION_MAX_HOPS its bound. There is no feature
+            # flag beside them and that is the decision, not an omission (OQ-3): the `report` key
+            # scope IS the switch.
+            REPORT_MATCH_WINDOW_MINUTES: "${REPORT_MATCH_WINDOW_MINUTES:-30}"
+            ESCALATION_ACK_MINUTES: "${ESCALATION_ACK_MINUTES:-15}"
+            ESCALATION_MAX_HOPS: "${ESCALATION_MAX_HOPS:-3}"
+
+    # N9 (docs/plans/AGENT_WORKER_PLAN.md, contract correction C11): schedules the retention endpoint.
+    # Without this NOTHING invoked POST /api/cron/retention in the reference stack, so reapStaleClaims
+    # never ran — a crashed agent's claim was never force-released and the claim_released(reason=stale)
+    # event path was untestable. Wraps a curl of that endpoint in a sleep-loop (scripts/cron-entrypoint.sh),
+    # the same "wrap it in a sleep-loop" pattern the dlq-drainer uses.
+    #
+    # sentinel-user-report-issue §4.4b: this one service now runs TWO independent loops — retention
+    # hourly and the escalation sweep every minute — each with its own gate, so enabling one never
+    # enables the other. Both ship OFF, matching the Helm chart's `retentionCron`/`oncallCron` and
+    # §12's "both schedulers ship off".
+    #
+    # NOTE (wait-healthy.sh): this is a long-running service with no healthcheck, so it MUST also be listed
+    # in that script's OPTIONAL_SERVICES — enumerating `docker compose config --services` otherwise makes
+    # the whole stack gate wait on / fail with it (see the comment block at scripts/wait-healthy.sh:51).
+    cron:
+        build:
+            context: .
+            dockerfile: scripts/Dockerfile.cron
+        container_name: sentinel-cron
+        depends_on:
+            dashboard:
+                condition: service_started
+        environment:
+            # In-cluster address of the dashboard, never a host-mapped port.
+            RETENTION_CRON_URL: http://dashboard:3000/api/cron/retention
+            # Must match the dashboard's CRON_SECRET above, or every call is rejected 401.
+            CRON_SECRET: dev-only-cron-secret-change-me
+            # Gate: ships OFF per repo convention. Flip to "true" to activate the schedule.
+            RETENTION_CRON_ENABLED: "${RETENTION_CRON_ENABLED:-false}"
+            RETENTION_CRON_INTERVAL_SECONDS: "3600" # how often it POSTs the endpoint (1h)
+            RETENTION_CRON_TIMEOUT_SECONDS: "180"
+            # sentinel-user-report-issue §4.4b: the escalation sweep. Its own URL, gate and
+            # interval — 60s, because a 15-minute ESCALATION_ACK_MINUTES swept hourly would be a
+            # 75-minute deadline, which is the contract's stated reason this is not a piggyback on
+            # the retention loop above. Also ships OFF; flip ONCALL_CRON_ENABLED to "true".
+            ONCALL_CRON_URL: http://dashboard:3000/api/cron/oncall-escalation
+            ONCALL_CRON_ENABLED: "${ONCALL_CRON_ENABLED:-false}"
+            ONCALL_CRON_INTERVAL_SECONDS: "${ONCALL_CRON_INTERVAL_SECONDS:-60}"
+            ONCALL_CRON_TIMEOUT_SECONDS: "20"
+        restart: unless-stopped
+
+volumes:
+    dlq_drainer_state:
+    postgres_data:
+    nats_data:
+    redis_data:
+    minio_data:

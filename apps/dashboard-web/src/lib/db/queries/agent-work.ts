@@ -1,0 +1,494 @@
+import { db } from '$lib/server/db';
+import {
+	issues,
+	projects,
+	manualIssueReports,
+	issueActivity,
+	externalIssueReports,
+	externalReporters,
+} from '$lib/db/schema';
+import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
+import { notifyIssueEvent, type NotifiedUser } from '$lib/server/notify';
+import { recordClaim } from '$lib/db/queries/reports';
+import { agentVisibilityCondition, type AgentVisibility } from '$lib/server/agent-access';
+import { AGENT_DEDUPE_WINDOW_MS } from '$lib/server/agent-dedupe';
+import {
+	findIdempotencyKey,
+	recordIdempotencyKey,
+	IdempotencyRaceError,
+} from '$lib/server/agent-idempotency';
+
+/**
+ * Manual Issues M5 stage 2 (design §7 step 1): `GET /api/agent/issues` -- the one deliberate
+ * bridge across Q9's strict issue_type separation. Spans BOTH `user_report` and `system_error`
+ * issues, scoped ONLY to the calling agent's organization (B7 -- `organizationId` here MUST
+ * always come from `AgentAuthContext`, never a request param). Deliberately its own query
+ * module, not an addition to `reports.ts` (user_report-only, per its own header) or `issues.ts`
+ * (system_error-oriented dashboard queries) -- neither is the right home for a cross-type list.
+ *
+ * N7b (A02): `since`/`sort`/`limit`/`cursor` bolt bootstrap-friendly pagination onto what was an
+ * always-unbounded list. Keyset on `(sortColumn, id)` -- NOT offset -- because rows churn (new
+ * issues arrive, `lastSeen` bumps on every occurrence) and an offset page would skip or repeat
+ * rows across polls; id as the tiebreaker keeps the page stable even when two rows share the same
+ * `firstSeen`/`lastSeen` timestamp (matches the events feed's cursor philosophy, events.ts's
+ * header). `limit` undefined ⇒ no `.limit()` clause at all and no `nextCursor` in the result --
+ * byte-identical to pre-N7b behavior for callers that pass nothing (backward compat).
+ *
+ * N9 (AGENT_WORKER_PLAN C12): adds `claimedByAgentId` (`claimed=me` -- this agent's own claims,
+ * resolved from the credential per B7) and a `waitingSince` list field (when the current blocking
+ * question was asked), so an agent can enumerate and age its own waiting questions directly.
+ */
+export const AGENT_ISSUES_MAX_LIMIT = 200;
+
+export type AgentIssuesSort = 'firstSeen' | 'lastSeen';
+
+/** `issues.source_channel`'s vocabulary after §4.6's CHECK swap. */
+export const AGENT_ISSUE_SOURCES = ['ingestion_sdk', 'manual_support', 'api', 'user_report_api'] as const;
+
+export type AgentIssueSource = (typeof AGENT_ISSUE_SOURCES)[number];
+
+export interface AgentIssuesCursor {
+	/** The value of the sort column (firstSeen or lastSeen) on the last row of the prior page. */
+	sortValue: Date;
+	id: string;
+}
+
+export interface ListAgentIssuesOptions {
+	organizationId: string;
+	/**
+	 * sentinel-cli-browser-login: a PERSONAL key's owner visibility (agent-access.ts) -- the owner's projects and
+	 * environment grants, as a GUARD (unlike `projectId`/`environment` below, which are caller-chosen filters). Omitted /
+	 * null = the whole organization (an org agent), byte-identical to before.
+	 */
+	visibility?: AgentVisibility | null;
+	type?: 'user_report' | 'system_error';
+	claimed?: boolean;
+	/**
+	 * N9 (AGENT_WORKER_PLAN C12): `claimed=me` -- restrict to issues claimed by THIS agent
+	 * (assigneeType='agent' AND assignedTo=agentId), mirroring the events feed's claimed=me
+	 * (events.ts). B7: the route resolves this from the credential's agentId, never a request param.
+	 * Mutually exclusive with `claimed` at the route layer; if both arrive here this wins.
+	 */
+	claimedByAgentId?: string;
+	projectId?: string;
+	/**
+	 * sentinel-project-environments §4.6: `WHERE issues.environment = $1`. Absent = every
+	 * environment, byte-identical to the pre-existing behaviour. A FILTER, not a guard — see the
+	 * comment at the predicate below.
+	 */
+	environment?: string;
+	waiting?: boolean;
+	/**
+	 * SR-6 / OQ-8: filter on `issues.source_channel`. §6's stated mitigation for the volume and
+	 * character change external intake brings -- a filter and a badge -- is a dashboard query
+	 * parameter and a Svelte component and does NOT reach the agent API, so the agent feed gets its
+	 * own. Omitted = every source, byte-identical to the pre-existing behaviour.
+	 */
+	source?: AgentIssueSource;
+	/** Only issues whose firstSeen >= since. */
+	since?: Date;
+	/** Sort column; default 'lastSeen' matches pre-N7b behavior. Always ordered descending. */
+	sort?: AgentIssuesSort;
+	/** No `.limit()` applied when omitted -- legacy unbounded behavior. Caller must pre-clamp to
+	 *  [1, AGENT_ISSUES_MAX_LIMIT]; this function clamps defensively too. */
+	limit?: number;
+	cursor?: AgentIssuesCursor;
+}
+
+export interface AgentIssueListItem {
+	id: string;
+	projectId: string;
+	projectName: string;
+	isInbox: boolean;
+	issueType: string;
+	message: string;
+	errorClass: string;
+	status: string;
+	/** sentinel-project-environments decision 54 (§4.9): the issue's environment. Part of issue
+	 *  IDENTITY (decision 7), so one error across N environments is N rows in this list -- this is
+	 *  the only field that tells two such siblings apart. NOT NULL in the schema. */
+	environment: string;
+	assigneeType: string | null;
+	assignedTo: string | null;
+	waitingOn: string | null;
+	/** N9 (AGENT_WORKER_PLAN C12): when the current blocking question was asked -- null unless the
+	 *  issue is currently waiting (waitingOn set). Lets an agent nag stale questions by age without
+	 *  reconstructing timing from the comment thread. */
+	waitingSince: Date | null;
+	firstSeen: Date | null;
+	lastSeen: Date | null;
+	count: number;
+	/** sentinel-affected-users decision 14: distinct users / tenants this issue's occurrences have
+	 *  touched within the retention window (§4.6). Integers >= 0, never null; recomputed downward
+	 *  by the hourly sweep (decision 12). */
+	affectedUserCount: number;
+	affectedTenantCount: number;
+	severity: string | null;
+	/** The reporting `"user".id`. Stays `null` for an external report -- see `reporterKind`. */
+	reporterId: string | null;
+	/** SR-6: `null` for a `system_error` issue, otherwise which door the report came through. */
+	reporterKind: 'org_member' | 'external' | null;
+	/** SR-6: the external reporter's display name, `null` for every other row. */
+	reporterDisplayName: string | null;
+	/** SR-6 / OQ-8: `issues.source_channel`, so an agent can tell an externally-sourced report from
+	 *  an org-member one without a second request. */
+	sourceChannel: string;
+	isWaiting: boolean;
+	/** N7e (A07): when the CURRENT claim (assigneeType/assignedTo) was made -- null if unclaimed. */
+	claimedAt: Date | null;
+}
+
+export interface ListAgentIssuesResult {
+	issues: AgentIssueListItem[];
+	/** Present only when `options.limit` was supplied and more rows exist beyond this page. */
+	nextCursor?: string;
+}
+
+/** Opaque cursor codec -- base64url of `{v: ISO timestamp, id}`. Exported so the route can decode
+ *  an incoming `cursor` param and the CLI/tests can round-trip a `nextCursor` value. */
+export function encodeAgentIssuesCursor(sortValue: Date, id: string): string {
+	return Buffer.from(JSON.stringify({ v: sortValue.toISOString(), id }), 'utf8').toString('base64url');
+}
+
+export function decodeAgentIssuesCursor(cursor: string): AgentIssuesCursor {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+	} catch {
+		throw new Error('invalid cursor');
+	}
+	if (
+		typeof parsed !== 'object' ||
+		parsed === null ||
+		typeof (parsed as { v?: unknown }).v !== 'string' ||
+		typeof (parsed as { id?: unknown }).id !== 'string'
+	) {
+		throw new Error('invalid cursor');
+	}
+	const sortValue = new Date((parsed as { v: string }).v);
+	if (Number.isNaN(sortValue.getTime())) {
+		throw new Error('invalid cursor');
+	}
+	return { sortValue, id: (parsed as { id: string }).id };
+}
+
+export async function listAgentIssues(options: ListAgentIssuesOptions): Promise<ListAgentIssuesResult> {
+	const sort: AgentIssuesSort = options.sort ?? 'lastSeen';
+	const sortColumn = sort === 'firstSeen' ? issues.firstSeen : issues.lastSeen;
+
+	const conditions = [eq(projects.organizationId, options.organizationId)];
+	const visibilityGuard = agentVisibilityCondition(options.visibility);
+	if (visibilityGuard) {
+		conditions.push(visibilityGuard);
+	}
+
+	if (options.type) {
+		conditions.push(eq(issues.issueType, options.type));
+	}
+	if (options.claimedByAgentId) {
+		// N9 (C12): `claimed=me` -- this agent's own claims only. Mirrors events.ts's claimed=me
+		// (assigneeType='agent' AND assignedTo=agentId). Takes precedence over the boolean `claimed`.
+		conditions.push(eq(issues.assigneeType, 'agent'));
+		conditions.push(eq(issues.assignedTo, options.claimedByAgentId));
+	} else if (options.claimed === true) {
+		conditions.push(sql`${issues.assignedTo} IS NOT NULL`);
+	} else if (options.claimed === false) {
+		conditions.push(isNull(issues.assignedTo));
+	}
+	if (options.projectId) {
+		conditions.push(eq(issues.projectId, options.projectId));
+	}
+	// sentinel-project-environments §4.6: a plain column predicate (decision 7 put `environment`
+	// into issue identity, so an issue belongs to exactly one). Absent means every environment —
+	// the existing behaviour, unchanged, so no deployed agent changes what it sees. There is no
+	// GUARD on this surface and none is wanted: `authenticateAgentRequest` resolves a key to an
+	// ORGANIZATION, not a person, so there is no membership row and no grant to resolve
+	// (contract §12 *Known limits* 2).
+	if (options.environment) {
+		conditions.push(eq(issues.environment, options.environment));
+	}
+	if (options.waiting === true) {
+		conditions.push(sql`${issues.waitingOn} IS NOT NULL`);
+	}
+	if (options.source) {
+		conditions.push(eq(issues.sourceChannel, options.source));
+	}
+	if (options.since) {
+		conditions.push(gte(issues.firstSeen, options.since));
+	}
+	if (options.cursor) {
+		// Keyset predicate on the (sortColumn, id) tuple -- strictly older than the cursor row,
+		// matching the descending order below. Postgres row comparison is lexicographic: this is
+		// equivalent to `sortColumn < v OR (sortColumn = v AND id < id)` but a single index-usable
+		// expression, and stable under concurrent inserts/updates elsewhere in the table (unlike
+		// OFFSET, which drifts as rows are added/removed ahead of the page).
+		conditions.push(
+			sql`(${sortColumn}, ${issues.id}) < (${options.cursor.sortValue.toISOString()}::timestamp, ${options.cursor.id})`
+		);
+	}
+
+	const hasLimit = options.limit !== undefined;
+	const clampedLimit = hasLimit
+		? Math.max(1, Math.min(options.limit as number, AGENT_ISSUES_MAX_LIMIT))
+		: undefined;
+
+	const baseQuery = db
+		.select({
+			id: issues.id,
+			projectId: issues.projectId,
+			projectName: projects.name,
+			isInbox: projects.isInbox,
+			issueType: issues.issueType,
+			message: issues.message,
+			errorClass: issues.errorClass,
+			status: issues.status,
+			// sentinel-project-environments decision 54: published on the agent contract.
+			environment: issues.environment,
+			assigneeType: issues.assigneeType,
+			assignedTo: issues.assignedTo,
+			claimedAt: issues.claimedAt,
+			waitingOn: issues.waitingOn,
+			waitingSince: issues.waitingSince,
+			firstSeen: issues.firstSeen,
+			lastSeen: issues.lastSeen,
+			count: issues.count,
+			// sentinel-affected-users decision 14: published on the agent contract beside `count`
+			// (AgentIssueListItemSchema declares both; the decision-54 contract test refuses the
+			// column otherwise).
+			affectedUserCount: issues.affectedUserCount,
+			affectedTenantCount: issues.affectedTenantCount,
+			sourceChannel: issues.sourceChannel,
+			// Reports only: null for system_error rows (left joins). SR-6 / §4.2's correction --
+			// reading only `manual_issue_reports` here made `severity` and `reporterId` silently
+			// null for every externally-submitted report, which is indistinguishable from "this is
+			// not a report" to the agent that reads them.
+			severity: sql<string | null>`coalesce(${manualIssueReports.severity}, ${externalIssueReports.severity})`,
+			reporterId: manualIssueReports.reporterId,
+			manualIssueId: manualIssueReports.issueId,
+			externalIssueId: externalIssueReports.issueId,
+			reporterDisplayName: externalReporters.displayName,
+		})
+		.from(issues)
+		.innerJoin(projects, eq(projects.id, issues.projectId))
+		.leftJoin(manualIssueReports, eq(manualIssueReports.issueId, issues.id))
+		.leftJoin(externalIssueReports, eq(externalIssueReports.issueId, issues.id))
+		.leftJoin(externalReporters, eq(externalReporters.id, externalIssueReports.externalReporterId))
+		.where(and(...conditions))
+		.orderBy(desc(sortColumn), desc(issues.id));
+
+	// Fetch one extra row (when paginating) to detect "more pages exist" without a second COUNT
+	// query -- mirrors events.ts's listOrgActivity.
+	const rows = clampedLimit !== undefined ? await baseQuery.limit(clampedLimit + 1) : await baseQuery;
+
+	const hasMore = clampedLimit !== undefined && rows.length > clampedLimit;
+	const page = hasMore ? rows.slice(0, clampedLimit) : rows;
+
+	const mapped: AgentIssueListItem[] = page.map((row: (typeof rows)[number]) => {
+		// `manualIssueId`/`externalIssueId` are companion-presence probes, not response fields --
+		// destructured out so they never reach the agent's JSON.
+		const { manualIssueId, externalIssueId, ...rest } = row;
+		return {
+		...rest,
+		reporterKind: manualIssueId !== null ? 'org_member' : externalIssueId !== null ? 'external' : null,
+		reporterDisplayName: externalIssueId !== null ? row.reporterDisplayName : null,
+		isWaiting: row.waitingOn !== null,
+		// N9 (C12): only surface waitingSince for a currently-waiting issue -- a cleared question can
+		// leave a stale timestamp behind (issues.ts backfill/re-open paths), so gate on waitingOn.
+		waitingSince: row.waitingOn !== null ? row.waitingSince : null,
+		};
+	});
+
+	let nextCursor: string | undefined;
+	if (hasLimit && hasMore) {
+		const last = page[page.length - 1];
+		const lastSortValue: Date | null = sort === 'firstSeen' ? last.firstSeen : last.lastSeen;
+		if (lastSortValue) {
+			nextCursor = encodeAgentIssuesCursor(lastSortValue, last.id);
+		}
+	}
+
+	return { issues: mapped, nextCursor };
+}
+
+export interface ClaimNextAgentIssueOptions {
+	organizationId: string;
+	/** sentinel-cli-browser-login: as `ListAgentIssuesOptions.visibility` -- a personal key never claims what it cannot see. */
+	visibility?: AgentVisibility | null;
+	/** B7: the claimant, resolved from the credential -- never a request param. */
+	agentId: string;
+	type?: 'user_report' | 'system_error';
+	projectId?: string;
+	environment?: string;
+	source?: AgentIssueSource;
+	/** Same vocabulary and direction as `listAgentIssues`: descending on this column, default
+	 *  `lastSeen`, `id` as the tiebreaker. */
+	sort?: AgentIssuesSort;
+}
+
+/**
+ * sentinel-agent-claim-next-issue: `POST /api/agent/issues/claim-next` -- select the next
+ * unclaimed issue and claim it for `agentId` in ONE statement, so two agents polling the same
+ * queue can never both be handed the same row.
+ *
+ * "Next" is defined by the same ordering `GET /api/agent/issues?claimed=false` uses (descending
+ * on `sort`, default `lastSeen`, `id` tiebreak), narrowed to `status = 'unresolved'`: a resolved
+ * or ignored issue is not work, and handing one to a worker loop would only make it release and
+ * ask again. The optional filters are the list route's own (`type`, `project`, `environment`,
+ * `source`), so an agent's discovery query and its claim query cannot disagree about what is
+ * eligible.
+ *
+ * Atomicity: the candidate is picked by a `SELECT ... FOR UPDATE OF issues SKIP LOCKED` subquery
+ * inside the UPDATE, and the UPDATE re-asserts `assigned_to IS NULL`. Under READ COMMITTED that
+ * closes both races: a concurrent claim-next skips the row this one has locked and takes the next
+ * eligible one, and a concurrent single-issue `claimIssue` that committed first makes the outer
+ * predicate fail so the statement updates nothing and this call reports "queue empty" for that
+ * row rather than double-claiming it (the caller then simply asks again). Returns `null` when no
+ * eligible issue exists -- deliberately not an error at this layer.
+ *
+ * The claim it records is byte-for-byte a `claimIssue` claim: same `claimed` activity row, same
+ * claimant auto-subscription, same notification fan-out, via reports.ts's `recordClaim`, all in
+ * this transaction (D18).
+ */
+export async function claimNextAgentIssue(
+	options: ClaimNextAgentIssueOptions
+): Promise<{ issue: typeof issues.$inferSelect; notified: NotifiedUser[] } | null> {
+	const sort: AgentIssuesSort = options.sort ?? 'lastSeen';
+	const sortColumn = sort === 'firstSeen' ? issues.firstSeen : issues.lastSeen;
+
+	const conditions = [
+		eq(projects.organizationId, options.organizationId),
+		isNull(issues.assignedTo),
+		eq(issues.status, 'unresolved'),
+	];
+	const visibilityGuard = agentVisibilityCondition(options.visibility);
+	if (visibilityGuard) {
+		conditions.push(visibilityGuard);
+	}
+	if (options.type) {
+		conditions.push(eq(issues.issueType, options.type));
+	}
+	if (options.projectId) {
+		conditions.push(eq(issues.projectId, options.projectId));
+	}
+	if (options.environment) {
+		conditions.push(eq(issues.environment, options.environment));
+	}
+	if (options.source) {
+		conditions.push(eq(issues.sourceChannel, options.source));
+	}
+
+	return await db.transaction(async (tx) => {
+		// `FOR UPDATE OF issues` (not the joined projects row) + SKIP LOCKED: concurrent callers
+		// each lock a different candidate instead of queueing on the same one and then losing on
+		// the `assigned_to IS NULL` re-check.
+		const candidate = tx
+			.select({ id: issues.id })
+			.from(issues)
+			.innerJoin(projects, eq(projects.id, issues.projectId))
+			.where(and(...conditions))
+			.orderBy(desc(sortColumn), desc(issues.id))
+			.limit(1)
+			.for('update', { of: issues, skipLocked: true });
+
+		const updated = await tx
+			.update(issues)
+			.set({ assigneeType: 'agent', assignedTo: options.agentId, claimedAt: new Date() })
+			.where(and(sql`${issues.id} = (${candidate})`, isNull(issues.assignedTo)))
+			.returning();
+
+		if (updated.length === 0) {
+			return null;
+		}
+
+		const notified = await recordClaim(tx, updated[0].id, 'agent', options.agentId);
+		return { issue: updated[0], notified };
+	});
+}
+
+/**
+ * Manual Issues M5 stage 2 (design §7 step 3): `POST /api/agent/issues/[id]/progress` --
+ * `progress_update` activity row + in-app-only notification (Q7: agent progress updates never
+ * email, `notify.ts`'s `EMAILABLE_KINDS` deliberately omits 'progress_update'). D18: one
+ * transaction, throw on failure.
+ */
+export async function recordAgentProgress(
+	issueId: string,
+	agentId: string,
+	messageMd: string,
+	idempotencyKey?: string
+): Promise<{ notified: NotifiedUser[]; deduplicated: boolean }> {
+	const IDEMPOTENCY_OP = 'issues.progress';
+	try {
+		return await recordAgentProgressTxn(issueId, agentId, messageMd, idempotencyKey, IDEMPOTENCY_OP);
+	} catch (err) {
+		// A concurrent duplicate committed our key first and rolled our transaction back. A progress
+		// update has no result to re-fetch beyond "it happened" -- replay a bare deduplicated success.
+		if (err instanceof IdempotencyRaceError) {
+			return { notified: [], deduplicated: true };
+		}
+		throw err;
+	}
+}
+
+async function recordAgentProgressTxn(
+	issueId: string,
+	agentId: string,
+	messageMd: string,
+	idempotencyKey: string | undefined,
+	idempotencyOp: string
+): Promise<{ notified: NotifiedUser[]; deduplicated: boolean }> {
+	return await db.transaction(async (tx) => {
+		// N9 (D21): idempotency-key replay -- checked BEFORE any write, read-only early return.
+		if (idempotencyKey) {
+			const hit = await findIdempotencyKey(tx, agentId, idempotencyKey, idempotencyOp);
+			if (hit) {
+				return { notified: [], deduplicated: true };
+			}
+		}
+
+		// A05-comment/progress (N7d): dedupe a retried progress post by natural key (same
+		// issue+agent+message within AGENT_DEDUPE_WINDOW_MS) -- mirrors createComment's plain-comment
+		// dedupe. `newValue` is jsonb; `->>'messageMd'` does a text comparison against the stored key.
+		const recentDuplicates = await tx
+			.select({ id: issueActivity.id })
+			.from(issueActivity)
+			.where(
+				and(
+					eq(issueActivity.issueId, issueId),
+					eq(issueActivity.eventType, 'progress_update'),
+					eq(issueActivity.actorType, 'agent'),
+					eq(issueActivity.actorId, agentId),
+					sql`${issueActivity.newValue}->>'messageMd' = ${messageMd}`,
+					gte(issueActivity.createdAt, new Date(Date.now() - AGENT_DEDUPE_WINDOW_MS))
+				)
+			);
+
+		if (recentDuplicates.length > 0) {
+			return { notified: [], deduplicated: true };
+		}
+
+		await tx.insert(issueActivity).values({
+			issueId,
+			eventType: 'progress_update',
+			actorType: 'agent',
+			actorId: agentId,
+			newValue: { messageMd },
+		});
+
+		const notified = await notifyIssueEvent(tx, {
+			issueId,
+			kind: 'progress_update',
+			actorType: 'agent',
+			actorId: agentId,
+			payload: { messageMd },
+		});
+
+		// N9 (D21): stamp the key LAST, in the same transaction; a concurrent-duplicate conflict
+		// throws IdempotencyRaceError and rolls back this progress row so only the winner survives.
+		if (idempotencyKey) {
+			await recordIdempotencyKey(tx, agentId, idempotencyKey, idempotencyOp, null);
+		}
+
+		return { notified, deduplicated: false };
+	});
+}

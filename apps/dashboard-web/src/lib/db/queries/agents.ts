@@ -1,0 +1,133 @@
+import { db } from '$lib/server/db';
+import { agents, auditLogs } from '$lib/db/schema';
+import { eq, and, desc } from 'drizzle-orm';
+
+/**
+ * Manual Issues M5 stage 1 (docs/plans/MANUAL_ISSUES_DESIGN.md §7, Q5): agent identity.
+ * Every mutation here writes an `audit_logs` row in the same shape as
+ * src/lib/db/queries/apikeys.ts's `api_key.*` actions, per Q5 ("every agent action is
+ * auditable"). Tenant scope (`orgId`) MUST always come from the caller's authenticated
+ * membership, never from the request body (B7) -- every function below takes orgId as an
+ * explicit parameter and callers are responsible for having derived it from the credential.
+ */
+
+// 'personal' (sentinel-cli-browser-login): a `sentinel login` agent owned by one user. Never created through createAgent --
+// only by the device flow's mint (cli-personal-keys.ts) -- and never in the org roster the agents admin API returns.
+export type AgentKind = 'ai' | 'bot' | 'personal';
+export type AgentStatus = 'active' | 'disabled';
+
+export interface AgentRow {
+	id: string;
+	orgId: string;
+	name: string;
+	kind: AgentKind;
+	status: AgentStatus;
+	createdBy: string;
+	createdAt: Date | null;
+	// N10: admin-set gate for GET /api/agent/repo-credentials (default false).
+	canAccessRepoCredentials: boolean;
+	// Set iff kind = 'personal' (agents_personal_owner_check).
+	ownerUserId: string | null;
+}
+
+export async function listAgents(orgId: string): Promise<AgentRow[]> {
+	const rows = await db
+		.select()
+		.from(agents)
+		.where(eq(agents.orgId, orgId))
+		.orderBy(desc(agents.createdAt));
+	return rows as AgentRow[];
+}
+
+// getAgentById intentionally does NOT filter by orgId -- exactly like apikeys.ts's
+// getApiKeyById, callers reading a caller-supplied agentId out of the URL MUST verify
+// `row.orgId === <the authenticated caller's org>` themselves before acting on it.
+export async function getAgentById(id: string): Promise<AgentRow | undefined> {
+	const [row] = await db.select().from(agents).where(eq(agents.id, id));
+	return row as AgentRow | undefined;
+}
+
+export async function createAgent(
+	actorUserId: string,
+	data: { orgId: string; name: string; kind: Exclude<AgentKind, 'personal'> }
+): Promise<AgentRow> {
+	const [newAgent] = await db
+		.insert(agents)
+		.values({
+			orgId: data.orgId,
+			name: data.name,
+			kind: data.kind,
+			status: 'active',
+			createdBy: actorUserId,
+		})
+		.returning();
+
+	await db.insert(auditLogs).values({
+		action: 'agent.created',
+		resourceType: 'agent',
+		resourceId: newAgent.id,
+		actorId: actorUserId,
+		metadata: { name: newAgent.name, kind: newAgent.kind, orgId: data.orgId },
+	});
+
+	return newAgent as AgentRow;
+}
+
+export async function setAgentStatus(
+	actorUserId: string,
+	orgId: string,
+	agentId: string,
+	status: AgentStatus
+): Promise<AgentRow> {
+	const [updated] = await db
+		.update(agents)
+		.set({ status })
+		.where(and(eq(agents.id, agentId), eq(agents.orgId, orgId)))
+		.returning();
+
+	if (!updated) {
+		throw new Error('Agent not found');
+	}
+
+	await db.insert(auditLogs).values({
+		action: 'agent.status_changed',
+		resourceType: 'agent',
+		resourceId: agentId,
+		actorId: actorUserId,
+		metadata: { status },
+	});
+
+	return updated as AgentRow;
+}
+
+/**
+ * N10: grant/withdraw the repo-credentials delivery gate. Audited like every agent mutation --
+ * this flag turns a triage identity into one that can fetch write-capable git tokens, so the
+ * audit trail must show who flipped it and when.
+ */
+export async function setAgentRepoCredentialAccess(
+	actorUserId: string,
+	orgId: string,
+	agentId: string,
+	canAccessRepoCredentials: boolean
+): Promise<AgentRow> {
+	const [updated] = await db
+		.update(agents)
+		.set({ canAccessRepoCredentials })
+		.where(and(eq(agents.id, agentId), eq(agents.orgId, orgId)))
+		.returning();
+
+	if (!updated) {
+		throw new Error('Agent not found');
+	}
+
+	await db.insert(auditLogs).values({
+		action: 'agent.repo_credential_access_changed',
+		resourceType: 'agent',
+		resourceId: agentId,
+		actorId: actorUserId,
+		metadata: { canAccessRepoCredentials },
+	});
+
+	return updated as AgentRow;
+}

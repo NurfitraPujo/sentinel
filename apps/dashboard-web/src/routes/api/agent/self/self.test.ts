@@ -1,0 +1,89 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// R1a (docs/plans/AGENT_AUTOMATION_REMEDIATION_PLAN.md N7f). GET /api/agent/self echoes exactly
+// what `authenticateAgentRequest` already resolved -- no second query.
+
+const authenticateAgentRequest = vi.fn();
+vi.mock('$lib/server/agent-auth', () => ({ authenticateAgentRequest }));
+
+const { GET } = await import('./+server');
+
+function makeEvent() {
+	return { request: new Request('http://localhost/api/agent/self') } as any;
+}
+
+beforeEach(() => {
+	vi.clearAllMocks();
+});
+
+describe('GET /api/agent/self', () => {
+	it('401s when unauthenticated', async () => {
+		authenticateAgentRequest.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }));
+		await expect(GET(makeEvent())).rejects.toMatchObject({ status: 401 });
+	});
+
+	it('returns agentId/name/organizationId and the key row, with createdAt/expiresAt ISO-formatted', async () => {
+		const createdAt = new Date('2026-08-01T00:00:00.000Z');
+		const expiresAt = new Date('2026-09-01T00:00:00.000Z');
+		authenticateAgentRequest.mockResolvedValue({
+			agentId: 'agent-1',
+			organizationId: 'org-1',
+			agentName: 'Triage Bot',
+			keyPrefixForAudit: 'abc123def456',
+			keyId: 'key-1',
+			keyPrefix: 'sent_agent_',
+			keyCreatedAt: createdAt,
+			keyExpiresAt: expiresAt,
+			agentKind: 'ai',
+			owner: null,
+		});
+
+		const res = await GET(makeEvent());
+		expect(res.status).toBe(200);
+		const body = await res.json();
+
+		expect(body).toEqual({
+			agentId: 'agent-1',
+			name: 'Triage Bot',
+			organizationId: 'org-1',
+			kind: 'ai',
+			owner: null,
+			key: {
+				id: 'key-1',
+				prefix: 'sent_agent_',
+				createdAt: '2026-08-01T00:00:00.000Z',
+				expiresAt: '2026-09-01T00:00:00.000Z',
+				lastUsedAt: null,
+			},
+		});
+	});
+
+	it('returns null createdAt/expiresAt for a non-expiring key with no createdAt', async () => {
+		authenticateAgentRequest.mockResolvedValue({
+			agentId: 'agent-1',
+			organizationId: 'org-1',
+			agentName: 'Triage Bot',
+			keyPrefixForAudit: 'abc123def456',
+			keyId: 'key-1',
+			keyPrefix: 'sent_agent_',
+			keyCreatedAt: null,
+			keyExpiresAt: null,
+		});
+
+		const res = await GET(makeEvent());
+		const body = await res.json();
+		expect(body.key.expiresAt).toBeNull();
+		expect(body.key.createdAt).toBeNull();
+	});
+
+	it('includes cliProfile only when SENTINEL_CLI_PROFILE is set (fresh-machine login suggestion)', async () => {
+		authenticateAgentRequest.mockResolvedValue({ agentId: 'a', organizationId: 'o', agentName: 'n', keyId: 'k', keyPrefix: 'p', keyCreatedAt: null, keyExpiresAt: null });
+		vi.stubEnv('SENTINEL_CLI_PROFILE', 'production');
+		const withProfile = await (await GET(makeEvent())).json();
+		expect(withProfile.cliProfile).toBe('production');
+		vi.stubEnv('SENTINEL_CLI_PROFILE', '');
+		const without = await (await GET(makeEvent())).json();
+		expect('cliProfile' in without).toBe(false);
+		vi.unstubAllEnvs();
+	});
+});

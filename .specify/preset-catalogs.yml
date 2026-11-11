@@ -1,0 +1,6 @@
+catalogs:
+- name: community
+  url: https://github.com/github/spec-kit
+  priority: 10
+  install_allowed: true
+  description: ''

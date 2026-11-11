@@ -1,0 +1,253 @@
+{{- $img := .Values.images.dashboard -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $secret := include "sentinel.secretName" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  annotations:
+    # Start only after the migrate Job (wave 1) completes.
+    "argocd.argoproj.io/sync-wave": "2"
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  {{- if not .Values.dashboard.autoscaling.enabled }}
+  replicas: {{ .Values.dashboard.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "sentinel.labels" . | nindent 8 }}
+        app.kubernetes.io/component: dashboard
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # sentinel-user-report-issue SR-3 / §12: the scrape half of the metrics chain, in the same
+        # three-annotation shape processor.yaml already uses. Verified at `b768e5b` this app had no
+        # /metrics route and no annotation, so nothing scraped it.
+        #
+        # The path is `/api/metrics`, not `/metrics`: `api` is in hooks.server.ts's reservedRoutes
+        # and a bare `/metrics` would be parsed as an organization slug by the `[orgSlug]`
+        # catch-all. The endpoint is unauthenticated by the same rule the ingestor's is — a scraper
+        # has no session — and what makes that safe is that every label value the app can emit is
+        # from a fixed, closed constant set, so the response carries no organization, project, key,
+        # reporter or report content. Keep that property if you add a metric.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.dashboard.containerPort | quote }}
+        prometheus.io/path: /api/metrics
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dashboard
+          image: "{{ $img.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.dashboard.containerPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "sentinel.configMapName" . }}
+          env:
+            # POSTGRES_* must precede DATABASE_URL — Kubernetes expands $(VAR) using vars
+            # defined earlier in this list.
+            {{- include "sentinel.postgresEnv" . | nindent 12 }}
+            {{- if include "sentinel.natsUrlIsSecret" . }}
+            - name: NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentinel.secretName" . }}
+                  key: NATS_URL
+            {{- end }}
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode={{ .Values.config.postgres.sslmode }}"
+            - name: OTEL_SERVICE_NAME
+              value: dashboard-web
+            {{- include "sentinel.otelEnv" . | nindent 12 }}
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: S3_SECRET_KEY } }
+            - name: AUTH_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: AUTH_SECRET } }
+            - name: SETTINGS_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SETTINGS_ENCRYPTION_KEY } }
+            - name: SENTINEL_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: SENTINEL_ENCRYPTION_KEY } }
+            - name: CRON_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: CRON_SECRET } }
+            # Google OAuth is optional (email magic-link is the fallback auth).
+            # These env entries render only when the keys exist in the ACTIVE
+            # secret pool (externalSecrets on AWS; sealedData when
+            # backend=sealed; else data) — Helm deep-merges the base values, so
+            # the check must not look at the inactive pool. Omitting the keys
+            # disables Google SSO without a CreateContainerConfigError on
+            # missing secret keys.
+            {{- if include "sentinel.secretPoolContains" (list . "GOOGLE_CLIENT_ID") }}
+            - name: GOOGLE_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_ID } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "GOOGLE_CLIENT_SECRET") }}
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GOOGLE_CLIENT_SECRET } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "GITHUB_CLIENT_ID") }}
+            - name: GITHUB_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GITHUB_CLIENT_ID } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "GITHUB_CLIENT_SECRET") }}
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: GITHUB_CLIENT_SECRET } }
+            {{- end }}
+            - name: EMAIL_SERVER
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: EMAIL_SERVER } }
+            # sentinel-sourcemaps §12: adapter-node's request-body cap and POST /api/sourcemaps's
+            # three caps (§4.1). Without BODY_SIZE_LIMIT the adapter 413s every real map before the
+            # route runs. Value syntax is documented beside each key in values.yaml
+            # (config.dashboard.*); docker-compose.yml carries the same BODY_SIZE_LIMIT.
+            - name: BODY_SIZE_LIMIT
+              value: {{ .Values.config.dashboard.bodySizeLimit | quote }}
+            - name: SOURCEMAP_MAX_BYTES
+              value: {{ .Values.config.dashboard.sourcemapMaxBytes | quote }}
+            - name: SOURCEMAP_MAX_FILES_PER_REQUEST
+              value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRequest | quote }}
+            - name: SOURCEMAP_MAX_FILES_PER_RELEASE
+              value: {{ .Values.config.dashboard.sourcemapMaxFilesPerRelease | quote }}
+            # sentinel-occurrence-spans TASK-02: the "Pull spans" button and POST /api/agent/traces/{id}/pull. The dashboard needs
+            # the SAME allow-list the processor reads (values.yaml `spans.pull`), and only when the processor can actually fetch:
+            # without scopes AND a trace store the variable is not rendered, so no button is offered for pulls that could never
+            # run. The processor's worker re-checks the allow-list at fetch time and stays the backstop.
+            {{- if and .Values.spans.pull.scopes .Values.spans.pull.storeKind .Values.spans.pull.storeUrl }}
+            - name: SPAN_PULL_SCOPES
+              value: {{ .Values.spans.pull.scopes | quote }}
+            {{- end }}
+            - name: SPAN_PULL_ON_DEMAND_LIMIT
+              value: {{ .Values.spans.pull.onDemandLimitPerHour | quote }}
+            # sentinel-reporting-and-dashboard: D6 SLI collection, D4 Databend analytics, D20 insights export. Every one
+            # is optional: unset means the dashboard runs without it and the affected sections say "unavailable".
+            {{- if .Values.serviceSlis }}
+            - name: SERVICE_SLI_CONFIG
+              value: {{ .Values.serviceSlis | toJson | quote }}
+            {{- end }}
+            {{- if .Values.analytics.victoriaMetricsUrl }}
+            - name: VICTORIAMETRICS_URL
+              value: {{ .Values.analytics.victoriaMetricsUrl | quote }}
+            {{- end }}
+            {{- if .Values.analytics.sliCluster }}
+            - name: SLI_CLUSTER
+              value: {{ .Values.analytics.sliCluster | quote }}
+            {{- end }}
+            {{- if .Values.analytics.databend.url }}
+            - name: DATABEND_URL
+              value: {{ .Values.analytics.databend.url | quote }}
+            - name: DATABEND_USER
+              value: {{ .Values.analytics.databend.user | quote }}
+            - name: DATABEND_DATABASE
+              value: {{ .Values.analytics.databend.database | quote }}
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "DATABEND_PASSWORD") }}
+            - name: DATABEND_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: DATABEND_PASSWORD } }
+            {{- end }}
+            {{- if include "sentinel.secretPoolContains" (list . "METRICS_SCRAPE_TOKEN") }}
+            - name: METRICS_SCRAPE_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: METRICS_SCRAPE_TOKEN } }
+            {{- end }}
+          livenessProbe:
+            httpGet: { path: {{ .Values.dashboard.livenessPath }}, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: {{ .Values.dashboard.readinessPath }}, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.dashboard.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  type: {{ .Values.dashboard.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: dashboard
+  ports:
+    - name: http
+      port: {{ .Values.dashboard.service.port }}
+      targetPort: http
+      {{- if and (eq .Values.dashboard.service.type "NodePort") .Values.dashboard.service.nodePort }}
+      nodePort: {{ .Values.dashboard.service.nodePort }}
+      {{- end }}
+{{- if .Values.dashboard.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+  annotations:
+    # Wave 3: attach only after the Deployment (wave 2) exists. Creating the
+    # HPA in wave 0 on a fresh install makes the HPA controller report
+    # "unable to get the target's current scale" (health Degraded), which
+    # aborts the whole ArgoCD sync before migrations (wave 1) ever run.
+    "argocd.argoproj.io/sync-wave": "3"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "sentinel.fullname" . }}-dashboard
+  minReplicas: {{ .Values.dashboard.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.dashboard.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.dashboard.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.dashboard.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sentinel.fullname" . }}-dashboard
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+  annotations:
+    # Wave 3: PDB selects Deployment pods (wave 2); keep it with the HPA so a
+    # fresh install never evaluates budgets against missing workloads.
+    "argocd.argoproj.io/sync-wave": "3"
+spec:
+  minAvailable: {{ .Values.dashboard.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+{{- end }}

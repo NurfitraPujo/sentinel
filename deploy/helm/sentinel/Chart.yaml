@@ -1,0 +1,29 @@
+apiVersion: v2
+name: sentinel
+description: |
+  Sentinel error-tracking pipeline: ingestor-go (HTTP ingest) -> NATS JetStream ->
+  processor-go -> PostgreSQL, with the SvelteKit dashboard-web reading the same database.
+  The chart ships the three first-party services plus an optional in-cluster copy of every
+  stateful dependency (PostgreSQL, NATS JetStream, Redis, MinIO). For production you are
+  expected to disable the bundled dependencies and point at managed equivalents — see
+  values.yaml and ../../../DEPLOYMENT.md.
+type: application
+# Chart version — bump on any template change.
+# 0.2.0: K8s Cloud CCE adaptation (per-service CCE ingresses, NodePort
+# services, external-services for RDS/Redis, SealedSecrets backend).
+# 0.3.0: AWS EKS dual-stack — ExternalSecret backend (global.provider=aws,
+# SSM Parameter Store via ESO) + values.aws.{staging,production}.yml.
+# 0.3.1: EKS scheduling + init hardening — nodeSelector/affinity/tolerations
+# on the migrate/init Jobs, both CronJobs and dlq-drainer (amd64-only images
+# must never land on Graviton nodes); idempotent NATS consumer creation in
+# scripts/nats-init.sh; declarative ECR tag pins in values.aws.production.yml.
+version: 0.3.1
+# The app version the default images track. Override image tags per-service in values.yaml.
+appVersion: "0.1.0"
+keywords:
+  - error-tracking
+  - observability
+  - sentinel
+home: https://github.com/NurfitraPujo/sentinel
+maintainers:
+  - name: Sentinel maintainers

@@ -1,0 +1,79 @@
+# Stage 1: Build
+FROM docker.io/library/node:22-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files from project root (context is project root)
+COPY apps/dashboard-web/package.json apps/dashboard-web/package-lock.json ./
+# pnpm pinned, not floating. Unpinned, this resolved to whatever `npm install -g pnpm`
+# served that day; pnpm 11 turned ignored build scripts into a hard error and every
+# compose build began failing with ERR_PNPM_IGNORED_BUILDS on esbuild and protobufjs,
+# taking the `integration` and `e2e` jobs with it. 10 is the version .github/workflows/ci.yml
+# already pins for the `dashboard` job (pnpm/action-setup version: 10), so the image and CI
+# now agree instead of drifting.
+RUN npm install -g pnpm@10 && pnpm install
+
+# Copy source
+COPY apps/dashboard-web/ ./
+
+# Build
+RUN pnpm build
+
+# Stage 1b: the `sentinel` CLI, cross-compiled for the four platforms the dashboard's /install.sh serves
+# (see apps/dashboard-web/src/lib/server/cli-dist.ts). Independent of the SvelteKit stage, so BuildKit
+# builds them in parallel and a dashboard-only change never rebuilds the CLI. tools/sentinel is a
+# stdlib-only module (no dependency download step); it is built with GOWORK=off exactly like CI's
+# `sentinel-cli` job. Only the version build-arg is declared AFTER the source COPY, so it is the one
+# thing that invalidates the compile layer — a retag rebuilds this stage, nothing else.
+FROM docker.io/library/golang:1.25-alpine AS cli
+
+WORKDIR /src
+COPY tools/sentinel/ ./
+ARG SENTINEL_VERSION=dev
+RUN set -eu; mkdir -p /out; \
+    for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do \
+      os=${target%/*}; arch=${target#*/}; \
+      GOWORK=off CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+        go build -trimpath -ldflags "-s -w -X main.version=${SENTINEL_VERSION}" \
+        -o "/out/sentinel-$os-$arch" . ; \
+    done; \
+    cd /out && sha256sum sentinel-* > checksums.txt && cat checksums.txt
+
+# Stage 2: Production
+FROM docker.io/library/node:22-alpine
+
+RUN apk add --no-cache ca-certificates tzdata
+
+# Create non-root user
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
+
+WORKDIR /app
+
+# Copy built assets from builder
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+# Prebuilt CLI binaries + sha256 checksums, served unauthenticated by /install.sh, /cli/download/<os>/<arch>
+# and /cli/checksums.txt (SENTINEL_CLI_DIR defaults to ./cli relative to WORKDIR).
+COPY --from=cli /out ./cli
+
+# OTel bootstrap (docs/plans/OBSERVABILITY_PLAN.md D-f). Deliberately NOT part of the SvelteKit/Vite
+# build (see the file's own header comment) — copied in directly, unbundled, and loaded via `node
+# --import` below so its module-loader hooks register before adapter-node's entrypoint ever touches
+# 'http'/'pg'.
+COPY apps/dashboard-web/instrumentation.mjs ./instrumentation.mjs
+
+USER appuser
+
+EXPOSE 3000
+
+ENV PORT=3000
+ENV POSTGRES_HOST=localhost
+ENV POSTGRES_PORT=5432
+ENV POSTGRES_USER=sentinel
+ENV POSTGRES_PASSWORD=changeme
+ENV POSTGRES_DB=sentinel
+ENV DATABASE_URL=postgres://sentinel:changeme@localhost:5432/sentinel
+
+ENTRYPOINT ["node", "--import", "./instrumentation.mjs", "build/index.js"]

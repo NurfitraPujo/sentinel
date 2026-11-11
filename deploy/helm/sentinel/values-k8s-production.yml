@@ -1,0 +1,300 @@
+# K8s CCE production values for the Sentinel chart.
+#
+# Fill every PLACEHOLDER before installing:
+#   - sealedData: paste kubeseal-encryptor ciphertext scoped to the
+#     sentinel-production namespace (see RUNBOOK.md). Never commit plaintext.
+#   - externalServices IPs: managed RDS / DCS Redis private IPs (10.200.x.x).
+#   - S3_* : OBS endpoint / bucket / browser-reachable public endpoint.
+#   - elbId / tlsCertIds: reuse cdc's shared internal ELB unless the platform
+#     team provisions a Sentinel-specific one.
+#
+# Render check (no cluster needed):
+#   helm template sentinel . -f values-k8s-production.yml
+
+global:
+  provider: k8s
+
+imagePullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: default-secret
+
+nodeSelector:
+  node_type: spot
+
+# -----------------------------------------------------------------------------
+# First-party images. All built from this repo and pushed to SWR
+# (swr.example.com/example-engineering). Tags default to
+# Chart.AppVersion; the release workflows --set image.tag to the git tag.
+# -----------------------------------------------------------------------------
+images:
+  ingestor:
+    repository: swr.example.com/example-engineering/sentinel-ingestor
+    tag: ""
+  processor:
+    repository: swr.example.com/example-engineering/sentinel-processor
+    tag: ""
+  dashboard:
+    repository: swr.example.com/example-engineering/sentinel-dashboard
+    tag: ""
+  migrate:
+    repository: swr.example.com/example-engineering/sentinel-db-migrate
+    tag: ""
+  dlqDrainer:
+    repository: swr.example.com/example-engineering/sentinel-dlq-drainer
+    tag: ""
+
+secrets:
+  create: false
+  existingSecret: ""
+  backend: sealed
+  # kubeseal-encryptor ciphertext, scope: namespace sentinel-production.
+  # Replace every PLACEHOLDER via the encryptor API before installing.
+  sealedData:
+    POSTGRES_PASSWORD: "AgAb+RSHgyHzdCKhPQa8wB47MUhM/YMOT0fV3T1eMbBPziON1iZJg5cFzECXu09Gi/+t7tFxocPZ/QWR6YIobuOIAo+wICbDC6Z5IedohRsEDvWUW+jfrA1en48WxhrYYZ5/yKZ+hwd02ef8g4mOb3ut1CRgAGSnlSGka9yiydsZq45Otz9xCHRIm9zXaiTYOTcvZo4+uyr5ITJQUZmLGl0sBLZ7mFcFgBt7TdOYeJM3yO8R+a+ywhkBMn2OKu/heWWAQxZe1mIVUMRH8ao9R5mMUqwAV9PdM/LMgFzYv7P7zn/7/WW+Ao+3GNURSSF/GD4D5YlFDWNR8PlWZbJE6S3KeTqFfb/QIoLu8rSTfYIU9XaUVh4d4emoOyk+lJISdN8QnoEpOTa6/IE+nkKdL+MYHwcpUEElUVhZ97DSxm8Ztv7ldgHTZGog6xUkMKGh1VbNp4aHe/QCMU7U9TwYeqy+oYsq4tLEHd2BwqXzNNqWWTca3vvz/bdY4AT1e/EDYF4DjZfj53smnkMj1sBYyMI3PladrQnnOrqtMpBZkVDzageyMDTUt0V/w2UEOAarHrrXM62188/+Z9DN7u++vnm5dJ74ubGm2luYe9USPdGexBppnvHSpM1n+RA99tR1vkpKPRyzqxG8HMzm2/bkGkwFRzAZgdA2sptDL5pgUZgFGAMZVcZqv+LAjqcx+gx1GuAgW6qwj7tZjVIypXOVK1Zhk7BC75eBDczJaIMg"
+    REDIS_PASSWORD: "AgC1KFdp3dR4VQexg+iwm37O7IxW//s8I4/4+Edz4veVRK0vGnvVTMry4sl10AtPD3k/t6JFDhQQi6N+J4SwGjTjY91JsZx3hAZ0en2U3BwqJYJo8N02gk1+oU+0dm1BuUiEDChngUlRVM6ik4Ai8OZM2Rr0HaFVnhCDvyh14uxGMDiF7PZogSJoOGnqMB/Qe3u33PRwPZs4G0tJnvspmkdKpdtqTOZkjnoN18snip24KBHMRj24bUsxjjD/hRN5tp+/tUkIwapU35h/tvkC+YnuLAkZbRBaI708cV+Yp/B3xEBWgB6/4GPhC0D6NEoCVZqXtvQ7c61+kH/nYUDTbuS4hGrG7UCjL0KMdDqnagvnfm77hjzOlJTyzp+QZdU38N/zV5jrPtVboT1Dg6t00Qvil9xfCSFDcnulmtnKRsNE/Yk9ElteSrkIgJ+5IhS0bFgmbZuhe7hGoFbdbu2sDw7I0KnYUCRgkkWpmavmVBWLMZze9X8I7PcB1HDI+N+PmsGq8IZkS3mypRdx0PZpf12/9EWwwNGEr+9R6QMiTNU6HHINscNssPkBQQ5aPpuvMRTV2L4Cs5PPiwq0RYF9OUSnu9AhsGVHfSUaj+KnjstGg1MplzMR6xdbqvim6UrZzr7rD1oJrRtEQbGYQ9Vlap+IFazfxP/oPQZSDIl79Cu/7OzYit0F+HIPQTdFdFo7xjjvpufOtiS8+j5oUv7aKqH6jTZVwiz+BUwREbt4pxBh9g=="
+    S3_ACCESS_KEY: "AgCmSDZ4rIH4QPJCNLk8AM17HXE0M3BLYTZ8HIIB3GfNYMRPc9PNu8vZzIFOoD/yyd/dyDXxDcl86eeMkm6mHzvyQC/xXzPgMCMNoj4gVw9GGOA6FUl8A82sOoIchz3PJwrXsvycvALiBbGsHecEyJmG66z9LPLjdnItAyM/peNW7DEsEOXHzM2oYxQkOf8dWwyG3QQ2hYLN6iUCCpqcUHSOn8wO9lHWaMQZ8FTdV44bskU5vh5FB9P0CPaYNyG8pCDVewVc0gALQ18pu1txtnPKkl+xrvXA6zlbEexQFqKOwNa9JK0Hoem4fQVwcI0zaWt2aDMpU4COoMRbn21WA/Mei87LJy8BwTaTMrCxRZZUPbrcCH3kVdBcTLkzZ9B2UMIDdjV6faX+ldFnisCEVTrVpcC9clCIJ37stYhOJ53o/ecAYdEpEzZc7MB/75Nbi6CZEBxAhfQPb4nOk3wE9FvRHYL3IWdlhVpQtJmu1sOsyVhSgbC+AkZH6boKE5GWMFqnJCkBLQOD5UhklbThyo5ypgRyIWhXolItteryFpz+tRXqD4jJOcGdYolFNqM3EX9ltW8u7wik2LrgqtVtDkqnqMUF6W4iLYGtSD9Ui9m6IxP/ulXPIbxD9Q0IRWY73/A4HS7IIpYJBPN4ppE2qCS9JLin7DYzgv1bdXuH+J2TpOcLEpmqPPf/OVENTHcGaWpkhJ33R9zw8b56QlT7aSjKBRPZ0g=="
+    S3_SECRET_KEY: "AgBt88+TKXQX9O03ZQxLyrXbdkg/SK+VHkNEwbWTLtLB2qi90FEP5ncyk2r07KIfWeDyMZQHYJzOHGlzRlPvkIpZh/yQLqCddFBLQ92rLvcb413zdWqzsZ/IBwK7UCjKjQADk8IzEheGJGagRw7yGNbDTQjCVuilsISUGENfmm3FvzkY//mevs80rxkxvAISsvVOhC+BlAEIEK3TYCsLjFULpI7nCkT8KCT14tHmxDh2LRBhmTFVhIZcKCsJeZygy6MeOdZNOuOvEOJ8gVkeZ1mdDfA8l135jlnCaQQ0KYvK3JYJtxLiFY6Luw+T1V2QU70+lY7wF9StqXCmv/86TxJdfLdbivAeGZdgiIG1EkBnTeDW5zyB/KiKpyqjhRAJhHLfCs3h7IIAMRBofOVU0Xbug5av6JpwHJUmGmNsDKQiLngK3fQjwst+/IM+sddNs68Wy8hrSAu9Yur8nJuVXOhMDqH5rmnuYDfWZv/Zm6Dy0v5QJPQ72+ZIa0qD9N5ld23AJeCkjszllngpCILRJYdjEJHanjaq2JDFr/mNzB6e3GaUTD3fYqY71KQ0crK5fbYu3timB20kcCkJOJEc3Ynj8J5p9bD3wL2owVaJnKE9Rz9TqcJDLGcxLg0/VYQmIOt++UMuRyUYpXSdJZiGlK9g6pE/jmYhrMvdfgrhfEjOh55+QH7cLmAu1PUpzZtbCZZejXfpHRMrRY4njUxmsaC9xrZoEpUxNrT/EI5JiJqOxN98R+rCplXy"
+    AUTH_SECRET: "AgC0cutd1SObjfxhZ5/xbmHEae00WSCbyfhRcj8ntITuRYDRbC5SqvE47FPvh4MV1FdLhx1KBKxkB85IqCzP3T1lBzpHkZssm5lAApb5e3PHbXYDQedCnNn0oD2cyO0gPG0TLzNiMVG0kqNQmowBsagwZvYBrS67Of47VI2/bxkTCIxQF+3zQyA1GT6qREHQNLIqLuhvYHk3s3i8eZxgwbuYbWTUCY/KRrn+e/zCL83kQPAllONye/oxweOIpU+wjdqicUnppvl+iJ3bXNAZx2k6xWgHl/f4QVxjD9ipspt5fuPHiYifpwoDMnY3ByVrryCGHLO3G2NXMoHB0ZMVBSlF5Wd7GtlLOq5f0/Jqz/3OjR2jb2GvEEKjTJucxcqjd2ge0KIH04wMVo/LkOWfkiP4gmfZ9WoxxqjU9rW3IjZ9iN6gv81tP5sRzD6eO/K1RfWOBuk9zXM95GY3zXjt8v9TaRuffERD4lYIbyhka5CVkZZxZC0MdCkvvfIWVwMuJRwG+7k8YDeW9j2zCtT0SaDmICToMzl/HaX6F8oHLOnaM3GLfX8nPxuHV+1GwNmM3YrKZh4Z14IJWAQjltkOgMA0IjeBLitcoGI7juOk9ZGDJBuH3P43Fhyt/KMrTmI3CFRZn7lLyk0nyj5kL5By9mS4SPyf9NsrlpjRKOjlbeDT0XAtaLfXQiMP9PtkVCSv/KSqPx4hQwCEZXPVW4H9JpqHpKdaJjGbNZ0tKLNDw/RzVA=="
+    SETTINGS_ENCRYPTION_KEY: "AgCazWpZyjG4X35V8BwSAm/I6gimer1VALBbg7TY3mrsf3/L5OQOl0mInGKIcQ97zrMdz9/TSei5+7XR268aAUrxFydVd29pIN3wiA63XEgxvfPbnK2+lFz/QCxkdaRJyc24dGMJHSf7PbTziXXl3SfZZNKDcFcsnVdwIHkrHp9FrSo0RciKOSx+hBr7Qhz+wT9C42++v0AdmatkzwoW5y95KB8YmRHO6JALcR3N3YS/mxLCFGJLtL5AJ0KlY2lgk96kSvVvuDkoqL82zCo7tvqnpPPu0EOOInyveC+WgjIfJbTyLmL4LEyCHKrcb+Gs0DRIoYE1EtZXtQYw4XbXTP2Nf0mFS59zi3kT7VdmC3XPwEzZ+EA7BrOe6YFE8hz+z6jrePk4KFO/hecbzRrVmDEDoXecJ1kYpnYsyWLpmIiD5UBs2vrbBos6A4dJotLN5DQQy6uPsUbxnKzSaY/GBukQeilRe+5D7Y/nNSFunXjKT+/rduNbbw6K+ba1k+J8Av+TdIfpeUdvdkuY0/SX4AuR9E50nlSjbvAsUqWPWEPpICqPTece6WNExnu1GLh5g4ccf/l0yqCbZtHiE+GDRdJo7XZbHITWnIOkeiK6aXmDnFyfnWOxvfbHzchVcnhD9sq1LeczKl/r+CMvS6758y+5LxBmMf8c0ltI/a6JtlBtuXmPkwxi3hXrJaB52acNXkFt9V/gfBOEX3GSgjnfFufg18PsAqPDFvv5BuXlZfmuXw=="
+    SENTINEL_ENCRYPTION_KEY: "AgAEDSuAAmEdckFk2QbX2UGJjPDAIBrqsv8TvmFlDMIfPV8W9eKOW4KfFOxhuE7ICn4cXLTyOGte7Uvcj60hf4UfrLNAWN9or3mmqNO7CNmGxpttSOd1D/Z69p1aVZwUWem+HG7PkKDC/4a03AE91c70L0dBmBIjnzV7ny8Bu5FoA7Y++Kgw22gxlzxBvFkDikQn40214Ixkx55h1/UrVB8vzqnLtdrVQ+YfxqEi+/h4/53E8WZQJnNCkhmqYIt5IkPhVYyoGA4i7Xc1oPykQ/ekRSQnT7w7vhtNAslKKMkLfY7UM89hjnAHH9z9i6SEBRSB5u7qdwFFaeBq/9LBfEUX45bd6sFmk73aOiMpJGf5jVk1xOaFjymr80ZeOi6gXhpngDr8oeSB+O/+dvTAM7pyiQZCc2P/hchMQBhYULegp54xJ97wb0NHQuqsvAuqQv0XeKLNdVYr4kNrh4DNf9Azl5w2/CmzRBj2sqiZhhiNsQe5IkzxKndirjhkaEHTz4EUO6jjaM21i9TmN0cLyzPApV2i8lFENPjQuZmb6hmgxj4tZPl5sOaZiZsrZEhv1weiV/x1p1CRl1o7onA5/59jdtjQavoxoOJaH6YdQ/nYKZUnenlMh9HTGshFUzYdmzDZJqOD2W/AA0Iudam3yTCgVQBZiCyseCUUe6rhQtSq2fOovonQra8y0qiMktJI01eZtKmkQacJPqQRSkANSGSZky5b9ZFYZjOVp2G/BsRkfQ=="
+    CRON_SECRET: "AgAPgpIt4ADo/iG2OfG1X4m5Btd6B1so3aQMQzGhe7hNTBFKBZdLEm4jYOjw7qrgvvOAiuVlm7TI3TqDds69RN22/pXddITKekPwbGvbYc8JJUAXDwfoB4haS4zS4q0nszxDsGx7aw4l3fAeQeCQRQaWfIrY99x/v1W5UlTrc9QmG1/UkAJiEEXbrpqcrKbqB7wP5bfQdRLcQM9BNxF/MYnHAylG5DF4Ooz9ddJRsBiPCjmTqoDcFob43ya3sv4uX+8fcoRxKDziakgcDlwj1Db3jR9slZXjF94+1aFAaphhdM7+uODczu955rjKWYJbGiLQyGdxCBfCuLp9mkmuYlfVbww/3GgVZJ3zMHRbFCndO+R+iqh2LuAHuTqUhYidNFxB7mzfZ28Xl9Fvf1puqUpeTA3eKMiu+hYo256+Yww26KX25+SFIJDr/ru7O9YIX9Ky4TBM9PRdYyLcGwBGepSqkBZY6eqO1wzGFuE8Mm/e0D5f5ul5eDdTgV4XYHbSlEmSXbNxArHYLTsRAacOI5nqKXdt13frrGqLqdNQOTCTVl0+JihK9TxDYHsWR++o4dqz7jiA8WYw3ODmfIS8iqSB4MJWj/V6pg31UqC5crUTgDIu68bq/O9Y/JuYzqkbcZmS7xnun00QbzhxQ7GKRZ7Dc+D/qys1seZ2OeenzPYYWh3e2FSb8zeevcXgH7Aj0VIHXEtwGe1cX2uKiVuexiH5Lhxeg9EGOpoqmIAEntIHPw=="
+    EMAIL_SERVER: "AgDktwOMWPYM4tGTltVTw1GiBHt5/RNZy163AuHKF8f1iXQIT2YQgtW1GHZnxdKdeVg40ajg4duwwWXPIU5Wy5p6xUVCLFg6HVcgKXUcaIP9FBklu44MpelMOy3ngoMCWvazMvLxJlGrMZ2A/AJ75iiLqGMbLcZfAOOxcL2uBgBciJiMe1boTY6YOWGkH98ZDW+EQH0wXH2X6WJT8qgcOrtTnn7Ru2Jf7RH5myUu48HQ4uyR4+0zYmWkoWyKpAEVcowVyGblSvwW3Yj86yj6J2eaaWTppGNs8xe262tT5deF0Vp+ibqiDu+AjV9+aKbVTt66kifFkbblUewgE5b4qO+/BWGYuxuxpcn0013wFYDgeOMG8xfYhShlNRvwl7KSq0UE/X4uHq7BW4+767Z/qJcmq9K/eOkREsegJORuN6nhyB4MVsD/6KGmrnIpxNofGSDyMM1bh0nTEgNwla30/+Wjvnja0mOVLcfNCyUxD9FPmo+tDgqZ/GSUWAqIcXyBGfuAIo3am1y/s+Lxl1QwYHqGyX8R72T53iz+93BfhkKXWA+K9BbYewrz/pjWUbXf6n/5Z0eywaI1IsKAyzlD90Wjez6QAmA/4czonTKtQONNN4cFsvCIp3zQgUvBpxRjbsJaRFrOHnZvKUHCzEppNPHi1bjVCSIxR5Sli04zIodxesDEXogFFz+kkRQSRi+HGFYHFVwJlGjwvhr0LE1N/VlCgpPnSIxLPotMPMN1ie5SayICDoeYVykSiqLA2QIaALgu3K8GR1ZTRFV7RcFZ2I/YkoG+RpUD935dHY4bwt6AT0+UVrAlr0vXNFdUej1eNmUIldDCg0YvaZSx8AoFOAkBmmBoNg=="
+    # Shared-cluster NATS DSN (with credentials) — seal via kubeseal-encrypt-string
+    # scoped to namespace sentinel-production, name sentinel-sentinel-secrets.
+    NATS_URL: "AgAFy2YlWqvKTikE55FDzp/gT4z8/VvDvzAMxh0eI/GtJ9ygtTAyJ+NSJykVUD45Lb4EFwv5/WAZw8PpzB9gpXakiJezFcdikdJ0z2UMLkG6+u3vHVnQGyGeRP6uEzoLfNlxvfX6XIg9aFO6HmkUrNE3ShckSrgq1wHVqujrX3TBwj15WCwVujkgCHmSn+eQN1AlPtUrOiObIUVd9uCORJP2ocjmUtkHZUuo57xUMxi81XmEFVHJdr6kTA/sBIkbkiHYpy/jGYpIwk9qXJXUp6rvSCGYit3pjCN/0ChiTbRxjCMmE5VIR0A6kcByhs0i7qWIGqIJCBQqpzE+wdi5F55IpWlmW6OflrEwCAclZFOOY43/N+koD/6KJRQ8PgRL5RypH1uXK43ZIBV6Gh4Sw0iyILMwpTd8xEhP2/0NeqmXfNyIrq7Ow9l/NDpLtJD+uZkV6xeXBbFPYMUeJpmBMuU8wmJo+GlM2BO2ygnBVXqwHb7XH8fSrRZymJM+zFSBBRctUbkLdCShmsJgcM7LzIvLRjstNVJAbARWUWcXjY447yp6BFfiPudNvn/N2vGYBTeuUOXe84w1nPCKH9rS/OLYv4G5ZHiPQdSRvJx4qBRz7KtmdCQBahPcQ6tzlwNSqZX0yEIrigzItSHGIUN4LJ7UJEZnt4XMgKrQx+ofCFLUixiDTw/opmOXA6a5IOHFURohC1E/aDY7qi7thSG9uMMd7DBhD0hyyHTR0+t3gxqegvxpBWCvJ8RAulM0tfITdRRjQf4PdR/PVR2S+SSCnNYaVzYBIhPvOFXAxWpeSFDcXg=="
+    # sentinel-event-enrichment TASK-07: sealed by the operator 2026-09-24 via kubeseal-encryptor,
+    # scope namespace sentinel-production, name sentinel-sentinel-secrets. Read only by the geoip-refresh CronJob.
+    MAXMIND_ACCOUNT_ID: "AgBkUZh992929VsRY1hGQ0hHbJS1+HH+qYojKJDj332aXgYEvaCCskOFCoM4WXaJ1d1YRsU81b6MKT3JAPY9M1JsVIdbkugSLqUvLPFJxd/putNJiSpWuX7GrZWtbMYYkh/FvQjwo62ggtPd4UAvE+B7QZb363ypWXnc9uxs0XKFTsCq+YvVcMJ+Hi2AKR6fZQOpwwcoLeaEMIrSVWwusPjlTvbMa8Yi7WC/X/O419w/knK57jzi2e/XJj25cnuS9JGvMT2YsTkXOm0x2DvA73GIWJ+ZSwpHROLXsYG3/j8Fo/VCu7zy93uIQ6wQyx1Z9GjT7xVvHs2Ww1YmayJtl56StGl73PwslGBRD3kW1oAzKyUxZlJSbmbSI75jYUgN0aeWCxEv6X7V1l2g0/Daf2dCYen9FPBXKcCIaLHuXPdJCHq+iE4yUw/fX7P6arjiIuuFm9ZU5wdOOU/UwLwmBe1lTg6pVz/7Je1PjT5TNeHYw5HpU/UZfXvcgwU+cOY7BG9QR3TbWut/iyMlOFqZQGSV+KoQ4Zu7L6z8yZccwTPT7TuTIofNYxswiCzkI76sQETN/1wn+r606OqVVL3VME0BQbJ6WfPpBTdJLFuj1ooV3lfj+HQDUXn7m0VypvlJ9zZt/HheWJpeHOaGZFG+tNKY0WCo7fBoX+wgC8v0RrTGM4u5qNOqT1+L8gfgOPyNAxbVdK7weU/K"
+    MAXMIND_LICENSE_KEY: "AgABgq/PvCZlMIOfE6Pm+NgQ3UOTqlSfWHTyHJZCS/iz96pKmjMU4xoxuG3EwEn61qe1oDemmLtUOFYyTqzxVpnZZ2jRRcrZY6lMbcmuiQYqlnEsPkdpC3+Fnkr0QmhlpAF+5MnUq/76H+Ze7HJXmHlhycfRXRe2j8kihnzpgtVa4MPHEcjWAO0ucROvOfyOpb5BXCK5yTAHJOSVI0uwWef5TCzL1Xd9pqe355Eo3oeLcn5papxb2cx6qGrQjLqzMy9QVE/N1z6+y6usuUeo2SfMFx17NxR+BRJONHjlo41FCU84T5BEIIk7hUnOGKmMJ25Puxmyye99v9vFdB0Gg/UNsuFSM2JgHt63CktOs3t8CrwVSglbHvuOFqEs89tqml6/txmjJsfVcLbxeZq38N9DzuEyjH7Cm4rjJWkjJ/GKU0VJn/x8VRHvaOKR8eQ+Q//3tNThjdZu9GkFsDjVBqC6bQ/cn/yscH9EsAeqsR1alW+c6MdgL7EDWUvYhgDdhmRDBJJ7C/Dc7w8QOdKk6rhRCMnXX2HJQWuwbY935nqv0tslg3p8jCXlfC46jjz+m4msxIHATSbPfrE5JD4an5ykspCTxSZMzi2vM7z0vfa6Tsk5HnLXPnQKCtLK4uHXv44faP9JbV92RcI4Nff/BMcICOOJQj9IOS751Oxuge/6LERCnXETe/X0MFLHje88oVwiRWc9/46UfuuktimBG3TTzkmj7qW7KuSqKYh1ndc2sSivOa+uSzCW"
+    GITHUB_CLIENT_ID: "AgBGPW4Iow8l7AXA4KPSGrrISgQisEb5H1oDrFEhAG7ELm1XN/Lu2YAmu/6bdcY/8qrtBS56WozQ9CF8xknRerB2uetG6YY/ovLGKejRDOQyOmD72cPElisARBS3X0D7JfZRpi9LWWi3I+Db+TFSG21bpiBTXoRF51iPp2kl9WyWFiQ1jO0fFPle7+/o0F3dfdbj05OPagSMkQ0EJ/4hJYODBiRnGco0AL121ei1dPphIvfOCA7ChJ+x+a+j9Di3NLUFbBIclJP16n1311VUxCLxOanygc4pfT3Tg6EPHoY+5XZ/yghkt/iq0gQhJkwVHWb4E+XAPUxSgydZy7+1Q73b7SCbnFd5Y4Avr0n0nP3QQ52q0vImOBNtBN1fYzLMzpHWyq181WbuUr3Z+WFORRRn4/hp6IduzLJpTSJr6s1a0anyVvD+1RJA2IKhW2LxM74dKQIw6OQKQ8pB3tuCVa4pTeC7UuJee6gAQOysjvL7WGVodXyCe2c7SChz1Oy3p1TNfgC92E0htUD4pHEogUXdCdV+4o5rGGyQRSiT5lVpDa70C0pXkcQ9x+08rKmvrSbWJ6FsgTew6ng0TSgK/EuGv3BsPdEXdDDTTLvH1xS48vhuRcpWRTll7azF0u6kERVSFUzCZc8vVTBhRSwN32JmqGlHuibz2vwRUuYLRC3eMTGaFtjr/5KmvePxqm3YpERYQMcVG4sR7bZJoyW6avK2Nq1Qxw=="
+    GITHUB_CLIENT_SECRET: "AgCjDzLIS40yIsVUG9hd2s993FusUNw4WgT9FFGAfQmEyFCEIUYkBS1mVHvAvQ48WatNTaQCNJi0eD0J/CTAN3wjlfhFseUfNU08L52iUhwjSDPOgYPCTfGwM/wAZTMcjIuOerQB/IP+ZzM/CMigzTgiKZqnuHPeiylV5zAAb/bkLSUTRX6JEN9FQuWlCfC6MGhTBb4M8a5hfzjoKD4uRfvCtiCiI9T3Vuka9vBxYQ2r8GcfWViOJpcAmbFQhwO0REmMM3UPoLWiWxOU9tHbGVrS4Vb/erpIIoMJr70uK/BMDO+z8vDh4DPmuVPKMM3aDyt9X0e6dqrqu6FaOzMtCcukV7AnSDdfA6KB5t3ZzHWrY4yFQUlOOnz6ELX8EdhzvwpMLJBAUBw5hTzHiM3djpd+lKW+Q4ZnwJv5VZtJP+LCt6hrlCuREzuvE1iR88KID/e1+OEZ+4J8duBaGI55bkCg/YaEBeoeT5FVKaM38oDV+Mi0kDjKxNHfUPoGleIEB3fG8mYQuFWcTsmRrKU1Ong5BubhJUxw4WWIulXUkq84gHBNLce2WmruuyvXJ8jSKVp3TBGigUBRY4VmgCvsd3JekWyLS0E3NZ+0NLhVA4T/C7MJvKmjbrkXLkoCXRQyZb8M6PmmKeE9SuoCHyaMBcbLfyXDlYzEWBzix6pyf6OoTy0ezaWHvHcSc50Em+pBQmwX0oAGW6kZwB9rdetRUiY4o7KMCt02W9e7eC2TpxSY1tUIhqCuYpK7"
+
+# -----------------------------------------------------------------------------
+# Managed VPC endpoints. CCE Standard cannot route pod traffic to these IPs
+# directly, so each entry also renders a selector-less Service + Endpoints
+# (templates/external-services.yaml) that apps dial by in-cluster DNS name.
+# -----------------------------------------------------------------------------
+externalServices:
+  - name: rds-postgres-sentinel
+    ip: 10.200.53.141
+    port: 5432
+  - name: dcs-redis-sentinel
+    ip: 10.200.60.184
+    port: 6379
+
+config:
+  postgres:
+    host: rds-postgres-sentinel
+    port: 5432
+    user: sentinel-user
+    database: sentinel-production
+    sslmode: require
+  nats:
+    # Shared cluster NATS (authenticated DSN sealed as NATS_URL) — bundled off.
+    url: ""
+  redis:
+    addr: "dcs-redis-sentinel:6379"
+    # DB 1: the shared DCS instance also serves cdc-pipeline on DB 0 —
+    # a dedicated index avoids key collisions. Confirm index 1 is free.
+    db: 1
+  s3:
+    endpoint: "https://obs.example.com"
+    publicEndpoint: "https://obs.example.com"
+    bucket: sentinel-production
+  otel:
+    exporterEndpoint: ""
+  dashboard:
+    authUrl: "https://sentinel.example.com"
+    authTrustHost: "true"
+    emailFrom: "noreply@example.ai"
+    dataRetentionDays: "30"
+    reportMatchWindowMinutes: "30"
+    escalationAckMinutes: "15"
+    escalationMaxHops: "3"
+    reportUploadRpm: "10"
+    reportUploadBytesPerDay: "262144000"
+    claimStaleHours: "24"
+    manualIssueRetentionDays: "365"
+    # sentinel-sourcemaps §12 (value syntax beside each key in values.yaml). Same as the chart
+    # defaults; listed so this block stays the complete list of dashboard knobs for the env.
+    bodySizeLimit: "110M"
+    sourcemapMaxBytes: "52428800"
+    sourcemapMaxFilesPerRequest: "50"
+    sourcemapMaxFilesPerRelease: "2000"
+  ingestor:
+    ratelimitStrictMode: "true"
+    # Contract decision 11: no forwarding header is believed on K8s. The tunnel writes the browser's
+    # IP into the body. Phase 4 (public endpoint) configures this; do not add node, pod or ELB ranges
+    # here. (sentinel-event-enrichment spec §3.3, §3.6; tests/unit/helm_geoip_test.go asserts it empty.)
+    trustedProxyCidrs: []
+
+migrate:
+  enabled: true
+  targets:
+    - processor
+    - ingestor
+    - dashboard
+
+# FROZEN since the 2026-10-03 production cutover: AWS EKS serves
+# sentinel-production, so nothing may write to K8s again. The freeze lives
+# in git (not `kubectl scale`) because the release workflow deploys to BOTH
+# clusters — a production tag would otherwise scale CCE straight back up.
+# Autoscaling is disabled (not minReplicas: 2) because the chart only renders
+# `replicas` when the HPA is off. migrate stays on (idempotent, reconciles
+# schema only). Mirrors the staging freeze (sentinel#59).
+ingestor:
+  replicaCount: 0
+  containerPort: 8080
+  service:
+    type: NodePort
+    port: 8080
+    nodePort: 31316
+  ingress:
+    enabled: true
+    host: api-sentinel.example.com
+    elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
+    tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    # 256Mi: the resident GeoLite2-City database (sentinel-event-enrichment spec §8.4).
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+# sentinel-event-enrichment (spec §8.3, §8.4): geo from GeoLite2-City in this env's OBS bucket. Storage is
+# pinned to the same endpoint and bucket as config.s3; the AWS S3 move edits these lines and the key names.
+geoip:
+  enabled: true
+  storage:
+    endpoint: "https://obs.example.com"
+    bucket: sentinel-production
+    region: "us-east-1"
+    prefix: "geoip/"
+  refreshCron:
+    enabled: true
+
+processor:
+  replicaCount: 0
+  healthPort: 8081
+  service:
+    type: ClusterIP
+    port: 8081
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    # 1Gi with values.yaml's processor.gomemlimit (800MiB, NOT overridden here): the two are
+    # derived together from §13 M2's parsed:raw ratio -- the arithmetic is in values.yaml beside
+    # gomemlimit. Lowering this alone puts the Go soft limit above the kernel's.
+    limits: { cpu: "1", memory: 1Gi }
+
+dashboard:
+  replicaCount: 0
+  containerPort: 3000
+  service:
+    type: NodePort
+    port: 3000
+    nodePort: 31317
+  ingress:
+    enabled: true
+    host: sentinel.example.com
+    elbId: 99ed1830-9f66-4ba4-84e2-3d1b819eaf55
+    tlsCertIds: ef8353e34fcd412699b149970aca8995,ef8353e34fcd412699b149970aca8995
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 768Mi }
+
+# Bundled stateful deps: all OFF on K8s — managed/shared equivalents above.
+dependencies:
+  postgres:
+    enabled: false
+  nats:
+    enabled: false
+  redis:
+    enabled: false
+  minio:
+    enabled: false
+
+# sentinel-span-ingest (contract D2/D3). Span ingest is on; the core-trace pull reads Tempo (shared by staging and
+# production, no auth). scopes maps the `example` organization - the organization that owns core's errors - to its `core`
+# project: the organization is the pull guard, and the project governs who may see the pulled spans (they are core's
+# data: SQL text and query parameters). The other organization on this database, `test`
+# (7ad17ddf-2ae1-47e8-b745-c5973965ac55), must NOT be listed.
+spans:
+  enabled: true
+  pull:
+    scopes: "98867bbe-5594-471e-a5c0-16b39d6afabc:7d95eb6d-6551-4096-a8b2-ef8944dfefcf"
+    storeKind: tempo
+    storeUrl: http://tempo.tempo-production.svc:3100
+
+init:
+  nats:
+    # Off while frozen: the streams AND consumers already exist on the CCE
+    # cluster, so there is nothing to converge (scripts/nats-init.sh has been
+    # idempotent since #68, but a no-op wave-1 Sync hook still costs a Job run
+    # per sync for zero effect). Same reason it is off on AWS.
+    enabled: false
+    image: swr.example.com/example-engineering/sentinel-nats-init
+    tag: ""
+    # ERROR_EVENTS limits on the shared-cluster JetStream store (infra
+    # k8s/hcs/argocd/cluster/nats/helm-values.production.yaml: fileStore.pvc.size 50Gi, maxSize 50Gi).
+    # 20 events/s x 5 KiB x 24h = 8.24 GiB <= 10GiB, ~22% of the store with the DLQ and control-plane
+    # streams counted - the derivation is scripts/nats-init.sh's ERROR_EVENTS block. Re-size here
+    # (and re-run the init job) rather than in the script; the script's defaults are the same numbers.
+    errorEvents:
+      maxAge: "24h"
+      maxBytes: "10GiB"
+  minio:
+    enabled: false
+    image: swr.example.com/example-engineering/sentinel-minio-init
+    tag: ""
+
+# Legacy combined ingress renders nothing when provider == k8s.
+ingress:
+  enabled: false
+
+retentionCron:
+  # Off while frozen — no dashboard to serve and nothing to retain against.
+  enabled: false
+  schedule: "0 * * * *"
+
+oncallCron:
+  enabled: false
+
+prometheusRule:
+  enabled: false
+
+dlqDrainer:
+  # Off while frozen — its jobTemplate hardcodes replicas: 1 and it POSTs to
+  # a scaled-to-zero dashboard.
+  enabled: false
+  drainerEnabled: "false"
+  drainerExecute: "false"
+  # CCE has no default StorageClass — Everest CSI csi-disk provisions EVS.
+  persistence:
+    storageClass: "csi-disk"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

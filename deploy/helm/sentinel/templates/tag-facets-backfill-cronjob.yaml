@@ -1,0 +1,73 @@
+{{- if .Values.tagFacetsBackfill.enabled }}
+{{- $img := .Values.images.processor -}}
+{{- $tag := $img.tag | default .Chart.AppVersion -}}
+{{- $bf := .Values.tagFacetsBackfill -}}
+# sentinel-issue-tag-facets spec §4.1: `processor backfill-tag-facets`, the one-off count of every
+# occurrence stored before the issue_tag_values triggers existed. A CronJob that NEVER RUNS BY ITSELF:
+#   * `suspend: true` is a literal here, not a value, so no overlay can switch it on;
+#   * the schedule is 31 February, which never fires even if `suspend` were removed;
+#   * no ArgoCD hook or wave annotation and no Helm hook annotation, so ArgoCD syncs it as an
+#     ordinary, mutable object (each release updates its jobTemplate, image tag included) and never
+#     waits on it. ArgoCD v2.9.6 has no CronJob health check, so it gates nothing (spec T27).
+# The operator starts exactly one run per environment, after checking none is Running (RUNBOOK.md
+# "Tag facets backfill"):
+#   kubectl -n sentinel-<env> create job --from=cronjob/<release>-sentinel-tag-facets-backfill \
+#     tag-facets-backfill-$(date +%s)
+# The Job it makes carries an owner reference to this CronJob. The run is resumable (backoffLimit 3 is
+# safe) and exits 2 if another runner holds its advisory lock.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "sentinel.fullname" . }}-tag-facets-backfill
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tag-facets-backfill
+spec:
+  suspend: true
+  schedule: "0 0 31 2 *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 21600
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            {{- include "sentinel.labels" . | nindent 12 }}
+            app.kubernetes.io/component: tag-facets-backfill
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "sentinel.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.affinity }}
+          affinity: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: tag-facets-backfill
+              image: "{{ $img.repository }}:{{ $tag }}"
+              imagePullPolicy: {{ .Values.imagePullPolicy }}
+              args: ["backfill-tag-facets", "-batch", {{ .Values.tagFacetsBackfill.batch | quote }}, "-pause", {{ .Values.tagFacetsBackfill.pause | quote }}, "-duty", {{ .Values.tagFacetsBackfill.duty | quote }}]
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              envFrom:
+                - configMapRef:
+                    name: {{ include "sentinel.configMapName" . }}
+              env:
+                {{- include "sentinel.postgresEnv" . | nindent 16 }}
+              resources:
+                {{- toYaml $bf.resources | nindent 16 }}
+{{- end }}

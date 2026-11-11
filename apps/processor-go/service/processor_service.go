@@ -1,0 +1,773 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/alerts"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/degradation"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/event"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/indexer"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/procmetrics"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/spanpull"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/store"
+	"github.com/NurfitraPujo/sentinel/apps/processor-go/symbolicate"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/nats"
+	"github.com/NurfitraPujo/sentinel/packages/shared-go/obs"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// tracer is obtained from the otel API's global accessor rather than threaded in from main() — see
+// procmetrics.meter's doc comment for why this is safe regardless of whether obs.Bootstrap has run
+// yet. Child spans started here (deserialize/store/index/alert dispatch — OBSERVABILITY_PLAN.md W2)
+// attach to whatever span main.go's subscriber handler already put in ctx (the consumer span, itself
+// parented on the ingestor's producer span via the extracted traceparent).
+var tracer trace.Tracer = otel.Tracer("processor-go")
+
+type ProcessorService struct {
+	db          *pgxpool.Pool
+	store       store.IssueStore
+	indexer     *indexer.Indexer
+	degradation *degradation.GracefulDegradation
+	alerts      *alerts.Dispatcher
+
+	// symbolicator and symPlatforms are sentinel-sourcemaps §4.4's stage and its gate set, wired by
+	// EnableSymbolication from main.go before Subscribe. Both zero until then: the gate refuses
+	// every event as skipped_platform (counted), nothing is fetched, and fingerprint.Compute's
+	// build-hash normalisation — which follows the same set — is off. That is exactly the
+	// SYMBOLICATE_PLATFORMS="" kill switch (decision 27), and also what every integration test
+	// that constructs NewProcessorService(pool) without wiring the stage gets.
+	symbolicator *symbolicate.Service
+	symPlatforms []string
+
+	// spanPull queues a stored occurrence's trace for a pull of core's spans (sentinel-span-ingest D3). nil — the
+	// default, and what every test that does not wire it gets — means the feature is off.
+	spanPull *spanpull.Queue
+}
+
+// SetSpanPull wires the span-pull queue; main.go calls it once, before Subscribe, when SPAN_PULL_* is configured.
+func (s *ProcessorService) SetSpanPull(q *spanpull.Queue) { s.spanPull = q }
+
+func NewProcessorService(db *pgxpool.Pool) *ProcessorService {
+	svc := &ProcessorService{
+		db:      db,
+		store:   store.NewStore(db),
+		indexer: indexer.NewIndexer(db),
+	}
+
+	svc.degradation = degradation.NewGracefulDegradation(func(ctx context.Context) bool {
+		return db.Ping(ctx) == nil
+	})
+
+	// Dispatcher construction + wiring (VERIFIED_STATE.md S8): previously
+	// NewProcessorService never built a Dispatcher at all, so 425 LOC of
+	// alerting code — covered by ~1,100 lines of passing tests — was never
+	// reached by the running binary. NewDispatcher itself now performs a
+	// synchronous initial config load (see alerts.NewDispatcher), and
+	// SetSender connects sendAlert to the real email/telegram notifiers
+	// instead of leaving it logging "ALERT: ..." and nothing else.
+	svc.alerts = alerts.NewDispatcher(db)
+	svc.alerts.SetSender(alerts.BuildSender(alerts.NotifierConfigFromEnv()))
+
+	return svc
+}
+
+// Alerts exposes the processor's alert dispatcher so operational tooling and
+// tests can install a custom sender (see alerts.Dispatcher.SetSender)
+// without needing package-internal access. Production wiring already calls
+// SetSender with alerts.BuildSender(alerts.NotifierConfigFromEnv()) inside
+// NewProcessorService; this accessor exists for callers — notably
+// tests/integration's execution proof for P5-1/S8 — that need to observe or
+// override that wiring.
+func (s *ProcessorService) Alerts() *alerts.Dispatcher {
+	return s.alerts
+}
+
+// EnableSymbolication wires sentinel-sourcemaps §4.4's stage into processEventInternal: cfg is
+// symbolicate.ParseConfig's result (the six knobs), fetcher the object-storage GET (an S3Fetcher
+// in main.go; a stub in tests). The stage's Store is this service's own store.LookupSourcemap, so
+// the lookup is always scoped by the project id ResolveProjectID returned — the tenancy rule of
+// §4.4 step 3 — and its Observer is the procmetrics adapter below. cfg.Platforms becomes both the
+// gate set and Compute's normalisation set.
+//
+// Called once, from main.go, AFTER decision 32's startup check passed and BEFORE Subscribe; with
+// cfg.Enabled() false (SYMBOLICATE_PLATFORMS set and empty) it wires nothing and returns nil, and
+// the service behaves as it does before the call. A second call replaces the stage; the previous
+// one's background fills are not waited for.
+func (s *ProcessorService) EnableSymbolication(cfg symbolicate.Config, fetcher symbolicate.Fetcher) error {
+	if !cfg.Enabled() {
+		s.symbolicator, s.symPlatforms = nil, nil
+		return nil
+	}
+	svc, err := symbolicate.New(cfg, symbolicate.StoreFunc(s.store.LookupSourcemap), fetcher,
+		symbolicate.WithObserver(symbolicationObserver{}))
+	if err != nil {
+		return fmt.Errorf("symbolication: %w", err)
+	}
+	s.symbolicator = svc
+	s.symPlatforms = cfg.Platforms
+	return nil
+}
+
+// CloseSymbolication waits for the stage's in-flight background fills (decision 37) so none
+// outlives the process's storage client; main.go defers it. A no-op when the stage is off.
+func (s *ProcessorService) CloseSymbolication() {
+	if s.symbolicator != nil {
+		s.symbolicator.Close()
+	}
+}
+
+// symbolicationObserver adapts symbolicate.Observer — the stage's seam for what only it can see
+// (cache events, the cache's byte total, the cold-path duration) — onto procmetrics' three
+// recorders. It lives here rather than in procmetrics because procmetrics is a leaf package with
+// no apps/processor-go-internal imports (its package doc says why), and the Observer's method
+// signatures name symbolicate's types.
+type symbolicationObserver struct{}
+
+func (symbolicationObserver) CacheEvent(kind symbolicate.CacheEventKind) {
+	procmetrics.RecordSourcemapCacheEvent(string(kind))
+}
+func (symbolicationObserver) CacheBytes(current int64) { procmetrics.SetSourcemapCacheBytes(current) }
+func (symbolicationObserver) FetchDuration(d time.Duration) {
+	procmetrics.RecordSourcemapFetchDuration(d)
+}
+
+// symbolicate is §4.4's stage as processEventInternal calls it: the three-part gate, then
+// event.Symbolicate (the rewrite onto evt.Stacktrace — Symbolicated and Raw for an applied
+// frame, NOTHING for one that passed through), then the metrics: one events_total per event
+// (the skipped_* reason, or the derivation of the frames' outcomes), one frames_total per frame
+// the gate admitted. projectID is ResolveProjectID's return, never anything from a frame. It
+// never fails the event (D7).
+func (s *ProcessorService) symbolicate(ctx context.Context, evt *event.ErrorEvent, projectID string) (transient bool) {
+	ok, skipped := symbolicate.Gate(s.symPlatforms, evt.Platform, evt.ReleaseVersion, len(evt.Stacktrace))
+	if !ok || s.symbolicator == nil {
+		if ok {
+			// Unreachable by construction (EnableSymbolication sets both or neither), kept so a
+			// future split of the two fields cannot turn into a nil dereference on the hot path.
+			skipped = symbolicate.EventSkippedPlatform
+		}
+		procmetrics.RecordSymbolicationEvent(ctx, string(skipped))
+		return false
+	}
+	// A redelivery (delivery count > 1) exists to try a failed lookup again, so it must not be
+	// answered from the negative cache for the fetch_error the previous delivery cached
+	// (sentinel-grouping-v2 §5.2; no_map and the other permanent answers stay cached). The bypass
+	// is for delivery 2 ONLY: delivery 3 uses the normal cache, so a persistent storage outage costs
+	// at most ONE uncached fetch per event (the retry), not one per redelivery.
+	if n, ok := nats.DeliveryCountFromContext(ctx); ok && n == 2 {
+		ctx = symbolicate.WithRetryFetchError(ctx)
+	}
+	res := evt.Symbolicate(ctx, s.symbolicator, projectID)
+	for i, o := range res.Outcomes {
+		if o == symbolicate.OutcomeTimeout || o == symbolicate.OutcomeFetchError {
+			transient = true
+		}
+		procmetrics.RecordSymbolicationFrame(ctx, string(o))
+		// turbopack-grouping §4.2's counter, one per frame in THIS loop so it sums to
+		// frames_total by construction (P9). Read off the post-copy frame: an applied frame
+		// carries the re-derived InApp and the SDK's under Raw (set together by the stage);
+		// any other outcome kept the SDK's value, so `changed` is false by definition.
+		to, changed := obs.SymbolicationInAppToKept, obs.SymbolicationInAppChangedFalse
+		if o == symbolicate.OutcomeApplied {
+			f := evt.Stacktrace[i]
+			to = strconv.FormatBool(f.InApp)
+			changed = strconv.FormatBool(f.InApp != f.Raw.InApp)
+		}
+		procmetrics.RecordInAppRederived(ctx, to, changed)
+	}
+	procmetrics.RecordSymbolicationEvent(ctx, string(res.EventOutcome()))
+	return transient
+}
+
+// MaxSymbolicationRetries is sentinel-grouping-v2 §5.2's per-message budget: an event whose
+// source-map lookup ended timeout or fetch_error is returned to JetStream for the subscriber's
+// delayed Nak (1s, then 5s) at most this many times before it is processed with whatever hash its
+// frames give. Delivery N has spent N-1 retries, so the third delivery is processed regardless.
+const MaxSymbolicationRetries = 2
+
+// errSymbolicationRetry is the transient (non-Permanent) error that asks the subscriber to
+// redeliver; ProcessEvent classifies it as a retried delivery.
+var errSymbolicationRetry = errors.New("symbolication timeout or fetch error: event returned to NATS for delayed redelivery")
+
+// outcomeSymbolicationRetry is the log and span attribute value that tells a deliberate retry from a
+// failure: the delayed redelivery is the design working, not a store error, so withSpan records it
+// as an attribute and leaves the span's status alone. The process_total metric still counts the
+// delivery as obs.OutcomeRetried (it was returned to NATS), which keeps that metric's invariant.
+const outcomeSymbolicationRetry = "symbolication_retry"
+
+// MarkSymbolicationRetry tags span with processor.outcome=symbolication_retry and reports true when err
+// is the deliberate symbolication redelivery; the span's status is left alone, so a retry is never read
+// as a failure. It reports false, touching nothing, for every other error. main.go's consumer span
+// uses it too: that span is the one a dashboard reads, and it used to mark every returned error.
+func MarkSymbolicationRetry(span trace.Span, err error) bool {
+	if !errors.Is(err, errSymbolicationRetry) {
+		return false
+	}
+	span.SetAttributes(attribute.String("processor.outcome", outcomeSymbolicationRetry))
+	return true
+}
+
+// shouldRetrySymbolication reports whether this delivery may still be redelivered. A context that
+// carries no delivery count (a direct call, not the subscriber) never retries.
+func shouldRetrySymbolication(ctx context.Context) bool {
+	n, ok := nats.DeliveryCountFromContext(ctx)
+	return ok && n >= 1 && n <= MaxSymbolicationRetries
+}
+
+// ProcessEvent is the entry point the NATS subscriber calls per message. Its
+// return value controls Ack/Nak: nil Acks, a non-nil error Naks (subject to
+// the subscriber's MaxDeliver/backoff/DLQ policy — see
+// packages/shared-go/nats/subscriber.go and D10 in docs/memory/DECISIONS.md).
+//
+// There is no in-memory buffering path anymore (see the degradation package's
+// doc comment and docs/memory/BUGS.md B1): a down database always returns an
+// error here so the event stays in JetStream, where D10's bounded retry with
+// backoff (1s/5s/15s/30s/60s, MaxDeliver 5) owns recovery, and a DLQ entry
+// preserves anything that outlasts that budget. This function must never call
+// processEventInternal for an event that did not get StatusProcessed.
+// ProcessEvent records MetricProcessDuration/MetricProcessEvents (OBSERVABILITY_PLAN.md §2/W2) around
+// the whole call, classifying the outcome from the returned error AND the stored flag
+// processEventInternal reports (docs/plans/IDEMPOTENCY_PLAN.md D-e): err != nil and nats.IsPermanent ->
+// OutcomeDeadLettered (dead-lettered on THIS delivery, unconditionally, by the subscriber regardless of
+// delivery count); err != nil otherwise -> OutcomeRetried; err == nil && !stored -> obs.OutcomeDuplicate
+// (store.StoreEvent found the (project_id, event_id) pair already stored — on any issue of the
+// project — and rolled back — a healthy no-op ACK, not a failure); err == nil && stored ->
+// OutcomeStored. This classifier is the ONLY place that records a process outcome for a message —
+// processEventInternal itself must never also record OutcomeDuplicate, or one message would mint
+// two time series and the stored+duplicate+retried+deadlettered == deliveries invariant (W3) would
+// stop holding.
+//
+// The retried-vs-deadlettered split is an approximation, not a certainty: whether NATS retries or
+// actually dead-letters a non-permanent error depends on the message's delivery count, which lives
+// entirely inside packages/shared-go/nats.Subscriber.handleMessage (private, and out of scope for this
+// change — see OBSERVABILITY_PLAN.md's W2 brief). A transient error on the LAST allowed delivery is
+// reported here as "retried" even though the subscriber will actually dead-letter it. This is the best
+// classification available from this call's own return value without touching that package.
+func (s *ProcessorService) ProcessEvent(ctx context.Context, data []byte) (err error) {
+	start := time.Now()
+	var stored bool
+	defer func() {
+		outcome := obs.OutcomeStored
+		switch {
+		case err != nil:
+			if nats.IsPermanent(err) {
+				outcome = obs.OutcomeDeadLettered
+			} else {
+				outcome = obs.OutcomeRetried
+			}
+		case !stored:
+			outcome = obs.OutcomeDuplicate
+		}
+		procmetrics.RecordProcessed(ctx, outcome, time.Since(start))
+	}()
+
+	switch s.degradation.Evaluate(ctx, data) {
+	case degradation.StatusProcessed:
+		stored, err = s.processEventInternal(ctx, data)
+		return err
+	case degradation.StatusUnavailable:
+		// Do NOT ACK. The database is down and this event has not been stored anywhere durable.
+		// Returning an error keeps it in JetStream, where D10's bounded retry with backoff
+		// (1s/5s/15s/30s/60s, MaxDeliver 5) owns recovery and a DLQ entry preserves anything that
+		// outlasts the budget. An earlier version of this code ACKed here on the grounds that the
+		// event "was buffered" in process memory — that silently destroyed events on a process
+		// restart, trading a duplicate-delivery bug for a permanent-loss bug, which is strictly worse.
+		return fmt.Errorf("database unavailable: event returned to NATS for bounded retry")
+	default:
+		return fmt.Errorf("unknown degradation status")
+	}
+}
+
+// VerifyAuditLogTable confirms audit_logs is present and writable-shaped at boot.
+//
+// It used to INSERT a fixed all-zero-UUID row with action 'verification_test' — a permanent piece of fake
+// audit data sitting in the audit trail, in the one table whose entire value is that everything in it
+// really happened. ON CONFLICT DO NOTHING kept it to a single row rather than one per boot, which is
+// precisely why nobody noticed it.
+//
+// A SELECT against the real column list proves the same things the INSERT did — the table exists and its
+// columns match what this service expects — without writing anything. LIMIT 0 means no rows are fetched;
+// Postgres still validates every identifier, so a renamed or dropped column fails here exactly as it
+// would have before.
+func (s *ProcessorService) VerifyAuditLogTable(ctx context.Context) error {
+	const query = `SELECT id, action, resource_type, actor_id, metadata FROM audit_logs LIMIT 0`
+	rows, err := s.db.Query(ctx, query)
+	if err != nil {
+		return fmt.Errorf("audit_logs is not usable: %w", err)
+	}
+	rows.Close()
+	return rows.Err()
+}
+
+// withSpan starts a child span named name on ctx, runs fn with the span-carrying context, records fn's
+// error (if any) onto the span, and always ends the span before returning. Used throughout
+// processEventInternal for the "meaningful stages" OBSERVABILITY_PLAN.md's W2 brief calls out:
+// deserialize, store, index, alert dispatch — all children of whatever span is already in ctx (the
+// consumer span main.go's subscriber handler opens after extracting the ingestor's producer span from
+// the NATS traceparent header).
+func withSpan(ctx context.Context, name string, fn func(ctx context.Context) error) error {
+	spanCtx, span := tracer.Start(ctx, name)
+	defer span.End()
+	if err := fn(spanCtx); err != nil {
+		if MarkSymbolicationRetry(span, err) {
+			return err
+		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
+// processEventInternal deserializes and stores one event, returning (stored, err) instead of a bare
+// error (docs/plans/IDEMPOTENCY_PLAN.md D-e): stored distinguishes "persisted" from "this
+// (project_id, event_id) pair was already stored, on whichever issue — store.StoreEvent rolled back
+// and this is a healthy no-op ACK", which ProcessEvent's deferred classifier is the ONLY place
+// allowed to turn into obs.OutcomeDuplicate (see that function's doc comment for why recording it
+// here too would double-count).
+func (s *ProcessorService) processEventInternal(ctx context.Context, data []byte) (bool, error) {
+	var evt *event.ErrorEvent
+	if err := withSpan(ctx, "processor.deserialize", func(ctx context.Context) error {
+		var deserializeErr error
+		evt, deserializeErr = event.Deserialize(data)
+		return deserializeErr
+	}); err != nil {
+		// A deserialize failure (malformed proto, a required field missing)
+		// is a property of these exact bytes: redelivering the same message
+		// will fail identically forever, so it must not spend its whole
+		// MaxDeliver budget being retried (VERIFIED_STATE.md S13).
+		slog.ErrorContext(ctx, "Failed to deserialize event", slog.String("error", err.Error()))
+		return false, nats.Permanent(err)
+	}
+
+	// No fingerprint on this line any more: at this point evt.Fingerprint is the client's value or
+	// "" — identity is computed below, after the project is resolved and the frames symbolicated
+	// (sentinel-sourcemaps §4.4), and logged there.
+	slog.InfoContext(ctx, "Processing event",
+		slog.String("project", evt.ProjectKey), slog.String("project_id", evt.ProjectID),
+		slog.String("error_class", evt.ErrorClass),
+		slog.String("release_version", evt.ReleaseVersion))
+
+	var projectID string
+	issue := &store.Issue{
+		ID: uuid.New().String(),
+		// sentinel-project-environments §4.9: part of the issue's identity, not just the
+		// occurrence's. Taken from the event (§4.8) — the registry is never consulted here.
+		Environment: evt.Environment,
+		// Fingerprint is set below, once the frames are final (§4.4): it used to be copied here
+		// from Deserialize's computation, which ran before any project lookup could happen.
+		Message:    evt.Message,
+		ErrorClass: evt.ErrorClass,
+		Status:     "unresolved",
+		FirstSeen:  evt.Timestamp,
+		LastSeen:   evt.Timestamp,
+	}
+
+	metadataJSON, _ := json.Marshal(evt.Metadata)
+	occ := &store.ErrorOccurrence{
+		ID:             uuid.New().String(),
+		Environment:    evt.Environment,
+		Platform:       evt.Platform,
+		ReleaseVersion: evt.ReleaseVersion,
+		// Stacktrace is marshalled below, AFTER symbolication — marshalling it here, as this code
+		// used to, would store the frames as sent and lose the rewrite (§4.4 step 6's
+		// `symbolicated`/`raw` record lives in this JSONB, decision D6).
+		Metadata:  metadataJSON,
+		TraceID:   evt.TraceID,
+		SpanID:    evt.SpanID,
+		CreatedAt: evt.Timestamp,
+		EventID:   evt.EventID,
+		// sentinel-affected-users §4.3: the raw, decision-5-bounded identifiers and the reason each
+		// was dropped when it was — read by event.Prepare before masking (decision 3), never from
+		// evt.Metadata, which by now is masked (a sensitive key's value is "***REDACTED***"). StoreEvent
+		// writes the side tables from the ids and counts the reasons after commit.
+		AffectedUserID:           evt.AffectedUserID,
+		AffectedTenantID:         evt.AffectedTenantID,
+		AffectedUserSkipReason:   evt.AffectedUserSkipReason,
+		AffectedTenantSkipReason: evt.AffectedTenantSkipReason,
+	}
+	fillOccurrenceV2(ctx, occ, evt)
+
+	var stored bool
+	// outcome is the class of the issue row's status AFTER the write (store.IssueOutcome, decision
+	// 29). It used to be discarded here with `_`; sentinel-releases-snooze §4.3 / decision 16 makes
+	// the service read it, for exactly one purpose — the dispatchAlert gate below.
+	var outcome store.IssueOutcome
+	storeErr := withSpan(ctx, "processor.store", func(ctx context.Context) error {
+		var err error
+		projectID, err = s.store.ResolveProjectID(ctx, evt.ProjectID, evt.ProjectKey)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to resolve project", slog.String("error", err.Error()))
+			return classifyProjectLookupError(err)
+		}
+		issue.ProjectID = projectID
+		// sentinel-occurrence-dedup-project §4.3: the same resolved value on the occurrence, for the
+		// (project_id, event_id) dedup key. StoreEvent writes issue.ProjectID to the row regardless
+		// and stamps it back here, so the two cannot disagree; never a value read from the payload.
+		occ.ProjectID = projectID
+
+		// sentinel-sourcemaps §4.4, the order the contract fixes: the project id is known (above),
+		// the frames are symbolicated (a child span — it can spend up to SYMBOLICATE_DEADLINE on a
+		// cold map), THEN the fingerprint is computed over the frames as they now are, and only
+		// then does the issue take its identity and the occurrence its JSONB. A client fingerprint
+		// without override survives verbatim through ComputeFingerprint's early return, frames
+		// rewritten or not (flow S7).
+		var symbolicationTransient bool
+		_ = withSpan(ctx, "processor.symbolicate", func(ctx context.Context) error {
+			symbolicationTransient = s.symbolicate(ctx, evt, projectID)
+			return nil
+		})
+		// sentinel-grouping-v2 §1.4: a minified-frame hash taken because the map was merely not
+		// ready would become a ghost issue per release. Only a server-computed identity depends on
+		// the frames, so a client fingerprint (without override) is never delayed. Nothing has been
+		// written yet, so redelivery is safe.
+		if symbolicationTransient && (evt.Fingerprint == "" || evt.FingerprintOverride) && shouldRetrySymbolication(ctx) {
+			delivery, _ := nats.DeliveryCountFromContext(ctx)
+			slog.InfoContext(ctx, "Symbolication incomplete; requesting delayed redelivery",
+				slog.String("outcome", outcomeSymbolicationRetry), slog.Uint64("delivery", delivery),
+				slog.Int("max_retries", MaxSymbolicationRetries))
+			return errSymbolicationRetry
+		}
+		evt.ComputeFingerprint(s.symPlatforms)
+		issue.Fingerprint = evt.Fingerprint
+		occ.Stacktrace, _ = json.Marshal(evt.Stacktrace)
+		slog.InfoContext(ctx, "Fingerprint computed", slog.String("fingerprint", evt.Fingerprint))
+
+		// StoreEvent (docs/plans/IDEMPOTENCY_PLAN.md D-c) folds the issue upsert/regression
+		// bookkeeping and the event_id-deduplicated occurrence insert into ONE transaction — this
+		// replaces the former three-step UpsertIssueWithOutcome / GetIssueIDByFingerprint /
+		// InsertOccurrence sequence, whose gap between the issue commit and the occurrence insert
+		// was the exact S18 count-inflation window (IDEMPOTENCY_PLAN.md §1). Audit persistence,
+		// alert dispatch, and search indexing all move to AFTER this call returns, gated on
+		// stored==true (D-d) — see below.
+		storeOutcome, storeResult, err := s.store.StoreEvent(ctx, issue, occ, evt.ReleaseVersion)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to store event", slog.String("error", err.Error()))
+			return classifyStoreError(err)
+		}
+		stored = storeResult
+		outcome = storeOutcome
+		return nil
+	})
+	if storeErr != nil {
+		return false, storeErr
+	}
+
+	if !stored {
+		// Duplicate: store.StoreEvent found (project_id, event_id) already stored — on the issue
+		// this delivery resolved to or on any other issue of the project (sentinel-occurrence-
+		// dedup-project R1) — and rolled back this delivery's issue/occurrence writes, a fresh issue
+		// row included (R2). This is a successful no-op — audit, alert dispatch, and indexing must
+		// NOT run for it (D-d: they are gated on stored==true, because each one reads state this
+		// delivery did not actually write). One structured log line is D-e's whole visibility
+		// contract for this branch, key-aware since sentinel-occurrence-dedup-project (§4.3, OQ-5
+		// (a)): event_id, project_id, the issue_id THIS delivery resolved to (not necessarily the
+		// stored row's), and matched_key — the constraint that refused the row, "project" for the
+		// arbiter and "issue" only on the decision-12 tolerance path (a pre-release row with
+		// project_id IS NULL). Same-issue vs cross-issue is NOT what matched_key says (decision 19).
+		//
+		// The NATS delivery count is deliberately omitted here — a RECORDED DEVIATION from
+		// IDEMPOTENCY_PLAN.md D-e, which asks for it (the plan's E2E_RECOVERY_PLAN.md P9-3 entry
+		// records the deviation alongside the acceptance-text one). Getting it to this call site
+		// would mean either changing nats.Subscriber's handler signature (14 call sites) or
+		// changing ProcessEvent/processEventInternal's signature to carry headers all the way
+		// down from main.go's Subscribe closure, for a single diagnostic log field. event_id and
+		// issue_id alone are already enough to find the exact duplicate in error_occurrences,
+		// and "redelivery vs client re-send" is distinguishable by whether the ingest-side POST
+		// count moved.
+		slog.InfoContext(ctx, "Duplicate event skipped: (project_id, event_id) already stored",
+			slog.String("event_id", occ.EventID),
+			slog.String("project_id", occ.ProjectID),
+			slog.String("issue_id", issue.ID),
+			slog.String("matched_key", occ.DuplicateMatchedKey))
+		return false, nil
+	}
+
+	// stored == true from here on. Audit, alert dispatch, and indexing all run AFTER StoreEvent's
+	// commit and ONLY for a delivery that actually wrote something (D-d) — order: commit (already
+	// happened, above) -> audit -> alert -> index. All three are best-effort: PersistAuditLog
+	// already swallows/logs its own failures (see its doc comment / AUDIT_PERSIST_FAILURE), and
+	// dispatchAlert/IndexOccurrence are void/logged-not-propagated by design (see below).
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "issue_upserted",
+		ResourceType: "issue",
+		ResourceID:   &issue.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"fingerprint": "%s", "project_id": "%s"}`, issue.Fingerprint, issue.ProjectID)),
+	})
+	s.store.PersistAuditLog(ctx, &store.AuditLog{
+		ID:           uuid.New().String(),
+		Action:       "occurrence_created",
+		ResourceType: "error_occurrence",
+		ResourceID:   &occ.ID,
+		ActorID:      "processor-go",
+		Metadata:     []byte(fmt.Sprintf(`{"issue_id": "%s", "environment": "%s"}`, occ.IssueID, occ.Environment)),
+	})
+
+	// sentinel-span-ingest D3: queue the occurrence's trace for a pull of core's spans. Best-effort like the audit rows
+	// above: MaybeEnqueue returns no error, logs and counts its own failures, and runs only for a delivery that wrote
+	// an occurrence, so a redelivery never enqueues twice. The organization allow-list and the per-issue window
+	// (SPAN_PULL_ISSUE_WINDOW: one pull per issue per window) are checked inside it.
+	s.spanPull.MaybeEnqueue(ctx, issue.ProjectID, issue.ID, occ.TraceID)
+
+	// sentinel-releases-snooze §4.3 "After commit" (decisions 15, 41): the `next` rewrite, only when
+	// step 4c's RETURNING inserted was true — this delivery is the FIRST sighting of (project, R), so
+	// every resolved issue of the project waiting on `next` with resolved_at < first_seen now knows its
+	// version. Here — after the audit rows, before alert dispatch and indexing — because it is one
+	// more best-effort post-commit call of exactly their kind: its own short transaction, never inside
+	// StoreEvent's (it wants nothing an ingest holds after its issues row, so it can never deadlock
+	// with one), its failure logged and counted and never returned. occ.ReleaseInserted is written
+	// back by StoreEvent only after tx.Commit, so a rolled-back first sighting never reaches this.
+	// The clock it compares resolved_at against is occ.ReleaseFirstSeen — the first_seen step 4c
+	// RETURNED, i.e. LEAST(occ.CreatedAt, now()) (decision 50) — never occ.CreatedAt itself: a
+	// client clock a year ahead would otherwise rewrite every waiting `next` issue of the project
+	// to this version on the strength of a first_seen the `releases` row does not hold.
+	if occ.ReleaseInserted {
+		_ = withSpan(ctx, "processor.release_next_rewrite", func(ctx context.Context) error {
+			s.rewriteNextIssues(ctx, projectID, occ.ReleaseVersion, occ.ReleaseFirstSeen)
+			return nil
+		})
+	}
+
+	// Dispatch on EVERY occurrence, not only new/regressed issues — EXCEPT an occurrence whose issue
+	// is `ignored` after the write (sentinel-releases-snooze decision 16, the gate below).
+	//
+	// Dispatcher.Dispatch is itself the rate limiter: it increments a per-project:issue counter
+	// inside a frequency window and only sends once the count reaches alert_configs
+	// .frequency_threshold. Gating on new-or-regressed here meant the counter could never exceed 1,
+	// because an issue is new exactly once — while frequency_threshold is NOT NULL DEFAULT 50. The
+	// two mechanisms cancelled out and no realistic configuration could ever produce an alert.
+	//
+	// Feeding every occurrence in is what the threshold is FOR: "tell me when this error happens 50
+	// times in an hour" is the product behavior, and a threshold of 1 still gives alert-on-first-sight.
+	//
+	// This span is best-effort and can never record an error: dispatchAlert (and, beneath it,
+	// alerts.Dispatcher.Dispatch) is void by design — it swallows/logs its own failures internally
+	// (queue-full, unroutable channel_config, panics in a caller-supplied sender, ...) so that a
+	// broken notifier can never fail or block event processing (see dispatchAlert's doc comment).
+	// There is no error left for this closure to propagate; changing that would mean changing
+	// Dispatcher.Dispatch's exported signature, which is out of scope here. sentinel_alert_dispatch_total
+	// (procmetrics.RecordAlertDispatch, including the dropped outcome) is the mechanism that actually
+	// makes alert-dispatch failures observable, not this span's status.
+	//
+	// Dispatch now runs AFTER StoreEvent's commit (D-d), fixing the §1 double-feed: a redelivery that
+	// used to feed the alert frequency counter for an event that was then rolled back at the
+	// occurrence step can no longer happen, because dispatch does not run at all when stored==false.
+	//
+	// The gate (sentinel-releases-snooze §4.3 "The outcome", decisions 16, 17, 29): dispatch is
+	// skipped iff the outcome is IssueOutcomeIgnored — the row's status after the write is `ignored`,
+	// a snooze still running or a plain indefinite ignore. The occurrence is stored, counted and
+	// bucketed (StoreEvent already did all of that); it simply never reaches the dispatcher's
+	// threshold counters, which is what "ignore" means. Every other outcome dispatches exactly as
+	// before — including IssueOutcomeUnsnoozed, the occurrence that ENDED a snooze: its row is
+	// `unresolved` now and it goes through the threshold normally, neither bypassed nor withheld
+	// (decision 17 forbids an immediate alert, not the ordinary one). `!= Ignored` rather than an
+	// allow-list of the other four, so a sixth outcome added later dispatches by default — silence is
+	// the failure mode this gate must never widen into by accident.
+	if outcome != store.IssueOutcomeIgnored {
+		_ = withSpan(ctx, "processor.alert_dispatch", func(ctx context.Context) error {
+			// issue.Environment, not occ.Environment: they are the same value on this path (both come
+			// from the event), but the alert scope in §4.7 is a decision about the ISSUE's environment,
+			// which decision 7 made part of its identity.
+			s.dispatchAlert(ctx, issue.ID, projectID, issue.Environment, evt.ErrorClass, evt.Message)
+			return nil
+		})
+	} else {
+		slog.InfoContext(ctx, "Alert dispatch skipped: issue is ignored after the write (decision 16)",
+			slog.String("issue_id", issue.ID), slog.String("project_id", projectID))
+	}
+
+	searchEntry := indexer.ExtractSearchFields(evt.Metadata)
+	searchEntry.OccurrenceID = occ.ID
+	// sentinel-affected-users §4.3 (last paragraph; decisions 13 and 19): error_search_index receives
+	// the SAME raw ids the side tables got. ExtractSearchFields just read them out of the masked map
+	// (until sentinel-event-schema-v2 also normalised, where a UUID was "<UUID>"), and the typed
+	// user.id / tenant_id tag (OQ-3) are not in the map at all. Overwrite both with the event's raw,
+	// decision-5-bounded fields: "" when the value was unusable, which
+	// IndexOccurrence's nullString already writes as NULL — so a 300-byte id is ABSENT from the index
+	// instead of failing this after-commit VARCHAR(255) insert as it would have. ExtractSearchFields,
+	// its key list, the columns and every reader are untouched; only these two values differ.
+	searchEntry.UserID = evt.AffectedUserID
+	searchEntry.TenantID = evt.AffectedTenantID
+	if searchEntry.TraceID == "" {
+		searchEntry.TraceID = evt.TraceID
+	}
+	if searchEntry.SpanID == "" {
+		searchEntry.SpanID = evt.SpanID
+	}
+
+	_ = withSpan(ctx, "processor.index", func(ctx context.Context) error {
+		if err := s.indexer.IndexOccurrence(ctx, searchEntry); err != nil {
+			slog.ErrorContext(ctx, "Failed to index occurrence", slog.String("error", err.Error()))
+			return err
+		}
+		return nil
+	})
+
+	return true, nil
+}
+
+// releaseNextRewriteQuery is sentinel-releases-snooze §4.3's "After commit" statement plus decision
+// 49's NOT EXISTS clause: $1 = project_id, $2 = the newly inserted release's version, $3 = its
+// first_seen (occ.ReleaseFirstSeen — the value step 4c's INSERT arm RETURNED, occ.CreatedAt clamped
+// to the ingest transaction's now() by decision 50). The comparison is STRICT
+// (`first_seen > resolved_at`), and a row with resolved_at IS NULL never matches because `NULL < x` is
+// not true — decision 27's rows are left alone, exactly as the dashboard's hourly catch-up leaves
+// them. Project-wide across environments (decision 41). `idx_issues_project_resolved_next` (a
+// partial index on project_id WHERE resolved_in_version = 'next') makes this an index scan over
+// exactly the waiting issues.
+//
+// The NOT EXISTS (decision 49, `fanout-earliest-newer`) makes the fan-out write ONLY the earliest
+// release newer than the row's resolved_at: a `next` issue for which some OTHER release of the
+// project was already first seen strictly between its resolved_at and this release's first_seen is
+// skipped — that earlier release's own fan-out failed (the pod died, or decision 42's accepted 40P01)
+// and the row belongs to the hourly catch-up, which picks earliest-newer by construction. Without it
+// the following release would write a version LATER than the truth, and an occurrence of the issue
+// in the earlier release would then be judged rowR.first_seen < rowX.first_seen → not a regression
+// (decision 13) — the issue would stay resolved on a release that still throws it. §8's "the
+// following new release can never write a later version than the truth" is true only with this
+// clause. `r.first_seen < $3` is strict so the release being fanned out never excludes itself.
+const releaseNextRewriteQuery = `
+	UPDATE issues SET resolved_in_version = $2
+	WHERE project_id = $1 AND status = 'resolved' AND resolved_in_version = 'next'
+	  AND resolved_at < $3
+	  AND NOT EXISTS (
+	    SELECT 1 FROM releases r
+	    WHERE r.project_id = $1 AND r.first_seen > issues.resolved_at AND r.first_seen < $3
+	  )
+`
+
+// rewriteNextIssues runs the post-commit `next` rewrite for a release this delivery was the first to
+// see (sentinel-releases-snooze §4.3 "After commit", decisions 8, 15, 42). It is best-effort in the
+// same sense PersistAuditLog and dispatchAlert are: it never returns an error, never panics out, and
+// never affects the Ack — the event is stored already, and a `next` issue this call fails to rewrite
+// keeps reading `next` until the dashboard's hourly catch-up (cleanupRetainedData's last statement)
+// rewrites it to the same earliest-newer release this call would have. The window is one hour, and
+// it is the release note's to state, not this function's to close.
+//
+// Its OWN short transaction — one autocommit UPDATE on the pool, never StoreEvent's transaction:
+// inside it the fan-out would take every waiting issues row of the project under the ingest lock
+// order and hold them to commit; outside it holds those rows for one statement and wants nothing an
+// ingest transaction holds AFTER its issues row (it takes no releases row), so ingest-vs-rewrite has
+// no cycle. What CAN deadlock is a batchUpdateIssues call over a set containing this project's
+// `next` issues in the same second (three multi-row writers on issues with unspecified relative
+// order, decision 42): Postgres kills one side with 40P01, and if it is this one the log line below
+// names that SQLSTATE so the cause is legible without a metric label. No activity row per rewritten
+// issue (decision 8): the resolution did not change, its version became known.
+func (s *ProcessorService) rewriteNextIssues(ctx context.Context, projectID, version string, firstSeen time.Time) {
+	tag, err := s.db.Exec(ctx, releaseNextRewriteQuery, projectID, version, firstSeen)
+	if err != nil {
+		// The SQLSTATE is the one field that tells a 40P01 (decision 42's accepted deadlock, self-
+		// healing) from a 42703/42P01 (a migration not applied — §12's rollout-order failure) from a
+		// connection failure (no *pgconn.PgError at all, "" here). It goes on the log line, never on
+		// the counter: the counter is unlabelled by contract (decision 30).
+		sqlstate := ""
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			sqlstate = pgErr.Code
+		}
+		slog.ErrorContext(ctx, "release next rewrite failed; the event is stored and the hourly catch-up will rewrite (contract §4.3)",
+			slog.String("project_id", projectID),
+			slog.String("release_version", version),
+			slog.String("sqlstate", sqlstate),
+			slog.String("error", err.Error()))
+		procmetrics.RecordReleaseNextRewriteFailure(ctx)
+		return
+	}
+	slog.InfoContext(ctx, "release next rewrite committed",
+		slog.String("project_id", projectID),
+		slog.String("release_version", version),
+		slog.Int64("issues_rewritten", tag.RowsAffected()))
+}
+
+// dispatchAlert calls the alert dispatcher and guarantees it can never fail
+// or block event processing (docs/plans/E2E_RECOVERY_PLAN.md P5-1 item 5):
+// Dispatch itself only touches in-memory counters/config and a non-blocking
+// notifier queue send (see alerts.BuildSender), so there is no network I/O
+// on this call path to time out on — but a panic anywhere in a
+// caller-supplied sender must still not be allowed to take down the event
+// that triggered it.
+func (s *ProcessorService) dispatchAlert(ctx context.Context, issueID, projectID, environment, errorClass, message string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "alerts: recovered from panic dispatching alert",
+				slog.String("issue_id", issueID), slog.String("project_id", projectID), slog.Any("panic", r))
+		}
+	}()
+	s.alerts.Dispatch(ctx, issueID, projectID, environment, errorClass, message)
+}
+
+// fillOccurrenceV2 is sentinel-event-schema-v2 §6.1: the per-occurrence v2 columns from the event.
+//
+//   - Level is the event's, or "error" when it sent none (the ingestor replaced an invalid one with "").
+//   - Message and ErrorClass are the occurrence's own values, as Prepare left them, with
+//     every U+0000 removed: the ingestor leaves top-level fields as sent, and Postgres rejects NUL in
+//     text (22021, class 22, Permanent) - without the strip an occurrence of an EXISTING issue whose
+//     message carries a NUL would newly dead-letter (spec P15, T27).
+//   - TraceFlags is nil when the event has no trace id: W3C trace-flags only exist as part of a
+//     traceparent.
+//   - ReceivedAt is nil for a message that predates the ingestor stamping it.
+//   - each JSONB body is the wire JSON of its field, nil when the event carried none.
+func fillOccurrenceV2(ctx context.Context, occ *store.ErrorOccurrence, evt *event.ErrorEvent) {
+	occ.Level = evt.Level
+	if occ.Level == "" {
+		occ.Level = "error"
+	}
+	occ.Message = strings.ReplaceAll(evt.Message, "\x00", "")
+	occ.ErrorClass = strings.ReplaceAll(evt.ErrorClass, "\x00", "")
+	occ.Logger = evt.Logger
+	occ.ServerName = evt.ServerName
+	occ.Transaction = evt.Transaction
+	occ.Dist = evt.Dist
+	occ.Source = evt.Source
+	// D18: service / tag_source / request_scoped from tags. occ.Source above is the wire capture origin and is
+	// NOT touched by this derivation.
+	requestURL := ""
+	if evt.Request != nil {
+		requestURL = evt.Request.URL
+	}
+	origin := event.DeriveOrigin(evt.Tags, evt.Transaction, requestURL)
+	occ.Service, occ.TagSource, occ.RequestScoped = origin.Service, origin.TagSource, origin.RequestScoped
+	if evt.TraceID != "" {
+		flags := int64(evt.TraceFlags)
+		occ.TraceFlags = &flags
+	}
+	if !evt.ReceivedAt.IsZero() {
+		receivedAt := evt.ReceivedAt
+		occ.ReceivedAt = &receivedAt
+	}
+	marshal := func(column string, v interface{}, present bool) json.RawMessage {
+		if !present {
+			return nil
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			// Unreachable for decoded JSON; a non-JSON value (a NaN from a hand-built proto) must not
+			// cost the event, so the column is stored NULL and the reason logged.
+			slog.WarnContext(ctx, "processor: v2 field is not JSON-encodable; storing NULL",
+				slog.String("column", column), slog.String("error", err.Error()))
+			return nil
+		}
+		return b
+	}
+	occ.SDK = marshal("sdk", evt.SDK, evt.SDK != nil)
+	occ.User = marshal("event_user", evt.User, evt.User != nil)
+	occ.Tags = marshal("tags", evt.Tags, len(evt.Tags) > 0)
+	occ.Contexts = marshal("contexts", evt.Contexts, len(evt.Contexts) > 0)
+	occ.Request = marshal("request", evt.Request, evt.Request != nil)
+	occ.Breadcrumbs = marshal("breadcrumbs", evt.Breadcrumbs, len(evt.Breadcrumbs) > 0)
+	occ.Exception = marshal("exception", evt.Exception, evt.Exception != nil)
+}

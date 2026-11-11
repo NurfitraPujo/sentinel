@@ -1,0 +1,30 @@
+{
+  "wire_v2_bounded.golden.json": {
+    "array_size": 404742,
+    "publish_cost": 405411
+  },
+  "wire_v2_bounded_crumbs.golden.json": {
+    "array_size": 123032,
+    "publish_cost": 123044
+  },
+  "wire_v2_bounded_numbers.golden.json": {
+    "array_size": 158568,
+    "publish_cost": 860685
+  },
+  "wire_v2_escapes.golden.json": {
+    "array_size": 53360,
+    "publish_cost": 21959
+  },
+  "wire_v2_full.golden.json": {
+    "array_size": 1047,
+    "publish_cost": 1066
+  },
+  "wire_v2_nul.golden.json": {
+    "array_size": 159593,
+    "publish_cost": 871251
+  },
+  "wire_v2_shrunk.golden.json": {
+    "array_size": 113539,
+    "publish_cost": 618756
+  }
+}

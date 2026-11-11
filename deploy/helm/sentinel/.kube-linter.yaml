@@ -1,0 +1,42 @@
+# Kube-linter config for the Sentinel chart (K8s CCE renders).
+# Mirrors cdc-pipeline's proven baseline: default check set with waivers for
+# chart debt / by-design patterns, not regressions.
+#
+# latest-tag: ArgoCD pins real image tags per deploy (`image.tag=<git tag>`);
+#   empty tag (→ Chart.AppVersion) is only the un-pinned default in values.
+# dangling-service: templates/external-services.yaml intentionally creates
+#   selector-less Services + manual Endpoints to reach RDS/DCS private IPs
+#   from the CCE Standard cluster (see file header comment).
+# no-read-only-root-fs / run-as-non-root: pods already run as 65532 with
+#   readOnlyRootFilesystem via pod/container securityContext; kube-linter
+#   cannot see Dockerfile USER so these would false-positive.
+# pdb-unhealthy-pod-eviction-policy: pre-existing PDBs predate the check;
+#   eviction policy is a hardening follow-up, not a K8s blocker.
+# pdb-min-available: false positive under kube-linter v0.6.5 (the version
+#   cdc-pipeline pins). Our Deployments omit `replicas:` when HPA is enabled
+#   (HPA owns the count, minReplicas=2) so the check assumes replicas=1 and
+#   compares against PDB minAvailable=1. Runtime is correct: HPA min 2 >
+#   PDB min 1. (cdc never hits this — it defines no PDBs.)
+# job-ttl-seconds-after-finished: migrate + nats-init are Helm hook Jobs
+#   (hook-delete-policy owns cleanup); TTL would fight hook lifecycle.
+# unset-cpu/memory-requirements: nats-init is a seconds-long one-shot with no
+#   resources block by design (pre-existing).
+#
+# Run: helm template sentinel . -f values-k8s-staging.yml \
+#        | kube-linter lint --config .kube-linter.yaml -
+checks:
+  exclude:
+    - "latest-tag"
+    - "no-read-only-root-fs"
+    - "run-as-non-root"
+    - "dangling-service"
+    - "pdb-unhealthy-pod-eviction-policy"
+    - "pdb-min-available"
+    - "unset-cpu-requirements"
+    - "unset-memory-requirements"
+
+# NOTE: "job-ttl-seconds-after-finished" used to be in the exclude list above and
+# had never done anything -- it is NOT a kube-linter check. `kube-linter checks
+# list` has nothing matching "ttl", and putting it in `include` fails with
+# `check "job-ttl-seconds-after-finished" not found`. Excluding a check that does
+# not exist excludes nothing (report-an-issue/BUG-89).

@@ -1,0 +1,157 @@
+:root {
+	/* Fonts */
+	--font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+	/* Color Tokens - OKLCH Palette (Impeccable Committed Product Palette) */
+	--bg-root: oklch(0.16 0.024 260);
+	--bg-surface: oklch(0.20 0.025 260);
+	--bg-surface-elevated: oklch(0.24 0.028 260);
+	--bg-surface-hover: oklch(0.26 0.028 260);
+
+	--border-color: oklch(0.28 0.022 260);
+	--border-color-muted: oklch(0.24 0.02 260 / 0.7);
+	--border-color-focus: oklch(0.65 0.18 250);
+
+	--text-primary: oklch(0.96 0.008 260);
+	--text-secondary: oklch(0.78 0.015 260);
+	--text-muted: oklch(0.64 0.018 260);
+	--text-subtle: oklch(0.50 0.018 260);
+
+	/* Brand & Interactive */
+	--color-primary: oklch(0.62 0.19 255);
+	--color-primary-hover: oklch(0.55 0.20 255);
+	--color-primary-subtle: oklch(0.62 0.19 255 / 0.15);
+
+	/* Severities & Statuses */
+	--severity-critical-bg: oklch(0.35 0.12 25 / 0.25);
+	--severity-critical-text: oklch(0.75 0.19 25);
+	--severity-critical-border: oklch(0.48 0.14 25);
+
+	--status-open-bg: oklch(0.40 0.10 75 / 0.25);
+	--status-open-text: oklch(0.80 0.15 75);
+	--status-open-border: oklch(0.52 0.12 75);
+
+	--status-resolved-bg: oklch(0.35 0.10 150 / 0.25);
+	--status-resolved-text: oklch(0.76 0.14 150);
+	--status-resolved-border: oklch(0.46 0.10 150);
+
+	--status-ignored-bg: oklch(0.30 0.02 260 / 0.35);
+	--status-ignored-text: oklch(0.72 0.02 260);
+	--status-ignored-border: oklch(0.38 0.02 260);
+
+	/* Categorical chart palette (sentinel-dashboard-metrics-improvement D12): ten distinct hues, each >= 3:1 against the
+	   page and card backgrounds (tests/chart-palette.test.ts). The nth series of a chart is --chart-n; slot 10 is the
+	   neutral one (unattributed, other services). The light set is for a light theme to opt into with data-theme="light". */
+	--chart-1: oklch(0.72 0.14 250);
+	--chart-2: oklch(0.78 0.15 60);
+	--chart-3: oklch(0.78 0.14 165);
+	--chart-4: oklch(0.74 0.17 350);
+	--chart-5: oklch(0.86 0.15 100);
+	--chart-6: oklch(0.72 0.15 300);
+	--chart-7: oklch(0.82 0.10 210);
+	--chart-8: oklch(0.72 0.17 25);
+	--chart-9: oklch(0.82 0.16 130);
+	--chart-10: oklch(0.70 0.02 260);
+
+	/* Spacing & Radii */
+	--radius-sm: 4px;
+	--radius-md: 6px;
+	--radius-lg: 8px;
+
+	/* Motion Timing Functions (Exponential Ease-out) */
+	--ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+	--transition-fast: 150ms var(--ease-out-expo);
+	--transition-normal: 220ms var(--ease-out-expo);
+}
+
+:root[data-theme='light'] {
+	--chart-1: oklch(0.52 0.18 255);
+	--chart-2: oklch(0.60 0.17 55);
+	--chart-3: oklch(0.55 0.13 165);
+	--chart-4: oklch(0.55 0.20 350);
+	--chart-5: oklch(0.58 0.13 95);
+	--chart-6: oklch(0.50 0.18 295);
+	--chart-7: oklch(0.55 0.10 215);
+	--chart-8: oklch(0.55 0.20 27);
+	--chart-9: oklch(0.58 0.15 130);
+	--chart-10: oklch(0.52 0.02 260);
+}
+
+* {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+body {
+	font-family: var(--font-sans);
+	background-color: var(--bg-root);
+	color: var(--text-primary);
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+input, button, select, textarea {
+	font-family: inherit;
+	color: inherit;
+}
+
+/* `input:not([type])` is here because these are ATTRIBUTE selectors: an <input> with no `type`
+   attribute behaves as a text field but matches none of them, so it fell through to the
+   `color: inherit` rule above — near-white --text-primary text on the browser's default white
+   input background, i.e. invisible typing. That shipped on /onboarding in v0.2.3-staging. The
+   inputs there now declare type="text" as well; this line means the next omission is a
+   non-event rather than the same bug again. */
+input:not([type]),
+input[type="email"],
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select {
+	background-color: var(--bg-root);
+	border: 1px solid var(--border-color);
+	color: var(--text-primary);
+	border-radius: var(--radius-sm);
+	outline: none;
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input:not([type]):focus,
+input[type="email"]:focus,
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="password"]:focus,
+select:focus {
+	border-color: var(--color-primary);
+	box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+}
+
+/* Mobile Touch & Element Sizing Safeguards */
+@media (max-width: 640px) {
+	button, 
+	.btn, 
+	.nav-link,
+	.btn-signout, 
+	.btn-signin,
+	.btn-action,
+	.clear-btn,
+	.metadata-toggle {
+		min-height: 44px;
+		min-width: 44px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	input:not([type]),
+	input[type="email"],
+	input[type="text"],
+	input[type="number"],
+	input[type="password"],
+	select {
+		min-height: 44px;
+		font-size: 16px !important; /* Prevents iOS auto-zoom on focus */
+	}
+}

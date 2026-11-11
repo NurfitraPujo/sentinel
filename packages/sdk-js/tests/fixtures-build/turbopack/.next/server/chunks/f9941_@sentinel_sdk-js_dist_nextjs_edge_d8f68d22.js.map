@@ -1,0 +1,1 @@
+{"version":3,"sources":["turbopack:///[project]/node_modules/@sentinel/sdk-js/dist/nextjs/edge.js"],"sourcesContent":["// turbopack:///[project]/node_modules/@sentinel/sdk-js/dist/nextjs/edge.js\nexport const x = 1;\n"],"names":["x"],"mappings":"AAAA,MAAMA,CAAC"}

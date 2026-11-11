@@ -1,0 +1,24 @@
+{
+  // Node 20 is the floor (contract §4.1): `web`'s pods run node:20-alpine. ES2022 lib + @types/node 20.x
+  // keep anything newer than node 20's baseline (Promise.withResolvers, Set.prototype.union, fs.glob,
+  // Array.fromAsync, import.meta.dirname) a type error rather than a module-load failure in production.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "tests", "scripts", "bench", "vitest.config.ts"]
+}

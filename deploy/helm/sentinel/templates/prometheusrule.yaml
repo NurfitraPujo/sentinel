@@ -1,0 +1,232 @@
+{{- if .Values.prometheusRule.enabled }}
+# sentinel-user-report-issue §12 / SR-3 — the alerting half of the metrics chain.
+#
+# §12 records that "where those rules live is half-resolved": the scheduling half is this chart, and
+# the plane's Prometheus/Grafana configuration lives in the `infra` repo, which is NOT an
+# implementing repo for this feature. The rules therefore ship HERE, as a chart-rendered
+# `PrometheusRule`, so the CronJob that produces these states and the alerts that notice them cannot
+# be deployed separately. `infra` remains free to own them later; moving a rendered rule is a much
+# smaller change than discovering the signals were never written.
+#
+# Ships OFF (`prometheusRule.enabled: false`) because the CRD belongs to the Prometheus Operator and
+# a cluster without it would fail the whole release on an unknown kind.
+#
+# **Aggregation under `dashboard.replicaCount: 2`.** Every counter in
+# `apps/dashboard-web/src/lib/server/metrics.ts` is process-local: a scrape sees one replica, and a
+# restart resets it to zero. So every expression below is `sum(increase(...))` ACROSS the pod
+# targets — `sum` for the replicas, `increase()` to absorb a restart. Never a bare counter value:
+# `sentinel_report_escalations_exhausted_total > 0` would stay true forever after one exhaustion and
+# would silently reset to false on a redeploy.
+#
+# Three signals, and §12 names each of them as the ONLY thing that notices a designed-silent state.
+# The `sentinel_report_triage_duration_seconds` p95 rule §12 also lists is deliberately absent:
+# "no number is set here — nobody has measured one, and an alert with an invented threshold is an
+# alert that gets muted." It belongs to the `sentinel-report-intake-measurement` follow-on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sentinel.fullname" . }}-user-reports
+  labels:
+    {{- include "sentinel.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ include "sentinel.fullname" . }}.user-reports
+      rules:
+        # §12: "above zero — a report walked the whole chain and no engineer acknowledged it. This
+        # is the 'nobody answered' signal, and it is the only thing that notices §4.4's terminal
+        # state." §4.4 makes `exhausted` a DESIGNED state, not a bug — which is exactly why it must
+        # page: nothing else in the system reacts to it.
+        - alert: SentinelReportEscalationExhausted
+          expr: sum(increase(sentinel_report_escalations_exhausted_total[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.exhausted }}
+          annotations:
+            summary: "A user report walked every escalation hop with no acknowledgement"
+            description: >-
+              An escalation chain reached ESCALATION_MAX_HOPS unacknowledged. The report stays
+              assigned to the last engineer tried and the chain will not move again. Contract
+              sentinel-user-report-issue §4.4.
+
+        # §12: "above zero — escalation ran for an org whose schedule resolves to nobody." The
+        # report is created and left unassigned for the pull loop; nothing else surfaces it.
+        - alert: SentinelOncallScheduleUnresolved
+          expr: sum(increase(sentinel_oncall_schedule_unresolved_total[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.unresolved }}
+          annotations:
+            summary: "Escalation ran for an organization with no resolvable on-call engineer"
+            description: >-
+              An on-call schedule is missing, has no members, or none of its members still holds an
+              ISSUE_WRITE_ROLES role. Reports for that organization are created unassigned.
+              Contract sentinel-user-report-issue §4.4/§12.
+
+        # §12's "unassigned `user_report` age — oldest unassigned report above a threshold —
+        # escalation stopped running, which is otherwise invisible". This is the backstop for
+        # §12's "the cron never runs" failure mode: both schedulers ship off, and an operator who
+        # deploys and forgets gets escalation-at-intake with no reassignment and nothing saying so.
+        #
+        # It is expressed on the escalation counter rather than on a report-age gauge, and that is a
+        # deliberate, stated limitation: this feature emits no age gauge, adding one would mean a
+        # per-scrape database query from the dashboard, and the observable that actually
+        # distinguishes "the sweep is running" from "nothing calls it" is whether the endpoint moves
+        # ANY escalation counter while reports keep arriving. A stated proxy beats a rule that
+        # references a series nobody emits.
+        - alert: SentinelReportEscalationStalled
+          expr: >-
+            sum(increase(sentinel_reports_received_total{outcome="created"}[{{ .Values.prometheusRule.stalledWindow }}])) > 0
+            and sum(increase(sentinel_report_escalations_total[{{ .Values.prometheusRule.stalledWindow }}])) == 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.stalled }}
+          annotations:
+            summary: "Reports are being created but no escalation is running"
+            description: >-
+              Reports were created in the window and no escalation was assigned, reassigned or
+              failed. Either every organization is unescalatable, or the escalation path is not
+              running at all. Check that ONE of the two schedulers is enabled
+              (oncallCron.enabled here, ONCALL_CRON_ENABLED under compose).
+              Contract sentinel-user-report-issue §12.
+
+    # sentinel-sourcemaps §12 — DORMANT (contract decision 18).
+    #
+    # This group renders and is committed, but NO Prometheus consumes Sentinel's PrometheusRule
+    # today: the state sentinel-user-report-issue (the group above) and sentinel-project-environments
+    # shipped in. Nothing below fires until the follow-on card "Load Sentinel rule groups into the
+    # live Prometheus" lands — `infra` is not a repo of this feature, and a rule that references a
+    # series nobody scrapes is a rule nobody is paged by. It is written now so the day the groups
+    # are loaded the alerts already exist, in the same object as the CronJob's, rather than being
+    # rediscovered as missing.
+    #
+    # Until then, three stand-ins are what notices the states these rules would (decisions 18, 32):
+    #   1. The processor's STARTUP FATAL — with SYMBOLICATE_PLATFORMS non-empty and
+    #      S3_ACCESS_KEY / S3_SECRET_KEY absent, apps/processor-go/main.go log.Fatalf's before it
+    #      subscribes: the pod CrashLoopBackOffs, never consumes an event, the rollout stalls on the
+    #      new ReplicaSet, and `kubectl get pods` shows RESTARTS climbing with
+    #      lastState.terminated.reason: Error and a last log line naming the two variables.
+    #   2. The RUNBOOK's PRE-DEPLOY CHECK (RUNBOOK.md §2) — `helm template` the release and confirm
+    #      both secretKeyRefs on the processor Deployment before a processor tag is cut.
+    #   3. The HAND-READ FALLBACK — sentinel_symbolication_events_total{outcome="none"} climbing on
+    #      the processor's /metrics while `sourcemaps` has rows for the release: symbolication is
+    #      not happening for a release that has maps.
+    #
+    # Same aggregation rule as the group above: every counter is per pod (processor.replicaCount 2,
+    # HPA to 8) and resets on restart, so every expression is `sum(increase(...))` across the pod
+    # targets, never a bare counter value.
+    #
+    # Named verbatim as contract §12 names it (not fullname-prefixed like the group above): a group
+    # name only has to be unique within this one PrometheusRule object, which is already per release.
+    - name: sentinel-sourcemaps
+      rules:
+        # §12: storage unreachable at runtime (credentials present), or a corrupt / mis-hashed map,
+        # degrades SILENTLY to pass-through — the frames look exactly like a project that never
+        # uploaded. A processor WITHOUT credentials never gets this far: that is the startup fatal
+        # (stand-in 1), not this rule.
+        - alert: SentinelSourcemapFetchErrors
+          expr: sum(increase(sentinel_symbolication_frames_total{outcome=~"fetch_error|map_error"}[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.sourcemapFetchErrors }}
+          annotations:
+            summary: "Sourcemap fetches or parses are failing on the processor"
+            description: >-
+              Frames passed through symbolication with outcome fetch_error (object storage
+              unreachable or the object missing) or map_error (parse failure, recovered decoder
+              panic, or a sha256 mismatch against the sourcemaps row). Events are still stored, on
+              their raw-frame fingerprint. Check S3_ENDPOINT/S3_BUCKET reachability from the
+              processor and the release's rows in `sourcemaps`. Contract sentinel-sourcemaps §12.
+
+        # §12: a cache too small for the release's maps fetches and parses per event (decision 11).
+        # `oversize` here is a map larger than SOURCEMAP_CACHE_BYTES (fetched, parsed, not
+        # retained); `evict` is churn. Both are latency, bounded per event by SYMBOLICATE_DEADLINE,
+        # and the levers are SOURCEMAP_CACHE_BYTES, SOURCEMAP_MAX_PARSE_BYTES and GOMEMLIMIT
+        # together (values.yaml, config.processor.* and processor.gomemlimit).
+        - alert: SentinelSourcemapCacheThrash
+          expr: sum(increase(sentinel_sourcemap_cache_events_total{kind=~"oversize|evict"}[{{ .Values.prometheusRule.window }}])) > 100
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.sourcemapCacheThrash }}
+          annotations:
+            summary: "The processor's sourcemap cache is thrashing"
+            description: >-
+              More than 100 cache evictions or over-cache-size parses in the window: the cache
+              cannot hold the release's maps and is re-fetching per event. Raise
+              SOURCEMAP_CACHE_BYTES (and GOMEMLIMIT / the memory limit with it), or lower
+              SOURCEMAP_MAX_PARSE_BYTES to keep the biggest maps out. Contract sentinel-sourcemaps
+              §12, decision 11.
+
+        # §12: the dashboard's upload route answered 503 storage_unavailable — CI saw it, and a CI
+        # step that does not fail the deploy on it ships a release with no maps (Known limit 1).
+        # Per-process counter on the dashboard (lib/server/metrics.ts), summed across its replicas.
+        - alert: SentinelSourcemapUploadStorageErrors
+          expr: sum(increase(sentinel_sourcemap_uploads_total{outcome="storage_error"}[{{ .Values.prometheusRule.window }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.sourcemapUploadStorageErrors }}
+          annotations:
+            summary: "Sourcemap uploads are failing on object storage"
+            description: >-
+              POST /api/sourcemaps returned 503 storage_unavailable: putObject failed mid-request,
+              no rows were written, and objects already put are orphans. The release deployed
+              without maps unless CI failed on the 503. Contract sentinel-sourcemaps §4.1/§12.
+    {{- if .Values.retentionCron.enabled }}
+
+    # sentinel-issue-tag-facets §5 "The standing signal" — DORMANT where the other groups are: it renders
+    # only under prometheusRule.enabled, which production keeps false, and nothing consumes Sentinel's
+    # rule groups until the "Load Sentinel rule groups into the live Prometheus" card lands. Until then
+    # the RUNBOOK's hand-read of sentinel_retention_runs_total on each dashboard replica's /api/metrics,
+    # together with the retention Job list, stands in for it.
+    #
+    # sentinel_retention_runs_total{outcome} is incremented once per authorised POST /api/cron/retention
+    # (apps/dashboard-web/src/lib/server/metrics.ts RETENTION_RUN_OUTCOME). Summed across the dashboard
+    # replicas, increase() absorbing a restart, as every rule in this file.
+    - name: sentinel-retention
+      rules:
+        # A holder of the route lock older than any live run can be: a dead or wedged dashboard process,
+        # or a session that is not a run. Occurrence deletion AND every reaper on the route are stopped
+        # until `pg_terminate_backend(<holderPid>)` (RUNBOOK "retention_cron.lock_stale").
+        - alert: SentinelRetentionLockStale
+          expr: sum(increase(sentinel_retention_runs_total{outcome="lock_stale"}[{{ .Values.prometheusRule.retentionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionLockStale }}
+          annotations:
+            summary: "The retention route lock is held by a dead or wedged session"
+            description: >-
+              POST /api/cron/retention answered 503 retention_lock_stale: the route's advisory lock is
+              held past the stale bound. Retention and the reapers on the route are stopped until the
+              holder goes. See RUNBOOK.md (retention_cron.lock_stale).
+
+        - alert: SentinelRetentionRunFailing
+          expr: sum(increase(sentinel_retention_runs_total{outcome=~"deadline_exceeded|connection_lost|failed"}[{{ .Values.prometheusRule.retentionWindow }}])) > 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionFailing }}
+          annotations:
+            summary: "Retention runs are failing"
+            description: >-
+              A retention run reached its deadline (usually a session holding rows a step needs), lost
+              its connection, or failed. The next hourly run continues from the oldest row. See
+              RUNBOOK.md (retention_cron.deadline_exceeded / connection_lost).
+
+        # Three hourly runs in a row did not complete: a Job that never reached the route (the dashboard
+        # down, a wrong CRON_SECRET), failures, or runs that finished `behind` (occurrence deletion
+        # stopped early). The `or vector(0)` makes it fire when no dashboard series was scraped at all,
+        # the very state it names; a present series is unaffected.
+        - alert: SentinelRetentionNotCompleting
+          expr: (sum(increase(sentinel_retention_runs_total{outcome="completed"}[{{ .Values.prometheusRule.retentionStalledWindow }}])) or vector(0)) == 0
+          for: {{ .Values.prometheusRule.for }}
+          labels:
+            severity: {{ .Values.prometheusRule.severity.retentionNotCompleting }}
+          annotations:
+            summary: "Retention has not completed a run in three hours"
+            description: >-
+              No POST /api/cron/retention ended `completed` in the window: Jobs are failing before the
+              route, runs are failing, or runs finish `behind` (occurrence deletion stopped early). Read
+              the retention_cron.* lines and the retention Job list. See RUNBOOK.md.
+    {{- end }}
+{{- end }}

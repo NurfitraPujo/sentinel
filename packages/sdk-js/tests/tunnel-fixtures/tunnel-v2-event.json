@@ -1,0 +1,28 @@
+{
+  "name": "tunnel-v2-event",
+  "inbound": {
+    "headers": {
+      "host": "app-staging.example.com",
+      "origin": "https://app-staging.example.com",
+      "sec-fetch-site": "same-origin",
+      "content-type": "application/json",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      "x-forwarded-for": "203.0.113.77"
+    },
+    "body": "[{\"event_id\":\"00000000-0000-4000-8006-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-v2-event\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"warning\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.2\"},\"user\":{\"id\":\"usr_1\",\"email\":\"ada@example.com\",\"username\":\"ada\",\"ip_address\":\"{{auto}}\"},\"tags\":{\"tenant_id\":\"org_a\",\"feature\":\"chats\"},\"contexts\":{\"ok\":{\"a\":1}},\"request\":{\"method\":\"POST\",\"url\":\"https://app-staging.example.com/checkout\",\"query_string\":\"step=2\",\"headers\":{\"x-request-id\":\"req_v2\"}},\"breadcrumbs\":[{\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"type\":\"default\",\"category\":\"ui.click\",\"message\":\"clicked save\",\"level\":\"info\"}]}]"
+  },
+  "forwarded": {
+    "path": "/ingest/batch",
+    "headers": {
+      "content-type": "application/json",
+      "x-api-key": "sk_tunnel_fixture_key",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      "x-sentinel-derive-ip": "off"
+    },
+    "body": "[{\"event_id\":\"00000000-0000-4000-8006-000000000001\",\"platform\":\"javascript\",\"environment\":\"production\",\"error_class\":\"TypeError\",\"message\":\"tunnel fixture tunnel-v2-event\",\"stacktrace\":[{\"file\":\"https://app/_next/static/chunks/app/page-9b0d4e.js\",\"line\":12,\"column\":34,\"function\":\"render\",\"in_app\":true}],\"metadata\":{\"runtime\":\"browser\"},\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"level\":\"warning\",\"sdk\":{\"name\":\"sentinel.javascript.browser\",\"version\":\"0.3.2\"},\"user\":{\"id\":\"usr_1\",\"username\":\"ada\",\"email\":\"ada@example.com\",\"ip_address\":\"203.0.113.77\"},\"tags\":{\"tenant_id\":\"org_a\",\"feature\":\"chats\"},\"contexts\":{\"ok\":{\"a\":1}},\"request\":{\"method\":\"POST\",\"url\":\"https://app-staging.example.com/checkout\",\"query_string\":\"step=2\",\"headers\":{\"x-request-id\":\"req_v2\"}},\"breadcrumbs\":[{\"timestamp\":\"2026-09-16T12:00:00.000Z\",\"type\":\"default\",\"category\":\"ui.click\",\"message\":\"clicked save\",\"level\":\"info\"}]}]"
+  },
+  "expect": {
+    "client_ip": "203.0.113.77",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "platform": "javascript",
+  "environment": "production",
+  "error_class": "Error",
+  "message": "login",
+  "stacktrace": [
+    {
+      "file": "https://app/_next/static/chunks/app/page-9b0d4e.js",
+      "line": 4,
+      "column": 4,
+      "function": "submit",
+      "in_app": true
+    }
+  ],
+  "metadata": {
+    "password": "[FILTERED]",
+    "author": "[FILTERED]",
+    "nested": {
+      "api_key": "[FILTERED]",
+      "safe": "kept"
+    },
+    "items": [
+      {
+        "password": "in-array"
+      }
+    ],
+    "request_id": "req_1",
+    "runtime": "browser"
+  },
+  "timestamp": "2026-09-16T12:00:00.000Z",
+  "level": "error",
+  "sdk": {
+    "name": "sentinel.javascript.browser",
+    "version": "0.3.2"
+  },
+  "user": {
+    "ip_address": "{{auto}}"
+  }
+}

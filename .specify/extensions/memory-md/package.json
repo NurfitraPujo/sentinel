@@ -1,0 +1,38 @@
+{
+  "name": "speckit-memory",
+  "version": "0.8.5",
+  "private": true,
+  "description": "Optional local memory optimizer for Spec Kit Memory Hub.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "bin": {
+    "speckit-memory": "dist/bin/speckit-memory.js"
+  },
+  "scripts": {
+    "build": "npx -y -p typescript@latest tsc -p tsconfig.json",
+    "postbuild": "chmod +x dist/bin/speckit-memory.js",
+    "prebuild": "rm -rf node_modules/typescript && npm install typescript@latest",
+    "clean": "rm -rf dist",
+    "start": "node dist/bin/speckit-memory.js",
+    "test-root": "./scripts/test-root-resolution.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@dqbd/tiktoken": "^1.0.22",
+    "better-sqlite3": "^12.9.0",
+    "chalk": "^4.1.2",
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "gray-matter": "^4.0.3",
+    "markdown-it": "^14.1.0",
+    "typescript": "^6.0.3",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.13.10"
+  }
+}
